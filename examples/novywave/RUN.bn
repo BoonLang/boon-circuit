@@ -43,9 +43,9 @@ store: [
 
     mode:
         LATEST {
-            TEXT { Dark }
-            elements.mode_to_light.event.press |> THEN { TEXT { Light } }
-            elements.mode_to_dark.event.press |> THEN { TEXT { Dark } }
+            Dark
+            elements.mode_to_light.event.press |> THEN { Light }
+            elements.mode_to_dark.event.press |> THEN { Dark }
         }
 
     active_scope:
@@ -64,6 +64,19 @@ store: [
             elements.select_temperature.event.press |> THEN { TEXT { temperature } }
         }
 
+    signal_catalog:
+        LIST {
+            [scope: TEXT { top.cpu }, name: TEXT { clk }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
+            [scope: TEXT { top.cpu }, name: TEXT { reset_n }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Input }]
+            [scope: TEXT { top.cpu }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, width: TEXT { 8-bit }, direction: TEXT { Output }]
+            [scope: TEXT { top.cpu }, name: TEXT { data_valid }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
+            [scope: TEXT { top.cpu }, name: TEXT { data_ready }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Input }]
+            [scope: TEXT { top.cpu }, name: TEXT { data_parity }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
+            [scope: TEXT { top.cpu }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, width: TEXT { 3-bit }, direction: TEXT { State }]
+            [scope: TEXT { top.cpu }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, width: TEXT { 16-bit }, direction: TEXT { Counter }]
+            [scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, width: TEXT { 16-bit }, direction: TEXT { Input }]
+        }
+
     signal_search_text:
         Text/empty() |> HOLD signal_search_text {
             LATEST {
@@ -73,7 +86,7 @@ store: [
 
     search_result_label:
         signal_search_text |> WHEN {
-            data => TEXT { 1 result: data_bus[7:0] }
+            data => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
             reset => TEXT { 1 result: reset_n }
             temp => TEXT { 1 result: temperature }
             clk => TEXT { 1 result: clk }
@@ -129,6 +142,8 @@ store: [
             elements.keyboard_capture.key |> WHEN {
                 W => TEXT { Close }
                 S => TEXT { Wide }
+                D => TEXT { Close }
+                Q => TEXT { Close }
                 __ => SKIP
             }
         }
@@ -141,6 +156,8 @@ store: [
                 elements.keyboard_capture.key |> WHEN {
                     A => TEXT { LeftWindow }
                     D => TEXT { RightWindow }
+                    Q => TEXT { RightWindow }
+                    S => TEXT { RightWindow }
                     __ => SKIP
                 }
             }
@@ -152,7 +169,9 @@ store: [
             elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
             elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
             elements.keyboard_capture.key |> WHEN {
+                D => TEXT { Cursor42 }
                 Q => TEXT { Cursor36 }
+                S => TEXT { Cursor36 }
                 E => TEXT { Cursor48 }
                 __ => SKIP
             }
@@ -167,15 +186,44 @@ store: [
             elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
         }
 
+    keyboard_viewport_label:
+        TEXT { 0 ns - 120 ns } |> HOLD keyboard_viewport_label {
+            LATEST {
+                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
+                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
+                elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+            elements.keyboard_capture.key |> WHEN {
+                W => TEXT { 36 ns - 60 ns }
+                S => TEXT { 60 ns - 240 ns }
+                A => TEXT { 24 ns - 48 ns }
+                D => TEXT { 48 ns - 72 ns }
+                Q => TEXT { 48 ns - 72 ns }
+                E => TEXT { 48 ns - 72 ns }
+                __ => SKIP
+            }
+            }
+        }
+
     cursor_label:
         LATEST {
             TEXT { 42 ns }
             elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
             elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
+        }
+
+    keyboard_cursor_label:
+        TEXT { 42 ns } |> HOLD keyboard_cursor_label {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
+                elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
             elements.keyboard_capture.key |> WHEN {
+                D => TEXT { 42 ns }
                 Q => TEXT { 36 ns }
+                S => TEXT { 36 ns }
                 E => TEXT { 48 ns }
                 __ => SKIP
+            }
             }
         }
 
@@ -241,10 +289,15 @@ store: [
                 elements.pan_right.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN } }
                 elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.keyboard_capture.key |> WHEN {
+                    W => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
+                    S => TEXT { FP_CPU_DATA_WIDE_RIGHT_36_BIN }
+                    Q => TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
+                    E => TEXT { FP_CPU_DATA_CLOSE_RIGHT_48_BIN }
                     D => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
                     A => TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
                     __ => SKIP
                 }
+                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
             }
         }
 
@@ -320,14 +373,62 @@ store: [
         }
 
     bridge_response_fingerprint:
-        bridge_response_page |> WHEN {
-            TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } => TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
-            TEXT { PAGE_CLK_FIT_CENTER_42_HEX } => TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
-            __ => TEXT { FP_STALE_OR_UNKNOWN_PAGE }
+        TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_response_fingerprint {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
+                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+            }
         }
 
     bridge_request_label:
         bridge_request_fingerprint
+
+    bridge_request_compact_label:
+        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label {
+            LATEST {
+                elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
+                elements.select_data.event.press |> THEN { TEXT { DATA_FIT } }
+                elements.format_cycle.event.press |> THEN { TEXT { DATA_BIN } }
+                elements.format_hex.event.press |> THEN { TEXT { DATA_HEX } }
+                elements.format_grouped.event.press |> THEN { TEXT { DATA_GROUP } }
+                elements.format_octal.event.press |> THEN { TEXT { DATA_OCT } }
+                elements.format_signed.event.press |> THEN { TEXT { DATA_SGN } }
+                elements.format_unsigned.event.press |> THEN { TEXT { DATA_UNS } }
+                elements.format_ascii.event.press |> THEN { TEXT { DATA_ASC } }
+                elements.zoom_in.event.press |> THEN { TEXT { DATA_CLOSE } }
+                elements.pan_right.event.press |> THEN { TEXT { DATA_RIGHT } }
+                elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.keyboard_capture.key |> WHEN {
+                    W => TEXT { DATA_CLOSE }
+                    S => TEXT { DATA_WIDE }
+                    Q => TEXT { DATA_36NS }
+                    E => TEXT { DATA_48NS }
+                    D => TEXT { DATA_RIGHT }
+                    A => TEXT { DATA_LEFT }
+                    __ => SKIP
+                }
+                elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+            }
+        }
+
+    bridge_response_compact_label:
+        TEXT { CLK_FIT } |> HOLD bridge_response_compact_label {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.keyboard_capture.key |> WHEN {
+                    D => TEXT { CLK_FIT }
+                    Q => TEXT { DATA_36NS }
+                    S => TEXT { DATA_36NS }
+                    W => TEXT { DATA_36NS }
+                    E => TEXT { DATA_36NS }
+                    __ => SKIP
+                }
+                elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+            }
+        }
 
     bridge_response_status:
         TEXT { ACCEPTED_CURRENT_PAGE } |> HOLD bridge_response_status {
@@ -341,6 +442,29 @@ store: [
                 elements.format_ascii.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
                 elements.load_fixture.event.press |> THEN { TEXT { ACCEPTED_CURRENT_PAGE } }
+            }
+        }
+
+    bridge_response_status_compact_label:
+        TEXT { CURRENT } |> HOLD bridge_response_status_compact_label {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { CURRENT } }
+                elements.keyboard_capture.key |> WHEN {
+                    D => TEXT { CURRENT }
+                    Q => TEXT { CURRENT }
+                    S => TEXT { CURRENT }
+                    W => TEXT { CURRENT }
+                    E => TEXT { CURRENT }
+                    __ => SKIP
+                }
+                elements.format_hex.event.press |> THEN { TEXT { STALE } }
+                elements.format_grouped.event.press |> THEN { TEXT { STALE } }
+                elements.format_octal.event.press |> THEN { TEXT { STALE } }
+                elements.format_signed.event.press |> THEN { TEXT { STALE } }
+                elements.format_unsigned.event.press |> THEN { TEXT { STALE } }
+                elements.format_ascii.event.press |> THEN { TEXT { STALE } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { STALE } }
+                elements.load_fixture.event.press |> THEN { TEXT { CURRENT } }
             }
         }
 

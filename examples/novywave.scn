@@ -3,13 +3,13 @@ source = "examples/novywave/RUN.bn"
 
 [[step]]
 id = "initial-loaded-fixture"
-expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure data pages only" }
+expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure data pages only" }
 
 [[step]]
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "signal_search_text" = "data", "search_result_label" = "1 result: data_bus[7:0]" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
 
 [[step]]
 id = "select-data-bus"
@@ -27,25 +27,31 @@ expect_root_text = { "format_label" = "Binary" }
 id = "zoom-in"
 user_action = { kind = "click", target = "zoom in" }
 expected_source_event = { source = "store.elements.zoom_in" }
-expect_root_text = { "viewport_label" = "36 ns - 60 ns" }
+expect_root_text = { "viewport_label" = "36 ns - 60 ns", "keyboard_viewport_label" = "36 ns - 60 ns" }
 
 [[step]]
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "48 ns - 72 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
 
 [[step]]
 id = "keyboard-cursor-left"
-user_action = { kind = "click", target = "cursor left" }
-expected_source_event = { source = "store.elements.cursor_left" }
-expect_root_text = { "cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN" }
+user_action = { kind = "key_down", target = "keyboard capture", key = "Q" }
+expected_source_event = { source = "store.elements.keyboard_capture", key = "Q" }
+expect_root_text = { "keyboard_last_key" = "Q", "keyboard_cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN" }
+
+[[step]]
+id = "keyboard-zoom-wide"
+user_action = { kind = "key_down", target = "keyboard capture", key = "S" }
+expected_source_event = { source = "store.elements.keyboard_capture", key = "S" }
+expect_root_text = { "keyboard_last_key" = "S", "keyboard_viewport_label" = "60 ns - 240 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN" }
 
 [[step]]
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
+expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
 
 [[step]]
 id = "toggle-marker"
@@ -81,7 +87,7 @@ expect_root_text = { "fixture_status" = "Empty" }
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
+expect_root_text = { "fixture_status" = "Loaded", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
 
 [[step]]
 id = "format-grouped-binary"

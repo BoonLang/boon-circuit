@@ -253,6 +253,7 @@ input_scenarios = [
   "zoom-in",
   "keyboard-pan-right",
   "keyboard-cursor-left",
+  "keyboard-zoom-wide",
   "reject-stale-page",
   "toggle-marker",
   "collapse-group",

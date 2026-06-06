@@ -1,36 +1,36 @@
 -- Physical NovyWave material and text theme.
 
-FUNCTION material(of) {
+FUNCTION material(mode, of) {
     of |> WHEN {
         AppBackground => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #f4f7fb }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f4f7fb }
             }
             gloss: 0.02
         ]
 
         PanelSurface => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #172033 }
-                TEXT { Light } => TEXT { #f8fafc }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #172033 }
+                Light => TEXT { #f8fafc }
             }
             gloss: 0.07
             metal: 0.0
-            transparency: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => 0.08
-                TEXT { Light } => 0.10
+            transparency: PASSED.mode |> WHEN {
+                Dark => 0.08
+                Light => 0.10
             }
             frosted_blur: 10
             frosted_saturate: 1.14
             glass_highlight: 0.32
-            glass_highlight_color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dce8ff38 }
-                TEXT { Light } => TEXT { #ffffffa3 }
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dce8ff38 }
+                Light => TEXT { #ffffffa3 }
             }
-            border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #2f80ed }
-                TEXT { Light } => TEXT { #2563eb }
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #2f80ed }
+                Light => TEXT { #2563eb }
             }
             border_width: 1
             shadows: LIST {
@@ -40,92 +40,92 @@ FUNCTION material(of) {
         ]
 
         PanelInset => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #0b1220 }
-                TEXT { Light } => TEXT { #ffffff }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #0b1220 }
+                Light => TEXT { #ffffff }
             }
             gloss: 0.05
-            transparency: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => 0.04
-                TEXT { Light } => 0.06
+            transparency: PASSED.mode |> WHEN {
+                Dark => 0.04
+                Light => 0.06
             }
             frosted_blur: 6
             glass_highlight: 0.18
-            glass_highlight_color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dce8ff22 }
-                TEXT { Light } => TEXT { #ffffff9c }
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dce8ff22 }
+                Light => TEXT { #ffffff9c }
             }
-            border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #25344f }
-                TEXT { Light } => TEXT { #d7dde8 }
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #25344f }
+                Light => TEXT { #d7dde8 }
             }
             border_width: 1
         ]
 
         TimelineGlass => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #020817d8 }
-                TEXT { Light } => TEXT { #f8fbffb8 }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #020817d8 }
+                Light => TEXT { #f8fbffb8 }
             }
             refraction: 1.5
             gloss: 0.08
-            transparency: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => 0.16
-                TEXT { Light } => 0.18
+            transparency: PASSED.mode |> WHEN {
+                Dark => 0.16
+                Light => 0.18
             }
             frosted_blur: 14
             frosted_saturate: 1.22
             glass_highlight: 0.58
-            glass_highlight_color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dce8ff4d }
-                TEXT { Light } => TEXT { #ffffffb8 }
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dce8ff4d }
+                Light => TEXT { #ffffffb8 }
             }
         ]
 
         TraceHigh => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #3b82f6 }
-                TEXT { Light } => TEXT { #2563eb }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #3b82f6 }
+                Light => TEXT { #2563eb }
             }
             glow: [color: TEXT { #3b82f6aa }, intensity: 0.28]
         ]
 
         TraceLow => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #020817 }
-                TEXT { Light } => TEXT { #d7e2ef }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #d7e2ef }
             }
         ]
 
         TraceUnknown => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #60a5fa }
-                TEXT { Light } => TEXT { #3b82f6 }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #60a5fa }
+                Light => TEXT { #3b82f6 }
             }
             glow: [color: TEXT { #60a5fa88 }, intensity: 0.20]
         ]
 
         AnalogTrace => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #6bbdff }
-                TEXT { Light } => TEXT { #1267aa }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #6bbdff }
+                Light => TEXT { #1267aa }
             }
             glow: [color: TEXT { #6bbdff88 }, intensity: 0.22]
         ]
 
         CursorGlow => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #ffef8a }
-                TEXT { Light } => TEXT { #9a7600 }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #ffef8a }
+                Light => TEXT { #9a7600 }
             }
             gloss: 0.18
             glow: [color: TEXT { #ffe768aa }, intensity: 0.38]
         ]
 
         MarkerChip => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #6147d9 }
-                TEXT { Light } => TEXT { #e7ddff }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #6147d9 }
+                Light => TEXT { #e7ddff }
             }
             gloss: 0.20
             glass_highlight: 0.30
@@ -133,35 +133,35 @@ FUNCTION material(of) {
         ]
 
         SelectedRow => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #203b62 }
-                TEXT { Light } => TEXT { #d7e9ff }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #203b62 }
+                Light => TEXT { #d7e9ff }
             }
-            border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #73b7ff }
-                TEXT { Light } => TEXT { #2474bb }
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #73b7ff }
+                Light => TEXT { #2474bb }
             }
             border_width: 1
             glow: [color: TEXT { #60a5fa55 }, intensity: 0.12]
         ]
 
         HoverControl => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #1a2b44 }
-                TEXT { Light } => TEXT { #e9f3ff }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #1a2b44 }
+                Light => TEXT { #e9f3ff }
             }
             gloss: 0.08
-            border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #49617f }
-                TEXT { Light } => TEXT { #bad0e8 }
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #49617f }
+                Light => TEXT { #bad0e8 }
             }
             border_width: 1
         ]
 
         PressedControl => [
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #28466d }
-                TEXT { Light } => TEXT { #cce4ff }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #28466d }
+                Light => TEXT { #cce4ff }
             }
             gloss: 0.12
             glow: [color: TEXT { #65b8ff44 }, intensity: 0.10]
@@ -173,51 +173,51 @@ FUNCTION material(of) {
     }
 }
 
-FUNCTION font(of) {
+FUNCTION font(mode, of) {
     of |> WHEN {
         Title => [
             family: TEXT { Inter, Arial, SansSerif }
             size: 32
             weight: Bold
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #eef7ff }
-                TEXT { Light } => TEXT { #102033 }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #eef7ff }
+                Light => TEXT { #102033 }
             }
         ]
         Heading => [
             family: TEXT { Inter, Arial, SansSerif }
             size: 15
             weight: Bold
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dceaff }
-                TEXT { Light } => TEXT { #182a3d }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dceaff }
+                Light => TEXT { #182a3d }
             }
         ]
         Body => [
             family: TEXT { Inter, Arial, SansSerif }
             size: 12
             weight: Regular
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #d2def0 }
-                TEXT { Light } => TEXT { #25384c }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #d2def0 }
+                Light => TEXT { #25384c }
             }
         ]
         Muted => [
             family: TEXT { Inter, Arial, SansSerif }
             size: 11
             weight: Regular
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #90a4bf }
-                TEXT { Light } => TEXT { #60748b }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
             }
         ]
         Mono => [
             family: TEXT { JetBrains Mono, Menlo, Monospace }
             size: 11
             weight: Regular
-            color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dbeafe }
-                TEXT { Light } => TEXT { #172033 }
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
             }
         ]
         __ => [
@@ -227,15 +227,15 @@ FUNCTION font(of) {
     }
 }
 
-FUNCTION trace_material(state) {
+FUNCTION trace_material(mode, state) {
     state |> WHEN {
-        High => material(of: TraceHigh)
-        Low => material(of: TraceLow)
-        Unknown => material(of: TraceUnknown)
-        AnalogLow => material(of: AnalogTrace)
-        AnalogMid => material(of: AnalogTrace)
-        AnalogHigh => material(of: AnalogTrace)
-        __ => material(of: TraceUnknown)
+        High => material(mode: mode, of: TraceHigh)
+        Low => material(mode: mode, of: TraceLow)
+        Unknown => material(mode: mode, of: TraceUnknown)
+        AnalogLow => material(mode: mode, of: AnalogTrace)
+        AnalogMid => material(mode: mode, of: AnalogTrace)
+        AnalogHigh => material(mode: mode, of: AnalogTrace)
+        __ => material(mode: mode, of: TraceUnknown)
     }
 }
 

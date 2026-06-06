@@ -21,10 +21,10 @@ FUNCTION root() {
             height: [sizing: Fill, minimum: Screen]
             padding: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #f4f7fb }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f4f7fb }
             }]
-            material: NovyTheme/material(of: AppBackground)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: AppBackground)
         ]
         items: LIST {
             header()
@@ -49,26 +49,26 @@ FUNCTION header() {
             rounded_corners: 8
             padding: [left: 10, right: 10, top: 5, bottom: 5]
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #0f172a }
-                TEXT { Light } => TEXT { #f8fafc }
+                Dark => TEXT { #0f172a }
+                Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #25344f }
-                TEXT { Light } => TEXT { #cbd5e1 }
+                Dark => TEXT { #25344f }
+                Light => TEXT { #cbd5e1 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Muted)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
                     width: 72
                     height: Fill
                     vertical_align: Center
                     color: PASSED.store.mode |> WHEN {
-                        TEXT { Dark } => TEXT { #90a4bf }
-                        TEXT { Light } => TEXT { #475569 }
+                        Dark => TEXT { #90a4bf }
+                        Light => TEXT { #475569 }
                     }
                 ]
                 text: TEXT { ● ● ● }
@@ -76,14 +76,14 @@ FUNCTION header() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Body)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
                     width: Fill
                     height: Fill
                     center: True
                     vertical_align: Center
                     color: PASSED.store.mode |> WHEN {
-                        TEXT { Dark } => TEXT { #d2def0 }
-                        TEXT { Light } => TEXT { #475569 }
+                        Dark => TEXT { #d2def0 }
+                        Light => TEXT { #475569 }
                     }
                 ]
                 text: TEXT { NovyWave.io }
@@ -105,7 +105,7 @@ FUNCTION header_stat(stat_label, stat_value) {
             height: Fill
             padding: 8
             rounded_corners: 10
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
             text_line(label_text: stat_label, font: Muted, width: Fill, height: 18)
@@ -178,13 +178,13 @@ FUNCTION empty_state() {
             depth: 10
             move: [closer: 2]
             rounded_corners: 18
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Title)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Title)
                     width: Fill
                     height: 44
                     center: True
@@ -194,7 +194,7 @@ FUNCTION empty_state() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Body)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
                     width: Fill
                     height: 28
                     center: True
@@ -210,28 +210,27 @@ FUNCTION left_panel() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 8
+        gap: 6
         style: [
             width: 430
             height: Fill
-            padding: 22
+            padding: 14
             depth: 10
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #172033 }
-                TEXT { Light } => TEXT { #f8fafc }
+                Dark => TEXT { #172033 }
+                Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #2f80ed }
-                TEXT { Light } => TEXT { #2563eb }
+                Dark => TEXT { #2f80ed }
+                Light => TEXT { #2563eb }
             }]
-            material: NovyTheme/material(of: PanelSurface)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
         items: LIST {
             panel_title(title_text: TEXT { Files and scopes })
             load_files_button()
             files_list()
-            search_box()
         }
     )
 }
@@ -240,7 +239,7 @@ FUNCTION files_list() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 2
+        gap: 1
         style: [width: Fill, paint: False]
         items: LIST {
             tree_row(label_text: TEXT { - counter.vcd }, indent_width: 0, selected: False)
@@ -248,7 +247,12 @@ FUNCTION files_list() {
             tree_row(label_text: TEXT {     clk }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     reset_n }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     data_bus[7:0] }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     data_valid }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     data_ready }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     state[2:0] }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {   + top.uart }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     tx_data[7:0] }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {   + top.analog }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT { - uart_compare.fst }, indent_width: 0, selected: False)
         }
     )
@@ -259,7 +263,7 @@ FUNCTION tree_row(label_text, indent_width, selected) {
         element: []
         style: [
             width: Fill
-            height: 22
+            height: 19
             padding: [left: 6, right: 6]
             rounded_corners: 4
             background: [color: selected |> WHEN {
@@ -271,14 +275,14 @@ FUNCTION tree_row(label_text, indent_width, selected) {
                 False => TEXT { #263753 }
             }]
             material: selected |> WHEN {
-                True => NovyTheme/material(of: SelectedRow)
-                False => NovyTheme/material(of: PanelInset)
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
             }
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 vertical_align: Center
@@ -300,14 +304,14 @@ FUNCTION file_row(file) {
             padding: 6
             rounded_corners: 9
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #101a2b }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
             text_line(label_text: file.name, font: Mono, width: Fill, height: 18)
@@ -327,20 +331,20 @@ FUNCTION search_box() {
             padding: [left: 10, right: 10]
             text_inset: 4
             rounded_corners: 9
-            font: NovyTheme/font(of: Body)
+            font: NovyTheme/font(mode: PASSED.store.mode, of: Body)
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dbeafe }
-                TEXT { Light } => TEXT { #172033 }
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
             }
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #0a1322 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #0a1322 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Hidden[text: TEXT { signal search }]
         text: PASSED.store.signal_search_text
@@ -360,8 +364,8 @@ FUNCTION scope_cpu_button() {
             border: [color: TEXT { #3B82F6 }]
             spring_range: 3
             material: PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
-                True => NovyTheme/material(of: SelectedRow)
-                False => NovyTheme/material(of: HoverControl)
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
             }
         ]
         label: Scene/Element/stripe(
@@ -389,8 +393,8 @@ FUNCTION scope_uart_button() {
             border: [color: TEXT { #263753 }]
             spring_range: 3
             material: PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
-                True => NovyTheme/material(of: SelectedRow)
-                False => NovyTheme/material(of: HoverControl)
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
             }
         ]
         label: Scene/Element/stripe(
@@ -419,14 +423,14 @@ FUNCTION timeline_panel() {
             move: [closer: 1]
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #172033 }
-                TEXT { Light } => TEXT { #f8fafc }
+                Dark => TEXT { #172033 }
+                Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #2f80ed }
-                TEXT { Light } => TEXT { #2563eb }
+                Dark => TEXT { #2f80ed }
+                Light => TEXT { #2563eb }
             }]
-            material: NovyTheme/material(of: PanelSurface)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
         items: LIST {
             timeline_header()
@@ -447,13 +451,13 @@ FUNCTION timeline_header() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Heading)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Heading)
                     width: 240
                     height: Fill
                     vertical_align: Center
                     color: PASSED.store.mode |> WHEN {
-                        TEXT { Dark } => TEXT { #dceaff }
-                        TEXT { Light } => TEXT { #182a3d }
+                        Dark => TEXT { #dceaff }
+                        Light => TEXT { #182a3d }
                     }
                 ]
                 text: TEXT { Selected Variables }
@@ -461,14 +465,14 @@ FUNCTION timeline_header() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Muted)
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
                     width: Fill
                     height: Fill
                     center: True
                     vertical_align: Center
                     color: PASSED.store.mode |> WHEN {
-                        TEXT { Dark } => TEXT { #90a4bf }
-                        TEXT { Light } => TEXT { #60748b }
+                        Dark => TEXT { #90a4bf }
+                        Light => TEXT { #60748b }
                     }
                 ]
                 text: TEXT { Dock to Right }
@@ -493,7 +497,6 @@ FUNCTION timeline_toolbar() {
             cursor_right_button()
             marker_button()
             group_button()
-            stale_response_button()
             format_button()
             keyboard_capture()
         }
@@ -511,8 +514,8 @@ FUNCTION keyboard_capture() {
             paint: False
             padding: 0
             rounded_corners: 8
-            font: NovyTheme/font(of: Muted)
-            material: NovyTheme/material(of: PanelInset)
+            font: NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Hidden[text: TEXT { keyboard capture }]
         text: Text/empty()
@@ -532,7 +535,7 @@ FUNCTION timeline_axis() {
             rounded_corners: 0
             background: [color: TEXT { #0A1322 }]
             border: [color: TEXT { #263753 }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
             Scene/Element/stripe(
@@ -569,7 +572,7 @@ FUNCTION axis_tick(label) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Muted)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
             width: 120
             height: 18
             center: True
@@ -587,18 +590,18 @@ FUNCTION cursor_chip() {
             height: 18
             rounded_corners: 8
             background: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: CursorGlow)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
             ]
-            text: PASSED.store.cursor_label
+            text: PASSED.store.keyboard_cursor_label
         )
     )
 }
@@ -611,12 +614,12 @@ FUNCTION marker_chip() {
             height: 18
             rounded_corners: 8
             background: [color: TEXT { #4F46E5 }]
-            material: NovyTheme/material(of: MarkerChip)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
@@ -636,12 +639,12 @@ FUNCTION collapsed_group() {
             rounded_corners: 10
             background: [color: TEXT { #0A1322 }]
             border: [color: TEXT { #263753 }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Body)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
                 width: Fill
                 height: Fill
                 center: True
@@ -689,16 +692,16 @@ FUNCTION waveform_row_clk() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #101a2b }
-                    TEXT { Light } => TEXT { #ffffff }
+                    Dark => TEXT { #101a2b }
+                    Light => TEXT { #ffffff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #263753 }
-                    TEXT { Light } => TEXT { #d7dde8 }
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #d7dde8 }
                 }]
                 material: active |> WHEN {
-                    True => NovyTheme/material(of: SelectedRow)
-                    False => NovyTheme/material(of: PanelInset)
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
                 }
             ]
             items: LIST {
@@ -724,16 +727,16 @@ FUNCTION waveform_row_reset() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #101a2b }
-                    TEXT { Light } => TEXT { #ffffff }
+                    Dark => TEXT { #101a2b }
+                    Light => TEXT { #ffffff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #263753 }
-                    TEXT { Light } => TEXT { #d7dde8 }
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #d7dde8 }
                 }]
                 material: active |> WHEN {
-                    True => NovyTheme/material(of: SelectedRow)
-                    False => NovyTheme/material(of: PanelInset)
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
                 }
             ]
             items: LIST {
@@ -759,16 +762,16 @@ FUNCTION waveform_row_data() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #101a2b }
-                    TEXT { Light } => TEXT { #ffffff }
+                    Dark => TEXT { #101a2b }
+                    Light => TEXT { #ffffff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #263753 }
-                    TEXT { Light } => TEXT { #d7dde8 }
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #d7dde8 }
                 }]
                 material: active |> WHEN {
-                    True => NovyTheme/material(of: SelectedRow)
-                    False => NovyTheme/material(of: PanelInset)
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
                 }
             ]
             items: LIST {
@@ -794,16 +797,16 @@ FUNCTION waveform_row_temperature() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #101a2b }
-                    TEXT { Light } => TEXT { #ffffff }
+                    Dark => TEXT { #101a2b }
+                    Light => TEXT { #ffffff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #263753 }
-                    TEXT { Light } => TEXT { #d7dde8 }
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #d7dde8 }
                 }]
                 material: active |> WHEN {
-                    True => NovyTheme/material(of: SelectedRow)
-                    False => NovyTheme/material(of: PanelInset)
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
                 }
             ]
             items: LIST {
@@ -824,25 +827,25 @@ FUNCTION fixed_signal_label(label_text) {
             padding: 6
             rounded_corners: 2
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #0a1322 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #0a1322 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #dbeafe }
-                    TEXT { Light } => TEXT { #172033 }
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
                 }
             ]
             text: label_text
@@ -858,26 +861,26 @@ FUNCTION fixed_value_clk() {
             height: Fill
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #dbeafe }
-                    TEXT { Light } => TEXT { #172033 }
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
                 }
             ]
             text: NovyFixtures/selected_clk_value(format: PASSED.store.value_format)
@@ -893,26 +896,26 @@ FUNCTION fixed_value_reset() {
             height: Fill
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #dbeafe }
-                    TEXT { Light } => TEXT { #172033 }
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
                 }
             ]
             text: NovyFixtures/selected_reset_value(format: PASSED.store.value_format)
@@ -928,26 +931,26 @@ FUNCTION fixed_value_data() {
             height: Fill
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #dbeafe }
-                    TEXT { Light } => TEXT { #172033 }
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
                 }
             ]
             text: NovyFixtures/selected_data_value(format: PASSED.store.value_format)
@@ -963,26 +966,26 @@ FUNCTION fixed_value_temperature() {
             height: Fill
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #111827 }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #dbeafe }
-                    TEXT { Light } => TEXT { #172033 }
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
                 }
             ]
             text: NovyFixtures/selected_temperature_value(format: PASSED.store.value_format)
@@ -1002,7 +1005,7 @@ FUNCTION fixed_wave_area(signal_id) {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items:
             NovyFixtures/segments(of: signal_id)
@@ -1022,7 +1025,7 @@ FUNCTION fixed_wave_area_clk() {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1056,7 +1059,7 @@ FUNCTION fixed_wave_area_reset() {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1078,7 +1081,7 @@ FUNCTION fixed_wave_area_data() {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
             data_bus_cells_row()
@@ -1137,7 +1140,7 @@ FUNCTION fixed_wave_area_temperature() {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1161,7 +1164,7 @@ FUNCTION waveform_cursor_line() {
             height: Fill
             rounded_corners: 1
             background: [color: TEXT { #FDE68A }]
-            material: NovyTheme/material(of: CursorGlow)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
@@ -1207,7 +1210,7 @@ FUNCTION data_bus_label(width_value, label_text) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Mono)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
             width: width_value
             height: Fill
             center: True
@@ -1228,8 +1231,8 @@ FUNCTION data_bus_cell_xx() {
             waveform_transition_edge_sky()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { XX })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { XX })
             )
         }
     )
@@ -1245,8 +1248,8 @@ FUNCTION data_bus_cell_0x12() {
             waveform_transition_edge_blue()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x12 })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x12 })
             )
         }
     )
@@ -1262,8 +1265,8 @@ FUNCTION data_bus_cell_0x00() {
             waveform_transition_edge_dark()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x00 })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x00 })
             )
         }
     )
@@ -1279,8 +1282,8 @@ FUNCTION data_bus_cell_0x2a() {
             waveform_transition_edge_blue()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x2a })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x2a })
             )
         }
     )
@@ -1296,8 +1299,8 @@ FUNCTION data_bus_cell_0x08() {
             waveform_transition_edge_dark()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x08 })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x08 })
             )
         }
     )
@@ -1313,8 +1316,8 @@ FUNCTION data_bus_cell_0xff() {
             waveform_transition_edge_blue()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0xff })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0xff })
             )
         }
     )
@@ -1330,8 +1333,8 @@ FUNCTION data_bus_cell_zz() {
             waveform_transition_edge_sky()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { ZZ })
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { ZZ })
             )
         }
     )
@@ -1347,8 +1350,8 @@ FUNCTION wave_cell_high(width_value, label_text) {
             waveform_transition_edge_blue()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: label_text)
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: label_text)
             )
         }
     )
@@ -1364,8 +1367,8 @@ FUNCTION wave_cell_low(width_value, label_text) {
             waveform_transition_edge_dark()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 8, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: label_text)
+                style: [width: Fill, height: 8, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: label_text)
             )
         }
     )
@@ -1381,8 +1384,8 @@ FUNCTION wave_cell_unknown(width_value, label_text) {
             waveform_transition_edge_sky()
             Scene/Element/label(
                 element: []
-                style: [width: Fill, height: 14, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: label_text)
+                style: [width: Fill, height: 14, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: label_text)
             )
         }
     )
@@ -1405,7 +1408,7 @@ FUNCTION wave_cell_analog_low(width_value, label_text) {
                     rounded_corners: 3
                     background: [color: TEXT { #1D4ED8 }]
                     border: [color: TEXT { #60A5FA }]
-                    material: NovyTheme/material(of: AnalogTrace)
+                    material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
                 child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
             )
@@ -1430,7 +1433,7 @@ FUNCTION wave_cell_analog_mid(width_value, label_text) {
                     rounded_corners: 3
                     background: [color: TEXT { #0891B2 }]
                     border: [color: TEXT { #A5F3FC }]
-                    material: NovyTheme/material(of: AnalogTrace)
+                    material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
                 child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
             )
@@ -1455,7 +1458,7 @@ FUNCTION wave_cell_analog_high(width_value, label_text) {
                     rounded_corners: 3
                     background: [color: TEXT { #7DD3FC }]
                     border: [color: TEXT { #E0F2FE }]
-                    material: NovyTheme/material(of: AnalogTrace)
+                    material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
                 child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
             )
@@ -1479,8 +1482,8 @@ FUNCTION waveform_row(signal) {
                 background: [color: TEXT { #101A2B }]
                 border: [color: TEXT { #263753 }]
                 material: active |> WHEN {
-                    True => NovyTheme/material(of: SelectedRow)
-                    False => NovyTheme/material(of: PanelInset)
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
                 }
             ]
             items: LIST {
@@ -1502,12 +1505,12 @@ FUNCTION signal_select_button(signal) {
             rounded_corners: 8
             background: [color: TEXT { #0A1322 }]
             border: [color: TEXT { #263753 }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 vertical_align: Center
@@ -1527,12 +1530,12 @@ FUNCTION value_pill(signal) {
             rounded_corners: 0
             background: [color: TEXT { #111827 }]
             border: [color: TEXT { #263753 }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
@@ -1565,7 +1568,7 @@ FUNCTION wave_area(signal) {
             rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items:
             NovyFixtures/segments(of: signal.id)
@@ -1674,7 +1677,7 @@ FUNCTION waveform_transition_edge_blue() {
             width: 1
             height: Fill
             background: [color: TEXT { #93C5FD }]
-            material: NovyTheme/material(of: CursorGlow)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
@@ -1683,7 +1686,7 @@ FUNCTION waveform_transition_edge_blue() {
 FUNCTION waveform_transition_edge_dark() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -1691,7 +1694,7 @@ FUNCTION waveform_transition_edge_dark() {
 FUNCTION waveform_transition_edge_sky() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -1699,7 +1702,7 @@ FUNCTION waveform_transition_edge_sky() {
 FUNCTION waveform_transition_edge_indigo() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -1707,7 +1710,7 @@ FUNCTION waveform_transition_edge_indigo() {
 FUNCTION waveform_transition_edge_cyan() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #A5F3FC }], material: NovyTheme/material(of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -1715,7 +1718,7 @@ FUNCTION waveform_transition_edge_cyan() {
 FUNCTION waveform_transition_edge_pale() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #E0F2FE }], material: NovyTheme/material(of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -1730,12 +1733,12 @@ FUNCTION waveform_trace_cell_blue(segment) {
             rounded_corners: 2
             background: [color: TEXT { #2563EB }]
             border: [color: TEXT { #60A5FA }]
-            material: NovyTheme/trace_material(state: segment.state)
+            material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Mono)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
                 width: Fill
                 height: Fill
                 center: True
@@ -1750,40 +1753,40 @@ FUNCTION waveform_trace_cell_blue(segment) {
 FUNCTION waveform_trace_cell_dark(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/trace_material(state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_sky(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/trace_material(state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_indigo(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/trace_material(state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #DBEAFE }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #DBEAFE }], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_cyan(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/trace_material(state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #ECFEFF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #ECFEFF }], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_pale(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/trace_material(state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #082F49 }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #082F49 }], text: segment.label)
     )
 }
 
@@ -1799,14 +1802,14 @@ FUNCTION variables_panel() {
             depth: 10
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #172033 }
-                TEXT { Light } => TEXT { #f8fafc }
+                Dark => TEXT { #172033 }
+                Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #2f80ed }
-                TEXT { Light } => TEXT { #2563eb }
+                Dark => TEXT { #2f80ed }
+                Light => TEXT { #2563eb }
             }]
-            material: NovyTheme/material(of: PanelSurface)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
         items: LIST {
             Scene/Element/stripe(
@@ -1842,12 +1845,16 @@ FUNCTION variables_list_all() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
+        gap: 4
+        style: [width: Fill, height: 150, paint: False]
         items: LIST {
             variable_clk_button()
             variable_reset_button()
             variable_data_button()
+            variable_data_valid_row()
+            variable_data_ready_row()
+            variable_state_row()
+            variable_error_count_row()
             variable_temperature_button()
         }
     )
@@ -1881,10 +1888,13 @@ FUNCTION variables_list_data() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
+        gap: 4
+        style: [width: Fill, height: 150, paint: False]
         items: LIST {
             variable_data_button()
+            variable_data_valid_row()
+            variable_data_ready_row()
+            variable_data_parity_row()
         }
     )
 }
@@ -1910,26 +1920,26 @@ FUNCTION variables_list_empty() {
             padding: 8
             rounded_corners: 8
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #101a2b }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Muted)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
                 color: PASSED.store.mode |> WHEN {
-                    TEXT { Dark } => TEXT { #90a4bf }
-                    TEXT { Light } => TEXT { #60748b }
+                    Dark => TEXT { #90a4bf }
+                    Light => TEXT { #60748b }
                 }
             ]
             text: TEXT { No matching signals }
@@ -1961,8 +1971,8 @@ FUNCTION variable_data_button() {
             height: 24
             rounded_corners: 8
             material: PASSED.store.active_signal == TEXT { data_bus } |> WHEN {
-                True => NovyTheme/material(of: SelectedRow)
-                False => NovyTheme/material(of: HoverControl)
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
             }
         ]
         label: variable_row_data()
@@ -1974,6 +1984,66 @@ FUNCTION variable_temperature_button() {
         element: [event: [press: PASSED.store.elements.select_temperature], hovered: PASSED.store.elements.select_temperature]
         style: [width: Fill, height: 24, paint: False]
         label: variable_row_temperature()
+    )
+}
+
+FUNCTION variable_data_valid_row() {
+    variable_static_row(
+        name_text: TEXT { data_valid }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { Output }
+    )
+}
+
+FUNCTION variable_data_ready_row() {
+    variable_static_row(
+        name_text: TEXT { data_ready }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { Input }
+    )
+}
+
+FUNCTION variable_data_parity_row() {
+    variable_static_row(
+        name_text: TEXT { data_parity }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { Output }
+    )
+}
+
+FUNCTION variable_state_row() {
+    variable_static_row(
+        name_text: TEXT { state[2:0] }
+        chip_a: TEXT { Reg }
+        chip_b: TEXT { 3-bit }
+        chip_c: TEXT { State }
+    )
+}
+
+FUNCTION variable_error_count_row() {
+    variable_static_row(
+        name_text: TEXT { error_count[15:0] }
+        chip_a: TEXT { Reg }
+        chip_b: TEXT { 16-bit }
+        chip_c: TEXT { Counter }
+    )
+}
+
+FUNCTION variable_static_row(name_text, chip_a, chip_b, chip_c) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 20, paint: False]
+        items: LIST {
+            variable_name_text(label_text: name_text)
+            variable_chip_literal(label_text: chip_a)
+            variable_chip_literal(label_text: chip_b)
+            variable_chip_literal(label_text: chip_c)
+        }
     )
 }
 
@@ -2041,7 +2111,7 @@ FUNCTION search_result_line() {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Muted)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
             width: Fill
             height: 18
             vertical_align: Center
@@ -2055,7 +2125,7 @@ FUNCTION variable_name_text(label_text) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Mono)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
             width: 180
             height: Fill
             vertical_align: Center
@@ -2101,12 +2171,12 @@ FUNCTION variable_chip_literal(label_text) {
             height: 20
             rounded_corners: 10
             background: [color: TEXT { #1D4ED8 }]
-            material: NovyTheme/material(of: MarkerChip)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(of: Muted)
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
                 width: Fill
                 height: Fill
                 center: True
@@ -2121,14 +2191,34 @@ FUNCTION variable_chip_literal(label_text) {
 FUNCTION inspector_strip() {
     Scene/Element/stripe(
         element: []
-        direction: Row
-        gap: 6
-        style: [width: Fill, height: 54, paint: False]
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 90, paint: False]
         items: LIST {
-            compact_inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label, row_width: 100)
-            compact_inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label, row_width: 76)
-            compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_label, row_width: 122)
-            row_resize_controls_compact()
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 6
+                style: [width: Fill, height: 42, paint: False]
+                items: LIST {
+                    compact_inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label, row_width: 118)
+                    compact_inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label, row_width: 76)
+                    compact_inspector_row(row_label: TEXT { View }, row_value: PASSED.store.keyboard_viewport_label, row_width: 118)
+                    row_resize_controls_compact()
+                }
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 6
+                style: [width: Fill, height: 42, paint: False]
+                items: LIST {
+                    compact_inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label, row_width: 76)
+                    compact_inspector_row(row_label: TEXT { Window }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
+                    compact_inspector_row(row_label: TEXT { Page }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
+                    compact_inspector_row(row_label: TEXT { Sync }, row_value: PASSED.store.bridge_response_status_compact_label, row_width: 82)
+                }
+            )
         }
     )
 }
@@ -2144,15 +2234,17 @@ FUNCTION inspector_panel() {
             padding: 10
             depth: 10
             rounded_corners: 14
-            material: NovyTheme/material(of: PanelSurface)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
         items: LIST {
             panel_title(title_text: TEXT { Inspector })
             inspector_row(row_label: TEXT { Active signal }, row_value: PASSED.store.active_signal_label)
             inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
-            inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.viewport_label)
-            inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_label)
-            inspector_row(row_label: TEXT { Response }, row_value: PASSED.store.bridge_response_status)
+            inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label)
+            inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.keyboard_viewport_label)
+            inspector_row(row_label: TEXT { Requested page }, row_value: PASSED.store.bridge_request_label)
+            inspector_row(row_label: TEXT { Loaded page }, row_value: PASSED.store.bridge_response_fingerprint)
+            inspector_row(row_label: TEXT { Page sync }, row_value: PASSED.store.bridge_response_status)
             inspector_row(row_label: TEXT { Bridge }, row_value: PASSED.store.bridge_contract)
             row_resize_controls()
         }
@@ -2170,14 +2262,14 @@ FUNCTION inspector_row(row_label, row_value) {
             padding: 8
             rounded_corners: 9
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #101a2b }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
             text_line(label_text: row_label, font: Muted, width: Fill, height: 16)
@@ -2193,22 +2285,22 @@ FUNCTION compact_inspector_row(row_label, row_value, row_width) {
         gap: 2
         style: [
             width: row_width
-            height: 52
-            padding: 8
+            height: 40
+            padding: [left: 8, right: 8, top: 4, bottom: 4]
             rounded_corners: 9
             background: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #101a2b }
-                TEXT { Light } => TEXT { #ffffff }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #ffffff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #263753 }
-                TEXT { Light } => TEXT { #d7dde8 }
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
             }]
-            material: NovyTheme/material(of: PanelInset)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
-            text_line(label_text: row_label, font: Muted, width: Fill, height: 16)
-            text_line(label_text: row_value, font: Mono, width: Fill, height: 22)
+            text_line(label_text: row_label, font: Muted, width: Fill, height: 12)
+            text_line(label_text: row_value, font: Mono, width: Fill, height: 18)
         }
     )
 }
@@ -2333,13 +2425,13 @@ FUNCTION panel_title(title_text) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Heading)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Heading)
             width: Fill
             height: 24
             vertical_align: Center
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dceaff }
-                TEXT { Light } => TEXT { #182a3d }
+                Dark => TEXT { #dceaff }
+                Light => TEXT { #182a3d }
             }
         ]
         text: title_text
@@ -2350,14 +2442,14 @@ FUNCTION button_label(button_text) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: Body)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
             width: Fill
             height: Fill
             center: True
             vertical_align: Center
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dbeafe }
-                TEXT { Light } => TEXT { #172033 }
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
             }
         ]
         text: button_text
@@ -2372,14 +2464,14 @@ FUNCTION compact_button_style(button_width) {
         spring_range: 3
         center: True
         background: [color: PASSED.store.mode |> WHEN {
-            TEXT { Dark } => TEXT { #101a2b }
-            TEXT { Light } => TEXT { #ffffff }
+            Dark => TEXT { #101a2b }
+            Light => TEXT { #ffffff }
         }]
         border: [color: PASSED.store.mode |> WHEN {
-            TEXT { Dark } => TEXT { #334761 }
-            TEXT { Light } => TEXT { #bad0e8 }
+            Dark => TEXT { #334761 }
+            Light => TEXT { #bad0e8 }
         }]
-        material: NovyTheme/material(of: HoverControl)
+        material: NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
     ]
 }
 
@@ -2407,8 +2499,8 @@ FUNCTION header_empty_button() {
 
 FUNCTION header_mode_button() {
     PASSED.store.mode |> WHEN {
-        TEXT { Dark } => header_mode_to_light_button()
-        TEXT { Light } => header_mode_to_dark_button()
+        Dark => header_mode_to_light_button()
+        Light => header_mode_to_dark_button()
         __ => header_mode_to_light_button()
     }
 }
@@ -2472,7 +2564,7 @@ FUNCTION zoom_in_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.zoom_in], hovered: PASSED.store.elements.zoom_in]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { W })
+        label: button_label(button_text: TEXT { + })
     )
 }
 
@@ -2480,7 +2572,7 @@ FUNCTION zoom_out_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.zoom_out], hovered: PASSED.store.elements.zoom_out]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { S })
+        label: button_label(button_text: TEXT { - })
     )
 }
 
@@ -2488,7 +2580,7 @@ FUNCTION pan_left_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.pan_left], hovered: PASSED.store.elements.pan_left]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { A })
+        label: button_label(button_text: TEXT { < })
     )
 }
 
@@ -2496,7 +2588,7 @@ FUNCTION pan_right_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.pan_right], hovered: PASSED.store.elements.pan_right]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { D })
+        label: button_label(button_text: TEXT { > })
     )
 }
 
@@ -2504,7 +2596,7 @@ FUNCTION cursor_left_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.cursor_left], hovered: PASSED.store.elements.cursor_left]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { Q })
+        label: button_label(button_text: TEXT { |< })
     )
 }
 
@@ -2512,7 +2604,7 @@ FUNCTION cursor_right_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.cursor_right], hovered: PASSED.store.elements.cursor_right]
         style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { E })
+        label: button_label(button_text: TEXT { >| })
     )
 }
 
@@ -2527,16 +2619,8 @@ FUNCTION marker_button() {
 FUNCTION group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
-        style: compact_button_style(button_width: 48)
-        label: button_label(button_text: TEXT { Grp })
-    )
-}
-
-FUNCTION stale_response_button() {
-    Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.stale_response_probe], hovered: PASSED.store.elements.stale_response_probe]
-        style: compact_button_style(button_width: 58)
-        label: button_label(button_text: TEXT { Stale })
+        style: compact_button_style(button_width: 64)
+        label: button_label(button_text: TEXT { Group })
     )
 }
 
@@ -2600,13 +2684,13 @@ FUNCTION text_line(label_text, font, width, height) {
     Scene/Element/text(
         element: []
         style: [
-            ...NovyTheme/font(of: font)
+            ...NovyTheme/font(mode: PASSED.store.mode, of: font)
             width: width
             height: height
             vertical_align: Center
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #dbeafe }
-                TEXT { Light } => TEXT { #172033 }
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
             }
         ]
         text: label_text

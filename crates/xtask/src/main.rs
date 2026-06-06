@@ -4013,6 +4013,86 @@ fn wait_for_loop_readback_change(
     })
 }
 
+fn wait_for_loop_readback_at_revision_or_change(
+    loop_report: &Path,
+    previous_hash: &str,
+    minimum_presented_revision: u64,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for readback revision",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report
+                        });
+                    }
+                    let readback = report
+                        .get("last_interactive_readback_artifact")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let hash = readback_sha256(&readback).unwrap_or_else(|| "missing".to_owned());
+                    let readback_presented_revision = readback
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let readback_content_revision = readback
+                        .get("content_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let revision_reached = minimum_presented_revision > 0
+                        && readback_presented_revision >= minimum_presented_revision
+                        && readback_content_revision >= minimum_presented_revision;
+                    let hash_changed = hash != "missing" && hash != previous_hash;
+                    if hash != "missing" && (revision_reached || hash_changed) {
+                        return json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "minimum_presented_revision": minimum_presented_revision,
+                            "presented_revision": report.get("presented_revision").cloned().unwrap_or(serde_json::Value::Null),
+                            "readback_presented_revision": readback_presented_revision,
+                            "readback_content_revision": readback_content_revision,
+                            "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "previous_hash": previous_hash,
+                            "frame_hash_after": hash,
+                            "readback_artifact_after": readback,
+                            "accepted_by_revision": revision_reached,
+                            "accepted_by_hash_change": hash_changed
+                        });
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for loop readback revision or hash change",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
+        "previous_hash": previous_hash,
+        "minimum_presented_revision": minimum_presented_revision,
+        "last_report": last_report
+    })
+}
+
 fn wait_for_loop_presented_change_since(
     loop_report: &Path,
     previous_revision: u64,
@@ -4501,6 +4581,7 @@ fn run_native_example_switch_live_probe(
         initial_frame_hash
     };
     let mut last_hash = String::new();
+    let mut last_distinct_hash = String::new();
     let mut per_switch = Vec::new();
     let mut ack_latencies = Vec::new();
     let mut dev_visual_latencies = Vec::new();
@@ -4533,9 +4614,14 @@ fn run_native_example_switch_live_probe(
         let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
         let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
         ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
-        let pending_overlay_readback = wait_for_loop_readback_change(
+        let pending_overlay_frame_revision = ack
+            .get("pending_overlay_frame_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let pending_overlay_readback = wait_for_loop_readback_at_revision_or_change(
             &preview_loop_report,
             &previous_hash,
+            pending_overlay_frame_revision,
             Duration::from_millis(750),
         );
         let ready = wait_for_replace_source_ready(
@@ -4559,10 +4645,6 @@ fn run_native_example_switch_live_probe(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
         }
-        let pending_overlay_frame_revision = ack
-            .get("pending_overlay_frame_revision")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
         let result_frame_revision = ready
             .pointer("/response/frame_revision")
             .and_then(serde_json::Value::as_u64)
@@ -4590,6 +4672,9 @@ fn run_native_example_switch_live_probe(
             first_hash = final_hash_after.clone();
         }
         if final_hash_after != "missing" {
+            if !first_hash.is_empty() && final_hash_after != first_hash {
+                last_distinct_hash = final_hash_after.clone();
+            }
             previous_hash = final_hash_after.clone();
             last_hash = final_hash_after;
         }
@@ -4854,7 +4939,13 @@ fn run_native_example_switch_live_probe(
         }),
         "last_good_frame_kept_while_pending": last_good_frame_kept_while_pending,
         "readback_hash_before": if first_hash.is_empty() { "missing" } else { first_hash.as_str() },
-        "readback_hash_after": if last_hash.is_empty() { "missing" } else { last_hash.as_str() },
+        "readback_hash_after": if !last_distinct_hash.is_empty() {
+            last_distinct_hash.as_str()
+        } else if last_hash.is_empty() {
+            "missing"
+        } else {
+            last_hash.as_str()
+        },
         "shutdown_ack": shutdown_ack,
         "preview_exit_status": preview_status.map(|status| status.to_string()).unwrap_or_else(|| "timeout".to_owned())
     }))
@@ -4865,73 +4956,56 @@ fn source_project_payload_for_switch(
     command_id: u64,
     source_revision: u64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let (virtual_uri, text, extra_units) = match label {
+    let (entrypoint_unit, units) = match label {
         "counter" | "aba:a" | "aba:a2" => {
-            let entry = boon_runtime::example_manifest_entry("counter")?;
-            let mut source = boon_runtime::source_text_for_entry(&entry)?;
             let title = match label {
                 "aba:a" => "ABA A Counter",
                 "aba:a2" => "ABA A2 Counter",
                 _ => "Counter",
             };
-            source = source.replace("TEXT { Counter }", &format!("TEXT {{ {title} }}"));
-            (format!("memory://{label}.bn"), source, Vec::new())
+            source_project_units_for_manifest_switch("counter", |source| {
+                *source = source.replace("TEXT { Counter }", &format!("TEXT {{ {title} }}"));
+            })?
         }
         "todomvc" | "todomvc-after-cells" | "aba:b" => {
-            let entry = boon_runtime::example_manifest_entry("todomvc")?;
-            let mut source = boon_runtime::source_text_for_entry(&entry)?;
-            if label == "aba:b" {
-                source.push_str("\n-- aba:b switch probe\n");
-            }
-            (format!("memory://{label}.bn"), source, Vec::new())
+            source_project_units_for_manifest_switch("todomvc", |source| {
+                if label == "aba:b" {
+                    source.push_str("\n-- aba:b switch probe\n");
+                }
+            })?
         }
-        "cells" | "custom:b" => {
-            let entry = boon_runtime::example_manifest_entry("cells")?;
-            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+        "cells" | "custom:b" => source_project_units_for_manifest_switch("cells", |source| {
             if label == "custom:b" {
                 source.push_str("\n-- custom:b switch probe\n");
             }
-            (format!("memory://{label}.bn"), source, Vec::new())
-        }
-        "custom:a" => {
-            let entry = boon_runtime::example_manifest_entry("counter")?;
-            let mut source = boon_runtime::source_text_for_entry(&entry)?;
-            source = source.replace("TEXT { Counter }", "TEXT { Custom A Counter }");
-            ("memory://custom-a.bn".to_owned(), source, Vec::new())
-        }
+        })?,
+        "custom:a" => source_project_units_for_manifest_switch("counter", |source| {
+            *source = source.replace("TEXT { Counter }", "TEXT { Custom A Counter }");
+        })?,
         "custom:multi-file" => {
             let entry = boon_runtime::example_manifest_entry("counter")?;
             let mut source = boon_runtime::source_text_for_entry(&entry)?;
             source = source.replace("TEXT { Counter }", "TEXT { Multi File Counter }");
-            (
-                "memory://custom-multi-main.bn".to_owned(),
+            let units = source_project_units_from_texts(
+                "memory://custom-multi-main.bn",
                 source,
                 vec![(
                     "memory://custom-multi-helper.bn".to_owned(),
                     "-- helper unit carried by SourceProjectPayload\n".to_owned(),
                 )],
-            )
+            );
+            ("memory://custom-multi-main.bn".to_owned(), units)
         }
-        "invalid-custom" => (
-            "memory://invalid-custom.bn".to_owned(),
-            "THIS IS NOT VALID BOON {".to_owned(),
-            Vec::new(),
-        ),
+        "invalid-custom" => {
+            let units = source_project_units_from_texts(
+                "memory://invalid-custom.bn",
+                "THIS IS NOT VALID BOON {".to_owned(),
+                Vec::new(),
+            );
+            ("memory://invalid-custom.bn".to_owned(), units)
+        }
         other => return Err(format!("unknown example switch label `{other}`").into()),
     };
-    let source_hash = boon_runtime::sha256_bytes(text.as_bytes());
-    let mut units = vec![json!({
-        "virtual_uri": virtual_uri,
-        "text": text,
-        "sha256": source_hash
-    })];
-    for (unit_uri, unit_text) in extra_units {
-        units.push(json!({
-            "virtual_uri": unit_uri,
-            "sha256": boon_runtime::sha256_bytes(unit_text.as_bytes()),
-            "text": unit_text
-        }));
-    }
     let project_hash = source_project_payload_units_hash(&units)?;
     let source_identity =
         opaque_xtask_source_identity(&format!("{command_id}:{source_revision}:{project_hash}"));
@@ -4940,9 +5014,72 @@ fn source_project_payload_for_switch(
         "source_revision": source_revision,
         "source_identity": source_identity,
         "project_hash": project_hash,
-        "entrypoint_unit": units[0].get("virtual_uri").and_then(serde_json::Value::as_str).unwrap_or("memory://main.bn"),
+        "entrypoint_unit": entrypoint_unit,
         "units": units
     }))
+}
+
+fn source_project_units_for_manifest_switch(
+    example_id: &str,
+    mutate_entry_source: impl FnOnce(&mut String),
+) -> Result<(String, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+    let entry = boon_runtime::example_manifest_entry(example_id)?;
+    let entry_path = Path::new(&entry.source)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&entry.source));
+    let mut units = Vec::new();
+    let mut entrypoint_unit = entry.source.clone();
+    let mut mutate_entry_source = Some(mutate_entry_source);
+    for runtime_unit in boon_runtime::source_units_for_entry(&entry)? {
+        let unit_path = Path::new(&runtime_unit.path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&runtime_unit.path));
+        let is_entry = unit_path == entry_path || runtime_unit.path == entry.source;
+        let mut text = runtime_unit.source;
+        if is_entry {
+            entrypoint_unit = runtime_unit.path.clone();
+            if let Some(mutate) = mutate_entry_source.take() {
+                mutate(&mut text);
+            }
+        }
+        let sha256 = boon_runtime::sha256_bytes(text.as_bytes());
+        units.push(json!({
+            "virtual_uri": runtime_unit.path,
+            "text": text,
+            "sha256": sha256,
+            "role": if is_entry { "entry" } else { "source" }
+        }));
+    }
+    Ok((entrypoint_unit, units))
+}
+
+fn source_project_units_from_texts(
+    entry_uri: &str,
+    entry_text: String,
+    extra_units: Vec<(String, String)>,
+) -> Vec<serde_json::Value> {
+    let mut units = vec![json!({
+        "virtual_uri": entry_uri,
+        "text": entry_text,
+        "sha256": "",
+        "role": "entry"
+    })];
+    for (unit_uri, unit_text) in extra_units {
+        units.push(json!({
+            "virtual_uri": unit_uri,
+            "text": unit_text,
+            "sha256": "",
+            "role": "source"
+        }));
+    }
+    for unit in &mut units {
+        let text = unit
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        unit["sha256"] = json!(boon_runtime::sha256_bytes(text.as_bytes()));
+    }
+    units
 }
 
 fn opaque_xtask_source_identity(seed: &str) -> String {
@@ -4953,7 +5090,13 @@ fn opaque_xtask_source_identity(seed: &str) -> String {
 fn source_project_payload_units_hash(
     units: &[serde_json::Value],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if units.len() == 1 {
+    if units.len() == 1
+        && units
+            .first()
+            .and_then(|unit| unit.get("role"))
+            .and_then(serde_json::Value::as_str)
+            == Some("entry")
+    {
         return Ok(units
             .first()
             .and_then(|unit| unit.get("sha256"))
@@ -4963,6 +5106,10 @@ fn source_project_payload_units_hash(
     }
     let mut canonical = String::new();
     for unit in units {
+        let role = unit
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("source");
         let virtual_uri = unit
             .get("virtual_uri")
             .and_then(serde_json::Value::as_str)
@@ -4971,16 +5118,12 @@ fn source_project_payload_units_hash(
             .get("sha256")
             .and_then(serde_json::Value::as_str)
             .ok_or("source project unit missing sha256")?;
-        let text = unit
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("source project unit missing text")?;
+        canonical.push_str(role);
+        canonical.push('\0');
         canonical.push_str(virtual_uri);
         canonical.push('\0');
         canonical.push_str(sha256);
         canonical.push('\0');
-        canonical.push_str(&boon_runtime::sha256_bytes(text.as_bytes()));
-        canonical.push('\n');
     }
     Ok(boon_runtime::sha256_bytes(canonical.as_bytes()))
 }

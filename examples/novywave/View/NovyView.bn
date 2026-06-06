@@ -2080,8 +2080,14 @@ FUNCTION waveform_row(signal) {
                 height: PASSED.store.row_height
                 padding: 5
                 rounded_corners: 9
-                background: [color: TEXT { #101A2B }]
-                border: [color: TEXT { #263753 }]
+                background: [color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #101A2B }
+                    Light => TEXT { #F4F8FF }
+                }]
+                border: [color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #B8C8DF }
+                }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
                     False => NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
@@ -2104,8 +2110,14 @@ FUNCTION signal_select_button(signal) {
             height: Fill
             padding: 6
             rounded_corners: 8
-            background: [color: TEXT { #0A1322 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0A1322 }
+                Light => TEXT { #FFFFFF }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #B8C8DF }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -2132,8 +2144,14 @@ FUNCTION value_pill(signal) {
             width: 86
             height: Fill
             rounded_corners: 0
-            background: [color: TEXT { #111827 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #111827 }
+                Light => TEXT { #E9F0FA }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #B8C8DF }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(

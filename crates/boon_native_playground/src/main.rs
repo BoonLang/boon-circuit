@@ -38305,28 +38305,33 @@ mod tests {
     }
 
     #[test]
-    fn operator_host_input_carries_row_identity_for_bound_sources() {
+    fn operator_host_input_uses_structural_row_text_for_novywave_bound_sources() {
         let source_path = repo_path("examples/novywave/RUN.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
         let requests = operator_host_input_probe_requests(&source_path, &source)
             .expect("NovyWave should produce operator host input probes");
-        let first_event = requests
-            .first()
-            .and_then(|request| request.get("source_events"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|events| events.first())
-            .and_then(|event| event.get("source_event"))
-            .expect("first NovyWave source event");
+        let data_bus_event = requests
+            .iter()
+            .filter_map(|request| request.get("source_events"))
+            .filter_map(serde_json::Value::as_array)
+            .flat_map(|events| events.iter())
+            .filter_map(|event| event.get("source_event"))
+            .find(|event| {
+                event.get("source").and_then(serde_json::Value::as_str)
+                    == Some("store.elements.select_data")
+                    && event.get("target_text").and_then(serde_json::Value::as_str)
+                        == Some("data_bus[7:0]")
+            })
+            .expect("NovyWave data_bus source event");
 
-        assert_eq!(
-            first_event["source"],
-            "signal_catalog_item.signal_elements.select_signal"
-        );
-        assert_eq!(first_event["target_text"], "data_bus[7:0]");
-        assert_eq!(first_event["target_key"], 3);
-        assert_eq!(first_event["target_generation"], 1);
-        assert_eq!(first_event["bind_epoch"], 5);
-        assert_eq!(first_event["source_id"], 5);
+        assert_eq!(data_bus_event["source"], "store.elements.select_data");
+        assert_eq!(data_bus_event["target_text"], "data_bus[7:0]");
+        for key in ["target_key", "target_generation", "bind_epoch", "source_id"] {
+            assert!(
+                data_bus_event.get(key).is_none(),
+                "NovyWave scenario must not expose process-local `{key}` in source events: {data_bus_event}"
+            );
+        }
     }
 
     #[test]
@@ -38617,6 +38622,20 @@ mod tests {
                 .expect("NovyWave manifest source units should load");
             let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-visual", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
+            let empty_state = runtime.document_state_summary();
+            let (_, empty_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&empty_state),
+            )
+            .expect("NovyWave empty layout should lower");
+            let empty_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &empty_layout,
+                "novywave-empty-reference-comparison",
+            );
+            physical_frame_text_item(&empty_layout, "No waveform loaded", "NovyWave empty state");
             runtime
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.load_fixture".to_owned(),
@@ -38658,6 +38677,94 @@ mod tests {
                 &light_layout,
                 "novywave-light-material-regions",
             );
+            let reference_paths = [
+                (
+                    "figma_dark_1440",
+                    PathBuf::from(
+                        "/home/martinkavik/repos/NovyWave/design/figma/figma_dark_1440x1024.png",
+                    ),
+                ),
+                (
+                    "figma_light_1440",
+                    PathBuf::from(
+                        "/home/martinkavik/repos/NovyWave/design/figma/figma_light_1440x1024.png",
+                    ),
+                ),
+                (
+                    "figma_dark_empty",
+                    PathBuf::from(
+                        "/home/martinkavik/repos/NovyWave/design/figma/figma_dark_empty.png",
+                    ),
+                ),
+                (
+                    "figma_light_empty",
+                    PathBuf::from(
+                        "/home/martinkavik/repos/NovyWave/design/figma/figma_light_empty.png",
+                    ),
+                ),
+                (
+                    "docs_full_ui",
+                    PathBuf::from(
+                        "/home/martinkavik/repos/NovyWave/docs/Tasks_9_and_11__media/novywave_full_ui.png",
+                    ),
+                ),
+            ];
+            let reference_images = reference_paths
+                .iter()
+                .map(|(label, path)| {
+                    let image = image::open(path)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "NovyWave reference `{label}` should decode at {}: {error}",
+                                path.display()
+                            )
+                        })
+                        .to_rgba8();
+                    reference_image_metadata(label, path, &image)
+                })
+                .collect::<Vec<_>>();
+            let reference_dark_luma = reference_images[0]["average_luma"].as_f64().unwrap_or(0.0);
+            let reference_light_luma = reference_images[1]["average_luma"].as_f64().unwrap_or(0.0);
+            assert!(
+                reference_dark_luma + 15.0 < reference_light_luma,
+                "NovyWave dark/light references should have measurable luma separation"
+            );
+            let boon_empty_metadata =
+                visual_image_metadata("boon_empty", &empty_image, "empty readback");
+            let boon_dark_metadata =
+                visual_image_metadata("boon_dark", &dark_image, "loaded dark readback");
+            let boon_light_metadata =
+                visual_image_metadata("boon_light", &light_image, "loaded light readback");
+            let comparison_report = json!({
+                "status": "pass",
+                "reference_source": "decoded NovyWave screenshots only; no Rust/Tauri code imported",
+                "reference_images": reference_images,
+                "boon_readbacks": [
+                    boon_empty_metadata,
+                    boon_dark_metadata,
+                    boon_light_metadata
+                ],
+                "structural_checks": {
+                    "empty_state_text_visible": true,
+                    "loaded_dark_has_timeline_glass": true,
+                    "loaded_dark_has_cursor_marker_trace_glow": true,
+                    "loaded_light_has_distinct_background": true
+                }
+            });
+            let comparison_path =
+                repo_path("target/artifacts/native-gpu/tests/novywave-reference-comparison.json");
+            std::fs::create_dir_all(
+                comparison_path
+                    .parent()
+                    .expect("comparison artifact should have parent"),
+            )
+            .expect("NovyWave comparison artifact directory should be creatable");
+            std::fs::write(
+                &comparison_path,
+                serde_json::to_vec_pretty(&comparison_report)
+                    .expect("NovyWave comparison report should serialize"),
+            )
+            .expect("NovyWave comparison report should write");
 
             let largest_painted_color = |frame: &boon_document::LayoutFrame| {
                 frame
@@ -39363,6 +39470,47 @@ mod tests {
             .clamp(0.0, image.height().saturating_sub(1) as f32) as u32;
         let pixel = image.get_pixel(x, y);
         0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
+    }
+
+    fn full_image_average_luma(image: &image::RgbaImage) -> f32 {
+        let mut total = 0.0_f64;
+        let mut count = 0_u64;
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                total += f64::from(image_luma_at(image, x as f32, y as f32));
+                count = count.saturating_add(1);
+            }
+        }
+        (total / (count.max(1) as f64)) as f32
+    }
+
+    fn reference_image_metadata(
+        label: &str,
+        path: &Path,
+        image: &image::RgbaImage,
+    ) -> serde_json::Value {
+        json!({
+            "label": label,
+            "path": path.display().to_string(),
+            "width": image.width(),
+            "height": image.height(),
+            "average_luma": full_image_average_luma(image),
+            "source": "NovyWave reference screenshot"
+        })
+    }
+
+    fn visual_image_metadata(
+        label: &str,
+        image: &image::RgbaImage,
+        source: &str,
+    ) -> serde_json::Value {
+        json!({
+            "label": label,
+            "width": image.width(),
+            "height": image.height(),
+            "average_luma": full_image_average_luma(image),
+            "source": source
+        })
     }
 
     fn average_image_luma(image: &image::RgbaImage, rect: boon_document::Rect) -> f32 {

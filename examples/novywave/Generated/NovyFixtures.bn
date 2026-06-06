@@ -38,6 +38,16 @@ FUNCTION scope_cpu_signals() {
     }
 }
 
+FUNCTION scope_cpu_visible_signals() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+    }
+}
+
 FUNCTION scope_uart_signals() {
     LIST {
         [id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]

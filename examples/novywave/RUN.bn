@@ -4,6 +4,9 @@ store: [
     elements: [
         load_fixture: SOURCE
         show_empty: SOURCE
+        select_counter_file: SOURCE
+        select_uart_compare_file: SOURCE
+        diagnostic_probe: SOURCE
         mode_to_light: SOURCE
         mode_to_dark: SOURCE
         zoom_in: SOURCE
@@ -24,6 +27,9 @@ store: [
         selected_restore_data: SOURCE
         selected_data_up: SOURCE
         selected_data_down: SOURCE
+        analog_limits_auto: SOURCE
+        analog_limits_manual: SOURCE
+        analog_limits_invalid: SOURCE
         format_cycle: SOURCE
         format_hex: SOURCE
         format_grouped: SOURCE
@@ -48,6 +54,99 @@ store: [
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
             elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
         }
+
+    active_file:
+        LATEST {
+            TEXT { counter.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
+            elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
+        }
+
+    compare_file:
+        LATEST {
+            TEXT { none }
+            elements.select_counter_file.event.press |> THEN { TEXT { none } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { counter.vcd } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+        }
+
+    file_compare_status:
+        LATEST {
+            TEXT { single fixture: counter.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { single fixture: counter.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing counter.vcd to uart_compare.fst } }
+            elements.load_fixture.event.press |> THEN { TEXT { single fixture: counter.vcd } }
+        }
+
+    file_compare_descriptor:
+        [
+            primary: active_file
+            compare: compare_file
+            status: file_compare_status
+            page: compare_request_page
+            source: TEXT { generated-fixture-page }
+        ]
+
+    compare_request_page:
+        LATEST {
+            TEXT { PAGE_COUNTER_PRIMARY }
+            elements.select_counter_file.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
+            elements.load_fixture.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
+        }
+
+    compare_result_label:
+        LATEST {
+            TEXT { primary page: counter.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { primary page: counter.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
+            elements.load_fixture.event.press |> THEN { TEXT { primary page: counter.vcd } }
+        }
+
+    file_status_detail:
+        diagnostic_state == TEXT { Unsupported } |> WHEN {
+            True => diagnostic_label
+            False => compare_result_label
+        }
+
+    diagnostic_state:
+        LATEST {
+            TEXT { OK }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { Unsupported } }
+            elements.select_counter_file.event.press |> THEN { TEXT { OK } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
+            elements.load_fixture.event.press |> THEN { TEXT { OK } }
+            elements.show_empty.event.press |> THEN { TEXT { Idle } }
+        }
+
+    diagnostic_label:
+        LATEST {
+            TEXT { bridge diagnostics OK }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
+            elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.load_fixture.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
+        }
+
+    diagnostic_file:
+        LATEST {
+            TEXT { none }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
+            elements.select_counter_file.event.press |> THEN { TEXT { none } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+
+    bridge_diagnostic:
+        [
+            kind: diagnostic_state
+            file: diagnostic_file
+            library: TEXT { wellen.v1 }
+            message: diagnostic_label
+        ]
 
     mode:
         LATEST {
@@ -179,6 +278,84 @@ store: [
             elements.selected_data_down.event.press |> THEN { TEXT { 4 selected } }
             elements.load_fixture.event.press |> THEN { TEXT { 4 selected } }
         }
+
+    analog_limit_kind:
+        TEXT { Auto } |> HOLD analog_limit_kind {
+            LATEST {
+            elements.analog_limits_auto.event.press |> THEN { TEXT { Auto } }
+            elements.analog_limits_manual.event.press |> THEN { TEXT { Manual } }
+            elements.load_fixture.event.press |> THEN { TEXT { Auto } }
+            }
+        }
+
+    analog_limit_validity:
+        TEXT { Valid } |> HOLD analog_limit_validity {
+            LATEST {
+            elements.analog_limits_auto.event.press |> THEN { TEXT { Valid } }
+            elements.analog_limits_manual.event.press |> THEN { TEXT { Valid } }
+            elements.analog_limits_invalid.event.press |> THEN { TEXT { Rejected } }
+            elements.load_fixture.event.press |> THEN { TEXT { Valid } }
+            }
+        }
+
+    analog_limit_min:
+        TEXT { 39 C } |> HOLD analog_limit_min {
+            LATEST {
+            elements.analog_limits_manual.event.press |> THEN { TEXT { -10 C } }
+            elements.analog_limits_auto.event.press |> THEN { TEXT { 39 C } }
+            elements.zoom_in.event.press |> THEN { TEXT { 40 C } }
+            elements.zoom_out.event.press |> THEN { TEXT { 38 C } }
+            elements.pan_left.event.press |> THEN { TEXT { 39 C } }
+            elements.pan_right.event.press |> THEN { TEXT { 40 C } }
+            elements.load_fixture.event.press |> THEN { TEXT { 39 C } }
+            }
+        }
+
+    analog_limit_max:
+        TEXT { 44 C } |> HOLD analog_limit_max {
+            LATEST {
+            elements.analog_limits_manual.event.press |> THEN { TEXT { 80 C } }
+            elements.analog_limits_auto.event.press |> THEN { TEXT { 44 C } }
+            elements.zoom_in.event.press |> THEN { TEXT { 43 C } }
+            elements.zoom_out.event.press |> THEN { TEXT { 45 C } }
+            elements.pan_left.event.press |> THEN { TEXT { 43 C } }
+            elements.pan_right.event.press |> THEN { TEXT { 44 C } }
+            elements.load_fixture.event.press |> THEN { TEXT { 44 C } }
+            }
+        }
+
+    analog_range_label:
+        TEXT { Auto 39 C .. 44 C } |> HOLD analog_range_label {
+            LATEST {
+            elements.analog_limits_manual.event.press |> THEN { TEXT { Manual -10 C .. 80 C } }
+            elements.analog_limits_auto.event.press |> THEN { TEXT { Auto 39 C .. 44 C } }
+            elements.zoom_in.event.press |> THEN { TEXT { Auto 40 C .. 43 C } }
+            elements.zoom_out.event.press |> THEN { TEXT { Auto 38 C .. 45 C } }
+            elements.pan_left.event.press |> THEN { TEXT { Auto 39 C .. 43 C } }
+            elements.pan_right.event.press |> THEN { TEXT { Auto 40 C .. 44 C } }
+            elements.load_fixture.event.press |> THEN { TEXT { Auto 39 C .. 44 C } }
+            }
+        }
+
+    analog_limit_error:
+        TEXT { none } |> HOLD analog_limit_error {
+            LATEST {
+            elements.analog_limits_invalid.event.press |> THEN { TEXT { rejected min >= max } }
+            elements.analog_limits_auto.event.press |> THEN { TEXT { none } }
+            elements.analog_limits_manual.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            }
+        }
+
+    analog_limit_descriptor:
+        [
+            limit_kind: analog_limit_kind
+            validity: analog_limit_validity
+            min: analog_limit_min
+            max: analog_limit_max
+            visible_window: keyboard_viewport_label
+            source: TEXT { Boon-visible analog limits }
+        ]
 
     marker_visibility:
         TEXT { Visible } |> HOLD marker_visibility {

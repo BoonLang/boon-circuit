@@ -2,24 +2,24 @@
 
 FUNCTION viewport_label(zoom, pan) {
     LIST { zoom, pan } |> WHEN {
-        LIST { Fit, Center } => TEXT { 0 ns - 120 ns }
-        LIST { Close, Center } => TEXT { 36 ns - 60 ns }
-        LIST { Wide, Center } => TEXT { 0 ns - 240 ns }
-        LIST { Fit, LeftWindow } => TEXT { 0 ns - 80 ns }
-        LIST { Fit, RightWindow } => TEXT { 80 ns - 160 ns }
-        LIST { Close, LeftWindow } => TEXT { 24 ns - 48 ns }
-        LIST { Close, RightWindow } => TEXT { 48 ns - 72 ns }
-        LIST { Wide, LeftWindow } => TEXT { 0 ns - 180 ns }
-        LIST { Wide, RightWindow } => TEXT { 60 ns - 240 ns }
+        LIST { TEXT { Fit }, TEXT { Center } } => TEXT { 0 ns - 120 ns }
+        LIST { TEXT { Close }, TEXT { Center } } => TEXT { 36 ns - 60 ns }
+        LIST { TEXT { Wide }, TEXT { Center } } => TEXT { 0 ns - 240 ns }
+        LIST { TEXT { Fit }, TEXT { LeftWindow } } => TEXT { 0 ns - 80 ns }
+        LIST { TEXT { Fit }, TEXT { RightWindow } } => TEXT { 80 ns - 160 ns }
+        LIST { TEXT { Close }, TEXT { LeftWindow } } => TEXT { 24 ns - 48 ns }
+        LIST { TEXT { Close }, TEXT { RightWindow } } => TEXT { 48 ns - 72 ns }
+        LIST { TEXT { Wide }, TEXT { LeftWindow } } => TEXT { 0 ns - 180 ns }
+        LIST { TEXT { Wide }, TEXT { RightWindow } } => TEXT { 60 ns - 240 ns }
         __ => TEXT { 0 ns - 120 ns }
     }
 }
 
 FUNCTION cursor_label(cursor) {
     cursor |> WHEN {
-        Cursor36 => TEXT { 36 ns }
-        Cursor42 => TEXT { 42 ns }
-        Cursor48 => TEXT { 48 ns }
+        TEXT { Cursor36 } => TEXT { 36 ns }
+        TEXT { Cursor42 } => TEXT { 42 ns }
+        TEXT { Cursor48 } => TEXT { 48 ns }
         __ => TEXT { 42 ns }
     }
 }
@@ -36,32 +36,32 @@ FUNCTION signal_label(signal) {
 
 FUNCTION format_label(format) {
     format |> WHEN {
-        Hexadecimal => TEXT { Hex }
-        Binary => TEXT { Binary }
-        Signed => TEXT { Signed }
-        ASCII => TEXT { ASCII }
+        TEXT { Hexadecimal } => TEXT { Hex }
+        TEXT { Binary } => TEXT { Binary }
+        TEXT { Signed } => TEXT { Signed }
+        TEXT { ASCII } => TEXT { ASCII }
         __ => TEXT { Hex }
     }
 }
 
 FUNCTION row_height(size) {
     size |> WHEN {
-        Compact => 34
-        Normal => 42
-        Tall => 58
+        TEXT { Compact } => 34
+        TEXT { Normal } => 42
+        TEXT { Tall } => 58
         __ => 42
     }
 }
 
 FUNCTION request_fingerprint(scope, signal, zoom, pan, cursor, format) {
     LIST { scope, signal, zoom, pan, cursor, format } |> WHEN {
-        LIST { TEXT { top.cpu }, TEXT { clk }, Fit, Center, Cursor42, Hexadecimal } =>
+        LIST { TEXT { top.cpu }, TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { fp:cpu-clk-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { reset_n }, Fit, Center, Cursor42, Hexadecimal } =>
+        LIST { TEXT { top.cpu }, TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { fp:cpu-reset-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { data_bus }, Fit, Center, Cursor42, Hexadecimal } =>
+        LIST { TEXT { top.cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { fp:cpu-data-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { data_bus }, Close, Center, Cursor42, Hexadecimal } =>
+        LIST { TEXT { top.cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { fp:cpu-data-close-center-42-hex }
         __ => TEXT { fp:structural-request }
     }

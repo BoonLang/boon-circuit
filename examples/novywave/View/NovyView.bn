@@ -25,8 +25,8 @@ FUNCTION root() {
         items: LIST {
             header()
             PASSED.store.fixture_status |> WHEN {
-                Empty => empty_state()
-                Loaded => loaded_app()
+                TEXT { Empty } => empty_state()
+                TEXT { Loaded } => loaded_app()
             }
         }
     )
@@ -62,7 +62,7 @@ FUNCTION header() {
             header_stat(stat_label: TEXT { Cursor }, stat_value: PASSED.store.cursor_label)
             toolbar_button(button_text: TEXT { Load }, source: PASSED.store.elements.load_fixture)
             toolbar_button(button_text: TEXT { Empty }, source: PASSED.store.elements.show_empty)
-            toolbar_button(button_text: PASSED.store.mode |> WHEN { Dark => TEXT { Light } Light => TEXT { Dark } }, source: PASSED.store.elements.mode_toggle)
+            toolbar_button(button_text: PASSED.store.mode |> WHEN { TEXT { Dark } => TEXT { Light } TEXT { Light } => TEXT { Dark } }, source: PASSED.store.elements.mode_toggle)
         }
     )
 }
@@ -89,17 +89,49 @@ FUNCTION header_stat(stat_label, stat_value) {
 FUNCTION loaded_app() {
     Scene/Element/stripe(
         element: []
-        direction: Row
-        gap: 10
+        direction: Column
+        gap: 8
         style: [
             width: Fill
             height: 650
             paint: False
         ]
         items: LIST {
+            browser_band()
+            selected_waveform_band()
+        }
+    )
+}
+
+FUNCTION browser_band() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: 246
+            paint: False
+        ]
+        items: LIST {
             left_panel()
+            variables_panel()
+        }
+    )
+}
+
+FUNCTION selected_waveform_band() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: Fill
+            paint: False
+        ]
+        items: LIST {
             timeline_panel()
-            inspector_panel()
         }
     )
 }
@@ -151,7 +183,7 @@ FUNCTION left_panel() {
         direction: Column
         gap: 8
         style: [
-            width: 250
+            width: 430
             height: Fill
             padding: 10
             depth: 10
@@ -160,12 +192,11 @@ FUNCTION left_panel() {
         ]
         items: LIST {
             panel_title(title_text: TEXT { Files and scopes })
+            toolbar_button(button_text: TEXT { Load files }, source: PASSED.store.elements.load_fixture)
             files_list()
             search_box()
-            scope_button(text: TEXT { top.cpu }, detail: TEXT { 8 signals }, source: PASSED.store.elements.scope_cpu, active: PASSED.store.active_scope == TEXT { top.cpu })
-            scope_button(text: TEXT { top.uart }, detail: TEXT { 5 signals }, source: PASSED.store.elements.scope_uart, active: PASSED.store.active_scope == TEXT { top.uart })
-            text_line(label_text: TEXT { Search result }, font: Muted, width: Fill, height: 18)
-            text_line(label_text: NovyFixtures/search_result(text: PASSED.store.signal_search_text), font: Mono, width: Fill, height: 24)
+            scope_button(text: TEXT { top.cpu }, detail: TEXT { 8 signals }, source: PASSED.store.elements.scope_cpu, active: PASSED.store.active_scope == TEXT { top_cpu })
+            scope_button(text: TEXT { top.uart }, detail: TEXT { 5 signals }, source: PASSED.store.elements.scope_uart, active: PASSED.store.active_scope == TEXT { top_uart })
         }
     )
 }
@@ -204,7 +235,7 @@ FUNCTION file_row(file) {
 FUNCTION search_box() {
     Scene/Element/text_input(
         element: [
-            event: [change: PASSED.store.elements.signal_search_input]
+            event: [change: SOURCE]
         ]
         style: [
             width: Fill
@@ -219,12 +250,13 @@ FUNCTION search_box() {
         text: PASSED.store.signal_search_text
         placeholder: [text: TEXT { search signals }]
     )
+    |> SOURCE { PASSED.store.elements.signal_search_input }
 }
 
 FUNCTION scope_button(scope_text, detail, source, active) {
     Scene/Element/button(
         element: [
-            event: [press: source]
+            event: [press: SOURCE]
             hovered: SOURCE
         ]
         style: [
@@ -249,6 +281,7 @@ FUNCTION scope_button(scope_text, detail, source, active) {
             }
         )
     )
+    |> SOURCE { source }
 }
 
 FUNCTION timeline_panel() {
@@ -266,12 +299,46 @@ FUNCTION timeline_panel() {
             material: NovyTheme/material(of: TimelineGlass)
         ]
         items: LIST {
+            timeline_header()
             timeline_toolbar()
             timeline_axis()
             PASSED.store.selected_group |> WHEN {
-                Collapsed => collapsed_group()
-                Expanded => waveform_rows()
+                TEXT { Collapsed } => collapsed_group()
+                TEXT { Expanded } => waveform_rows()
             }
+        }
+    )
+}
+
+FUNCTION timeline_header() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 30, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Heading)
+                    width: 240
+                    height: Fill
+                    vertical_align: Center
+                ]
+                text: TEXT { Selected Variables }
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Muted)
+                    width: Fill
+                    height: Fill
+                    center: True
+                    vertical_align: Center
+                ]
+                text: TEXT { Dock to Right }
+            )
+            toolbar_button(button_text: TEXT { Remove All }, source: PASSED.store.elements.show_empty)
         }
     )
 }
@@ -300,7 +367,7 @@ FUNCTION timeline_toolbar() {
 FUNCTION keyboard_capture() {
     Scene/Element/text_input(
         element: [
-            event: [key_down: PASSED.store.elements.keyboard_capture]
+            event: [key_down: SOURCE]
         ]
         style: [
             width: 88
@@ -314,6 +381,7 @@ FUNCTION keyboard_capture() {
         text: TEXT { keys }
         placeholder: []
     )
+    |> SOURCE { PASSED.store.elements.keyboard_capture }
 }
 
 FUNCTION timeline_axis() {
@@ -350,8 +418,8 @@ FUNCTION timeline_axis() {
                 items: LIST {
                     cursor_chip()
                     PASSED.store.marker_visibility |> WHEN {
-                        Visible => marker_chip()
-                        Hidden => NoElement
+                        TEXT { Visible } => marker_chip()
+                        TEXT { Hidden } => NoElement
                     }
                 }
             )
@@ -481,37 +549,41 @@ FUNCTION waveform_row(signal) {
 }
 
 FUNCTION signal_select_button(signal) {
-    Scene/Element/button(
-        element: [
-            event: [
-                press: signal.id |> WHEN {
-                    TEXT { clk } => PASSED.store.elements.select_clk
-                    TEXT { reset_n } => PASSED.store.elements.select_reset
-                    TEXT { data_bus } => PASSED.store.elements.select_data
-                    TEXT { temperature } => PASSED.store.elements.select_temperature
-                    __ => PASSED.store.elements.select_clk
-                }
+    BLOCK {
+        source:
+            signal.id |> WHEN {
+                TEXT { clk } => PASSED.store.elements.select_clk
+                TEXT { reset_n } => PASSED.store.elements.select_reset
+                TEXT { data_bus } => PASSED.store.elements.select_data
+                TEXT { temperature } => PASSED.store.elements.select_temperature
+                __ => PASSED.store.elements.select_clk
+            }
+
+        Scene/Element/button(
+            element: [
+                event: [press: SOURCE]
+                hovered: SOURCE
             ]
-            hovered: SOURCE
-        ]
-        style: [
-            width: 145
-            height: Fill
-            padding: 6
-            rounded_corners: 8
-            material: NovyTheme/material(of: HoverControl)
-        ]
-        label: Scene/Element/text(
-            element: []
             style: [
-                ...NovyTheme/font(of: Mono)
-                width: Fill
+                width: 145
                 height: Fill
-                vertical_align: Center
+                padding: 6
+                rounded_corners: 8
+                material: NovyTheme/material(of: HoverControl)
             ]
-            text: signal.name
+            label: Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Mono)
+                    width: Fill
+                    height: Fill
+                    vertical_align: Center
+                ]
+                text: signal.name
+            )
         )
-    )
+        |> SOURCE { source }
+    }
 }
 
 FUNCTION value_pill(signal) {
@@ -570,6 +642,116 @@ FUNCTION waveform_segment(segment) {
             style: [paint: False]
             text: Text/empty()
         )
+    )
+}
+
+FUNCTION variables_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: Fill
+            height: Fill
+            padding: 10
+            depth: 10
+            rounded_corners: 14
+            material: NovyTheme/material(of: PanelSurface)
+        ]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 10
+                style: [width: Fill, height: 38, paint: False]
+                items: LIST {
+                    panel_title(title_text: TEXT { Variables })
+                    search_box()
+                }
+            )
+            variables_list()
+            inspector_strip()
+        }
+    )
+}
+
+FUNCTION variables_list() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_browser_row(row_name: TEXT { clk }, type_text: TEXT { Wire 1-bit }, direction_text: TEXT { Input })
+            variable_browser_row(row_name: TEXT { reset_n }, type_text: TEXT { Wire 1-bit }, direction_text: TEXT { Input })
+            variable_browser_row(row_name: TEXT { data_bus[7:0] }, type_text: TEXT { Wire 8-bit }, direction_text: TEXT { Output })
+            variable_browser_row(row_name: TEXT { temperature }, type_text: TEXT { Analog }, direction_text: TEXT { Input })
+        }
+    )
+}
+
+FUNCTION variable_browser_row(row_name, type_text, direction_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: 24
+            paint: False
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Mono)
+                    width: 180
+                    height: Fill
+                    vertical_align: Center
+                ]
+                text: row_name
+            )
+            variable_chip(text: type_text)
+            variable_chip(text: direction_text)
+        }
+    )
+}
+
+FUNCTION variable_chip(text) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 72
+            height: 20
+            rounded_corners: 10
+            material: NovyTheme/material(of: MarkerChip)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Muted)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: text
+        )
+    )
+}
+
+FUNCTION inspector_strip() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 54, paint: False]
+        items: LIST {
+            inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label)
+            inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
+            inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_fingerprint)
+            row_resize_controls()
+        }
     )
 }
 
@@ -646,7 +828,7 @@ FUNCTION panel_title(title_text) {
 FUNCTION toolbar_button(button_text, source) {
     Scene/Element/button(
         element: [
-            event: [press: source]
+            event: [press: SOURCE]
             hovered: SOURCE
         ]
         style: [
@@ -669,6 +851,7 @@ FUNCTION toolbar_button(button_text, source) {
             text: button_text
         )
     )
+    |> SOURCE { source }
 }
 
 FUNCTION text_line(label_text, font, width, height) {

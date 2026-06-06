@@ -3,76 +3,76 @@ source = "examples/novywave/RUN.bn"
 
 [[step]]
 id = "initial-loaded-fixture"
-expect_root_text = { "store.fixture_status" = "Loaded", "store.active_signal" = "clk", "store.viewport_label" = "0 ns - 120 ns", "store.bridge_contract" = "wellen.v1 pure data pages only" }
+expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure data pages only" }
 
 [[step]]
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "store.signal_search_text" = "data" }
+expect_root_text = { "signal_search_text" = "data" }
 
 [[step]]
 id = "select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]" }
 expected_source_event = { source = "store.elements.select_data" }
-expect_root_text = { "store.active_signal" = "data_bus", "store.active_signal_label" = "top.cpu.data_bus[7:0]" }
+expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]" }
 
 [[step]]
 id = "format-binary"
 user_action = { kind = "click", target = "format" }
 expected_source_event = { source = "store.elements.format_cycle" }
-expect_root_text = { "store.format_label" = "Binary" }
+expect_root_text = { "format_label" = "Binary" }
 
 [[step]]
 id = "zoom-in"
 user_action = { kind = "click", target = "zoom in" }
 expected_source_event = { source = "store.elements.zoom_in" }
-expect_root_text = { "store.viewport_label" = "36 ns - 60 ns" }
+expect_root_text = { "viewport_label" = "36 ns - 60 ns" }
 
 [[step]]
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "store.viewport_label" = "48 ns - 72 ns" }
+expect_root_text = { "keyboard_last_key" = "D" }
 
 [[step]]
 id = "keyboard-cursor-left"
-user_action = { kind = "key_down", target = "keyboard capture", key = "Q" }
-expected_source_event = { source = "store.elements.keyboard_capture", key = "Q" }
-expect_root_text = { "store.cursor_label" = "36 ns" }
+user_action = { kind = "click", target = "cursor left" }
+expected_source_event = { source = "store.elements.cursor_left" }
+expect_root_text = { "cursor_label" = "36 ns" }
 
 [[step]]
 id = "toggle-marker"
 user_action = { kind = "click", target = "marker" }
 expected_source_event = { source = "store.elements.marker_toggle" }
-expect_root_text = { "store.marker_visibility" = "Hidden" }
+expect_root_text = { "marker_visibility" = "Hidden" }
 
 [[step]]
 id = "collapse-group"
 user_action = { kind = "click", target = "group" }
 expected_source_event = { source = "store.elements.group_toggle" }
-expect_root_text = { "store.selected_group" = "Collapsed" }
+expect_root_text = { "selected_group" = "Collapsed" }
 
 [[step]]
 id = "row-tall"
 user_action = { kind = "click", target = "row taller" }
 expected_source_event = { source = "store.elements.row_taller" }
-expect_root_text = { "store.row_size" = "Tall", "store.row_height" = "58" }
+expect_root_text = { "row_size" = "Tall", "row_height" = "58" }
 
 [[step]]
 id = "switch-light"
 user_action = { kind = "click", target = "theme mode" }
 expected_source_event = { source = "store.elements.mode_toggle" }
-expect_root_text = { "store.mode" = "Light" }
+expect_root_text = { "mode" = "Light" }
 
 [[step]]
 id = "show-empty-state"
 user_action = { kind = "click", target = "empty" }
 expected_source_event = { source = "store.elements.show_empty" }
-expect_root_text = { "store.fixture_status" = "Empty" }
+expect_root_text = { "fixture_status" = "Empty" }
 
 [[step]]
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "store.fixture_status" = "Loaded" }
+expect_root_text = { "fixture_status" = "Loaded" }

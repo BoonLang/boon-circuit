@@ -47,16 +47,16 @@ FUNCTION search_result(text) {
 
 FUNCTION signal_value(signal, format) {
     LIST { signal, format } |> WHEN {
-        LIST { TEXT { clk }, Binary } => TEXT { 1b }
-        LIST { TEXT { clk }, Signed } => TEXT { 1 }
-        LIST { TEXT { clk }, ASCII } => TEXT { . }
-        LIST { TEXT { reset_n }, Binary } => TEXT { 1b }
-        LIST { TEXT { data_bus }, Binary } => TEXT { 00101010 }
-        LIST { TEXT { data_bus }, Signed } => TEXT { 42 }
-        LIST { TEXT { data_bus }, ASCII } => TEXT { * }
-        LIST { TEXT { temperature }, Signed } => TEXT { 43 }
-        LIST { TEXT { temperature }, ASCII } => TEXT { temp }
-        LIST { TEXT { temperature }, Binary } => TEXT { analog }
+        LIST { TEXT { clk }, TEXT { Binary } } => TEXT { 1b }
+        LIST { TEXT { clk }, TEXT { Signed } } => TEXT { 1 }
+        LIST { TEXT { clk }, TEXT { ASCII } } => TEXT { . }
+        LIST { TEXT { reset_n }, TEXT { Binary } } => TEXT { 1b }
+        LIST { TEXT { data_bus }, TEXT { Binary } } => TEXT { 00101010 }
+        LIST { TEXT { data_bus }, TEXT { Signed } } => TEXT { 42 }
+        LIST { TEXT { data_bus }, TEXT { ASCII } } => TEXT { * }
+        LIST { TEXT { temperature }, TEXT { Signed } } => TEXT { 43 }
+        LIST { TEXT { temperature }, TEXT { ASCII } } => TEXT { temp }
+        LIST { TEXT { temperature }, TEXT { Binary } } => TEXT { analog }
         __ => signal |> WHEN {
             TEXT { data_bus } => TEXT { 0x2a }
             TEXT { temperature } => TEXT { 42.8 C }

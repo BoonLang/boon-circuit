@@ -5157,6 +5157,7 @@ impl GenericScheduledRuntime {
                             &self.scalar_equations,
                             &target,
                             input.source,
+                            input.key,
                             input.text,
                             input.address,
                             input.seq,
@@ -8064,12 +8065,13 @@ impl GenericCircuitRuntime {
         equations: &ScalarEquationPlan,
         target: &str,
         source: &str,
+        payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) =
-            equations.eval_text(target, source, payload_text, payload_address, |path| {
+            equations.eval_text(target, source, payload_key, payload_text, payload_address, |path| {
                 self.root_textlike(path).ok()
             })?
         else {
@@ -8118,6 +8120,7 @@ impl GenericCircuitRuntime {
         equations: &ScalarEquationPlan,
         source: &str,
         source_id: SourceId,
+        payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
         seq: TickSeq,
@@ -8129,6 +8132,7 @@ impl GenericCircuitRuntime {
             equations,
             target,
             source,
+            payload_key,
             payload_text,
             payload_address,
             seq,
@@ -8660,6 +8664,10 @@ impl GenericCircuitRuntime {
                 };
                 Ok(IndexedTextCandidate::SourceText(Cow::Borrowed(value)))
             }
+            ScalarUpdateExpression::SourceKey => Err(format!(
+                "indexed text update `{target}` from `{source}` cannot use key payload directly"
+            )
+            .into()),
             ScalarUpdateExpression::SourceAddress => Err(format!(
                 "indexed text update `{target}` from `{source}` cannot use address payload directly"
             )
@@ -9995,6 +10003,7 @@ struct ScalarUpdateBranch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ScalarUpdateExpression {
     SourceText,
+    SourceKey,
     SourceAddress,
     Const(String),
     NumberInfix {
@@ -10019,7 +10028,10 @@ impl ScalarUpdateExpression {
     fn is_indexed_text_expression(&self) -> bool {
         matches!(
             self,
-            Self::SourceText | Self::PreviousValue(_) | Self::TextTrimOrPrevious { .. }
+            Self::SourceText
+                | Self::SourceKey
+                | Self::PreviousValue(_)
+                | Self::TextTrimOrPrevious { .. }
         )
     }
 
@@ -11278,6 +11290,9 @@ impl ScalarEquationPlan {
                     UpdateExpression::SourcePayload { path } if path == "text" => {
                         ScalarUpdateExpression::SourceText
                     }
+                    UpdateExpression::SourcePayload { path } if path == "key" => {
+                        ScalarUpdateExpression::SourceKey
+                    }
                     UpdateExpression::SourcePayload { path } if path == "address" => {
                         ScalarUpdateExpression::SourceAddress
                     }
@@ -11320,12 +11335,20 @@ impl ScalarEquationPlan {
         &self,
         target: &str,
         source: &str,
+        payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
         read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) =
-            self.eval_text_value(target, source, payload_text, payload_address, read_textlike)?
+            self.eval_text_value(
+                target,
+                source,
+                payload_key,
+                payload_text,
+                payload_address,
+                read_textlike,
+            )?
         else {
             return Ok(None);
         };
@@ -11339,6 +11362,7 @@ impl ScalarEquationPlan {
         &self,
         target: &str,
         source: &str,
+        payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
         read_textlike: impl Fn(&str) -> Option<String> + Copy,
@@ -11356,6 +11380,12 @@ impl ScalarEquationPlan {
                     return Ok(None);
                 };
                 Ok(Some(ScalarTextValue::Text(Cow::Borrowed(text))))
+            }
+            ScalarUpdateExpression::SourceKey => {
+                let Some(key) = payload_key else {
+                    return Ok(None);
+                };
+                Ok(Some(ScalarTextValue::Text(Cow::Borrowed(key))))
             }
             ScalarUpdateExpression::SourceAddress => {
                 let Some(address) = payload_address else {
@@ -12344,6 +12374,7 @@ impl SourceRoute {
                     }
                     ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::NumberInfix { .. }
+                    | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::BoolNot(_)
                     | ScalarUpdateExpression::MatchConst { .. }
@@ -12365,6 +12396,7 @@ impl SourceRoute {
                         SourceRouteBoolAction::ConstFalse
                     }
                     ScalarUpdateExpression::SourceText
+                    | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::NumberInfix { .. }
@@ -15178,6 +15210,59 @@ FUNCTION icon_code(item) {
                 .iter()
                 .any(|delta| delta.kind == "ListInsert")
         );
+    }
+
+    #[test]
+    fn live_runtime_applies_root_text_key_payload_source_events() {
+        let source = r#"
+store: [
+    sources: [
+        keyboard: SOURCE
+    ]
+    last_key:
+        Text/empty() |> HOLD last_key {
+            LATEST {
+                sources.keyboard.key
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }))
+"#;
+        let mut runtime = LiveRuntime::new(
+            "playground-live:key-payload",
+            source,
+            Path::new("../../examples/counter.scn"),
+        )
+        .unwrap();
+
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.sources.keyboard".to_owned()),
+        );
+        expected.insert("key".to_owned(), toml::Value::String("D".to_owned()));
+        let step = ScenarioStep {
+            id: "keyboard-root-text".to_owned(),
+            expected_source_event: Some(expected),
+            ..ScenarioStep::default()
+        };
+
+        let output = runtime
+            .apply_source_event_for_step(
+                &step,
+                LiveSourceEvent {
+                    source: "store.sources.keyboard".to_owned(),
+                    key: Some("D".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.state_summary["store"]["last_key"], "D");
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.last_key")
+        }));
     }
 
     #[test]

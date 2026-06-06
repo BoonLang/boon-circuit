@@ -27,186 +27,164 @@ store: [
     ]
 
     fixture_status:
-        Loaded
-        |> HOLD fixture_status {
-            LATEST {
-                elements.show_empty.event.press |> THEN { Empty }
-                elements.load_fixture.event.press |> THEN { Loaded }
-            }
+        LATEST {
+            TEXT { Loaded }
+            elements.show_empty.event.press |> THEN { TEXT { Empty } }
+            elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
         }
 
     mode:
-        Dark
-        |> HOLD mode {
-            LATEST {
-                elements.mode_toggle.event.press |> THEN { Light }
-            }
+        LATEST {
+            TEXT { Dark }
+            elements.mode_toggle.event.press |> THEN { TEXT { Light } }
         }
 
     active_scope:
-        TEXT { top.cpu }
-        |> HOLD active_scope {
-            LATEST {
-                elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
-                elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
-            }
+        LATEST {
+            TEXT { top_cpu }
+            elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
+            elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
         }
 
     active_signal:
-        TEXT { clk }
-        |> HOLD active_signal {
-            LATEST {
-                elements.select_clk.event.press |> THEN { TEXT { clk } }
-                elements.select_reset.event.press |> THEN { TEXT { reset_n } }
-                elements.select_data.event.press |> THEN { TEXT { data_bus } }
-                elements.select_temperature.event.press |> THEN { TEXT { temperature } }
-            }
+        LATEST {
+            TEXT { clk }
+            elements.select_clk.event.press |> THEN { TEXT { clk } }
+            elements.select_reset.event.press |> THEN { TEXT { reset_n } }
+            elements.select_data.event.press |> THEN { TEXT { data_bus } }
+            elements.select_temperature.event.press |> THEN { TEXT { temperature } }
         }
 
     signal_search_text:
-        TEXT { clk }
-        |> HOLD signal_search_text {
+        Text/empty() |> HOLD signal_search_text {
             LATEST {
-                elements.signal_search_input.event.change.text
+                elements.signal_search_input.text
+            }
+        }
+
+    keyboard_last_key:
+        Text/empty() |> HOLD keyboard_last_key {
+            LATEST {
+                elements.keyboard_capture.key
             }
         }
 
     selected_group:
-        Expanded
-        |> HOLD selected_group {
-            LATEST {
-                elements.group_toggle.event.press |> THEN { Collapsed }
-            }
+        LATEST {
+            TEXT { Expanded }
+            elements.group_toggle.event.press |> THEN { TEXT { Collapsed } }
         }
 
     marker_visibility:
-        Visible
-        |> HOLD marker_visibility {
-            LATEST {
-                elements.marker_toggle.event.press |> THEN { Hidden }
-            }
+        LATEST {
+            TEXT { Visible }
+            elements.marker_toggle.event.press |> THEN { TEXT { Hidden } }
         }
 
     row_size:
-        Normal
-        |> HOLD row_size {
-            LATEST {
-                elements.row_taller.event.press |> THEN { Tall }
-                elements.row_shorter.event.press |> THEN { Compact }
-            }
+        LATEST {
+            TEXT { Normal }
+            elements.row_taller.event.press |> THEN { TEXT { Tall } }
+            elements.row_shorter.event.press |> THEN { TEXT { Compact } }
         }
 
     value_format:
-        Hexadecimal
-        |> HOLD value_format {
-            LATEST {
-                elements.format_cycle.event.press |> THEN { Binary }
-            }
+        LATEST {
+            TEXT { Hexadecimal }
+            elements.format_cycle.event.press |> THEN { TEXT { Binary } }
         }
 
     zoom_level:
-        Fit
-        |> HOLD zoom_level {
-            LATEST {
-                elements.zoom_in.event.press |> THEN { Close }
-                elements.zoom_out.event.press |> THEN { Wide }
-                elements.keyboard_capture.event.key_down.key |> WHEN {
-                    W => Close
-                    S => Wide
-                    __ => SKIP
-                }
+        LATEST {
+            TEXT { Fit }
+            elements.zoom_in.event.press |> THEN { TEXT { Close } }
+            elements.zoom_out.event.press |> THEN { TEXT { Wide } }
+            elements.keyboard_capture.event.key_down.key |> WHEN {
+                W => TEXT { Close }
+                S => TEXT { Wide }
+                __ => SKIP
             }
         }
 
     pan_window:
-        Center
-        |> HOLD pan_window {
-            LATEST {
-                elements.pan_left.event.press |> THEN { LeftWindow }
-                elements.pan_right.event.press |> THEN { RightWindow }
-                elements.keyboard_capture.event.key_down.key |> WHEN {
-                    A => LeftWindow
-                    D => RightWindow
-                    __ => SKIP
-                }
+        LATEST {
+            TEXT { Center }
+            elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
+            elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
+            elements.keyboard_capture.event.key_down.key |> WHEN {
+                A => TEXT { LeftWindow }
+                D => TEXT { RightWindow }
+                __ => SKIP
             }
         }
 
     cursor_position:
-        Cursor42
-        |> HOLD cursor_position {
-            LATEST {
-                elements.cursor_left.event.press |> THEN { Cursor36 }
-                elements.cursor_right.event.press |> THEN { Cursor48 }
-                elements.keyboard_capture.event.key_down.key |> WHEN {
-                    Q => Cursor36
-                    E => Cursor48
-                    __ => SKIP
-                }
+        LATEST {
+            TEXT { Cursor42 }
+            elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
+            elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
+            elements.keyboard_capture.event.key_down.key |> WHEN {
+                Q => TEXT { Cursor36 }
+                E => TEXT { Cursor48 }
+                __ => SKIP
             }
         }
 
     viewport_label:
-        zoom_level |> WHEN {
-            Fit => pan_window |> WHEN {
-                Center => TEXT { 0 ns - 120 ns }
-                LeftWindow => TEXT { 0 ns - 80 ns }
-                RightWindow => TEXT { 80 ns - 160 ns }
-            }
-            Close => pan_window |> WHEN {
-                Center => TEXT { 36 ns - 60 ns }
-                LeftWindow => TEXT { 24 ns - 48 ns }
-                RightWindow => TEXT { 48 ns - 72 ns }
-            }
-            Wide => pan_window |> WHEN {
-                Center => TEXT { 0 ns - 240 ns }
-                LeftWindow => TEXT { 0 ns - 180 ns }
-                RightWindow => TEXT { 60 ns - 240 ns }
+        LATEST {
+            TEXT { 0 ns - 120 ns }
+            elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
+            elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+            elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
+            elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+            elements.keyboard_capture.event.key_down.key |> WHEN {
+                A => TEXT { 24 ns - 48 ns }
+                D => TEXT { 48 ns - 72 ns }
+                __ => SKIP
             }
         }
 
     cursor_label:
-        cursor_position |> WHEN {
-            Cursor36 => TEXT { 36 ns }
-            Cursor42 => TEXT { 42 ns }
-            Cursor48 => TEXT { 48 ns }
+        LATEST {
+            TEXT { 42 ns }
+            elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
+            elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
+            elements.keyboard_capture.event.key_down.key |> WHEN {
+                Q => TEXT { 36 ns }
+                E => TEXT { 48 ns }
+                __ => SKIP
+            }
         }
 
     active_signal_label:
-        TEXT { top.cpu.clk }
-        |> HOLD active_signal_label {
-            LATEST {
-                elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
-                elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
-                elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
-                elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
-            }
+        LATEST {
+            TEXT { top.cpu.clk }
+            elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
+            elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
+            elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
+            elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
         }
 
     format_label:
-        value_format |> WHEN {
-            Hexadecimal => TEXT { Hex }
-            Binary => TEXT { Binary }
-            Signed => TEXT { Signed }
-            ASCII => TEXT { ASCII }
+        LATEST {
+            TEXT { Hex }
+            elements.format_cycle.event.press |> THEN { TEXT { Binary } }
         }
 
     row_height:
-        row_size |> WHEN {
-            Compact => 34
-            Normal => 42
-            Tall => 58
+        LATEST {
+            42
+            elements.row_taller.event.press |> THEN { 58 }
+            elements.row_shorter.event.press |> THEN { 34 }
         }
 
     bridge_request_fingerprint:
-        TEXT { fp:cpu-clk-visible-window }
-        |> HOLD bridge_request_fingerprint {
-            LATEST {
-                elements.select_clk.event.press |> THEN { TEXT { fp:cpu-clk-visible-window } }
-                elements.select_reset.event.press |> THEN { TEXT { fp:cpu-reset-visible-window } }
-                elements.select_data.event.press |> THEN { TEXT { fp:cpu-data-visible-window } }
-                elements.select_temperature.event.press |> THEN { TEXT { fp:analog-temperature-visible-window } }
-            }
+        LATEST {
+            TEXT { fp:cpu-clk-visible-window }
+            elements.select_clk.event.press |> THEN { TEXT { fp:cpu-clk-visible-window } }
+            elements.select_reset.event.press |> THEN { TEXT { fp:cpu-reset-visible-window } }
+            elements.select_data.event.press |> THEN { TEXT { fp:cpu-data-visible-window } }
+            elements.select_temperature.event.press |> THEN { TEXT { fp:analog-temperature-visible-window } }
         }
 
     stale_response_policy: TEXT { structural fingerprint match required }

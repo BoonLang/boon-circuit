@@ -165,8 +165,8 @@ during implementation, but the ownership should not.
 
 Core records:
 
-- `WaveformFile`: stable file descriptor, display name, format, time bounds,
-  loading state, diagnostics.
+- `WaveformFile`: stable structural file identity descriptor, display name,
+  format, time bounds, loading state, diagnostics.
 - `ScopeNode`: id, name, full path, child scopes, visible state, signal summary.
 - `Signal`: id, scope path, name, type, width, analog metadata.
 - `SelectedSignal`: signal reference, display format, row height, group id,

@@ -17239,13 +17239,11 @@ fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_mod
                     insert_json_style_value(node, "material_color", color);
                 }
                 for (material_key, material_value) in object {
-                    if material_key == "color" {
-                        continue;
-                    }
-                    if material_key == "shadows" {
-                        lower_json_shadow_style(material_value, node);
-                    } else {
-                        insert_json_style_value(node, material_key, material_value);
+                    match material_key.as_str() {
+                        "color" => {}
+                        "shadows" => lower_json_shadow_style(material_value, node),
+                        "glow" => lower_json_style_field("glow", material_value, node),
+                        _ => insert_json_style_value(node, material_key, material_value),
                     }
                 }
             } else {
@@ -38329,6 +38327,374 @@ mod tests {
         assert_eq!(first_event["target_generation"], 1);
         assert_eq!(first_event["bind_epoch"], 5);
         assert_eq!(first_event["source_id"], 5);
+    }
+
+    #[test]
+    fn novywave_controls_lower_hover_material_and_pointer_contracts() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-hover", &units)
+            .expect("NovyWave runtime should initialize from manifest units");
+        let state_summary = runtime.document_state_summary();
+        let (layout_proof, layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&state_summary),
+        )
+        .expect("NovyWave layout should lower from live document state");
+
+        for label in ["Probe", "Light", "Fmt"] {
+            let context = format!("NovyWave control `{label}`");
+            let button = physical_button_for_text(&layout, label, &context);
+            let text = physical_frame_text_item(&layout, label, &context);
+            let text_center_x = text.bounds.x + text.bounds.width * 0.5;
+            let text_center_y = text.bounds.y + text.bounds.height * 0.5;
+            let button_center_x = button.bounds.x + button.bounds.width * 0.5;
+            let button_center_y = button.bounds.y + button.bounds.height * 0.5;
+            assert!(
+                (text_center_x - button_center_x).abs() <= 1.0
+                    && (text_center_y - button_center_y).abs() <= 1.0,
+                "{context} label should be centered: text={:?}, button={:?}",
+                text.bounds,
+                button.bounds
+            );
+            assert_eq!(
+                button.kind,
+                boon_document_model::DocumentNodeKind::Button,
+                "{context} should lower as a native button"
+            );
+            assert_eq!(
+                style_number_from_map(&button.style, "spring_range"),
+                Some(3.0),
+                "{context} should keep the Boon physical spring range: {:?}",
+                button.style
+            );
+            assert_eq!(
+                style_number_from_map(&button.style, "gloss"),
+                Some(0.05),
+                "{context} should preserve resting PanelInset gloss from NovyTheme: {:?}",
+                button.style
+            );
+            assert_eq!(
+                style_number_from_map(&button.style, "border_width"),
+                Some(1.0),
+                "{context} should preserve HoverControl border width from NovyTheme: {:?}",
+                button.style
+            );
+            assert_eq!(
+                style_text_from_map(&button.style, "cursor"),
+                Some("pointer"),
+                "{context} should expose a pointer cursor before host hover: {:?}",
+                button.style
+            );
+
+            let mut hover_input = deterministic_click_input(0, 0.0, 0.0);
+            hover_input.mouse_motion_event_count = 0;
+            hover_input.mouse_window_pos =
+                Some(boon_native_app_window::NativeMouseWindowPosition {
+                    x: f64::from(button.bounds.x + button.bounds.width * 0.5),
+                    y: f64::from(button.bounds.y + button.bounds.height * 0.5),
+                    window_width: 920.0,
+                    window_height: 720.0,
+                });
+            let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+                layout_proof: layout_proof.clone(),
+                layout_frame_override: Some(layout.clone()),
+                update_count: 0,
+                scroll_x_px: 0.0,
+                scroll_y_px: 0.0,
+                last_error: None,
+                last_error_count: 0,
+                status_overlay: None,
+                last_dirty_reason: None,
+            }));
+            let mut input_state = PreviewNativeInputState::default();
+            assert!(
+                preview_update_hover_from_input(
+                    &layout_proof,
+                    &hover_input,
+                    &shared_render_state,
+                    &mut input_state,
+                )
+                .expect("NovyWave hover overlay should update"),
+                "{context} should change the preview frame on first hover"
+            );
+            assert_eq!(
+                preview_cursor_icon(&layout_proof, &input_state),
+                boon_native_app_window::NativeCursorIcon::Pointer,
+                "{context} should request the native pointer cursor while hovered"
+            );
+            let hover_frame = latest_preview_frame(&shared_render_state);
+            let hovered_button = physical_button_for_text(&hover_frame, label, &context);
+            assert_eq!(
+                hovered_button.style.get("__hover"),
+                Some(&boon_document_model::StyleValue::Bool(true)),
+                "{context} should mark the hovered button in the native frame"
+            );
+            assert_eq!(
+                style_number_from_map(&hovered_button.style, "__hover_gloss"),
+                Some(0.08),
+                "{context} hover overlay should expose HoverControl gloss for rendering"
+            );
+        }
+
+        for (label, expected_color, expected_intensity) in [
+            ("42 ns", "#ffe768aa", 0.38),
+            ("M reset released", "#8f75ff88", 0.22),
+        ] {
+            let context = format!("NovyWave glow material `{label}`");
+            let glowing_item = layout
+                .display_list
+                .iter()
+                .filter(|item| style_text_from_map(&item.style, "glow_color").is_some())
+                .find(|item| {
+                    layout.display_list.iter().any(|text| {
+                        text.text.as_deref() == Some(label)
+                            && rect_contains_bounds(item.bounds, text.bounds)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    panic!("{context} should render a containing item with lowered glow fields")
+                });
+            assert_eq!(
+                style_text_from_map(&glowing_item.style, "glow_color"),
+                Some(expected_color),
+                "{context} should preserve material glow color: {:?}",
+                glowing_item.style
+            );
+            assert_eq!(
+                style_number_from_map(&glowing_item.style, "glow_intensity"),
+                Some(expected_intensity),
+                "{context} should preserve material glow intensity: {:?}",
+                glowing_item.style
+            );
+            assert_eq!(
+                style_text_from_map(&glowing_item.style, "box_shadow_8_color"),
+                Some(expected_color),
+                "{context} should expose glow as a renderable shadow color: {:?}",
+                glowing_item.style
+            );
+            assert_eq!(
+                style_number_from_map(&glowing_item.style, "box_shadow_8_blur"),
+                Some(18.0),
+                "{context} should expose glow as a renderable shadow blur: {:?}",
+                glowing_item.style
+            );
+        }
+    }
+
+    #[test]
+    fn novywave_dark_light_material_readbacks_cover_visual_regions() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "skipping NovyWave visual readback test: request_adapter failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-playground-novywave-visual-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let source_path = repo_path("examples/novywave/RUN.bn");
+            let units = boon_runtime::source_units_for_path(&source_path)
+                .expect("NovyWave manifest source units should load");
+            let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-visual", &units)
+                .expect("NovyWave runtime should initialize from manifest units");
+            let dark_state = runtime.document_state_summary();
+            let (dark_proof, dark_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&dark_state),
+                )
+                .expect("NovyWave dark layout should lower");
+            let dark_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &dark_layout,
+                "novywave-dark-material-regions",
+            );
+
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.mode_to_light".to_owned(),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave light-mode source event should apply");
+            let light_state = runtime.document_state_summary();
+            let (_, light_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&light_state),
+            )
+            .expect("NovyWave light layout should lower");
+            let light_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &light_layout,
+                "novywave-light-material-regions",
+            );
+
+            let largest_painted_color = |frame: &boon_document::LayoutFrame| {
+                frame
+                    .display_list
+                    .iter()
+                    .filter(|item| display_item_paint_color(item).is_some())
+                    .max_by(|left, right| {
+                        let left_area = left.bounds.width * left.bounds.height;
+                        let right_area = right.bounds.width * right.bounds.height;
+                        left_area
+                            .partial_cmp(&right_area)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .and_then(display_item_paint_color)
+                    .map(str::to_owned)
+            };
+            assert_eq!(
+                largest_painted_color(&dark_layout).as_deref(),
+                Some("#111827"),
+                "NovyWave dark root should lower the AppBackground paint color"
+            );
+            assert_eq!(
+                largest_painted_color(&light_layout).as_deref(),
+                Some("#f4f7fb"),
+                "NovyWave light root should lower the AppBackground paint color"
+            );
+            assert!(
+                image_luma_at(&dark_image, 8.0, 8.0) + 80.0 < image_luma_at(&light_image, 8.0, 8.0),
+                "NovyWave dark and light readbacks should visibly differ at the app background"
+            );
+
+            let timeline_glass = dark_layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    style_number_from_map(&item.style, "refraction") == Some(1.5)
+                        && style_number_from_map(&item.style, "frosted_blur").unwrap_or(0.0) >= 14.0
+                        && item.bounds.width > 300.0
+                        && item.bounds.height >= 20.0
+                })
+                .expect("NovyWave should lower a timeline glass material region");
+            assert!(
+                image_luma_range(&dark_image, timeline_glass.bounds) >= 12.0,
+                "timeline glass crop should contain visible material/data variation, bounds={:?}",
+                timeline_glass.bounds
+            );
+
+            let cursor_glow = dark_layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    style_text_from_map(&item.style, "glow_color") == Some("#ffe768aa")
+                        && dark_layout.display_list.iter().any(|text| {
+                            text.text.as_deref() == Some("42 ns")
+                                && rect_contains_bounds(item.bounds, text.bounds)
+                        })
+                })
+                .expect("NovyWave cursor chip should lower CursorGlow");
+            let marker_glow = dark_layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    style_text_from_map(&item.style, "glow_color") == Some("#8f75ff88")
+                        && item.bounds.width >= 100.0
+                        && item.bounds.height >= 14.0
+                })
+                .expect("NovyWave marker chip should lower MarkerChip glow");
+            for (label, bounds) in [
+                ("cursor glow crop", cursor_glow.bounds),
+                ("marker glow crop", marker_glow.bounds),
+            ] {
+                assert!(
+                    image_luma_range(&dark_image, bounds) >= 18.0,
+                    "{label} should contain visible glow/text contrast, bounds={bounds:?}"
+                );
+            }
+
+            let trace_glow = dark_layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    style_text_from_map(&item.style, "glow_color") == Some("#3b82f6aa")
+                        && item.bounds.width > 20.0
+                        && item.bounds.height >= 10.0
+                })
+                .expect("NovyWave digital trace should lower TraceHigh glow");
+            assert!(
+                image_luma_range(&dark_image, trace_glow.bounds) >= 14.0,
+                "waveform trace crop should contain visible high/low contrast, bounds={:?}",
+                trace_glow.bounds
+            );
+
+            let probe_button = physical_button_for_text(&dark_layout, "Probe", "NovyWave hover");
+            let mut hover_input = deterministic_click_input(0, 0.0, 0.0);
+            hover_input.mouse_motion_event_count = 0;
+            hover_input.mouse_window_pos =
+                Some(boon_native_app_window::NativeMouseWindowPosition {
+                    x: f64::from(probe_button.bounds.x + probe_button.bounds.width * 0.5),
+                    y: f64::from(probe_button.bounds.y + probe_button.bounds.height * 0.5),
+                    window_width: 920.0,
+                    window_height: 720.0,
+                });
+            let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+                layout_proof: dark_proof,
+                layout_frame_override: Some(dark_layout.clone()),
+                update_count: 0,
+                scroll_x_px: 0.0,
+                scroll_y_px: 0.0,
+                last_error: None,
+                last_error_count: 0,
+                status_overlay: None,
+                last_dirty_reason: None,
+            }));
+            let mut input_state = PreviewNativeInputState::default();
+            let hover_layout_proof = shared_render_state.lock().unwrap().layout_proof.clone();
+            assert!(
+                preview_update_hover_from_input(
+                    &hover_layout_proof,
+                    &hover_input,
+                    &shared_render_state,
+                    &mut input_state,
+                )
+                .expect("NovyWave hover overlay should update for readback")
+            );
+            let hover_frame = latest_preview_frame(&shared_render_state);
+            let hover_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &hover_frame,
+                "novywave-probe-hover-material-region",
+            );
+            let hover_diff = image_abs_diff_sum(&dark_image, &hover_image, probe_button.bounds);
+            assert!(
+                hover_diff >= 120,
+                "hovered Probe control should change app-owned pixels, diff={hover_diff}, bounds={:?}",
+                probe_button.bounds
+            );
+        });
     }
 
     #[test]

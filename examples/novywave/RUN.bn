@@ -196,6 +196,54 @@ store: [
             elements.show_empty.event.press |> THEN { TEXT { no waveform stats } }
         }
 
+    bridge_large_fixture_contract:
+        LATEST {
+            TEXT { wave_27.fst 28860652B -> bounded page requests only }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded compare page only } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd 25B -> diagnostic only } }
+            elements.show_empty.event.press |> THEN { TEXT { no large file materialized } }
+            elements.load_fixture.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded page requests only } }
+        }
+
+    bridge_payload_limit_bytes: 65536
+    bridge_transition_limit: 256
+    bridge_visible_row_limit: 32
+    bridge_segment_limit: 256
+
+    bridge_page_window_label:
+        LATEST {
+            TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
+            elements.zoom_in.event.press |> THEN { TEXT { window 36-60ns, max 256 transitions, payload <= 64KiB } }
+            elements.zoom_out.event.press |> THEN { TEXT { window 0-240ns, max 256 transitions, payload <= 64KiB } }
+            elements.pan_left.event.press |> THEN { TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB } }
+            elements.pan_right.event.press |> THEN { TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB } }
+            elements.show_empty.event.press |> THEN { TEXT { no page window scheduled } }
+        }
+
+    bridge_hierarchy_page_cursor_label:
+        LATEST {
+            TEXT { hierarchy cursor root:0..64 next=top.cpu }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { hierarchy cursor top.uart:0..64 next=none } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { hierarchy cursor none } }
+            elements.show_empty.event.press |> THEN { TEXT { hierarchy cursor none } }
+            elements.load_fixture.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
+        }
+
+    bridge_materialization_bound_label:
+        LATEST {
+            TEXT { visible rows 4/15, waveform segments 32/256 max }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { visible rows 4/5, waveform segments 28/256 max } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 3/15, waveform segments 24/256 max } }
+            elements.show_empty.event.press |> THEN { TEXT { visible rows 0/0, waveform segments 0/256 max } }
+            elements.load_fixture.event.press |> THEN { TEXT { visible rows 4/15, waveform segments 32/256 max } }
+        }
+
+    bridge_payload_bound_label:
+        TEXT { payload <= 64KiB; full waveform never enters Boon }
+
     compare_request_page:
         LATEST {
             TEXT { PAGE_COUNTER_PRIMARY }
@@ -1004,6 +1052,13 @@ store: [
             page: bridge_request_page
             descriptor: bridge_request_descriptor_label
             fingerprint: bridge_request_fingerprint
+            window: bridge_page_window_label
+            hierarchy_cursor: bridge_hierarchy_page_cursor_label
+            payload_limit_bytes: bridge_payload_limit_bytes
+            transition_limit: bridge_transition_limit
+            visible_row_limit: bridge_visible_row_limit
+            segment_limit: bridge_segment_limit
+            materialization: bridge_materialization_bound_label
         ]
 
     bridge_response_descriptor:
@@ -1011,6 +1066,10 @@ store: [
             page: bridge_response_page
             descriptor: bridge_response_descriptor_label
             fingerprint: bridge_response_fingerprint
+            payload_limit_bytes: bridge_payload_limit_bytes
+            transition_limit: bridge_transition_limit
+            visible_row_limit: bridge_visible_row_limit
+            segment_limit: bridge_segment_limit
         ]
 
     bridge_signal_page_label:

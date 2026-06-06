@@ -393,7 +393,7 @@ FUNCTION file_load_button() {
             event: [press: PASSED.store.elements.load_fixture]
             hovered: PASSED.store.elements.load_fixture
         ]
-        style: compact_button_style(button_width: 76)
+        style: compact_button_style(button_width: 76, hovered: element.hovered)
         label: button_label(button_text: TEXT { Load })
     )
 }
@@ -404,7 +404,7 @@ FUNCTION file_diagnostic_button() {
             event: [press: PASSED.store.elements.diagnostic_probe]
             hovered: PASSED.store.elements.diagnostic_probe
         ]
-        style: compact_button_style(button_width: 76)
+        style: compact_button_style(button_width: 76, hovered: element.hovered)
         label: button_label(button_text: TEXT { Probe })
     )
 }
@@ -3043,7 +3043,7 @@ FUNCTION format_palette() {
 FUNCTION format_hex_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_hex], hovered: PASSED.store.elements.format_hex]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Hex })
     )
 }
@@ -3051,7 +3051,7 @@ FUNCTION format_hex_button() {
 FUNCTION format_binary_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Bin })
     )
 }
@@ -3059,7 +3059,7 @@ FUNCTION format_binary_button() {
 FUNCTION format_grouped_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_grouped], hovered: PASSED.store.elements.format_grouped]
-        style: compact_button_style(button_width: 44)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { Grp })
     )
 }
@@ -3067,7 +3067,7 @@ FUNCTION format_grouped_button() {
 FUNCTION format_octal_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_octal], hovered: PASSED.store.elements.format_octal]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Oct })
     )
 }
@@ -3075,7 +3075,7 @@ FUNCTION format_octal_button() {
 FUNCTION format_signed_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_signed], hovered: PASSED.store.elements.format_signed]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Sgn })
     )
 }
@@ -3083,7 +3083,7 @@ FUNCTION format_signed_button() {
 FUNCTION format_unsigned_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_unsigned], hovered: PASSED.store.elements.format_unsigned]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Uns })
     )
 }
@@ -3091,7 +3091,7 @@ FUNCTION format_unsigned_button() {
 FUNCTION format_ascii_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_ascii], hovered: PASSED.store.elements.format_ascii]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { Asc })
     )
 }
@@ -3099,7 +3099,7 @@ FUNCTION format_ascii_button() {
 FUNCTION row_shorter_button_compact() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.row_shorter], hovered: PASSED.store.elements.row_shorter]
-        style: compact_button_style(button_width: 54)
+        style: compact_button_style(button_width: 54, hovered: element.hovered)
         label: button_label(button_text: TEXT { Short })
     )
 }
@@ -3107,7 +3107,7 @@ FUNCTION row_shorter_button_compact() {
 FUNCTION row_taller_button_compact() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.row_taller], hovered: PASSED.store.elements.row_taller]
-        style: compact_button_style(button_width: 44)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { Tall })
     )
 }
@@ -3147,7 +3147,7 @@ FUNCTION button_label(button_text) {
     )
 }
 
-FUNCTION compact_button_style(button_width) {
+FUNCTION compact_button_style(button_width, hovered) {
     [
         width: button_width
         height: 28
@@ -3158,11 +3158,20 @@ FUNCTION compact_button_style(button_width) {
             Dark => TEXT { #101a2b }
             Light => TEXT { #ffffff }
         }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #1a2b44 }
+            Light => TEXT { #e9f3ff }
+        }
         border: [color: PASSED.store.mode |> WHEN {
             Dark => TEXT { #334761 }
             Light => TEXT { #bad0e8 }
         }]
-        material: NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
+        __hover_border: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #49617f }
+            Light => TEXT { #bad0e8 }
+        }
+        material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        __hover_gloss: 0.08
     ]
 }
 
@@ -3172,7 +3181,7 @@ FUNCTION header_load_button() {
             event: [press: PASSED.store.elements.load_fixture]
             hovered: PASSED.store.elements.load_fixture
         ]
-        style: compact_button_style(button_width: 54)
+        style: compact_button_style(button_width: 54, hovered: element.hovered)
         label: button_label(button_text: TEXT { Load })
     )
 }
@@ -3183,7 +3192,7 @@ FUNCTION header_empty_button() {
             event: [press: PASSED.store.elements.show_empty]
             hovered: PASSED.store.elements.show_empty
         ]
-        style: compact_button_style(button_width: 62)
+        style: compact_button_style(button_width: 62, hovered: element.hovered)
         label: button_label(button_text: TEXT { Empty })
     )
 }
@@ -3202,7 +3211,7 @@ FUNCTION header_mode_to_light_button() {
             event: [press: PASSED.store.elements.mode_to_light]
             hovered: PASSED.store.elements.mode_to_light
         ]
-        style: compact_button_style(button_width: 58)
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
         label: button_label(button_text: TEXT { Light })
     )
 }
@@ -3213,7 +3222,7 @@ FUNCTION header_mode_to_dark_button() {
             event: [press: PASSED.store.elements.mode_to_dark]
             hovered: PASSED.store.elements.mode_to_dark
         ]
-        style: compact_button_style(button_width: 58)
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
         label: button_label(button_text: TEXT { Dark })
     )
 }
@@ -3224,7 +3233,7 @@ FUNCTION empty_load_button() {
             event: [press: PASSED.store.elements.load_fixture]
             hovered: PASSED.store.elements.load_fixture
         ]
-        style: compact_button_style(button_width: 96)
+        style: compact_button_style(button_width: 96, hovered: element.hovered)
         label: button_label(button_text: TEXT { Load fixture })
     )
 }
@@ -3235,7 +3244,7 @@ FUNCTION remove_all_button() {
             event: [press: PASSED.store.elements.show_empty]
             hovered: PASSED.store.elements.show_empty
         ]
-        style: compact_button_style(button_width: 82)
+        style: compact_button_style(button_width: 82, hovered: element.hovered)
         label: button_label(button_text: TEXT { Remove })
     )
 }
@@ -3243,7 +3252,7 @@ FUNCTION remove_all_button() {
 FUNCTION zoom_in_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.zoom_in], hovered: PASSED.store.elements.zoom_in]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { + })
     )
 }
@@ -3251,7 +3260,7 @@ FUNCTION zoom_in_button() {
 FUNCTION zoom_out_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.zoom_out], hovered: PASSED.store.elements.zoom_out]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { - })
     )
 }
@@ -3259,7 +3268,7 @@ FUNCTION zoom_out_button() {
 FUNCTION pan_left_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.pan_left], hovered: PASSED.store.elements.pan_left]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { < })
     )
 }
@@ -3267,7 +3276,7 @@ FUNCTION pan_left_button() {
 FUNCTION pan_right_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.pan_right], hovered: PASSED.store.elements.pan_right]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { > })
     )
 }
@@ -3275,7 +3284,7 @@ FUNCTION pan_right_button() {
 FUNCTION cursor_left_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.cursor_left], hovered: PASSED.store.elements.cursor_left]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { |< })
     )
 }
@@ -3283,7 +3292,7 @@ FUNCTION cursor_left_button() {
 FUNCTION cursor_right_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.cursor_right], hovered: PASSED.store.elements.cursor_right]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { >| })
     )
 }
@@ -3291,7 +3300,7 @@ FUNCTION cursor_right_button() {
 FUNCTION marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_toggle], hovered: PASSED.store.elements.marker_toggle]
-        style: compact_button_style(button_width: 42)
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { M })
     )
 }
@@ -3299,7 +3308,7 @@ FUNCTION marker_button() {
 FUNCTION create_group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_create], hovered: PASSED.store.elements.group_create]
-        style: compact_button_style(button_width: 76)
+        style: compact_button_style(button_width: 76, hovered: element.hovered)
         label: button_label(button_text: TEXT { [NewGrp] })
     )
 }
@@ -3307,7 +3316,7 @@ FUNCTION create_group_button() {
 FUNCTION group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
-        style: compact_button_style(button_width: 72)
+        style: compact_button_style(button_width: 72, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Group] })
     )
 }
@@ -3315,7 +3324,7 @@ FUNCTION group_button() {
 FUNCTION remove_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_data], hovered: PASSED.store.elements.selected_remove_data]
-        style: compact_button_style(button_width: 78)
+        style: compact_button_style(button_width: 78, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Rm data] })
     )
 }
@@ -3323,7 +3332,7 @@ FUNCTION remove_data_button() {
 FUNCTION restore_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_restore_data], hovered: PASSED.store.elements.selected_restore_data]
-        style: compact_button_style(button_width: 82)
+        style: compact_button_style(button_width: 82, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Restore] })
     )
 }
@@ -3331,7 +3340,7 @@ FUNCTION restore_data_button() {
 FUNCTION data_up_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_up], hovered: PASSED.store.elements.selected_data_up]
-        style: compact_button_style(button_width: 50)
+        style: compact_button_style(button_width: 50, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Up] })
     )
 }
@@ -3339,7 +3348,7 @@ FUNCTION data_up_button() {
 FUNCTION data_down_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_down], hovered: PASSED.store.elements.selected_data_down]
-        style: compact_button_style(button_width: 62)
+        style: compact_button_style(button_width: 62, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Down] })
     )
 }
@@ -3347,7 +3356,7 @@ FUNCTION data_down_button() {
 FUNCTION analog_auto_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_auto], hovered: PASSED.store.elements.analog_limits_auto]
-        style: compact_button_style(button_width: 58)
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Auto] })
     )
 }
@@ -3355,7 +3364,7 @@ FUNCTION analog_auto_button() {
 FUNCTION analog_manual_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_manual], hovered: PASSED.store.elements.analog_limits_manual]
-        style: compact_button_style(button_width: 58)
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Man] })
     )
 }
@@ -3363,7 +3372,7 @@ FUNCTION analog_manual_button() {
 FUNCTION analog_invalid_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_invalid], hovered: PASSED.store.elements.analog_limits_invalid]
-        style: compact_button_style(button_width: 58)
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Bad] })
     )
 }
@@ -3371,7 +3380,7 @@ FUNCTION analog_invalid_button() {
 FUNCTION rename_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_rename], hovered: PASSED.store.elements.marker_rename]
-        style: compact_button_style(button_width: 52)
+        style: compact_button_style(button_width: 52, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Ren] })
     )
 }
@@ -3379,7 +3388,7 @@ FUNCTION rename_marker_button() {
 FUNCTION jump_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_jump], hovered: PASSED.store.elements.marker_jump]
-        style: compact_button_style(button_width: 62)
+        style: compact_button_style(button_width: 62, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Jump] })
     )
 }
@@ -3387,7 +3396,7 @@ FUNCTION jump_marker_button() {
 FUNCTION remove_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_remove], hovered: PASSED.store.elements.marker_remove]
-        style: compact_button_style(button_width: 52)
+        style: compact_button_style(button_width: 52, hovered: element.hovered)
         label: button_label(button_text: TEXT { [Del] })
     )
 }
@@ -3395,7 +3404,7 @@ FUNCTION remove_marker_button() {
 FUNCTION format_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
-        style: compact_button_style(button_width: 48)
+        style: compact_button_style(button_width: 48, hovered: element.hovered)
         label: button_label(button_text: TEXT { Fmt })
     )
 }
@@ -3403,7 +3412,7 @@ FUNCTION format_button() {
 FUNCTION select_clk_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_clk], hovered: PASSED.store.elements.select_clk]
-        style: compact_button_style(button_width: 44)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { clk })
     )
 }
@@ -3411,7 +3420,7 @@ FUNCTION select_clk_button() {
 FUNCTION select_reset_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_reset], hovered: PASSED.store.elements.select_reset]
-        style: compact_button_style(button_width: 44)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { rst })
     )
 }
@@ -3419,7 +3428,7 @@ FUNCTION select_reset_button() {
 FUNCTION select_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_data], hovered: PASSED.store.elements.select_data]
-        style: compact_button_style(button_width: 50)
+        style: compact_button_style(button_width: 50, hovered: element.hovered)
         label: button_label(button_text: TEXT { data })
     )
 }
@@ -3427,7 +3436,7 @@ FUNCTION select_data_button() {
 FUNCTION select_temperature_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_temperature], hovered: PASSED.store.elements.select_temperature]
-        style: compact_button_style(button_width: 44)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { tmp })
     )
 }
@@ -3435,7 +3444,7 @@ FUNCTION select_temperature_button() {
 FUNCTION row_shorter_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.row_shorter], hovered: PASSED.store.elements.row_shorter]
-        style: compact_button_style(button_width: 62)
+        style: compact_button_style(button_width: 62, hovered: element.hovered)
         label: button_label(button_text: TEXT { Short })
     )
 }
@@ -3443,7 +3452,7 @@ FUNCTION row_shorter_button() {
 FUNCTION row_taller_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.row_taller], hovered: PASSED.store.elements.row_taller]
-        style: compact_button_style(button_width: 54)
+        style: compact_button_style(button_width: 54, hovered: element.hovered)
         label: button_label(button_text: TEXT { Tall })
     )
 }

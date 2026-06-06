@@ -25,12 +25,107 @@ FUNCTION scopes() {
     }
 }
 
+FUNCTION scope_cpu_signals() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { data_parity }, name: TEXT { data_parity }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { state }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, bit_width: TEXT { 3-bit }, direction: TEXT { State }]
+        [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, bit_width: TEXT { 16-bit }, direction: TEXT { Counter }]
+    }
+}
+
+FUNCTION scope_uart_signals() {
+    LIST {
+        [id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }]
+        [id: TEXT { baud_tick }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }]
+        [id: TEXT { uart_busy }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }]
+        [id: TEXT { framing_error }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }]
+    }
+}
+
+FUNCTION scope_analog_signals() {
+    LIST {
+        [id: TEXT { temperature }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }]
+        [id: TEXT { voltage }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }]
+    }
+}
+
+FUNCTION search_data_signals() {
+    LIST {
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { data_parity }, name: TEXT { data_parity }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+    }
+}
+
+FUNCTION search_reset_signals() {
+    LIST {
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+    }
+}
+
+FUNCTION search_temperature_signals() {
+    LIST {
+        [id: TEXT { temperature }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }]
+    }
+}
+
+FUNCTION search_clock_signals() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+    }
+}
+
+FUNCTION search_tx_signals() {
+    LIST {
+        [id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+    }
+}
+
+FUNCTION search_vcore_signals() {
+    LIST {
+        [id: TEXT { voltage }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }]
+    }
+}
+
 FUNCTION selected_signals() {
     LIST {
         [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
         [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
+    }
+}
+
+FUNCTION selected_signals_without_data() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
+    }
+}
+
+FUNCTION selected_signals_data_first() {
+    LIST {
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
+        [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
+    }
+}
+
+FUNCTION selected_signals_data_last() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
     }
 }
 

@@ -814,70 +814,38 @@ FUNCTION waveform_rows() {
 
 FUNCTION waveform_rows_expanded() {
     PASSED.store.selected_rows_profile |> WHEN {
-        TEXT { WithoutData } => waveform_rows_without_data()
-        TEXT { DataFirst } => waveform_rows_data_first()
-        TEXT { DataLast } => waveform_rows_data_last()
-        __ => waveform_rows_default_order()
+        TEXT { WithoutData } => waveform_rows_from(list: NovyFixtures/selected_signals_without_data())
+        TEXT { DataFirst } => waveform_rows_from(list: NovyFixtures/selected_signals_data_first())
+        TEXT { DataLast } => waveform_rows_from(list: NovyFixtures/selected_signals_data_last())
+        __ => waveform_rows_from(list: NovyFixtures/selected_signals())
     }
 }
 
-FUNCTION waveform_rows_default_order() {
+FUNCTION waveform_rows_from(list) {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 2
         style: [width: Fill, height: Fill, paint: False]
-        items: LIST {
-            waveform_row_clk()
-            waveform_row_reset()
-            waveform_row_data()
-            waveform_row_temperature()
-        }
+        items:
+            list |> List/map(row, new: selected_waveform_row(row: row))
     )
 }
 
-FUNCTION waveform_rows_without_data() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 2
-        style: [width: Fill, height: Fill, paint: False]
-        items: LIST {
-            waveform_row_clk()
-            waveform_row_reset()
-            waveform_row_temperature()
+FUNCTION selected_waveform_row(row) {
+    row.id == TEXT { clk } |> WHEN {
+        True => waveform_row_clk()
+        False => row.id == TEXT { reset_n } |> WHEN {
+            True => waveform_row_reset()
+            False => row.id == TEXT { data_bus } |> WHEN {
+                True => waveform_row_data()
+                False => row.id == TEXT { temperature } |> WHEN {
+                    True => waveform_row_temperature()
+                    False => waveform_row(signal: row)
+                }
+            }
         }
-    )
-}
-
-FUNCTION waveform_rows_data_first() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 2
-        style: [width: Fill, height: Fill, paint: False]
-        items: LIST {
-            waveform_row_data()
-            waveform_row_clk()
-            waveform_row_reset()
-            waveform_row_temperature()
-        }
-    )
-}
-
-FUNCTION waveform_rows_data_last() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 2
-        style: [width: Fill, height: Fill, paint: False]
-        items: LIST {
-            waveform_row_clk()
-            waveform_row_reset()
-            waveform_row_temperature()
-            waveform_row_data()
-        }
-    )
+    }
 }
 
 FUNCTION waveform_row_clk() {
@@ -1677,7 +1645,7 @@ FUNCTION wave_cell_analog_low(width_value, label_text) {
         style: [width: width_value, height: Fill, paint: False]
         items: LIST {
             waveform_transition_edge_indigo()
-            Scene/Element/block(
+            Scene/Element/label(
                 element: []
                 style: [
                     width: Fill
@@ -1688,7 +1656,18 @@ FUNCTION wave_cell_analog_low(width_value, label_text) {
                     border: [color: TEXT { #60A5FA }]
                     material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
-                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+                label: Scene/Element/text(
+                    element: []
+                    style: [
+                        ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                        width: Fill
+                        height: Fill
+                        center: True
+                        vertical_align: Center
+                        color: TEXT { #EAF4FF }
+                    ]
+                    text: label_text
+                )
             )
         }
     )
@@ -1702,18 +1681,29 @@ FUNCTION wave_cell_analog_mid(width_value, label_text) {
         style: [width: width_value, height: Fill, paint: False]
         items: LIST {
             waveform_transition_edge_cyan()
-            Scene/Element/block(
+            Scene/Element/label(
                 element: []
                 style: [
                     width: Fill
-                    height: 20
+                    height: 16
                     align: [column: Center]
                     rounded_corners: 3
                     background: [color: TEXT { #0891B2 }]
                     border: [color: TEXT { #A5F3FC }]
                     material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
-                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+                label: Scene/Element/text(
+                    element: []
+                    style: [
+                        ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                        width: Fill
+                        height: Fill
+                        center: True
+                        vertical_align: Center
+                        color: TEXT { #EAF4FF }
+                    ]
+                    text: label_text
+                )
             )
         }
     )
@@ -1727,18 +1717,29 @@ FUNCTION wave_cell_analog_high(width_value, label_text) {
         style: [width: width_value, height: Fill, paint: False]
         items: LIST {
             waveform_transition_edge_pale()
-            Scene/Element/block(
+            Scene/Element/label(
                 element: []
                 style: [
                     width: Fill
-                    height: 28
+                    height: 22
                     align: [column: Center]
                     rounded_corners: 3
                     background: [color: TEXT { #7DD3FC }]
                     border: [color: TEXT { #E0F2FE }]
                     material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)
                 ]
-                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+                label: Scene/Element/text(
+                    element: []
+                    style: [
+                        ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                        width: Fill
+                        height: Fill
+                        center: True
+                        vertical_align: Center
+                        color: TEXT { #0f172a }
+                    ]
+                    text: label_text
+                )
             )
         }
     )
@@ -2144,125 +2145,108 @@ FUNCTION variables_list_for_scope() {
 }
 
 FUNCTION variables_list_all() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 4
-        style: [
-            width: Fill
-            height: 150
-            paint: False
-            scroll_y: True
-            scrollbars: True
-        ]
-        items:
-            PASSED.store.signal_catalog
-            |> List/map(signal, new: variable_signal_button(signal: signal))
-    )
+    variables_signal_list(list: NovyFixtures/scope_cpu_signals(), height_value: 150)
 }
 
 FUNCTION variables_list_clk() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
-        items: LIST {
-            variable_clk_button()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_clock_signals(), height_value: 116)
 }
 
 FUNCTION variables_list_reset() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
-        items: LIST {
-            variable_reset_button()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_reset_signals(), height_value: 116)
 }
 
 FUNCTION variables_list_data() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 4
-        style: [width: Fill, height: 150, paint: False]
-        items: LIST {
-            variable_data_button()
-            variable_data_valid_row()
-            variable_data_ready_row()
-            variable_data_parity_row()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_data_signals(), height_value: 150)
 }
 
 FUNCTION variables_list_temperature() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
-        items: LIST {
-            variable_temperature_button()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_temperature_signals(), height_value: 116)
 }
 
 FUNCTION variables_list_tx() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
-        items: LIST {
-            variable_uart_tx_row()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_tx_signals(), height_value: 116)
 }
 
 FUNCTION variables_list_vcore() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 5
-        style: [width: Fill, height: 116, paint: False]
-        items: LIST {
-            variable_vcore_row()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/search_vcore_signals(), height_value: 116)
 }
 
 FUNCTION variables_list_uart() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 4
-        style: [width: Fill, height: 150, paint: False]
-        items: LIST {
-            variable_uart_tx_row()
-            variable_uart_rx_row()
-            variable_baud_tick_row()
-            variable_uart_busy_row()
-            variable_framing_error_row()
-        }
-    )
+    variables_signal_list(list: NovyFixtures/scope_uart_signals(), height_value: 150)
 }
 
 FUNCTION variables_list_analog() {
+    variables_signal_list(list: NovyFixtures/scope_analog_signals(), height_value: 150)
+}
+
+FUNCTION variables_signal_list(list, height_value) {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 4
-        style: [width: Fill, height: 150, paint: False]
-        items: LIST {
-            variable_temperature_button()
-            variable_vcore_row()
-        }
+        style: [width: Fill, height: height_value, paint: False, scroll_y: True, scrollbars: True]
+        items:
+            list |> List/map(signal, new: variable_result_row(signal: signal))
     )
+}
+
+FUNCTION variable_result_row(signal) {
+    signal.id == TEXT { clk } |> WHEN {
+        True => variable_clk_button()
+        False => signal.id == TEXT { reset_n } |> WHEN {
+            True => variable_reset_button()
+            False => signal.id == TEXT { data_bus } |> WHEN {
+                True => variable_data_button()
+                False => signal.id == TEXT { temperature } |> WHEN {
+                    True => variable_temperature_button()
+                    False => variable_result_static_row(signal: signal)
+                }
+            }
+        }
+    }
+}
+
+FUNCTION variable_result_static_row(signal) {
+    signal.id == TEXT { data_valid } |> WHEN {
+        True => variable_data_valid_row()
+        False => signal.id == TEXT { data_ready } |> WHEN {
+            True => variable_data_ready_row()
+            False => signal.id == TEXT { data_parity } |> WHEN {
+                True => variable_data_parity_row()
+                False => signal.id == TEXT { state } |> WHEN {
+                    True => variable_state_row()
+                    False => signal.id == TEXT { error_count } |> WHEN {
+                        True => variable_error_count_row()
+                        False => signal.id == TEXT { tx_data } |> WHEN {
+                            True => variable_uart_tx_row()
+                            False => signal.id == TEXT { rx_data } |> WHEN {
+                                True => variable_uart_rx_row()
+                                False => signal.id == TEXT { baud_tick } |> WHEN {
+                                    True => variable_baud_tick_row()
+                                    False => signal.id == TEXT { uart_busy } |> WHEN {
+                                        True => variable_uart_busy_row()
+                                        False => signal.id == TEXT { framing_error } |> WHEN {
+                                            True => variable_framing_error_row()
+                                            False => signal.id == TEXT { voltage } |> WHEN {
+                                                True => variable_vcore_row()
+                                                False => variable_static_row(
+                                                    name_text: signal.name
+                                                    chip_a: signal.kind
+                                                    chip_b: signal.bit_width
+                                                    chip_c: signal.direction
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 FUNCTION variables_list_empty() {

@@ -150,6 +150,16 @@ store: [
             elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
         }
 
+    selected_rows_count:
+        LATEST {
+            4
+            elements.selected_remove_data.event.press |> THEN { 3 }
+            elements.selected_restore_data.event.press |> THEN { 4 }
+            elements.selected_data_up.event.press |> THEN { 4 }
+            elements.selected_data_down.event.press |> THEN { 4 }
+            elements.load_fixture.event.press |> THEN { 4 }
+        }
+
     selected_rows_order_label:
         LATEST {
             TEXT { clk, reset_n, data_bus[7:0], temperature }
@@ -454,6 +464,50 @@ store: [
             elements.row_shorter.event.press |> THEN { 34 }
         }
 
+    bridge_request_page:
+        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_request_page {
+            LATEST {
+                elements.select_clk.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
+                elements.select_reset.event.press |> THEN { TEXT { PAGE_RESET_FIT_CENTER_42_HEX } }
+                elements.select_data.event.press |> THEN { TEXT { PAGE_DATA_FIT_CENTER_42_HEX } }
+                elements.select_temperature.event.press |> THEN { TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX } }
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { PAGE_CLK_FIT_CENTER_42_HEX }
+                                reset_n => TEXT { PAGE_RESET_FIT_CENTER_42_HEX }
+                                data_bus => TEXT { PAGE_DATA_FIT_CENTER_42_HEX }
+                                temperature => TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
+                elements.format_cycle.event.press |> THEN { TEXT { PAGE_DATA_FIT_CENTER_42_BIN } }
+                elements.format_hex.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_HEX } }
+                elements.format_grouped.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_GROUPED_BIN } }
+                elements.format_octal.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_OCTAL } }
+                elements.format_signed.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_SIGNED } }
+                elements.format_unsigned.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_UNSIGNED } }
+                elements.format_ascii.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_ASCII } }
+                elements.zoom_in.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN } }
+                elements.pan_right.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN } }
+                elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.keyboard_capture.key |> WHEN {
+                    W => TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }
+                    S => TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN }
+                    Q => TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN }
+                    E => TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN }
+                    D => TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }
+                    A => TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN }
+                    __ => SKIP
+                }
+                elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+            }
+        }
+
     bridge_request_fingerprint:
         TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_request_fingerprint {
             LATEST {
@@ -579,6 +633,12 @@ store: [
             }
         }
 
+    bridge_request_descriptor:
+        bridge_page_descriptor(request_page: bridge_request_page)
+
+    bridge_response_descriptor:
+        bridge_page_descriptor(request_page: bridge_response_page)
+
     bridge_request_label:
         bridge_request_fingerprint
 
@@ -645,12 +705,12 @@ store: [
         }
 
     bridge_response_status:
-        bridge_match_status(request: bridge_request_fingerprint, response: bridge_response_fingerprint)
+        bridge_page_match_status(request: bridge_request_page, response: bridge_response_page)
 
     bridge_response_status_compact_label:
-        bridge_match_compact_label(request: bridge_request_fingerprint, response: bridge_response_fingerprint)
+        bridge_page_match_compact_label(request: bridge_request_page, response: bridge_response_page)
 
-    stale_response_policy: TEXT { structural fingerprint match required }
+    stale_response_policy: TEXT { canonical page id equality required }
     bridge_contract: NovyBridge/contract_summary()
 ]
 
@@ -681,29 +741,51 @@ FUNCTION scoped_search_label(text, scope) {
 
 FUNCTION scoped_empty_search_label(scope) {
     scope == TEXT { top_uart } |> WHEN {
-        True => TEXT { 5 results: tx_data[7:0], rx_data[7:0], baud_tick, uart_busy, framing_error }
+        True => TEXT { 5 results in top.uart }
         False => scope == TEXT { top_analog } |> WHEN {
-            True => TEXT { 2 results: temperature, vcore }
-            False => TEXT { 4 results: clk, reset_n, data_bus, temperature }
+            True => TEXT { 2 results in top.analog }
+            False => TEXT { 8 results in top.cpu }
         }
     }
 }
 
-FUNCTION bridge_match_label(request, response) {
-    request == response |> WHEN {
-        True => TEXT { MATCH }
-        False => TEXT { MISMATCH }
+FUNCTION bridge_page_descriptor(request_page) {
+    request_page |> WHEN {
+        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { CLK }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_CLK_FIT_CENTER_42_HEX }]
+        TEXT { PAGE_RESET_FIT_CENTER_42_HEX } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { RESET_N }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_RESET_FIT_CENTER_42_HEX }]
+        TEXT { PAGE_DATA_FIT_CENTER_42_HEX } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_DATA_FIT_CENTER_42_HEX }]
+        TEXT { PAGE_DATA_FIT_CENTER_42_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_FIT_CENTER_42_BIN }]
+        TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN }]
+        TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }]
+        TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor36 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN }]
+        TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor48 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN }]
+        TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { LeftWindow }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN }]
+        TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN } =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Wide }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor36 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN }]
+        TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX } =>
+            [scope: TEXT { TOP_ANALOG }, signal: TEXT { TEMPERATURE }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX }]
+        __ =>
+            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { FormatOnly }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: request_page, page: request_page]
     }
 }
 
-FUNCTION bridge_match_status(request, response) {
+FUNCTION bridge_page_match_status(request, response) {
     request == response |> WHEN {
         True => TEXT { ACCEPTED_CURRENT_PAGE }
         False => TEXT { REJECTED_STALE_PAGE }
     }
 }
 
-FUNCTION bridge_match_compact_label(request, response) {
+FUNCTION bridge_page_match_compact_label(request, response) {
     request == response |> WHEN {
         True => TEXT { CURRENT }
         False => TEXT { STALE }

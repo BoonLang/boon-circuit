@@ -21,7 +21,7 @@ expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "tx", "
 id = "clear-search-uart"
 user_action = { kind = "type_text", target = "signal search", text = "" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "" }
-expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results: tx_data[7:0], rx_data[7:0], baud_tick, uart_busy, framing_error" }
+expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results in top.uart" }
 
 [[step]]
 id = "select-analog-scope"
@@ -33,7 +33,7 @@ expect_root_text = { "active_scope" = "top_analog", "active_scope_key" = "TOP_AN
 id = "select-temperature-analog"
 user_action = { kind = "click", target = "variable row", target_text = "temperature" }
 expected_source_event = { source = "store.elements.select_temperature", target_text = "temperature" }
-expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "bridge_request_fingerprint" = "FP_ANALOG_TEMP_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
+expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "bridge_request_page" = "PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_ANALOG_TEMP_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
 
 [[step]]
 id = "select-cpu-scope"
@@ -45,7 +45,7 @@ expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU",
 id = "row-select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]", target_key = 3, target_generation = 1, source_id = 5, bind_epoch = 5 }
 expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
-expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]", "active_signal_key" = "DATA_BUS", "bridge_request_fingerprint" = "FP_CPU_DATA_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "DATA_FIT" }
+expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]", "active_signal_key" = "DATA_BUS", "bridge_request_page" = "PAGE_DATA_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_DATA_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "DATA_FIT" }
 expect_semantic_delta_contains = ["FieldSet:selected_once"]
 
 [[step]]
@@ -59,25 +59,25 @@ expect_semantic_delta_contains = ["FieldSet:selected_once"]
 id = "selected-remove-data"
 user_action = { kind = "click", target = "selected row control", target_text = "Remove data" }
 expected_source_event = { source = "store.elements.selected_remove_data", target_text = "Remove data" }
-expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_order_label" = "clk, reset_n, temperature", "selected_signal_count_label" = "3 selected" }
+expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_count" = "3", "selected_rows_order_label" = "clk, reset_n, temperature", "selected_signal_count_label" = "3 selected" }
 
 [[step]]
 id = "selected-restore-data"
 user_action = { kind = "click", target = "selected row control", target_text = "Restore data" }
 expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore data" }
-expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], temperature", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], temperature", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "selected-data-up"
 user_action = { kind = "click", target = "selected row control", target_text = "Data up" }
 expected_source_event = { source = "store.elements.selected_data_up", target_text = "Data up" }
-expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, temperature", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count" = "4", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, temperature", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "selected-data-down"
 user_action = { kind = "click", target = "selected row control", target_text = "Data down" }
 expected_source_event = { source = "store.elements.selected_data_down", target_text = "Data down" }
-expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_order_label" = "clk, reset_n, temperature, data_bus[7:0]", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, temperature, data_bus[7:0]", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "search-data"
@@ -114,6 +114,18 @@ id = "search-data-again"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
 expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
+
+[[step]]
+id = "search-vcore"
+user_action = { kind = "type_text", target = "signal search", text = "vcore" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "vcore" }
+expect_root_text = { "signal_search_text" = "vcore", "search_result_label" = "1 result: vcore" }
+
+[[step]]
+id = "clear-search-cpu-summary"
+user_action = { kind = "type_text", target = "signal search", text = "" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "" }
+expect_root_text = { "signal_search_text" = "", "search_result_label" = "8 results in top.cpu" }
 
 [[step]]
 id = "select-data-bus"
@@ -155,43 +167,43 @@ expect_root_text = { "pan_window" = "LeftWindow", "viewport_label" = "24 ns - 48
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "48 ns - 72 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "48 ns - 72 ns", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
 
 [[step]]
 id = "keyboard-cursor-left"
 user_action = { kind = "key_down", target = "keyboard capture", key = "Q" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "Q" }
-expect_root_text = { "keyboard_last_key" = "Q", "keyboard_cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN" }
+expect_root_text = { "keyboard_last_key" = "Q", "keyboard_cursor_label" = "36 ns", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN" }
 
 [[step]]
 id = "keyboard-zoom-wide"
 user_action = { kind = "key_down", target = "keyboard capture", key = "S" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "S" }
-expect_root_text = { "keyboard_last_key" = "S", "keyboard_viewport_label" = "60 ns - 240 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN" }
+expect_root_text = { "keyboard_last_key" = "S", "keyboard_viewport_label" = "60 ns - 240 ns", "bridge_request_page" = "PAGE_DATA_WIDE_RIGHT_36_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN" }
 
 [[step]]
 id = "keyboard-zoom-close"
 user_action = { kind = "key_down", target = "keyboard capture", key = "W" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "W" }
-expect_root_text = { "keyboard_last_key" = "W", "zoom_level" = "Close", "keyboard_viewport_label" = "36 ns - 60 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
+expect_root_text = { "keyboard_last_key" = "W", "zoom_level" = "Close", "keyboard_viewport_label" = "36 ns - 60 ns", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
 
 [[step]]
 id = "keyboard-cursor-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "E" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "E" }
-expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "48 ns", "cursor_position" = "Cursor48", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_48_BIN" }
+expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "48 ns", "cursor_position" = "Cursor48", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_48_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_48_BIN" }
 
 [[step]]
 id = "keyboard-pan-left"
 user_action = { kind = "key_down", target = "keyboard capture", key = "A" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "A" }
-expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "keyboard_viewport_label" = "24 ns - 48 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN" }
+expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "keyboard_viewport_label" = "24 ns - 48 ns", "bridge_request_page" = "PAGE_DATA_CLOSE_LEFT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN" }
 
 [[step]]
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
+expect_root_text = { "bridge_request_page" = "PAGE_DATA_CLOSE_LEFT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "canonical page id equality required" }
 
 [[step]]
 id = "toggle-marker"
@@ -252,43 +264,43 @@ expect_root_text = { "fixture_status" = "Empty" }
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
+expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
 
 [[step]]
 id = "format-grouped-binary"
 user_action = { kind = "click", target = "Grp" }
 expected_source_event = { source = "store.elements.format_grouped" }
-expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_request_page" = "PAGE_DATA_FORMAT_GROUPED_BIN", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE" }
 
 [[step]]
 id = "format-octal"
 user_action = { kind = "click", target = "Oct" }
 expected_source_event = { source = "store.elements.format_octal" }
-expect_root_text = { "value_format" = "Octal", "format_label" = "Octal", "data_bus_rendered_value" = "052" }
+expect_root_text = { "value_format" = "Octal", "format_label" = "Octal", "data_bus_rendered_value" = "052", "bridge_request_page" = "PAGE_DATA_FORMAT_OCTAL", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
 id = "format-signed"
 user_action = { kind = "click", target = "Sgn" }
 expected_source_event = { source = "store.elements.format_signed" }
-expect_root_text = { "value_format" = "Signed", "format_label" = "Signed", "data_bus_rendered_value" = "42" }
+expect_root_text = { "value_format" = "Signed", "format_label" = "Signed", "data_bus_rendered_value" = "42", "bridge_request_page" = "PAGE_DATA_FORMAT_SIGNED", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
 id = "format-unsigned"
 user_action = { kind = "click", target = "Uns" }
 expected_source_event = { source = "store.elements.format_unsigned" }
-expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned", "data_bus_rendered_value" = "42" }
+expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned", "data_bus_rendered_value" = "42", "bridge_request_page" = "PAGE_DATA_FORMAT_UNSIGNED", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
 id = "format-ascii"
 user_action = { kind = "click", target = "Asc" }
 expected_source_event = { source = "store.elements.format_ascii" }
-expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII", "data_bus_rendered_value" = "*" }
+expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII", "data_bus_rendered_value" = "*", "bridge_request_page" = "PAGE_DATA_FORMAT_ASCII", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
 id = "format-hex"
 user_action = { kind = "click", target = "Hex" }
 expected_source_event = { source = "store.elements.format_hex" }
-expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a" }
+expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a", "bridge_request_page" = "PAGE_DATA_FORMAT_HEX", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
 id = "switch-dark"

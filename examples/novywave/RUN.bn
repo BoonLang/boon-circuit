@@ -13,10 +13,17 @@ store: [
         cursor_left: SOURCE
         cursor_right: SOURCE
         marker_toggle: SOURCE
+        marker_rename: SOURCE
+        marker_remove: SOURCE
+        marker_jump: SOURCE
         group_toggle: SOURCE
         stale_response_probe: SOURCE
         row_taller: SOURCE
         row_shorter: SOURCE
+        selected_remove_data: SOURCE
+        selected_restore_data: SOURCE
+        selected_data_up: SOURCE
+        selected_data_down: SOURCE
         format_cycle: SOURCE
         format_hex: SOURCE
         format_grouped: SOURCE
@@ -117,22 +124,7 @@ store: [
         }
 
     search_result_label:
-        signal_search_text == TEXT { data } |> WHEN {
-            True => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
-            False => signal_search_text == TEXT { reset } |> WHEN {
-                True => TEXT { 1 result: reset_n }
-                False => signal_search_text == TEXT { temp } |> WHEN {
-                    True => TEXT { 1 result: temperature }
-                    False => signal_search_text == TEXT { clk } |> WHEN {
-                        True => TEXT { 1 result: clk }
-                        False => signal_search_text == TEXT { zzz } |> WHEN {
-                            True => TEXT { 0 results: zzz }
-                            False => TEXT { 4 results: clk, reset_n, data_bus, temperature }
-                        }
-                    }
-                }
-            }
-        }
+        scoped_search_label(text: signal_search_text, scope: active_scope)
 
     keyboard_last_key:
         Text/empty() |> HOLD keyboard_last_key {
@@ -148,10 +140,70 @@ store: [
             elements.load_fixture.event.press |> THEN { TEXT { Expanded } }
         }
 
+    selected_rows_profile:
+        LATEST {
+            TEXT { DefaultOrder }
+            elements.selected_remove_data.event.press |> THEN { TEXT { WithoutData } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
+            elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
+            elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
+        }
+
+    selected_rows_order_label:
+        LATEST {
+            TEXT { clk, reset_n, data_bus[7:0], temperature }
+            elements.selected_remove_data.event.press |> THEN { TEXT { clk, reset_n, temperature } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
+            elements.selected_data_up.event.press |> THEN { TEXT { data_bus[7:0], clk, reset_n, temperature } }
+            elements.selected_data_down.event.press |> THEN { TEXT { clk, reset_n, temperature, data_bus[7:0] } }
+            elements.load_fixture.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
+        }
+
+    selected_signal_count_label:
+        LATEST {
+            TEXT { 4 selected }
+            elements.selected_remove_data.event.press |> THEN { TEXT { 3 selected } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { 4 selected } }
+            elements.selected_data_up.event.press |> THEN { TEXT { 4 selected } }
+            elements.selected_data_down.event.press |> THEN { TEXT { 4 selected } }
+            elements.load_fixture.event.press |> THEN { TEXT { 4 selected } }
+        }
+
     marker_visibility:
         LATEST {
             TEXT { Visible }
             elements.marker_toggle.event.press |> THEN { TEXT { Hidden } }
+            elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
+            elements.marker_rename.event.press |> THEN { TEXT { Visible } }
+            elements.marker_jump.event.press |> THEN { TEXT { Visible } }
+        }
+
+    marker_label:
+        LATEST {
+            TEXT { M reset released }
+            elements.marker_rename.event.press |> THEN { TEXT { M data stable } }
+            elements.marker_remove.event.press |> THEN { TEXT { No markers } }
+            elements.marker_jump.event.press |> THEN { TEXT { M data stable } }
+            elements.load_fixture.event.press |> THEN { TEXT { M reset released } }
+        }
+
+    marker_count_label:
+        LATEST {
+            TEXT { 1 marker }
+            elements.marker_rename.event.press |> THEN { TEXT { 1 marker } }
+            elements.marker_remove.event.press |> THEN { TEXT { 0 markers } }
+            elements.marker_jump.event.press |> THEN { TEXT { 1 marker } }
+            elements.load_fixture.event.press |> THEN { TEXT { 1 marker } }
+        }
+
+    marker_focus_label:
+        LATEST {
+            TEXT { reset released at 42 ns }
+            elements.marker_rename.event.press |> THEN { TEXT { data stable at 42 ns } }
+            elements.marker_jump.event.press |> THEN { TEXT { jumped to data stable at 42 ns } }
+            elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
+            elements.load_fixture.event.press |> THEN { TEXT { reset released at 42 ns } }
         }
 
     marker_to_add:
@@ -228,6 +280,7 @@ store: [
             TEXT { Cursor42 }
             elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
             elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
+            elements.marker_jump.event.press |> THEN { TEXT { Cursor42 } }
             elements.keyboard_capture.key |> WHEN {
                 D => TEXT { Cursor42 }
                 Q => TEXT { Cursor36 }
@@ -270,6 +323,7 @@ store: [
             TEXT { 42 ns }
             elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
             elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
+            elements.marker_jump.event.press |> THEN { TEXT { 42 ns } }
         }
 
     keyboard_cursor_label:
@@ -277,6 +331,7 @@ store: [
             LATEST {
                 elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
                 elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
+                elements.marker_jump.event.press |> THEN { TEXT { 42 ns } }
             elements.keyboard_capture.key |> WHEN {
                 D => TEXT { 42 ns }
                 Q => TEXT { 36 ns }
@@ -374,9 +429,22 @@ store: [
             elements.load_fixture.event.press |> THEN { TEXT { Binary } }
         }
 
+    data_bus_rendered_value:
+        LATEST {
+            TEXT { 0x2a }
+            elements.format_cycle.event.press |> THEN { TEXT { 00101010 } }
+            elements.format_grouped.event.press |> THEN { TEXT { 0010 1010 } }
+            elements.format_octal.event.press |> THEN { TEXT { 052 } }
+            elements.format_signed.event.press |> THEN { TEXT { 42 } }
+            elements.format_unsigned.event.press |> THEN { TEXT { 42 } }
+            elements.format_ascii.event.press |> THEN { TEXT { * } }
+            elements.format_hex.event.press |> THEN { TEXT { 0x2a } }
+            elements.load_fixture.event.press |> THEN { TEXT { 00101010 } }
+        }
+
     row_height:
         LATEST {
-            42
+            36
             elements.row_taller.event.press |> THEN { 58 }
             elements.row_shorter.event.press |> THEN { 34 }
         }
@@ -387,6 +455,7 @@ store: [
                 elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
                 elements.select_data.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX } }
+                elements.select_temperature.event.press |> THEN { TEXT { FP_ANALOG_TEMP_FIT_CENTER_42_HEX } }
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
                         signal_catalog_item.signal_elements.select_signal.event.press
@@ -514,6 +583,7 @@ store: [
                 elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
                 elements.select_data.event.press |> THEN { TEXT { DATA_FIT } }
+                elements.select_temperature.event.press |> THEN { TEXT { TEMP_FIT } }
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
                         signal_catalog_item.signal_elements.select_signal.event.press
@@ -611,6 +681,41 @@ store: [
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()
 ]
+
+FUNCTION scoped_search_label(text, scope) {
+    text == TEXT { data } |> WHEN {
+        True => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
+        False => text == TEXT { reset } |> WHEN {
+            True => TEXT { 1 result: reset_n }
+            False => text == TEXT { temp } |> WHEN {
+                True => TEXT { 1 result: temperature }
+                False => text == TEXT { clk } |> WHEN {
+                    True => TEXT { 1 result: clk }
+                    False => text == TEXT { zzz } |> WHEN {
+                        True => TEXT { 0 results: zzz }
+                        False => text == TEXT { tx } |> WHEN {
+                            True => TEXT { 1 result: tx_data[7:0] }
+                            False => text == TEXT { vcore } |> WHEN {
+                                True => TEXT { 1 result: vcore }
+                                False => scoped_empty_search_label(scope: scope)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION scoped_empty_search_label(scope) {
+    scope == TEXT { top_uart } |> WHEN {
+        True => TEXT { 5 results: tx_data[7:0], rx_data[7:0], baud_tick, uart_busy, framing_error }
+        False => scope == TEXT { top_analog } |> WHEN {
+            True => TEXT { 2 results: temperature, vcore }
+            False => TEXT { 4 results: clk, reset_n, data_bus, temperature }
+        }
+    }
+}
 
 FUNCTION new_signal(signal) {
     [

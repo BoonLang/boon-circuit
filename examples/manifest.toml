@@ -248,6 +248,13 @@ initial_visible_assertions = [
 ]
 input_scenarios = [
   "row-select-data-bus",
+  "selected-remove-data",
+  "selected-restore-data",
+  "selected-data-up",
+  "selected-data-down",
+  "search-uart-tx",
+  "clear-search-uart",
+  "select-temperature-analog",
   "search-data",
   "select-data-bus",
   "format-binary",
@@ -257,6 +264,9 @@ input_scenarios = [
   "keyboard-zoom-wide",
   "reject-stale-page",
   "toggle-marker",
+  "rename-marker",
+  "jump-marker",
+  "remove-marker",
   "collapse-group",
   "row-tall",
   "switch-light",

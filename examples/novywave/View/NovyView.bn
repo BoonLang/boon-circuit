@@ -571,9 +571,23 @@ FUNCTION timeline_header() {
 FUNCTION timeline_toolbar() {
     Scene/Element/stripe(
         element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 60, paint: False]
+        items: LIST {
+            timeline_navigation_controls()
+            selected_row_controls()
+            keyboard_capture()
+        }
+    )
+}
+
+FUNCTION timeline_navigation_controls() {
+    Scene/Element/stripe(
+        element: []
         direction: Row
         gap: 6
-        style: [width: Fill, height: 38, paint: False]
+        style: [width: Fill, height: 28, paint: False]
         items: LIST {
             zoom_in_button()
             zoom_out_button()
@@ -584,7 +598,38 @@ FUNCTION timeline_toolbar() {
             marker_button()
             group_button()
             format_button()
-            keyboard_capture()
+        }
+    )
+}
+
+FUNCTION selected_row_controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 28, paint: False]
+        items: LIST {
+            remove_data_button()
+            restore_data_button()
+            data_up_button()
+            data_down_button()
+            rename_marker_button()
+            jump_marker_button()
+            remove_marker_button()
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+                    width: Fill
+                    height: Fill
+                    vertical_align: Center
+                    color: PASSED.store.mode |> WHEN {
+                        Dark => TEXT { #90a4bf }
+                        Light => TEXT { #60748b }
+                    }
+                ]
+                text: PASSED.store.selected_rows_order_label
+            )
         }
     )
 }
@@ -616,7 +661,7 @@ FUNCTION timeline_axis() {
         gap: 3
         style: [
             width: Fill
-            height: 48
+            height: 42
             padding: 6
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
@@ -720,7 +765,7 @@ FUNCTION marker_chip() {
                 center: True
                 vertical_align: Center
             ]
-            text: TEXT { M reset released }
+            text: PASSED.store.marker_label
         )
     )
 }
@@ -768,7 +813,7 @@ FUNCTION waveform_rows_expanded() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 5
+        gap: 2
         style: [width: Fill, height: Fill, paint: False]
         items: LIST {
             waveform_row_clk()
@@ -793,12 +838,12 @@ FUNCTION waveform_row_clk() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #101a2b }
-                    Light => TEXT { #ffffff }
+                    Dark => TEXT { #071120 }
+                    Light => TEXT { #f7fbff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #263753 }
-                    Light => TEXT { #d7dde8 }
+                    Dark => TEXT { #1c2b43 }
+                    Light => TEXT { #cbd9ec }
                 }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -828,12 +873,12 @@ FUNCTION waveform_row_reset() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #101a2b }
-                    Light => TEXT { #ffffff }
+                    Dark => TEXT { #071120 }
+                    Light => TEXT { #f7fbff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #263753 }
-                    Light => TEXT { #d7dde8 }
+                    Dark => TEXT { #1c2b43 }
+                    Light => TEXT { #cbd9ec }
                 }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -863,12 +908,12 @@ FUNCTION waveform_row_data() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #101a2b }
-                    Light => TEXT { #ffffff }
+                    Dark => TEXT { #071120 }
+                    Light => TEXT { #f7fbff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #263753 }
-                    Light => TEXT { #d7dde8 }
+                    Dark => TEXT { #1c2b43 }
+                    Light => TEXT { #cbd9ec }
                 }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -898,12 +943,12 @@ FUNCTION waveform_row_temperature() {
                 padding: 5
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #101a2b }
-                    Light => TEXT { #ffffff }
+                    Dark => TEXT { #071120 }
+                    Light => TEXT { #f7fbff }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #263753 }
-                    Light => TEXT { #d7dde8 }
+                    Dark => TEXT { #1c2b43 }
+                    Light => TEXT { #cbd9ec }
                 }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -1109,8 +1154,8 @@ FUNCTION fixed_wave_area(signal_id) {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1137,8 +1182,8 @@ FUNCTION fixed_wave_area_clk() {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1179,8 +1224,8 @@ FUNCTION fixed_wave_area_reset() {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1209,8 +1254,8 @@ FUNCTION fixed_wave_area_data() {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1276,8 +1321,8 @@ FUNCTION fixed_wave_area_temperature() {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1712,8 +1757,8 @@ FUNCTION wave_area(signal) {
                 Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #93b4e8 }
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #b7c9e6 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1985,6 +2030,8 @@ FUNCTION variables_list() {
         reset => variables_list_reset()
         temp => variables_list_temperature()
         clk => variables_list_clk()
+        tx => variables_list_tx()
+        vcore => variables_list_vcore()
         zzz => variables_list_empty()
         __ => variables_list_for_scope()
     }
@@ -2063,6 +2110,30 @@ FUNCTION variables_list_temperature() {
         style: [width: Fill, height: 116, paint: False]
         items: LIST {
             variable_temperature_button()
+        }
+    )
+}
+
+FUNCTION variables_list_tx() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_uart_tx_row()
+        }
+    )
+}
+
+FUNCTION variables_list_vcore() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_vcore_row()
         }
     )
 }
@@ -2741,7 +2812,7 @@ FUNCTION button_label(button_text) {
 FUNCTION compact_button_style(button_width) {
     [
         width: button_width
-        height: 32
+        height: 28
         rounded_corners: 8
         spring_range: 3
         center: True
@@ -2903,6 +2974,62 @@ FUNCTION group_button() {
         element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
         style: compact_button_style(button_width: 64)
         label: button_label(button_text: TEXT { Group })
+    )
+}
+
+FUNCTION remove_data_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.selected_remove_data], hovered: PASSED.store.elements.selected_remove_data]
+        style: compact_button_style(button_width: 78)
+        label: button_label(button_text: TEXT { Remove data })
+    )
+}
+
+FUNCTION restore_data_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.selected_restore_data], hovered: PASSED.store.elements.selected_restore_data]
+        style: compact_button_style(button_width: 82)
+        label: button_label(button_text: TEXT { Restore data })
+    )
+}
+
+FUNCTION data_up_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.selected_data_up], hovered: PASSED.store.elements.selected_data_up]
+        style: compact_button_style(button_width: 64)
+        label: button_label(button_text: TEXT { Data up })
+    )
+}
+
+FUNCTION data_down_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.selected_data_down], hovered: PASSED.store.elements.selected_data_down]
+        style: compact_button_style(button_width: 78)
+        label: button_label(button_text: TEXT { Data down })
+    )
+}
+
+FUNCTION rename_marker_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.marker_rename], hovered: PASSED.store.elements.marker_rename]
+        style: compact_button_style(button_width: 54)
+        label: button_label(button_text: TEXT { Ren M })
+    )
+}
+
+FUNCTION jump_marker_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.marker_jump], hovered: PASSED.store.elements.marker_jump]
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { Jump M })
+    )
+}
+
+FUNCTION remove_marker_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.marker_remove], hovered: PASSED.store.elements.marker_remove]
+        style: compact_button_style(button_width: 54)
+        label: button_label(button_text: TEXT { Del M })
     )
 }
 

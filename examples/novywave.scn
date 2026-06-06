@@ -12,10 +12,28 @@ expected_source_event = { source = "store.elements.scope_uart", target_text = "+
 expect_root_text = { "active_scope" = "top_uart", "active_scope_key" = "TOP_UART", "active_scope_label" = "top.uart", "active_scope_signal_count" = "5 signals", "bridge_response_scope" = "TOP_UART" }
 
 [[step]]
+id = "search-uart-tx"
+user_action = { kind = "type_text", target = "signal search", text = "tx" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "tx" }
+expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "tx", "search_result_label" = "1 result: tx_data[7:0]" }
+
+[[step]]
+id = "clear-search-uart"
+user_action = { kind = "type_text", target = "signal search", text = "" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "" }
+expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results: tx_data[7:0], rx_data[7:0], baud_tick, uart_busy, framing_error" }
+
+[[step]]
 id = "select-analog-scope"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.analog" }
 expected_source_event = { source = "store.elements.scope_analog", target_text = "+ top.analog" }
 expect_root_text = { "active_scope" = "top_analog", "active_scope_key" = "TOP_ANALOG", "active_scope_label" = "top.analog", "active_scope_signal_count" = "2 signals", "bridge_response_scope" = "TOP_ANALOG" }
+
+[[step]]
+id = "select-temperature-analog"
+user_action = { kind = "click", target = "variable row", target_text = "temperature" }
+expected_source_event = { source = "store.elements.select_temperature", target_text = "temperature" }
+expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "bridge_request_fingerprint" = "FP_ANALOG_TEMP_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
 
 [[step]]
 id = "select-cpu-scope"
@@ -36,6 +54,30 @@ user_action = { kind = "click", target = "signal row", target_text = "data_bus[7
 expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
 expect_root_text = { "active_signal" = "data_bus" }
 expect_semantic_delta_contains = ["FieldSet:selected_once"]
+
+[[step]]
+id = "selected-remove-data"
+user_action = { kind = "click", target = "selected row control", target_text = "Remove data" }
+expected_source_event = { source = "store.elements.selected_remove_data", target_text = "Remove data" }
+expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_order_label" = "clk, reset_n, temperature", "selected_signal_count_label" = "3 selected" }
+
+[[step]]
+id = "selected-restore-data"
+user_action = { kind = "click", target = "selected row control", target_text = "Restore data" }
+expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore data" }
+expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], temperature", "selected_signal_count_label" = "4 selected" }
+
+[[step]]
+id = "selected-data-up"
+user_action = { kind = "click", target = "selected row control", target_text = "Data up" }
+expected_source_event = { source = "store.elements.selected_data_up", target_text = "Data up" }
+expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, temperature", "selected_signal_count_label" = "4 selected" }
+
+[[step]]
+id = "selected-data-down"
+user_action = { kind = "click", target = "selected row control", target_text = "Data down" }
+expected_source_event = { source = "store.elements.selected_data_down", target_text = "Data down" }
+expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_order_label" = "clk, reset_n, temperature, data_bus[7:0]", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "search-data"
@@ -83,7 +125,7 @@ expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.
 id = "format-binary"
 user_action = { kind = "click", target = "format" }
 expected_source_event = { source = "store.elements.format_cycle" }
-expect_root_text = { "format_label" = "Binary" }
+expect_root_text = { "format_label" = "Binary", "data_bus_rendered_value" = "00101010" }
 
 [[step]]
 id = "zoom-in"
@@ -159,6 +201,24 @@ expect_root_text = { "marker_visibility" = "Hidden", "marker_to_add" = "36 ns", 
 expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
+id = "rename-marker"
+user_action = { kind = "click", target = "marker control", target_text = "Ren M" }
+expected_source_event = { source = "store.elements.marker_rename", target_text = "Ren M" }
+expect_root_text = { "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_count_label" = "1 marker", "marker_focus_label" = "data stable at 42 ns" }
+
+[[step]]
+id = "jump-marker"
+user_action = { kind = "click", target = "marker control", target_text = "Jump M" }
+expected_source_event = { source = "store.elements.marker_jump", target_text = "Jump M" }
+expect_root_text = { "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_focus_label" = "jumped to data stable at 42 ns", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "42 ns" }
+
+[[step]]
+id = "remove-marker"
+user_action = { kind = "click", target = "marker control", target_text = "Del M" }
+expected_source_event = { source = "store.elements.marker_remove", target_text = "Del M" }
+expect_root_text = { "marker_visibility" = "Hidden", "marker_label" = "No markers", "marker_count_label" = "0 markers", "marker_focus_label" = "no marker selected" }
+
+[[step]]
 id = "collapse-group"
 user_action = { kind = "click", target = "group" }
 expected_source_event = { source = "store.elements.group_toggle" }
@@ -192,43 +252,43 @@ expect_root_text = { "fixture_status" = "Empty" }
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
+expect_root_text = { "fixture_status" = "Loaded", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
 
 [[step]]
 id = "format-grouped-binary"
 user_action = { kind = "click", target = "Grp" }
 expected_source_event = { source = "store.elements.format_grouped" }
-expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_response_status" = "REJECTED_STALE_PAGE" }
 
 [[step]]
 id = "format-octal"
 user_action = { kind = "click", target = "Oct" }
 expected_source_event = { source = "store.elements.format_octal" }
-expect_root_text = { "value_format" = "Octal", "format_label" = "Octal" }
+expect_root_text = { "value_format" = "Octal", "format_label" = "Octal", "data_bus_rendered_value" = "052" }
 
 [[step]]
 id = "format-signed"
 user_action = { kind = "click", target = "Sgn" }
 expected_source_event = { source = "store.elements.format_signed" }
-expect_root_text = { "value_format" = "Signed", "format_label" = "Signed" }
+expect_root_text = { "value_format" = "Signed", "format_label" = "Signed", "data_bus_rendered_value" = "42" }
 
 [[step]]
 id = "format-unsigned"
 user_action = { kind = "click", target = "Uns" }
 expected_source_event = { source = "store.elements.format_unsigned" }
-expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned" }
+expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned", "data_bus_rendered_value" = "42" }
 
 [[step]]
 id = "format-ascii"
 user_action = { kind = "click", target = "Asc" }
 expected_source_event = { source = "store.elements.format_ascii" }
-expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII" }
+expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII", "data_bus_rendered_value" = "*" }
 
 [[step]]
 id = "format-hex"
 user_action = { kind = "click", target = "Hex" }
 expected_source_event = { source = "store.elements.format_hex" }
-expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex" }
+expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a" }
 
 [[step]]
 id = "switch-dark"

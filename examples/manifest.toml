@@ -247,6 +247,7 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
+  "row-select-data-bus",
   "search-data",
   "select-data-bus",
   "format-binary",

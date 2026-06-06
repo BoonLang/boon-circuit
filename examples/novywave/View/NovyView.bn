@@ -1003,9 +1003,17 @@ FUNCTION fixed_wave_area(signal_id) {
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items:
             NovyFixtures/segments(of: signal_id)
@@ -1023,9 +1031,17 @@ FUNCTION fixed_wave_area_clk() {
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1057,9 +1073,17 @@ FUNCTION fixed_wave_area_reset() {
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1079,9 +1103,17 @@ FUNCTION fixed_wave_area_data() {
             height: Fill
             padding: [top: 4, bottom: 4, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items: LIST {
             data_bus_cells_row()
@@ -1138,9 +1170,17 @@ FUNCTION fixed_wave_area_temperature() {
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items: LIST {
             waveform_cursor_line()
@@ -1566,9 +1606,17 @@ FUNCTION wave_area(signal) {
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
             rounded_corners: 0
-            background: [color: TEXT { #020817 }]
-            border: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #020817 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            scroll_x: True
+            scrollbars: True
         ]
         items:
             NovyFixtures/segments(of: signal.id)
@@ -1846,7 +1894,13 @@ FUNCTION variables_list_all() {
         element: []
         direction: Column
         gap: 4
-        style: [width: Fill, height: 150, paint: False]
+        style: [
+            width: Fill
+            height: 150
+            paint: False
+            scroll_y: True
+            scrollbars: True
+        ]
         items:
             PASSED.store.signal_catalog
             |> List/map(signal, new: variable_signal_button(signal: signal))

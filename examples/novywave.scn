@@ -6,6 +6,12 @@ id = "initial-loaded-fixture"
 expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure data pages only" }
 
 [[step]]
+id = "row-select-data-bus"
+user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]", target_key = 3, target_generation = 1, source_id = 5, bind_epoch = 5 }
+expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
+expect_semantic_delta_contains = ["FieldSet:selected_once"]
+
+[[step]]
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }

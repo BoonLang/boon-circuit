@@ -5537,6 +5537,18 @@ impl GenericScheduledRuntime {
         step: &ScenarioStep,
         source_event: GenericSourceEvent<'_>,
     ) -> RuntimeResult<Option<usize>> {
+        match self.resolve_bound_source_index(list, step.user_action.as_ref(), Some(source_event))?
+        {
+            GenericBoundSourceIndex::Bound(index) => return Ok(Some(index)),
+            GenericBoundSourceIndex::Stale => {
+                return Err(format!(
+                    "{} source `{}` has stale or mismatched row binding identity for list `{list}`",
+                    step.id, source_event.source
+                )
+                .into());
+            }
+            GenericBoundSourceIndex::Unspecified => {}
+        }
         if let Some(address) = source_event.address {
             let source_id = self.source_routes.require_source_id(source_event.source)?;
             let lookup_field = self
@@ -15448,6 +15460,78 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         assert_eq!(duplicates.len(), 2);
         assert_eq!(duplicates[0]["completed"], false);
         assert_eq!(duplicates[1]["completed"], true);
+    }
+
+    #[test]
+    fn live_runtime_prefers_bound_row_identity_over_target_text() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:todomvc",
+            source,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .unwrap();
+        let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
+            row.get(field)
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                })
+                .unwrap_or_else(|| panic!("todo row missing numeric `{field}`: {row}"))
+        };
+        let initial = runtime.state_summary();
+        let first_todo = &initial["todos"][0];
+        let target_key = json_u64_field(first_todo, "key");
+        let target_generation = json_u64_field(first_todo, "generation");
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Buy groceries checkbox".to_owned()),
+        );
+        action.insert(
+            "target_key".to_owned(),
+            toml::Value::Integer(target_key as i64),
+        );
+        action.insert(
+            "target_generation".to_owned(),
+            toml::Value::Integer(target_generation as i64),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
+        );
+        expected.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Buy groceries".to_owned()),
+        );
+        let step = ScenarioStep {
+            id: "bound-row-identity-wins".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..ScenarioStep::default()
+        };
+
+        let output = runtime.apply_checked_step(&step).unwrap();
+        let todos = output
+            .state_summary
+            .get("todos")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(todos[0]["title"], "Read documentation");
+        assert_eq!(todos[0]["completed"], true);
+        assert_eq!(todos[3]["title"], "Buy groceries");
+        assert_eq!(todos[3]["completed"], false);
+        assert_eq!(
+            output
+                .semantic_deltas
+                .iter()
+                .filter(|delta| delta.field_path.as_deref() == Some("completed"))
+                .count(),
+            1
+        );
     }
 
     #[test]

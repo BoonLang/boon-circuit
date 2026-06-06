@@ -83,6 +83,17 @@ store: [
         |> List/retain(signal_catalog_item, if: signal_catalog_item.selected_once)
         |> List/count()
 
+    row_selected_signal_key:
+        signal_catalog
+        |> List/map(signal_catalog_item, new: LATEST {
+            signal_catalog_item.signal_elements.select_signal.event.press
+                |> THEN { signal_catalog_item.key }
+        })
+        |> List/latest()
+
+    data_bus_alias:
+        List/find_value(signal_catalog, field: key, value: TEXT { data_bus }, target: alias, fallback: Text/empty())
+
     signal_search_text:
         Text/empty() |> HOLD signal_search_text {
             LATEST {

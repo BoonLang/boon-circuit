@@ -541,6 +541,27 @@ store: [
             elements.show_empty.event.press |> THEN { TEXT { no group } }
         }
 
+    group_to_create:
+        LATEST {
+            elements.group_create.event.press |> THEN { TEXT { Core bus group } }
+        }
+
+    groups:
+        LIST {}
+        |> List/append(item: group_to_create |> THEN {
+            [
+                name: group_to_create
+                members_label: TEXT { clk, reset_n, data_bus[7:0], temperature }
+            ]
+        })
+        |> List/map(group, new: new_signal_group(group: group, store: store))
+        |> List/remove(group, when:
+            LATEST {
+                elements.load_fixture.event.press |> THEN { True }
+                elements.show_empty.event.press |> THEN { True }
+            }
+        )
+
     selected_rows_profile:
         LATEST {
             TEXT { Empty }
@@ -1531,6 +1552,30 @@ FUNCTION new_marker(marker, store) {
                     store.elements.marker_rename.event.press |> THEN { TEXT { data stable } }
                 }
             }
+    ]
+}
+
+FUNCTION new_signal_group(group, store) {
+    [
+        group_elements: [
+            collapse_group: SOURCE
+            expand_group: SOURCE
+        ]
+        name: group.name
+        members_label: group.members_label
+        collapsed:
+            False |> HOLD collapsed {
+                LATEST {
+                    store.elements.group_toggle.event.press |> THEN { True }
+                    store.elements.group_expand.event.press |> THEN { False }
+                }
+            }
+        state_label:
+            collapsed |> WHEN {
+                True => TEXT { Collapsed }
+                False => TEXT { Expanded }
+            }
+        row_count_label: TEXT { 4 grouped signals }
     ]
 }
 

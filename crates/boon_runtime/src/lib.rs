@@ -5275,7 +5275,7 @@ impl GenericScheduledRuntime {
         seq: TickSeq,
         mut resolve_index: impl FnMut(&str, GenericSourceEvent<'a>) -> RuntimeResult<Option<usize>>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
-        let list = self.source_action_list_for_event(step_id, source_event.source)?;
+        let list = self.source_action_list_for_top_level_event(step_id, source_event)?;
         let index = match list.as_deref() {
             Some(list) => resolve_index(list, source_event)?,
             None => None,
@@ -5365,14 +5365,50 @@ impl GenericScheduledRuntime {
         })
     }
 
+    fn source_action_list_for_top_level_event(
+        &self,
+        step_id: &str,
+        source_event: GenericSourceEvent<'_>,
+    ) -> RuntimeResult<Option<String>> {
+        if source_event.address.is_some() {
+            return self.source_action_list_for_event(step_id, source_event.source);
+        }
+        let lists = self.source_action_lists_for_event(source_event.source)?;
+        if source_event.target_text.is_some() && lists.len() <= 1 {
+            return self.source_action_list_for_event(step_id, source_event.source);
+        }
+        match lists.as_slice() {
+            [] => Ok(None),
+            [list] => Ok(Some(list.clone())),
+            _ => Ok(None),
+        }
+    }
+
     fn source_action_list_for_event(
         &self,
         step_id: &str,
         source: &str,
     ) -> RuntimeResult<Option<String>> {
+        let lists = self.source_action_lists_for_event(source)?;
+        let mut list = None;
+        for action_list in lists {
+            if let Some(existing) = list.as_ref()
+                && existing != &action_list
+            {
+                return Err(format!(
+                    "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
+                )
+                .into());
+            }
+            list = Some(action_list);
+        }
+        Ok(list)
+    }
+
+    fn source_action_lists_for_event(&self, source: &str) -> RuntimeResult<Vec<String>> {
         let source_id = self.source_routes.require_source_id(source)?;
         let actions = self.source_routes.actions_for_source_id(source_id)?;
-        let mut list = None;
+        let mut lists = Vec::new();
         for action in actions {
             let action_list = match action {
                 SourceAction::RootScalar
@@ -5388,18 +5424,12 @@ impl GenericScheduledRuntime {
                 }
             };
             if let Some(action_list) = action_list {
-                if let Some(existing) = list.as_ref()
-                    && existing != &action_list
-                {
-                    return Err(format!(
-                        "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
-                    )
-                    .into());
+                if !lists.iter().any(|existing| existing == &action_list) {
+                    lists.push(action_list);
                 }
-                list = Some(action_list);
             }
         }
-        Ok(list)
+        Ok(lists)
     }
 
     fn indexed_target_list(&self, target: &str) -> RuntimeResult<&str> {
@@ -11306,6 +11336,7 @@ struct RuntimeDerivedTextTransform {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeDerivedTextExpression {
+    Const { value: String },
     EnterKeyPayloadTextTrimNonEmpty,
     EnterKeyRootTextTrimNonEmpty { path: String },
     SourceRootText { path: String },
@@ -11319,6 +11350,9 @@ fn source_event_transform_text_expression(
 ) -> RuntimeDerivedTextExpression {
     let exprs = statement_ast_exprs(&value.statement, expressions);
     let Some(path) = text_trim_input_path_from_exprs(&exprs) else {
+        if let Some(value) = source_then_const_text_value(&exprs, source) {
+            return RuntimeDerivedTextExpression::Const { value };
+        }
         let Some(path) = source_then_text_value(&exprs, source) else {
             return RuntimeDerivedTextExpression::Unsupported;
         };
@@ -11954,6 +11988,7 @@ impl DerivedEquationPlan {
             return Ok(None);
         };
         match &transform.expression {
+            RuntimeDerivedTextExpression::Const { value } => Ok(Some(Cow::Owned(value.clone()))),
             RuntimeDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
                 if key != Some("Enter") {
                     return Ok(None);
@@ -12703,6 +12738,23 @@ fn source_then_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
     })
 }
 
+fn source_then_const_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        let input_path = ast_argument_value_in_exprs(exprs, input)?;
+        if !source_event_path_matches(&input_path, source)
+            && !source_path_before_line_matches(exprs, expr.line, source)
+        {
+            return None;
+        }
+        output
+            .and_then(|output| ast_const_text_value_in_exprs(exprs, output))
+            .or_else(|| const_text_value_after_line(exprs, expr.line))
+    })
+}
+
 fn source_path_before_line_matches(exprs: &[AstExpr], line: usize, source: &str) -> bool {
     exprs
         .iter()
@@ -12715,11 +12767,26 @@ fn source_path_before_line_matches(exprs: &[AstExpr], line: usize, source: &str)
         .is_some_and(|path| source_event_path_matches(&path, source))
 }
 
+fn const_text_value_after_line(exprs: &[AstExpr], line: usize) -> Option<String> {
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line)
+        .find_map(|expr| ast_const_text_value_in_exprs(exprs, expr.id))
+}
+
 fn simple_value_after_line(exprs: &[AstExpr], line: usize) -> Option<String> {
     exprs
         .iter()
         .filter(|expr| expr.line > line)
         .find_map(|expr| ast_simple_text_value_in_exprs(exprs, expr.id))
+}
+
+fn ast_const_text_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 fn ast_simple_text_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
@@ -16556,6 +16623,152 @@ FUNCTION new_marker(marker, store) {
         }));
         let summary = output.state_summary;
         assert_eq!(summary["markers"][0]["label"], "data stable");
+    }
+
+    #[test]
+    fn source_const_text_appends_structural_list_row_from_ir() {
+        let source = r#"
+store: [
+    elements: [
+        create_group: SOURCE
+        collapse_group: SOURCE
+        reset: SOURCE
+    ]
+    group_to_create:
+        LATEST {
+            elements.create_group.event.press |> THEN { TEXT { Core bus group } }
+        }
+    groups:
+        LIST {}
+        |> List/append(item: group_to_create |> THEN {
+            [
+                name: group_to_create
+            ]
+        })
+        |> List/map(group, new: new_group(group: group, store: store))
+        |> List/remove(group, when:
+            LATEST {
+                elements.reset.event.press |> THEN { True }
+            }
+        )
+    markers:
+        LIST {
+            [label: TEXT { 42 ns }]
+        }
+        |> List/map(marker, new: new_marker(marker: marker))
+        |> List/remove(marker, when:
+            LATEST {
+                elements.reset.event.press |> THEN { True }
+            }
+        )
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Groups }))
+
+FUNCTION new_group(group, store) {
+    [
+        group_elements: [
+            collapse_group: SOURCE
+        ]
+        name: group.name
+        collapsed:
+            False |> HOLD collapsed {
+                LATEST {
+                    store.elements.collapse_group.event.press |> THEN { True }
+                }
+            }
+    ]
+}
+
+FUNCTION new_marker(marker) {
+    [
+        label: marker.label
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("source-const-append-row", source)
+            .expect("runtime should load const append source");
+        let mut create_expected = BTreeMap::new();
+        create_expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.create_group".to_owned()),
+        );
+        let create_step = ScenarioStep {
+            id: "create-group".to_owned(),
+            expected_source_event: Some(create_expected),
+            expect_semantic_delta_contains: vec!["ListInsert".to_owned()],
+            ..ScenarioStep::default()
+        };
+        let create_output = runtime
+            .apply_source_event_for_step(
+                &create_step,
+                LiveSourceEvent {
+                    source: "store.elements.create_group".to_owned(),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        assert!(create_output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "ListInsert"
+                && delta.list_id.as_deref() == Some("groups")
+                && matches!(&delta.value, ProtocolValue::Text(value) if value == "Core bus group")
+        }));
+
+        let mut collapse_expected = BTreeMap::new();
+        collapse_expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.collapse_group".to_owned()),
+        );
+        let collapse_step = ScenarioStep {
+            id: "collapse-group".to_owned(),
+            expected_source_event: Some(collapse_expected),
+            expect_semantic_delta_contains: vec!["FieldSet:collapsed".to_owned()],
+            ..ScenarioStep::default()
+        };
+        let collapse_output = runtime
+            .apply_source_event_for_step(
+                &collapse_step,
+                LiveSourceEvent {
+                    source: "store.elements.collapse_group".to_owned(),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        assert!(collapse_output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.list_id.as_deref() == Some("groups")
+                && delta.field_path.as_deref() == Some("collapsed")
+                && matches!(&delta.value, ProtocolValue::Bool(true))
+        }));
+
+        let mut reset_expected = BTreeMap::new();
+        reset_expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.reset".to_owned()),
+        );
+        let reset_step = ScenarioStep {
+            id: "reset-groups-and-markers".to_owned(),
+            expected_source_event: Some(reset_expected),
+            expect_semantic_delta_contains: vec!["ListRemove".to_owned()],
+            ..ScenarioStep::default()
+        };
+        let reset_output = runtime
+            .apply_source_event_for_step(
+                &reset_step,
+                LiveSourceEvent {
+                    source: "store.elements.reset".to_owned(),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        let removed_lists = reset_output
+            .semantic_deltas
+            .iter()
+            .filter(|delta| delta.kind == "ListRemove")
+            .filter_map(|delta| delta.list_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert!(removed_lists.contains("groups"));
+        assert!(removed_lists.contains("markers"));
     }
 
     #[test]

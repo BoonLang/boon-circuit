@@ -138,7 +138,7 @@ FUNCTION browser_band() {
         gap: 8
         style: [
             width: Fill
-            height: 322
+            height: 286
             paint: False
         ]
         items: LIST {
@@ -155,7 +155,7 @@ FUNCTION selected_waveform_band() {
         gap: 8
         style: [
             width: Fill
-            height: Fill
+            height: 650
             gap: 0
             paint: False
         ]
@@ -812,8 +812,8 @@ FUNCTION timeline_toolbar() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 5
-        style: [width: Fill, height: 104, paint: False]
+        gap: 3
+        style: [width: Fill, height: 72, paint: False]
         items: LIST {
             timeline_navigation_controls()
             selected_row_controls()
@@ -828,7 +828,7 @@ FUNCTION timeline_navigation_controls() {
         element: []
         direction: Row
         gap: 6
-        style: [width: Fill, height: 28, paint: False]
+        style: [width: Fill, height: 22, paint: False]
         items: LIST {
             zoom_in_button()
             zoom_out_button()
@@ -852,7 +852,7 @@ FUNCTION selected_row_controls() {
         element: []
         direction: Row
         gap: 10
-        style: [width: Fill, height: 28, paint: False]
+        style: [width: Fill, height: 22, paint: False]
         items: LIST {
             remove_data_button()
             control_separator()
@@ -876,7 +876,7 @@ FUNCTION analog_limit_controls() {
         element: []
         direction: Row
         gap: 10
-        style: [width: Fill, height: 28, paint: False]
+        style: [width: Fill, height: 22, paint: False]
         items: LIST {
             analog_auto_button()
             control_separator()
@@ -1140,10 +1140,23 @@ FUNCTION waveform_rows_expanded() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 2
-        style: [width: Fill, height: Fill, paint: False]
+        gap: 1
+        style: [
+            width: Fill
+            height: 360
+            padding: 0
+            rounded_corners: 0
+            scroll_y: True
+            scrollbars: True
+            background: [color: TEXT { #020817 }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1f2a3c }
+                Light => TEXT { #1f2a3c }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+        ]
         items:
-            PASSED.store.selected_signal_rows |> List/map(row, new: selected_waveform_row(row: row))
+            PASSED.store.selected_signals |> List/map(row, new: selected_waveform_row(row: row))
     )
 }
 
@@ -1193,15 +1206,15 @@ FUNCTION waveform_row(signal) {
             style: [
                 width: Fill
                 height: PASSED.store.row_height
-                padding: 5
-                rounded_corners: 9
+                padding: 0
+                rounded_corners: 0
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #101A2B }
-                    Light => TEXT { #F4F8FF }
+                    Dark => TEXT { #0b1220 }
+                    Light => TEXT { #f8fafc }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #263753 }
-                    Light => TEXT { #B8C8DF }
+                    Dark => TEXT { #243449 }
+                    Light => TEXT { #cfd8e6 }
                 }]
                 material: active |> WHEN {
                     True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -1223,8 +1236,8 @@ FUNCTION signal_select_button(signal) {
         style: [
             width: 145
             height: Fill
-            padding: 6
-            rounded_corners: 8
+            padding: [left: 10, right: 8]
+            rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #0A1322 }
                 Light => TEXT { #FFFFFF }
@@ -1305,11 +1318,11 @@ FUNCTION wave_area(signal) {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #101a2b }
+                Light => TEXT { #020817 }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #93b4e8 }
+                Light => TEXT { #1f2a3c }
             }]
             glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
@@ -1317,7 +1330,7 @@ FUNCTION wave_area(signal) {
             scrollbars: True
         ]
         items:
-            NovyFixtures/segments(of: signal.id)
+            NovyFixtures/segments(signal_id: signal.id)
             |> List/map(segment, new: waveform_segment(segment: segment))
     )
 }
@@ -1478,7 +1491,7 @@ FUNCTION waveform_trace_cell_blue(segment) {
             width: Fill
             height: NovyTheme/trace_height(state: segment.state)
             align: [column: Center]
-            rounded_corners: 2
+            rounded_corners: 0
             background: [color: TEXT { #2563EB }]
             border: [color: TEXT { #60A5FA }]
             glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
@@ -1501,7 +1514,7 @@ FUNCTION waveform_trace_cell_blue(segment) {
 FUNCTION waveform_trace_cell_dark(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Dark), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -1509,7 +1522,7 @@ FUNCTION waveform_trace_cell_dark(segment) {
 FUNCTION waveform_trace_cell_sky(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Sky), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -1517,7 +1530,7 @@ FUNCTION waveform_trace_cell_sky(segment) {
 FUNCTION waveform_trace_cell_indigo(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Indigo), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -1525,7 +1538,7 @@ FUNCTION waveform_trace_cell_indigo(segment) {
 FUNCTION waveform_trace_cell_cyan(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Cyan), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -1533,7 +1546,7 @@ FUNCTION waveform_trace_cell_cyan(segment) {
 FUNCTION waveform_trace_cell_pale(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Pale), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -1542,7 +1555,7 @@ FUNCTION variables_panel() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 8
+        gap: 4
         style: [
             width: Fill
             height: Fill
@@ -1579,7 +1592,10 @@ FUNCTION variables_panel() {
 }
 
 FUNCTION variables_list() {
-    variables_signal_list(list: PASSED.store.search_results, height_value: 150)
+    PASSED.store.signal_search_text == TEXT {} |> WHEN {
+        True => variables_list_for_scope()
+        False => variables_signal_list(list: PASSED.store.search_results, height_value: 108)
+    }
 }
 
 FUNCTION variables_list_for_scope() {
@@ -1593,7 +1609,18 @@ FUNCTION variables_list_for_scope() {
 }
 
 FUNCTION variables_list_all() {
-    variables_signal_list(list: NovyFixtures/scope_cpu_visible_signals(), height_value: 150)
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 108, paint: False]
+        items: LIST {
+            variable_clk_button()
+            variable_reset_button()
+            variable_data_button()
+            variable_data_valid_row()
+        }
+    )
 }
 
 FUNCTION variables_list_clk() {
@@ -1621,11 +1648,32 @@ FUNCTION variables_list_vcore() {
 }
 
 FUNCTION variables_list_uart() {
-    variables_signal_list(list: NovyFixtures/scope_uart_signals(), height_value: 150)
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 96, paint: False]
+        items: LIST {
+            variable_uart_tx_row()
+            variable_uart_rx_row()
+            variable_baud_tick_row()
+            variable_uart_busy_row()
+            variable_framing_error_row()
+        }
+    )
 }
 
 FUNCTION variables_list_analog() {
-    variables_signal_list(list: NovyFixtures/scope_analog_signals(), height_value: 150)
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 54, paint: False]
+        items: LIST {
+            variable_temperature_button()
+            variable_vcore_row()
+        }
+    )
 }
 
 FUNCTION variables_signal_list(list, height_value) {
@@ -2075,14 +2123,14 @@ FUNCTION inspector_strip() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 4
-        style: [width: Fill, height: 90, paint: False]
+        gap: 2
+        style: [width: Fill, height: 62, paint: False]
         items: LIST {
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 6
-                style: [width: Fill, height: 42, paint: False]
+                style: [width: Fill, height: 30, paint: False]
                 items: LIST {
                     compact_inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label, row_width: 118)
                     compact_inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label, row_width: 76)
@@ -2094,7 +2142,7 @@ FUNCTION inspector_strip() {
                 element: []
                 direction: Row
                 gap: 6
-                style: [width: Fill, height: 42, paint: False]
+                style: [width: Fill, height: 30, paint: False]
                 items: LIST {
                     compact_inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label, row_width: 76)
                     compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
@@ -2171,8 +2219,8 @@ FUNCTION compact_inspector_row(row_label, row_value, row_width) {
         gap: 2
         style: [
             width: row_width
-            height: 40
-            padding: [left: 8, right: 8, top: 4, bottom: 4]
+            height: 29
+            padding: [left: 8, right: 8, top: 2, bottom: 2]
             rounded_corners: 9
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #101a2b }
@@ -2185,8 +2233,8 @@ FUNCTION compact_inspector_row(row_label, row_value, row_width) {
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
-            text_line(label_text: row_label, font: Muted, width: Fill, height: 12)
-            text_line(label_text: row_value, font: Mono, width: Fill, height: 18)
+            text_line(label_text: row_label, font: Muted, width: Fill, height: 10)
+            text_line(label_text: row_value, font: Mono, width: Fill, height: 14)
         }
     )
 }
@@ -2209,7 +2257,7 @@ FUNCTION row_resize_controls_compact() {
         element: []
         direction: Row
         gap: 6
-        style: [width: 104, height: 36, paint: False]
+        style: [width: 104, height: 28, paint: False]
         items: LIST {
             row_shorter_button_compact()
             row_taller_button_compact()
@@ -2222,7 +2270,7 @@ FUNCTION format_palette() {
         element: []
         direction: Row
         gap: 6
-        style: [width: Fill, height: 32, paint: False]
+        style: [width: Fill, height: 22, paint: False]
         items: LIST {
             format_hex_button()
             format_binary_button()

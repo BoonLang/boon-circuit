@@ -271,7 +271,7 @@ expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "ke
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary", "bridge_request_descriptor_label" = "TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary", "bridge_response_page" = "CLK_FIT", "bridge_response_fingerprint" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_scope" = "TOP_CPU", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "bridge_response_window_label" = "0 ns - 120 ns", "stale_response_policy" = "canonical structural request equality required" }
+expect_root_text = { "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary", "bridge_request_descriptor_label" = "TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary", "bridge_request_structural_key" = "sha256:fixture-counter-vcd|wave:vcd:counter:0-240ns|TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary|24 ns - 48 ns", "bridge_response_page" = "CLK_FIT", "bridge_response_fingerprint" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_structural_key" = "sha256:fixture-counter-vcd|wave:vcd:counter:0-240ns|TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal|0 ns - 120 ns", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_scope" = "TOP_CPU", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "bridge_response_window_label" = "0 ns - 120 ns", "stale_response_policy" = "canonical structural request equality required" }
 
 [[step]]
 id = "toggle-marker"
@@ -325,13 +325,13 @@ expect_semantic_delta_contains = ["FieldSet:collapsed"]
 id = "row-tall"
 user_action = { kind = "click", target = "row taller" }
 expected_source_event = { source = "store.elements.row_taller" }
-expect_root_text = { "row_size" = "Tall", "row_height" = "58" }
+expect_root_text = { "row_size" = "Tall", "row_height" = "44" }
 
 [[step]]
 id = "row-compact"
 user_action = { kind = "click", target = "row shorter" }
 expected_source_event = { source = "store.elements.row_shorter" }
-expect_root_text = { "row_size" = "Compact", "row_height" = "34" }
+expect_root_text = { "row_size" = "Compact", "row_height" = "22" }
 
 [[step]]
 id = "switch-light"

@@ -325,13 +325,13 @@ FUNCTION trace_cell_material(mode, state, tone) {
 
 FUNCTION trace_height(state) {
     state |> WHEN {
-        High => 18
-        Low => 6
-        Unknown => 14
-        AnalogLow => 8
-        AnalogMid => 15
-        AnalogHigh => 24
-        __ => 10
+        High => 22
+        Low => 22
+        Unknown => 22
+        AnalogLow => 12
+        AnalogMid => 17
+        AnalogHigh => 22
+        __ => 18
     }
 }
 

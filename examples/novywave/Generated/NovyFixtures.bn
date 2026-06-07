@@ -46,28 +46,28 @@ FUNCTION scope_cpu_signals() {
 
 FUNCTION scope_cpu_visible_signals() {
     LIST {
-        [id: TEXT { clk }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
-        [id: TEXT { reset_n }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
-        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
-        [id: TEXT { data_valid }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
-        [id: TEXT { data_ready }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { clk }, key: TEXT { clk }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { reset_n }, key: TEXT { reset_n }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
+        [id: TEXT { data_bus }, key: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_valid }, key: TEXT { data_valid }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }]
+        [id: TEXT { data_ready }, key: TEXT { data_ready }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }]
     }
 }
 
 FUNCTION scope_uart_signals() {
     LIST {
-        [id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
-        [id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }]
-        [id: TEXT { baud_tick }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }]
-        [id: TEXT { uart_busy }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }]
-        [id: TEXT { framing_error }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }]
+        [id: TEXT { tx_data }, key: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }]
+        [id: TEXT { rx_data }, key: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }]
+        [id: TEXT { baud_tick }, key: TEXT { baud_tick }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }]
+        [id: TEXT { uart_busy }, key: TEXT { uart_busy }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }]
+        [id: TEXT { framing_error }, key: TEXT { framing_error }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }]
     }
 }
 
 FUNCTION scope_analog_signals() {
     LIST {
-        [id: TEXT { temperature }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }]
-        [id: TEXT { voltage }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }]
+        [id: TEXT { temperature }, key: TEXT { temperature }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }]
+        [id: TEXT { voltage }, key: TEXT { voltage }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }]
     }
 }
 
@@ -289,8 +289,8 @@ FUNCTION signal_value(signal, format) {
     }
 }
 
-FUNCTION segments(of) {
-    of |> WHEN {
+FUNCTION segments(signal_id) {
+    signal_id |> WHEN {
         TEXT { clk } => LIST {
             [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 28, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]

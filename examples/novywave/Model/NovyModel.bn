@@ -46,10 +46,10 @@ FUNCTION format_label(format) {
 
 FUNCTION row_height(size) {
     size |> WHEN {
-        TEXT { Compact } => 34
-        TEXT { Normal } => 36
-        TEXT { Tall } => 58
-        __ => 36
+        TEXT { Compact } => 22
+        TEXT { Normal } => 28
+        TEXT { Tall } => 44
+        __ => 28
     }
 }
 

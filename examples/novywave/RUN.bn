@@ -471,7 +471,6 @@ store: [
 
     selected_signals:
         selected_signal_rows
-        |> List/map(selected_signal, new: new_selected_signal(selected_signal: selected_signal, store: store))
 
     data_bus_alias:
         List/find_value(signal_catalog, field: key, value: TEXT { data_bus }, target: alias, fallback: Text/empty())
@@ -1146,9 +1145,9 @@ store: [
 
     row_height:
         LATEST {
-            36
-            elements.row_taller.event.press |> THEN { 58 }
-            elements.row_shorter.event.press |> THEN { 34 }
+            28
+            elements.row_taller.event.press |> THEN { 44 }
+            elements.row_shorter.event.press |> THEN { 22 }
         }
 
     bridge_request_fingerprint:
@@ -1262,6 +1261,92 @@ store: [
             }
         }
 
+    bridge_request_window_label:
+        TEXT { no request window } |> HOLD bridge_request_window_label {
+            LATEST {
+                elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
+                elements.select_clk.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { 0 ns - 120 ns }
+                        Off => TEXT { no request window }
+                    }
+                }
+                elements.select_temperature.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_cycle.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_hex.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_grouped.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_octal.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_signed.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_unsigned.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_ascii.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
+                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+                elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+                elements.keyboard_capture.key |> WHEN {
+                    A => TEXT { 24 ns - 48 ns }
+                    D => TEXT { 48 ns - 72 ns }
+                    Q => TEXT { 48 ns - 72 ns }
+                    E => TEXT { 48 ns - 72 ns }
+                    W => TEXT { 36 ns - 60 ns }
+                    S => TEXT { 60 ns - 240 ns }
+                    __ => SKIP
+                }
+                elements.load_fixture.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.show_empty.event.press |> THEN { TEXT { no request window } }
+            }
+        }
+
+    bridge_request_structural_key:
+        bridge_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                bridge_file_digest
+                |> Text/concat(with: bridge_waveform_ref, separator: "|")
+                |> Text/concat(with: bridge_request_descriptor_label, separator: "|")
+                |> Text/concat(with: bridge_request_window_label, separator: "|")
+        }
+
+    bridge_response_file_digest:
+        TEXT { sha256:none } |> HOLD bridge_response_file_digest {
+            LATEST {
+                elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
+                elements.cursor_left.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+                elements.load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+                elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
+            }
+        }
+
+    bridge_response_waveform_ref:
+        TEXT { wave:none } |> HOLD bridge_response_waveform_ref {
+            LATEST {
+                elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
+                elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+                elements.load_fixture.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+                elements.show_empty.event.press |> THEN { TEXT { wave:none } }
+            }
+        }
+
+    bridge_response_structural_key:
+        bridge_response_descriptor_label == TEXT { No response available } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                bridge_response_file_digest
+                |> Text/concat(with: bridge_response_waveform_ref, separator: "|")
+                |> Text/concat(with: bridge_response_descriptor_label, separator: "|")
+                |> Text/concat(with: bridge_response_window_label, separator: "|")
+        }
+
     bridge_response_fingerprint:
         bridge_response_descriptor_label
 
@@ -1329,7 +1414,7 @@ store: [
                 pan: pan_window
                 cursor: cursor_position
                 format: value_format
-                window: viewport_label
+                window: bridge_request_window_label
             ]
             window: bridge_page_window_label
             hierarchy_cursor: bridge_hierarchy_page_cursor_label
@@ -1347,8 +1432,8 @@ store: [
             fingerprint: bridge_response_fingerprint
             identity: [
                 module: TEXT { wellen.v1 }
-                file_digest: bridge_file_digest
-                waveform_ref: bridge_waveform_ref
+                file_digest: bridge_response_file_digest
+                waveform_ref: bridge_response_waveform_ref
                 scope: bridge_descriptor_scope_label(descriptor: bridge_response_descriptor_label)
                 signal: bridge_descriptor_signal_label(descriptor: bridge_response_descriptor_label)
                 zoom: bridge_descriptor_zoom_label(descriptor: bridge_response_descriptor_label)
@@ -1479,10 +1564,10 @@ store: [
         }
 
     bridge_response_status:
-        bridge_page_match_status(request: bridge_request_descriptor_label, response: bridge_response_descriptor_label)
+        bridge_page_match_status(request: bridge_request_structural_key, response: bridge_response_structural_key)
 
     bridge_response_status_compact_label:
-        bridge_page_match_compact_label(request: bridge_request_descriptor_label, response: bridge_response_descriptor_label)
+        bridge_page_match_compact_label(request: bridge_request_structural_key, response: bridge_response_structural_key)
 
     stale_response_policy: TEXT { canonical structural request equality required }
     bridge_contract: TEXT { wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats }
@@ -1493,7 +1578,7 @@ store: [
 ]
 
 FUNCTION bridge_page_match_status(request, response) {
-    request == TEXT { No request scheduled } |> WHEN {
+    request == TEXT { no-request } |> WHEN {
         True => TEXT { NOT_REQUESTED }
         False => request == response |> WHEN {
             True => TEXT { ACCEPTED_CURRENT_PAGE }
@@ -1503,7 +1588,7 @@ FUNCTION bridge_page_match_status(request, response) {
 }
 
 FUNCTION bridge_page_match_compact_label(request, response) {
-    request == TEXT { No request scheduled } |> WHEN {
+    request == TEXT { no-request } |> WHEN {
         True => TEXT { NONE }
         False => request == response |> WHEN {
             True => TEXT { CURRENT }
@@ -1634,17 +1719,6 @@ FUNCTION new_signal_group(group, store) {
                 False => TEXT { Expanded }
             }
         row_count_label: TEXT { 4 grouped signals }
-    ]
-}
-
-FUNCTION new_selected_signal(selected_signal, store) {
-    [
-        id: selected_signal.id
-        name: selected_signal.name
-        current_value: selected_signal.current_value
-        kind: selected_signal.kind
-        row_height: store.row_height
-        row_size: store.row_size
     ]
 }
 

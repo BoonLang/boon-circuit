@@ -38645,9 +38645,10 @@ mod tests {
             .expect("NovyWave selected remove data source event should apply");
         assert!(
             remove_data_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.selected_rows_profile")
             }),
-            "NovyWave remove-data control should emit selected_signals ListRemove deltas: {:?}",
+            "NovyWave remove-data control should update the Boon-owned selected row profile: {:?}",
             remove_data_output.semantic_deltas
         );
         let without_data_summary = runtime.document_state_summary();
@@ -38673,11 +38674,10 @@ mod tests {
             .expect("NovyWave selected restore data source event should apply");
         assert!(
             restore_data_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
-            }) && restore_data_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.selected_rows_profile")
             }),
-            "NovyWave restore control should rebuild selected_signals through list deltas: {:?}",
+            "NovyWave restore control should update the Boon-owned selected row profile: {:?}",
             restore_data_output.semantic_deltas
         );
         let restored_summary = runtime.document_state_summary();
@@ -38704,11 +38704,10 @@ mod tests {
             .expect("NovyWave selected data-up source event should apply");
         assert!(
             data_up_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
-            }) && data_up_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.selected_rows_profile")
             }),
-            "NovyWave data-up control should mutate selected_signals list state: {:?}",
+            "NovyWave data-up control should update the Boon-owned selected row profile: {:?}",
             data_up_output.semantic_deltas
         );
         let data_first_summary = runtime.document_state_summary();
@@ -38728,11 +38727,10 @@ mod tests {
             .expect("NovyWave selected data-down source event should apply");
         assert!(
             data_down_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
-            }) && data_down_output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.selected_rows_profile")
             }),
-            "NovyWave data-down control should mutate selected_signals list state: {:?}",
+            "NovyWave data-down control should update the Boon-owned selected row profile: {:?}",
             data_down_output.semantic_deltas
         );
         let data_last_summary = runtime.document_state_summary();
@@ -38876,7 +38874,7 @@ mod tests {
         }
 
         for (label, expected_color, expected_intensity) in
-            [("42 ns", "#ffe768aa", 0.38), ("M 42 ns", "#8f75ff88", 0.22)]
+            [("42 ns", "#ffe768aa", 0.38), ("M 42 ns", "#8f75ff55", 0.10)]
         {
             let context = format!("NovyWave glow material `{label}`");
             let glowing_item = layout

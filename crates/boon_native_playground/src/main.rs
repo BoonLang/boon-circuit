@@ -39400,7 +39400,7 @@ mod tests {
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_text_from_map(&item.style, "glow_color") == Some("#8f75ff88")
+                    style_text_from_map(&item.style, "glow_color") == Some("#8f75ff55")
                         && item.bounds.width >= 100.0
                         && item.bounds.height >= 14.0
                 })
@@ -39419,7 +39419,7 @@ mod tests {
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_text_from_map(&item.style, "glow_color") == Some("#3b82f655")
+                    style_text_from_map(&item.style, "glow_color") == Some("#3b82f62a")
                         && item.bounds.width > 20.0
                         && item.bounds.height >= 10.0
                 })

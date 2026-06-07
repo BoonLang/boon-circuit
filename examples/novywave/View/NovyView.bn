@@ -278,8 +278,8 @@ FUNCTION left_panel() {
                 Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #2f80ed }
-                Light => TEXT { #2563eb }
+                Dark => TEXT { #304057 }
+                Light => TEXT { #c9d7ea }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
@@ -753,8 +753,8 @@ FUNCTION timeline_panel() {
                 Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #2f80ed }
-                Light => TEXT { #2563eb }
+                Dark => TEXT { #304057 }
+                Light => TEXT { #c9d7ea }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
@@ -1311,7 +1311,7 @@ FUNCTION wave_area(signal) {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
@@ -1481,7 +1481,7 @@ FUNCTION waveform_trace_cell_blue(segment) {
             rounded_corners: 2
             background: [color: TEXT { #2563EB }]
             border: [color: TEXT { #60A5FA }]
-            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)
         ]
         label: Scene/Element/text(
@@ -1554,8 +1554,8 @@ FUNCTION variables_panel() {
                 Light => TEXT { #f8fafc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #2f80ed }
-                Light => TEXT { #2563eb }
+                Dark => TEXT { #304057 }
+                Light => TEXT { #c9d7ea }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
@@ -2048,10 +2048,10 @@ FUNCTION variable_chip_literal(label_text) {
             height: 20
             rounded_corners: 10
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1d4ed8 }
-                Light => TEXT { #d7e9ff }
+                Dark => TEXT { #24385f }
+                Light => TEXT { #e5edf7 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
         ]
         label: Scene/Element/text(
             element: []

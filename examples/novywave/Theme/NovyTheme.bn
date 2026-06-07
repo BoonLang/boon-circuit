@@ -12,30 +12,30 @@ FUNCTION material(mode, of) {
 
         PanelSurface => [
             color: PASSED.mode |> WHEN {
-                Dark => TEXT { #172033 }
+                Dark => TEXT { #162033 }
                 Light => TEXT { #f8fafc }
             }
             gloss: 0.07
             metal: 0.0
             transparency: PASSED.mode |> WHEN {
-                Dark => 0.08
+                Dark => 0.06
                 Light => 0.10
             }
             frosted_blur: 10
-            frosted_saturate: 1.14
-            glass_highlight: 0.32
+            frosted_saturate: 1.06
+            glass_highlight: 0.18
             glass_highlight_color: PASSED.mode |> WHEN {
-                Dark => TEXT { #dce8ff38 }
-                Light => TEXT { #ffffffa3 }
+                Dark => TEXT { #dce8ff24 }
+                Light => TEXT { #ffffff8f }
             }
             border: PASSED.mode |> WHEN {
-                Dark => TEXT { #2f80ed }
-                Light => TEXT { #2563eb }
+                Dark => TEXT { #304057 }
+                Light => TEXT { #c9d7ea }
             }
             border_width: 1
             shadows: LIST {
-                [y: 1, blur: 2, color: TEXT { #ffffff40 }]
-                [y: 14, blur: 30, color: TEXT { #1d4ed829 }]
+                [y: 1, blur: 2, color: TEXT { #ffffff22 }]
+                [y: 12, blur: 24, color: TEXT { #0b122024 }]
             }
         ]
 
@@ -119,7 +119,10 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #3b82f6 }
                 Light => TEXT { #2563eb }
             }
-            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
+            glow: PASSED.mode |> WHEN {
+                Dark => [color: TEXT { #3b82f633 }, intensity: 0.04]
+                Light => [color: TEXT { #2563eb24 }, intensity: 0.02]
+            }
         ]
 
         TraceLow => [
@@ -135,8 +138,8 @@ FUNCTION material(mode, of) {
                 Light => TEXT { #3b82f6 }
             }
             glow: PASSED.mode |> WHEN {
-                Dark => [color: TEXT { #60a5fa88 }, intensity: 0.20]
-                Light => [color: TEXT { #3b82f642 }, intensity: 0.06]
+                Dark => [color: TEXT { #60a5fa4d }, intensity: 0.09]
+                Light => [color: TEXT { #3b82f62e }, intensity: 0.04]
             }
         ]
 
@@ -158,7 +161,7 @@ FUNCTION material(mode, of) {
                 Light => TEXT { #1267aa }
             }
             glow: PASSED.mode |> WHEN {
-                Dark => [color: TEXT { #6bbdff88 }, intensity: 0.22]
+                Dark => [color: TEXT { #6bbdff4d }, intensity: 0.10]
                 Light => [color: TEXT { #1267aa3d }, intensity: 0.05]
             }
         ]
@@ -177,22 +180,25 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #6147d9 }
                 Light => TEXT { #e7ddff }
             }
-            gloss: 0.20
-            glass_highlight: 0.30
-            glow: [color: TEXT { #8f75ff88 }, intensity: 0.22]
+            gloss: 0.12
+            glass_highlight: 0.18
+            glow: [color: TEXT { #8f75ff55 }, intensity: 0.10]
         ]
 
         SelectedRow => [
             color: PASSED.mode |> WHEN {
-                Dark => TEXT { #203b62 }
-                Light => TEXT { #d7e9ff }
+                Dark => TEXT { #1b3457 }
+                Light => TEXT { #e3efff }
             }
             border: PASSED.mode |> WHEN {
-                Dark => TEXT { #73b7ff }
-                Light => TEXT { #2474bb }
+                Dark => TEXT { #4f8cc8 }
+                Light => TEXT { #4f8cc8 }
             }
             border_width: 1
-            glow: [color: TEXT { #60a5fa55 }, intensity: 0.12]
+            glow: PASSED.mode |> WHEN {
+                Dark => [color: TEXT { #60a5fa33 }, intensity: 0.06]
+                Light => [color: TEXT { #2474bb24 }, intensity: 0.03]
+            }
         ]
 
         HoverControl => [

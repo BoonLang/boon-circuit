@@ -264,12 +264,12 @@ store: [
 
     compare_request_page:
         LATEST {
-            TEXT { PAGE_UNAVAILABLE }
-            elements.select_counter_file.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
-            elements.load_fixture.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
-            elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
+            TEXT { compare:none }
+            elements.select_counter_file.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:counter.vcd+uart_compare.fst:0-240ns } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { compare:simple_test.ghw:primary } }
+            elements.load_fixture.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
+            elements.show_empty.event.press |> THEN { TEXT { compare:none } }
         }
 
     compare_result_label:
@@ -1151,111 +1151,11 @@ store: [
             elements.row_shorter.event.press |> THEN { 34 }
         }
 
-    bridge_request_page:
-        TEXT { PAGE_UNAVAILABLE } |> HOLD bridge_request_page {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
-                elements.select_clk.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.select_reset.event.press |> THEN { TEXT { PAGE_RESET_FIT_CENTER_42_HEX } }
-                elements.select_data.event.press |> THEN {
-                    data_signal_toggle_state |> WHEN {
-                        On => TEXT { PAGE_DATA_FIT_CENTER_42_HEX }
-                        Off => TEXT { PAGE_UNAVAILABLE }
-                    }
-                }
-                elements.select_temperature.event.press |> THEN { TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX } }
-                signal_catalog
-                    |> List/map(signal_catalog_item, new:
-                        signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN {
-                            signal_catalog_item.key |> WHEN {
-                                clk => TEXT { PAGE_CLK_FIT_CENTER_42_HEX }
-                                reset_n => TEXT { PAGE_RESET_FIT_CENTER_42_HEX }
-                                data_bus => TEXT { PAGE_DATA_FIT_CENTER_42_HEX }
-                                temperature => TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX }
-                                __ => SKIP
-                            }
-                        }
-                    )
-                    |> List/latest()
-                elements.format_cycle.event.press |> THEN { TEXT { PAGE_DATA_FIT_CENTER_42_BIN } }
-                elements.format_hex.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_HEX } }
-                elements.format_grouped.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_GROUPED_BIN } }
-                elements.format_octal.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_OCTAL } }
-                elements.format_signed.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_SIGNED } }
-                elements.format_unsigned.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_UNSIGNED } }
-                elements.format_ascii.event.press |> THEN { TEXT { PAGE_DATA_FORMAT_ASCII } }
-                elements.zoom_in.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN } }
-                elements.pan_right.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN } }
-                elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
-                elements.keyboard_capture.key |> WHEN {
-                    W => TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }
-                    S => TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN }
-                    Q => TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN }
-                    E => TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN }
-                    D => TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }
-                    A => TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN }
-                    __ => SKIP
-                }
-                elements.load_fixture.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
-            }
-        }
-
     bridge_request_fingerprint:
-        TEXT { FP_NONE } |> HOLD bridge_request_fingerprint {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { FP_COMPARE_COUNTER_UART } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { FP_GHW_SIMPLE_PRIMARY } }
-                elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
-                elements.select_data.event.press |> THEN {
-                    data_signal_toggle_state |> WHEN {
-                        On => TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
-                        Off => TEXT { FP_NONE }
-                    }
-                }
-                elements.select_temperature.event.press |> THEN { TEXT { FP_ANALOG_TEMP_FIT_CENTER_42_HEX } }
-                signal_catalog
-                    |> List/map(signal_catalog_item, new:
-                        signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN {
-                            signal_catalog_item.key |> WHEN {
-                                clk => TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
-                                reset_n => TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX }
-                                data_bus => TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
-                                temperature => TEXT { FP_ANALOG_TEMP_FIT_CENTER_42_HEX }
-                                __ => SKIP
-                            }
-                        }
-                    )
-                    |> List/latest()
-                elements.format_cycle.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN } }
-                elements.format_hex.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_HEX } }
-                elements.format_grouped.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_GROUPED_BIN } }
-                elements.format_octal.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_OCTAL } }
-                elements.format_signed.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_SIGNED } }
-                elements.format_unsigned.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_UNSIGNED } }
-                elements.format_ascii.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_ASCII } }
-                elements.zoom_in.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN } }
-                elements.pan_right.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN } }
-                elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
-                elements.keyboard_capture.key |> WHEN {
-                    W => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
-                    S => TEXT { FP_CPU_DATA_WIDE_RIGHT_36_BIN }
-                    Q => TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
-                    E => TEXT { FP_CPU_DATA_CLOSE_RIGHT_48_BIN }
-                    D => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
-                    A => TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
-                    __ => SKIP
-                }
-                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
-            }
-        }
+        bridge_request_descriptor_label
+
+    bridge_request_page:
+        bridge_request_compact_label
 
     bridge_response_scope:
         TEXT { NONE } |> HOLD bridge_response_scope {
@@ -1266,6 +1166,7 @@ store: [
                 elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
                 elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
@@ -1344,35 +1245,35 @@ store: [
             }
         }
 
-    bridge_response_page:
-        TEXT { PAGE_UNAVAILABLE } |> HOLD bridge_response_page {
+    bridge_response_window_label:
+        TEXT { no response window } |> HOLD bridge_response_window_label {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
-                elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.load_fixture.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
+                elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
+                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
+                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.pan_left.event.press |> THEN { TEXT { 0 ns - 80 ns } }
+                elements.pan_right.event.press |> THEN { TEXT { 80 ns - 160 ns } }
+                elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.load_fixture.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.show_empty.event.press |> THEN { TEXT { no response window } }
             }
         }
 
     bridge_response_fingerprint:
-        TEXT { FP_NONE } |> HOLD bridge_response_fingerprint {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { FP_COMPARE_COUNTER_UART } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { FP_GHW_SIMPLE_PRIMARY } }
-                elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
-            }
-        }
+        bridge_response_descriptor_label
+
+    bridge_response_page:
+        bridge_response_compact_label
 
     bridge_request_descriptor_label:
         TEXT { No request scheduled } |> HOLD bridge_request_descriptor_label {
             LATEST {
+                elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_clk.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_reset.event.press |> THEN { TEXT { TOP_CPU/RESET_N/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_data.event.press |> THEN {
@@ -1418,6 +1319,18 @@ store: [
             page: bridge_request_page
             descriptor: bridge_request_descriptor_label
             fingerprint: bridge_request_fingerprint
+            identity: [
+                module: TEXT { wellen.v1 }
+                file_digest: bridge_file_digest
+                waveform_ref: bridge_waveform_ref
+                scope: active_scope_key
+                signal: active_signal_key
+                zoom: zoom_level
+                pan: pan_window
+                cursor: cursor_position
+                format: value_format
+                window: viewport_label
+            ]
             window: bridge_page_window_label
             hierarchy_cursor: bridge_hierarchy_page_cursor_label
             payload_limit_bytes: bridge_payload_limit_bytes
@@ -1432,6 +1345,18 @@ store: [
             page: bridge_response_page
             descriptor: bridge_response_descriptor_label
             fingerprint: bridge_response_fingerprint
+            identity: [
+                module: TEXT { wellen.v1 }
+                file_digest: bridge_file_digest
+                waveform_ref: bridge_waveform_ref
+                scope: bridge_descriptor_scope_label(descriptor: bridge_response_descriptor_label)
+                signal: bridge_descriptor_signal_label(descriptor: bridge_response_descriptor_label)
+                zoom: bridge_descriptor_zoom_label(descriptor: bridge_response_descriptor_label)
+                pan: bridge_descriptor_pan_label(descriptor: bridge_response_descriptor_label)
+                cursor: bridge_descriptor_cursor_label(descriptor: bridge_response_descriptor_label)
+                format: bridge_descriptor_format_label(descriptor: bridge_response_descriptor_label)
+                window: bridge_descriptor_window_label(descriptor: bridge_response_descriptor_label)
+            ]
             payload_limit_bytes: bridge_payload_limit_bytes
             transition_limit: bridge_transition_limit
             visible_row_limit: bridge_visible_row_limit
@@ -1440,12 +1365,12 @@ store: [
 
     bridge_signal_page_label:
         LATEST {
-            TEXT { PAGE_UNAVAILABLE }
-            elements.select_counter_file.event.press |> THEN { bridge_request_page }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
-            elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
+            TEXT { no-request }
+            elements.select_counter_file.event.press |> THEN { bridge_request_descriptor_label }
+            elements.select_uart_compare_file.event.press |> THEN { bridge_request_descriptor_label }
+            elements.select_ghw_file.event.press |> THEN { bridge_request_descriptor_label }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { no-request } }
+            elements.show_empty.event.press |> THEN { TEXT { no-request } }
         }
 
     bridge_cursor_values_label:
@@ -1534,6 +1459,9 @@ store: [
     bridge_response_compact_label:
         TEXT { NONE } |> HOLD bridge_response_compact_label {
             LATEST {
+                elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { GHW_MAIN } }
                 elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
                 elements.keyboard_capture.key |> WHEN {
                     D => TEXT { CLK_FIT }
@@ -1551,12 +1479,12 @@ store: [
         }
 
     bridge_response_status:
-        bridge_page_match_status(request: bridge_request_page, response: bridge_response_page)
+        bridge_page_match_status(request: bridge_request_descriptor_label, response: bridge_response_descriptor_label)
 
     bridge_response_status_compact_label:
-        bridge_page_match_compact_label(request: bridge_request_page, response: bridge_response_page)
+        bridge_page_match_compact_label(request: bridge_request_descriptor_label, response: bridge_response_descriptor_label)
 
-    stale_response_policy: TEXT { canonical page id equality required }
+    stale_response_policy: TEXT { canonical structural request equality required }
     bridge_contract: TEXT { wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats }
     bridge_provider_version: TEXT { planned official wellen 0.24.x provider }
     bridge_schema_version: TEXT { wellen.v1 fixture schema draft; hashes required before live bridge }
@@ -1565,7 +1493,7 @@ store: [
 ]
 
 FUNCTION bridge_page_match_status(request, response) {
-    request == TEXT { PAGE_UNAVAILABLE } |> WHEN {
+    request == TEXT { No request scheduled } |> WHEN {
         True => TEXT { NOT_REQUESTED }
         False => request == response |> WHEN {
             True => TEXT { ACCEPTED_CURRENT_PAGE }
@@ -1575,12 +1503,72 @@ FUNCTION bridge_page_match_status(request, response) {
 }
 
 FUNCTION bridge_page_match_compact_label(request, response) {
-    request == TEXT { PAGE_UNAVAILABLE } |> WHEN {
+    request == TEXT { No request scheduled } |> WHEN {
         True => TEXT { NONE }
         False => request == response |> WHEN {
             True => TEXT { CURRENT }
             False => TEXT { STALE }
         }
+    }
+}
+
+FUNCTION bridge_descriptor_scope_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } => TEXT { TOP_UART }
+        TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { GHW_SIMPLE }
+        TEXT { No response available } => TEXT { NONE }
+        __ => TEXT { TOP_CPU }
+    }
+}
+
+FUNCTION bridge_descriptor_signal_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } => TEXT { TX_DATA }
+        TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { GHW_COUNTER }
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { DATA_BUS }
+        TEXT { No response available } => TEXT { NONE }
+        __ => TEXT { CLK }
+    }
+}
+
+FUNCTION bridge_descriptor_zoom_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Close }
+        TEXT { No response available } => TEXT { None }
+        __ => TEXT { Fit }
+    }
+}
+
+FUNCTION bridge_descriptor_pan_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { RightWindow }
+        TEXT { No response available } => TEXT { None }
+        __ => TEXT { Center }
+    }
+}
+
+FUNCTION bridge_descriptor_cursor_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Cursor36 }
+        TEXT { No response available } => TEXT { None }
+        __ => TEXT { Cursor42 }
+    }
+}
+
+FUNCTION bridge_descriptor_format_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Binary }
+        TEXT { No response available } => TEXT { None }
+        __ => TEXT { Hexadecimal }
+    }
+}
+
+FUNCTION bridge_descriptor_window_label(descriptor) {
+    descriptor |> WHEN {
+        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { 48 ns - 72 ns }
+        TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { 0 ns - 100 ns }
+        TEXT { No response available } => TEXT { no response window }
+        __ => TEXT { 0 ns - 120 ns }
     }
 }
 

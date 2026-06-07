@@ -54,37 +54,27 @@ FUNCTION row_height(size) {
 }
 
 FUNCTION request_fingerprint(scope, signal, zoom, pan, cursor, format) {
-    LIST { scope, signal, zoom, pan, cursor, format } |> WHEN {
-        LIST { TEXT { top_cpu }, TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
-        LIST { TEXT { top_cpu }, TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Binary } } =>
-            TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { FP_CPU_DATA_CLOSE_CENTER_42_HEX }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Binary } } =>
-            TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Cursor42 }, TEXT { Binary } } =>
-            TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Cursor36 }, TEXT { Binary } } =>
-            TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
-        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { LeftWindow }, TEXT { Cursor42 }, TEXT { Binary } } =>
-            TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
-        __ => TEXT { FP_STRUCTURAL_REQUEST }
+    signal == TEXT { NONE } |> WHEN {
+        True => TEXT { no-request }
+        False =>
+            TEXT { request }
+            |> Text/concat(with: scope, separator: "|")
+            |> Text/concat(with: signal, separator: "|")
+            |> Text/concat(with: zoom, separator: "|")
+            |> Text/concat(with: pan, separator: "|")
+            |> Text/concat(with: cursor, separator: "|")
+            |> Text/concat(with: format, separator: "|")
     }
 }
 
 FUNCTION request_label(signal, zoom, pan, format) {
-    LIST { signal, zoom, pan, format } |> WHEN {
-        LIST { TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_CLK_FIT_HEX }
-        LIST { TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_RESET_FIT_HEX }
-        LIST { TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Binary } } => TEXT { FP_DATA_CLOSE_RIGHT_BIN }
-        LIST { TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Binary } } => TEXT { FP_DATA_CLOSE_BIN }
-        LIST { TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_DATA_FIT_HEX }
-        LIST { TEXT { temperature }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_TEMP_FIT_HEX }
-        __ => TEXT { FP_STRUCTURAL_REQUEST }
+    signal == TEXT { NONE } |> WHEN {
+        True => TEXT { no-request }
+        False =>
+            TEXT { request }
+            |> Text/concat(with: signal, separator: "|")
+            |> Text/concat(with: zoom, separator: "|")
+            |> Text/concat(with: pan, separator: "|")
+            |> Text/concat(with: format, separator: "|")
     }
 }

@@ -14788,7 +14788,6 @@ fn document_function_args_context<'a>(
                 });
             if let Some(render_statement) = render_statement {
                 scoped.render_args.insert(name.clone(), render_statement);
-                continue;
             }
             let value = document_eval_expr_value(expr, expressions, context)
                 .or_else(|| {
@@ -15369,8 +15368,15 @@ fn lower_mapped_document_children(
     let Some(function) = functions.get(function_name) else {
         return false;
     };
+    let list_expr_id = statement
+        .expr
+        .and_then(|expr_id| match &expressions.get(expr_id)?.kind {
+            AstExprKind::Pipe { input, op, .. } if op == "List/map" => Some(*input),
+            _ => None,
+        })
+        .unwrap_or(mapped.list_expr_id);
     let Some(items_value) =
-        document_eval_mapped_list_items(statement, mapped.list_expr_id, expressions, context)
+        document_eval_mapped_list_items(statement, list_expr_id, expressions, context)
     else {
         return false;
     };
@@ -15451,8 +15457,7 @@ fn document_eval_mapped_list_items(
     {
         let input_expr = expressions.get(*input)?;
         let input_value = if matches!(input_expr.kind, AstExprKind::Delimiter) {
-            let base_expr = statement
-                .expr
+            let base_expr = document_previous_pipeline_expr_id(statement, list_expr_id)
                 .and_then(|expr_id| expressions.get(expr_id))?;
             document_eval_expr_value(base_expr, expressions, context).or_else(|| {
                 let list_path = document_expr_value(base_expr, expressions)?;
@@ -15475,10 +15480,46 @@ fn document_eval_mapped_list_items(
             context,
         );
     }
+    if let AstExprKind::Pipe { input, op, args } = &expr.kind
+        && matches!(
+            op.as_str(),
+            "List/filter_field_equal" | "List/filter_field_not_equal"
+        )
+    {
+        let input_expr = expressions.get(*input)?;
+        let input_value = if matches!(input_expr.kind, AstExprKind::Delimiter) {
+            let base_expr = document_previous_pipeline_expr_id(statement, list_expr_id)
+                .and_then(|expr_id| expressions.get(expr_id))?;
+            document_eval_expr_value(base_expr, expressions, context).or_else(|| {
+                let list_path = document_expr_value(base_expr, expressions)?;
+                document_resolved_value(&list_path, context).cloned()
+            })?
+        } else {
+            document_eval_mapped_list_items(statement, *input, expressions, context)?
+        };
+        return document_eval_list_filter_field(
+            input_value,
+            args,
+            expressions,
+            context,
+            op == "List/filter_field_equal",
+        );
+    }
     document_eval_expr_value(expr, expressions, context).or_else(|| {
         let list_path = document_expr_value(expr, expressions)?;
         document_resolved_value(&list_path, context).cloned()
     })
+}
+
+fn document_previous_pipeline_expr_id(statement: &AstStatement, expr_id: usize) -> Option<usize> {
+    let index = statement
+        .children
+        .iter()
+        .position(|child| child.expr == Some(expr_id))?;
+    statement.children[..index]
+        .iter()
+        .rev()
+        .find_map(|child| child.expr)
 }
 
 fn typechecked_render_slot_list_map_binding<'a>(
@@ -15907,6 +15948,22 @@ fn document_eval_list_map_input_items(
                 .unwrap_or(&[]),
             expressions,
             context,
+        );
+    }
+    if let AstExprKind::Pipe { input, op, args } = &expr.kind
+        && matches!(
+            op.as_str(),
+            "List/filter_field_equal" | "List/filter_field_not_equal"
+        )
+    {
+        let input_value =
+            document_eval_list_map_input_items(search_statements, *input, expressions, context)?;
+        return document_eval_list_filter_field(
+            input_value,
+            args,
+            expressions,
+            context,
+            op == "List/filter_field_equal",
         );
     }
     document_eval_expr_value(expr, expressions, context).or_else(|| {
@@ -21364,7 +21421,14 @@ fn document_eval_pipe_value_from_input(
 ) -> Option<Value> {
     if matches!(
         op,
-        "List/is_not_empty" | "List/count" | "List/retain" | "List/any" | "List/every" | "List/map"
+        "List/is_not_empty"
+            | "List/count"
+            | "List/retain"
+            | "List/filter_field_equal"
+            | "List/filter_field_not_equal"
+            | "List/any"
+            | "List/every"
+            | "List/map"
     ) && let Some(todos) = input.as_object().and_then(|object| object.get("todos"))
     {
         input = todos.clone();
@@ -21380,6 +21444,12 @@ fn document_eval_pipe_value_from_input(
         "List/is_not_empty" => input.as_array().map(|items| Value::Bool(!items.is_empty())),
         "List/count" => input.as_array().map(|items| json!(items.len() as u64)),
         "List/retain" => document_eval_list_retain(input, args, expressions, context),
+        "List/filter_field_equal" => {
+            document_eval_list_filter_field(input, args, expressions, context, true)
+        }
+        "List/filter_field_not_equal" => {
+            document_eval_list_filter_field(input, args, expressions, context, false)
+        }
         "List/any" => document_eval_list_quantifier(input, args, expressions, context, true),
         "List/every" => document_eval_list_quantifier(input, args, expressions, context, false),
         "Text/is_not_empty" => input.as_str().map(|text| Value::Bool(!text.is_empty())),
@@ -21892,6 +21962,29 @@ fn document_eval_list_retain_with_statement_children(
         }
     }
     Some(Value::Array(retained))
+}
+
+fn document_eval_list_filter_field(
+    input: Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    equal: bool,
+) -> Option<Value> {
+    let field = document_call_arg_text(args, "field", expressions, context)?;
+    let expected = document_call_arg_text(args, "value", expressions, context)?;
+    let mut filtered = Vec::new();
+    for item in input.as_array()? {
+        let actual = item
+            .as_object()
+            .and_then(|object| object.get(&field))
+            .map(json_value_to_document_text)
+            .unwrap_or_default();
+        if (actual == expected) == equal {
+            filtered.push(item.clone());
+        }
+    }
+    Some(Value::Array(filtered))
 }
 
 fn document_eval_list_quantifier(
@@ -38949,9 +39042,7 @@ mod tests {
                             && item.bounds.x < 180.0
                             && item.bounds.y > 450.0
                     })
-                    .unwrap_or_else(|| {
-                        panic!("missing selected waveform row label `{row_label}`")
-                    });
+                    .unwrap_or_else(|| panic!("missing selected waveform row label `{row_label}`"));
                 let row_center_y = row_text.bounds.y + row_text.bounds.height * 0.5;
                 let segment_text = layout
                     .display_list

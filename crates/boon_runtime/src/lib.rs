@@ -4957,7 +4957,7 @@ impl SummaryLimits {
 
     fn document_preview() -> Self {
         Self {
-            list_rows: Some(64),
+            list_rows: Some(256),
             chunk_row_start: 0,
             chunk_rows: Some(24),
             chunk_column_start: 0,

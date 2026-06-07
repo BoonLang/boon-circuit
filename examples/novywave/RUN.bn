@@ -673,14 +673,36 @@ store: [
             }
         }
 
+    marker_current_label:
+        TEXT { No markers } |> HOLD marker_current_label {
+            LATEST {
+            elements.marker_rename.event.press |> THEN { TEXT { data stable } }
+            elements.marker_remove.event.press |> THEN { TEXT { No markers } }
+            elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
+            elements.load_fixture.event.press |> THEN { marker_default_label }
+            elements.show_empty.event.press |> THEN { TEXT { No markers } }
+            }
+        }
+
+    marker_state:
+        Empty |> HOLD marker_state {
+            LATEST {
+            elements.marker_rename.event.press |> THEN { Renamed }
+            elements.marker_remove.event.press |> THEN { Empty }
+            elements.marker_toggle.event.press |> THEN { Added }
+            elements.load_fixture.event.press |> THEN { Default }
+            elements.show_empty.event.press |> THEN { Empty }
+            }
+        }
+
     marker_label:
         TEXT { No markers } |> HOLD marker_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { M data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
-            elements.marker_jump.event.press |> THEN { TEXT { M data stable } }
+            elements.marker_jump.event.press |> THEN { marker_label }
             elements.marker_toggle.event.press |> THEN { TEXT { M 36 ns } }
-            elements.load_fixture.event.press |> THEN { TEXT { M reset released } }
+            elements.load_fixture.event.press |> THEN { TEXT { M 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
@@ -699,10 +721,17 @@ store: [
         TEXT { no marker selected } |> HOLD marker_focus_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { data stable at 42 ns } }
-            elements.marker_jump.event.press |> THEN { TEXT { jumped to data stable at 42 ns } }
+            elements.marker_jump.event.press |> THEN {
+                marker_state |> WHEN {
+                    Renamed => TEXT { jumped to data stable at 42 ns }
+                    Default => TEXT { jumped to 42 ns }
+                    Added => TEXT { jumped to 36 ns }
+                    __ => TEXT { jumped to 42 ns }
+                }
+            }
             elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
             elements.marker_toggle.event.press |> THEN { TEXT { added marker at 36 ns } }
-            elements.load_fixture.event.press |> THEN { TEXT { reset released at 42 ns } }
+            elements.load_fixture.event.press |> THEN { TEXT { marker at 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { no marker selected } }
             }
         }
@@ -721,7 +750,7 @@ store: [
         |> List/append(item: marker_to_add |> THEN {
             [label: marker_to_add]
         })
-        |> List/map(marker, new: new_marker(marker: marker))
+        |> List/map(marker, new: new_marker(marker: marker, store: store))
         |> List/remove(marker, when:
             LATEST {
                 marker.marker_elements.remove_marker.event.press |> THEN { True }
@@ -914,6 +943,24 @@ store: [
             elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
         }
 
+    data_signal_toggle_state:
+        TEXT { Off } |> HOLD data_signal_toggle_state {
+            LATEST {
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { Off }
+                        Off => TEXT { On }
+                        __ => TEXT { On }
+                    }
+                }
+                elements.select_clk.event.press |> THEN { TEXT { Off } }
+                elements.select_reset.event.press |> THEN { TEXT { Off } }
+                elements.select_temperature.event.press |> THEN { TEXT { Off } }
+                elements.load_fixture.event.press |> THEN { TEXT { Off } }
+                elements.show_empty.event.press |> THEN { TEXT { Off } }
+            }
+        }
+
     active_signal_key:
         TEXT { NONE } |> HOLD active_signal_key {
             LATEST {
@@ -986,7 +1033,12 @@ store: [
                 elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
                 elements.select_clk.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { PAGE_RESET_FIT_CENTER_42_HEX } }
-                elements.select_data.event.press |> THEN { TEXT { PAGE_DATA_FIT_CENTER_42_HEX } }
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { PAGE_DATA_FIT_CENTER_42_HEX }
+                        Off => TEXT { PAGE_UNAVAILABLE }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX } }
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -1034,7 +1086,12 @@ store: [
                 elements.select_ghw_file.event.press |> THEN { TEXT { FP_GHW_SIMPLE_PRIMARY } }
                 elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
-                elements.select_data.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX } }
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
+                        Off => TEXT { FP_NONE }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { FP_ANALOG_TEMP_FIT_CENTER_42_HEX } }
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -1192,7 +1249,12 @@ store: [
             LATEST {
                 elements.select_clk.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_reset.event.press |> THEN { TEXT { TOP_CPU/RESET_N/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_data.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Hexadecimal }
+                        Off => TEXT { No request scheduled }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal } }
                 elements.format_cycle.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Binary } }
                 elements.zoom_in.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/Center/Cursor42/Binary } }
@@ -1298,7 +1360,12 @@ store: [
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_MAIN } }
                 elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
-                elements.select_data.event.press |> THEN { TEXT { DATA_FIT } }
+                elements.select_data.event.press |> THEN {
+                    data_signal_toggle_state |> WHEN {
+                        On => TEXT { DATA_FIT }
+                        Off => TEXT { NONE }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMP_FIT } }
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -1453,12 +1520,17 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION new_marker(marker) {
+FUNCTION new_marker(marker, store) {
     [
         marker_elements: [
             remove_marker: SOURCE
         ]
-        label: marker.label
+        label:
+            marker.label |> HOLD label {
+                LATEST {
+                    store.elements.marker_rename.event.press |> THEN { TEXT { data stable } }
+                }
+            }
     ]
 }
 

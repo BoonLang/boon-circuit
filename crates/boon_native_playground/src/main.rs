@@ -38819,10 +38819,7 @@ mod tests {
             {
                 Ok(adapter) => adapter,
                 Err(error) => {
-                    eprintln!(
-                        "skipping NovyWave visual readback test: request_adapter failed: {error}"
-                    );
-                    return;
+                    panic!("NovyWave visual readback test requires a WGPU adapter: {error}");
                 }
             };
             let (device, queue) = adapter
@@ -38857,6 +38854,36 @@ mod tests {
                 "novywave-empty-reference-comparison",
             );
             physical_frame_text_item(&empty_layout, "No waveform loaded", "NovyWave empty state");
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.mode_to_light".to_owned(),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave light empty-mode source event should apply");
+            let empty_light_state = runtime.document_state_summary();
+            let (_, empty_light_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&empty_light_state),
+            )
+            .expect("NovyWave empty light layout should lower");
+            let empty_light_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &empty_light_layout,
+                "novywave-empty-light-reference-comparison",
+            );
+            physical_frame_text_item(
+                &empty_light_layout,
+                "No waveform loaded",
+                "NovyWave light empty state",
+            );
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.mode_to_dark".to_owned(),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave dark-mode source event should restore before loaded readbacks");
             runtime
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.load_fixture".to_owned(),
@@ -38957,7 +38984,9 @@ mod tests {
             let dark_reference_profile = normalized_luma_profile(&decoded_references[0].2);
             let light_reference_profile = normalized_luma_profile(&decoded_references[1].2);
             let empty_dark_reference_profile = normalized_luma_profile(&decoded_references[2].2);
+            let empty_light_reference_profile = normalized_luma_profile(&decoded_references[3].2);
             let boon_empty_profile = normalized_luma_profile(&empty_image);
+            let boon_empty_light_profile = normalized_luma_profile(&empty_light_image);
             let boon_dark_profile = normalized_luma_profile(&dark_image);
             let boon_light_profile = normalized_luma_profile(&light_image);
             let dark_profile_distance =
@@ -38967,6 +38996,10 @@ mod tests {
             let empty_profile_distance = normalized_luma_profile_distance(
                 &empty_dark_reference_profile,
                 &boon_empty_profile,
+            );
+            let empty_light_profile_distance = normalized_luma_profile_distance(
+                &empty_light_reference_profile,
+                &boon_empty_light_profile,
             );
             let light_reference_timeline =
                 normalized_luma_profile_value(&light_reference_profile, "timeline");
@@ -38989,6 +39022,10 @@ mod tests {
                 "Boon empty readback should stay regionally close to NovyWave empty dark reference, distance={empty_profile_distance:.2}"
             );
             assert!(
+                empty_light_profile_distance <= 45.0,
+                "Boon empty light readback should stay regionally close to NovyWave empty light reference, distance={empty_light_profile_distance:.2}"
+            );
+            assert!(
                 boon_light_timeline <= light_reference_timeline + 45.0,
                 "Boon light timeline should preserve the reference dark waveform canvas; reference={light_reference_timeline:.2}, rendered={boon_light_timeline:.2}"
             );
@@ -38998,6 +39035,11 @@ mod tests {
             );
             let boon_empty_metadata =
                 visual_image_metadata("boon_empty", &empty_image, "empty readback");
+            let boon_empty_light_metadata = visual_image_metadata(
+                "boon_empty_light",
+                &empty_light_image,
+                "empty light readback",
+            );
             let boon_dark_metadata =
                 visual_image_metadata("boon_dark", &dark_image, "loaded dark readback");
             let boon_light_metadata =
@@ -39008,6 +39050,7 @@ mod tests {
                 "reference_images": reference_images,
                 "boon_readbacks": [
                     boon_empty_metadata,
+                    boon_empty_light_metadata,
                     boon_dark_metadata,
                     boon_light_metadata
                 ],
@@ -39015,7 +39058,9 @@ mod tests {
                     "reference_dark": normalized_luma_profile_json(&dark_reference_profile),
                     "reference_light": normalized_luma_profile_json(&light_reference_profile),
                     "reference_empty_dark": normalized_luma_profile_json(&empty_dark_reference_profile),
+                    "reference_empty_light": normalized_luma_profile_json(&empty_light_reference_profile),
                     "boon_empty": normalized_luma_profile_json(&boon_empty_profile),
+                    "boon_empty_light": normalized_luma_profile_json(&boon_empty_light_profile),
                     "boon_dark": normalized_luma_profile_json(&boon_dark_profile),
                     "boon_light": normalized_luma_profile_json(&boon_light_profile)
                 },
@@ -39023,6 +39068,7 @@ mod tests {
                     "loaded_dark_vs_reference_dark": dark_profile_distance,
                     "loaded_light_vs_reference_light": light_profile_distance,
                     "empty_vs_reference_empty_dark": empty_profile_distance,
+                    "empty_light_vs_reference_empty_light": empty_light_profile_distance,
                     "loaded_light_timeline_delta": boon_light_timeline - light_reference_timeline,
                     "loaded_light_lower_waveform_delta": boon_light_lower_waveform - light_reference_lower_waveform
                 },

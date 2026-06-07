@@ -5225,6 +5225,9 @@ impl GenericScheduledRuntime {
             if has_indexed_text_target(SourceRouteTextAction::SourceText, indexed_commit_field) {
                 return Ok(SourceActionKind::IndexedTextCommit);
             }
+            if has_indexed_text(SourceRouteTextAction::Const) {
+                return Ok(SourceActionKind::IndexedTextConst);
+            }
             if source_event.key.is_some()
                 && (has_indexed_text(SourceRouteTextAction::SourceText)
                     || has_indexed_text(SourceRouteTextAction::TextTrimOrPrevious))
@@ -9043,6 +9046,9 @@ impl GenericCircuitRuntime {
                 "indexed text update `{target}` from `{source}` cannot use address payload directly"
             )
             .into()),
+            ScalarUpdateExpression::Const(value) => {
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(value.clone())))
+            }
             ScalarUpdateExpression::PreviousValue(path) => {
                 let Some(value) = payload_text else {
                     return Ok(IndexedTextCandidate::PreviousField(path.clone()));
@@ -9095,8 +9101,7 @@ impl GenericCircuitRuntime {
                 };
                 Ok(IndexedTextCandidate::TrimmedOrSkip(value))
             }
-            ScalarUpdateExpression::Const(_)
-            | ScalarUpdateExpression::NumberInfix { .. }
+            ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::BoolNot(_)
             | ScalarUpdateExpression::MatchConst { .. }
             | ScalarUpdateExpression::Unsupported => Err(format!(
@@ -10413,7 +10418,7 @@ impl ScalarUpdateExpression {
                 | Self::SourceKey
                 | Self::PreviousValue(_)
                 | Self::TextTrimOrPrevious { .. }
-        )
+        ) || matches!(self, Self::Const(value) if value != "True" && value != "False")
     }
 
     fn is_indexed_bool_expression(&self) -> bool {
@@ -10800,6 +10805,7 @@ enum SourceActionKind {
     ListRemove,
     IndexedTextChange,
     IndexedTextCommit,
+    IndexedTextConst,
     IndexedTextIdentity,
     IndexedTextKey,
     IndexedTextOpen,
@@ -10817,6 +10823,7 @@ impl SourceActionKind {
             Self::ListRemove => "list_remove",
             Self::IndexedTextChange => "indexed_text_change",
             Self::IndexedTextCommit => "indexed_text_commit",
+            Self::IndexedTextConst => "indexed_text_const",
             Self::IndexedTextIdentity => "indexed_text_identity",
             Self::IndexedTextKey => "indexed_text_key",
             Self::IndexedTextOpen => "indexed_text_open",
@@ -11609,6 +11616,7 @@ enum SourceAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceRouteTextAction {
+    Const,
     SourceText,
     PreviousValue,
     TextTrimOrPrevious,
@@ -12851,6 +12859,7 @@ impl SourceRoute {
         self.actions
             .extend(self.indexed_text_targets.iter().filter_map(|target| {
                 let kind = match &target.expression {
+                    ScalarUpdateExpression::Const(_) => SourceRouteTextAction::Const,
                     ScalarUpdateExpression::SourceText => SourceRouteTextAction::SourceText,
                     ScalarUpdateExpression::PreviousValue(_) => {
                         SourceRouteTextAction::PreviousValue
@@ -12859,8 +12868,7 @@ impl SourceRoute {
                     ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
                         SourceRouteTextAction::TextTrimOrPrevious
                     }
-                    ScalarUpdateExpression::Const(_)
-                    | ScalarUpdateExpression::NumberInfix { .. }
+                    ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::BoolNot(_)
@@ -13679,6 +13687,7 @@ impl ListScenarioHarness {
                 }
                 SourceActionKind::IndexedTextChange
                 | SourceActionKind::IndexedTextCommit
+                | SourceActionKind::IndexedTextConst
                 | SourceActionKind::IndexedTextIdentity
                 | SourceActionKind::IndexedTextKey
                 | SourceActionKind::IndexedTextOpen
@@ -13709,6 +13718,7 @@ impl ListScenarioHarness {
                 | SourceActionKind::IndexedBoolToggle
                 | SourceActionKind::IndexedTextKey
                 | SourceActionKind::IndexedTextCommit
+                | SourceActionKind::IndexedTextConst
                 | SourceActionKind::IndexedTextChange
                 | SourceActionKind::IndexedTextOpen
         ) {
@@ -16472,6 +16482,80 @@ FUNCTION new_entry(entry) {
             summary["store"]["visible_rows"][1]["entries"][0]["address"],
             "C0"
         );
+    }
+
+    #[test]
+    fn indexed_text_const_source_updates_row_state_from_ir() {
+        let source = r#"
+store: [
+    elements: [
+        rename: SOURCE
+    ]
+    markers:
+        LIST {
+            [label: TEXT { 42 ns }]
+        }
+        |> List/map(marker, new: new_marker(marker: marker, store: store))
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Markers }))
+
+FUNCTION new_marker(marker, store) {
+    [
+        marker_elements: [
+            remove_marker: SOURCE
+        ]
+        label:
+            marker.label |> HOLD label {
+                LATEST {
+                    store.elements.rename.event.press |> THEN { TEXT { data stable } }
+                }
+            }
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("indexed-text-const-row-update", source)
+            .expect("runtime should load const indexed text source");
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("42 ns".to_owned()),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.rename".to_owned()),
+        );
+        expected.insert(
+            "target_text".to_owned(),
+            toml::Value::String("42 ns".to_owned()),
+        );
+        let step = ScenarioStep {
+            id: "rename-marker-row".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            expect_semantic_delta_contains: vec!["FieldSet:label".to_owned()],
+            ..ScenarioStep::default()
+        };
+        let output = runtime
+            .apply_source_event_for_step(
+                &step,
+                LiveSourceEvent {
+                    source: "store.elements.rename".to_owned(),
+                    target_text: Some("42 ns".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.list_id.as_deref() == Some("markers")
+                && delta.field_path.as_deref() == Some("label")
+                && matches!(&delta.value, ProtocolValue::Text(value) if value == "data stable")
+        }));
+        let summary = output.state_summary;
+        assert_eq!(summary["markers"][0]["label"], "data stable");
     }
 
     #[test]

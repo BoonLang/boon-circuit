@@ -182,7 +182,7 @@ FUNCTION empty_state() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #101a2b }
-                Light => TEXT { #101a2b }
+                Light => TEXT { #f8fbff }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #2f80ed }

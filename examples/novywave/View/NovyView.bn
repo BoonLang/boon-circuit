@@ -1307,6 +1307,34 @@ FUNCTION value_pill(signal) {
 }
 
 FUNCTION wave_area(signal) {
+    signal.id == TEXT { clk } |> WHEN {
+        True => wave_area_clk()
+        False => signal.id == TEXT { reset_n } |> WHEN {
+            True => wave_area_reset()
+            False => signal.id == TEXT { data_bus } |> WHEN {
+                True => wave_area_data_bus()
+                False => signal.id == TEXT { temperature } |> WHEN {
+                    True => wave_area_temperature()
+                    False => signal.id == TEXT { data_valid } |> WHEN {
+                        True => wave_area_data_valid()
+                        False => signal.id == TEXT { data_ready } |> WHEN {
+                            True => wave_area_data_ready()
+                            False => signal.id == TEXT { state } |> WHEN {
+                                True => wave_area_state()
+                                False => signal.id == TEXT { error_count } |> WHEN {
+                                    True => wave_area_error_count()
+                                    False => wave_area_unknown()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION wave_area_clk() {
     Scene/Element/stripe(
         element: []
         direction: Row
@@ -1329,33 +1357,241 @@ FUNCTION wave_area(signal) {
             scroll_x: True
             scrollbars: True
         ]
-        items:
-            signal.id == TEXT { clk } |> WHEN {
-                True => NovyFixtures/clk_segments()
-                False => signal.id == TEXT { reset_n } |> WHEN {
-                    True => NovyFixtures/reset_segments()
-                    False => signal.id == TEXT { data_bus } |> WHEN {
-                        True => NovyFixtures/data_bus_segments()
-                        False => signal.id == TEXT { temperature } |> WHEN {
-                            True => NovyFixtures/temperature_segments()
-                            False => signal.id == TEXT { data_valid } |> WHEN {
-                                True => NovyFixtures/data_valid_segments()
-                                False => signal.id == TEXT { data_ready } |> WHEN {
-                                    True => NovyFixtures/data_ready_segments()
-                                    False => signal.id == TEXT { state } |> WHEN {
-                                        True => NovyFixtures/state_segments()
-                                        False => signal.id == TEXT { error_count } |> WHEN {
-                                            True => NovyFixtures/error_count_segments()
-                                            False => NovyFixtures/unknown_segments()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            |> List/map(segment, new: waveform_segment(segment: segment))
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_marker_line()
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 28, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 28, state: Low, label: TEXT { 0 }])
+        }
+    )
+}
+
+FUNCTION wave_area_reset() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_dark(segment: [width: 84, state: Low, label: TEXT { reset }])
+            waveform_marker_line()
+            waveform_segment_blue(segment: [width: 252, state: High, label: TEXT { released }])
+        }
+    )
+}
+
+FUNCTION wave_area_data_bus() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_sky(segment: [width: 56, state: Unknown, label: TEXT { XX }])
+            waveform_marker_line()
+            waveform_segment_blue(segment: [width: 56, state: High, label: TEXT { 0x12 }])
+            waveform_segment_dark(segment: [width: 56, state: Low, label: TEXT { 0x00 }])
+            waveform_segment_blue(segment: [width: 84, state: High, label: TEXT { 0x2a }])
+            waveform_segment_dark(segment: [width: 84, state: Low, label: TEXT { 0x08 }])
+        }
+    )
+}
+
+FUNCTION wave_area_data_valid() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_dark(segment: [width: 96, state: Low, label: TEXT { 0 }])
+            waveform_marker_line()
+            waveform_segment_blue(segment: [width: 160, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 80, state: Low, label: TEXT { 0 }])
+        }
+    )
+}
+
+FUNCTION wave_area_data_ready() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_blue(segment: [width: 48, state: High, label: TEXT { 1 }])
+            waveform_marker_line()
+            waveform_segment_dark(segment: [width: 144, state: Low, label: TEXT { 0 }])
+            waveform_segment_blue(segment: [width: 144, state: High, label: TEXT { 1 }])
+        }
+    )
+}
+
+FUNCTION wave_area_state() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_sky(segment: [width: 72, state: Unknown, label: TEXT { IDLE }])
+            waveform_marker_line()
+            waveform_segment_blue(segment: [width: 128, state: High, label: TEXT { RUN }])
+            waveform_segment_dark(segment: [width: 136, state: Low, label: TEXT { WAIT }])
+        }
+    )
+}
+
+FUNCTION wave_area_error_count() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_dark(segment: [width: 188, state: Low, label: TEXT { 0 }])
+            waveform_marker_line()
+            waveform_segment_blue(segment: [width: 56, state: High, label: TEXT { 1 }])
+            waveform_segment_dark(segment: [width: 92, state: Low, label: TEXT { 0 }])
+        }
+    )
+}
+
+FUNCTION wave_area_temperature() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_indigo(segment: [width: 42, state: AnalogLow, label: TEXT { 39 }])
+            waveform_segment_cyan(segment: [width: 42, state: AnalogMid, label: TEXT { 41 }])
+            waveform_marker_line()
+            waveform_segment_pale(segment: [width: 42, state: AnalogHigh, label: TEXT { 44 }])
+            waveform_segment_cyan(segment: [width: 42, state: AnalogMid, label: TEXT { 43 }])
+            waveform_segment_indigo(segment: [width: 42, state: AnalogLow, label: TEXT { 40 }])
+            waveform_segment_cyan(segment: [width: 42, state: AnalogMid, label: TEXT { 42 }])
+            waveform_segment_pale(segment: [width: 42, state: AnalogHigh, label: TEXT { 44 }])
+            waveform_segment_cyan(segment: [width: 42, state: AnalogMid, label: TEXT { 43 }])
+        }
+    )
+}
+
+FUNCTION wave_area_unknown() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
+            scroll_x: True
+            scrollbars: True
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            waveform_segment_sky(segment: [width: 336, state: Unknown, label: TEXT { unknown }])
+        }
     )
 }
 

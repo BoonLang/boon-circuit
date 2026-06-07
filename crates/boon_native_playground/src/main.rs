@@ -38777,6 +38777,29 @@ mod tests {
                 "NovyWave selected waveform rows should render Boon-owned current value `{selected_value}`"
             );
         }
+        let waveform_labels = layout
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref())
+            .collect::<Vec<_>>();
+        for segment_label in ["released", "0x12", "0x2a", "RUN"] {
+            assert!(
+                waveform_labels.iter().any(|label| *label == segment_label),
+                "NovyWave waveform rows should lower distinct segment label `{segment_label}`; labels={waveform_labels:?}"
+            );
+        }
+        let waveform_paints = layout
+            .display_list
+            .iter()
+            .filter(|item| item.bounds.x >= 250.0 && item.bounds.y >= 500.0)
+            .filter_map(display_item_paint_color)
+            .collect::<Vec<_>>();
+        for analog_color in ["#1D4ED8", "#0891B2", "#7DD3FC"] {
+            assert!(
+                waveform_paints.iter().any(|color| *color == analog_color),
+                "NovyWave temperature row should lower analog trace color `{analog_color}`; paints={waveform_paints:?}"
+            );
+        }
 
         for label in ["Probe", "Light", "Fmt"] {
             let context = format!("NovyWave control `{label}`");

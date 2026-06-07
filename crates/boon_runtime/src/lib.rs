@@ -6597,6 +6597,9 @@ impl GenericScheduledRuntime {
             });
             return Ok(value);
         }
+        if let Some(value) = self.root_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
         Ok(BoonValue::Text(name.to_owned()))
     }
 
@@ -6625,6 +6628,9 @@ impl GenericScheduledRuntime {
             frame
                 .reads
                 .insert(GenericReadKey::Root { field: full_path });
+            return Ok(value);
+        }
+        if let Some(value) = self.root_derived_boon_value(&full_path, frame)? {
             return Ok(value);
         }
         Ok(BoonValue::Text(full_path))
@@ -6758,6 +6764,16 @@ impl GenericScheduledRuntime {
                     .map(|index| BoonValue::Number(index as i64))
                     .unwrap_or(BoonValue::NaN))
             }
+            "Text/contains" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let needle = self.named_arg_value(args, "needle", frame)?;
+                Ok(BoonValue::Bool(
+                    value
+                        .as_text()
+                        .unwrap_or_default()
+                        .contains(&needle.as_text().unwrap_or_default()),
+                ))
+            }
             "Text/to_number" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 let text = value.as_text().unwrap_or_default();
@@ -6864,6 +6880,42 @@ impl GenericScheduledRuntime {
                     .unwrap_or(BoonValue::Empty);
                 self.list_find_value(list, &field, expected, &target, fallback, frame)
             }
+            "List/filter_text_contains" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/filter_text_contains requires field")?;
+                let needle = self.named_arg_value(args, "needle", frame)?;
+                let prefer_field = self.field_name_arg(args, "prefer_field", frame)?;
+                let empty_field = self.field_name_arg(args, "empty_field", frame)?;
+                let empty_value = if empty_field.is_some() {
+                    Some(self.named_arg_value(args, "empty_value", frame)?)
+                } else {
+                    None
+                };
+                self.list_filter_text_contains(
+                    list,
+                    &field,
+                    needle,
+                    prefer_field.as_deref(),
+                    empty_field.as_deref(),
+                    empty_value,
+                    frame,
+                )
+            }
+            "List/join_field" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/join_field requires field")?;
+                let separator = self
+                    .named_arg_value(args, "separator", frame)
+                    .unwrap_or_else(|_| BoonValue::Text(",".to_owned()));
+                let empty = self
+                    .named_arg_value(args, "empty", frame)
+                    .unwrap_or_else(|_| BoonValue::Text(String::new()));
+                self.list_join_field(list, &field, separator, empty, frame)
+            }
             "List/get" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let index = self
@@ -6873,6 +6925,10 @@ impl GenericScheduledRuntime {
                 self.list_get(list, index, frame)
             }
             "List/count" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
+            }
+            "List/length" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
             }
@@ -7080,6 +7136,26 @@ impl GenericScheduledRuntime {
         }
     }
 
+    fn field_name_arg(
+        &mut self,
+        args: &[AstCallArg],
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<String>> {
+        if let Some(raw) = self.raw_named_arg(args, name) {
+            if raw != "TEXT" {
+                return Ok(Some(normalized_field_name(&raw)));
+            }
+        }
+        let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) else {
+            return Ok(None);
+        };
+        Ok(self
+            .eval_expr(arg.value, frame)?
+            .as_text()
+            .map(|value| normalized_field_name(&value)))
+    }
+
     fn list_find(
         &mut self,
         list: BoonValue,
@@ -7115,6 +7191,122 @@ impl GenericScheduledRuntime {
             BoonValue::Empty => Ok(fallback),
             other => Ok(other),
         }
+    }
+
+    fn list_filter_text_contains(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        needle: BoonValue,
+        prefer_field: Option<&str>,
+        empty_field: Option<&str>,
+        empty_value: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list)?;
+        let needle = normalized_search_text(&needle.as_text().unwrap_or_default());
+        let empty_value = empty_value
+            .and_then(|value| value.as_text())
+            .map(|value| normalized_search_text(&value));
+        let prefer_matches = if needle.is_empty() {
+            Vec::new()
+        } else if let Some(prefer_field) = prefer_field {
+            let mut matches = Vec::new();
+            for value in &values {
+                if normalized_search_text(&self.list_value_field_text(
+                    value,
+                    prefer_field,
+                    frame,
+                )?) == needle
+                {
+                    matches.push(value.clone());
+                }
+            }
+            matches
+        } else {
+            Vec::new()
+        };
+        if !prefer_matches.is_empty() {
+            return Ok(BoonValue::List(prefer_matches));
+        }
+        let mut output = Vec::new();
+        for value in values {
+            let keep = if needle.is_empty() {
+                match (empty_field, empty_value.as_deref()) {
+                    (Some(field), Some(expected)) => {
+                        normalized_search_text(&self.list_value_field_text(&value, field, frame)?)
+                            == expected
+                    }
+                    _ => true,
+                }
+            } else {
+                normalized_search_text(&self.list_value_field_text(&value, field, frame)?)
+                    .contains(&needle)
+            };
+            if keep {
+                output.push(value);
+            }
+        }
+        Ok(BoonValue::List(output))
+    }
+
+    fn list_join_field(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        separator: BoonValue,
+        empty: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list)?;
+        let separator = separator.as_text().unwrap_or_else(|| ",".to_owned());
+        let mut parts = Vec::new();
+        for value in values {
+            let text = self.list_value_field_text(&value, field, frame)?;
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        if parts.is_empty() {
+            return Ok(empty);
+        }
+        Ok(BoonValue::Text(parts.join(&separator)))
+    }
+
+    fn list_values_for_iteration(&self, list: BoonValue) -> RuntimeResult<Vec<BoonValue>> {
+        match list {
+            BoonValue::List(values) => Ok(values),
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                Ok((0..len)
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .collect())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn list_value_field_text(
+        &mut self,
+        value: &BoonValue,
+        field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<String> {
+        let field = normalized_field_name(field);
+        let field_value = match value {
+            BoonValue::Record(record) => record
+                .get(&field)
+                .cloned()
+                .unwrap_or_else(|| BoonValue::Empty),
+            BoonValue::RowRef { list, index } => {
+                self.read_list_field(list, *index, &field, frame)?
+            }
+            _ => BoonValue::Empty,
+        };
+        Ok(field_value.as_text().unwrap_or_default())
     }
 
     fn list_get(
@@ -7649,6 +7841,21 @@ impl GenericScheduledRuntime {
             }
         }
         None
+    }
+
+    fn root_derived_boon_value(
+        &mut self,
+        path: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
+            return Ok(None);
+        };
+        let value = self.eval_statement_value(&plan.statement, frame)?;
+        frame.reads.insert(GenericReadKey::Root {
+            field: plan.path.clone(),
+        });
+        Ok(Some(value))
     }
 
     fn runtime_path_list_head<'a>(&'a self, path: &'a str) -> Option<(&'a str, RuntimePathTail)> {
@@ -12164,6 +12371,12 @@ impl GenericDerivedPlan {
             .find(|field| field.list == key.list && field.field == key.field)
     }
 
+    fn root_field_plan(&self, path: &str) -> Option<&GenericDerivedRootField> {
+        self.root_fields
+            .iter()
+            .find(|field| field.path == path || row_field_name(&field.path) == path)
+    }
+
     fn contains_field(&self, list: &str, field: &str) -> bool {
         self.indexed_fields
             .iter()
@@ -13431,6 +13644,24 @@ fn row_field_name(path: &str) -> &str {
     path.rsplit_once('.')
         .map(|(_, field)| field)
         .unwrap_or(path)
+}
+
+fn normalized_search_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalized_field_name(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('"').trim();
+    trimmed
+        .strip_prefix("TEXT {")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(str::trim)
+        .unwrap_or(trimmed)
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -16714,6 +16945,101 @@ FUNCTION new_entry(entry) {
         assert_eq!(
             summary["store"]["visible_rows"][1]["entries"][0]["address"],
             "C0"
+        );
+    }
+
+    #[test]
+    fn list_filter_text_contains_and_join_field_project_derived_record_lists() {
+        let source = r#"
+store: [
+    elements: [
+        search: SOURCE
+        scope_uart: SOURCE
+    ]
+    signals:
+        LIST {
+            [key: TEXT { clk }, scope: TEXT { top.cpu }, name: TEXT { clk }, family: TEXT { clock }]
+            [key: TEXT { data_bus }, scope: TEXT { top.cpu }, name: TEXT { data_bus[7:0] }, family: TEXT { data }]
+            [key: TEXT { tx_data }, scope: TEXT { top.uart }, name: TEXT { tx_data[7:0] }, family: TEXT { uart }]
+            [key: TEXT { uart_busy }, scope: TEXT { top.uart }, name: TEXT { uart_busy }, family: TEXT { uart }]
+        }
+        |> List/map(signal, new: new_signal(signal: signal))
+    active_scope_label:
+        TEXT { top.cpu } |> HOLD active_scope_label {
+            LATEST {
+                elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
+            }
+        }
+    search_text:
+        Text/empty() |> HOLD search_text {
+            LATEST {
+                elements.search.text |> Text/trim()
+            }
+        }
+    search_results:
+        signals |> List/filter_text_contains(field: "name", needle: search_text, prefer_field: "family", empty_field: "scope", empty_value: active_scope_label)
+    search_results_count:
+        search_results |> List/length()
+    search_results_key_summary:
+        search_results |> List/join_field(field: "key", separator: ",", empty: "none")
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Search }))
+
+FUNCTION new_signal(signal) {
+    [
+        key: signal.key
+        scope: signal.scope
+        name: signal.name
+        family: signal.family
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("derived-list-search", source).unwrap();
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["search_results_count"], 2);
+        assert_eq!(
+            initial["store"]["search_results_key_summary"],
+            "clk,data_bus"
+        );
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.scope_uart".to_owned(),
+                target_text: Some("UART".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let scoped = runtime.state_summary();
+        assert_eq!(scoped["store"]["search_results_count"], 2);
+        assert_eq!(
+            scoped["store"]["search_results_key_summary"],
+            "tx_data,uart_busy"
+        );
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.search".to_owned(),
+                text: Some("tx".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let searched = runtime.state_summary();
+        assert_eq!(searched["store"]["search_results_count"], 1);
+        assert_eq!(searched["store"]["search_results_key_summary"], "tx_data");
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.search".to_owned(),
+                text: Some("data".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let family_preferred = runtime.state_summary();
+        assert_eq!(family_preferred["store"]["search_results_count"], 1);
+        assert_eq!(
+            family_preferred["store"]["search_results_key_summary"],
+            "data_bus"
         );
     }
 

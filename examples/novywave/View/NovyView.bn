@@ -2454,28 +2454,7 @@ FUNCTION variables_panel() {
 }
 
 FUNCTION variables_list() {
-    PASSED.store.signal_search_text == TEXT { data } |> WHEN {
-        True => variables_list_data()
-        False => PASSED.store.signal_search_text == TEXT { reset } |> WHEN {
-            True => variables_list_reset()
-            False => PASSED.store.signal_search_text == TEXT { temp } |> WHEN {
-                True => variables_list_temperature()
-                False => PASSED.store.signal_search_text == TEXT { clk } |> WHEN {
-                    True => variables_list_clk()
-                    False => PASSED.store.signal_search_text == TEXT { tx } |> WHEN {
-                        True => variables_list_tx()
-                        False => PASSED.store.signal_search_text == TEXT { vcore } |> WHEN {
-                            True => variables_list_vcore()
-                            False => PASSED.store.signal_search_text == TEXT { zzz } |> WHEN {
-                                True => variables_list_empty()
-                                False => variables_list_for_scope()
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    variables_signal_list(list: PASSED.store.search_results, height_value: 150)
 }
 
 FUNCTION variables_list_for_scope() {
@@ -2536,13 +2515,13 @@ FUNCTION variables_signal_list(list, height_value) {
 }
 
 FUNCTION variable_result_row(signal) {
-    signal.id == TEXT { clk } |> WHEN {
+    signal.key == TEXT { clk } |> WHEN {
         True => variable_clk_button()
-        False => signal.id == TEXT { reset_n } |> WHEN {
+        False => signal.key == TEXT { reset_n } |> WHEN {
             True => variable_reset_button()
-            False => signal.id == TEXT { data_bus } |> WHEN {
+            False => signal.key == TEXT { data_bus } |> WHEN {
                 True => variable_data_button()
-                False => signal.id == TEXT { temperature } |> WHEN {
+                False => signal.key == TEXT { temperature } |> WHEN {
                     True => variable_temperature_button()
                     False => variable_result_static_row(signal: signal)
                 }
@@ -2552,27 +2531,27 @@ FUNCTION variable_result_row(signal) {
 }
 
 FUNCTION variable_result_static_row(signal) {
-    signal.id == TEXT { data_valid } |> WHEN {
+    signal.key == TEXT { data_valid } |> WHEN {
         True => variable_data_valid_row()
-        False => signal.id == TEXT { data_ready } |> WHEN {
+        False => signal.key == TEXT { data_ready } |> WHEN {
             True => variable_data_ready_row()
-            False => signal.id == TEXT { data_parity } |> WHEN {
+            False => signal.key == TEXT { data_parity } |> WHEN {
                 True => variable_data_parity_row()
-                False => signal.id == TEXT { state } |> WHEN {
+                False => signal.key == TEXT { state } |> WHEN {
                     True => variable_state_row()
-                    False => signal.id == TEXT { error_count } |> WHEN {
+                    False => signal.key == TEXT { error_count } |> WHEN {
                         True => variable_error_count_row()
-                        False => signal.id == TEXT { tx_data } |> WHEN {
+                        False => signal.key == TEXT { tx_data } |> WHEN {
                             True => variable_uart_tx_row()
-                            False => signal.id == TEXT { rx_data } |> WHEN {
+                            False => signal.key == TEXT { rx_data } |> WHEN {
                                 True => variable_uart_rx_row()
-                                False => signal.id == TEXT { baud_tick } |> WHEN {
+                                False => signal.key == TEXT { baud_tick } |> WHEN {
                                     True => variable_baud_tick_row()
-                                    False => signal.id == TEXT { uart_busy } |> WHEN {
+                                    False => signal.key == TEXT { uart_busy } |> WHEN {
                                         True => variable_uart_busy_row()
-                                        False => signal.id == TEXT { framing_error } |> WHEN {
+                                        False => signal.key == TEXT { framing_error } |> WHEN {
                                             True => variable_framing_error_row()
-                                            False => signal.id == TEXT { voltage } |> WHEN {
+                                            False => signal.key == TEXT { voltage } |> WHEN {
                                                 True => variable_vcore_row()
                                                 False => variable_static_row(
                                                     name_text: signal.name

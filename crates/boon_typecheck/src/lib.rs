@@ -3320,6 +3320,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/trim",
                 "Text/concat",
                 "Text/substring",
+                "List/join_field",
                 "Error/text",
                 "Router/route",
                 "Router/go_to",
@@ -3331,6 +3332,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Number/add",
                 "Number/subtract",
                 "List/count",
+                "List/length",
                 "List/sum",
                 "Text/find",
                 "Text/length",
@@ -3345,6 +3347,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/is_empty",
                 "Text/is_not_empty",
                 "Text/starts_with",
+                "Text/contains",
                 "List/every",
                 "List/any",
                 "List/is_not_empty",
@@ -3358,6 +3361,7 @@ impl Default for BuiltinSignatureRegistry {
                 "List/remove",
                 "List/range",
                 "List/chunk",
+                "List/filter_text_contains",
             ]
             .into_iter()
             .collect(),

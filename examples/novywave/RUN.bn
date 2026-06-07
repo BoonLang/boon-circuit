@@ -488,11 +488,15 @@ store: [
             }
         }
 
+    search_results:
+        signal_catalog
+        |> List/filter_text_contains(field: "name", needle: signal_search_text, prefer_field: "family", empty_field: "scope", empty_value: active_scope_label)
+
     search_results_count:
-        search_result_count(text: signal_search_text, scope: active_scope)
+        search_results |> List/length()
 
     search_results_key_summary:
-        search_result_key_summary(text: signal_search_text, scope: active_scope)
+        search_results |> List/join_field(field: "key", separator: ",", empty: "none")
 
     focused_control_label:
         TEXT { none } |> HOLD focused_control_label {

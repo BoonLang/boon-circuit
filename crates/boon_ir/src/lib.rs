@@ -4961,6 +4961,8 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
             | "List/chunk"
             | "List/find"
             | "List/find_value"
+            | "List/filter_text_contains"
+            | "List/join_field"
             | "List/get"
             | "List/append"
             | "List/remove"

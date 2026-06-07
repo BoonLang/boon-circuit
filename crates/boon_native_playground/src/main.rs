@@ -2329,7 +2329,7 @@ fn cached_document_static_analysis(
     {
         return Ok(Arc::clone(analysis));
     }
-    let runtime_analysis = boon_runtime::cached_static_analysis_from_project(
+    let runtime_analysis = boon_runtime::cached_runtime_static_analysis_from_project(
         &format!("native-document-static:{}", source_path.display()),
         units,
     )?;
@@ -25502,7 +25502,7 @@ where
         return preview_stale_source_project_result(payload, build_started, "before-live-runtime");
     }
     let live_runtime_started = Instant::now();
-    let live_runtime_result = boon_runtime::LiveRuntime::from_project(
+    let live_runtime_result = boon_runtime::LiveRuntime::from_project_profiled(
         &format!("native-preview-live:{}", entrypoint.virtual_uri),
         &runtime_units,
     );
@@ -25511,34 +25511,37 @@ where
         return preview_stale_source_project_result(payload, build_started, "after-live-runtime");
     }
     let runtime_summary_started = Instant::now();
-    let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
-        Ok(mut runtime) => {
-            let state_summary = runtime.state_summary();
-            let document_state_summary = runtime.document_state_summary();
-            let summary = preview_runtime_summary_from_state_summary(
-                Path::new(&entrypoint.virtual_uri),
-                &source_hash,
-                state_summary,
-            );
-            (
-                summary,
-                Some(document_state_summary),
-                Some(Arc::new(Mutex::new(runtime))),
-            )
-        }
-        Err(error) => (
-            json!({
-                "status": "fail",
-                "owns_live_runtime": false,
-                "reason": error.to_string(),
-                "source_path": entrypoint.virtual_uri,
-                "source_sha256": source_hash.clone(),
-                "full_state_mirroring_allowed": false
-            }),
-            None,
-            None,
-        ),
-    };
+    let (runtime_summary, document_state_summary, live_runtime, live_runtime_profile) =
+        match live_runtime_result {
+            Ok((mut runtime, profile)) => {
+                let state_summary = runtime.state_summary();
+                let document_state_summary = runtime.document_state_summary();
+                let summary = preview_runtime_summary_from_state_summary(
+                    Path::new(&entrypoint.virtual_uri),
+                    &source_hash,
+                    state_summary,
+                );
+                (
+                    summary,
+                    Some(document_state_summary),
+                    Some(Arc::new(Mutex::new(runtime))),
+                    profile,
+                )
+            }
+            Err(error) => (
+                json!({
+                    "status": "fail",
+                    "owns_live_runtime": false,
+                    "reason": error.to_string(),
+                    "source_path": entrypoint.virtual_uri,
+                    "source_sha256": source_hash.clone(),
+                    "full_state_mirroring_allowed": false
+                }),
+                None,
+                None,
+                json!({"status": "fail", "reason": error.to_string()}),
+            ),
+        };
     let runtime_summary_ms = elapsed_ms(runtime_summary_started);
     if !is_latest() {
         return preview_stale_source_project_result(
@@ -25582,6 +25585,7 @@ where
             "source_bytes": source_bytes,
             "source_unit_count": payload.units.len(),
             "runtime_source_unit_count": payload.runtime_units().len(),
+            "live_runtime_profile": live_runtime_profile,
             "layout_ms": layout_ms,
             "runtime_summary_ms": runtime_summary_ms,
             "live_runtime_ms": live_runtime_ms,

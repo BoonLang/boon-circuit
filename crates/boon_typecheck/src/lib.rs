@@ -4,6 +4,7 @@ use boon_parser::{
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Type {
@@ -375,8 +376,54 @@ impl TypeCheckReport {
 }
 
 pub fn check(program: &ParsedProgram) -> TypeCheckReport {
-    let mut checker = Checker::new(program);
-    checker.check_program()
+    check_profiled(program).0
+}
+
+pub fn check_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckProfile) {
+    let (mut checker, init_profile) = Checker::new_profiled(program);
+    checker.check_program_profiled(true, init_profile)
+}
+
+pub fn check_runtime_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckProfile) {
+    let (mut checker, init_profile) = Checker::new_profiled(program);
+    checker.check_program_profiled(false, init_profile)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TypeCheckProfile {
+    pub checker_init_ms: f64,
+    pub source_paths_ms: f64,
+    pub source_payload_shape_table_ms: f64,
+    pub source_payload_types_ms: f64,
+    pub object_bindings_ms: f64,
+    pub function_param_requirements_ms: f64,
+    pub name_bindings_ms: f64,
+    pub passed_context_ms: f64,
+    pub flow_bindings_ms: f64,
+    pub render_contracts_ms: f64,
+    pub refresh_static_row_scope_bindings_ms: f64,
+    pub recursive_functions_ms: f64,
+    pub check_statements_ms: f64,
+    pub ensure_all_expressions_ms: f64,
+    pub report_counts_ms: f64,
+    pub type_hint_table_ms: f64,
+    pub assemble_report_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckerInitProfile {
+    checker_init_ms: f64,
+    source_paths_ms: f64,
+    source_payload_shape_table_ms: f64,
+    source_payload_types_ms: f64,
+    object_bindings_ms: f64,
+    function_param_requirements_ms: f64,
+    name_bindings_ms: f64,
+    passed_context_ms: f64,
+    flow_bindings_ms: f64,
+    render_contracts_ms: f64,
+    refresh_static_row_scope_bindings_ms: f64,
 }
 
 struct Checker<'a> {
@@ -394,6 +441,7 @@ struct Checker<'a> {
     expr_type_vars: BTreeMap<usize, TypeVar>,
     runtime_list_map_exprs: BTreeSet<usize>,
     visited: BTreeSet<usize>,
+    expr_type_cache: Vec<Option<FlowType>>,
     expr_type_table: ExprTypeTable,
     function_type_table: FunctionTypeTable,
     render_slot_table: RenderSlotTable,
@@ -403,31 +451,52 @@ struct Checker<'a> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(program: &'a ParsedProgram) -> Self {
+    fn new_profiled(program: &'a ParsedProgram) -> (Self, CheckerInitProfile) {
+        let checker_init_started = Instant::now();
+        let source_paths_started = Instant::now();
         let source_paths = program
             .source_ports
             .iter()
             .map(|source| source.path.clone())
             .collect();
+        let source_paths_ms = typecheck_elapsed_ms(source_paths_started);
+        let source_payload_shape_table_started = Instant::now();
         let source_payload_shape_table = source_payload_shape_table(program);
+        let source_payload_shape_table_ms =
+            typecheck_elapsed_ms(source_payload_shape_table_started);
+        let source_payload_types_started = Instant::now();
         let source_payload_types = source_payload_shape_table
             .iter()
             .map(|entry| (entry.source_path.clone(), entry.payload_type.clone()))
             .collect();
+        let source_payload_types_ms = typecheck_elapsed_ms(source_payload_types_started);
+        let object_bindings_started = Instant::now();
         let object_bindings = object_bindings(program);
+        let object_bindings_ms = typecheck_elapsed_ms(object_bindings_started);
+        let function_param_requirements_started = Instant::now();
         let function_param_requirements = function_param_requirements(program);
+        let function_param_requirements_ms =
+            typecheck_elapsed_ms(function_param_requirements_started);
+        let name_bindings_started = Instant::now();
         let mut name_bindings =
             name_bindings(program, &source_payload_types, &function_param_requirements);
+        let name_bindings_ms = typecheck_elapsed_ms(name_bindings_started);
+        let passed_context_started = Instant::now();
         if let Some(passed_type) = passed_context_type(program, &name_bindings) {
             name_bindings.insert("PASSED".to_owned(), passed_type);
         }
+        let passed_context_ms = typecheck_elapsed_ms(passed_context_started);
+        let flow_bindings_started = Instant::now();
         let flow_bindings = flow_bindings(program);
+        let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
+        let render_contracts_started = Instant::now();
         let render_contracts =
             RenderContractRegistry::default().with_active_root(if scene_root(program).is_some() {
                 "scene"
             } else {
                 "document"
             });
+        let render_contracts_ms = typecheck_elapsed_ms(render_contracts_started);
         let mut checker = Self {
             program,
             vars: TypeVarStore::default(),
@@ -443,6 +512,7 @@ impl<'a> Checker<'a> {
             expr_type_vars: BTreeMap::new(),
             runtime_list_map_exprs: BTreeSet::new(),
             visited: BTreeSet::new(),
+            expr_type_cache: vec![None; program.expressions.len()],
             expr_type_table: ExprTypeTable::default(),
             function_type_table: FunctionTypeTable::default(),
             render_slot_table: RenderSlotTable::default(),
@@ -450,8 +520,23 @@ impl<'a> Checker<'a> {
             constraints: Vec::new(),
             diagnostics: Vec::new(),
         };
+        let refresh_started = Instant::now();
         checker.refresh_static_row_scope_bindings();
-        checker
+        let refresh_static_row_scope_bindings_ms = typecheck_elapsed_ms(refresh_started);
+        let init_profile = CheckerInitProfile {
+            checker_init_ms: typecheck_elapsed_ms(checker_init_started),
+            source_paths_ms,
+            source_payload_shape_table_ms,
+            source_payload_types_ms,
+            object_bindings_ms,
+            function_param_requirements_ms,
+            name_bindings_ms,
+            passed_context_ms,
+            flow_bindings_ms,
+            render_contracts_ms,
+            refresh_static_row_scope_bindings_ms,
+        };
+        (checker, init_profile)
     }
 
     fn refresh_static_row_scope_bindings(&mut self) {
@@ -492,14 +577,26 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_program(&mut self) -> TypeCheckReport {
+    fn check_program_profiled(
+        &mut self,
+        include_type_hints: bool,
+        init_profile: CheckerInitProfile,
+    ) -> (TypeCheckReport, TypeCheckProfile) {
+        let total_started = Instant::now();
+        let recursive_functions_started = Instant::now();
         self.check_recursive_functions();
+        let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
+        let check_statements_started = Instant::now();
         for statement in &self.program.ast.statements {
             self.check_statement(statement, false);
         }
+        let check_statements_ms = typecheck_elapsed_ms(check_statements_started);
+        let ensure_all_expressions_started = Instant::now();
         for expr in &self.program.expressions {
             self.ensure_expr(expr.id);
         }
+        let ensure_all_expressions_ms = typecheck_elapsed_ms(ensure_all_expressions_started);
+        let report_counts_started = Instant::now();
         let render_slot_count = self.render_slot_table.slots.len();
         let render_slot_failure_count = self
             .render_slot_table
@@ -525,15 +622,23 @@ impl<'a> Checker<'a> {
             .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
             .count();
         let source_payload_shape_table = self.source_payload_shape_table.clone();
-        let type_hint_table = type_hint_table(
-            self.program,
-            &self.expr_type_table,
-            &self.function_type_table,
-            &self.render_slot_table,
-            &source_payload_shape_table,
-            &self.name_bindings,
-        );
-        TypeCheckReport {
+        let report_counts_ms = typecheck_elapsed_ms(report_counts_started);
+        let type_hint_table_started = Instant::now();
+        let type_hint_table = if include_type_hints {
+            type_hint_table(
+                self.program,
+                &self.expr_type_table,
+                &self.function_type_table,
+                &self.render_slot_table,
+                &source_payload_shape_table,
+                &self.name_bindings,
+            )
+        } else {
+            TypeHintTable::default()
+        };
+        let type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
+        let assemble_report_started = Instant::now();
+        let report = TypeCheckReport {
             expression_count: self.program.expressions.len(),
             checked_expression_count: self.visited.len(),
             unresolved_type_variable_count,
@@ -562,7 +667,32 @@ impl<'a> Checker<'a> {
             list_map_bindings: std::mem::take(&mut self.list_map_bindings),
             constraints: std::mem::take(&mut self.constraints),
             diagnostics: std::mem::take(&mut self.diagnostics),
-        }
+        };
+        let assemble_report_ms = typecheck_elapsed_ms(assemble_report_started);
+        (
+            report,
+            TypeCheckProfile {
+                checker_init_ms: init_profile.checker_init_ms,
+                source_paths_ms: init_profile.source_paths_ms,
+                source_payload_shape_table_ms: init_profile.source_payload_shape_table_ms,
+                source_payload_types_ms: init_profile.source_payload_types_ms,
+                object_bindings_ms: init_profile.object_bindings_ms,
+                function_param_requirements_ms: init_profile.function_param_requirements_ms,
+                name_bindings_ms: init_profile.name_bindings_ms,
+                passed_context_ms: init_profile.passed_context_ms,
+                flow_bindings_ms: init_profile.flow_bindings_ms,
+                render_contracts_ms: init_profile.render_contracts_ms,
+                refresh_static_row_scope_bindings_ms: init_profile
+                    .refresh_static_row_scope_bindings_ms,
+                recursive_functions_ms,
+                check_statements_ms,
+                ensure_all_expressions_ms,
+                report_counts_ms,
+                type_hint_table_ms,
+                assemble_report_ms,
+                total_ms: init_profile.checker_init_ms + typecheck_elapsed_ms(total_started),
+            },
+        )
     }
 
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
@@ -872,11 +1002,10 @@ impl<'a> Checker<'a> {
 
     fn ensure_expr(&mut self, expr_id: usize) -> FlowType {
         if let Some(existing) = self
-            .expr_type_table
-            .entries
-            .iter()
-            .find(|entry| entry.expr_id == expr_id)
-            .map(|entry| entry.flow_type.clone())
+            .expr_type_cache
+            .get(expr_id)
+            .and_then(|entry| entry.as_ref())
+            .cloned()
         {
             return existing;
         }
@@ -909,6 +1038,9 @@ impl<'a> Checker<'a> {
             expr_id,
             flow_type: flow_type.clone(),
         });
+        if let Some(slot) = self.expr_type_cache.get_mut(expr_id) {
+            *slot = Some(flow_type.clone());
+        }
         flow_type
     }
 
@@ -2521,6 +2653,10 @@ impl<'a> Checker<'a> {
             message,
         }
     }
+}
+
+fn typecheck_elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 fn diagnostic_for_statement(statement: Option<&AstStatement>, message: String) -> TypeDiagnostic {
@@ -5858,11 +5994,41 @@ fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShape
         .iter()
         .map(|source| source.path.clone())
         .collect::<BTreeSet<_>>();
+    let source_lookup = SourcePayloadPathLookup::new(&source_paths);
+    let mut fields_by_source = source_paths
+        .iter()
+        .map(|source_path| (source_path.clone(), BTreeMap::new()))
+        .collect::<BTreeMap<String, BTreeMap<String, Type>>>();
+    for expr in &program.expressions {
+        let AstExprKind::Path(parts) = &expr.kind else {
+            continue;
+        };
+        let Some(field) = source_payload_field_name(parts) else {
+            continue;
+        };
+        for source_path in source_lookup.source_paths_for_parts(parts) {
+            if let Some(fields) = fields_by_source.get_mut(&source_path) {
+                fields.insert(field.to_owned(), source_payload_field_type(field));
+            }
+        }
+    }
+    collect_payload_pattern_fields(
+        &program.ast.statements,
+        &program.expressions,
+        &source_lookup,
+        &mut fields_by_source,
+    );
     program
         .source_ports
         .iter()
         .map(|source| {
-            let fields = source_payload_fields_for_path(program, &source_paths, &source.path);
+            let fields = fields_by_source
+                .get(&source.path)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, ty)| SourcePayloadShapeField { name, ty })
+                .collect::<Vec<_>>();
             let payload_type = Type::Object(ObjectShape::from_ordered_fields(
                 fields
                     .iter()
@@ -6566,43 +6732,11 @@ fn byte_column_for_line(source: &str, line: usize, byte: usize) -> usize {
         .saturating_add(1)
 }
 
-fn source_payload_fields_for_path(
-    program: &ParsedProgram,
-    source_paths: &BTreeSet<String>,
-    source_path: &str,
-) -> Vec<SourcePayloadShapeField> {
-    let mut fields = BTreeMap::new();
-    for expr in &program.expressions {
-        match &expr.kind {
-            AstExprKind::Path(parts) => {
-                if source_path_matches_parts(source_paths, source_path, parts)
-                    && let Some(field) = source_payload_field_name(parts)
-                {
-                    fields.insert(field.to_owned(), source_payload_field_type(field));
-                }
-            }
-            _ => {}
-        }
-    }
-    collect_payload_pattern_fields_for_source(
-        &program.ast.statements,
-        &program.expressions,
-        source_paths,
-        source_path,
-        &mut fields,
-    );
-    fields
-        .into_iter()
-        .map(|(name, ty)| SourcePayloadShapeField { name, ty })
-        .collect()
-}
-
-fn collect_payload_pattern_fields_for_source(
+fn collect_payload_pattern_fields(
     statements: &[AstStatement],
     expressions: &[AstExpr],
-    source_paths: &BTreeSet<String>,
-    source_path: &str,
-    fields: &mut BTreeMap<String, Type>,
+    source_lookup: &SourcePayloadPathLookup,
+    fields_by_source: &mut BTreeMap<String, BTreeMap<String, Type>>,
 ) {
     for statement in statements {
         if let Some(expr_id) = statement.expr
@@ -6610,72 +6744,123 @@ fn collect_payload_pattern_fields_for_source(
                 kind: AstExprKind::When { input },
                 ..
             }) = expressions.get(expr_id)
-            && expr_is_source_path(*input, expressions, source_paths, source_path)
         {
-            for child in &statement.children {
-                if let Some(AstExpr {
-                    kind: AstExprKind::MatchArm { pattern, .. },
-                    ..
-                }) = child.expr.and_then(|expr_id| expressions.get(expr_id))
-                {
-                    for field in source_payload_fields_from_pattern(pattern) {
-                        fields.insert(field.to_owned(), source_payload_field_type(field));
+            for source_path in expr_source_paths(*input, expressions, source_lookup) {
+                if let Some(fields) = fields_by_source.get_mut(&source_path) {
+                    for child in &statement.children {
+                        if let Some(AstExpr {
+                            kind: AstExprKind::MatchArm { pattern, .. },
+                            ..
+                        }) = child.expr.and_then(|expr_id| expressions.get(expr_id))
+                        {
+                            for field in source_payload_fields_from_pattern(pattern) {
+                                fields.insert(field.to_owned(), source_payload_field_type(field));
+                            }
+                        }
                     }
                 }
             }
         }
-        collect_payload_pattern_fields_for_source(
+        collect_payload_pattern_fields(
             &statement.children,
             expressions,
-            source_paths,
-            source_path,
-            fields,
+            source_lookup,
+            fields_by_source,
         );
     }
 }
 
-fn expr_is_source_path(
-    expr_id: usize,
-    expressions: &[AstExpr],
-    source_paths: &BTreeSet<String>,
-    source_path: &str,
-) -> bool {
-    match expressions.get(expr_id).map(|expr| &expr.kind) {
-        Some(AstExprKind::Identifier(value)) => {
-            source_path_matches_parts(source_paths, source_path, std::slice::from_ref(value))
+struct SourcePayloadPathLookup {
+    exact_prefix: BTreeMap<String, Vec<String>>,
+    suffix: BTreeMap<String, Vec<String>>,
+}
+
+impl SourcePayloadPathLookup {
+    fn new(source_paths: &BTreeSet<String>) -> Self {
+        let mut exact_prefix = BTreeMap::<String, Vec<String>>::new();
+        let mut suffix = BTreeMap::<String, Vec<String>>::new();
+        for source_path in source_paths {
+            for alias in source_path_aliases(source_path) {
+                push_unique(
+                    exact_prefix.entry(alias.clone()).or_default(),
+                    source_path.clone(),
+                );
+                let parts = alias.split('.').collect::<Vec<_>>();
+                for index in 0..parts.len() {
+                    push_unique(
+                        suffix.entry(parts[index..].join(".")).or_default(),
+                        source_path.clone(),
+                    );
+                }
+            }
         }
-        Some(AstExprKind::Path(parts)) => {
-            source_path_matches_parts(source_paths, source_path, parts)
+        Self {
+            exact_prefix,
+            suffix,
         }
-        Some(AstExprKind::Pipe { input, .. }) | Some(AstExprKind::When { input }) => {
-            expr_is_source_path(*input, expressions, source_paths, source_path)
+    }
+
+    fn source_paths_for_parts(&self, parts: &[String]) -> Vec<String> {
+        let normalized_parts = normalized_source_path_parts(parts);
+        let path = normalized_parts.join(".");
+        let path_without_payload = parts_without_payload(&normalized_parts).join(".");
+        let mut matches = Vec::new();
+        let path_parts = path.split('.').collect::<Vec<_>>();
+        for end in 1..=path_parts.len() {
+            if let Some(sources) = self.exact_prefix.get(&path_parts[..end].join(".")) {
+                for source in sources {
+                    push_unique(&mut matches, source.clone());
+                }
+            }
         }
-        _ => false,
+        if let Some(sources) = self.suffix.get(&path_without_payload) {
+            for source in sources {
+                push_unique(&mut matches, source.clone());
+            }
+        }
+        matches
     }
 }
 
-fn source_path_matches_parts(
-    source_paths: &BTreeSet<String>,
-    source_path: &str,
-    parts: &[String],
-) -> bool {
-    let normalized_parts = normalized_source_path_parts(parts);
-    let path = normalized_parts.join(".");
-    if !path_is_source_path(source_paths, &path) {
-        return false;
+fn source_path_aliases(source_path: &str) -> Vec<String> {
+    let mut aliases = vec![source_path.to_owned()];
+    aliases.push(
+        source_path
+            .strip_prefix("store.")
+            .unwrap_or(source_path)
+            .to_owned(),
+    );
+    if let Some((_, relative)) = source_path.split_once('.') {
+        aliases.push(relative.to_owned());
     }
-    let store_relative = source_path.strip_prefix("store.").unwrap_or(source_path);
-    let scoped_relative = source_path
-        .split_once('.')
-        .map(|(_, relative)| relative)
-        .unwrap_or(source_path);
-    let path_without_payload = parts_without_payload(&normalized_parts).join(".");
-    [source_path, store_relative, scoped_relative]
-        .into_iter()
-        .any(|base| {
-            path.starts_with(&format!("{base}."))
-                || base.ends_with(&format!(".{path_without_payload}"))
-        })
+    let mut unique = Vec::new();
+    for alias in aliases {
+        push_unique(&mut unique, alias);
+    }
+    unique
+}
+
+fn push_unique<T: Eq>(items: &mut Vec<T>, item: T) {
+    if !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
+fn expr_source_paths(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    source_lookup: &SourcePayloadPathLookup,
+) -> Vec<String> {
+    match expressions.get(expr_id).map(|expr| &expr.kind) {
+        Some(AstExprKind::Identifier(value)) => {
+            source_lookup.source_paths_for_parts(std::slice::from_ref(value))
+        }
+        Some(AstExprKind::Path(parts)) => source_lookup.source_paths_for_parts(parts),
+        Some(AstExprKind::Pipe { input, .. }) | Some(AstExprKind::When { input }) => {
+            expr_source_paths(*input, expressions, source_lookup)
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn parts_without_payload(parts: &[String]) -> &[String] {

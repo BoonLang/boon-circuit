@@ -6,8 +6,8 @@ use bitvec::prelude::*;
 use boon_ir::{
     DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListId, ListInitializer,
     ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
-    TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower, verify_hidden_identity,
-    verify_static_schedule,
+    TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower, lower_profiled,
+    lower_runtime_profiled, verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, DocumentAst,
@@ -738,7 +738,103 @@ fn cached_runtime_plan_from_source(
     source_label: &str,
     source_text: &str,
 ) -> RuntimeResult<CachedRuntimePlan> {
+    Ok(cached_runtime_plan_from_source_profiled(source_label, source_text)?.0)
+}
+
+fn cached_runtime_plan_from_source_profiled(
+    source_label: &str,
+    source_text: &str,
+) -> RuntimeResult<(CachedRuntimePlan, JsonValue)> {
+    let total_started = Instant::now();
     let key = sha256_bytes(source_text.as_bytes());
+    if let Some(plan) = runtime_plan_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok((
+            plan,
+            json!({
+                "cache_hit": true,
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ));
+    }
+
+    let parse_started = Instant::now();
+    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+    let parse_ms = runtime_elapsed_ms(parse_started);
+    let lower_started = Instant::now();
+    let (ir, lower_profile) = lower_runtime_profiled(&parsed)?;
+    let lower_ms = runtime_elapsed_ms(lower_started);
+    let verify_started = Instant::now();
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let verify_ms = runtime_elapsed_ms(verify_started);
+    let compile_started = Instant::now();
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let expression_count = ir.expression_count;
+    let graph_node_count = ir.graph_node_count;
+    let plan = CachedRuntimePlan {
+        ir: Arc::new(ir),
+        compiled: Arc::new(compiled),
+    };
+    if let Ok(mut cache) = runtime_plan_cache().lock() {
+        cache.insert(key, plan.clone());
+    }
+    Ok((
+        plan,
+        json!({
+            "cache_hit": false,
+            "parse_ms": parse_ms,
+            "lower_ms": lower_ms,
+            "lower_profile": lower_profile,
+            "verify_ms": verify_ms,
+            "compile_ms": compile_ms,
+            "expression_count": expression_count,
+            "graph_node_count": graph_node_count,
+            "total_ms": runtime_elapsed_ms(total_started)
+        }),
+    ))
+}
+
+fn cached_runtime_plan_from_project(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<CachedRuntimePlan> {
+    Ok(cached_runtime_plan_from_project_profiled(source_label, units)?.0)
+}
+
+fn cached_full_runtime_plan_from_project(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<CachedRuntimePlan> {
+    if units.len() == 1 {
+        let unit = &units[0];
+        let key = format!("full:{}", sha256_bytes(unit.source.as_bytes()));
+        if let Some(plan) = runtime_plan_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned())
+        {
+            return Ok(plan);
+        }
+        let parsed = parse_source(unit.path.clone(), unit.source.clone())?;
+        let (ir, _) = lower_profiled(&parsed)?;
+        verify_hidden_identity(&ir)?;
+        verify_static_schedule(&ir)?;
+        let compiled = CompiledProgram::from_ir(&ir)?;
+        let plan = CachedRuntimePlan {
+            ir: Arc::new(ir),
+            compiled: Arc::new(compiled),
+        };
+        if let Ok(mut cache) = runtime_plan_cache().lock() {
+            cache.insert(key, plan.clone());
+        }
+        return Ok(plan);
+    }
+    let key = format!("full:{}", source_units_hash(units));
     if let Some(plan) = runtime_plan_cache()
         .lock()
         .ok()
@@ -746,9 +842,13 @@ fn cached_runtime_plan_from_source(
     {
         return Ok(plan);
     }
-
-    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
-    let ir = lower(&parsed)?;
+    let parsed = parse_project(
+        source_label.to_owned(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    )?;
+    let (ir, _) = lower_profiled(&parsed)?;
     verify_hidden_identity(&ir)?;
     verify_static_schedule(&ir)?;
     let compiled = CompiledProgram::from_ir(&ir)?;
@@ -762,13 +862,14 @@ fn cached_runtime_plan_from_source(
     Ok(plan)
 }
 
-fn cached_runtime_plan_from_project(
+fn cached_runtime_plan_from_project_profiled(
     source_label: &str,
     units: &[RuntimeSourceUnit],
-) -> RuntimeResult<CachedRuntimePlan> {
+) -> RuntimeResult<(CachedRuntimePlan, JsonValue)> {
+    let total_started = Instant::now();
     if units.len() == 1 {
         let unit = &units[0];
-        return cached_runtime_plan_from_source(&unit.path, &unit.source);
+        return cached_runtime_plan_from_source_profiled(&unit.path, &unit.source);
     }
     let key = source_units_hash(units);
     if let Some(plan) = runtime_plan_cache()
@@ -776,19 +877,36 @@ fn cached_runtime_plan_from_project(
         .ok()
         .and_then(|cache| cache.get(&key).cloned())
     {
-        return Ok(plan);
+        return Ok((
+            plan,
+            json!({
+                "cache_hit": true,
+                "source_unit_count": units.len(),
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ));
     }
 
+    let parse_started = Instant::now();
     let parsed = parse_project(
         source_label.to_owned(),
         units
             .iter()
             .map(|unit| (unit.path.clone(), unit.source.clone())),
     )?;
-    let ir = lower(&parsed)?;
+    let parse_ms = runtime_elapsed_ms(parse_started);
+    let lower_started = Instant::now();
+    let (ir, lower_profile) = lower_runtime_profiled(&parsed)?;
+    let lower_ms = runtime_elapsed_ms(lower_started);
+    let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
     verify_static_schedule(&ir)?;
+    let verify_ms = runtime_elapsed_ms(verify_started);
+    let compile_started = Instant::now();
     let compiled = CompiledProgram::from_ir(&ir)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let expression_count = ir.expression_count;
+    let graph_node_count = ir.graph_node_count;
     let plan = CachedRuntimePlan {
         ir: Arc::new(ir),
         compiled: Arc::new(compiled),
@@ -796,7 +914,25 @@ fn cached_runtime_plan_from_project(
     if let Ok(mut cache) = runtime_plan_cache().lock() {
         cache.insert(key, plan.clone());
     }
-    Ok(plan)
+    Ok((
+        plan,
+        json!({
+            "cache_hit": false,
+            "source_unit_count": units.len(),
+            "parse_ms": parse_ms,
+            "lower_ms": lower_ms,
+            "lower_profile": lower_profile,
+            "verify_ms": verify_ms,
+            "compile_ms": compile_ms,
+            "expression_count": expression_count,
+            "graph_node_count": graph_node_count,
+            "total_ms": runtime_elapsed_ms(total_started)
+        }),
+    ))
+}
+
+fn runtime_elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 pub fn source_units_hash(units: &[RuntimeSourceUnit]) -> String {
@@ -823,12 +959,18 @@ pub fn cached_static_analysis_from_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<RuntimeStaticProgramAnalysis> {
-    let plan = if units.len() == 1 {
-        let unit = &units[0];
-        cached_runtime_plan_from_source(&unit.path, &unit.source)?
-    } else {
-        cached_runtime_plan_from_project(source_label, units)?
-    };
+    let plan = cached_full_runtime_plan_from_project(source_label, units)?;
+    Ok(RuntimeStaticProgramAnalysis {
+        typecheck_report: plan.ir.typecheck_report.clone(),
+        view_bindings: plan.ir.view_bindings.clone(),
+    })
+}
+
+pub fn cached_runtime_static_analysis_from_project(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<RuntimeStaticProgramAnalysis> {
+    let plan = cached_runtime_plan_from_project(source_label, units)?;
     Ok(RuntimeStaticProgramAnalysis {
         typecheck_report: plan.ir.typecheck_report.clone(),
         view_bindings: plan.ir.view_bindings.clone(),
@@ -878,6 +1020,30 @@ impl LiveRuntime {
             runtime,
             next_step: 1,
         })
+    }
+
+    pub fn from_project_profiled(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        let total_started = Instant::now();
+        let (plan, plan_profile) = cached_runtime_plan_from_project_profiled(source_label, units)?;
+        let runtime_started = Instant::now();
+        let (runtime, runtime_profile) =
+            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let runtime_ms = runtime_elapsed_ms(runtime_started);
+        Ok((
+            Self {
+                runtime,
+                next_step: 1,
+            },
+            json!({
+                "plan": plan_profile,
+                "runtime": runtime_profile,
+                "runtime_total_ms": runtime_ms,
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ))
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
@@ -1769,10 +1935,27 @@ struct LoadedRuntime {
 
 impl LoadedRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
-        let generic = GenericScheduledRuntime::new(ir, compiled)?;
+        Ok(Self::new_profiled(ir, compiled)?.0)
+    }
+
+    fn new_profiled(
+        ir: &TypedProgram,
+        compiled: &CompiledProgram,
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        let (generic, generic_profile) = GenericScheduledRuntime::new_profiled(ir, compiled)?;
         Ok(Self {
             generic: Some(generic),
-        })
+        }
+        .with_profile(generic_profile))
+    }
+
+    fn with_profile(self, generic_profile: JsonValue) -> (Self, JsonValue) {
+        (
+            self,
+            json!({
+                "generic": generic_profile
+            }),
+        )
     }
 
     fn generic_state_summary(&mut self) -> JsonValue {
@@ -4754,8 +4937,20 @@ impl SummaryLimits {
 
 impl GenericScheduledRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
+        Ok(Self::new_profiled(ir, compiled)?.0)
+    }
+
+    fn new_profiled(
+        ir: &TypedProgram,
+        compiled: &CompiledProgram,
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        let total_started = Instant::now();
+        let storage_started = Instant::now();
+        let storage = GenericCircuitRuntime::new(ir)?;
+        let storage_ms = runtime_elapsed_ms(storage_started);
+        let clone_started = Instant::now();
         let mut runtime = Self {
-            storage: GenericCircuitRuntime::new(ir)?,
+            storage,
             router_route: "/".to_owned(),
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
@@ -4768,11 +4963,31 @@ impl GenericScheduledRuntime {
             root_state_paths: compiled.root_state_paths.clone(),
             list_summary_fields: compiled.list_summary_fields.clone(),
         };
+        let clone_ms = runtime_elapsed_ms(clone_started);
+        let bind_started = Instant::now();
         runtime.bind_initial_list_sources()?;
+        let bind_initial_list_sources_ms = runtime_elapsed_ms(bind_started);
+        let first_derived_started = Instant::now();
         runtime.initialize_generic_derived_fields()?;
+        let first_derived_ms = runtime_elapsed_ms(first_derived_started);
+        let reset_started = Instant::now();
         runtime.reset_indexed_holds_from_row_initial_fields(ir)?;
+        let reset_indexed_holds_ms = runtime_elapsed_ms(reset_started);
+        let second_derived_started = Instant::now();
         runtime.initialize_generic_derived_fields()?;
-        Ok(runtime)
+        let second_derived_ms = runtime_elapsed_ms(second_derived_started);
+        Ok((
+            runtime,
+            json!({
+                "storage_ms": storage_ms,
+                "clone_plans_ms": clone_ms,
+                "bind_initial_list_sources_ms": bind_initial_list_sources_ms,
+                "initialize_generic_derived_first_ms": first_derived_ms,
+                "reset_indexed_holds_ms": reset_indexed_holds_ms,
+                "initialize_generic_derived_second_ms": second_derived_ms,
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ))
     }
 
     fn source_payload_has_text(&self, source: &str) -> bool {

@@ -11161,6 +11161,18 @@ impl DevWindowShell {
         }
     }
 
+    fn attach_preview_transport_result_if_queued(
+        &mut self,
+        value: &mut serde_json::Value,
+        timeout: Duration,
+    ) {
+        if value.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+            && value.get("preview_transport").is_some()
+        {
+            value["preview_transport_result"] = self.wait_for_preview_replace_result(timeout);
+        }
+    }
+
     fn update_preview_summary_from_transport(&mut self, transport: &serde_json::Value) {
         if let Some(summary) = transport
             .pointer("/ack/preview_runtime_summary")
@@ -11236,6 +11248,7 @@ impl DevWindowShell {
             .find(|entry| entry.id != original)
             .map(|entry| entry.id.clone())
             .or_else(|| shell.catalog.entries.first().map(|entry| entry.id.clone()));
+        let preview_probe_timeout = Duration::from_secs(10);
         let mut tab_switch_json = match alternate {
             Some(example_id) => shell.dispatch_host_synthetic_source_path(
                 &format!("dev.tabs.select.{example_id}"),
@@ -11244,46 +11257,41 @@ impl DevWindowShell {
             ),
             None => json!({"status": "fail", "blocker": "ExampleCatalog has no tab entries"}),
         };
-        if tab_switch_json
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass")
-        {
-            tab_switch_json["preview_transport_result"] =
-                shell.wait_for_preview_replace_result(Duration::from_secs(2));
-        }
+        shell
+            .attach_preview_transport_result_if_queued(&mut tab_switch_json, preview_probe_timeout);
         let mut run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
-        if run.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            run["preview_transport_result"] =
-                shell.wait_for_preview_replace_result(Duration::from_secs(2));
-        }
+        shell.attach_preview_transport_result_if_queued(&mut run, preview_probe_timeout);
         let mut format =
             shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
-        if format.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            format["preview_transport_result"] =
-                shell.wait_for_preview_replace_result(Duration::from_secs(2));
-        }
+        shell.attach_preview_transport_result_if_queued(&mut format, preview_probe_timeout);
         let mut reset =
             shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
-        if reset.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            reset["preview_transport_result"] =
-                shell.wait_for_preview_replace_result(Duration::from_secs(2));
-        }
+        shell.attach_preview_transport_result_if_queued(&mut reset, preview_probe_timeout);
         let editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
             "\n-- host synthetic editor input",
             1180.0,
             820.0,
         );
-        let new_custom_tab =
+        let mut editor_text_input = editor_text_input;
+        shell.attach_preview_transport_result_if_queued(
+            &mut editor_text_input,
+            preview_probe_timeout,
+        );
+        let mut new_custom_tab =
             shell.dispatch_host_synthetic_source_path("dev.tabs.new", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut new_custom_tab, preview_probe_timeout);
         let new_custom_id = new_custom_tab
             .get("stable_id")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
-        let new_custom_editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
+        let mut new_custom_editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
             "-- persisted custom draft\n",
             1180.0,
             820.0,
+        );
+        shell.attach_preview_transport_result_if_queued(
+            &mut new_custom_editor_text_input,
+            preview_probe_timeout,
         );
         let custom_source = std::fs::read_to_string("examples/counter.bn").unwrap_or_else(|_| {
             "-- custom example metadata lives outside Boon source\nstore: [title: TEXT { Custom }]\ndocument: Document/new(root: Element/label(element: [], style: [], label: store.title))\n".to_owned()
@@ -11311,15 +11319,20 @@ impl DevWindowShell {
         let custom_rename = shell
             .catalog
             .rename_custom_example("custom:probe", "Probe Custom Renamed");
-        let select_probe_custom = shell.dispatch_host_synthetic_source_path(
+        let mut select_probe_custom = shell.dispatch_host_synthetic_source_path(
             "dev.tabs.select.custom:probe",
             1180.0,
             820.0,
         );
+        shell.attach_preview_transport_result_if_queued(
+            &mut select_probe_custom,
+            preview_probe_timeout,
+        );
         let custom_ui_source_bindings = shell.document_source_paths();
         let custom_remove_enabled = shell.remove_custom_enabled_probe(1180.0, 820.0);
-        let custom_remove =
+        let mut custom_remove =
             shell.dispatch_host_synthetic_source_path("dev.commands.remove_custom", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut custom_remove, preview_probe_timeout);
         let dirty_tab_preservation = shell
             .workspace
             .dirty_tab_preservation_probe(&shell.catalog)
@@ -11337,15 +11350,23 @@ impl DevWindowShell {
         );
         let new_custom_remove = match new_custom_id.as_deref() {
             Some(id) => {
-                let select_new_custom = shell.dispatch_host_synthetic_source_path(
+                let mut select_new_custom = shell.dispatch_host_synthetic_source_path(
                     &format!("dev.tabs.select.{id}"),
                     1180.0,
                     820.0,
+                );
+                shell.attach_preview_transport_result_if_queued(
+                    &mut select_new_custom,
+                    preview_probe_timeout,
                 );
                 let mut remove_new_custom = shell.dispatch_host_synthetic_source_path(
                     "dev.commands.remove_custom",
                     1180.0,
                     820.0,
+                );
+                shell.attach_preview_transport_result_if_queued(
+                    &mut remove_new_custom,
+                    preview_probe_timeout,
                 );
                 remove_new_custom["select_before_remove"] = select_new_custom;
                 remove_new_custom
@@ -11364,10 +11385,7 @@ impl DevWindowShell {
             1180.0,
             820.0,
         );
-        if restore.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            restore["preview_transport_result"] =
-                shell.wait_for_preview_replace_result(Duration::from_secs(2));
-        }
+        shell.attach_preview_transport_result_if_queued(&mut restore, preview_probe_timeout);
         let status_pass = [
             &tab_switch_json,
             &run,
@@ -38686,10 +38704,9 @@ mod tests {
             );
         }
 
-        for (label, expected_color, expected_intensity) in [
-            ("42 ns", "#ffe768aa", 0.38),
-            ("M reset released", "#8f75ff88", 0.22),
-        ] {
+        for (label, expected_color, expected_intensity) in
+            [("42 ns", "#ffe768aa", 0.38), ("M 42 ns", "#8f75ff88", 0.22)]
+        {
             let context = format!("NovyWave glow material `{label}`");
             let glowing_item = layout
                 .display_list
@@ -38913,12 +38930,13 @@ mod tests {
                 })
                 .expect("NovyWave light-mode source event should apply");
             let light_state = runtime.document_state_summary();
-            let (_, light_layout) = native_document_layout_proof_with_project_state_embedded(
-                &source_path,
-                &units,
-                Some(&light_state),
-            )
-            .expect("NovyWave light layout should lower");
+            let (light_proof, light_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&light_state),
+                )
+                .expect("NovyWave light layout should lower");
             let light_image = render_physical_todomvc_frame_image(
                 &device,
                 &queue,
@@ -39044,6 +39062,49 @@ mod tests {
                 visual_image_metadata("boon_dark", &dark_image, "loaded dark readback");
             let boon_light_metadata =
                 visual_image_metadata("boon_light", &light_image, "loaded light readback");
+            let mut visual_contract_metrics = Vec::new();
+            {
+                let mut record_text_metric =
+                    |mode_label: &str,
+                     frame: &boon_document::LayoutFrame,
+                     image: &image::RgbaImage,
+                     label: &str,
+                     min_luma_range: f32| {
+                        let text_item = physical_frame_text_item(frame, label, mode_label);
+                        let luma_range = assert_rendered_text_region_has_luma_contrast(
+                            image,
+                            text_item.bounds,
+                            min_luma_range,
+                            &format!("NovyWave {mode_label} `{label}` readability"),
+                        );
+                        visual_contract_metrics.push(json!({
+                            "metric": "text_luma_range",
+                            "mode": mode_label,
+                            "label": label,
+                            "luma_range": luma_range,
+                            "min_luma_range": min_luma_range,
+                            "bounds": rect_metric_json(text_item.bounds)
+                        }));
+                    };
+                record_text_metric(
+                    "empty_dark",
+                    &empty_layout,
+                    &empty_image,
+                    "No waveform loaded",
+                    16.0,
+                );
+                record_text_metric(
+                    "empty_light",
+                    &empty_light_layout,
+                    &empty_light_image,
+                    "No waveform loaded",
+                    16.0,
+                );
+                for label in ["NovyWave.io", "- counter.vcd", "data_bus[7:0]", "42 ns"] {
+                    record_text_metric("loaded_dark", &dark_layout, &dark_image, label, 14.0);
+                    record_text_metric("loaded_light", &light_layout, &light_image, label, 14.0);
+                }
+            }
             let comparison_report = json!({
                 "status": "pass",
                 "reference_source": "decoded NovyWave screenshots only; no Rust/Tauri code imported",
@@ -39077,7 +39138,8 @@ mod tests {
                     "loaded_dark_has_timeline_glass": true,
                     "loaded_dark_has_cursor_marker_trace_glow": true,
                     "loaded_light_has_distinct_background": true
-                }
+                },
+                "visual_contract_metrics": visual_contract_metrics.clone()
             });
             let comparison_path =
                 repo_path("target/artifacts/native-gpu/tests/novywave-reference-comparison.json");
@@ -39231,6 +39293,170 @@ mod tests {
                 "hovered Probe control should change app-owned pixels, diff={hover_diff}, bounds={:?}",
                 probe_button.bounds
             );
+            visual_contract_metrics.push(json!({
+                "metric": "control_hover_pixel_diff",
+                "mode": "loaded_dark",
+                "label": "Probe",
+                "diff": hover_diff,
+                "min_diff": 120,
+                "bounds": rect_metric_json(probe_button.bounds)
+            }));
+
+            let fmt_button = physical_button_for_text(&light_layout, "Fmt", "NovyWave light hover");
+            let mut light_hover_input = deterministic_click_input(0, 0.0, 0.0);
+            light_hover_input.mouse_motion_event_count = 0;
+            light_hover_input.mouse_window_pos =
+                Some(boon_native_app_window::NativeMouseWindowPosition {
+                    x: f64::from(fmt_button.bounds.x + fmt_button.bounds.width * 0.5),
+                    y: f64::from(fmt_button.bounds.y + fmt_button.bounds.height * 0.5),
+                    window_width: 920.0,
+                    window_height: 720.0,
+                });
+            let light_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+                layout_proof: light_proof.clone(),
+                layout_frame_override: Some(light_layout.clone()),
+                update_count: 0,
+                scroll_x_px: 0.0,
+                scroll_y_px: 0.0,
+                last_error: None,
+                last_error_count: 0,
+                status_overlay: None,
+                last_dirty_reason: None,
+            }));
+            let mut light_input_state = PreviewNativeInputState::default();
+            let light_hover_layout_proof = light_shared_render_state
+                .lock()
+                .unwrap()
+                .layout_proof
+                .clone();
+            assert!(
+                preview_update_hover_from_input(
+                    &light_hover_layout_proof,
+                    &light_hover_input,
+                    &light_shared_render_state,
+                    &mut light_input_state,
+                )
+                .expect("NovyWave light hover overlay should update for readback")
+            );
+            let light_hover_frame = latest_preview_frame(&light_shared_render_state);
+            let light_hover_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &light_hover_frame,
+                "novywave-fmt-light-hover-material-region",
+            );
+            let light_hover_diff =
+                image_abs_diff_sum(&light_image, &light_hover_image, fmt_button.bounds);
+            assert!(
+                light_hover_diff >= 120,
+                "hovered Fmt control should change light-mode app-owned pixels, diff={light_hover_diff}, bounds={:?}",
+                fmt_button.bounds
+            );
+            visual_contract_metrics.push(json!({
+                "metric": "control_hover_pixel_diff",
+                "mode": "loaded_light",
+                "label": "Fmt",
+                "diff": light_hover_diff,
+                "min_diff": 120,
+                "bounds": rect_metric_json(fmt_button.bounds)
+            }));
+
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.format_cycle".to_owned(),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave format-cycle pressed source event should apply");
+            let pressed_fmt_state = runtime.document_state_summary();
+            let (_, pressed_fmt_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&pressed_fmt_state),
+            )
+            .expect("NovyWave pressed Fmt layout should lower");
+            let pressed_fmt_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &pressed_fmt_layout,
+                "novywave-fmt-pressed-material-region",
+            );
+            let pressed_fmt_diff =
+                image_abs_diff_sum(&light_image, &pressed_fmt_image, fmt_button.bounds);
+            assert!(
+                pressed_fmt_diff >= 120,
+                "pressed Fmt control should change app-owned pixels, diff={pressed_fmt_diff}, bounds={:?}",
+                fmt_button.bounds
+            );
+            visual_contract_metrics.push(json!({
+                "metric": "control_pressed_pixel_diff",
+                "mode": "loaded_light",
+                "label": "Fmt",
+                "diff": pressed_fmt_diff,
+                "min_diff": 120,
+                "bounds": rect_metric_json(fmt_button.bounds)
+            }));
+
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.signal_search_focus_probe".to_owned(),
+                    target_text: Some("signal search".to_owned()),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave search focus source event should apply for visual readback");
+            let focused_state = runtime.document_state_summary();
+            let (_, focused_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&focused_state),
+            )
+            .expect("NovyWave focused search layout should lower");
+            let focused_image = render_physical_todomvc_frame_image(
+                &device,
+                &queue,
+                &focused_layout,
+                "novywave-search-focused-material-region",
+            );
+            let focused_search = focused_layout
+                .display_list
+                .iter()
+                .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+                .expect("NovyWave focused search input should render");
+            let focus_diff =
+                image_abs_diff_sum(&light_image, &focused_image, focused_search.bounds);
+            assert!(
+                focus_diff >= 120,
+                "focused search input should change app-owned pixels, diff={focus_diff}, bounds={:?}",
+                focused_search.bounds
+            );
+            visual_contract_metrics.push(json!({
+                "metric": "control_focus_pixel_diff",
+                "mode": "loaded_light",
+                "label": "signal search",
+                "diff": focus_diff,
+                "min_diff": 120,
+                "bounds": rect_metric_json(focused_search.bounds)
+            }));
+
+            let visual_contract_path = repo_path(
+                "target/artifacts/native-gpu/tests/novywave-visual-contract-metrics.json",
+            );
+            std::fs::write(
+                &visual_contract_path,
+                serde_json::to_vec_pretty(&json!({
+                    "status": "pass",
+                    "source": "app-owned WGPU readback crops from NovyWave Boon example",
+                    "source_path": source_path.display().to_string(),
+                    "source_units_hash": boon_runtime::source_units_hash(&units),
+                    "source_unit_count": units.len(),
+                    "generated_at_unix_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system time should be after Unix epoch")
+                        .as_millis(),
+                    "metrics": visual_contract_metrics
+                }))
+                .expect("NovyWave visual contract metrics should serialize"),
+            )
+            .expect("NovyWave visual contract metrics should write");
         });
     }
 
@@ -39970,6 +40196,29 @@ mod tests {
             }
         }
         max_luma - min_luma
+    }
+
+    fn assert_rendered_text_region_has_luma_contrast(
+        image: &image::RgbaImage,
+        rect: boon_document::Rect,
+        min_luma_range: f32,
+        context: &str,
+    ) -> f32 {
+        let luma_range = image_luma_range(image, rect);
+        assert!(
+            luma_range >= min_luma_range,
+            "{context} should have readable foreground/background luma contrast: range={luma_range:.2}, required={min_luma_range:.2}, bounds={rect:?}"
+        );
+        luma_range
+    }
+
+    fn rect_metric_json(rect: boon_document::Rect) -> serde_json::Value {
+        json!({
+            "x": rect.x,
+            "y": rect.y,
+            "width": rect.width,
+            "height": rect.height
+        })
     }
 
     fn image_abs_diff_sum(

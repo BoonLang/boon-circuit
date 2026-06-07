@@ -140,6 +140,18 @@ FUNCTION material(mode, of) {
             }
         ]
 
+        TraceEdge => [
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #60a5fa }
+                Light => TEXT { #2563eb }
+            }
+            gloss: 0.04
+            glow: PASSED.mode |> WHEN {
+                Dark => [color: TEXT { #60a5fa3d }, intensity: 0.06]
+                Light => [color: TEXT { #2563eb24 }, intensity: 0.03]
+            }
+        ]
+
         AnalogTrace => [
             color: PASSED.mode |> WHEN {
                 Dark => TEXT { #6bbdff }
@@ -296,6 +308,15 @@ FUNCTION trace_material(mode, state) {
     }
 }
 
+FUNCTION trace_cell_material(mode, state, tone) {
+    [
+        ...trace_material(mode: PASSED.mode, state: PASSED.state)
+        color: trace_fill_color(mode: PASSED.mode, tone: PASSED.tone)
+        border: trace_border_color(mode: PASSED.mode, tone: PASSED.tone)
+        border_width: 1
+    ]
+}
+
 FUNCTION trace_height(state) {
     state |> WHEN {
         High => 18
@@ -306,4 +327,69 @@ FUNCTION trace_height(state) {
         AnalogHigh => 24
         __ => 10
     }
+}
+
+FUNCTION trace_fill_color(mode, tone) {
+    tone |> WHEN {
+        Blue => PASSED.mode |> WHEN {
+            Dark => TEXT { #2563EB }
+            Light => TEXT { #2563EB }
+        }
+        Dark => TEXT { #06111F }
+        Sky => PASSED.mode |> WHEN {
+            Dark => TEXT { #0EA5E9 }
+            Light => TEXT { #0284C7 }
+        }
+        Indigo => PASSED.mode |> WHEN {
+            Dark => TEXT { #1D4ED8 }
+            Light => TEXT { #1D4ED8 }
+        }
+        Cyan => PASSED.mode |> WHEN {
+            Dark => TEXT { #0891B2 }
+            Light => TEXT { #087A98 }
+        }
+        Pale => PASSED.mode |> WHEN {
+            Dark => TEXT { #7DD3FC }
+            Light => TEXT { #38BDF8 }
+        }
+        __ => material(mode: PASSED.mode, of: TraceUnknown).color
+    }
+}
+
+FUNCTION trace_border_color(mode, tone) {
+    tone |> WHEN {
+        Blue => TEXT { #60A5FA }
+        Dark => PASSED.mode |> WHEN {
+            Dark => TEXT { #1D4ED8 }
+            Light => TEXT { #2563EB }
+        }
+        Sky => PASSED.mode |> WHEN {
+            Dark => TEXT { #BAE6FD }
+            Light => TEXT { #7DD3FC }
+        }
+        Indigo => TEXT { #60A5FA }
+        Cyan => TEXT { #A5F3FC }
+        Pale => PASSED.mode |> WHEN {
+            Dark => TEXT { #E0F2FE }
+            Light => TEXT { #BAE6FD }
+        }
+        __ => material(mode: PASSED.mode, of: TraceUnknown).color
+    }
+}
+
+FUNCTION trace_label_color(mode, tone) {
+    tone |> WHEN {
+        Dark => PASSED.mode |> WHEN {
+            Dark => TEXT { #7EA6D9 }
+            Light => TEXT { #9DC5F4 }
+        }
+        __ => TEXT { #EAF4FF }
+    }
+}
+
+FUNCTION trace_label_font(mode, tone) {
+    [
+        ...font(mode: PASSED.mode, of: Mono)
+        color: trace_label_color(mode: PASSED.mode, tone: PASSED.tone)
+    ]
 }

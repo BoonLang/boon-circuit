@@ -2322,7 +2322,7 @@ FUNCTION waveform_transition_edge_blue() {
             width: 1
             height: Fill
             background: [color: TEXT { #60A5FA }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
@@ -2331,7 +2331,7 @@ FUNCTION waveform_transition_edge_blue() {
 FUNCTION waveform_transition_edge_dark() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -2339,7 +2339,7 @@ FUNCTION waveform_transition_edge_dark() {
 FUNCTION waveform_transition_edge_sky() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -2347,7 +2347,7 @@ FUNCTION waveform_transition_edge_sky() {
 FUNCTION waveform_transition_edge_indigo() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -2355,7 +2355,7 @@ FUNCTION waveform_transition_edge_indigo() {
 FUNCTION waveform_transition_edge_cyan() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -2363,7 +2363,7 @@ FUNCTION waveform_transition_edge_cyan() {
 FUNCTION waveform_transition_edge_pale() {
     Scene/Element/block(
         element: []
-        style: [width: 1, height: Fill, background: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)]
+        style: [width: 1, height: Fill, background: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -2376,19 +2376,16 @@ FUNCTION waveform_trace_cell_blue(segment) {
             height: NovyTheme/trace_height(state: segment.state)
             align: [column: Center]
             rounded_corners: 2
-            background: [color: TEXT { #2563EB }]
-            border: [color: TEXT { #60A5FA }]
-            material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)
+            material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Blue)
         ]
         label: Scene/Element/text(
             element: []
             style: [
-                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                ...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Blue)
                 width: Fill
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #EAF4FF }
             ]
             text: segment.label
         )
@@ -2398,40 +2395,40 @@ FUNCTION waveform_trace_cell_blue(segment) {
 FUNCTION waveform_trace_cell_dark(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Dark)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Dark), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_sky(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Sky)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Sky), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_indigo(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Indigo)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Indigo), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_cyan(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Cyan)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Cyan), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
 
 FUNCTION waveform_trace_cell_pale(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Pale)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Pale), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
 

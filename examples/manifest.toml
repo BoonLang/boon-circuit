@@ -324,9 +324,12 @@ visual_artifacts = [
   "timeline-glass-material-crop",
   "waveform-trace-crop",
   "cursor-marker-glow-crop",
+  "text-readability-crop-metrics",
+  "hover-focus-pressed-crop-metrics",
   "novywave-empty-reference-comparison",
   "novywave-reference-comparison-crop",
   "novywave-reference-comparison-json",
+  "novywave-visual-contract-metrics-json",
 ]
 performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",

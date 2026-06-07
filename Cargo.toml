@@ -56,3 +56,39 @@ glyphon = "=0.11.0"
 app_window = { path = "vendor/app_window" }
 wgsl_bindgen = "=0.22.2"
 futures = "0.3"
+
+[profile.dev.package.boon_document]
+opt-level = 2
+
+[profile.dev.package.boon_native_app_window]
+opt-level = 2
+
+[profile.dev.package.boon_native_gpu]
+opt-level = 2
+
+[profile.dev.package.boon_native_playground]
+opt-level = 2
+
+[profile.dev.package.glyphon]
+opt-level = 2
+
+[profile.dev.package.image]
+opt-level = 2
+
+[profile.dev.package.png]
+opt-level = 2
+
+[profile.dev.package.fdeflate]
+opt-level = 2
+
+[profile.dev.package.flate2]
+opt-level = 2
+
+[profile.dev.package.miniz_oxide]
+opt-level = 2
+
+[profile.dev.package.crc32fast]
+opt-level = 2
+
+[profile.dev.package.wgpu]
+opt-level = 2

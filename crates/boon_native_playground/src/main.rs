@@ -591,6 +591,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "source_hash": code_hash.clone(),
             "preview_receives_example_name": false
         }),
+        prewarmed_project_hashes: BTreeSet::new(),
         replace_worker: PreviewReplaceWorkerQueue::default(),
     }));
     if let Some(path) = connect.as_deref() {
@@ -1924,6 +1925,7 @@ fn native_document_layout_proof_with_project_state_embedded(
 
 #[derive(Default)]
 struct DocumentLayoutProfile {
+    layout_cache_hit: bool,
     parse_cache_ms: f64,
     typecheck_ms: f64,
     ir_lower_source_binding_index_ms: f64,
@@ -1944,6 +1946,7 @@ struct DocumentLayoutProfile {
 impl DocumentLayoutProfile {
     fn to_json(&self) -> serde_json::Value {
         json!({
+            "layout_cache_hit": self.layout_cache_hit,
             "parse_cache_ms": self.parse_cache_ms,
             "typecheck_ms": self.typecheck_ms,
             "ir_lower_source_binding_index_ms": self.ir_lower_source_binding_index_ms,
@@ -1963,13 +1966,59 @@ impl DocumentLayoutProfile {
     }
 }
 
+#[derive(Clone)]
+struct DocumentLayoutCacheEntry {
+    proof: serde_json::Value,
+    layout_frame: boon_document::LayoutFrame,
+}
+
+fn document_layout_cache() -> &'static Mutex<BTreeMap<String, Arc<DocumentLayoutCacheEntry>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<DocumentLayoutCacheEntry>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 fn native_document_layout_proof_with_project_state_mode(
     source_path: &Path,
     units: &[boon_runtime::RuntimeSourceUnit],
     runtime_state_override: Option<&serde_json::Value>,
     write_artifact: bool,
 ) -> Result<(serde_json::Value, Option<boon_document::LayoutFrame>), Box<dyn std::error::Error>> {
+    let source_sha256 = boon_runtime::source_units_hash(units);
+    let (viewport_width, viewport_height) = preview_viewport_for_source_path(source_path);
+    let precomputed_runtime_state =
+        normalize_runtime_state_for_source_path(source_path, runtime_state_override.cloned());
+    let precomputed_runtime_state_hash = precomputed_runtime_state
+        .as_ref()
+        .map(|state| boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default()));
+    let cache_key = runtime_state_override.is_some().then(|| {
+        format!(
+            "{}:{}:{}:{viewport_width:.1}:{viewport_height:.1}:artifact={write_artifact}",
+            source_path.display(),
+            source_sha256,
+            precomputed_runtime_state_hash
+                .as_deref()
+                .unwrap_or("no-runtime-state")
+        )
+    });
+    if let Some(cache_key) = cache_key.as_ref()
+        && let Ok(cache) = document_layout_cache().lock()
+        && let Some(entry) = cache.get(cache_key)
+    {
+        let mut proof = entry.proof.clone();
+        proof["layout_cache_hit"] = json!(true);
+        proof["layout_cache_key"] = json!(cache_key);
+        if let Some(profile) = proof
+            .get_mut("layout_profile")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            profile.insert("layout_cache_hit".to_owned(), json!(true));
+        }
+        return Ok((proof, Some(entry.layout_frame.clone())));
+    }
+
     let mut profile = DocumentLayoutProfile {
+        layout_cache_hit: false,
         source_unit_count: units.len(),
         source_bytes: units.iter().map(|unit| unit.source.len()).sum(),
         ..DocumentLayoutProfile::default()
@@ -1995,12 +2044,14 @@ fn native_document_layout_proof_with_project_state_mode(
     profile.ir_lower_source_binding_index_ms = 0.0;
     profile.source_binding_index_count = source_binding_index.values().map(Vec::len).sum::<usize>();
     let runtime_state_started = Instant::now();
-    let runtime_state = normalize_runtime_state_for_source_path(
-        source_path,
-        runtime_state_override
-            .cloned()
-            .or_else(|| runtime_document_state_summary_for_project(source_path, units).ok()),
-    );
+    let runtime_state = if runtime_state_override.is_some() {
+        precomputed_runtime_state
+    } else {
+        normalize_runtime_state_for_source_path(
+            source_path,
+            runtime_document_state_summary_for_project(source_path, units).ok(),
+        )
+    };
     profile.runtime_state_ms = elapsed_ms(runtime_state_started);
     let function_registry_started = Instant::now();
     let document_functions =
@@ -2078,7 +2129,6 @@ fn native_document_layout_proof_with_project_state_mode(
         .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
         .lock()
         .map_err(|_| "document text measurer mutex poisoned")?;
-    let (viewport_width, viewport_height) = preview_viewport_for_source_path(source_path);
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
         viewport: boon_host::Viewport {
@@ -2092,7 +2142,6 @@ fn native_document_layout_proof_with_project_state_mode(
     });
     profile.text_measure_and_layout_ms = elapsed_ms(text_measure_and_layout_started);
 
-    let source_sha256 = boon_runtime::source_units_hash(units);
     let runtime_state_hash = runtime_state
         .as_ref()
         .map(|state| boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default()));
@@ -2235,7 +2284,23 @@ fn native_document_layout_proof_with_project_state_mode(
         "runtime_document_state_used": runtime_state.is_some(),
         "runtime_document_state_hash": runtime_state_hash.clone(),
         "live_artifact_write_skipped": !write_artifact,
+        "layout_cache_hit": false,
+        "layout_cache_key": cache_key.clone().unwrap_or_else(|| "uncached-runtime-state-fallback".to_owned()),
     });
+    if let Some(cache_key) = cache_key {
+        if let Ok(mut cache) = document_layout_cache().lock() {
+            if cache.len() > 32 {
+                cache.clear();
+            }
+            cache.insert(
+                cache_key,
+                Arc::new(DocumentLayoutCacheEntry {
+                    proof: proof.clone(),
+                    layout_frame: layout.clone(),
+                }),
+            );
+        }
+    }
     Ok((proof, Some(layout)))
 }
 
@@ -24454,6 +24519,7 @@ struct PreviewIpcState {
     latest_accepted_command_id: u64,
     latest_accepted_source_revision: u64,
     replace_status_cache: serde_json::Value,
+    prewarmed_project_hashes: BTreeSet<String>,
     replace_worker: PreviewReplaceWorkerQueue,
 }
 
@@ -24809,6 +24875,21 @@ fn handle_preview_ipc_client(
                 })
             });
         wake_handle.wake();
+        writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+        stream.flush()?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("prewarm-source-project") {
+        let response = preview_prewarm_source_project(&state, &request).unwrap_or_else(|error| {
+            json!({
+                "kind": "prewarm-source-project-result",
+                "status": "fail",
+                "diagnostic": error.to_string(),
+                "source_project_committed": false,
+                "preview_receives_example_name": false,
+                "preview_pid": std::process::id()
+            })
+        });
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
@@ -25194,6 +25275,12 @@ fn preview_enqueue_source_project(
         let mut state = state
             .lock()
             .map_err(|_| "preview IPC state mutex poisoned")?;
+        let source_project_prewarmed = state
+            .prewarmed_project_hashes
+            .contains(&payload.project_hash)
+            || state
+                .prewarmed_project_hashes
+                .contains(&payload_runtime_hash);
         if payload.command_id < state.latest_accepted_command_id
             || payload.source_revision < state.latest_accepted_source_revision
         {
@@ -25259,7 +25346,9 @@ fn preview_enqueue_source_project(
         }
         state.latest_accepted_command_id = payload.command_id;
         state.latest_accepted_source_revision = payload.source_revision;
-        let pending_overlay_frame_revision = {
+        let pending_overlay_frame_revision = if source_project_prewarmed {
+            0
+        } else {
             let mut shared = state
                 .shared_render_state
                 .lock()
@@ -25284,6 +25373,7 @@ fn preview_enqueue_source_project(
             "entrypoint_unit": payload.entrypoint_unit,
             "active_file": payload.active_file(),
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
+            "source_project_prewarmed": source_project_prewarmed,
             "replace_job_queue_depth": 1,
             "replace_job_dropped_stale": 0,
             "render_thread_blocked_on_replace_count": 0,
@@ -25372,6 +25462,44 @@ fn preview_enqueue_source_project(
         ack_payload_bytes = next;
     }
     Ok(ack)
+}
+
+fn preview_prewarm_source_project(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let payload = source_project_payload_from_request(request)?;
+    let result = preview_build_source_project(payload.clone(), || true);
+    let payload_runtime_hash = boon_runtime::source_units_hash(&payload.runtime_units());
+    if result.status == "pass" {
+        let mut state = state
+            .lock()
+            .map_err(|_| "preview IPC state mutex poisoned")?;
+        state
+            .prewarmed_project_hashes
+            .insert(payload.project_hash.clone());
+        state.prewarmed_project_hashes.insert(payload_runtime_hash);
+    }
+    Ok(json!({
+        "kind": "prewarm-source-project-result",
+        "status": result.status,
+        "command_id": payload.command_id,
+        "source_revision": payload.source_revision,
+        "source_identity": payload.source_identity,
+        "project_hash": payload.project_hash,
+        "source_hash": result.source_sha256,
+        "entrypoint_unit": payload.entrypoint_unit,
+        "active_file": payload.active_file(),
+        "unit_count": payload.units.len(),
+        "runtime_unit_count": payload.runtime_units().len(),
+        "source_bytes": result.source_bytes,
+        "prewarm_elapsed_ms": elapsed_ms(started),
+        "parse_lower_runtime_layout_timings": result.timings,
+        "source_project_committed": false,
+        "preview_receives_example_name": false,
+        "preview_pid": std::process::id()
+    }))
 }
 
 fn source_project_payload_from_request(
@@ -34735,6 +34863,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
@@ -34802,6 +34931,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
@@ -34951,6 +35081,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
         start_preview_ipc_server(
@@ -37894,6 +38025,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
@@ -37962,6 +38094,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
         let todomvc_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
@@ -38072,6 +38205,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
@@ -38134,6 +38268,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
@@ -39024,6 +39159,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         };
         let base = json!({
@@ -39079,6 +39215,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)

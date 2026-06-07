@@ -712,6 +712,7 @@ pub fn run_source_initial_state(
     })
 }
 
+#[derive(Clone)]
 pub struct LiveRuntime {
     runtime: LoadedRuntime,
     next_step: usize,
@@ -731,6 +732,11 @@ struct CachedRuntimePlan {
 
 fn runtime_plan_cache() -> &'static Mutex<BTreeMap<String, CachedRuntimePlan>> {
     static CACHE: OnceLock<Mutex<BTreeMap<String, CachedRuntimePlan>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn initialized_live_runtime_cache() -> &'static Mutex<BTreeMap<String, LiveRuntime>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, LiveRuntime>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -1027,17 +1033,49 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
         let total_started = Instant::now();
+        let source_key = source_units_hash(units);
+        if let Some(runtime) = initialized_live_runtime_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&source_key).cloned())
+        {
+            return Ok((
+                runtime,
+                json!({
+                    "initialized_runtime_cache_hit": true,
+                    "plan": {
+                        "cache_hit": true,
+                        "source_unit_count": units.len(),
+                        "total_ms": runtime_elapsed_ms(total_started)
+                    },
+                    "runtime": {
+                        "initialized_runtime_cache_hit": true,
+                        "total_ms": 0.0
+                    },
+                    "runtime_total_ms": 0.0,
+                    "total_ms": runtime_elapsed_ms(total_started)
+                }),
+            ));
+        }
         let (plan, plan_profile) = cached_runtime_plan_from_project_profiled(source_label, units)?;
         let runtime_started = Instant::now();
         let (runtime, runtime_profile) =
             LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref())?;
         let runtime_ms = runtime_elapsed_ms(runtime_started);
+        let live_runtime = Self {
+            runtime,
+            next_step: 1,
+        };
+        if let Ok(mut cache) = initialized_live_runtime_cache().lock() {
+            if cache.len() > 16 {
+                cache.clear();
+            }
+            cache.insert(source_key, live_runtime.clone());
+        }
         Ok((
-            Self {
-                runtime,
-                next_step: 1,
-            },
+            live_runtime,
             json!({
+                "initialized_runtime_cache_hit": false,
                 "plan": plan_profile,
                 "runtime": runtime_profile,
                 "runtime_total_ms": runtime_ms,
@@ -1929,6 +1967,7 @@ fn run_loaded_scenario(
     run_generic_scenario(runtime, _parsed, ir, &compiled, scenario, layer)
 }
 
+#[derive(Clone)]
 struct LoadedRuntime {
     generic: Option<GenericScheduledRuntime>,
 }

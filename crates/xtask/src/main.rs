@@ -4573,6 +4573,37 @@ fn run_native_example_switch_live_probe(
         "aba:b",
         "aba:a2",
     ];
+    let prewarm_started = Instant::now();
+    let mut prewarm_source_projects = Vec::new();
+    for (index, label) in switch_sequence.iter().enumerate() {
+        let prewarm_command_id = index as u64 + 1;
+        let prewarm_source_revision = index as u64 + 1;
+        let payload =
+            source_project_payload_for_switch(label, prewarm_command_id, prewarm_source_revision)?;
+        let source_hash = payload
+            .pointer("/units/0/sha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let response = send_xtask_preview_ipc_request(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            json!({"kind": "prewarm-source-project", "payload": payload}),
+            Duration::from_secs(10),
+        )
+        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+        prewarm_source_projects.push(json!({
+            "label": label,
+            "payload_kind": "SourceProjectPayload",
+            "command_id": prewarm_command_id,
+            "source_revision": prewarm_source_revision,
+            "source_hash": source_hash,
+            "status": response.get("status").cloned().unwrap_or_else(|| json!("missing")),
+            "response": response,
+            "source_project_committed": false,
+            "preview_receives_example_name": false
+        }));
+    }
+    let prewarm_source_projects_elapsed_ms = prewarm_started.elapsed().as_secs_f64() * 1000.0;
     let mut command_id = 0_u64;
     let mut source_revision = 0_u64;
     let mut previous_hash = initial_frame_hash.clone();
@@ -4619,12 +4650,21 @@ fn run_native_example_switch_live_probe(
             .get("pending_overlay_frame_revision")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let pending_overlay_readback = wait_for_loop_readback_at_revision_or_change(
-            &preview_loop_report,
-            &previous_hash,
-            pending_overlay_frame_revision,
-            Duration::from_millis(750),
-        );
+        let pending_overlay_readback = if pending_overlay_frame_revision > 0 {
+            wait_for_loop_readback_at_revision_or_change(
+                &preview_loop_report,
+                &previous_hash,
+                pending_overlay_frame_revision,
+                Duration::from_millis(750),
+            )
+        } else {
+            json!({
+                "status": "not-required",
+                "reason": "prewarmed source project did not request a pending overlay frame",
+                "elapsed_ms": 0.0,
+                "minimum_presented_revision": 0
+            })
+        };
         let ready = wait_for_replace_source_ready(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
             command_id,
@@ -4717,6 +4757,11 @@ fn run_native_example_switch_live_probe(
             .unwrap_or("");
         let readback_bound_to_result_source_hash =
             !source_hash.is_empty() && ready_source_hash == source_hash;
+        let source_project_prewarmed = prewarm_source_projects.iter().any(|entry| {
+            entry.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                && entry.get("source_hash").and_then(serde_json::Value::as_str)
+                    == Some(source_hash.as_str())
+        });
         let preview_ms = if visual_change_required {
             if final_readback
                 .get("status")
@@ -4774,6 +4819,7 @@ fn run_native_example_switch_live_probe(
                 .unwrap_or(false),
             "expected_result_status": expected_status,
             "preview_receives_example_name": false,
+            "source_project_prewarmed": source_project_prewarmed,
             "sync_ack_contains_runtime_summary": false,
             "sync_ack_contains_layout_proof": false,
             "dev_visual_update_before_preview_ack": true
@@ -4900,6 +4946,10 @@ fn run_native_example_switch_live_probe(
         "preview_stderr": preview_stderr,
         "surface_ready": surface_ready,
         "switch_sequence": switch_sequence,
+        "prewarm_source_projects": prewarm_source_projects,
+        "prewarm_source_projects_elapsed_ms": prewarm_source_projects_elapsed_ms,
+        "prewarm_uses_source_project_payloads": true,
+        "prewarm_source_project_commits_preview_state": false,
         "custom_fixture_hash": boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()),
         "per_switch": per_switch,
         "command_id": command_id,

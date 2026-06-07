@@ -6903,6 +6903,38 @@ impl GenericScheduledRuntime {
                     frame,
                 )
             }
+            "List/filter_field_not_equal" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/filter_field_not_equal requires field")?;
+                let value = self.named_arg_value(args, "value", frame)?;
+                self.list_filter_field_equal(list, &field, value, false, frame)
+            }
+            "List/filter_field_equal" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/filter_field_equal requires field")?;
+                let value = self.named_arg_value(args, "value", frame)?;
+                self.list_filter_field_equal(list, &field, value, true, frame)
+            }
+            "List/move_field_first" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/move_field_first requires field")?;
+                let value = self.named_arg_value(args, "value", frame)?;
+                self.list_move_field(list, &field, value, true, frame)
+            }
+            "List/move_field_last" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .field_name_arg(args, "field", frame)?
+                    .ok_or("List/move_field_last requires field")?;
+                let value = self.named_arg_value(args, "value", frame)?;
+                self.list_move_field(list, &field, value, false, frame)
+            }
             "List/join_field" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let field = self
@@ -7219,7 +7251,7 @@ impl GenericScheduledRuntime {
                     frame,
                 )?) == needle
                 {
-                    matches.push(value.clone());
+                    matches.push(self.list_value_record(value.clone(), frame)?);
                 }
             }
             matches
@@ -7244,8 +7276,58 @@ impl GenericScheduledRuntime {
                     .contains(&needle)
             };
             if keep {
-                output.push(value);
+                output.push(self.list_value_record(value, frame)?);
             }
+        }
+        Ok(BoonValue::List(output))
+    }
+
+    fn list_filter_field_equal(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        value: BoonValue,
+        equal: bool,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list)?;
+        let expected = value.as_text().unwrap_or_default();
+        let mut output = Vec::new();
+        for value in values {
+            if (self.list_value_field_text(&value, field, frame)? == expected) == equal {
+                output.push(self.list_value_record(value, frame)?);
+            }
+        }
+        Ok(BoonValue::List(output))
+    }
+
+    fn list_move_field(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        value: BoonValue,
+        first: bool,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list)?;
+        let expected = value.as_text().unwrap_or_default();
+        let mut matched = Vec::new();
+        let mut rest = Vec::new();
+        for value in values {
+            let record = self.list_value_record(value, frame)?;
+            if self.list_value_field_text(&record, field, frame)? == expected {
+                matched.push(record);
+            } else {
+                rest.push(record);
+            }
+        }
+        let mut output = Vec::with_capacity(matched.len() + rest.len());
+        if first {
+            output.extend(matched);
+            output.extend(rest);
+        } else {
+            output.extend(rest);
+            output.extend(matched);
         }
         Ok(BoonValue::List(output))
     }
@@ -7299,14 +7381,81 @@ impl GenericScheduledRuntime {
         let field_value = match value {
             BoonValue::Record(record) => record
                 .get(&field)
+                .or_else(|| {
+                    record
+                        .iter()
+                        .find(|(key, _)| row_field_name(key) == field)
+                        .map(|(_, value)| value)
+                })
                 .cloned()
                 .unwrap_or_else(|| BoonValue::Empty),
             BoonValue::RowRef { list, index } => {
+                let field = self.resolve_list_row_field(list, *index, &field)?;
                 self.read_list_field(list, *index, &field, frame)?
             }
             _ => BoonValue::Empty,
         };
         Ok(field_value.as_text().unwrap_or_default())
+    }
+
+    fn resolve_list_row_field(
+        &self,
+        list: &str,
+        index: usize,
+        field: &str,
+    ) -> RuntimeResult<String> {
+        let field = normalized_field_name(field);
+        if self
+            .storage
+            .list_row_value_opt(list, index, &field)
+            .is_some()
+            || self.generic_derived.contains_field(list, &field)
+        {
+            return Ok(field);
+        }
+        let mut candidates = Vec::new();
+        for candidate in self.storage.text_fields_for_row(list, index)? {
+            if row_field_name(&candidate) == field {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in self.storage.bool_fields_for_row(list, index)? {
+            if row_field_name(&candidate) == field {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in &self.generic_derived.indexed_fields {
+            if candidate.list == list && row_field_name(&candidate.field) == field {
+                candidates.push(candidate.field.clone());
+            }
+        }
+        candidates.into_iter().next().ok_or_else(|| {
+            format!("generic list `{list}` row {index} has no field `{field}`").into()
+        })
+    }
+
+    fn list_value_record(
+        &mut self,
+        value: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let BoonValue::RowRef { list, index } = value else {
+            return Ok(value);
+        };
+        let mut record = BTreeMap::new();
+        for field in self.storage.text_fields_for_row(&list, index)? {
+            record.insert(
+                field.clone(),
+                self.read_list_field(&list, index, &field, frame)?,
+            );
+        }
+        for field in self.storage.bool_fields_for_row(&list, index)? {
+            record.insert(
+                field.clone(),
+                self.read_list_field(&list, index, &field, frame)?,
+            );
+        }
+        Ok(BoonValue::Record(record))
     }
 
     fn list_get(
@@ -17002,6 +17151,9 @@ FUNCTION new_signal(signal) {
             initial["store"]["search_results_key_summary"],
             "clk,data_bus"
         );
+        assert_eq!(initial["store"]["search_results"][0]["key"], "clk");
+        assert_eq!(initial["store"]["search_results"][0]["name"], "clk");
+        assert!(initial["store"]["search_results"][0]["list"].is_null());
 
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -17027,6 +17179,11 @@ FUNCTION new_signal(signal) {
         let searched = runtime.state_summary();
         assert_eq!(searched["store"]["search_results_count"], 1);
         assert_eq!(searched["store"]["search_results_key_summary"], "tx_data");
+        assert_eq!(searched["store"]["search_results"][0]["key"], "tx_data");
+        assert_eq!(
+            searched["store"]["search_results"][0]["scope"],
+            "top . uart"
+        );
 
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -17041,6 +17198,137 @@ FUNCTION new_signal(signal) {
             family_preferred["store"]["search_results_key_summary"],
             "data_bus"
         );
+        assert_eq!(
+            family_preferred["store"]["search_results"][0]["name"],
+            "data_bus [ 7 : 0 ]"
+        );
+    }
+
+    #[test]
+    fn list_filter_field_and_move_project_selected_rows() {
+        let source = r#"
+store: [
+    elements: [
+        load_fixture: SOURCE
+        show_empty: SOURCE
+        selected_remove_data: SOURCE
+        selected_restore_data: SOURCE
+        selected_data_up: SOURCE
+        selected_data_down: SOURCE
+    ]
+    selected_signal_defaults:
+        LIST {
+            [id: TEXT { clk }, name: TEXT { clk }, enabled: TEXT { loaded }]
+            [id: TEXT { reset_n }, name: TEXT { reset_n }, enabled: TEXT { loaded }]
+            [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, enabled: TEXT { loaded }]
+            [id: TEXT { data_valid }, name: TEXT { data_valid }, enabled: TEXT { loaded }]
+        }
+    selected_rows_enabled_value:
+        TEXT { none } |> HOLD selected_rows_enabled_value {
+            LATEST {
+                elements.load_fixture.event.press |> THEN { TEXT { loaded } }
+                elements.selected_remove_data.event.press |> THEN { TEXT { loaded } }
+                elements.selected_restore_data.event.press |> THEN { TEXT { loaded } }
+                elements.selected_data_up.event.press |> THEN { TEXT { loaded } }
+                elements.selected_data_down.event.press |> THEN { TEXT { loaded } }
+                elements.show_empty.event.press |> THEN { TEXT { none } }
+            }
+        }
+    selected_rows_removed_signal_id:
+        LATEST {
+            TEXT { none }
+            elements.selected_remove_data.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_up.event.press |> THEN { TEXT { none } }
+            elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+    selected_rows_first_signal_id:
+        LATEST {
+            TEXT { none }
+            elements.selected_data_up.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { none } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+    selected_rows_last_signal_id:
+        LATEST {
+            TEXT { none }
+            elements.selected_data_down.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { none } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_up.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+    selected_signals:
+        selected_signal_defaults
+        |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
+        |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+        |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
+        |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
+    selected_rows_count:
+        selected_signals |> List/length()
+    selected_rows_order_label:
+        selected_signals |> List/join_field(field: "name", separator: ", ", empty: "none")
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Selected rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("selected-list-transforms", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["selected_rows_order_label"],
+            "none"
+        );
+
+        for (source, expected_count, expected_order) in [
+            (
+                "store.elements.load_fixture",
+                4,
+                "clk, reset_n, data_bus [ 7 : 0 ], data_valid",
+            ),
+            (
+                "store.elements.selected_remove_data",
+                3,
+                "clk, reset_n, data_valid",
+            ),
+            (
+                "store.elements.selected_restore_data",
+                4,
+                "clk, reset_n, data_bus [ 7 : 0 ], data_valid",
+            ),
+            (
+                "store.elements.selected_data_up",
+                4,
+                "data_bus [ 7 : 0 ], clk, reset_n, data_valid",
+            ),
+            (
+                "store.elements.selected_data_down",
+                4,
+                "clk, reset_n, data_valid, data_bus [ 7 : 0 ]",
+            ),
+            ("store.elements.show_empty", 0, "none"),
+        ] {
+            runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: source.to_owned(),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap();
+            let summary = runtime.state_summary();
+            assert_eq!(
+                summary["store"]["selected_rows_count"],
+                serde_json::json!(expected_count),
+                "{source}"
+            );
+            assert_eq!(
+                summary["store"]["selected_rows_order_label"], expected_order,
+                "{source}"
+            );
+        }
     }
 
     #[test]

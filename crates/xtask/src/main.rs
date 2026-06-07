@@ -4580,11 +4580,7 @@ fn run_native_example_switch_live_probe(
         let prewarm_source_revision = index as u64 + 1;
         let payload =
             source_project_payload_for_switch(label, prewarm_command_id, prewarm_source_revision)?;
-        let source_hash = payload
-            .pointer("/units/0/sha256")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let source_hash = source_project_payload_hash(&payload);
         let response = send_xtask_preview_ipc_request(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
             json!({"kind": "prewarm-source-project", "payload": payload}),
@@ -4629,11 +4625,7 @@ fn run_native_example_switch_live_probe(
         source_revision = source_revision.saturating_add(1);
         let payload = source_project_payload_for_switch(label, command_id, source_revision)?;
         let dev_visual_update_ms = (switch_started.elapsed().as_secs_f64() * 1000.0).max(0.001);
-        let source_hash = payload
-            .pointer("/units/0/sha256")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let source_hash = source_project_payload_hash(&payload);
         last_source_hash = source_hash.clone();
         let request = json!({"kind": "replace-source", "payload": payload});
         let ack_started = Instant::now();
@@ -5069,6 +5061,15 @@ fn source_project_payload_for_switch(
         "entrypoint_unit": entrypoint_unit,
         "units": units
     }))
+}
+
+fn source_project_payload_hash(payload: &serde_json::Value) -> String {
+    payload
+        .get("project_hash")
+        .or_else(|| payload.pointer("/units/0/sha256"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned()
 }
 
 fn source_project_units_for_manifest_switch(
@@ -6985,6 +6986,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let source_file_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
     let source_hash = source_hash_for_report_source_files(&project_files, &source_text)?;
     let project_source_units = manifest_project_units_for_report(&entry)?;
+    let manifest_scenario_path = PathBuf::from(&entry.scenario);
+    let manifest_scenario_hash = file_hash(&entry.scenario);
     let scenario_labels = native_preview_e2e_scenario_labels(&entry);
     let mut cosmic_launch_proof = json!({"status": "not-run"});
     let title_token = native_gpu_title_token(&format!("preview-e2e-{example}"));
@@ -7241,6 +7244,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "release_build": release_build,
         "scenario_hash": scenario_hash,
         "scenario_artifact": scenario_artifact,
+        "manifest_scenario_path": manifest_scenario_path,
+        "manifest_scenario_hash": manifest_scenario_hash,
         "layout_probe_report": layout_probe_report,
         "prelaunch_layout_probe": layout_probe,
         "driver_target_region": driver_target,
@@ -10192,11 +10197,29 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
             material_metrics = novywave_material_metrics(&artifact);
         }
     }
+    let leaked_signal_placeholders = loaded_texts
+        .iter()
+        .filter(|text| text.contains("signal."))
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
 
     let required_runtime_sources = [
         "store.elements.load_fixture",
         "store.elements.select_uart_compare_file",
         "store.elements.select_ghw_file",
+        "store.elements.scope_uart",
+        "store.elements.scope_analog",
+        "store.elements.signal_search_input",
+        "store.elements.zoom_in",
+        "store.elements.pan_left",
+        "store.elements.cursor_left",
+        "store.elements.marker_toggle",
+        "store.elements.group_create",
+        "store.elements.row_taller",
+        "store.elements.analog_limits_manual",
+        "store.elements.analog_limits_invalid",
+        "store.elements.analog_limits_auto",
         "store.elements.selected_remove_data",
         "store.elements.selected_restore_data",
         "store.elements.selected_data_up",
@@ -10225,6 +10248,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
     let pass = initial_layout.is_some()
         && missing_empty_labels.is_empty()
         && missing_loaded_labels.is_empty()
+        && leaked_signal_placeholders.is_empty()
         && missing_runtime_sources.is_empty()
         && material_pass
         && visual_artifacts_pass;
@@ -10247,6 +10271,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "post_input_layout_artifact_count": post_input_layout_paths.len(),
         "missing_empty_labels": missing_empty_labels,
         "missing_loaded_labels": missing_loaded_labels,
+        "leaked_signal_placeholders": leaked_signal_placeholders,
         "runtime_sources": runtime_sources.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>(),
         "missing_runtime_sources": missing_runtime_sources,
         "material_metrics": material_metrics,
@@ -17853,6 +17878,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "todo_mvc_physical")],
         ),
         native_gpu_required_report(
+            "preview-e2e-novywave",
+            "target/reports/native-gpu/preview-e2e-novywave.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "novywave")],
+        ),
+        native_gpu_required_report(
             "todomvc-physical-reference-parity",
             "target/reports/native-gpu/todomvc-physical-reference-parity.json",
             "verify-native-todomvc-physical-reference-parity",
@@ -17964,6 +17995,12 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "cells")],
         ),
         native_gpu_required_report(
+            "dev-editor-novywave",
+            "target/reports/native-gpu/dev-editor-novywave.json",
+            "verify-native-dev-window-editor",
+            &[("--example", "novywave")],
+        ),
+        native_gpu_required_report(
             "example-tabs",
             "target/reports/native-gpu/example-tabs.json",
             "verify-native-example-tabs",
@@ -18004,6 +18041,12 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
             "target/reports/native-gpu/speed-cells.json",
             "verify-native-example-speed",
             &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "scroll-speed-novywave",
+            "target/reports/native-gpu/scroll-speed-novywave.json",
+            "verify-native-gpu-scroll-speed",
+            &[("--example", "novywave")],
         ),
         native_gpu_required_report(
             "dev-editor-speed",
@@ -18466,7 +18509,10 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 );
             }
         }
-        "preview-e2e-todomvc" | "preview-e2e-cells" | "preview-e2e-todo_mvc_physical" => {
+        "preview-e2e-todomvc"
+        | "preview-e2e-cells"
+        | "preview-e2e-todo_mvc_physical"
+        | "preview-e2e-novywave" => {
             let physical_preview = label == "preview-e2e-todo_mvc_physical";
             require_str_field(&mut blockers, report, "display_server", "wayland");
             let tier = report
@@ -18502,6 +18548,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_nonempty_array(&mut blockers, report, "window_cmdline");
             require_hash_field(&mut blockers, report, "source_hash");
             require_hash_field(&mut blockers, report, "scenario_hash");
+            require_preview_manifest_scenario_freshness(&mut blockers, label, report);
             require_nonempty_array(&mut blockers, report, "scenario_labels");
             require_nonempty_array(
                 &mut blockers,
@@ -18617,6 +18664,14 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     "input_injection_method must be BoonDriver host input or isolated Weston real-window input"
                         .to_owned(),
                 );
+            }
+            if label == "preview-e2e-novywave"
+                && report
+                    .pointer("/novywave_preview_content_evidence/status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("pass")
+            {
+                blockers.push("novywave_preview_content_evidence.status must be pass".to_owned());
             }
         }
         "idle-wake-counter"
@@ -19166,7 +19221,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 }
             }
         }
-        "scroll-speed-cells" => {
+        "scroll-speed-cells" | "scroll-speed-novywave" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
             if report
@@ -19177,18 +19232,40 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 blockers.push("boon_driver_proof.status must be pass".to_owned());
             }
             require_bool_field(&mut blockers, report, "operator_host_wheel_input", true);
-            require_u64_at_least(
-                &mut blockers,
-                report,
-                "logical_columns",
-                native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26),
-            );
-            require_u64_at_least(
-                &mut blockers,
-                report,
-                "logical_rows",
-                native_gpu_budget_u64("cells", "logical_rows").unwrap_or(100),
-            );
+            if label == "scroll-speed-cells" {
+                require_u64_at_least(
+                    &mut blockers,
+                    report,
+                    "logical_columns",
+                    native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26),
+                );
+                require_u64_at_least(
+                    &mut blockers,
+                    report,
+                    "logical_rows",
+                    native_gpu_budget_u64("cells", "logical_rows").unwrap_or(100),
+                );
+            } else {
+                require_u64_at_least(&mut blockers, report, "source_line_count", 500);
+                require_positive_u64(&mut blockers, report, "visible_row_count");
+                require_positive_u64(&mut blockers, report, "visible_column_count");
+                require_bool_field(
+                    &mut blockers,
+                    report,
+                    "preview_receives_example_name",
+                    false,
+                );
+                if report
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|path| !path.ends_with("examples/novywave/RUN.bn"))
+                {
+                    blockers.push(
+                        "scroll-speed-novywave source_path must point at examples/novywave/RUN.bn"
+                            .to_owned(),
+                    );
+                }
+            }
             require_bool_field(&mut blockers, report, "synthetic_scroll", false);
             require_bool_field(
                 &mut blockers,
@@ -19295,6 +19372,40 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         _ => {}
     }
     blockers
+}
+
+fn require_preview_manifest_scenario_freshness(
+    blockers: &mut Vec<String>,
+    label: &str,
+    report: &serde_json::Value,
+) {
+    let Some(expected_path) = (match label {
+        "preview-e2e-todomvc" => Some("examples/todomvc.scn"),
+        "preview-e2e-cells" => Some("examples/cells.scn"),
+        "preview-e2e-todo_mvc_physical" => Some("examples/todo_mvc_physical.scn"),
+        "preview-e2e-novywave" => Some("examples/novywave.scn"),
+        _ => None,
+    }) else {
+        return;
+    };
+    if report
+        .get("manifest_scenario_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_path)
+    {
+        blockers.push(format!(
+            "manifest_scenario_path must be `{expected_path}` for label `{label}`"
+        ));
+    }
+    if report
+        .get("manifest_scenario_hash")
+        .and_then(serde_json::Value::as_str)
+        != Some(file_hash(expected_path).as_str())
+    {
+        blockers.push(format!(
+            "manifest_scenario_hash must match current `{expected_path}` for label `{label}`"
+        ));
+    }
 }
 
 fn native_visible_reality_harness(report: &serde_json::Value) -> serde_json::Value {
@@ -19726,6 +19837,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("todomvc") => "preview-e2e-todomvc",
             Some("cells") => "preview-e2e-cells",
             Some("todo_mvc_physical") => "preview-e2e-todo_mvc_physical",
+            Some("novywave") => "preview-e2e-novywave",
             _ => "preview-e2e",
         },
         "verify-native-visible-launch" => match value_arg(args, "--example").as_deref() {
@@ -19737,6 +19849,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-dev-window-editor" => match value_arg(args, "--example").as_deref() {
             Some("todomvc") => "dev-editor-todomvc",
             Some("cells") => "dev-editor-cells",
+            Some("novywave") => "dev-editor-novywave",
             _ => "dev-editor",
         },
         "verify-native-example-tabs" => "example-tabs",

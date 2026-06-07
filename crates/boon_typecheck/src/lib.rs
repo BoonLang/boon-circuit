@@ -3362,6 +3362,10 @@ impl Default for BuiltinSignatureRegistry {
                 "List/range",
                 "List/chunk",
                 "List/filter_text_contains",
+                "List/filter_field_equal",
+                "List/filter_field_not_equal",
+                "List/move_field_first",
+                "List/move_field_last",
             ]
             .into_iter()
             .collect(),
@@ -6469,7 +6473,13 @@ fn statement_pipeline_hint_type(
             continue;
         };
         ty = match op.as_str() {
-            "List/retain" | "List/remove" | "SOURCE" => ty,
+            "List/retain"
+            | "List/remove"
+            | "List/filter_field_equal"
+            | "List/filter_field_not_equal"
+            | "List/move_field_first"
+            | "List/move_field_last"
+            | "SOURCE" => ty,
             "List/count" | "List/sum" => Type::Number,
             "List/append" => {
                 let append_ty = args

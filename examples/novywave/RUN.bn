@@ -400,82 +400,51 @@ store: [
         })
         |> List/latest()
 
-    selected_rows_without_data_trigger:
-        LATEST {
-            elements.selected_remove_data.event.press |> THEN { TEXT { selected rows without data } }
+    selected_signal_defaults:
+        LIST {
+            [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
         }
 
-    selected_rows_default_trigger:
-        LATEST {
-            elements.selected_restore_data.event.press |> THEN { TEXT { selected rows default } }
+    selected_rows_enabled_value:
+        fixture_status == TEXT { Loaded } |> WHEN {
+            True => TEXT { loaded }
+            False => TEXT { none }
         }
 
-    selected_rows_data_first_trigger:
-        LATEST {
-            elements.selected_data_up.event.press |> THEN { TEXT { selected rows data first } }
+    selected_rows_removed_signal_id:
+        selected_rows_profile == TEXT { WithoutData } |> WHEN {
+            True => TEXT { data_bus }
+            False => TEXT { none }
         }
 
-    selected_rows_data_last_trigger:
-        LATEST {
-            elements.selected_data_down.event.press |> THEN { TEXT { selected rows data last } }
+    selected_rows_first_signal_id:
+        selected_rows_profile == TEXT { DataFirst } |> WHEN {
+            True => TEXT { data_bus }
+            False => TEXT { none }
         }
 
-    selected_rows_load_trigger:
-        LATEST {
-            elements.load_fixture.event.press |> THEN { TEXT { selected rows loaded } }
+    selected_rows_last_signal_id:
+        selected_rows_profile == TEXT { DataLast } |> WHEN {
+            True => TEXT { data_bus }
+            False => TEXT { none }
         }
+
+    selected_signal_rows:
+        selected_signal_defaults
+        |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
+        |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+        |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
+        |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
 
     selected_signals:
-        LIST {}
-        |> List/remove(row, when:
-            LATEST {
-                elements.selected_remove_data.event.press |> THEN { True }
-                elements.selected_restore_data.event.press |> THEN { True }
-                elements.selected_data_up.event.press |> THEN { True }
-                elements.selected_data_down.event.press |> THEN { True }
-                elements.load_fixture.event.press |> THEN { True }
-                elements.show_empty.event.press |> THEN { True }
-            }
-        )
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "data_bus", name: "data_bus[7:0]", current_value: "0x2a", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "clk", name: "clk", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "clk", name: "clk", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "clk", name: "clk", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "clk", name: "clk", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "reset_n", name: "reset_n", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "clk", name: "clk", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "reset_n", name: "reset_n", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "reset_n", name: "reset_n", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "reset_n", name: "reset_n", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "data_bus", name: "data_bus[7:0]", current_value: "0x2a", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "data_valid", name: "data_valid", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "data_bus", name: "data_bus[7:0]", current_value: "0x2a", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "data_valid", name: "data_valid", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "reset_n", name: "reset_n", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "data_ready", name: "data_ready", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "data_valid", name: "data_valid", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "data_valid", name: "data_valid", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "data_ready", name: "data_ready", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "data_valid", name: "data_valid", current_value: "1", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "state", name: "state[2:0]", current_value: "Run", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "data_ready", name: "data_ready", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "data_ready", name: "data_ready", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "state", name: "state[2:0]", current_value: "Run", kind: Digital] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "data_ready", name: "data_ready", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "error_count", name: "error_count[15:0]", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "state", name: "state[2:0]", current_value: "Run", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "state", name: "state[2:0]", current_value: "Run", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "error_count", name: "error_count[15:0]", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "state", name: "state[2:0]", current_value: "Run", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "temperature", name: "temperature", current_value: "42.8 C", kind: Analog] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "error_count", name: "error_count[15:0]", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "error_count", name: "error_count[15:0]", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_default_trigger |> THEN { [id: "temperature", name: "temperature", current_value: "42.8 C", kind: Analog] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "error_count", name: "error_count[15:0]", current_value: "0", kind: Digital] })
-        |> List/append(item: selected_rows_data_last_trigger |> THEN { [id: "data_bus", name: "data_bus[7:0]", current_value: "0x2a", kind: Digital] })
-        |> List/append(item: selected_rows_without_data_trigger |> THEN { [id: "temperature", name: "temperature", current_value: "42.8 C", kind: Analog] })
-        |> List/append(item: selected_rows_load_trigger |> THEN { [id: "temperature", name: "temperature", current_value: "42.8 C", kind: Analog] })
-        |> List/append(item: selected_rows_data_first_trigger |> THEN { [id: "temperature", name: "temperature", current_value: "42.8 C", kind: Analog] })
+        selected_signal_rows
         |> List/map(selected_signal, new: new_selected_signal(selected_signal: selected_signal, store: store))
 
     data_bus_alias:
@@ -663,13 +632,13 @@ store: [
 
     selected_rows_count:
         LATEST {
-            0
-            elements.selected_remove_data.event.press |> THEN { 7 }
-            elements.selected_restore_data.event.press |> THEN { 8 }
-            elements.selected_data_up.event.press |> THEN { 8 }
-            elements.selected_data_down.event.press |> THEN { 8 }
-            elements.load_fixture.event.press |> THEN { 8 }
-            elements.show_empty.event.press |> THEN { 0 }
+            TEXT { 0 }
+            elements.selected_remove_data.event.press |> THEN { TEXT { 7 } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { 8 } }
+            elements.selected_data_up.event.press |> THEN { TEXT { 8 } }
+            elements.selected_data_down.event.press |> THEN { TEXT { 8 } }
+            elements.load_fixture.event.press |> THEN { TEXT { 8 } }
+            elements.show_empty.event.press |> THEN { TEXT { 0 } }
         }
 
     selected_rows_order_label:
@@ -1739,14 +1708,10 @@ FUNCTION new_signal_group(group, store) {
 
 FUNCTION new_selected_signal(selected_signal, store) {
     [
-        id:
-            selected_signal.id |> HOLD id { LATEST {} }
-        name:
-            selected_signal.name |> HOLD name { LATEST {} }
-        current_value:
-            selected_signal.current_value |> HOLD current_value { LATEST {} }
-        kind:
-            selected_signal.kind |> HOLD kind { LATEST {} }
+        id: selected_signal.id
+        name: selected_signal.name
+        current_value: selected_signal.current_value
+        kind: selected_signal.kind
         row_height: store.row_height
         row_size: store.row_size
     ]

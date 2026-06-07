@@ -220,6 +220,12 @@ expected_source_event = { source = "store.elements.cursor_right" }
 expect_root_text = { "cursor_position" = "Cursor48", "cursor_label" = "48 ns" }
 
 [[step]]
+id = "cursor-left"
+user_action = { kind = "click", target = "cursor left" }
+expected_source_event = { source = "store.elements.cursor_left" }
+expect_root_text = { "cursor_position" = "Cursor36", "cursor_label" = "36 ns", "keyboard_cursor_label" = "36 ns", "bridge_response_cursor" = "Cursor36" }
+
+[[step]]
 id = "pan-left"
 user_action = { kind = "click", target = "pan left" }
 expected_source_event = { source = "store.elements.pan_left" }
@@ -253,7 +259,7 @@ expect_root_text = { "keyboard_last_key" = "W", "zoom_level" = "Close", "keyboar
 id = "keyboard-cursor-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "E" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "E" }
-expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "48 ns", "cursor_position" = "Cursor48", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_48_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_48_BIN" }
+expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "48 ns", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_48_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_48_BIN" }
 
 [[step]]
 id = "keyboard-pan-left"

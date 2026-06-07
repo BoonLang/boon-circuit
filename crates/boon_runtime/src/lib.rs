@@ -6284,6 +6284,7 @@ impl GenericScheduledRuntime {
         statement: &AstStatement,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
         if let Some(expr_id) = statement.expr {
             if self.generic_derived.expr_is_block_marker(expr_id) {
                 return self.eval_statement_block(&statement.children, frame);
@@ -6302,6 +6303,7 @@ impl GenericScheduledRuntime {
         children: &[AstStatement],
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
         let expr = self
             .generic_derived
             .expressions
@@ -6379,6 +6381,7 @@ impl GenericScheduledRuntime {
         input: BoonValue,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
         let Some(expr_id) = statement.expr else {
             return Ok(input);
         };
@@ -6477,6 +6480,7 @@ impl GenericScheduledRuntime {
         attached_children: Option<&[AstStatement]>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
         let mut record = BTreeMap::new();
         for field in fields {
             let value = if let Some(children) = attached_children
@@ -6503,6 +6507,17 @@ impl GenericScheduledRuntime {
     }
 
     fn expr_accepts_attached_children(&self, expr_id: usize) -> bool {
+        self.expr_accepts_attached_children_inner(expr_id, &mut BTreeSet::new())
+    }
+
+    fn expr_accepts_attached_children_inner(
+        &self,
+        expr_id: usize,
+        seen: &mut BTreeSet<usize>,
+    ) -> bool {
+        if !seen.insert(expr_id) {
+            return false;
+        }
         let Some(expr) = self.generic_derived.expressions.get(expr_id) else {
             return false;
         };
@@ -6511,7 +6526,7 @@ impl GenericScheduledRuntime {
             AstExprKind::Pipe { op, .. } if op == "WHEN" || op == "WHILE" => true,
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => fields
                 .iter()
-                .any(|field| self.expr_accepts_attached_children(field.value)),
+                .any(|field| self.expr_accepts_attached_children_inner(field.value, seen)),
             _ => false,
         }
     }
@@ -6522,6 +6537,7 @@ impl GenericScheduledRuntime {
         arms: &[AstStatement],
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
         for arm in arms {
             let Some(expr_id) = arm.expr else {
                 continue;
@@ -8043,7 +8059,13 @@ impl GenericScheduledRuntime {
         let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
             return Ok(None);
         };
-        let value = self.eval_statement_value(&plan.statement, frame)?;
+        if frame.root_stack.contains(&plan.path) {
+            return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
+        }
+        frame.root_stack.push(plan.path.clone());
+        let value = self.eval_statement_value(&plan.statement, frame);
+        frame.root_stack.pop();
+        let value = value?;
         frame.reads.insert(GenericReadKey::Root {
             field: plan.path.clone(),
         });
@@ -11753,6 +11775,7 @@ struct GenericEvalFrame {
     row: Option<GenericEvalRow>,
     reads: BTreeSet<GenericReadKey>,
     stack: Vec<GenericDerivedKey>,
+    root_stack: Vec<String>,
     call_depth: usize,
     eval_budget: usize,
 }
@@ -12699,6 +12722,7 @@ impl GenericEvalFrame {
             row: None,
             reads: BTreeSet::new(),
             stack: Vec::new(),
+            root_stack: Vec::new(),
             call_depth: 0,
             eval_budget: 20_000,
         }
@@ -12714,6 +12738,7 @@ impl GenericEvalFrame {
             }),
             reads: BTreeSet::new(),
             stack: Vec::new(),
+            root_stack: Vec::new(),
             call_depth: 0,
             eval_budget: 20_000,
         }
@@ -12725,6 +12750,7 @@ impl GenericEvalFrame {
             row: self.row.clone(),
             reads: BTreeSet::new(),
             stack: self.stack.clone(),
+            root_stack: self.root_stack.clone(),
             call_depth: self.call_depth,
             eval_budget: self.eval_budget,
         }

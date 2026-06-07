@@ -671,8 +671,18 @@ FUNCTION search_box_focused() {
 }
 
 FUNCTION scope_cpu_button() {
+    PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
+        True => PASSED.store.scope_cpu_expansion_state == TEXT { Expanded } |> WHEN {
+            True => scope_cpu_row_button(source: PASSED.store.elements.scope_cpu_collapse, label_text: TEXT { - top.cpu }, selected: True)
+            False => scope_cpu_row_button(source: PASSED.store.elements.scope_cpu_expand, label_text: TEXT { + top.cpu }, selected: True)
+        }
+        False => scope_cpu_row_button(source: PASSED.store.elements.scope_cpu, label_text: TEXT { + top.cpu }, selected: False)
+    }
+}
+
+FUNCTION scope_cpu_row_button(source, label_text, selected) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.scope_cpu], hovered: PASSED.store.elements.scope_cpu]
+        element: [event: [press: source], hovered: source]
         style: [
             width: Fill
             height: 22
@@ -687,7 +697,7 @@ FUNCTION scope_cpu_button() {
                 Light => TEXT { #2474bb }
             }]
             spring_range: 3
-            material: PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
+            material: selected |> WHEN {
                 True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
                 False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
             }
@@ -698,7 +708,7 @@ FUNCTION scope_cpu_button() {
             gap: 8
             style: [paint: False]
             items: LIST {
-                text_line(label_text: TEXT { + top.cpu }, font: Body, width: Fill, height: 18)
+                text_line(label_text: label_text, font: Body, width: Fill, height: 18)
                 text_line(label_text: TEXT { 8 signals }, font: Muted, width: 70, height: 18)
             }
         )
@@ -1663,7 +1673,13 @@ FUNCTION variables_list_for_scope() {
             True => variables_list_analog()
             False => PASSED.store.active_scope == TEXT { ghw_simple } |> WHEN {
                 True => variables_list_ghw()
-                False => variables_list_all()
+                False => PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
+                    True => PASSED.store.scope_cpu_expansion_state == TEXT { Expanded } |> WHEN {
+                        True => variables_list_all()
+                        False => variables_scope_collapsed()
+                    }
+                    False => variables_list_all()
+                }
             }
         }
     }
@@ -1842,6 +1858,42 @@ FUNCTION variables_list_empty() {
                 }
             ]
             text: TEXT { No matching signals }
+        )
+    )
+}
+
+FUNCTION variables_scope_collapsed() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 108
+            padding: 8
+            rounded_corners: 8
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #90a4bf }
+                    Light => TEXT { #60748b }
+                }
+            ]
+            text: TEXT { Scope collapsed }
         )
     )
 }

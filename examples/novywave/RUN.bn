@@ -52,6 +52,8 @@ store: [
         keyboard_capture: SOURCE
         signal_search_input: SOURCE
         scope_cpu: SOURCE
+        scope_cpu_expand: SOURCE
+        scope_cpu_collapse: SOURCE
         scope_uart: SOURCE
         scope_analog: SOURCE
         select_clk: SOURCE
@@ -364,6 +366,8 @@ store: [
         LATEST {
             TEXT { none }
             elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { top_cpu } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { top_cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top_analog } }
             elements.select_counter_file.event.press |> THEN { TEXT { top_cpu } }
@@ -673,6 +677,8 @@ store: [
             LATEST {
                 elements.signal_search_focus_probe.event.click |> THEN { TEXT { signal search } }
                 elements.scope_cpu.event.press |> THEN { TEXT { none } }
+                elements.scope_cpu_expand.event.press |> THEN { TEXT { none } }
+                elements.scope_cpu_collapse.event.press |> THEN { TEXT { none } }
                 elements.scope_uart.event.press |> THEN { TEXT { none } }
                 elements.scope_analog.event.press |> THEN { TEXT { none } }
                 elements.select_counter_file.event.press |> THEN { TEXT { none } }
@@ -706,6 +712,8 @@ store: [
                 elements.show_empty.event.press |> THEN { TEXT { none } }
                 elements.signal_search_focus_probe.event.click |> THEN { TEXT { none } }
                 elements.scope_cpu.event.press |> THEN { TEXT { none } }
+                elements.scope_cpu_expand.event.press |> THEN { TEXT { none } }
+                elements.scope_cpu_collapse.event.press |> THEN { TEXT { none } }
                 elements.scope_uart.event.press |> THEN { TEXT { none } }
                 elements.scope_analog.event.press |> THEN { TEXT { none } }
                 elements.select_counter_file.event.press |> THEN { TEXT { none } }
@@ -1210,6 +1218,8 @@ store: [
         LATEST {
             TEXT { NONE }
             elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
             elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
             elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
@@ -1223,6 +1233,8 @@ store: [
         LATEST {
             TEXT { none }
             elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { top.cpu } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { top.cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
             elements.select_counter_file.event.press |> THEN { TEXT { top.cpu } }
@@ -1236,6 +1248,8 @@ store: [
         LATEST {
             TEXT { 0 signals }
             elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { 8 signals } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { 8 signals } }
             elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
             elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
             elements.select_counter_file.event.press |> THEN { TEXT { 8 signals } }
@@ -1243,6 +1257,44 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { 4 signals } }
             elements.load_fixture.event.press |> THEN { TEXT { 8 signals } }
             elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
+        }
+
+    scope_cpu_expansion_state:
+        LATEST {
+            TEXT { Expanded }
+            elements.scope_cpu.event.press |> THEN { TEXT { Expanded } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { Expanded } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { Collapsed } }
+            elements.select_counter_file.event.press |> THEN { TEXT { Expanded } }
+            elements.load_fixture.event.press |> THEN { TEXT { Expanded } }
+            elements.show_empty.event.press |> THEN { TEXT { Collapsed } }
+        }
+
+    active_scope_expansion_label:
+        active_scope == TEXT { top_cpu } |> WHEN {
+            True => scope_cpu_expansion_state
+            False => active_scope == TEXT { none } |> WHEN {
+                True => TEXT { None }
+                False => TEXT { Expanded }
+            }
+        }
+
+    active_scope_visible_signal_count:
+        active_scope == TEXT { top_cpu } |> WHEN {
+            True => scope_cpu_expansion_state == TEXT { Expanded } |> WHEN {
+                True => TEXT { 8 visible }
+                False => TEXT { 0 visible }
+            }
+            False => active_scope == TEXT { top_uart } |> WHEN {
+                True => TEXT { 5 visible }
+                False => active_scope == TEXT { top_analog } |> WHEN {
+                    True => TEXT { 2 visible }
+                    False => active_scope == TEXT { ghw_simple } |> WHEN {
+                        True => TEXT { 4 visible }
+                        False => TEXT { 0 visible }
+                    }
+                }
+            }
         }
 
     data_signal_toggle_state:

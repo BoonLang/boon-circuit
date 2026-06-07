@@ -1479,14 +1479,31 @@ fn view_data_path_for_expr_id(
     expressions: &[AstExpr],
     context: &DocumentViewBindingContext,
 ) -> Option<String> {
-    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
-    view_data_path_for_expr(expressions.get(expr_id)?, expressions, context)
+    view_data_path_for_expr_id_inner(expr_id, expressions, context, &mut BTreeSet::new())
 }
 
-fn view_data_path_for_expr(
+fn view_data_path_for_expr_id_inner(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+    seen: &mut BTreeSet<usize>,
+) -> Option<String> {
+    if !seen.insert(expr_id) {
+        return None;
+    }
+    let resolved_expr_id =
+        document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
+    if resolved_expr_id != expr_id {
+        return view_data_path_for_expr_id_inner(resolved_expr_id, expressions, context, seen);
+    }
+    view_data_path_for_expr_inner(expressions.get(expr_id)?, expressions, context, seen)
+}
+
+fn view_data_path_for_expr_inner(
     expr: &AstExpr,
     expressions: &[AstExpr],
     context: &DocumentViewBindingContext,
+    seen: &mut BTreeSet<usize>,
 ) -> Option<String> {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
@@ -1494,11 +1511,15 @@ fn view_data_path_for_expr(
         }
         AstExprKind::Identifier(value) => context
             .arg_expr(value)
-            .and_then(|expr_id| view_data_path_for_expr_id(expr_id, expressions, context))
+            .and_then(|expr_id| {
+                view_data_path_for_expr_id_inner(expr_id, expressions, context, seen)
+            })
             .or_else(|| Some(value.clone())),
         AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == "element") => None,
         AstExprKind::Path(parts) => Some(normalized_view_data_path(&parts.join("."))),
-        AstExprKind::Infix { left, .. } => view_data_path_for_expr_id(*left, expressions, context),
+        AstExprKind::Infix { left, .. } => {
+            view_data_path_for_expr_id_inner(*left, expressions, context, seen)
+        }
         _ => None,
     }
 }
@@ -6366,6 +6387,38 @@ scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
             ],
         )
         .unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Button"
+                && binding.attr == "press"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.button"
+                && binding.source_id.is_some()
+        }));
+    }
+
+    #[test]
+    fn source_named_argument_view_binding_does_not_recurse_into_itself() {
+        let source = r#"
+HOLD
+LATEST
+
+store: [
+    button: SOURCE
+]
+
+document: Document/new(root: wrapped_button(source: store.button))
+
+FUNCTION wrapped_button(source) {
+    Element/button(
+        element: [event: [press: source], hovered: source]
+        style: []
+        label: TEXT { Go }
+    )
+}
+"#;
+        let parsed = boon_parser::parse_source("self-named-source-arg.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
 
         assert!(ir.view_bindings.iter().any(|binding| {

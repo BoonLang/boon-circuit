@@ -108,7 +108,19 @@ expect_root_text = { "analog_limit_kind" = "Auto", "analog_limit_validity" = "Va
 id = "select-cpu-scope"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.cpu" }
 expected_source_event = { source = "store.elements.scope_cpu", target_text = "+ top.cpu" }
-expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU", "active_scope_label" = "top.cpu", "active_scope_signal_count" = "8 signals", "bridge_response_scope" = "TOP_CPU" }
+expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU", "active_scope_label" = "top.cpu", "active_scope_signal_count" = "8 signals", "active_scope_expansion_label" = "Expanded", "active_scope_visible_signal_count" = "8 visible", "bridge_response_scope" = "TOP_CPU" }
+
+[[step]]
+id = "collapse-top-cpu-scope"
+user_action = { kind = "click", target = "scope row", target_text = "- top.cpu" }
+expected_source_event = { source = "store.elements.scope_cpu_collapse", target_text = "- top.cpu" }
+expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU", "active_scope_label" = "top.cpu", "active_scope_signal_count" = "8 signals", "scope_cpu_expansion_state" = "Collapsed", "active_scope_expansion_label" = "Collapsed", "active_scope_visible_signal_count" = "0 visible" }
+
+[[step]]
+id = "expand-top-cpu-scope"
+user_action = { kind = "click", target = "scope row", target_text = "+ top.cpu" }
+expected_source_event = { source = "store.elements.scope_cpu_expand", target_text = "+ top.cpu" }
+expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU", "active_scope_label" = "top.cpu", "active_scope_signal_count" = "8 signals", "scope_cpu_expansion_state" = "Expanded", "active_scope_expansion_label" = "Expanded", "active_scope_visible_signal_count" = "8 visible" }
 
 [[step]]
 id = "row-select-data-bus"

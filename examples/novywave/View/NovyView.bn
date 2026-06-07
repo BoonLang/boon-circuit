@@ -1330,7 +1330,31 @@ FUNCTION wave_area(signal) {
             scrollbars: True
         ]
         items:
-            NovyFixtures/segments(signal_id: signal.id)
+            signal.id == TEXT { clk } |> WHEN {
+                True => NovyFixtures/clk_segments()
+                False => signal.id == TEXT { reset_n } |> WHEN {
+                    True => NovyFixtures/reset_segments()
+                    False => signal.id == TEXT { data_bus } |> WHEN {
+                        True => NovyFixtures/data_bus_segments()
+                        False => signal.id == TEXT { temperature } |> WHEN {
+                            True => NovyFixtures/temperature_segments()
+                            False => signal.id == TEXT { data_valid } |> WHEN {
+                                True => NovyFixtures/data_valid_segments()
+                                False => signal.id == TEXT { data_ready } |> WHEN {
+                                    True => NovyFixtures/data_ready_segments()
+                                    False => signal.id == TEXT { state } |> WHEN {
+                                        True => NovyFixtures/state_segments()
+                                        False => signal.id == TEXT { error_count } |> WHEN {
+                                            True => NovyFixtures/error_count_segments()
+                                            False => NovyFixtures/unknown_segments()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             |> List/map(segment, new: waveform_segment(segment: segment))
     )
 }

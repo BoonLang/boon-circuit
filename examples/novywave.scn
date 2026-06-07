@@ -13,7 +13,7 @@ expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "view
 
 [[step]]
 id = "bridge-contract-descriptor"
-expect_root_text = { "bridge_provider_version" = "planned official wellen 0.24.x provider", "bridge_schema_version" = "wellen.v1 fixture schema draft; hashes required before live bridge", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_open_summary" = "fixture VCD wave:vcd:counter:0-240ns", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog", "bridge_file_stats_label" = "VCD 15 signals, 0-240ns, bounded pages", "bridge_cursor_values_label" = "clk=1 reset_n=1 data=0x2a temp=42C", "bridge_request_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_large_fixture_contract" = "counter.vcd 311B -> bounded page requests only", "bridge_payload_limit_bytes" = "65536", "bridge_transition_limit" = "256", "bridge_visible_row_limit" = "32", "bridge_segment_limit" = "256", "bridge_page_window_label" = "window 0-120ns, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor root:0..64 next=top.cpu", "bridge_materialization_bound_label" = "visible rows 4/15, waveform segments 32/256 max", "bridge_payload_bound_label" = "payload <= 64KiB; full waveform never enters Boon", "reference_visual_basis" = "figma dark/light loaded + empty, docs full UI", "reference_loaded_basis" = "figma loaded 1440x1024/1920x1080; docs full UI 1364x747", "reference_workflow_basis" = "docs: analog limits, markers, loading, errors, multi-file", "reference_waveform_basis" = "simple.vcd 311B; simple_test.ghw 833B; wave_27.fst 28.9MB", "reference_comparison_status" = "ref: figma/docs + fixture files" }
+expect_root_text = { "bridge_provider_version" = "planned official wellen 0.24.x provider", "bridge_schema_version" = "wellen.v1 fixture schema draft; hashes required before live bridge", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_open_summary" = "fixture VCD wave:vcd:counter:0-240ns", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog", "bridge_file_stats_label" = "VCD 15 signals, 0-240ns, bounded pages", "bridge_cursor_values_label" = "clk=1 reset_n=1 data=0x2a temp=42C", "bridge_request_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_large_fixture_contract" = "counter.vcd 311B -> bounded page requests only", "bridge_payload_limit_bytes" = "65536", "bridge_transition_limit" = "256", "bridge_visible_row_limit" = "32", "bridge_segment_limit" = "256", "bridge_page_window_label" = "window 0-120ns, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor root:0..64 next=top.cpu", "bridge_materialization_bound_label" = "visible rows 8/15, waveform segments 64/256 max", "bridge_payload_bound_label" = "payload <= 64KiB; full waveform never enters Boon", "reference_visual_basis" = "figma dark/light loaded + empty, docs full UI", "reference_loaded_basis" = "figma loaded 1440x1024/1920x1080; docs full UI 1364x747", "reference_workflow_basis" = "docs: analog limits, markers, loading, errors, multi-file", "reference_waveform_basis" = "simple.vcd 311B; simple_test.ghw 833B; wave_27.fst 28.9MB", "reference_comparison_status" = "ref: figma/docs + fixture files" }
 
 [[step]]
 id = "select-compare-fixture"
@@ -25,7 +25,7 @@ expect_root_text = { "active_file" = "uart_compare.fst", "compare_file" = "count
 id = "select-primary-fixture"
 user_action = { kind = "click", target = "file row", target_text = "- counter.vcd" }
 expected_source_event = { source = "store.elements.select_counter_file", target_text = "- counter.vcd" }
-expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog", "bridge_large_fixture_contract" = "counter.vcd 311B -> bounded page requests only", "bridge_page_window_label" = "window 0-120ns, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor root:0..64 next=top.cpu", "bridge_materialization_bound_label" = "visible rows 4/15, waveform segments 32/256 max", "bridge_request_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
+expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog", "bridge_large_fixture_contract" = "counter.vcd 311B -> bounded page requests only", "bridge_page_window_label" = "window 0-120ns, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor root:0..64 next=top.cpu", "bridge_materialization_bound_label" = "visible rows 8/15, waveform segments 64/256 max", "bridge_request_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
 
 [[step]]
 id = "select-ghw-fixture"
@@ -121,25 +121,25 @@ expect_root_text = { "active_signal" = "data_bus" }
 id = "selected-remove-data"
 user_action = { kind = "click", target = "selected row control", target_text = "[Rm data]" }
 expected_source_event = { source = "store.elements.selected_remove_data", target_text = "[Rm data]" }
-expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_count" = "3", "selected_rows_order_label" = "clk, reset_n, temperature", "selected_signal_count_label" = "3 selected" }
+expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_count" = "7", "selected_rows_order_label" = "clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature", "selected_signal_count_label" = "7 selected" }
 
 [[step]]
 id = "selected-restore-data"
 user_action = { kind = "click", target = "selected row control", target_text = "[Restore]" }
 expected_source_event = { source = "store.elements.selected_restore_data", target_text = "[Restore]" }
-expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], temperature", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "8", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature", "selected_signal_count_label" = "8 selected" }
 
 [[step]]
 id = "selected-data-up"
 user_action = { kind = "click", target = "selected row control", target_text = "[Up]" }
 expected_source_event = { source = "store.elements.selected_data_up", target_text = "[Up]" }
-expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count" = "4", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, temperature", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count" = "8", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature", "selected_signal_count_label" = "8 selected" }
 
 [[step]]
 id = "selected-data-down"
 user_action = { kind = "click", target = "selected row control", target_text = "[Down]" }
 expected_source_event = { source = "store.elements.selected_data_down", target_text = "[Down]" }
-expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, temperature, data_bus[7:0]", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "8", "selected_rows_order_label" = "clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature, data_bus[7:0]", "selected_signal_count_label" = "8 selected" }
 
 [[step]]
 id = "search-data"
@@ -308,7 +308,7 @@ expect_root_text = { "selected_group" = "Collapsed" }
 id = "expand-group"
 user_action = { kind = "click", target = "group expand", target_text = "Expand group" }
 expected_source_event = { source = "store.elements.group_expand", target_text = "Expand group" }
-expect_root_text = { "selected_group" = "Expanded", "selected_rows_count" = "4", "selected_signal_count_label" = "4 selected" }
+expect_root_text = { "selected_group" = "Expanded", "selected_rows_count" = "8", "selected_signal_count_label" = "8 selected" }
 
 [[step]]
 id = "row-tall"

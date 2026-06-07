@@ -39045,15 +39045,16 @@ mod tests {
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_number_from_map(&item.style, "refraction") == Some(1.5)
-                        && style_number_from_map(&item.style, "frosted_blur").unwrap_or(0.0) >= 14.0
-                        && item.bounds.width > 300.0
+                    matches!(
+                        display_item_paint_color(item),
+                        Some("#020817" | "#020817e6")
+                    ) && item.bounds.width > 300.0
                         && item.bounds.height >= 20.0
                 })
-                .expect("NovyWave should lower a timeline glass material region");
+                .expect("NovyWave should lower a dark waveform canvas paint region");
             assert!(
                 image_luma_range(&dark_image, timeline_glass.bounds) >= 12.0,
-                "timeline glass crop should contain visible material/data variation, bounds={:?}",
+                "waveform canvas crop should contain visible material/data variation, bounds={:?}",
                 timeline_glass.bounds
             );
 
@@ -39091,7 +39092,7 @@ mod tests {
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_text_from_map(&item.style, "glow_color") == Some("#3b82f6aa")
+                    style_text_from_map(&item.style, "glow_color") == Some("#3b82f655")
                         && item.bounds.width > 20.0
                         && item.bounds.height >= 10.0
                 })

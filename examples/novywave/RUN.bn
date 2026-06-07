@@ -251,12 +251,12 @@ store: [
     bridge_materialization_bound_label:
         LATEST {
             TEXT { visible rows 0/0, waveform segments 0/256 max }
-            elements.select_counter_file.event.press |> THEN { TEXT { visible rows 4/15, waveform segments 32/256 max } }
+            elements.select_counter_file.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { visible rows 4/5, waveform segments 28/256 max } }
             elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
-            elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 3/15, waveform segments 24/256 max } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 7/15, waveform segments 56/256 max } }
             elements.show_empty.event.press |> THEN { TEXT { visible rows 0/0, waveform segments 0/256 max } }
-            elements.load_fixture.event.press |> THEN { TEXT { visible rows 4/15, waveform segments 32/256 max } }
+            elements.load_fixture.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
         }
 
     bridge_payload_bound_label:
@@ -385,9 +385,7 @@ store: [
         |> List/map(signal, new: new_signal(signal: signal))
 
     selected_signal_count:
-        signal_catalog
-        |> List/retain(signal_catalog_item, if: signal_catalog_item.selected_once)
-        |> List/count()
+        selected_rows_count
 
     row_selected_signal_key:
         signal_catalog
@@ -552,33 +550,33 @@ store: [
     selected_rows_count:
         LATEST {
             0
-            elements.selected_remove_data.event.press |> THEN { 3 }
-            elements.selected_restore_data.event.press |> THEN { 4 }
-            elements.selected_data_up.event.press |> THEN { 4 }
-            elements.selected_data_down.event.press |> THEN { 4 }
-            elements.load_fixture.event.press |> THEN { 4 }
+            elements.selected_remove_data.event.press |> THEN { 7 }
+            elements.selected_restore_data.event.press |> THEN { 8 }
+            elements.selected_data_up.event.press |> THEN { 8 }
+            elements.selected_data_down.event.press |> THEN { 8 }
+            elements.load_fixture.event.press |> THEN { 8 }
             elements.show_empty.event.press |> THEN { 0 }
         }
 
     selected_rows_order_label:
         LATEST {
             TEXT { none }
-            elements.selected_remove_data.event.press |> THEN { TEXT { clk, reset_n, temperature } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
-            elements.selected_data_up.event.press |> THEN { TEXT { data_bus[7:0], clk, reset_n, temperature } }
-            elements.selected_data_down.event.press |> THEN { TEXT { clk, reset_n, temperature, data_bus[7:0] } }
-            elements.load_fixture.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
+            elements.selected_data_up.event.press |> THEN { TEXT { data_bus[7:0], clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
+            elements.selected_data_down.event.press |> THEN { TEXT { clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature, data_bus[7:0] } }
+            elements.load_fixture.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_signal_count_label:
         LATEST {
             TEXT { 0 selected }
-            elements.selected_remove_data.event.press |> THEN { TEXT { 3 selected } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { 4 selected } }
-            elements.selected_data_up.event.press |> THEN { TEXT { 4 selected } }
-            elements.selected_data_down.event.press |> THEN { TEXT { 4 selected } }
-            elements.load_fixture.event.press |> THEN { TEXT { 4 selected } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { 7 selected } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { 8 selected } }
+            elements.selected_data_up.event.press |> THEN { TEXT { 8 selected } }
+            elements.selected_data_down.event.press |> THEN { TEXT { 8 selected } }
+            elements.load_fixture.event.press |> THEN { TEXT { 8 selected } }
             elements.show_empty.event.press |> THEN { TEXT { 0 selected } }
         }
 
@@ -664,8 +662,6 @@ store: [
         TEXT { Hidden } |> HOLD marker_visibility {
             LATEST {
             elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
-            elements.marker_rename.event.press |> THEN { TEXT { Visible } }
-            elements.marker_jump.event.press |> THEN { TEXT { Visible } }
             elements.marker_toggle.event.press |> THEN { TEXT { Visible } }
             elements.load_fixture.event.press |> THEN { TEXT { Visible } }
             elements.show_empty.event.press |> THEN { TEXT { Hidden } }
@@ -687,9 +683,7 @@ store: [
     marker_count_label:
         TEXT { 0 markers } |> HOLD marker_count_label {
             LATEST {
-            elements.marker_rename.event.press |> THEN { TEXT { 2 markers } }
             elements.marker_remove.event.press |> THEN { TEXT { 0 markers } }
-            elements.marker_jump.event.press |> THEN { TEXT { 2 markers } }
             elements.marker_toggle.event.press |> THEN { TEXT { 2 markers } }
             elements.load_fixture.event.press |> THEN { TEXT { 1 marker } }
             elements.show_empty.event.press |> THEN { TEXT { 0 markers } }
@@ -720,7 +714,10 @@ store: [
         })
         |> List/map(marker, new: new_marker(marker: marker))
         |> List/remove(marker, when:
-            marker.marker_elements.remove_marker.event.press |> THEN { True }
+            LATEST {
+                marker.marker_elements.remove_marker.event.press |> THEN { True }
+                elements.marker_remove.event.press |> THEN { True }
+            }
         )
 
     row_size:

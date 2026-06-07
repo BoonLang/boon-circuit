@@ -115,6 +115,10 @@ FUNCTION selected_signals() {
         [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital]
+        [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital]
+        [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital]
         [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
     }
 }
@@ -123,6 +127,10 @@ FUNCTION selected_signals_without_data() {
     LIST {
         [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital]
+        [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital]
+        [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital]
         [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
     }
 }
@@ -132,6 +140,10 @@ FUNCTION selected_signals_data_first() {
         [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
         [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital]
+        [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital]
+        [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital]
         [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
     }
 }
@@ -140,6 +152,10 @@ FUNCTION selected_signals_data_last() {
     LIST {
         [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
         [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital]
+        [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital]
+        [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital]
         [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
         [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
     }
@@ -309,6 +325,26 @@ FUNCTION segments(of) {
             [width: 42, state: AnalogMid, color: TEXT { #38BDF8 }, label: TEXT { 42 }]
             [width: 42, state: AnalogHigh, color: TEXT { #93C5FD }, label: TEXT { 44 }]
             [width: 42, state: AnalogMid, color: TEXT { #38BDF8 }, label: TEXT { 43 }]
+        }
+        TEXT { data_valid } => LIST {
+            [width: 96, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+            [width: 160, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+            [width: 80, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+        }
+        TEXT { data_ready } => LIST {
+            [width: 48, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+            [width: 144, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+            [width: 144, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+        }
+        TEXT { state } => LIST {
+            [width: 72, state: Unknown, color: TEXT { #60A5FA }, label: TEXT { IDLE }]
+            [width: 128, state: High, color: TEXT { #3B82F6 }, label: TEXT { RUN }]
+            [width: 136, state: Low, color: TEXT { #020817 }, label: TEXT { WAIT }]
+        }
+        TEXT { error_count } => LIST {
+            [width: 188, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+            [width: 56, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+            [width: 92, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
         }
         __ => LIST {
             [width: 336, state: Unknown, color: TEXT { #60A5FA }, label: TEXT { unknown }]

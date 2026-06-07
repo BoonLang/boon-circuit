@@ -85,23 +85,32 @@ FUNCTION material(mode, of) {
         WaveformGlass => [
             color: PASSED.mode |> WHEN {
                 Dark => TEXT { #020817e6 }
-                Light => TEXT { #101a2be6 }
+                Light => TEXT { #050b18f5 }
             }
             refraction: 1.5
-            gloss: 0.07
+            gloss: PASSED.mode |> WHEN {
+                Dark => 0.07
+                Light => 0.03
+            }
             transparency: PASSED.mode |> WHEN {
                 Dark => 0.14
-                Light => 0.10
+                Light => 0.03
             }
-            frosted_blur: 10
-            frosted_saturate: 1.16
+            frosted_blur: PASSED.mode |> WHEN {
+                Dark => 10
+                Light => 3
+            }
+            frosted_saturate: PASSED.mode |> WHEN {
+                Dark => 1.16
+                Light => 1.04
+            }
             glass_highlight: PASSED.mode |> WHEN {
                 Dark => 0.40
-                Light => 0.24
+                Light => 0.08
             }
             glass_highlight_color: PASSED.mode |> WHEN {
                 Dark => TEXT { #dce8ff38 }
-                Light => TEXT { #c8e6ff36 }
+                Light => TEXT { #c8e6ff14 }
             }
         ]
 
@@ -110,13 +119,13 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #3b82f6 }
                 Light => TEXT { #2563eb }
             }
-            glow: [color: TEXT { #3b82f6aa }, intensity: 0.28]
+            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
         ]
 
         TraceLow => [
             color: PASSED.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #d7e2ef }
+                Light => TEXT { #020817 }
             }
         ]
 
@@ -125,7 +134,10 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #60a5fa }
                 Light => TEXT { #3b82f6 }
             }
-            glow: [color: TEXT { #60a5fa88 }, intensity: 0.20]
+            glow: PASSED.mode |> WHEN {
+                Dark => [color: TEXT { #60a5fa88 }, intensity: 0.20]
+                Light => [color: TEXT { #3b82f642 }, intensity: 0.06]
+            }
         ]
 
         AnalogTrace => [
@@ -133,7 +145,10 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #6bbdff }
                 Light => TEXT { #1267aa }
             }
-            glow: [color: TEXT { #6bbdff88 }, intensity: 0.22]
+            glow: PASSED.mode |> WHEN {
+                Dark => [color: TEXT { #6bbdff88 }, intensity: 0.22]
+                Light => [color: TEXT { #1267aa3d }, intensity: 0.05]
+            }
         ]
 
         CursorGlow => [

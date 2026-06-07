@@ -558,7 +558,7 @@ FUNCTION search_box_resting() {
             }
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #0a1322 }
-                Light => TEXT { #ffffff }
+                Light => TEXT { #f3f7fc }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #263753 }
@@ -801,7 +801,7 @@ FUNCTION timeline_header() {
                         Light => TEXT { #60748b }
                     }
                 ]
-                text: PASSED.store.selected_rows_order_label
+                text: PASSED.store.selected_signal_count_label
             )
             remove_all_button()
         }
@@ -1191,7 +1191,7 @@ FUNCTION waveform_row_clk() {
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #071120 }
-                    Light => TEXT { #f7fbff }
+                    Light => TEXT { #eef4fb }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #1c2b43 }
@@ -1226,7 +1226,7 @@ FUNCTION waveform_row_reset() {
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #071120 }
-                    Light => TEXT { #f7fbff }
+                    Light => TEXT { #eef4fb }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #1c2b43 }
@@ -1261,7 +1261,7 @@ FUNCTION waveform_row_data() {
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #071120 }
-                    Light => TEXT { #f7fbff }
+                    Light => TEXT { #eef4fb }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #1c2b43 }
@@ -1296,7 +1296,7 @@ FUNCTION waveform_row_temperature() {
                 rounded_corners: 2
                 background: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #071120 }
-                    Light => TEXT { #f7fbff }
+                    Light => TEXT { #eef4fb }
                 }]
                 border: [color: PASSED.store.mode |> WHEN {
                     Dark => TEXT { #1c2b43 }
@@ -1360,7 +1360,7 @@ FUNCTION fixed_value_clk() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
-                Light => TEXT { #ffffff }
+                Light => TEXT { #edf3f9 }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #263753 }
@@ -1395,7 +1395,7 @@ FUNCTION fixed_value_reset() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
-                Light => TEXT { #ffffff }
+                Light => TEXT { #edf3f9 }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #263753 }
@@ -1430,7 +1430,7 @@ FUNCTION fixed_value_data() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
-                Light => TEXT { #ffffff }
+                Light => TEXT { #edf3f9 }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #263753 }
@@ -1465,7 +1465,7 @@ FUNCTION fixed_value_temperature() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
-                Light => TEXT { #ffffff }
+                Light => TEXT { #edf3f9 }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #263753 }

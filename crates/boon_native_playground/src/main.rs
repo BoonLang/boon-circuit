@@ -38939,6 +38939,99 @@ mod tests {
             );
         }
 
+        let assert_waveform_segment_in_row =
+            |layout: &boon_document::LayoutFrame, row_label: &str, segment_label: &str| {
+                let row_text = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        item.text.as_deref() == Some(row_label)
+                            && item.bounds.x < 180.0
+                            && item.bounds.y > 450.0
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("missing selected waveform row label `{row_label}`")
+                    });
+                let row_center_y = row_text.bounds.y + row_text.bounds.height * 0.5;
+                let segment_text = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        item.text.as_deref() == Some(segment_label)
+                            && item.bounds.x > 250.0
+                            && item.bounds.y > 450.0
+                            && ((item.bounds.y + item.bounds.height * 0.5) - row_center_y).abs()
+                                <= 12.0
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing waveform segment `{segment_label}` aligned with selected row `{row_label}`"
+                        )
+                    });
+                assert!(
+                    segment_text.bounds.x > row_text.bounds.x + 220.0,
+                    "segment `{segment_label}` should render in waveform lane for row `{row_label}`: row={:?}, segment={:?}",
+                    row_text.bounds,
+                    segment_text.bounds
+                );
+            };
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.select_uart_compare_file".to_owned(),
+                target_text: Some("- uart_compare.fst".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave UART fixture source event should apply");
+        let uart_state = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&uart_state),
+            vec!["tx_data", "rx_data", "baud_tick", "uart_busy"],
+            "NovyWave UART/FST file selection should replace the visible selected rows"
+        );
+        assert_eq!(
+            uart_state.pointer("/store/active_signal"),
+            Some(&json!("tx_data")),
+            "NovyWave UART/FST file selection should update the active signal"
+        );
+        let (_, uart_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&uart_state),
+        )
+        .expect("NovyWave UART fixture layout should lower");
+        assert_waveform_segment_in_row(&uart_layout, "tx_data[7:0]", "0x55");
+        assert_waveform_segment_in_row(&uart_layout, "rx_data[7:0]", "0xaa");
+        assert_waveform_segment_in_row(&uart_layout, "uart_busy", "busy");
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.select_ghw_file".to_owned(),
+                target_text: Some("- simple_test.ghw".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave GHW fixture source event should apply");
+        let ghw_state = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&ghw_state),
+            vec!["ghw_counter", "ghw_enable", "ghw_state"],
+            "NovyWave GHW file selection should replace the visible selected rows"
+        );
+        assert_eq!(
+            ghw_state.pointer("/store/active_signal"),
+            Some(&json!("ghw_counter")),
+            "NovyWave GHW file selection should update the active signal"
+        );
+        let (_, ghw_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&ghw_state),
+        )
+        .expect("NovyWave GHW fixture layout should lower");
+        assert_waveform_segment_in_row(&ghw_layout, "ghw.counter[3:0]", "3");
+        assert_waveform_segment_in_row(&ghw_layout, "ghw.enable", "enable");
+        assert_waveform_segment_in_row(&ghw_layout, "ghw.state", "Count");
+
         runtime
             .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                 source: "store.elements.signal_search_focus_probe".to_owned(),

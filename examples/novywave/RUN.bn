@@ -342,6 +342,9 @@ store: [
             elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top_analog } }
+            elements.select_counter_file.event.press |> THEN { TEXT { top_cpu } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { top_uart } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { ghw_simple } }
             elements.load_fixture.event.press |> THEN { TEXT { top_cpu } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -364,6 +367,9 @@ store: [
                 }
             }
             elements.select_temperature.event.press |> THEN { TEXT { temperature } }
+            elements.select_counter_file.event.press |> THEN { TEXT { clk } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter } }
             elements.load_fixture.event.press |> THEN { TEXT { clk } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
             }
@@ -386,6 +392,10 @@ store: [
             [key: TEXT { framing_error }, scope: TEXT { top.uart }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }, family: TEXT { uart }]
             [key: TEXT { temperature }, scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }, family: TEXT { analog }]
             [key: TEXT { voltage }, scope: TEXT { top.analog }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }, family: TEXT { analog }]
+            [key: TEXT { ghw_counter }, scope: TEXT { ghw.simple }, name: TEXT { ghw.counter[3:0] }, kind: TEXT { Reg }, bit_width: TEXT { 4-bit }, direction: TEXT { Counter }, family: TEXT { ghw }]
+            [key: TEXT { ghw_enable }, scope: TEXT { ghw.simple }, name: TEXT { ghw.enable }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { ghw }]
+            [key: TEXT { ghw_state }, scope: TEXT { ghw.simple }, name: TEXT { ghw.state }, kind: TEXT { Reg }, bit_width: TEXT { 2-bit }, direction: TEXT { State }, family: TEXT { ghw }]
+            [key: TEXT { ghw_clk }, scope: TEXT { ghw.simple }, name: TEXT { ghw.clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { ghw }]
         }
         |> List/map(signal, new: new_signal(signal: signal))
 
@@ -400,16 +410,33 @@ store: [
         })
         |> List/latest()
 
+    selected_signal_fixture:
+        LATEST {
+            TEXT { counter }
+            elements.select_counter_file.event.press |> THEN { TEXT { counter } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { uart } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { ghw } }
+            elements.load_fixture.event.press |> THEN { TEXT { counter } }
+            elements.show_empty.event.press |> THEN { TEXT { counter } }
+        }
+
     selected_signal_defaults:
         LIST {
-            [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { counter }, id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
+            [fixture: TEXT { uart }, id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { uart }, id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { uart }, id: TEXT { baud_tick }, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { uart }, id: TEXT { uart_busy }, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { ghw }, id: TEXT { ghw_counter }, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { ghw }, id: TEXT { ghw_enable }, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [fixture: TEXT { ghw }, id: TEXT { ghw_state }, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }]
         }
 
     selected_rows_enabled_value:
@@ -425,6 +452,9 @@ store: [
             elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
             elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
             elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
+            elements.select_counter_file.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { DefaultOrder } }
             elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
         }
@@ -436,6 +466,9 @@ store: [
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.select_counter_file.event.press |> THEN { TEXT { none } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -447,6 +480,9 @@ store: [
             elements.selected_remove_data.event.press |> THEN { TEXT { none } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.select_counter_file.event.press |> THEN { TEXT { none } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -458,12 +494,16 @@ store: [
             elements.selected_remove_data.event.press |> THEN { TEXT { none } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
+            elements.select_counter_file.event.press |> THEN { TEXT { none } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_signal_rows:
         selected_signal_defaults
+        |> List/filter_field_equal(field: "fixture", value: selected_signal_fixture)
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
         |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
@@ -865,6 +905,11 @@ store: [
             }
         )
 
+    active_marker_count:
+        markers
+        |> List/retain(marker, if: marker.has_label)
+        |> List/count()
+
     row_size:
         LATEST {
             TEXT { Normal }
@@ -1020,6 +1065,9 @@ store: [
                     }
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
+                elements.select_counter_file.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart.tx_data[7:0] } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple.counter[3:0] } }
                 elements.load_fixture.event.press |> THEN { TEXT { top.cpu.clk } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
             }
@@ -1031,6 +1079,9 @@ store: [
             elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
             elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
+            elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE } }
             elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
             elements.show_empty.event.press |> THEN { TEXT { NONE } }
         }
@@ -1041,6 +1092,9 @@ store: [
             elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
+            elements.select_counter_file.event.press |> THEN { TEXT { top.cpu } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple } }
             elements.load_fixture.event.press |> THEN { TEXT { top.cpu } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -1051,6 +1105,9 @@ store: [
             elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
             elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
             elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
+            elements.select_counter_file.event.press |> THEN { TEXT { 8 signals } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { 5 signals } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { 4 signals } }
             elements.load_fixture.event.press |> THEN { TEXT { 8 signals } }
             elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
         }
@@ -1099,6 +1156,9 @@ store: [
                     }
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+                elements.select_counter_file.event.press |> THEN { TEXT { CLK } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { TX_DATA } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { GHW_COUNTER } }
                 elements.load_fixture.event.press |> THEN { TEXT { CLK } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
@@ -1695,6 +1755,7 @@ FUNCTION new_marker(marker, store) {
                     store.elements.marker_rename.event.press |> THEN { TEXT { data stable } }
                 }
             }
+        has_label: True
     ]
 }
 

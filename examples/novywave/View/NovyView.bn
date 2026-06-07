@@ -30,7 +30,10 @@ FUNCTION root() {
             header()
             PASSED.store.fixture_status == TEXT { Empty } |> WHEN {
                 True => empty_state()
-                False => loaded_app()
+                False => PASSED.store.fixture_status == TEXT { Loading } |> WHEN {
+                    True => loading_state()
+                    False => loaded_app()
+                }
             }
         }
     )
@@ -259,6 +262,66 @@ FUNCTION empty_state_fact(label_text) {
             ]
             text: label_text
         )
+    )
+}
+
+FUNCTION loading_state() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 14
+        style: [
+            width: Fill
+            height: 650
+            align: [row: Center]
+            padding: 72
+            depth: 12
+            move: [closer: 3]
+            rounded_corners: 0
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0b1628 }
+                Light => TEXT { #eef6ff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #2563eb }
+                Light => TEXT { #3b82f6 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Title)
+                    width: Fill
+                    height: 44
+                    center: True
+                    color: PASSED.store.mode |> WHEN {
+                        Dark => TEXT { #dceaff }
+                        Light => TEXT { #172033 }
+                    }
+                ]
+                text: PASSED.store.loading_state_title
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+                    width: Fill
+                    height: 30
+                    center: True
+                    color: PASSED.store.mode |> WHEN {
+                        Dark => TEXT { #bfdbfe }
+                        Light => TEXT { #1e3a5f }
+                    }
+                ]
+                text: PASSED.store.loading_state_hint
+            )
+            empty_state_fact(label_text: PASSED.store.bridge_open_summary)
+            empty_state_fact(label_text: PASSED.store.bridge_materialization_bound_label)
+            empty_state_fact(label_text: PASSED.store.bridge_page_window_label)
+            header_load_button()
+        }
     )
 }
 

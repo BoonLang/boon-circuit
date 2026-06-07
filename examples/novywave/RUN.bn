@@ -9,6 +9,7 @@ store: [
         }
 
     elements: [
+        begin_load_fixture: SOURCE
         load_fixture: SOURCE
         show_empty: SOURCE
         select_counter_file: SOURCE
@@ -63,6 +64,7 @@ store: [
         LATEST {
             TEXT { Empty }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { Loading } }
             elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
         }
 
@@ -70,6 +72,8 @@ store: [
     empty_state_hint: TEXT { Drop or load a VCD, FST, or GHW waveform to inspect signals. }
     empty_state_bridge_label: TEXT { Bridge state: no request scheduled; pure descriptor is wave:none }
     empty_state_formats_label: TEXT { Supported fixture contracts: VCD, FST, GHW }
+    loading_state_title: TEXT { Loading waveform }
+    loading_state_hint: TEXT { Opening counter.vcd through wellen.v1 descriptor handshake. }
     reference_visual_basis: NovyReference/visual_basis_label()
     reference_loaded_basis: NovyReference/loaded_reference_label()
     reference_empty_basis: NovyReference/empty_reference_label()
@@ -84,6 +88,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -94,6 +99,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -104,6 +110,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { single fixture: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing counter.vcd to uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { single fixture: simple_test.ghw } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { opening counter.vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { single fixture: counter.vcd } }
             elements.show_empty.event.press |> THEN { TEXT { no waveform loaded } }
         }
@@ -126,6 +133,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { VCD } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { VCD } }
             elements.load_fixture.event.press |> THEN { TEXT { VCD } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -137,6 +145,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { sha256:fixture-corrupted-vcd } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
             elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
         }
@@ -148,6 +157,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { diagnostic:unsupported-corrupted-vcd } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { wave:opening:counter } }
             elements.load_fixture.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
             elements.show_empty.event.press |> THEN { TEXT { wave:none } }
         }
@@ -159,6 +169,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -170,6 +181,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.select_ghw_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { DIAGNOSTIC } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { OPENING } }
             elements.load_fixture.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.show_empty.event.press |> THEN { TEXT { NOT_REQUESTED } }
         }
@@ -181,6 +193,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { fixture FST wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { fixture GHW wave:ghw:simple-test:0-100ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { opening VCD counter.vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
             elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
@@ -192,6 +205,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
             elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { HIER:none } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { HIER:opening } }
             elements.load_fixture.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
             elements.show_empty.event.press |> THEN { TEXT { HIER:none } }
         }
@@ -203,6 +217,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { no waveform stats } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { loading waveform stats } }
             elements.load_fixture.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
             elements.show_empty.event.press |> THEN { TEXT { no waveform stats } }
         }
@@ -215,6 +230,7 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd 25B -> diagnostic only } }
             elements.show_empty.event.press |> THEN { TEXT { no large file materialized } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd pending -> no page materialized } }
             elements.load_fixture.event.press |> THEN { TEXT { counter.vcd 311B -> bounded page requests only } }
         }
 
@@ -234,6 +250,7 @@ store: [
             elements.pan_left.event.press |> THEN { TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB } }
             elements.pan_right.event.press |> THEN { TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB } }
             elements.show_empty.event.press |> THEN { TEXT { no page window scheduled } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { no page window scheduled } }
             elements.load_fixture.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
         }
 
@@ -245,6 +262,7 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { hierarchy cursor none } }
             elements.show_empty.event.press |> THEN { TEXT { hierarchy cursor none } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { hierarchy cursor opening } }
             elements.load_fixture.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
         }
 
@@ -256,6 +274,7 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
             elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 7/15, waveform segments 56/256 max } }
             elements.show_empty.event.press |> THEN { TEXT { visible rows 0/0, waveform segments 0/256 max } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { visible rows 0/15, waveform segments 0/256 max } }
             elements.load_fixture.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
         }
 
@@ -268,6 +287,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:counter.vcd+uart_compare.fst:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { compare:simple_test.ghw:primary } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { compare:counter.vcd:opening } }
             elements.load_fixture.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
             elements.show_empty.event.press |> THEN { TEXT { compare:none } }
         }
@@ -278,6 +298,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { primary page: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
             elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW fixture } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { opening page: counter.vcd } }
             elements.load_fixture.event.press |> THEN { TEXT { primary page: counter.vcd } }
             elements.show_empty.event.press |> THEN { TEXT { no compare page } }
         }
@@ -295,6 +316,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
             elements.select_ghw_file.event.press |> THEN { TEXT { OK } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { Loading } }
             elements.load_fixture.event.press |> THEN { TEXT { OK } }
             elements.show_empty.event.press |> THEN { TEXT { Idle } }
         }
@@ -306,6 +328,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_ghw_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { loading waveform } }
             elements.load_fixture.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
@@ -317,6 +340,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -438,6 +462,110 @@ store: [
             [fixture: TEXT { ghw }, id: TEXT { ghw_enable }, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
             [fixture: TEXT { ghw }, id: TEXT { ghw_state }, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }]
         }
+
+    selected_waveform_segments:
+        LIST {
+            [signal_id: TEXT { clk }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { reset_n }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { reset_n }, width: 84, state: Low, label: TEXT { reset }]
+            [signal_id: TEXT { reset_n }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { reset_n }, width: 252, state: High, label: TEXT { released }]
+            [signal_id: TEXT { data_bus }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { data_bus }, width: 56, state: Unknown, label: TEXT { XX }]
+            [signal_id: TEXT { data_bus }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { data_bus }, width: 56, state: High, label: TEXT { 0x12 }]
+            [signal_id: TEXT { data_bus }, width: 56, state: Low, label: TEXT { 0x00 }]
+            [signal_id: TEXT { data_bus }, width: 84, state: High, label: TEXT { 0x2a }]
+            [signal_id: TEXT { data_bus }, width: 84, state: Low, label: TEXT { 0x08 }]
+            [signal_id: TEXT { data_valid }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { data_valid }, width: 96, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { data_valid }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { data_valid }, width: 160, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { data_valid }, width: 80, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { data_ready }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { data_ready }, width: 48, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { data_ready }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { data_ready }, width: 144, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { data_ready }, width: 144, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { state }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { state }, width: 72, state: Unknown, label: TEXT { IDLE }]
+            [signal_id: TEXT { state }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { state }, width: 128, state: High, label: TEXT { RUN }]
+            [signal_id: TEXT { state }, width: 136, state: Low, label: TEXT { WAIT }]
+            [signal_id: TEXT { error_count }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { error_count }, width: 188, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { error_count }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { error_count }, width: 56, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { error_count }, width: 92, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { temperature }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 39 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 41 }]
+            [signal_id: TEXT { temperature }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 40 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 42 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }]
+            [signal_id: TEXT { tx_data }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { tx_data }, width: 48, state: Unknown, label: TEXT { idle }]
+            [signal_id: TEXT { tx_data }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { tx_data }, width: 88, state: High, label: TEXT { 0x55 }]
+            [signal_id: TEXT { tx_data }, width: 72, state: Low, label: TEXT { gap }]
+            [signal_id: TEXT { tx_data }, width: 104, state: High, label: TEXT { 0xa5 }]
+            [signal_id: TEXT { rx_data }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { rx_data }, width: 64, state: Low, label: TEXT { start }]
+            [signal_id: TEXT { rx_data }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { rx_data }, width: 96, state: High, label: TEXT { 0xaa }]
+            [signal_id: TEXT { rx_data }, width: 72, state: Low, label: TEXT { stop }]
+            [signal_id: TEXT { rx_data }, width: 80, state: High, label: TEXT { idle }]
+            [signal_id: TEXT { baud_tick }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { baud_tick }, width: 44, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { baud_tick }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }]
+            [signal_id: TEXT { baud_tick }, width: 78, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }]
+            [signal_id: TEXT { baud_tick }, width: 120, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { uart_busy }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { uart_busy }, width: 86, state: Low, label: TEXT { idle }]
+            [signal_id: TEXT { uart_busy }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { uart_busy }, width: 156, state: High, label: TEXT { busy }]
+            [signal_id: TEXT { uart_busy }, width: 92, state: Low, label: TEXT { idle }]
+            [signal_id: TEXT { ghw_counter }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { ghw_counter }, width: 64, state: Unknown, label: TEXT { init }]
+            [signal_id: TEXT { ghw_counter }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 1 }]
+            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 2 }]
+            [signal_id: TEXT { ghw_counter }, width: 98, state: High, label: TEXT { 3 }]
+            [signal_id: TEXT { ghw_enable }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { ghw_enable }, width: 72, state: Low, label: TEXT { 0 }]
+            [signal_id: TEXT { ghw_enable }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { ghw_enable }, width: 216, state: High, label: TEXT { enable }]
+            [signal_id: TEXT { ghw_state }, width: 0, state: CursorLine, label: TEXT { cursor }]
+            [signal_id: TEXT { ghw_state }, width: 72, state: Unknown, label: TEXT { Reset }]
+            [signal_id: TEXT { ghw_state }, width: 0, state: MarkerLine, label: TEXT { marker }]
+            [signal_id: TEXT { ghw_state }, width: 184, state: High, label: TEXT { Count }]
+            [signal_id: TEXT { ghw_state }, width: 72, state: Low, label: TEXT { Hold }]
+        }
+        |> List/map(segment, new: new_waveform_segment(segment: segment))
+
+    active_waveform_segment_labels:
+        selected_waveform_segments
+        |> List/filter_field_equal(field: "signal_id", value: active_signal)
+        |> List/join_field(field: "label", separator: ",", empty: "none")
 
     selected_rows_enabled_value:
         fixture_status == TEXT { Loaded } |> WHEN {
@@ -1741,6 +1869,15 @@ FUNCTION new_signal(signal) {
                     signal_elements.alias_input.text
                 }
             }
+    ]
+}
+
+FUNCTION new_waveform_segment(segment) {
+    [
+        signal_id: segment.signal_id
+        width: segment.width
+        state: segment.state
+        label: segment.label
     ]
 }
 

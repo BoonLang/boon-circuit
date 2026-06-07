@@ -6382,15 +6382,37 @@ impl ExampleWorkspace {
         let loaded_from_open_buffer = self.open_buffers.iter().any(|(path, _)| {
             paths_match_for_preview_units(Path::new(path), Path::new(&active_file))
         });
-        let buffer = if let Some(buffer) = self
+        let active_file_dirty = self
+            .dirty_files
+            .iter()
+            .any(|path| paths_match_for_preview_units(Path::new(path), Path::new(&active_file)));
+        let open_buffer = self
             .open_buffers
             .iter()
             .find(|(path, _)| {
                 paths_match_for_preview_units(Path::new(path), Path::new(&active_file))
             })
-            .map(|(_, buffer)| buffer.clone())
-        {
-            buffer
+            .map(|(_, buffer)| buffer.clone());
+        let current_text = || -> Result<String, Box<dyn std::error::Error>> {
+            if entry.inline_source.is_some()
+                && paths_match_for_preview_units(Path::new(&entry.source), Path::new(&active_file))
+            {
+                Ok(entry.inline_source.clone().unwrap_or_default())
+            } else {
+                Ok(std::fs::read_to_string(repo_relative_path(&active_file))?)
+            }
+        };
+        let (buffer, reused_open_buffer) = if let Some(buffer) = open_buffer {
+            if entry.custom || active_file_dirty {
+                (buffer, true)
+            } else {
+                let text = current_text()?;
+                if text == buffer.source_text {
+                    (buffer, true)
+                } else {
+                    (CodeEditorModel::new(&active_file, &text), false)
+                }
+            }
         } else {
             let text = if entry.inline_source.is_some()
                 && paths_match_for_preview_units(Path::new(&entry.source), Path::new(&active_file))
@@ -6399,7 +6421,7 @@ impl ExampleWorkspace {
             } else {
                 std::fs::read_to_string(repo_relative_path(&active_file))?
             };
-            CodeEditorModel::new(&active_file, &text)
+            (CodeEditorModel::new(&active_file, &text), false)
         };
         let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
         self.selected_example_id = entry.id.clone();
@@ -6423,6 +6445,7 @@ impl ExampleWorkspace {
             "previous_example_id": previous_example_id,
             "previous_dirty_preserved": previous_dirty == self.dirty_examples.contains(&previous_example_id),
             "loaded_from_open_buffer": loaded_from_open_buffer,
+            "reused_open_buffer": reused_open_buffer,
             "loaded_project_buffers_synchronously": false,
             "project_type_hint_refresh": {
                 "status": "deferred",
@@ -6465,18 +6488,31 @@ impl ExampleWorkspace {
             .open_buffers
             .iter()
             .any(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)));
-        let mut buffer = if let Some(buffer) = self
+        let spec_dirty = self
+            .dirty_files
+            .iter()
+            .any(|path| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)));
+        let open_buffer = self
             .open_buffers
             .iter()
             .find(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)))
-            .map(|(_, buffer)| buffer.clone())
-        {
-            buffer
+            .map(|(_, buffer)| buffer.clone());
+        let (mut buffer, reused_open_buffer) = if let Some(buffer) = open_buffer {
+            if entry.custom || spec_dirty {
+                (buffer, true)
+            } else {
+                let text = std::fs::read_to_string(repo_relative_path(&spec_path))?;
+                if text == buffer.source_text {
+                    (buffer, true)
+                } else {
+                    (CodeEditorModel::new(&spec_path, &text), false)
+                }
+            }
         } else {
             let text = std::fs::read_to_string(repo_relative_path(&spec_path))?;
             let buffer = CodeEditorModel::new(&spec_path, &text);
             self.open_buffers.insert(spec_path, buffer.clone());
-            buffer
+            (buffer, false)
         };
         if let Some(hinting) = self.project_type_hinting_for_file(&buffer.file_name) {
             buffer.set_type_hinting(hinting);
@@ -6497,6 +6533,7 @@ impl ExampleWorkspace {
             "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
             "buffer_line_count": self.selected_buffer.line_count,
             "loaded_from_open_buffer": loaded_from_open_buffer,
+            "reused_open_buffer": reused_open_buffer,
             "project_file_count": editor_files.len(),
             "project_type_hint_refresh": {
                 "status": "skipped",

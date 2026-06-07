@@ -9162,9 +9162,14 @@ impl GenericCircuitRuntime {
         template.reset_from_initial_text(&mut row, |initial_name| {
             append_fields
                 .iter()
-                .any(|field| field.name == initial_name && field.source == trigger)
+                .any(|field| field.name == row_field_name(initial_name) && field.source == trigger)
                 .then_some(trigger_value)
         })?;
+        for field in append_fields {
+            if field.source == trigger {
+                row.columns.set_textlike(&field.name, trigger_value)?;
+            }
+        }
         self.append_row_for_trigger(equations, list, trigger, row)
     }
 
@@ -11302,13 +11307,11 @@ enum RuntimeDerivedTextExpression {
 
 fn source_event_transform_text_expression(
     value: &boon_ir::DerivedValue,
+    source: &str,
     expressions: &[AstExpr],
 ) -> RuntimeDerivedTextExpression {
     let exprs = statement_ast_exprs(&value.statement, expressions);
     let Some(path) = text_trim_input_path_from_exprs(&exprs) else {
-        let Some(source) = value.sources.first() else {
-            return RuntimeDerivedTextExpression::Unsupported;
-        };
         let Some(path) = source_then_text_value(&exprs, source) else {
             return RuntimeDerivedTextExpression::Unsupported;
         };
@@ -11823,6 +11826,7 @@ impl ScalarEquationPlan {
                 Ok(arms
                     .iter()
                     .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
                     .map(|arm| ScalarTextValue::Text(Cow::Owned(arm.output.clone()))))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
@@ -11908,14 +11912,19 @@ impl DerivedEquationPlan {
                 value.kind == DerivedValueKind::SourceEventTransform
                     && append_triggers.contains(value.path.as_str())
             })
-            .map(|value| RuntimeDerivedTextTransform {
-                target: value.path.clone(),
-                source: value.sources.first().cloned().unwrap_or_default(),
-                expression: if value.sources.len() == 1 {
-                    source_event_transform_text_expression(value, &ir.expressions)
-                } else {
-                    RuntimeDerivedTextExpression::Unsupported
-                },
+            .flat_map(|value| {
+                value
+                    .sources
+                    .iter()
+                    .map(|source| RuntimeDerivedTextTransform {
+                        target: value.path.clone(),
+                        source: source.clone(),
+                        expression: source_event_transform_text_expression(
+                            value,
+                            source,
+                            &ir.expressions,
+                        ),
+                    })
             })
             .collect();
         Self { text_transforms }
@@ -18294,6 +18303,40 @@ FUNCTION new_entry(entry) {
             value_delta_count >= 4,
             "A0 fanout should emit value deltas for source and dependents"
         );
+    }
+
+    #[test]
+    fn scalar_match_const_uses_default_arm_for_unmatched_values() {
+        let equations = ScalarEquationPlan {
+            branches: vec![ScalarUpdateBranch {
+                target: "store.active_signal".to_owned(),
+                source: "store.elements.select_data".to_owned(),
+                expression: ScalarUpdateExpression::MatchConst {
+                    input: "store.active_signal".to_owned(),
+                    arms: vec![
+                        UpdateMatchArm {
+                            pattern: "data_bus".to_owned(),
+                            output: "none".to_owned(),
+                        },
+                        UpdateMatchArm {
+                            pattern: "__".to_owned(),
+                            output: "data_bus".to_owned(),
+                        },
+                    ],
+                },
+            }],
+        };
+        let value = equations
+            .eval_text(
+                "store.active_signal",
+                "store.elements.select_data",
+                None,
+                None,
+                None,
+                |path| (path == "store.active_signal").then(|| "temperature".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(value, Some(Cow::Owned("data_bus".to_owned())));
     }
 
     fn cell_address_hash_for_test(address: &str) -> u64 {

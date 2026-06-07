@@ -265,7 +265,7 @@ input_scenarios = [
   "analog-auto-limits",
   "select-cpu-scope",
   "row-select-data-bus",
-  "row-unselect-data-bus",
+  "active-signal-toggle-data-bus",
   "selected-remove-data",
   "selected-restore-data",
   "selected-data-up",

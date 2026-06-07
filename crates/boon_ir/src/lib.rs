@@ -983,7 +983,12 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
                 branch.source
             ));
         }
-        verify_scheduled_update_expression(&branch.expression, &branch.source, &known_symbols)?;
+        verify_scheduled_update_expression(
+            &branch.expression,
+            &branch.target,
+            &branch.source,
+            &known_symbols,
+        )?;
     }
     for operation in &program.list_operations {
         if !list_names.contains(operation.list.as_str()) {
@@ -2929,6 +2934,7 @@ fn projection_field_name(path: &str) -> &str {
 
 fn verify_scheduled_update_expression(
     value: &UpdateExpression,
+    target: &str,
     source: &str,
     known_symbols: &BTreeSet<&str>,
 ) -> Result<(), String> {
@@ -2962,7 +2968,7 @@ fn verify_scheduled_update_expression(
             }
         }
         UpdateExpression::Unknown { summary } => Err(format!(
-            "static schedule contains unsupported update expression `{summary}`"
+            "static schedule contains unsupported update expression for `{target}` from `{source}`: `{summary}`"
         )),
     }
 }
@@ -4917,6 +4923,16 @@ fn update_expression_for_source(
         return expression;
     }
     if let Some(value) = branch.then_simple_update_value() {
+        if let SimpleThenUpdateValue::Path(path) = &value {
+            let canonical = canonical_scalar_update_path(field, target, path);
+            if scope_id_for_path(&row_scopes(program), &canonical).is_none()
+                && let Some(expression) =
+                    match_const_update_expression(field, target, source, &branch)
+                        .filter(|expression| !match_const_input_is_row_scoped(program, expression))
+            {
+                return expression;
+            }
+        }
         return match value {
             SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
             SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
@@ -4959,6 +4975,13 @@ fn update_expression_for_source(
     UpdateExpression::Unknown {
         summary: "source reaches target through derived local field".to_owned(),
     }
+}
+
+fn match_const_input_is_row_scoped(program: &ParsedProgram, expression: &UpdateExpression) -> bool {
+    let UpdateExpression::MatchConst { input, .. } = expression else {
+        return false;
+    };
+    scope_id_for_path(&row_scopes(program), input).is_some()
 }
 
 fn match_const_update_expression(
@@ -6596,6 +6619,48 @@ document:
     }
 
     #[test]
+    fn nested_then_when_lowers_to_match_const_before_path_readback() {
+        let source = r#"
+store: [
+    elements: [
+        select_data: SOURCE
+    ]
+    active_signal:
+        TEXT { none } |> HOLD active_signal {
+            LATEST {
+                elements.select_data.event.press |> THEN {
+                    active_signal |> WHEN {
+                        data_bus => TEXT { none }
+                        __ => TEXT { data_bus }
+                    }
+                }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("nested-then-when.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "store.active_signal"
+                && branch.source == "store.elements.select_data"
+                && branch.expression
+                    == UpdateExpression::MatchConst {
+                        input: "store.active_signal".to_owned(),
+                        arms: vec![
+                            UpdateMatchArm {
+                                pattern: "data_bus".to_owned(),
+                                output: "none".to_owned(),
+                            },
+                            UpdateMatchArm {
+                                pattern: "__".to_owned(),
+                                output: "data_bus".to_owned(),
+                            },
+                        ],
+                    }
+        }));
+    }
+
+    #[test]
     fn state_initial_values_are_lowered_from_ast_exprs() {
         let source = r#"
 -- True False TEXT { comment } todo.title must not become an initializer
@@ -6718,6 +6783,8 @@ FUNCTION new_todo(todo) {
             Some(expected.clone())
         );
         let row_scopes = row_scopes(&parsed);
+        let fields = typed_field_defs(&parsed);
+        let direct_sources = direct_source_refs_by_path(&fields, &parsed);
         let state_cells = parsed
             .state_cells
             .iter()
@@ -6734,7 +6801,7 @@ FUNCTION new_todo(todo) {
                 source_line: cell.line,
             })
             .collect::<Vec<_>>();
-        let unknown_branches = update_branches(&parsed, &state_cells)
+        let unknown_branches = update_branches(&parsed, &state_cells, &fields, &direct_sources)
             .into_iter()
             .filter(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
             .collect::<Vec<_>>();
@@ -6752,7 +6819,6 @@ FUNCTION new_todo(todo) {
                 .map(|source| &source.path)
                 .collect::<Vec<_>>()
         );
-        let fields = typed_field_defs(&parsed);
         let todos_field = fields
             .iter()
             .find(|field| field.path == "store.todos")

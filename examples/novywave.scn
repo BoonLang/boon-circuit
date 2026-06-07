@@ -112,10 +112,10 @@ expected_source_event = { source = "store.elements.select_data", target_text = "
 expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]", "active_signal_key" = "DATA_BUS", "bridge_request_page" = "PAGE_DATA_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_DATA_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "DATA_FIT" }
 
 [[step]]
-id = "row-unselect-data-bus"
+id = "active-signal-toggle-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]" }
 expected_source_event = { source = "store.elements.select_data", target_text = "data_bus[7:0]" }
-expect_root_text = { "active_signal" = "data_bus" }
+expect_root_text = { "active_signal" = "none", "active_signal_label" = "none", "active_signal_key" = "NONE" }
 
 [[step]]
 id = "selected-remove-data"
@@ -291,6 +291,7 @@ id = "remove-marker"
 user_action = { kind = "click", target = "marker control", target_text = "[Del]" }
 expected_source_event = { source = "store.elements.marker_remove", target_text = "[Del]" }
 expect_root_text = { "marker_visibility" = "Hidden", "marker_label" = "No markers", "marker_count_label" = "0 markers", "marker_focus_label" = "no marker selected" }
+expect_semantic_delta_contains = ["ListRemove"]
 
 [[step]]
 id = "create-group"
@@ -350,7 +351,8 @@ expect_root_text = { "fixture_status" = "Empty", "active_file" = "none", "compar
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_descriptor_file" = "counter.vcd", "bridge_request_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_request_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "0x2a" }
+expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "marker_count_label" = "1 marker", "marker_to_add" = "42 ns", "bridge_descriptor_file" = "counter.vcd", "bridge_request_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_request_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_request_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "0x2a" }
+expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
 id = "select-data-before-format"

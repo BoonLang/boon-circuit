@@ -357,7 +357,12 @@ store: [
                 |> List/latest()
             elements.select_clk.event.press |> THEN { TEXT { clk } }
             elements.select_reset.event.press |> THEN { TEXT { reset_n } }
-            elements.select_data.event.press |> THEN { TEXT { data_bus } }
+            elements.select_data.event.press |> THEN {
+                active_signal |> WHEN {
+                    data_bus => TEXT { none }
+                    __ => TEXT { data_bus }
+                }
+            }
             elements.select_temperature.event.press |> THEN { TEXT { temperature } }
             elements.load_fixture.event.press |> THEN { TEXT { clk } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
@@ -702,13 +707,17 @@ store: [
             }
         }
 
+    marker_default_label:
+        TEXT { 42 ns }
+
     marker_to_add:
-        elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
+        LATEST {
+            elements.load_fixture.event.press |> THEN { marker_default_label }
+            elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
+        }
 
     markers:
-        LIST {
-            [label: TEXT { 42 ns }]
-        }
+        LIST {}
         |> List/append(item: marker_to_add |> THEN {
             [label: marker_to_add]
         })
@@ -717,6 +726,7 @@ store: [
             LATEST {
                 marker.marker_elements.remove_marker.event.press |> THEN { True }
                 elements.marker_remove.event.press |> THEN { True }
+                elements.show_empty.event.press |> THEN { True }
             }
         )
 
@@ -862,7 +872,12 @@ store: [
                     |> List/latest()
                 elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
                 elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
-                elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
+                elements.select_data.event.press |> THEN {
+                    active_signal_key |> WHEN {
+                        DATA_BUS => TEXT { none }
+                        __ => TEXT { top.cpu.data_bus[7:0] }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
                 elements.load_fixture.event.press |> THEN { TEXT { top.cpu.clk } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
@@ -918,7 +933,12 @@ store: [
                     |> List/latest()
                 elements.select_clk.event.press |> THEN { TEXT { CLK } }
                 elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
-                elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
+                elements.select_data.event.press |> THEN {
+                    active_signal_key |> WHEN {
+                        DATA_BUS => TEXT { NONE }
+                        __ => TEXT { DATA_BUS }
+                    }
+                }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
                 elements.load_fixture.event.press |> THEN { TEXT { CLK } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }

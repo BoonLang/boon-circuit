@@ -567,6 +567,11 @@ store: [
         |> List/filter_field_equal(field: "signal_id", value: active_signal)
         |> List/join_field(field: "label", separator: ",", empty: "none")
 
+    active_waveform_segment_count:
+        selected_waveform_segments
+        |> List/filter_field_equal(field: "signal_id", value: active_signal)
+        |> List/length()
+
     selected_rows_enabled_value:
         fixture_status == TEXT { Loaded } |> WHEN {
             True => TEXT { loaded }

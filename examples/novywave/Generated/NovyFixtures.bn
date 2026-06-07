@@ -292,7 +292,9 @@ FUNCTION signal_value(signal, format) {
 FUNCTION segments(of) {
     of |> WHEN {
         TEXT { clk } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 28, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 28, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
             [width: 28, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
             [width: 28, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
@@ -306,19 +308,25 @@ FUNCTION segments(of) {
             [width: 28, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
         }
         TEXT { reset_n } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 84, state: Low, color: TEXT { #020817 }, label: TEXT { reset }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 252, state: High, color: TEXT { #3B82F6 }, label: TEXT { released }]
         }
         TEXT { data_bus } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 56, state: Unknown, color: TEXT { #60A5FA }, label: TEXT { XX }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 56, state: High, color: TEXT { #3B82F6 }, label: TEXT { 0x12 }]
             [width: 56, state: Low, color: TEXT { #020817 }, label: TEXT { 0x00 }]
             [width: 84, state: High, color: TEXT { #3B82F6 }, label: TEXT { 0x2a }]
             [width: 84, state: Low, color: TEXT { #020817 }, label: TEXT { 0x08 }]
         }
         TEXT { temperature } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 42, state: AnalogLow, color: TEXT { #1D4ED8 }, label: TEXT { 39 }]
             [width: 42, state: AnalogMid, color: TEXT { #38BDF8 }, label: TEXT { 41 }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 42, state: AnalogHigh, color: TEXT { #93C5FD }, label: TEXT { 43 }]
             [width: 42, state: AnalogMid, color: TEXT { #38BDF8 }, label: TEXT { 42 }]
             [width: 42, state: AnalogLow, color: TEXT { #1D4ED8 }, label: TEXT { 40 }]
@@ -327,26 +335,35 @@ FUNCTION segments(of) {
             [width: 42, state: AnalogMid, color: TEXT { #38BDF8 }, label: TEXT { 43 }]
         }
         TEXT { data_valid } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 96, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 160, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
             [width: 80, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
         }
         TEXT { data_ready } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 48, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 144, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
             [width: 144, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
         }
         TEXT { state } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 72, state: Unknown, color: TEXT { #60A5FA }, label: TEXT { IDLE }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 128, state: High, color: TEXT { #3B82F6 }, label: TEXT { RUN }]
             [width: 136, state: Low, color: TEXT { #020817 }, label: TEXT { WAIT }]
         }
         TEXT { error_count } => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 188, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
+            [width: 2, state: MarkerLine, color: TEXT { #A78BFA }, label: TEXT {}]
             [width: 56, state: High, color: TEXT { #3B82F6 }, label: TEXT { 1 }]
             [width: 92, state: Low, color: TEXT { #020817 }, label: TEXT { 0 }]
         }
         __ => LIST {
+            [width: 2, state: CursorLine, color: TEXT { #FDE68A }, label: TEXT {}]
             [width: 336, state: Unknown, color: TEXT { #60A5FA }, label: TEXT { unknown }]
         }
     }

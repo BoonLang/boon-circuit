@@ -38621,10 +38621,153 @@ mod tests {
             Some(&json!("42.8 C")),
             "NovyWave runtime state should keep temperature current value in Boon data"
         );
+        let selected_ids = |summary: &serde_json::Value| -> Vec<String> {
+            summary
+                .pointer("/store/selected_signals")
+                .and_then(serde_json::Value::as_array)
+                .expect("NovyWave selected_signals should be exposed as Boon data")
+                .iter()
+                .map(|signal| {
+                    signal
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("selected signal should expose stable id")
+                        .to_owned()
+                })
+                .collect()
+        };
+        let remove_data_output = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_remove_data".to_owned(),
+                target_text: Some("[Rm data]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave selected remove data source event should apply");
+        assert!(
+            remove_data_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
+            }),
+            "NovyWave remove-data control should emit selected_signals ListRemove deltas: {:?}",
+            remove_data_output.semantic_deltas
+        );
+        let without_data_summary = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&without_data_summary),
+            vec![
+                "clk",
+                "reset_n",
+                "data_valid",
+                "data_ready",
+                "state",
+                "error_count",
+                "temperature"
+            ],
+            "NovyWave remove-data control should remove data_bus from actual selected_signals"
+        );
+        let restore_data_output = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_restore_data".to_owned(),
+                target_text: Some("[Restore]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave selected restore data source event should apply");
+        assert!(
+            restore_data_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
+            }) && restore_data_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+            }),
+            "NovyWave restore control should rebuild selected_signals through list deltas: {:?}",
+            restore_data_output.semantic_deltas
+        );
+        let restored_summary = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&restored_summary),
+            vec![
+                "clk",
+                "reset_n",
+                "data_bus",
+                "data_valid",
+                "data_ready",
+                "state",
+                "error_count",
+                "temperature"
+            ],
+            "NovyWave restore control should restore default selected_signals order"
+        );
+        let data_up_output = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_data_up".to_owned(),
+                target_text: Some("[Up]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave selected data-up source event should apply");
+        assert!(
+            data_up_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
+            }) && data_up_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+            }),
+            "NovyWave data-up control should mutate selected_signals list state: {:?}",
+            data_up_output.semantic_deltas
+        );
+        let data_first_summary = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&data_first_summary)
+                .first()
+                .map(String::as_str),
+            Some("data_bus"),
+            "NovyWave data-up control should move data_bus to the first selected row"
+        );
+        let data_down_output = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_data_down".to_owned(),
+                target_text: Some("[Down]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave selected data-down source event should apply");
+        assert!(
+            data_down_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListRemove" && delta.list_id.as_deref() == Some("selected_signals")
+            }) && data_down_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("selected_signals")
+            }),
+            "NovyWave data-down control should mutate selected_signals list state: {:?}",
+            data_down_output.semantic_deltas
+        );
+        let data_last_summary = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&data_last_summary).last().map(String::as_str),
+            Some("data_bus"),
+            "NovyWave data-down control should move data_bus to the last selected row"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.signal_search_input".to_owned(),
+                text: Some("data".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave signal search text event should apply");
+        let search_state_summary = runtime.document_state_summary();
+        assert_eq!(
+            search_state_summary.pointer("/store/signal_search_text"),
+            Some(&json!("data")),
+            "NovyWave search input should update Boon-owned search text"
+        );
+        assert_eq!(
+            search_state_summary.pointer("/store/search_results_count"),
+            Some(&json!(4)),
+            "NovyWave search result count should reflect the fixture signal catalog"
+        );
+        assert_eq!(
+            search_state_summary.pointer("/store/search_results_key_summary"),
+            Some(&json!("data_bus,data_valid,data_ready,data_parity")),
+            "NovyWave search result keys should reflect the fixture signal catalog"
+        );
         let (layout_proof, layout) = native_document_layout_proof_with_project_state_embedded(
             &source_path,
             &units,
-            Some(&state_summary),
+            Some(&search_state_summary),
         )
         .expect("NovyWave layout should lower from live document state");
         for selected_value in ["0x2a", "42.8 C"] {
@@ -39136,6 +39279,17 @@ mod tests {
             let comparison_report = json!({
                 "status": "pass",
                 "reference_source": "decoded NovyWave screenshots only; no Rust/Tauri code imported",
+                "source_path": source_path.display().to_string(),
+                "source_units_hash": boon_runtime::source_units_hash(&units),
+                "source_unit_count": units.len(),
+                "source_unit_paths": units
+                    .iter()
+                    .map(|unit| unit.path.clone())
+                    .collect::<Vec<_>>(),
+                "generated_at_unix_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time should be after Unix epoch")
+                    .as_millis(),
                 "reference_images": reference_images,
                 "boon_readbacks": [
                     boon_empty_metadata,
@@ -39476,6 +39630,10 @@ mod tests {
                     "source_path": source_path.display().to_string(),
                     "source_units_hash": boon_runtime::source_units_hash(&units),
                     "source_unit_count": units.len(),
+                    "source_unit_paths": units
+                        .iter()
+                        .map(|unit| unit.path.clone())
+                        .collect::<Vec<_>>(),
                     "generated_at_unix_ms": std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("system time should be after Unix epoch")

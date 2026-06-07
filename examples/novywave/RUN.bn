@@ -488,6 +488,12 @@ store: [
             }
         }
 
+    search_results_count:
+        search_result_count(text: signal_search_text, scope: active_scope)
+
+    search_results_key_summary:
+        search_result_key_summary(text: signal_search_text, scope: active_scope)
+
     focused_control_label:
         TEXT { none } |> HOLD focused_control_label {
             LATEST {
@@ -1568,6 +1574,76 @@ FUNCTION scoped_empty_search_label(scope) {
         False => scope == TEXT { top_analog } |> WHEN {
             True => TEXT { 2 results in top.analog }
             False => TEXT { 8 results in top.cpu }
+        }
+    }
+}
+
+FUNCTION search_result_key_summary(text, scope) {
+    text == TEXT { data } |> WHEN {
+        True => TEXT { data_bus,data_valid,data_ready,data_parity }
+        False => text == TEXT { reset } |> WHEN {
+            True => TEXT { reset_n }
+            False => text == TEXT { temp } |> WHEN {
+                True => TEXT { temperature }
+                False => text == TEXT { clk } |> WHEN {
+                    True => TEXT { clk }
+                    False => text == TEXT { tx } |> WHEN {
+                        True => TEXT { tx_data }
+                        False => text == TEXT { vcore } |> WHEN {
+                            True => TEXT { voltage }
+                            False => text == TEXT { zzz } |> WHEN {
+                                True => TEXT { none }
+                                False => empty_search_result_key_summary(scope: scope)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION search_result_count(text, scope) {
+    text == TEXT { data } |> WHEN {
+        True => 4
+        False => text == TEXT { reset } |> WHEN {
+            True => 1
+            False => text == TEXT { temp } |> WHEN {
+                True => 1
+                False => text == TEXT { clk } |> WHEN {
+                    True => 1
+                    False => text == TEXT { tx } |> WHEN {
+                        True => 1
+                        False => text == TEXT { vcore } |> WHEN {
+                            True => 1
+                            False => text == TEXT { zzz } |> WHEN {
+                                True => 0
+                                False => empty_search_result_count(scope: scope)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION empty_search_result_count(scope) {
+    scope == TEXT { top_uart } |> WHEN {
+        True => 5
+        False => scope == TEXT { top_analog } |> WHEN {
+            True => 2
+            False => 8
+        }
+    }
+}
+
+FUNCTION empty_search_result_key_summary(scope) {
+    scope == TEXT { top_uart } |> WHEN {
+        True => TEXT { tx_data,rx_data,baud_tick,uart_busy,framing_error }
+        False => scope == TEXT { top_analog } |> WHEN {
+            True => TEXT { temperature,voltage }
+            False => TEXT { clk,reset_n,data_bus,data_valid,data_ready,data_parity,state,error_count }
         }
     }
 }

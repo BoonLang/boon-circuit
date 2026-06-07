@@ -10217,11 +10217,17 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .get("pass")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
+    let visual_artifacts = novywave_visual_artifact_evidence();
+    let visual_artifacts_pass = visual_artifacts
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     let pass = initial_layout.is_some()
         && missing_empty_labels.is_empty()
         && missing_loaded_labels.is_empty()
         && missing_runtime_sources.is_empty()
-        && material_pass;
+        && material_pass
+        && visual_artifacts_pass;
     json!({
         "status": if pass { "pass" } else { "fail" },
         "initial_layout_artifact": initial_layout_path,
@@ -10244,8 +10250,140 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "runtime_sources": runtime_sources.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>(),
         "missing_runtime_sources": missing_runtime_sources,
         "material_metrics": material_metrics,
+        "visual_artifacts": visual_artifacts,
         "contract": "NovyWave native preview must prove empty state, loaded waveform UI labels, workflow actions, and physical material/glow/glass style regions"
     })
+}
+
+fn novywave_visual_artifact_evidence() -> serde_json::Value {
+    let comparison_path =
+        Path::new("target/artifacts/native-gpu/tests/novywave-reference-comparison.json");
+    let metrics_path =
+        Path::new("target/artifacts/native-gpu/tests/novywave-visual-contract-metrics.json");
+    let comparison = read_json(comparison_path).ok();
+    let metrics = read_json(metrics_path).ok();
+    let artifact_source_path = comparison
+        .as_ref()
+        .and_then(|artifact| artifact.get("source_path"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            metrics
+                .as_ref()
+                .and_then(|artifact| artifact.get("source_path"))
+                .and_then(serde_json::Value::as_str)
+        });
+    let current_source_path = artifact_source_path.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../boon_native_playground/../../examples/novywave/RUN.bn")
+    });
+    let comparison_source_unit_paths = json_string_array(
+        comparison
+            .as_ref()
+            .and_then(|artifact| artifact.get("source_unit_paths")),
+    );
+    let current_source_units_hash =
+        source_units_hash_for_recorded_paths(&comparison_source_unit_paths).or_else(|| {
+            boon_runtime::source_units_for_path(&current_source_path)
+                .ok()
+                .map(|units| boon_runtime::source_units_hash(&units))
+        });
+    let comparison_status = comparison
+        .as_ref()
+        .and_then(|artifact| artifact.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let metrics_status = metrics
+        .as_ref()
+        .and_then(|artifact| artifact.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let comparison_source_units_hash = comparison
+        .as_ref()
+        .and_then(|artifact| artifact.get("source_units_hash"))
+        .and_then(serde_json::Value::as_str);
+    let metrics_source_units_hash = metrics
+        .as_ref()
+        .and_then(|artifact| artifact.get("source_units_hash"))
+        .and_then(serde_json::Value::as_str);
+    let readback_labels = comparison
+        .as_ref()
+        .and_then(|artifact| artifact.get("boon_readbacks"))
+        .and_then(serde_json::Value::as_array)
+        .map(|readbacks| {
+            readbacks
+                .iter()
+                .filter_map(|readback| readback.get("label").and_then(serde_json::Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let required_readback_labels = ["boon_empty", "boon_empty_light", "boon_dark", "boon_light"];
+    let missing_readback_labels = required_readback_labels
+        .iter()
+        .filter(|label| !readback_labels.contains(**label))
+        .map(|label| json!(label))
+        .collect::<Vec<_>>();
+    let metrics_count = metrics
+        .as_ref()
+        .and_then(|artifact| artifact.get("metrics"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let hashes_match = current_source_units_hash.as_deref().is_some()
+        && comparison_source_units_hash == current_source_units_hash.as_deref()
+        && metrics_source_units_hash == current_source_units_hash.as_deref();
+    let pass = comparison_status == Some("pass")
+        && metrics_status == Some("pass")
+        && hashes_match
+        && missing_readback_labels.is_empty()
+        && metrics_count >= 8;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "comparison_path": comparison_path,
+        "metrics_path": metrics_path,
+        "comparison_sha256": boon_runtime::sha256_file(comparison_path).ok(),
+        "metrics_sha256": boon_runtime::sha256_file(metrics_path).ok(),
+        "comparison_status": comparison_status.unwrap_or("missing"),
+        "metrics_status": metrics_status.unwrap_or("missing"),
+        "current_source_path": current_source_path,
+        "comparison_source_unit_paths": comparison_source_unit_paths,
+        "current_source_units_hash": current_source_units_hash,
+        "comparison_source_units_hash": comparison_source_units_hash,
+        "metrics_source_units_hash": metrics_source_units_hash,
+        "source_units_hashes_match": hashes_match,
+        "required_readback_labels": required_readback_labels,
+        "missing_readback_labels": missing_readback_labels,
+        "metrics_count": metrics_count,
+        "contract": "NovyWave E2E must link fresh app-owned WGPU visual readbacks for empty, loaded dark, loaded light, reference comparison, and material metrics"
+    })
+}
+
+fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn source_units_hash_for_recorded_paths(paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    if let [path] = paths {
+        let source = fs::read_to_string(path).ok()?;
+        return Some(boon_runtime::sha256_bytes(source.as_bytes()));
+    }
+    let mut canonical = String::new();
+    for path in paths {
+        let source = fs::read_to_string(path).ok()?;
+        canonical.push_str(path);
+        canonical.push('\0');
+        canonical.push_str(&boon_runtime::sha256_bytes(source.as_bytes()));
+        canonical.push('\0');
+    }
+    Some(boon_runtime::sha256_bytes(canonical.as_bytes()))
 }
 
 fn missing_layout_labels(texts: &[String], required: &[&str]) -> Vec<serde_json::Value> {
@@ -14794,20 +14932,72 @@ fn verify_native_example_tabs(args: &[String]) -> Result<(), Box<dyn std::error:
                 )
             }),
         );
-        let tab_real_window = report
+        let dev_probe = report
             .as_ref()
-            .and_then(|report| report.pointer("/dev_shell_interaction_probe/evidence_tier"))
+            .and_then(|report| report.get("dev_shell_interaction_probe"));
+        let tab_switch = dev_probe.and_then(|probe| probe.get("tab_switch"));
+        let tab_real_window = dev_probe
+            .and_then(|probe| probe.get("evidence_tier"))
             .and_then(serde_json::Value::as_str)
-            == Some("real-window");
+            == Some(boon_driver::TIER_REAL_WINDOW)
+            && dev_probe
+                .and_then(|probe| probe.get("visible_window_input"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        let tab_app_owned_route = tab_switch
+            .and_then(|tab| tab.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && tab_switch
+                .and_then(|tab| tab.get("direct_dispatch_without_hit_test"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && tab_switch
+                .and_then(|tab| tab.pointer("/host_synthetic_activation/source_binding_resolved"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && tab_switch
+                .and_then(|tab| tab.pointer("/host_synthetic_activation/hit_test_performed"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && tab_switch
+                .and_then(|tab| tab.pointer("/host_synthetic_activation/route_contract"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|contract| {
+                    contract.contains("HostInputEvent")
+                        && contract.contains("layout hit region")
+                        && contract.contains("SourceBinding")
+                        && contract.contains("DevWindowShell")
+                })
+            && dev_probe
+                .and_then(|probe| probe.pointer("/visible_route_proof/status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+            && dev_probe
+                .and_then(|probe| probe.get("app_owned_framebuffer"))
+                .is_some()
+            && dev_probe
+                .and_then(|probe| probe.get("real_os_input_claimed"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true);
+        let tab_input_proven = tab_real_window || tab_app_owned_route;
+        let observed_tier = dev_probe
+            .as_ref()
+            .and_then(|probe| probe.get("evidence_tier"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-example-tabs:{}:tab-switch-real-window", entry.id),
-            tab_real_window,
-            format!("preview_report={}", report_path.display()),
-            (!tab_real_window).then(|| {
+            format!("native-example-tabs:{}:tab-switch-app-owned-route", entry.id),
+            tab_input_proven,
+            format!(
+                "preview_report={}, observed_tier={observed_tier}, real_window={tab_real_window}, app_owned_route={tab_app_owned_route}",
+                report_path.display()
+            ),
+            (!tab_input_proven).then(|| {
                 format!(
-                    "example `{}` tab switching is not proven at the required real-window tier",
+                    "example `{}` tab switching is not proven through app-owned hit-tested host-event or real-window evidence",
                     entry.id
                 )
             }),

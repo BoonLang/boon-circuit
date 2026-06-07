@@ -55,13 +55,13 @@ expect_root_text = { "focused_control_label" = "signal search", "focused_control
 id = "type-search-uart-tx"
 user_action = { kind = "type_text", target = "signal search", text = "tx" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "tx" }
-expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "tx", "search_result_label" = "1 result: tx_data[7:0]" }
+expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "tx", "search_result_label" = "1 result: tx_data[7:0]", "search_results_count" = "1", "search_results_key_summary" = "tx_data" }
 
 [[step]]
 id = "clear-search-uart"
 user_action = { kind = "type_text", target = "signal search", text = "" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "" }
-expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results in top.uart" }
+expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results in top.uart", "search_results_count" = "5", "search_results_key_summary" = "tx_data,rx_data,baud_tick,uart_busy,framing_error" }
 
 [[step]]
 id = "blur-signal-search"
@@ -145,49 +145,49 @@ expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count"
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity", "search_results_count" = "4", "search_results_key_summary" = "data_bus,data_valid,data_ready,data_parity" }
 
 [[step]]
 id = "search-reset"
 user_action = { kind = "type_text", target = "signal search", text = "reset" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "reset" }
-expect_root_text = { "signal_search_text" = "reset", "search_result_label" = "1 result: reset_n" }
+expect_root_text = { "signal_search_text" = "reset", "search_result_label" = "1 result: reset_n", "search_results_count" = "1", "search_results_key_summary" = "reset_n" }
 
 [[step]]
 id = "search-temperature"
 user_action = { kind = "type_text", target = "signal search", text = "temp" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "temp" }
-expect_root_text = { "signal_search_text" = "temp", "search_result_label" = "1 result: temperature" }
+expect_root_text = { "signal_search_text" = "temp", "search_result_label" = "1 result: temperature", "search_results_count" = "1", "search_results_key_summary" = "temperature" }
 
 [[step]]
 id = "search-clock"
 user_action = { kind = "type_text", target = "signal search", text = "clk" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "clk" }
-expect_root_text = { "signal_search_text" = "clk", "search_result_label" = "1 result: clk" }
+expect_root_text = { "signal_search_text" = "clk", "search_result_label" = "1 result: clk", "search_results_count" = "1", "search_results_key_summary" = "clk" }
 
 [[step]]
 id = "search-empty-result"
 user_action = { kind = "type_text", target = "signal search", text = "zzz" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "zzz" }
-expect_root_text = { "signal_search_text" = "zzz", "search_result_label" = "0 results: zzz" }
+expect_root_text = { "signal_search_text" = "zzz", "search_result_label" = "0 results: zzz", "search_results_count" = "0", "search_results_key_summary" = "none" }
 
 [[step]]
 id = "search-data-again"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity", "search_results_count" = "4", "search_results_key_summary" = "data_bus,data_valid,data_ready,data_parity" }
 
 [[step]]
 id = "search-vcore"
 user_action = { kind = "type_text", target = "signal search", text = "vcore" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "vcore" }
-expect_root_text = { "signal_search_text" = "vcore", "search_scope_mode" = "Global", "search_result_label" = "1 result: vcore" }
+expect_root_text = { "signal_search_text" = "vcore", "search_scope_mode" = "Global", "search_result_label" = "1 result: vcore", "search_results_count" = "1", "search_results_key_summary" = "voltage" }
 
 [[step]]
 id = "clear-search-cpu-summary"
 user_action = { kind = "type_text", target = "signal search", text = "" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "" }
-expect_root_text = { "signal_search_text" = "", "search_result_label" = "8 results in top.cpu" }
+expect_root_text = { "signal_search_text" = "", "search_result_label" = "8 results in top.cpu", "search_results_count" = "8", "search_results_key_summary" = "clk,reset_n,data_bus,data_valid,data_ready,data_parity,state,error_count" }
 
 [[step]]
 id = "select-data-bus"

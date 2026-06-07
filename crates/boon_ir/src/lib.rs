@@ -4109,7 +4109,45 @@ fn text_literal_value(tokens: &[String]) -> Option<String> {
         return None;
     }
     let close = tokens.iter().rposition(|token| token == "}")?;
-    Some(tokens[2..close].join(" "))
+    Some(join_text_literal_tokens(&tokens[2..close]))
+}
+
+fn join_text_literal_tokens(tokens: &[String]) -> String {
+    let mut output = String::new();
+    let mut previous = "";
+    for token in tokens {
+        if output.is_empty() {
+            output.push_str(token);
+        } else if text_literal_needs_space(previous, token) {
+            output.push(' ');
+            output.push_str(token);
+        } else {
+            output.push_str(token);
+        }
+        previous = token;
+    }
+    output
+}
+
+fn text_literal_needs_space(previous: &str, current: &str) -> bool {
+    if matches!(
+        current,
+        "[" | "(" | "{" | "]" | ")" | "}" | "," | "." | ":" | ";" | "%"
+    ) {
+        return false;
+    }
+    if matches!(previous, "[" | "(" | "{" | "." | ":" | "#" | "/" | "%") {
+        return false;
+    }
+    if previous.chars().all(|ch| ch.is_ascii_digit())
+        && current
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, 'x' | 'X'))
+    {
+        return false;
+    }
+    true
 }
 
 fn extract_i64_arg_from_items(items: &[AstItem], name: &str) -> Option<i64> {

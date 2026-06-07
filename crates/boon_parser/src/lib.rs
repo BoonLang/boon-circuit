@@ -1729,15 +1729,44 @@ fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Opt
     {
         return None;
     }
-    if let Some(text) = text_literal_source_value(item, source) {
+    if let Some(text) = text_literal_source_value(tokens, item, source) {
         return Some(text);
     }
+    if tokens == ["TEXT", "{"] {
+        return text_literal_source_value_from_start(item.start, source);
+    }
     let close = tokens.iter().rposition(|token| token == "}")?;
-    Some(tokens[2..close].join(" "))
+    Some(join_text_literal_tokens(&tokens[2..close]))
 }
 
-fn text_literal_source_value(item: &ParserItem, source: &str) -> Option<String> {
-    let slice = source.get(item.start..)?;
+fn text_literal_source_value(tokens: &[String], item: &ParserItem, source: &str) -> Option<String> {
+    let (start, end) = span_for_tokens(tokens, item)?;
+    let slice = source.get(start..end)?;
+    let text_start = slice.find("TEXT")?;
+    let open = text_start + slice[text_start..].find('{')?;
+    let content_start = open + 1;
+    let mut depth = 1i32;
+    for (offset, ch) in slice[content_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(
+                        slice[content_start..content_start + offset]
+                            .trim()
+                            .to_owned(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn text_literal_source_value_from_start(start: usize, source: &str) -> Option<String> {
+    let slice = source.get(start..)?;
     let text_start = slice.find("TEXT")?;
     let open = text_start + slice[text_start..].find('{')?;
     let content_start = open + 1;
@@ -1784,6 +1813,44 @@ fn unescape_string_literal(value: &str) -> String {
         }
     }
     output
+}
+
+fn join_text_literal_tokens(tokens: &[String]) -> String {
+    let mut output = String::new();
+    let mut previous = "";
+    for token in tokens {
+        if output.is_empty() {
+            output.push_str(token);
+        } else if text_literal_needs_space(previous, token) {
+            output.push(' ');
+            output.push_str(token);
+        } else {
+            output.push_str(token);
+        }
+        previous = token;
+    }
+    output
+}
+
+fn text_literal_needs_space(previous: &str, current: &str) -> bool {
+    if matches!(
+        current,
+        "[" | "(" | "{" | "]" | ")" | "}" | "," | "." | ":" | ";" | "%"
+    ) {
+        return false;
+    }
+    if matches!(previous, "[" | "(" | "{" | "." | ":" | "#" | "/" | "%") {
+        return false;
+    }
+    if previous.chars().all(|ch| ch.is_ascii_digit())
+        && current
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, 'x' | 'X'))
+    {
+        return false;
+    }
+    true
 }
 
 fn value_starts_uppercase_identifier(value: &str) -> bool {
@@ -3708,6 +3775,36 @@ document: Document/new(
         assert!(!program.ast.expressions.iter().any(|expr| {
             matches!(&expr.kind, AstExprKind::Unknown(tokens) if tokens.iter().any(|token| token.contains("fill")))
         }));
+    }
+
+    #[test]
+    fn text_literals_preserve_compact_technical_punctuation() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+value:
+    TEXT { Binary } |> WHEN {
+        TEXT { Binary } => TEXT { 0x2a }
+        __ => TEXT { 42.8 C }
+    }
+name: TEXT { data_bus[7:0] }
+document: Document/new(root: Element/label(element: [], style: [], label: name))
+"#;
+        let program = parse_source("examples/technical-text.bn", source).unwrap();
+        let texts: Vec<_> = program
+            .ast
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::TextLiteral(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"0x2a"), "{texts:#?}");
+        assert!(texts.contains(&"42.8 C"), "{texts:#?}");
+        assert!(texts.contains(&"data_bus[7:0]"), "{texts:#?}");
     }
 
     #[test]

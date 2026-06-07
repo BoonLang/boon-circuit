@@ -1143,12 +1143,18 @@ FUNCTION waveform_rows_expanded() {
         gap: 2
         style: [width: Fill, height: Fill, paint: False]
         items:
-            PASSED.store.selected_signals |> List/map(row, new: selected_waveform_row(row: row))
+            PASSED.store.selected_signal_rows |> List/map(row, new: selected_waveform_row(row: row))
     )
 }
 
 FUNCTION selected_waveform_row(row) {
-    waveform_row(signal: row)
+    row.id |> WHEN {
+        TEXT { clk } => waveform_row_clk()
+        TEXT { reset_n } => waveform_row_reset()
+        TEXT { data_bus } => waveform_row_data()
+        TEXT { temperature } => waveform_row_temperature()
+        __ => waveform_row(signal: row)
+    }
 }
 
 FUNCTION waveform_row_clk() {
@@ -1426,7 +1432,7 @@ FUNCTION fixed_value_data() {
                     Light => TEXT { #172033 }
                 }
             ]
-            text: NovyFixtures/selected_data_value(format: PASSED.store.value_format)
+            text: PASSED.store.data_bus_rendered_value
         )
     )
 }
@@ -1461,7 +1467,7 @@ FUNCTION fixed_value_temperature() {
                     Light => TEXT { #172033 }
                 }
             ]
-            text: NovyFixtures/selected_temperature_value(format: PASSED.store.value_format)
+            text: PASSED.store.temperature_rendered_value
         )
     )
 }

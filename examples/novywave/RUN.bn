@@ -1096,6 +1096,19 @@ store: [
             elements.load_fixture.event.press |> THEN { TEXT { 0x2a } }
         }
 
+    temperature_rendered_value:
+        LATEST {
+            TEXT { 42.8 C }
+            elements.format_cycle.event.press |> THEN { TEXT { analog } }
+            elements.format_grouped.event.press |> THEN { TEXT { analog } }
+            elements.format_octal.event.press |> THEN { TEXT { analog } }
+            elements.format_signed.event.press |> THEN { TEXT { 43 } }
+            elements.format_unsigned.event.press |> THEN { TEXT { 43 } }
+            elements.format_ascii.event.press |> THEN { TEXT { temp } }
+            elements.format_hex.event.press |> THEN { TEXT { 42.8 C } }
+            elements.load_fixture.event.press |> THEN { TEXT { 42.8 C } }
+        }
+
     row_height:
         LATEST {
             36

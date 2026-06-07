@@ -17180,10 +17180,7 @@ FUNCTION new_signal(signal) {
         assert_eq!(searched["store"]["search_results_count"], 1);
         assert_eq!(searched["store"]["search_results_key_summary"], "tx_data");
         assert_eq!(searched["store"]["search_results"][0]["key"], "tx_data");
-        assert_eq!(
-            searched["store"]["search_results"][0]["scope"],
-            "top . uart"
-        );
+        assert_eq!(searched["store"]["search_results"][0]["scope"], "top.uart");
 
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -17200,7 +17197,7 @@ FUNCTION new_signal(signal) {
         );
         assert_eq!(
             family_preferred["store"]["search_results"][0]["name"],
-            "data_bus [ 7 : 0 ]"
+            "data_bus[7:0]"
         );
     }
 
@@ -17288,7 +17285,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Selected r
             (
                 "store.elements.load_fixture",
                 4,
-                "clk, reset_n, data_bus [ 7 : 0 ], data_valid",
+                "clk, reset_n, data_bus[7:0], data_valid",
             ),
             (
                 "store.elements.selected_remove_data",
@@ -17298,17 +17295,17 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Selected r
             (
                 "store.elements.selected_restore_data",
                 4,
-                "clk, reset_n, data_bus [ 7 : 0 ], data_valid",
+                "clk, reset_n, data_bus[7:0], data_valid",
             ),
             (
                 "store.elements.selected_data_up",
                 4,
-                "data_bus [ 7 : 0 ], clk, reset_n, data_valid",
+                "data_bus[7:0], clk, reset_n, data_valid",
             ),
             (
                 "store.elements.selected_data_down",
                 4,
-                "clk, reset_n, data_valid, data_bus [ 7 : 0 ]",
+                "clk, reset_n, data_valid, data_bus[7:0]",
             ),
             ("store.elements.show_empty", 0, "none"),
         ] {

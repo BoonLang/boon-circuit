@@ -1,6 +1,13 @@
 -- NovyWave - Boon-first physical waveform viewer playground example.
 
 store: [
+    visible_editor_reference: NovyReference/visual_basis_label()
+    visible_editor_pipe_probe:
+        LATEST {
+            TEXT { Visible editor syntax probe }
+            elements.load_fixture.event.press |> THEN { TEXT { Fixture syntax path exercised } }
+        }
+
     elements: [
         load_fixture: SOURCE
         show_empty: SOURCE

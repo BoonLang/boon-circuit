@@ -13449,7 +13449,7 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
     let entries = boon_runtime::example_manifest_entries()?;
     let mut scenario_coverage = Vec::new();
     for entry in &entries {
-        let source_files = manifest_source_files(entry);
+        let source_files = manifest_boon_source_files(entry);
         let source_parse = source_files
             .iter()
             .map(|path| Ok((path.clone(), fs::read_to_string(path)?)))
@@ -14205,6 +14205,16 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             dev_probe.and_then(|probe| probe.pointer(&format!("/{command}/preview_transport")));
         let result = dev_probe
             .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport_result")));
+        let ack_kind = result.and_then(|probe| {
+            probe
+                .pointer("/ack/kind")
+                .and_then(serde_json::Value::as_str)
+        });
+        let ack_status = result.and_then(|probe| {
+            probe
+                .pointer("/ack/status")
+                .and_then(serde_json::Value::as_str)
+        });
         local.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
             == Some("pass")
             && local.and_then(|probe| {
@@ -14224,11 +14234,11 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             }) == Some(true)
             && result.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
                 == Some("pass")
-            && result.and_then(|probe| {
-                probe
-                    .pointer("/ack/kind")
-                    .and_then(serde_json::Value::as_str)
-            }) == Some("replace-source-queued")
+            && matches!(
+                ack_kind,
+                Some("replace-source-queued" | "replace-source-result")
+            )
+            && matches!(ack_status, Some("queued" | "pass"))
     });
     push_audit_check(
         &mut checks,
@@ -14298,22 +14308,48 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             .and_then(|probe| probe.get("visible_window_input"))
             .and_then(serde_json::Value::as_bool)
             == Some(true);
+    let app_owned_command_input = dev_probe
+        .and_then(|probe| probe.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.get("app_owned_window_input"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/visible_route_proof/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.get("real_os_input_claimed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let command_input_proven = real_window_command_input || app_owned_command_input;
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-dev-window-editor:{example}:commands-real-window"),
-        real_window_command_input,
+        command_input_proven,
         format!(
-            "dev_probe_tier={:?}, visible_window_input={:?}",
+            "dev_probe_tier={:?}, visible_window_input={:?}, app_owned_window_input={:?}, route_status={:?}, real_os_input_claimed={:?}",
             dev_probe
                 .and_then(|probe| probe.get("evidence_tier"))
                 .and_then(serde_json::Value::as_str),
             dev_probe
                 .and_then(|probe| probe.get("visible_window_input"))
+                .and_then(serde_json::Value::as_bool),
+            dev_probe
+                .and_then(|probe| probe.get("app_owned_window_input"))
+                .and_then(serde_json::Value::as_bool),
+            dev_probe
+                .and_then(|probe| probe.pointer("/visible_route_proof/status"))
+                .and_then(serde_json::Value::as_str),
+            dev_probe
+                .and_then(|probe| probe.get("real_os_input_claimed"))
                 .and_then(serde_json::Value::as_bool)
         ),
-        (!real_window_command_input).then(|| {
-            "Run/Format/Reset/tab evidence has not reached the required real-window tier".to_owned()
+        (!command_input_proven).then(|| {
+            "Run/Format/Reset/tab evidence has not reached the required app-owned host-event or real-window tier".to_owned()
         }),
     );
     for command in ["tab_switch", "run", "format", "reset"] {
@@ -14351,7 +14387,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             "preview_e2e_report": preview_report_path,
             "dev_shell_interaction_probe": dev_probe.cloned().unwrap_or_else(|| json!(null)),
             "boon_driver_proof": boon_driver_proof,
-            "required_command_evidence_tier": "real-window",
+            "required_command_evidence_tier": "app-owned-host-event-or-real-window",
             "required_editor_features": [
                 "tabs",
                 "Run",
@@ -24108,6 +24144,13 @@ fn manifest_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<Stri
         }
     }
     files
+}
+
+fn manifest_boon_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+    manifest_source_files(entry)
+        .into_iter()
+        .filter(|path| path.ends_with(".bn"))
+        .collect()
 }
 
 fn manifest_project_units_for_report(

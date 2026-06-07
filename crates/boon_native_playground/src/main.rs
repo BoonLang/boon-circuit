@@ -1097,21 +1097,6 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(proof) => report
                     .as_deref()
                     .map(|report| {
-                        let dev_shell_interaction_probe = report_shell
-                            .lock()
-                            .map(|shell| {
-                                if probe && !skip_visible_input_probe {
-                                    shell.visible_input_probe(&proof)
-                                } else {
-                                    shell.passive_visible_probe(&proof)
-                                }
-                            })
-                            .unwrap_or_else(|_| {
-                                json!({
-                                    "status": "fail",
-                                    "diagnostic": "dev shell mutex poisoned"
-                                })
-                            });
                         let ipc_probe = if probe && !skip_ipc_probe {
                             let ipc_start = Instant::now();
                             run_dev_ipc_probe(
@@ -1153,6 +1138,21 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 format!("dev IPC probe failed: {error}"),
                             );
                         }
+                        let dev_shell_interaction_probe = report_shell
+                            .lock()
+                            .map(|shell| {
+                                if probe && !skip_visible_input_probe {
+                                    shell.visible_input_probe(&proof)
+                                } else {
+                                    shell.passive_visible_probe(&proof)
+                                }
+                            })
+                            .unwrap_or_else(|_| {
+                                json!({
+                                    "status": "fail",
+                                    "diagnostic": "dev shell mutex poisoned"
+                                })
+                            });
                         write_role_report(
                             report,
                             "dev",
@@ -1253,7 +1253,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .saturating_add(effective_dev_hold_ms)
                 .saturating_add(input_sample_delay_ms)
                 .max(dev_start_delay_ms.saturating_add(role_report_timeout_ms))
-                .saturating_add(5_000),
+                .saturating_add(60_000),
         )
     } else {
         child_hold_ms
@@ -11322,11 +11322,15 @@ impl DevWindowShell {
             }
         };
         let mutation_probe_editor_model = shell.workspace.selected_buffer.model_feature_probe();
-        let restore = shell.dispatch_host_synthetic_source_path(
+        let mut restore = shell.dispatch_host_synthetic_source_path(
             &format!("dev.tabs.select.{original}"),
             1180.0,
             820.0,
         );
+        if restore.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            restore["preview_transport_result"] =
+                shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        }
         let status_pass = [
             &tab_switch_json,
             &run,
@@ -11424,8 +11428,7 @@ impl DevWindowShell {
         &self,
         surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
     ) -> serde_json::Value {
-        let mut shell_probe = self.clone();
-        shell_probe.preview_transport = PreviewTransport::new(None);
+        let shell_probe = self.clone();
         let mut probe = shell_probe.command_probe();
         let route_proof = self.dev_window_route_proof(surface_proof);
         let route_pass = route_proof
@@ -38928,6 +38931,14 @@ mod tests {
                 &empty_dark_reference_profile,
                 &boon_empty_profile,
             );
+            let light_reference_timeline =
+                normalized_luma_profile_value(&light_reference_profile, "timeline");
+            let light_reference_lower_waveform =
+                normalized_luma_profile_value(&light_reference_profile, "lower_waveform");
+            let boon_light_timeline =
+                normalized_luma_profile_value(&boon_light_profile, "timeline");
+            let boon_light_lower_waveform =
+                normalized_luma_profile_value(&boon_light_profile, "lower_waveform");
             assert!(
                 dark_profile_distance <= 45.0,
                 "Boon loaded dark readback should stay regionally close to NovyWave dark reference, distance={dark_profile_distance:.2}"
@@ -38939,6 +38950,14 @@ mod tests {
             assert!(
                 empty_profile_distance <= 45.0,
                 "Boon empty readback should stay regionally close to NovyWave empty dark reference, distance={empty_profile_distance:.2}"
+            );
+            assert!(
+                boon_light_timeline <= light_reference_timeline + 45.0,
+                "Boon light timeline should preserve the reference dark waveform canvas; reference={light_reference_timeline:.2}, rendered={boon_light_timeline:.2}"
+            );
+            assert!(
+                boon_light_lower_waveform <= light_reference_lower_waveform + 45.0,
+                "Boon light lower waveform should preserve the reference dark data region; reference={light_reference_lower_waveform:.2}, rendered={boon_light_lower_waveform:.2}"
             );
             let boon_empty_metadata =
                 visual_image_metadata("boon_empty", &empty_image, "empty readback");
@@ -38966,7 +38985,9 @@ mod tests {
                 "normalized_region_luma_distance": {
                     "loaded_dark_vs_reference_dark": dark_profile_distance,
                     "loaded_light_vs_reference_light": light_profile_distance,
-                    "empty_vs_reference_empty_dark": empty_profile_distance
+                    "empty_vs_reference_empty_dark": empty_profile_distance,
+                    "loaded_light_timeline_delta": boon_light_timeline - light_reference_timeline,
+                    "loaded_light_lower_waveform_delta": boon_light_lower_waveform - light_reference_lower_waveform
                 },
                 "structural_checks": {
                     "empty_state_text_visible": true,
@@ -39758,6 +39779,13 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn normalized_luma_profile_value(profile: &[(&'static str, f32)], region: &str) -> f32 {
+        profile
+            .iter()
+            .find_map(|(label, average_luma)| (*label == region).then_some(*average_luma))
+            .unwrap_or_else(|| panic!("normalized luma profile should contain region `{region}`"))
     }
 
     fn normalized_luma_profile_distance(

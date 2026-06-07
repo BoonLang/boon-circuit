@@ -82,6 +82,29 @@ FUNCTION material(mode, of) {
             }
         ]
 
+        WaveformGlass => [
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #020817e6 }
+                Light => TEXT { #101a2be6 }
+            }
+            refraction: 1.5
+            gloss: 0.07
+            transparency: PASSED.mode |> WHEN {
+                Dark => 0.14
+                Light => 0.10
+            }
+            frosted_blur: 10
+            frosted_saturate: 1.16
+            glass_highlight: PASSED.mode |> WHEN {
+                Dark => 0.40
+                Light => 0.24
+            }
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Dark => TEXT { #dce8ff38 }
+                Light => TEXT { #c8e6ff36 }
+            }
+        ]
+
         TraceHigh => [
             color: PASSED.mode |> WHEN {
                 Dark => TEXT { #3b82f6 }

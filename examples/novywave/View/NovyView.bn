@@ -1509,7 +1509,7 @@ FUNCTION fixed_wave_area(signal_id) {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]
@@ -1537,7 +1537,7 @@ FUNCTION fixed_wave_area_clk() {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]
@@ -1580,7 +1580,7 @@ FUNCTION fixed_wave_area_reset() {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]
@@ -1611,7 +1611,7 @@ FUNCTION fixed_wave_area_data() {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]
@@ -1680,7 +1680,7 @@ FUNCTION fixed_wave_area_temperature() {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]
@@ -2211,7 +2211,7 @@ FUNCTION wave_area(signal) {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
         ]

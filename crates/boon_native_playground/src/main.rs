@@ -38208,6 +38208,48 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_novywave_builds_runtime_state_before_preview_commit() {
+        let novywave_path = repo_path("examples/novywave/RUN.bn");
+        let novywave_units = boon_runtime::source_units_for_path(&novywave_path).unwrap();
+        assert_eq!(novywave_units.len(), 9);
+        assert!(novywave_units.iter().any(|unit| {
+            unit.path.ends_with("examples/novywave/View/NovyView.bn")
+                && unit.source.contains("FUNCTION main_scene")
+        }));
+
+        let payload = SourceProjectPayload::from_units(
+            18,
+            5,
+            "opaque-novywave-source-id",
+            &novywave_path.display().to_string(),
+            novywave_units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone()))
+                .collect(),
+        )
+        .unwrap();
+        let result = preview_build_source_project(payload, || true);
+
+        eprintln!("NovyWave replace-source build timings: {}", result.timings);
+        assert_eq!(result.status, "pass", "timings={}", result.timings);
+        assert_eq!(result.runtime_summary["status"], "pass");
+        assert_eq!(result.runtime_summary["owns_live_runtime"], true);
+        assert!(
+            result
+                .runtime_summary
+                .get("state_summary_top_level_keys")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("store"))),
+            "NovyWave preview switch must build the real runtime store before committing"
+        );
+        assert!(result.live_runtime.is_some());
+        assert_eq!(result.layout_proof["status"], "pass");
+        assert_eq!(result.layout_proof["runtime_document_state_used"], true);
+        assert_eq!(result.timings["runtime_deferred"], false);
+        assert_eq!(result.timings["source_unit_count"], 9);
+    }
+
+    #[test]
     fn source_project_payload_rejects_scenario_fields_and_legacy_identity_is_opaque() {
         let source = std::fs::read_to_string(repo_path("examples/counter.bn")).unwrap();
         let payload = SourceProjectPayload::single_unit(
@@ -38709,7 +38751,7 @@ mod tests {
                     ),
                 ),
             ];
-            let reference_images = reference_paths
+            let decoded_references = reference_paths
                 .iter()
                 .map(|(label, path)| {
                     let image = image::open(path)
@@ -38720,14 +38762,44 @@ mod tests {
                             )
                         })
                         .to_rgba8();
-                    reference_image_metadata(label, path, &image)
+                    (*label, path.clone(), image)
                 })
+                .collect::<Vec<_>>();
+            let reference_images = decoded_references
+                .iter()
+                .map(|(label, path, image)| reference_image_metadata(label, path, image))
                 .collect::<Vec<_>>();
             let reference_dark_luma = reference_images[0]["average_luma"].as_f64().unwrap_or(0.0);
             let reference_light_luma = reference_images[1]["average_luma"].as_f64().unwrap_or(0.0);
             assert!(
                 reference_dark_luma + 15.0 < reference_light_luma,
                 "NovyWave dark/light references should have measurable luma separation"
+            );
+            let dark_reference_profile = normalized_luma_profile(&decoded_references[0].2);
+            let light_reference_profile = normalized_luma_profile(&decoded_references[1].2);
+            let empty_dark_reference_profile = normalized_luma_profile(&decoded_references[2].2);
+            let boon_empty_profile = normalized_luma_profile(&empty_image);
+            let boon_dark_profile = normalized_luma_profile(&dark_image);
+            let boon_light_profile = normalized_luma_profile(&light_image);
+            let dark_profile_distance =
+                normalized_luma_profile_distance(&dark_reference_profile, &boon_dark_profile);
+            let light_profile_distance =
+                normalized_luma_profile_distance(&light_reference_profile, &boon_light_profile);
+            let empty_profile_distance = normalized_luma_profile_distance(
+                &empty_dark_reference_profile,
+                &boon_empty_profile,
+            );
+            assert!(
+                dark_profile_distance <= 45.0,
+                "Boon loaded dark readback should stay regionally close to NovyWave dark reference, distance={dark_profile_distance:.2}"
+            );
+            assert!(
+                light_profile_distance <= 45.0,
+                "Boon loaded light readback should stay regionally close to NovyWave light reference, distance={light_profile_distance:.2}"
+            );
+            assert!(
+                empty_profile_distance <= 45.0,
+                "Boon empty readback should stay regionally close to NovyWave empty dark reference, distance={empty_profile_distance:.2}"
             );
             let boon_empty_metadata =
                 visual_image_metadata("boon_empty", &empty_image, "empty readback");
@@ -38744,6 +38816,19 @@ mod tests {
                     boon_dark_metadata,
                     boon_light_metadata
                 ],
+                "normalized_region_profiles": {
+                    "reference_dark": normalized_luma_profile_json(&dark_reference_profile),
+                    "reference_light": normalized_luma_profile_json(&light_reference_profile),
+                    "reference_empty_dark": normalized_luma_profile_json(&empty_dark_reference_profile),
+                    "boon_empty": normalized_luma_profile_json(&boon_empty_profile),
+                    "boon_dark": normalized_luma_profile_json(&boon_dark_profile),
+                    "boon_light": normalized_luma_profile_json(&boon_light_profile)
+                },
+                "normalized_region_luma_distance": {
+                    "loaded_dark_vs_reference_dark": dark_profile_distance,
+                    "loaded_light_vs_reference_light": light_profile_distance,
+                    "empty_vs_reference_empty_dark": empty_profile_distance
+                },
                 "structural_checks": {
                     "empty_state_text_visible": true,
                     "loaded_dark_has_timeline_glass": true,
@@ -39497,6 +39582,94 @@ mod tests {
             "average_luma": full_image_average_luma(image),
             "source": "NovyWave reference screenshot"
         })
+    }
+
+    fn normalized_luma_profile(image: &image::RgbaImage) -> Vec<(&'static str, f32)> {
+        const REGIONS: [(&str, f32, f32, f32, f32); 9] = [
+            ("full", 0.0, 0.0, 1.0, 1.0),
+            ("header", 0.0, 0.0, 1.0, 0.10),
+            ("left_panel", 0.0, 0.12, 0.30, 0.62),
+            ("center_panel", 0.30, 0.12, 0.74, 0.62),
+            ("right_panel", 0.74, 0.12, 1.0, 0.62),
+            ("timeline", 0.0, 0.62, 1.0, 0.88),
+            ("footer", 0.0, 0.88, 1.0, 1.0),
+            ("center_focus", 0.28, 0.25, 0.78, 0.78),
+            ("lower_waveform", 0.18, 0.58, 0.94, 0.86),
+        ];
+        REGIONS
+            .iter()
+            .map(|(label, x0, y0, x1, y1)| {
+                let rect = normalized_image_rect(image, *x0, *y0, *x1, *y1);
+                (*label, average_image_rect_luma(image, rect))
+            })
+            .collect()
+    }
+
+    fn normalized_luma_profile_json(profile: &[(&'static str, f32)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            profile
+                .iter()
+                .map(|(label, average_luma)| {
+                    json!({
+                        "region": label,
+                        "average_luma": average_luma
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn normalized_luma_profile_distance(
+        reference: &[(&'static str, f32)],
+        rendered: &[(&'static str, f32)],
+    ) -> f32 {
+        let mut total = 0.0_f32;
+        let mut count = 0.0_f32;
+        for ((reference_label, reference_luma), (rendered_label, rendered_luma)) in
+            reference.iter().zip(rendered)
+        {
+            assert_eq!(
+                reference_label, rendered_label,
+                "normalized luma profile regions must align"
+            );
+            total += (reference_luma - rendered_luma).abs();
+            count += 1.0;
+        }
+        total / count.max(1.0)
+    }
+
+    fn normalized_image_rect(
+        image: &image::RgbaImage,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+    ) -> (u32, u32, u32, u32) {
+        let width = image.width().max(1) as f32;
+        let height = image.height().max(1) as f32;
+        let left = (x0.clamp(0.0, 1.0) * width).floor() as u32;
+        let top = (y0.clamp(0.0, 1.0) * height).floor() as u32;
+        let right = (x1.clamp(0.0, 1.0) * width).ceil() as u32;
+        let bottom = (y1.clamp(0.0, 1.0) * height).ceil() as u32;
+        (
+            left.min(image.width().saturating_sub(1)),
+            top.min(image.height().saturating_sub(1)),
+            right.clamp(1, image.width()),
+            bottom.clamp(1, image.height()),
+        )
+    }
+
+    fn average_image_rect_luma(image: &image::RgbaImage, rect: (u32, u32, u32, u32)) -> f32 {
+        let (left, top, right, bottom) = rect;
+        let mut total = 0.0_f64;
+        let mut count = 0_u64;
+        for y in top..bottom.max(top + 1).min(image.height()) {
+            for x in left..right.max(left + 1).min(image.width()) {
+                total += f64::from(image_luma_at(image, x as f32, y as f32));
+                count = count.saturating_add(1);
+            }
+        }
+        (total / (count.max(1) as f64)) as f32
     }
 
     fn visual_image_metadata(

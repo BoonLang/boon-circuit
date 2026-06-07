@@ -305,6 +305,7 @@ input_scenarios = [
   "select-primary-clears-diagnostic",
   "show-empty-state",
   "reload-fixture",
+  "select-data-before-format",
   "format-grouped-binary",
   "format-octal",
   "format-signed",

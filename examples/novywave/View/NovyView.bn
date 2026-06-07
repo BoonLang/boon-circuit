@@ -182,7 +182,7 @@ FUNCTION empty_state() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #101a2b }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #2f80ed }
@@ -1021,7 +1021,10 @@ FUNCTION cursor_chip() {
             width: 118
             height: 18
             rounded_corners: 8
-            background: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1D4ED8 }
+                Light => TEXT { #FDE68A }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         label: Scene/Element/text(
@@ -1045,7 +1048,10 @@ FUNCTION marker_chip() {
             width: 150
             height: 18
             rounded_corners: 8
-            background: [color: TEXT { #4F46E5 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #4F46E5 }
+                Light => TEXT { #E7DDFF }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
         ]
         label: Scene/Element/text(
@@ -1497,11 +1503,11 @@ FUNCTION fixed_wave_area(signal_id) {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1525,11 +1531,11 @@ FUNCTION fixed_wave_area_clk() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1568,11 +1574,11 @@ FUNCTION fixed_wave_area_reset() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1599,11 +1605,11 @@ FUNCTION fixed_wave_area_data() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -1668,11 +1674,11 @@ FUNCTION fixed_wave_area_temperature() {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True
@@ -2199,11 +2205,11 @@ FUNCTION wave_area(signal) {
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #020817 }
-                Light => TEXT { #f8fbff }
+                Light => TEXT { #101a2b }
             }]
             border: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #1f2a3c }
-                Light => TEXT { #b7c9e6 }
+                Light => TEXT { #93b4e8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
             scroll_x: True

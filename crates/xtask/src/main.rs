@@ -4563,6 +4563,7 @@ fn run_native_example_switch_live_probe(
         "counter",
         "todomvc",
         "cells",
+        "novywave",
         "todomvc-after-cells",
         "custom:a",
         "custom:b",
@@ -4979,6 +4980,7 @@ fn source_project_payload_for_switch(
                 source.push_str("\n-- custom:b switch probe\n");
             }
         })?,
+        "novywave" => source_project_units_for_manifest_switch("novywave", |_| {})?,
         "custom:a" => source_project_units_for_manifest_switch("counter", |source| {
             *source = source.replace("TEXT { Counter }", "TEXT { Custom A Counter }");
         })?,
@@ -6674,7 +6676,7 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         else {
             continue;
         };
-        if matches!(label, "counter" | "todomvc" | "cells") {
+        if matches!(label, "counter" | "todomvc" | "cells" | "novywave") {
             bundled_preview_latencies.push(latency);
         } else {
             custom_preview_latencies.push(latency);
@@ -18361,6 +18363,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "counter",
                 "todomvc",
                 "cells",
+                "novywave",
                 "custom:a",
                 "custom:b",
                 "custom:multi-file",

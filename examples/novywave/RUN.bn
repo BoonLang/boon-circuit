@@ -88,6 +88,7 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     file_compare_status:
@@ -471,6 +472,8 @@ store: [
     search_result_label:
         scoped_search_label(text: signal_search_text, scope: active_scope)
 
+    search_scope_mode: TEXT { Global }
+
     keyboard_last_key:
         Text/empty() |> HOLD keyboard_last_key {
             LATEST {
@@ -677,9 +680,9 @@ store: [
     marker_count_label:
         TEXT { 0 markers } |> HOLD marker_count_label {
             LATEST {
-            elements.marker_rename.event.press |> THEN { TEXT { 1 marker } }
+            elements.marker_rename.event.press |> THEN { TEXT { 2 markers } }
             elements.marker_remove.event.press |> THEN { TEXT { 0 markers } }
-            elements.marker_jump.event.press |> THEN { TEXT { 1 marker } }
+            elements.marker_jump.event.press |> THEN { TEXT { 2 markers } }
             elements.marker_toggle.event.press |> THEN { TEXT { 2 markers } }
             elements.load_fixture.event.press |> THEN { TEXT { 1 marker } }
             elements.show_empty.event.press |> THEN { TEXT { 0 markers } }
@@ -837,7 +840,7 @@ store: [
         }
 
     active_signal_label:
-        TEXT { top.cpu.clk } |> HOLD active_signal_label {
+        TEXT { none } |> HOLD active_signal_label {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -857,35 +860,43 @@ store: [
                 elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
                 elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
                 elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
+                elements.load_fixture.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
 
     active_scope_key:
         LATEST {
-            TEXT { TOP_CPU }
+            TEXT { NONE }
             elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
             elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
+            elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.show_empty.event.press |> THEN { TEXT { NONE } }
         }
 
     active_scope_label:
         LATEST {
-            TEXT { top.cpu }
+            TEXT { none }
             elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
+            elements.load_fixture.event.press |> THEN { TEXT { top.cpu } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     active_scope_signal_count:
         LATEST {
-            TEXT { 8 signals }
+            TEXT { 0 signals }
             elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
             elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
             elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
+            elements.load_fixture.event.press |> THEN { TEXT { 8 signals } }
+            elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
         }
 
     active_signal_key:
-        TEXT { CLK } |> HOLD active_signal_key {
+        TEXT { NONE } |> HOLD active_signal_key {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -905,6 +916,8 @@ store: [
                 elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
                 elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+                elements.load_fixture.event.press |> THEN { TEXT { CLK } }
+                elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 

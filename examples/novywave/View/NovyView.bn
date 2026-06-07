@@ -1137,16 +1137,7 @@ FUNCTION waveform_rows() {
 }
 
 FUNCTION waveform_rows_expanded() {
-    PASSED.store.selected_rows_profile == TEXT { WithoutData } |> WHEN {
-        True => waveform_rows_from(list: NovyFixtures/selected_signals_without_data())
-        False => PASSED.store.selected_rows_profile == TEXT { DataFirst } |> WHEN {
-            True => waveform_rows_from(list: NovyFixtures/selected_signals_data_first())
-            False => PASSED.store.selected_rows_profile == TEXT { DataLast } |> WHEN {
-                True => waveform_rows_from(list: NovyFixtures/selected_signals_data_last())
-                False => waveform_rows_from(list: NovyFixtures/selected_signals())
-            }
-        }
-    }
+    waveform_rows_from(list: PASSED.store.selected_signals)
 }
 
 FUNCTION waveform_rows_from(list) {

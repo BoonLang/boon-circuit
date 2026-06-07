@@ -451,7 +451,13 @@ pub enum ListOperationKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListAppendField {
     pub name: String,
-    pub source: String,
+    pub value: ListAppendFieldValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListAppendFieldValue {
+    Source { path: String },
+    Const { value: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3000,7 +3006,9 @@ fn verify_scheduled_list_operation(
         ListOperationKind::Append { trigger, fields } => {
             require_known_symbol("append trigger", trigger, known_symbols)?;
             for field in fields {
-                require_known_symbol("append field source", &field.source, known_symbols)?;
+                if let ListAppendFieldValue::Source { path } = &field.value {
+                    require_known_symbol("append field source", path, known_symbols)?;
+                }
             }
             Ok(())
         }
@@ -3233,7 +3241,14 @@ fn reject_list_operation_identity(value: &ListOperationKind) -> Result<(), Strin
             reject_hidden_identity_identifier("append trigger", trigger)?;
             for field in fields {
                 reject_hidden_identity_identifier("append field", &field.name)?;
-                reject_hidden_identity_identifier("append field source", &field.source)?;
+                match &field.value {
+                    ListAppendFieldValue::Source { path } => {
+                        reject_hidden_identity_identifier("append field source", path)?;
+                    }
+                    ListAppendFieldValue::Const { value } => {
+                        reject_hidden_identity_identifier("append field const", value)?;
+                    }
+                }
             }
             Ok(())
         }
@@ -3705,8 +3720,11 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
         {
             continue;
         }
-        if let Some(trigger) = list_append_trigger(field) {
-            let fields = list_append_fields(field, program, &fields);
+        for append_expr in list_append_exprs(field) {
+            let Some(trigger) = list_append_trigger(field, append_expr) else {
+                continue;
+            };
+            let fields = list_append_fields(field, program, &fields, append_expr);
             operations.push(ListOperation {
                 list: list_name.to_owned(),
                 kind: ListOperationKind::Append { trigger, fields },
@@ -4237,8 +4255,8 @@ fn ast_simple_then_update_value_in_exprs(
     }
 }
 
-fn list_append_trigger(field: &FieldDef) -> Option<String> {
-    let AstExprKind::Pipe { args, .. } = &list_append_expr(field)?.kind else {
+fn list_append_trigger(field: &FieldDef, append_expr: &AstExpr) -> Option<String> {
+    let AstExprKind::Pipe { args, .. } = &append_expr.kind else {
         return None;
     };
     let item_arg = args
@@ -4260,44 +4278,85 @@ fn list_append_fields(
     field: &FieldDef,
     program: &ParsedProgram,
     fields: &[FieldDef],
+    append_expr: &AstExpr,
 ) -> Vec<ListAppendField> {
-    let Some(append_expr) = list_append_expr(field) else {
-        return Vec::new();
-    };
-    let literal_fields = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.id > append_expr.id)
-        .find_map(|expr| match &expr.kind {
-            AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(
-                fields
-                    .iter()
-                    .filter_map(|record_field| {
-                        let source = ast_argument_value(field, record_field.value)?;
-                        (!record_field.name.is_empty() && !source.is_empty()).then(|| {
-                            ListAppendField {
-                                name: record_field.name.clone(),
-                                source: canonical_local_path(&source, &field.parent_path),
-                            }
-                        })
+    let literal_fields = list_append_item_record_fields(field, append_expr)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|record_field| {
+                    let value = list_append_record_field_value(field, record_field.value)?;
+                    (!record_field.name.is_empty()).then(|| ListAppendField {
+                        name: record_field.name.clone(),
+                        value,
                     })
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
+                })
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     if !literal_fields.is_empty() {
         return literal_fields;
     }
-    list_append_function_constructor_fields(field, program, fields)
+    list_append_function_constructor_fields(field, program, fields, append_expr)
+}
+
+fn list_append_item_record_fields<'a>(
+    field: &'a FieldDef,
+    append_expr: &AstExpr,
+) -> Option<&'a [AstRecordField]> {
+    let item_expr = list_append_item_expr(field, append_expr)?;
+    append_item_record_fields_from_expr(field, item_expr.id).or_else(|| {
+        field
+            .ast_exprs
+            .iter()
+            .filter(|expr| expr.line >= item_expr.line)
+            .find_map(record_fields_from_expr)
+    })
+}
+
+fn append_item_record_fields_from_expr(
+    field: &FieldDef,
+    expr_id: usize,
+) -> Option<&[AstRecordField]> {
+    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Record(_) | AstExprKind::Object(_) => record_fields_from_expr(expr),
+        AstExprKind::Then {
+            output: Some(output),
+            ..
+        } => append_item_record_fields_from_expr(field, *output),
+        AstExprKind::Pipe { args, .. } | AstExprKind::Call { args, .. } => args
+            .iter()
+            .find_map(|arg| append_item_record_fields_from_expr(field, arg.value)),
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            append_item_record_fields_from_expr(field, *initial)
+        }
+        AstExprKind::Infix { left, right, .. } => append_item_record_fields_from_expr(field, *left)
+            .or_else(|| append_item_record_fields_from_expr(field, *right)),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => append_item_record_fields_from_expr(field, *output),
+        _ => None,
+    }
+}
+
+fn record_fields_from_expr(expr: &AstExpr) -> Option<&[AstRecordField]> {
+    match &expr.kind {
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(fields.as_slice()),
+        _ => None,
+    }
 }
 
 fn list_append_function_constructor_fields(
     field: &FieldDef,
     program: &ParsedProgram,
     fields: &[FieldDef],
+    append_expr: &AstExpr,
 ) -> Vec<ListAppendField> {
-    let Some((function, arg_sources)) = list_append_item_constructor_args(field, program) else {
+    let Some((function, arg_sources)) =
+        list_append_item_constructor_args(field, program, append_expr)
+    else {
         return Vec::new();
     };
     let Some(row_scope) = row_scope_for_append_constructor(program, &function) else {
@@ -4321,17 +4380,54 @@ fn list_append_function_constructor_fields(
                     .strip_prefix(&prefix)
                     .unwrap_or(candidate.local_name.as_str())
                     .to_owned(),
-                source: source.clone(),
+                value: ListAppendFieldValue::Source {
+                    path: source.clone(),
+                },
             })
         })
         .collect()
 }
 
+fn list_append_record_field_value(
+    field: &FieldDef,
+    expr_id: usize,
+) -> Option<ListAppendFieldValue> {
+    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::StringLiteral(value)
+        | AstExprKind::TextLiteral(value)
+        | AstExprKind::Number(value)
+        | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value) => Some(ListAppendFieldValue::Const {
+            value: value.clone(),
+        }),
+        AstExprKind::Bool(true) => Some(ListAppendFieldValue::Const {
+            value: "True".to_owned(),
+        }),
+        AstExprKind::Bool(false) => Some(ListAppendFieldValue::Const {
+            value: "False".to_owned(),
+        }),
+        AstExprKind::Identifier(value) => Some(ListAppendFieldValue::Source {
+            path: canonical_local_path(value, &field.parent_path),
+        }),
+        AstExprKind::Path(parts) if !parts.is_empty() => Some(ListAppendFieldValue::Source {
+            path: canonical_local_path(&parts.join("."), &field.parent_path),
+        }),
+        _ => {
+            let source = ast_argument_value(field, expr_id)?;
+            (!source.is_empty()).then(|| ListAppendFieldValue::Source {
+                path: canonical_local_path(&source, &field.parent_path),
+            })
+        }
+    }
+}
+
 fn list_append_item_constructor_args(
     field: &FieldDef,
     program: &ParsedProgram,
+    append_expr: &AstExpr,
 ) -> Option<(String, BTreeMap<String, String>)> {
-    let item_expr = list_append_item_expr(field)?;
+    let item_expr = list_append_item_expr(field, append_expr)?;
     match &item_expr.kind {
         AstExprKind::Pipe { input, op, args } => Some((
             op.clone(),
@@ -4414,8 +4510,8 @@ fn row_scope_for_append_constructor<'a>(
         .map(|scope| scope.row_scope.as_str())
 }
 
-fn list_append_item_expr<'a>(field: &'a FieldDef) -> Option<&'a AstExpr> {
-    let AstExprKind::Pipe { args, .. } = &list_append_expr(field)?.kind else {
+fn list_append_item_expr<'a>(field: &'a FieldDef, append_expr: &AstExpr) -> Option<&'a AstExpr> {
+    let AstExprKind::Pipe { args, .. } = &append_expr.kind else {
         return None;
     };
     let item_arg = args
@@ -4427,8 +4523,8 @@ fn list_append_item_expr<'a>(field: &'a FieldDef) -> Option<&'a AstExpr> {
         .find(|expr| expr.id == item_arg.value)
 }
 
-fn list_append_expr(field: &FieldDef) -> Option<&AstExpr> {
-    field.ast_exprs.iter().find(|expr| {
+fn list_append_exprs(field: &FieldDef) -> impl Iterator<Item = &AstExpr> {
+    field.ast_exprs.iter().filter(|expr| {
         matches!(
             &expr.kind,
             AstExprKind::Pipe { op, .. } if op == "List/append"
@@ -6517,7 +6613,9 @@ document:
                         trigger: "store.title_to_add".to_owned(),
                         fields: vec![ListAppendField {
                             name: "title".to_owned(),
-                            source: "store.title_to_add".to_owned(),
+                            value: ListAppendFieldValue::Source {
+                                path: "store.title_to_add".to_owned(),
+                            },
                         }],
                     }
         }));
@@ -6894,7 +6992,9 @@ FUNCTION new_todo(todo) {
                         trigger: "store.title_to_save".to_owned(),
                         fields: vec![ListAppendField {
                             name: "title".to_owned(),
-                            source: "store.title_to_save".to_owned(),
+                            value: ListAppendFieldValue::Source {
+                                path: "store.title_to_save".to_owned(),
+                            },
                         }],
                     }
         }));
@@ -7106,7 +7206,9 @@ FUNCTION new_todo(todo) {
                         trigger: "store.pending_title".to_owned(),
                         fields: vec![ListAppendField {
                             name: "title".to_owned(),
-                            source: "store.pending_title".to_owned(),
+                            value: ListAppendFieldValue::Source {
+                                path: "store.pending_title".to_owned(),
+                            },
                         }],
                     }
         }));
@@ -7143,8 +7245,68 @@ FUNCTION new_todo(title) {
                         trigger: "store.title_to_save".to_owned(),
                         fields: vec![ListAppendField {
                             name: "title".to_owned(),
-                            source: "store.title_to_save".to_owned(),
+                            value: ListAppendFieldValue::Source {
+                                path: "store.title_to_save".to_owned(),
+                            },
                         }],
+                    }
+        }));
+    }
+
+    #[test]
+    fn list_append_record_fields_can_mix_source_and_constants() {
+        let source = r#"
+store: [
+    sources: [
+        input: [key_down: SOURCE]
+    ]
+    pending_title:
+        sources.input.key_down |> THEN { typed_title }
+    todos:
+        LIST {}
+        |> List/append(item: pending_title |> THEN {
+            [title: pending_title, kind: TEXT { Signal }, visible: True]
+        })
+        |> List/map(todo, new: new_todo(todo: todo))
+]
+FUNCTION new_todo(todo) {
+    [
+        title:
+            todo.title |> HOLD title { LATEST {} }
+        kind:
+            todo.kind |> HOLD kind { LATEST {} }
+        visible:
+            todo.visible |> HOLD visible { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("append-mixed-fields.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Append {
+                        trigger: "store.pending_title".to_owned(),
+                        fields: vec![
+                            ListAppendField {
+                                name: "title".to_owned(),
+                                value: ListAppendFieldValue::Source {
+                                    path: "store.pending_title".to_owned(),
+                                },
+                            },
+                            ListAppendField {
+                                name: "kind".to_owned(),
+                                value: ListAppendFieldValue::Const {
+                                    value: "Signal".to_owned(),
+                                },
+                            },
+                            ListAppendField {
+                                name: "visible".to_owned(),
+                                value: ListAppendFieldValue::Const {
+                                    value: "True".to_owned(),
+                                },
+                            },
+                        ],
                     }
         }));
     }

@@ -4,10 +4,10 @@
 
 use bitvec::prelude::*;
 use boon_ir::{
-    DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListId, ListInitializer,
-    ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
-    TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower, lower_profiled,
-    lower_runtime_profiled, verify_hidden_identity, verify_static_schedule,
+    DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListAppendFieldValue, ListId,
+    ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, SourceId,
+    SourcePayloadField, TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower,
+    lower_profiled, lower_runtime_profiled, verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, DocumentAst,
@@ -2229,7 +2229,14 @@ impl RuntimeSymbols {
                     symbols.intern(trigger);
                     for field in fields {
                         symbols.intern(&field.name);
-                        symbols.intern(&field.source);
+                        match &field.value {
+                            ListAppendFieldValue::Source { path } => {
+                                symbols.intern(path);
+                            }
+                            ListAppendFieldValue::Const { value } => {
+                                symbols.intern(value);
+                            }
+                        }
                     }
                 }
                 ListOperationKind::Remove { source, predicate } => {
@@ -5527,8 +5534,12 @@ impl GenericScheduledRuntime {
                         }
                     }
                 }
-                SourceAction::ListAppend { list, trigger } => {
-                    let source_paths = self.list_source_bindings.source_paths(list)?;
+                SourceAction::ListAppend {
+                    list,
+                    trigger,
+                    append_ordinal,
+                } => {
+                    let source_paths = self.list_source_bindings.source_paths_or_empty(list);
                     let Some(value) = self.storage.eval_derived_text_transform(
                         &self.derived_equations,
                         trigger,
@@ -5543,6 +5554,7 @@ impl GenericScheduledRuntime {
                         &self.list_equations,
                         list,
                         trigger,
+                        *append_ordinal,
                         value.as_ref(),
                         source_paths,
                     )?;
@@ -9165,9 +9177,10 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
+        append_ordinal: usize,
         row: RuntimeRowSnapshot,
     ) -> RuntimeResult<(u64, u64)> {
-        let expected = equations.append_trigger(list)?;
+        let expected = equations.append_trigger_at(append_ordinal, list)?;
         if expected != trigger {
             return Err(format!(
                 "list `{list}` append trigger `{trigger}` does not match IR trigger `{expected}`"
@@ -9182,30 +9195,44 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
+        append_ordinal: usize,
         trigger_value: &str,
     ) -> RuntimeResult<(u64, u64)> {
-        let append_fields = equations.append_fields(list, trigger)?;
+        let append_fields = equations.append_fields_at(append_ordinal, list, trigger)?;
         let template = self
             .lists
             .row_template(list)
             .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let mut row = self.lists.pop_spare(list).map(Ok).unwrap_or_else(|| {
-            let initial_fields = equations.append_initial_fields(list, trigger, trigger_value)?;
+            let initial_fields =
+                equations.append_initial_fields_at(append_ordinal, list, trigger, trigger_value)?;
             template.materialize(initial_fields)
         })?;
         template.reset_from_initial_text(&mut row, |initial_name| {
             append_fields
                 .iter()
-                .any(|field| field.name == row_field_name(initial_name) && field.source == trigger)
-                .then_some(trigger_value)
+                .find(|field| field.name == row_field_name(initial_name))
+                .and_then(|field| match &field.value {
+                    RuntimeListAppendFieldValue::Source { path } if path == trigger => {
+                        Some(trigger_value)
+                    }
+                    RuntimeListAppendFieldValue::Const { value } => Some(value.as_str()),
+                    RuntimeListAppendFieldValue::Source { .. } => None,
+                })
         })?;
         for field in append_fields {
-            if field.source == trigger {
-                row.columns.set_textlike(&field.name, trigger_value)?;
+            match &field.value {
+                RuntimeListAppendFieldValue::Source { path } if path == trigger => {
+                    row.columns.set_textlike(&field.name, trigger_value)?;
+                }
+                RuntimeListAppendFieldValue::Const { value } => {
+                    row.columns.set_textlike(&field.name, value)?;
+                }
+                RuntimeListAppendFieldValue::Source { .. } => {}
             }
         }
-        self.append_row_for_trigger(equations, list, trigger, row)
+        self.append_row_for_trigger(equations, list, trigger, append_ordinal, row)
     }
 
     fn reserve_spare_rows_for_trigger_text(
@@ -9213,6 +9240,7 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
+        append_ordinal: usize,
         count: usize,
         text_capacity: usize,
     ) -> RuntimeResult<()> {
@@ -9232,7 +9260,8 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         spare_rows.reserve(additional + count);
         for _ in 0..additional {
-            let initial_fields = equations.append_initial_fields(list, trigger, "")?;
+            let initial_fields =
+                equations.append_initial_fields_at(append_ordinal, list, trigger, "")?;
             let mut row = template.materialize(initial_fields)?;
             row.reserve_textlike_fields(text_capacity)?;
             spare_rows.push(row);
@@ -9245,11 +9274,17 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
+        append_ordinal: usize,
         trigger_value: &str,
         source_paths: &[String],
     ) -> RuntimeResult<GenericListRowCommit> {
-        let (key, generation) =
-            self.append_row_for_trigger_text(equations, list, trigger, trigger_value)?;
+        let (key, generation) = self.append_row_for_trigger_text(
+            equations,
+            list,
+            trigger,
+            append_ordinal,
+            trigger_value,
+        )?;
         self.bind_row_sources(list, key, generation, source_paths)?;
         Ok(GenericListRowCommit {
             list: list.to_owned(),
@@ -9270,7 +9305,7 @@ impl GenericCircuitRuntime {
         text: Option<&'a str>,
         source_paths: &[String],
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
-        let trigger = routes.list_append_trigger(source, list)?;
+        let (trigger, append_ordinal) = routes.list_append_target(source, list)?;
         let Some(value) = self.eval_derived_text_transform(derived, trigger, source, key, text)?
         else {
             return Ok(None);
@@ -9279,6 +9314,7 @@ impl GenericCircuitRuntime {
             lists,
             list,
             trigger,
+            append_ordinal,
             value.as_ref(),
             source_paths,
         )?;
@@ -11601,6 +11637,7 @@ struct SourceRouteListRemove {
 struct SourceRouteListAppend {
     list: String,
     trigger: String,
+    append_ordinal: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11637,6 +11674,7 @@ enum SourceAction {
     ListAppend {
         list: String,
         trigger: String,
+        append_ordinal: usize,
     },
     IndexedText {
         kind: SourceRouteTextAction,
@@ -11697,7 +11735,24 @@ enum RuntimeListOperationKind {
 #[derive(Clone, Debug)]
 struct RuntimeListAppendField {
     name: String,
-    source: String,
+    value: RuntimeListAppendFieldValue,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeListAppendFieldValue {
+    Source { path: String },
+    Const { value: String },
+}
+
+impl RuntimeListAppendFieldValue {
+    fn from_ir(value: &ListAppendFieldValue) -> Self {
+        match value {
+            ListAppendFieldValue::Source { path } => Self::Source { path: path.clone() },
+            ListAppendFieldValue::Const { value } => Self::Const {
+                value: value.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12435,7 +12490,7 @@ impl SourceRoutePlan {
                 .root_text_transform_targets
                 .push(target);
         }
-        for operation in &lists.operations {
+        for (append_ordinal, operation) in lists.operations.iter().enumerate() {
             match &operation.kind {
                 RuntimeListOperationKind::Append { trigger, .. } => {
                     for route in routes
@@ -12446,6 +12501,7 @@ impl SourceRoutePlan {
                         route.list_append_targets.push(SourceRouteListAppend {
                             list: operation.list.clone(),
                             trigger: trigger.clone(),
+                            append_ordinal,
                         });
                     }
                 }
@@ -12561,8 +12617,8 @@ impl SourceRoutePlan {
     }
 
     #[cfg(test)]
-    fn list_append_trigger(&self, source: &str, list: &str) -> RuntimeResult<&str> {
-        self.require_source(source)?.list_append_trigger(list)
+    fn list_append_target(&self, source: &str, list: &str) -> RuntimeResult<(&str, usize)> {
+        self.require_source(source)?.list_append_target(list)
     }
 
     fn address_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
@@ -12867,6 +12923,13 @@ impl ListSourceBindingPlan {
             .ok_or_else(|| format!("list `{list}` has no scoped source binding plan").into())
     }
 
+    fn source_paths_or_empty(&self, list: &str) -> &[String] {
+        self.list_slots
+            .iter()
+            .find_map(|binding| (binding.list == list).then_some(binding.source_paths.as_slice()))
+            .unwrap_or(&[])
+    }
+
     fn source_count(&self, list: &str) -> RuntimeResult<usize> {
         self.source_paths(list).map(<[_]>::len)
     }
@@ -12918,6 +12981,7 @@ impl SourceRoute {
                     .map(|target| SourceAction::ListAppend {
                         list: target.list.clone(),
                         trigger: target.trigger.clone(),
+                        append_ordinal: target.append_ordinal,
                     }),
             );
         if !self.root_scalar_targets.is_empty() {
@@ -13026,22 +13090,22 @@ impl SourceRoute {
     }
 
     #[cfg(test)]
-    fn list_append_trigger(&self, list: &str) -> RuntimeResult<&str> {
-        let mut trigger = None;
+    fn list_append_target(&self, list: &str) -> RuntimeResult<(&str, usize)> {
+        let mut target = None;
         for candidate in &self.list_append_targets {
             if candidate.list != list {
                 continue;
             }
-            if trigger.is_some_and(|current| current != candidate.trigger.as_str()) {
+            if target.is_some_and(|(current, _)| current != candidate.trigger.as_str()) {
                 return Err(format!(
                     "source `{}` has multiple list-append triggers for `{list}`",
                     self.source
                 )
                 .into());
             }
-            trigger = Some(candidate.trigger.as_str());
+            target = Some((candidate.trigger.as_str(), candidate.append_ordinal));
         }
-        trigger.ok_or_else(|| {
+        target.ok_or_else(|| {
             format!(
                 "source `{}` has no compiled list-append route for `{list}`",
                 self.source
@@ -13066,7 +13130,7 @@ impl ListEquationPlan {
                                 .iter()
                                 .map(|field| RuntimeListAppendField {
                                     name: field.name.clone(),
-                                    source: field.source.clone(),
+                                    value: RuntimeListAppendFieldValue::from_ir(&field.value),
                                 })
                                 .collect(),
                         }
@@ -13111,6 +13175,14 @@ impl ListEquationPlan {
             .ok_or_else(|| format!("list `{list}` has no append operation in IR").into())
     }
 
+    fn append_trigger_at(&self, append_ordinal: usize, list: &str) -> RuntimeResult<&str> {
+        let operation = self.append_operation_at(append_ordinal, list)?;
+        let RuntimeListOperationKind::Append { trigger, .. } = &operation.kind else {
+            unreachable!();
+        };
+        Ok(trigger)
+    }
+
     fn append_fields(&self, list: &str, trigger: &str) -> RuntimeResult<&[RuntimeListAppendField]> {
         self.operations
             .iter()
@@ -13125,6 +13197,29 @@ impl ListEquationPlan {
                 | RuntimeListOperationKind::Count { .. } => None,
             })
             .ok_or_else(|| format!("list `{list}` has no append trigger `{trigger}` in IR").into())
+    }
+
+    fn append_fields_at(
+        &self,
+        append_ordinal: usize,
+        list: &str,
+        trigger: &str,
+    ) -> RuntimeResult<&[RuntimeListAppendField]> {
+        let operation = self.append_operation_at(append_ordinal, list)?;
+        let RuntimeListOperationKind::Append {
+            trigger: expected,
+            fields,
+        } = &operation.kind
+        else {
+            unreachable!();
+        };
+        if expected != trigger {
+            return Err(format!(
+                "list `{list}` append ordinal `{append_ordinal}` has trigger `{expected}`, expected `{trigger}`"
+            )
+            .into());
+        }
+        Ok(fields)
     }
 
     fn append_initial_fields(
@@ -13148,21 +13243,85 @@ impl ListEquationPlan {
         let RuntimeListOperationKind::Append { fields, .. } = &operation.kind else {
             unreachable!();
         };
+        Self::append_initial_fields_for_fields(fields, trigger, trigger_value)
+    }
+
+    fn append_initial_fields_for_fields(
+        fields: &[RuntimeListAppendField],
+        trigger: &str,
+        trigger_value: &str,
+    ) -> RuntimeResult<ValueColumns> {
         let mut initial_fields = ValueColumns::default();
         for field in fields {
-            if field.source != trigger {
-                return Err(format!(
-                    "append field `{}` uses unsupported source `{}`; expected trigger `{trigger}`",
-                    field.name, field.source
-                )
-                .into());
+            match &field.value {
+                RuntimeListAppendFieldValue::Source { path } if path == trigger => {
+                    initial_fields.insert_value(
+                        field.name.to_owned(),
+                        FieldValue::Text(trigger_value.to_owned()),
+                    );
+                }
+                RuntimeListAppendFieldValue::Source { path } => {
+                    return Err(format!(
+                        "append field `{}` uses unsupported source `{path}`; expected trigger `{trigger}`",
+                        field.name
+                    )
+                    .into());
+                }
+                RuntimeListAppendFieldValue::Const { value } => {
+                    initial_fields
+                        .insert_value(field.name.to_owned(), FieldValue::Text(value.clone()));
+                }
             }
-            initial_fields.insert_value(
-                field.name.to_owned(),
-                FieldValue::Text(trigger_value.to_owned()),
-            );
         }
         Ok(initial_fields)
+    }
+
+    fn append_initial_fields_at(
+        &self,
+        append_ordinal: usize,
+        list: &str,
+        trigger: &str,
+        trigger_value: &str,
+    ) -> RuntimeResult<ValueColumns> {
+        let operation = self.append_operation_at(append_ordinal, list)?;
+        let RuntimeListOperationKind::Append {
+            trigger: expected,
+            fields,
+        } = &operation.kind
+        else {
+            unreachable!();
+        };
+        if expected != trigger {
+            return Err(format!(
+                "list `{list}` append ordinal `{append_ordinal}` has trigger `{expected}`, expected `{trigger}`"
+            )
+            .into());
+        }
+        Self::append_initial_fields_for_fields(fields, trigger, trigger_value)
+    }
+
+    fn append_operation_at(
+        &self,
+        append_ordinal: usize,
+        list: &str,
+    ) -> RuntimeResult<&RuntimeListOperation> {
+        let operation = self.operations.get(append_ordinal).ok_or_else(|| {
+            format!("list `{list}` has no append operation ordinal `{append_ordinal}`")
+        })?;
+        match &operation.kind {
+            RuntimeListOperationKind::Append { .. } if operation.list == list => Ok(operation),
+            RuntimeListOperationKind::Append { .. } => Err(format!(
+                "append operation ordinal `{append_ordinal}` targets list `{}`, expected `{list}`",
+                operation.list
+            )
+            .into()),
+            RuntimeListOperationKind::Remove { .. }
+            | RuntimeListOperationKind::Retain { .. }
+            | RuntimeListOperationKind::Count { .. } => Err(format!(
+                "operation ordinal `{append_ordinal}` for list `{list}` is not an append"
+            )
+            .into()),
+        }
     }
 
     fn count_predicate(&self, list: &str, target: &str) -> RuntimeResult<RuntimeListPredicate> {
@@ -16641,9 +16800,7 @@ store: [
     groups:
         LIST {}
         |> List/append(item: group_to_create |> THEN {
-            [
-                name: group_to_create
-            ]
+            [name: group_to_create, role: TEXT { Bus }]
         })
         |> List/map(group, new: new_group(group: group, store: store))
         |> List/remove(group, when:
@@ -16671,6 +16828,8 @@ FUNCTION new_group(group, store) {
             collapse_group: SOURCE
         ]
         name: group.name
+        role:
+            group.role |> HOLD role { LATEST {} }
         collapsed:
             False |> HOLD collapsed {
                 LATEST {
@@ -16713,6 +16872,7 @@ FUNCTION new_marker(marker) {
                 && delta.list_id.as_deref() == Some("groups")
                 && matches!(&delta.value, ProtocolValue::Text(value) if value == "Core bus group")
         }));
+        assert_eq!(create_output.state_summary["groups"][0]["role"], "Bus");
 
         let mut collapse_expected = BTreeMap::new();
         collapse_expected.insert(
@@ -17609,6 +17769,7 @@ FUNCTION new_marker(marker) {
                 &compiled.list_equations,
                 "todos",
                 "store.sources.new_todo_input.key_down",
+                0,
                 todo_generic_row("Wrong trigger"),
             )
             .unwrap_err()

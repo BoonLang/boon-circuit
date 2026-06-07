@@ -38602,6 +38602,25 @@ mod tests {
             })
             .expect("NovyWave load fixture source event should apply before control checks");
         let state_summary = runtime.document_state_summary();
+        let selected_signals = state_summary
+            .pointer("/store/selected_signals")
+            .and_then(serde_json::Value::as_array)
+            .expect("NovyWave loaded state should expose selected_signals as Boon data");
+        assert_eq!(
+            selected_signals.len(),
+            8,
+            "NovyWave loaded fixture should expose eight selected waveform rows"
+        );
+        assert_eq!(
+            state_summary.pointer("/store/selected_signals/2/current_value"),
+            Some(&json!("0x2a")),
+            "NovyWave runtime state should keep data_bus current value in Boon data"
+        );
+        assert_eq!(
+            state_summary.pointer("/store/selected_signals/7/current_value"),
+            Some(&json!("42.8 C")),
+            "NovyWave runtime state should keep temperature current value in Boon data"
+        );
         let (layout_proof, layout) = native_document_layout_proof_with_project_state_embedded(
             &source_path,
             &units,

@@ -10349,11 +10349,19 @@ fn novywave_material_metrics(layout_artifact: &serde_json::Value) -> serde_json:
         {
             hover_regions += 1;
         }
-        if item
+        let waveform_row_text = style
+            .get("__scope_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|scope| scope.starts_with("row-"))
+            && item
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+        let waveform_marker_text = item
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|text| matches!(text, "0x2a" | "XX" | "ZZ" | "42.8 C" | "M 42 ns"))
-        {
+            .is_some_and(|text| matches!(text, "M 42 ns" | "42 ns"));
+        if waveform_row_text || waveform_marker_text {
             waveform_text_regions += 1;
         }
     }

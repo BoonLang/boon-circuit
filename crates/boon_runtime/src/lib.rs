@@ -8015,7 +8015,14 @@ impl GenericScheduledRuntime {
                         .unwrap_or_else(|_| serde_json::Map::new()),
                 ));
             }
-            root.insert(summary.list.clone(), JsonValue::Array(rows));
+            let value = JsonValue::Array(rows);
+            if let Some(store) = root
+                .get_mut("store")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                store.entry(summary.list.clone()).or_insert(value.clone());
+            }
+            root.insert(summary.list.clone(), value);
         }
         root.insert(
             "source_binding_count".to_owned(),

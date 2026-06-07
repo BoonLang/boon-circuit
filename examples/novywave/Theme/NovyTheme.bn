@@ -310,9 +310,9 @@ FUNCTION trace_material(mode, state) {
 
 FUNCTION trace_cell_material(mode, state, tone) {
     [
-        ...trace_material(mode: PASSED.mode, state: PASSED.state)
-        color: trace_fill_color(mode: PASSED.mode, tone: PASSED.tone)
-        border: trace_border_color(mode: PASSED.mode, tone: PASSED.tone)
+        ...trace_material(mode: mode, state: state)
+        color: trace_fill_color(mode: mode, tone: tone)
+        border: trace_border_color(mode: mode, tone: tone)
         border_width: 1
     ]
 }
@@ -331,55 +331,55 @@ FUNCTION trace_height(state) {
 
 FUNCTION trace_fill_color(mode, tone) {
     tone |> WHEN {
-        Blue => PASSED.mode |> WHEN {
+        Blue => mode |> WHEN {
             Dark => TEXT { #2563EB }
             Light => TEXT { #2563EB }
         }
         Dark => TEXT { #06111F }
-        Sky => PASSED.mode |> WHEN {
+        Sky => mode |> WHEN {
             Dark => TEXT { #0EA5E9 }
             Light => TEXT { #0284C7 }
         }
-        Indigo => PASSED.mode |> WHEN {
+        Indigo => mode |> WHEN {
             Dark => TEXT { #1D4ED8 }
             Light => TEXT { #1D4ED8 }
         }
-        Cyan => PASSED.mode |> WHEN {
+        Cyan => mode |> WHEN {
             Dark => TEXT { #0891B2 }
             Light => TEXT { #087A98 }
         }
-        Pale => PASSED.mode |> WHEN {
+        Pale => mode |> WHEN {
             Dark => TEXT { #7DD3FC }
             Light => TEXT { #38BDF8 }
         }
-        __ => material(mode: PASSED.mode, of: TraceUnknown).color
+        __ => material(mode: mode, of: TraceUnknown).color
     }
 }
 
 FUNCTION trace_border_color(mode, tone) {
     tone |> WHEN {
         Blue => TEXT { #60A5FA }
-        Dark => PASSED.mode |> WHEN {
+        Dark => mode |> WHEN {
             Dark => TEXT { #1D4ED8 }
             Light => TEXT { #2563EB }
         }
-        Sky => PASSED.mode |> WHEN {
+        Sky => mode |> WHEN {
             Dark => TEXT { #BAE6FD }
             Light => TEXT { #7DD3FC }
         }
         Indigo => TEXT { #60A5FA }
         Cyan => TEXT { #A5F3FC }
-        Pale => PASSED.mode |> WHEN {
+        Pale => mode |> WHEN {
             Dark => TEXT { #E0F2FE }
             Light => TEXT { #BAE6FD }
         }
-        __ => material(mode: PASSED.mode, of: TraceUnknown).color
+        __ => material(mode: mode, of: TraceUnknown).color
     }
 }
 
 FUNCTION trace_label_color(mode, tone) {
     tone |> WHEN {
-        Dark => PASSED.mode |> WHEN {
+        Dark => mode |> WHEN {
             Dark => TEXT { #7EA6D9 }
             Light => TEXT { #9DC5F4 }
         }
@@ -389,7 +389,7 @@ FUNCTION trace_label_color(mode, tone) {
 
 FUNCTION trace_label_font(mode, tone) {
     [
-        ...font(mode: PASSED.mode, of: Mono)
-        color: trace_label_color(mode: PASSED.mode, tone: PASSED.tone)
+        ...font(mode: mode, of: Mono)
+        color: trace_label_color(mode: mode, tone: tone)
     ]
 }

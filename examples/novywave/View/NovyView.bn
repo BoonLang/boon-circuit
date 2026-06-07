@@ -1484,6 +1484,7 @@ FUNCTION fixed_wave_area(signal_id) {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
+            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
@@ -1512,6 +1513,7 @@ FUNCTION fixed_wave_area_clk() {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
+            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
@@ -2186,6 +2188,7 @@ FUNCTION wave_area(signal) {
                 Dark => TEXT { #1f2a3c }
                 Light => TEXT { #93b4e8 }
             }]
+            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
             scroll_x: True
             scrollbars: True
@@ -2351,7 +2354,10 @@ FUNCTION waveform_trace_cell_blue(segment) {
             height: NovyTheme/trace_height(state: segment.state)
             align: [column: Center]
             rounded_corners: 2
-            material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Blue)
+            background: [color: TEXT { #2563EB }]
+            border: [color: TEXT { #60A5FA }]
+            glow: [color: TEXT { #3b82f655 }, intensity: 0.08]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: TraceHigh)
         ]
         label: Scene/Element/text(
             element: []
@@ -2370,7 +2376,7 @@ FUNCTION waveform_trace_cell_blue(segment) {
 FUNCTION waveform_trace_cell_dark(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Dark)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Dark), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -2378,7 +2384,7 @@ FUNCTION waveform_trace_cell_dark(segment) {
 FUNCTION waveform_trace_cell_sky(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Sky)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Sky), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -2386,7 +2392,7 @@ FUNCTION waveform_trace_cell_sky(segment) {
 FUNCTION waveform_trace_cell_indigo(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Indigo)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Indigo), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -2394,7 +2400,7 @@ FUNCTION waveform_trace_cell_indigo(segment) {
 FUNCTION waveform_trace_cell_cyan(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Cyan)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Cyan), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }
@@ -2402,7 +2408,7 @@ FUNCTION waveform_trace_cell_cyan(segment) {
 FUNCTION waveform_trace_cell_pale(segment) {
     Scene/Element/label(
         element: []
-        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, material: NovyTheme/trace_cell_material(mode: PASSED.store.mode, state: segment.state, tone: Pale)]
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Pale), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
 }

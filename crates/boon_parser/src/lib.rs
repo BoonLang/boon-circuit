@@ -2312,6 +2312,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/is_not_empty"
             | "List/latest"
             | "Text/empty"
+            | "Text/concat"
             | "Text/trim"
             | "Text/substring"
             | "Text/length"

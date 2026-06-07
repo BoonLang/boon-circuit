@@ -418,22 +418,48 @@ store: [
             False => TEXT { none }
         }
 
+    selected_rows_profile:
+        LATEST {
+            TEXT { Empty }
+            elements.selected_remove_data.event.press |> THEN { TEXT { WithoutData } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
+            elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
+            elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.show_empty.event.press |> THEN { TEXT { Empty } }
+        }
+
     selected_rows_removed_signal_id:
-        selected_rows_profile == TEXT { WithoutData } |> WHEN {
-            True => TEXT { data_bus }
-            False => TEXT { none }
+        LATEST {
+            TEXT { none }
+            elements.selected_remove_data.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_up.event.press |> THEN { TEXT { none } }
+            elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_rows_first_signal_id:
-        selected_rows_profile == TEXT { DataFirst } |> WHEN {
-            True => TEXT { data_bus }
-            False => TEXT { none }
+        LATEST {
+            TEXT { none }
+            elements.selected_data_up.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { none } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_down.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_rows_last_signal_id:
-        selected_rows_profile == TEXT { DataLast } |> WHEN {
-            True => TEXT { data_bus }
-            False => TEXT { none }
+        LATEST {
+            TEXT { none }
+            elements.selected_data_down.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_remove_data.event.press |> THEN { TEXT { none } }
+            elements.selected_restore_data.event.press |> THEN { TEXT { none } }
+            elements.selected_data_up.event.press |> THEN { TEXT { none } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_signal_rows:
@@ -466,6 +492,9 @@ store: [
 
     search_results_key_summary:
         search_results |> List/join_field(field: "key", separator: ",", empty: "none")
+
+    search_results_name_summary:
+        search_results |> List/join_field(field: "name", separator: ", ", empty: "none")
 
     focused_control_label:
         TEXT { none } |> HOLD focused_control_label {
@@ -537,7 +566,26 @@ store: [
         }
 
     search_result_label:
-        scoped_search_label(text: signal_search_text, scope: active_scope)
+        signal_search_text |> Text/is_empty() |> WHEN {
+            True =>
+                search_results_count
+                |> Text/concat(with: TEXT { results in }, separator: " ")
+                |> Text/concat(with: active_scope_label, separator: " ")
+            False => search_results_count == 1 |> WHEN {
+                True =>
+                    TEXT { 1 result: }
+                    |> Text/concat(with: search_results_name_summary, separator: " ")
+                False => search_results_count == 0 |> WHEN {
+                    True =>
+                        TEXT { 0 results: }
+                        |> Text/concat(with: signal_search_text, separator: " ")
+                    False =>
+                        search_results_count
+                        |> Text/concat(with: TEXT { results: }, separator: " ")
+                        |> Text/concat(with: search_results_name_summary, separator: " ")
+                }
+            }
+        }
 
     search_scope_mode: TEXT { Global }
 
@@ -619,49 +667,14 @@ store: [
             }
         )
 
-    selected_rows_profile:
-        LATEST {
-            TEXT { Empty }
-            elements.selected_remove_data.event.press |> THEN { TEXT { WithoutData } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
-            elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
-            elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.show_empty.event.press |> THEN { TEXT { Empty } }
-        }
-
     selected_rows_count:
-        LATEST {
-            TEXT { 0 }
-            elements.selected_remove_data.event.press |> THEN { TEXT { 7 } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { 8 } }
-            elements.selected_data_up.event.press |> THEN { TEXT { 8 } }
-            elements.selected_data_down.event.press |> THEN { TEXT { 8 } }
-            elements.load_fixture.event.press |> THEN { TEXT { 8 } }
-            elements.show_empty.event.press |> THEN { TEXT { 0 } }
-        }
+        selected_signal_rows |> List/length()
 
     selected_rows_order_label:
-        LATEST {
-            TEXT { none }
-            elements.selected_remove_data.event.press |> THEN { TEXT { clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
-            elements.selected_data_up.event.press |> THEN { TEXT { data_bus[7:0], clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
-            elements.selected_data_down.event.press |> THEN { TEXT { clk, reset_n, data_valid, data_ready, state[2:0], error_count[15:0], temperature, data_bus[7:0] } }
-            elements.load_fixture.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature } }
-            elements.show_empty.event.press |> THEN { TEXT { none } }
-        }
+        selected_signal_rows |> List/join_field(field: "name", separator: ", ", empty: "none")
 
     selected_signal_count_label:
-        LATEST {
-            TEXT { 0 selected }
-            elements.selected_remove_data.event.press |> THEN { TEXT { 7 selected } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { 8 selected } }
-            elements.selected_data_up.event.press |> THEN { TEXT { 8 selected } }
-            elements.selected_data_down.event.press |> THEN { TEXT { 8 selected } }
-            elements.load_fixture.event.press |> THEN { TEXT { 8 selected } }
-            elements.show_empty.event.press |> THEN { TEXT { 0 selected } }
-        }
+        selected_rows_count |> Text/concat(with: TEXT { selected }, separator: " ")
 
     analog_limit_kind:
         TEXT { Auto } |> HOLD analog_limit_kind {
@@ -1522,117 +1535,12 @@ store: [
         bridge_page_match_compact_label(request: bridge_request_page, response: bridge_response_page)
 
     stale_response_policy: TEXT { canonical page id equality required }
-    bridge_contract: NovyBridge/contract_summary()
-    bridge_provider_version: NovyBridge/provider_version()
-    bridge_schema_version: NovyBridge/schema_version()
-    bridge_effect_exports: NovyBridge/effect_exports_label()
-    bridge_data_policy: NovyBridge/data_policy_label()
+    bridge_contract: TEXT { wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats }
+    bridge_provider_version: TEXT { planned official wellen 0.24.x provider }
+    bridge_schema_version: TEXT { wellen.v1 fixture schema draft; hashes required before live bridge }
+    bridge_effect_exports: TEXT { open/hierarchy/signal/cursor/stats }
+    bridge_data_policy: TEXT { comparable descriptors only; no Rust handles }
 ]
-
-FUNCTION scoped_search_label(text, scope) {
-    text == TEXT { data } |> WHEN {
-        True => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
-        False => text == TEXT { reset } |> WHEN {
-            True => TEXT { 1 result: reset_n }
-            False => text == TEXT { temp } |> WHEN {
-                True => TEXT { 1 result: temperature }
-                False => text == TEXT { clk } |> WHEN {
-                    True => TEXT { 1 result: clk }
-                    False => text == TEXT { zzz } |> WHEN {
-                        True => TEXT { 0 results: zzz }
-                        False => text == TEXT { tx } |> WHEN {
-                            True => TEXT { 1 result: tx_data[7:0] }
-                            False => text == TEXT { vcore } |> WHEN {
-                                True => TEXT { 1 result: vcore }
-                                False => scoped_empty_search_label(scope: scope)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-FUNCTION scoped_empty_search_label(scope) {
-    scope == TEXT { top_uart } |> WHEN {
-        True => TEXT { 5 results in top.uart }
-        False => scope == TEXT { top_analog } |> WHEN {
-            True => TEXT { 2 results in top.analog }
-            False => TEXT { 8 results in top.cpu }
-        }
-    }
-}
-
-FUNCTION search_result_key_summary(text, scope) {
-    text == TEXT { data } |> WHEN {
-        True => TEXT { data_bus,data_valid,data_ready,data_parity }
-        False => text == TEXT { reset } |> WHEN {
-            True => TEXT { reset_n }
-            False => text == TEXT { temp } |> WHEN {
-                True => TEXT { temperature }
-                False => text == TEXT { clk } |> WHEN {
-                    True => TEXT { clk }
-                    False => text == TEXT { tx } |> WHEN {
-                        True => TEXT { tx_data }
-                        False => text == TEXT { vcore } |> WHEN {
-                            True => TEXT { voltage }
-                            False => text == TEXT { zzz } |> WHEN {
-                                True => TEXT { none }
-                                False => empty_search_result_key_summary(scope: scope)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-FUNCTION search_result_count(text, scope) {
-    text == TEXT { data } |> WHEN {
-        True => 4
-        False => text == TEXT { reset } |> WHEN {
-            True => 1
-            False => text == TEXT { temp } |> WHEN {
-                True => 1
-                False => text == TEXT { clk } |> WHEN {
-                    True => 1
-                    False => text == TEXT { tx } |> WHEN {
-                        True => 1
-                        False => text == TEXT { vcore } |> WHEN {
-                            True => 1
-                            False => text == TEXT { zzz } |> WHEN {
-                                True => 0
-                                False => empty_search_result_count(scope: scope)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-FUNCTION empty_search_result_count(scope) {
-    scope == TEXT { top_uart } |> WHEN {
-        True => 5
-        False => scope == TEXT { top_analog } |> WHEN {
-            True => 2
-            False => 8
-        }
-    }
-}
-
-FUNCTION empty_search_result_key_summary(scope) {
-    scope == TEXT { top_uart } |> WHEN {
-        True => TEXT { tx_data,rx_data,baud_tick,uart_busy,framing_error }
-        False => scope == TEXT { top_analog } |> WHEN {
-            True => TEXT { temperature,voltage }
-            False => TEXT { clk,reset_n,data_bus,data_valid,data_ready,data_parity,state,error_count }
-        }
-    }
-}
 
 FUNCTION bridge_page_match_status(request, response) {
     request == TEXT { PAGE_UNAVAILABLE } |> WHEN {

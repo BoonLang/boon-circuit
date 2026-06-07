@@ -6591,13 +6591,13 @@ impl GenericScheduledRuntime {
         {
             return self.read_list_field(&row.list, row.index, name, frame);
         }
+        if let Some(value) = self.root_pure_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
             frame.reads.insert(GenericReadKey::Root {
                 field: name.to_owned(),
             });
-            return Ok(value);
-        }
-        if let Some(value) = self.root_derived_boon_value(name, frame)? {
             return Ok(value);
         }
         Ok(BoonValue::Text(name.to_owned()))
@@ -6624,13 +6624,13 @@ impl GenericScheduledRuntime {
             return self.read_list_field(&row.list, row.index, &parts[1], frame);
         }
         let full_path = parts.join(".");
+        if let Some(value) = self.root_pure_derived_boon_value(&full_path, frame)? {
+            return Ok(value);
+        }
         if let Some(value) = self.runtime_scalar_boon_value(&full_path) {
             frame
                 .reads
                 .insert(GenericReadKey::Root { field: full_path });
-            return Ok(value);
-        }
-        if let Some(value) = self.root_derived_boon_value(&full_path, frame)? {
             return Ok(value);
         }
         Ok(BoonValue::Text(full_path))
@@ -6716,6 +6716,20 @@ impl GenericScheduledRuntime {
         match function {
             "SOURCE" => self.call_input_or_first(input, args, frame),
             "Text/empty" => Ok(BoonValue::Text(String::new())),
+            "Text/concat" => {
+                let left = self.call_input_or_first(input, args, frame)?;
+                let right = self.named_or_positional_arg_value(args, "with", 0, frame)?;
+                let separator = self
+                    .named_arg_value(args, "separator", frame)
+                    .map(|value| value.as_text().unwrap_or_default())
+                    .unwrap_or_default();
+                Ok(BoonValue::Text(format!(
+                    "{}{}{}",
+                    left.as_text().unwrap_or_default(),
+                    separator,
+                    right.as_text().unwrap_or_default()
+                )))
+            }
             "Text/trim" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Text(
@@ -7696,7 +7710,7 @@ impl GenericScheduledRuntime {
         Ok(BoonValue::Number(sum))
     }
 
-    fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+    fn assert_generic_step_expectations(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
             let mut required_fields = vec!["formula_text"];
             if expect.value.is_some() {
@@ -7778,9 +7792,38 @@ impl GenericScheduledRuntime {
             assert_eq_report(&step.id, "recomputed", expected, &actual)?;
         }
         for (path, expected) in &step.expect_root_text {
-            self.assert_root_textlike(&step.id, path, path, expected)?;
+            self.assert_root_textlike_for_scenario(&step.id, path, path, expected)?;
         }
         Ok(())
+    }
+
+    fn assert_root_textlike_for_scenario(
+        &mut self,
+        step_id: &str,
+        label: &str,
+        path: &str,
+        expected: &str,
+    ) -> RuntimeResult<()> {
+        let actual = self.root_textlike_for_assertion(path)?;
+        assert_eq_report(step_id, label, &expected, &actual.as_str())
+    }
+
+    fn root_textlike_for_assertion(&mut self, path: &str) -> RuntimeResult<String> {
+        let candidates = if path.contains('.') {
+            vec![path.to_owned()]
+        } else {
+            vec![format!("store.{path}"), path.to_owned()]
+        };
+        for candidate in &candidates {
+            let mut frame = GenericEvalFrame::root();
+            if let Some(value) = self.root_derived_boon_value(candidate, &mut frame)?
+                && !matches!(value, BoonValue::Error(_) | BoonValue::Empty)
+                && let Some(text) = value.as_text()
+            {
+                return Ok(text);
+            }
+        }
+        self.root_textlike(path)
     }
 
     fn generic_addressed_row(&self, address: &str) -> RuntimeResult<(String, usize)> {
@@ -8005,6 +8048,20 @@ impl GenericScheduledRuntime {
             field: plan.path.clone(),
         });
         Ok(Some(value))
+    }
+
+    fn root_pure_derived_boon_value(
+        &mut self,
+        path: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        let Some(plan) = self.generic_derived.root_field_plan(path) else {
+            return Ok(None);
+        };
+        if !matches!(plan.kind, DerivedValueKind::Pure) {
+            return Ok(None);
+        }
+        self.root_derived_boon_value(path, frame)
     }
 
     fn runtime_path_list_head<'a>(&'a self, path: &'a str) -> Option<(&'a str, RuntimePathTail)> {
@@ -14675,7 +14732,7 @@ impl ScenarioExecutor for LoadedRuntime {
     fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
         let generic = self
             .generic
-            .as_ref()
+            .as_mut()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
         generic.assert_generic_step_expectations(step)
     }
@@ -17326,6 +17383,38 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Selected r
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn text_concat_builds_labels_from_numbers_and_text() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    held: Text/empty() |> HOLD held { LATEST {} }
+    count: 4
+    scope: TEXT { top.cpu }
+    names: TEXT { data_bus[7:0], data_valid }
+    scoped_label:
+        count
+        |> Text/concat(with: TEXT { results in }, separator: " ")
+        |> Text/concat(with: scope, separator: " ")
+    results_label:
+        count
+        |> Text/concat(with: TEXT { results: }, separator: " ")
+        |> Text/concat(with: names, separator: " ")
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Text concat }))
+"#;
+        let mut runtime = LiveRuntime::from_source("text-concat-labels", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["scoped_label"], "4 results in top.cpu");
+        assert_eq!(
+            summary["store"]["results_label"],
+            "4 results: data_bus[7:0], data_valid"
+        );
     }
 
     #[test]

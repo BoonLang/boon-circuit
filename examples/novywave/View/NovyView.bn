@@ -1137,34 +1137,18 @@ FUNCTION waveform_rows() {
 }
 
 FUNCTION waveform_rows_expanded() {
-    waveform_rows_from(list: PASSED.store.selected_signals)
-}
-
-FUNCTION waveform_rows_from(list) {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 2
         style: [width: Fill, height: Fill, paint: False]
         items:
-            list |> List/map(row, new: selected_waveform_row(row: row))
+            PASSED.store.selected_signals |> List/map(row, new: selected_waveform_row(row: row))
     )
 }
 
 FUNCTION selected_waveform_row(row) {
-    row.id == TEXT { clk } |> WHEN {
-        True => waveform_row_clk()
-        False => row.id == TEXT { reset_n } |> WHEN {
-            True => waveform_row_reset()
-            False => row.id == TEXT { data_bus } |> WHEN {
-                True => waveform_row_data()
-                False => row.id == TEXT { temperature } |> WHEN {
-                    True => waveform_row_temperature()
-                    False => waveform_row(signal: row)
-                }
-            }
-        }
-    }
+    waveform_row(signal: row)
 }
 
 FUNCTION waveform_row_clk() {

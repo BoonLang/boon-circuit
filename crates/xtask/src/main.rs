@@ -7968,6 +7968,48 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             "physical TodoMVC preview E2E did not prove initial rows, add-todo visual output, single clear-completed control, and theme runtime actions".to_owned()
         }),
     );
+    let novywave_content_evidence = if example == "novywave" {
+        novywave_preview_content_evidence(&extra)
+    } else {
+        json!({"status": "not-applicable"})
+    };
+    let novywave_content_pass = example != "novywave"
+        || novywave_content_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let novywave_content_detail = format!(
+        "status={:?}, missing_empty={}, missing_loaded={}, missing_sources={}, material_pass={:?}",
+        novywave_content_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        novywave_content_evidence
+            .get("missing_empty_labels")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        novywave_content_evidence
+            .get("missing_loaded_labels")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        novywave_content_evidence
+            .get("missing_runtime_sources")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        novywave_content_evidence
+            .pointer("/material_metrics/pass")
+            .and_then(serde_json::Value::as_bool)
+    );
+    extra["novywave_preview_content_evidence"] = novywave_content_evidence;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:novywave-content"),
+        novywave_content_pass,
+        novywave_content_detail,
+        (!novywave_content_pass).then(|| {
+            "NovyWave preview E2E did not prove empty state, loaded waveform UI, physical material regions, and representative workflow actions".to_owned()
+        }),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -10059,6 +10101,284 @@ fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serd
         "add_runtime_pass": add_runtime_pass,
         "theme_runtime_sources": theme_runtime_sources,
         "missing_theme_sources": missing_theme_sources
+    })
+}
+
+fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::Value {
+    let initial_layout_path = report
+        .pointer("/preview_document_layout_proof/artifact_path")
+        .or_else(|| report.pointer("/preview_native_gpu_render_proof/layout_artifact"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let initial_layout = initial_layout_path
+        .as_deref()
+        .and_then(|path| read_json(Path::new(path)).ok());
+    let initial_texts = initial_layout
+        .as_ref()
+        .map(layout_display_texts)
+        .unwrap_or_default();
+    let required_empty_labels = [
+        "NovyWave.io",
+        "No waveform loaded",
+        "Drop or load a VCD, FST, or GHW waveform to inspect signals.",
+        "Bridge state: no request scheduled; pure descriptor is wave:none",
+        "Supported fixture contracts: VCD, FST, GHW",
+        "Load fixture",
+    ];
+    let missing_empty_labels = missing_layout_labels(&initial_texts, &required_empty_labels);
+
+    let post_input_layout_paths = report
+        .pointer("/boon_driver_proof/action_proofs")
+        .and_then(serde_json::Value::as_array)
+        .map(|actions| {
+            actions
+                .iter()
+                .filter_map(|action| {
+                    action
+                        .pointer("/framebuffer_delta_evidence/post_input_layout_artifact")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let required_loaded_labels = [
+        "Files and scopes",
+        "Variables",
+        "Selected Variables",
+        "single fixture: counter.vcd",
+        "fixture VCD wave:vcd:counter:0-240ns",
+        "- counter.vcd",
+        "- uart_compare.fst",
+        "- simple_test.ghw",
+        "+ top.cpu",
+        "+ top.uart",
+        "+ top.analog",
+        "data_bus[7:0]",
+        "0x2a",
+        "Auto 39 C .. 44 C",
+        "0 ns",
+        "40 ns",
+        "80 ns",
+        "120 ns",
+        "M 42 ns",
+        "42.8 C",
+    ];
+    let mut loaded_layout_path = None;
+    let mut loaded_texts = Vec::new();
+    let mut material_metrics = json!({"pass": false, "reason": "no loaded layout artifact"});
+    let mut missing_loaded_labels = required_loaded_labels
+        .iter()
+        .map(|label| json!(label))
+        .collect::<Vec<_>>();
+    for path in &post_input_layout_paths {
+        let Ok(artifact) = read_json(Path::new(path)) else {
+            continue;
+        };
+        let texts = layout_display_texts(&artifact);
+        let missing = missing_layout_labels(&texts, &required_loaded_labels);
+        if missing.is_empty() {
+            material_metrics = novywave_material_metrics(&artifact);
+            loaded_layout_path = Some(path.clone());
+            loaded_texts = texts;
+            missing_loaded_labels = missing;
+            break;
+        }
+        if missing.len() < missing_loaded_labels.len() {
+            loaded_layout_path = Some(path.clone());
+            loaded_texts = texts;
+            missing_loaded_labels = missing;
+            material_metrics = novywave_material_metrics(&artifact);
+        }
+    }
+
+    let required_runtime_sources = [
+        "store.elements.load_fixture",
+        "store.elements.select_uart_compare_file",
+        "store.elements.select_ghw_file",
+        "store.elements.selected_remove_data",
+        "store.elements.selected_restore_data",
+        "store.elements.selected_data_up",
+        "store.elements.selected_data_down",
+        "store.elements.stale_response_probe",
+        "store.elements.mode_to_light",
+        "store.elements.mode_to_dark",
+        "store.elements.format_ascii",
+    ];
+    let runtime_sources = novywave_passed_runtime_sources(report);
+    let missing_runtime_sources = required_runtime_sources
+        .iter()
+        .filter(|source| !runtime_sources.contains(**source))
+        .map(|source| json!(source))
+        .collect::<Vec<_>>();
+
+    let material_pass = material_metrics
+        .get("pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let pass = initial_layout.is_some()
+        && missing_empty_labels.is_empty()
+        && missing_loaded_labels.is_empty()
+        && missing_runtime_sources.is_empty()
+        && material_pass;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "initial_layout_artifact": initial_layout_path,
+        "loaded_layout_artifact": loaded_layout_path,
+        "initial_text_samples": initial_texts
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .take(48)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "loaded_text_samples": loaded_texts
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .take(96)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "post_input_layout_artifact_count": post_input_layout_paths.len(),
+        "missing_empty_labels": missing_empty_labels,
+        "missing_loaded_labels": missing_loaded_labels,
+        "runtime_sources": runtime_sources.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>(),
+        "missing_runtime_sources": missing_runtime_sources,
+        "material_metrics": material_metrics,
+        "contract": "NovyWave native preview must prove empty state, loaded waveform UI labels, workflow actions, and physical material/glow/glass style regions"
+    })
+}
+
+fn missing_layout_labels(texts: &[String], required: &[&str]) -> Vec<serde_json::Value> {
+    required
+        .iter()
+        .filter(|label| !texts.iter().any(|text| text == **label))
+        .map(|label| json!(label))
+        .collect()
+}
+
+fn novywave_passed_runtime_sources(report: &serde_json::Value) -> BTreeSet<String> {
+    let mut sources = BTreeSet::new();
+    if let Some(assertions) = report
+        .pointer("/native_runtime_assertion_evidence/assertions")
+        .and_then(serde_json::Value::as_array)
+    {
+        for assertion in assertions {
+            if assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true) {
+                if let Some(source) = assertion
+                    .pointer("/event/source")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    sources.insert(source.to_owned());
+                }
+            }
+        }
+    }
+    if let Some(actions) = report
+        .pointer("/boon_driver_proof/action_proofs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for action in actions {
+            if action.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+                if let Some(source) = action
+                    .pointer("/runtime_event/source")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    sources.insert(source.to_owned());
+                }
+            }
+        }
+    }
+    sources
+}
+
+fn novywave_material_metrics(layout_artifact: &serde_json::Value) -> serde_json::Value {
+    let Some(display_list) = layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return json!({"pass": false, "reason": "layout artifact missing display list"});
+    };
+    let mut frosted_regions = 0_u64;
+    let mut glow_regions = 0_u64;
+    let mut glass_regions = 0_u64;
+    let mut depth_regions = 0_u64;
+    let mut hover_regions = 0_u64;
+    let mut waveform_text_regions = 0_u64;
+    for item in display_list {
+        let Some(style) = item.get("style").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if style
+            .get("frosted_blur")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            > 0.0
+        {
+            frosted_regions += 1;
+        }
+        if style.get("glow_color").is_some()
+            || style
+                .get("glow_intensity")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0)
+                > 0.0
+        {
+            glow_regions += 1;
+        }
+        if style
+            .get("glass_highlight")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            > 0.0
+        {
+            glass_regions += 1;
+        }
+        if style
+            .get("depth")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            > 0.0
+        {
+            depth_regions += 1;
+        }
+        if style
+            .get("__hover_scope")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || style.get("__hover_background").is_some()
+        {
+            hover_regions += 1;
+        }
+        if item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| matches!(text, "0x2a" | "XX" | "ZZ" | "42.8 C" | "M 42 ns"))
+        {
+            waveform_text_regions += 1;
+        }
+    }
+    let pass = frosted_regions >= 4
+        && glow_regions >= 4
+        && glass_regions >= 8
+        && depth_regions >= 3
+        && hover_regions >= 8
+        && waveform_text_regions >= 4;
+    json!({
+        "pass": pass,
+        "frosted_regions": frosted_regions,
+        "glow_regions": glow_regions,
+        "glass_regions": glass_regions,
+        "depth_regions": depth_regions,
+        "hover_regions": hover_regions,
+        "waveform_text_regions": waveform_text_regions,
+        "thresholds": {
+            "frosted_regions_min": 4,
+            "glow_regions_min": 4,
+            "glass_regions_min": 8,
+            "depth_regions_min": 3,
+            "hover_regions_min": 8,
+            "waveform_text_regions_min": 4
+        }
     })
 }
 

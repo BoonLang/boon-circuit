@@ -22047,7 +22047,7 @@ fn document_resolved_value<'a>(
     let mut parts = path.split('.');
     let first = parts.next()?;
     let mut current = if first == "PASSED" {
-        context.passed.as_ref()?
+        context.passed.as_ref().or(context.root)?
     } else {
         context.locals.get(first).or_else(|| {
             context
@@ -38608,6 +38608,15 @@ mod tests {
             Some(&state_summary),
         )
         .expect("NovyWave layout should lower from live document state");
+        for selected_value in ["0x2a", "42.8 C"] {
+            assert!(
+                layout
+                    .display_list
+                    .iter()
+                    .any(|item| item.text.as_deref() == Some(selected_value)),
+                "NovyWave selected waveform rows should render Boon-owned current value `{selected_value}`"
+            );
+        }
 
         for label in ["Probe", "Light", "Fmt"] {
             let context = format!("NovyWave control `{label}`");

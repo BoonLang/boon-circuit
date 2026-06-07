@@ -593,6 +593,22 @@ store: [
         Text/empty() |> HOLD keyboard_last_key {
             LATEST {
                 elements.keyboard_capture.key
+                elements.load_fixture.event.press |> THEN { Text/empty() }
+                elements.show_empty.event.press |> THEN { Text/empty() }
+                elements.select_counter_file.event.press |> THEN { Text/empty() }
+                elements.select_uart_compare_file.event.press |> THEN { Text/empty() }
+                elements.select_ghw_file.event.press |> THEN { Text/empty() }
+                elements.select_clk.event.press |> THEN { Text/empty() }
+                elements.select_reset.event.press |> THEN { Text/empty() }
+                elements.select_data.event.press |> THEN { Text/empty() }
+                elements.select_temperature.event.press |> THEN { Text/empty() }
+                elements.format_cycle.event.press |> THEN { Text/empty() }
+                elements.format_hex.event.press |> THEN { Text/empty() }
+                elements.format_grouped.event.press |> THEN { Text/empty() }
+                elements.format_octal.event.press |> THEN { Text/empty() }
+                elements.format_signed.event.press |> THEN { Text/empty() }
+                elements.format_unsigned.event.press |> THEN { Text/empty() }
+                elements.format_ascii.event.press |> THEN { Text/empty() }
             }
         }
 
@@ -884,6 +900,8 @@ store: [
                     A => TEXT { Close }
                     __ => SKIP
                 }
+                elements.load_fixture.event.press |> THEN { TEXT { Fit } }
+                elements.show_empty.event.press |> THEN { TEXT { Fit } }
             }
         }
 
@@ -901,6 +919,8 @@ store: [
                     E => TEXT { RightWindow }
                     __ => SKIP
                 }
+                elements.load_fixture.event.press |> THEN { TEXT { Center } }
+                elements.show_empty.event.press |> THEN { TEXT { Center } }
             }
         }
 
@@ -917,6 +937,8 @@ store: [
                 E => TEXT { Cursor48 }
                 __ => SKIP
             }
+            elements.load_fixture.event.press |> THEN { TEXT { Cursor42 } }
+            elements.show_empty.event.press |> THEN { TEXT { Cursor42 } }
         }
 
     viewport_label:

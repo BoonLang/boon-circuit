@@ -410,6 +410,11 @@ pub enum UpdateExpression {
         path: String,
         previous: String,
     },
+    PrefixPayloadConcat {
+        prefix: String,
+        payload_path: String,
+        separator: String,
+    },
     BoolNot {
         path: String,
     },
@@ -2987,6 +2992,17 @@ fn verify_scheduled_update_expression(
             }
             require_known_symbol("trim previous", previous, known_symbols)
         }
+        UpdateExpression::PrefixPayloadConcat {
+            prefix: _,
+            payload_path,
+            separator: _,
+        } => {
+            if source_payload_input_matches(payload_path, source) {
+                Ok(())
+            } else {
+                require_known_symbol("concat payload", payload_path, known_symbols)
+            }
+        }
         UpdateExpression::MatchConst { input, .. } => {
             if source_payload_input_matches(input, source) {
                 Ok(())
@@ -3234,6 +3250,15 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::TextTrimOrPrevious { path, previous } => {
             reject_hidden_identity_identifier("trim source", path)?;
             reject_hidden_identity_identifier("trim previous", previous)
+        }
+        UpdateExpression::PrefixPayloadConcat {
+            prefix,
+            payload_path,
+            separator,
+        } => {
+            reject_hidden_identity_identifier("concat prefix", prefix)?;
+            reject_hidden_identity_identifier("concat payload", payload_path)?;
+            reject_hidden_identity_identifier("concat separator", separator)
         }
         UpdateExpression::NumberInfix { left, right, .. } => {
             reject_hidden_identity_identifier("number infix left", left)?;
@@ -3677,7 +3702,9 @@ fn update_branches(
             let mut branches = direct_sources_for_field(direct_sources, field)
                 .cloned()
                 .map(|source| UpdateBranch {
-                    expression: update_expression_for_source(program, &cell.path, field, &source),
+                    expression: update_expression_for_source(
+                        program, &cell.path, field, fields, &source,
+                    ),
                     indexed: cell.indexed,
                     target: cell.path.clone(),
                     source,
@@ -3912,7 +3939,7 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
         DerivedValueKind::Aggregate
     } else if field.has_any_operator(&["List/retain", "List/map", "List/chunk", "List/find"]) {
         DerivedValueKind::ListView
-    } else if !sources.is_empty() || field.has_when_or_then_expr() {
+    } else if !sources.is_empty() || field.has_then_expr() {
         DerivedValueKind::SourceEventTransform
     } else if field.ast_items.is_empty() {
         DerivedValueKind::Unknown
@@ -5048,6 +5075,7 @@ fn update_expression_for_source(
     program: &ParsedProgram,
     target: &str,
     field: &FieldDef,
+    fields: &[FieldDef],
     source: &str,
 ) -> UpdateExpression {
     let variants = source_ref_variants(source);
@@ -5083,12 +5111,25 @@ fn update_expression_for_source(
     if let Some(expression) = branch.then_number_infix_expression(field, target) {
         return expression;
     }
+    if let Some(expression) =
+        prefix_payload_concat_update_expression_from_items(&branch.items, &variants)
+    {
+        return expression;
+    }
+    if let Some(expression) =
+        then_function_match_update_expression(program, field, target, fields, source)
+    {
+        return expression;
+    }
+    if let Some(expression) = branch.then_prefix_payload_concat_expression(&variants) {
+        return expression;
+    }
     if let Some(value) = branch.then_simple_update_value() {
         if let SimpleThenUpdateValue::Path(path) = &value {
-            let canonical = canonical_scalar_update_path(field, target, path);
+            let canonical = canonical_scalar_update_path_with_fields(field, target, path, fields);
             if scope_id_for_path(&row_scopes(program), &canonical).is_none()
                 && let Some(expression) =
-                    match_const_update_expression(field, target, source, &branch)
+                    match_const_update_expression(field, target, fields, source, &branch)
                         .filter(|expression| !match_const_input_is_row_scoped(program, expression))
             {
                 return expression;
@@ -5097,11 +5138,12 @@ fn update_expression_for_source(
         return match value {
             SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
             SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
-                path: canonical_scalar_update_path(field, target, &path),
+                path: canonical_scalar_update_path_with_fields(field, target, &path, fields),
             },
         };
     }
-    if let Some(expression) = match_const_update_expression(field, target, source, &branch) {
+    if let Some(expression) = match_const_update_expression(field, target, fields, source, &branch)
+    {
         return expression;
     }
     if variants
@@ -5138,6 +5180,212 @@ fn update_expression_for_source(
     }
 }
 
+fn then_function_match_update_expression(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+) -> Option<UpdateExpression> {
+    field.ast_exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        if !then_input_matches_source(field, input, source) {
+            return None;
+        }
+        let output = output.or_else(|| {
+            field
+                .ast_exprs
+                .iter()
+                .filter(|candidate| candidate.line > expr.line)
+                .find_map(|candidate| match candidate.kind {
+                    AstExprKind::Call { .. } => Some(candidate.id),
+                    _ => None,
+                })
+        })?;
+        let output = field
+            .ast_exprs
+            .iter()
+            .find(|candidate| candidate.id == output)?;
+        let AstExprKind::Call { function, args } = &output.kind else {
+            return None;
+        };
+        function_match_const_update_expression(program, field, target, fields, function, args)
+    })
+}
+
+fn function_match_const_update_expression(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    function: &str,
+    args: &[AstCallArg],
+) -> Option<UpdateExpression> {
+    let function = function_definition_for_call(program, function)?;
+    let function_expr_ids = statement_expr_ids_recursive(&function.statement, &program.expressions);
+    let function_exprs = function_expr_ids
+        .iter()
+        .filter_map(|expr_id| program.expressions.iter().find(|expr| expr.id == *expr_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    function_exprs.iter().find_map(|expr| {
+        let AstExprKind::When { input } = expr.kind else {
+            return None;
+        };
+        let input_name = ast_argument_value_in_exprs(&function_exprs, input)?;
+        let call_input = function_call_arg_update_path(
+            field,
+            target,
+            fields,
+            &field.ast_exprs,
+            args,
+            &function.args,
+            &input_name,
+        )?;
+        let arms =
+            match_const_arms_for_statement_exprs(&function.statement, &function_exprs, expr.id);
+        (!arms.is_empty()).then_some(UpdateExpression::MatchConst {
+            input: call_input,
+            arms,
+        })
+    })
+}
+
+fn function_definition_for_call<'a>(
+    program: &'a ParsedProgram,
+    function: &str,
+) -> Option<FunctionDefinition> {
+    let definitions = function_definitions(program);
+    definitions
+        .iter()
+        .find(|definition| definition.name == function)
+        .cloned()
+        .or_else(|| {
+            let suffix = function.rsplit_once('/').map(|(_, name)| name)?;
+            definitions
+                .iter()
+                .find(|definition| definition.name == suffix)
+                .cloned()
+        })
+}
+
+fn statement_expr_ids_recursive(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<usize> {
+    let mut ids = Vec::new();
+    collect_statement_expr_ids_recursive(statement, expressions, &mut ids);
+    ids
+}
+
+fn collect_statement_expr_ids_recursive(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    ids: &mut Vec<usize>,
+) {
+    if let Some(expr_id) = statement.expr {
+        ids.push(expr_id);
+        collect_expr_ids_recursive(expr_id, expressions, ids);
+    }
+    for child in &statement.children {
+        collect_statement_expr_ids_recursive(child, expressions, ids);
+    }
+}
+
+fn collect_expr_ids_recursive(expr_id: usize, expressions: &[AstExpr], ids: &mut Vec<usize>) {
+    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
+        return;
+    };
+    let push_child = |child_id: usize, ids: &mut Vec<usize>| {
+        if !ids.contains(&child_id) {
+            ids.push(child_id);
+        }
+        collect_expr_ids_recursive(child_id, expressions, ids);
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => {
+            for arg in args {
+                push_child(arg.value, ids);
+            }
+        }
+        AstExprKind::Pipe { input, args, .. } => {
+            push_child(*input, ids);
+            for arg in args {
+                push_child(arg.value, ids);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            push_child(*initial, ids);
+        }
+        AstExprKind::Then {
+            input,
+            output: Some(output),
+        } => {
+            push_child(*input, ids);
+            push_child(*output, ids);
+        }
+        AstExprKind::Then {
+            input,
+            output: None,
+        } => push_child(*input, ids),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => push_child(*output, ids),
+        AstExprKind::Infix { left, right, .. } => {
+            push_child(*left, ids);
+            push_child(*right, ids);
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for record_field in fields {
+                push_child(record_field.value, ids);
+            }
+        }
+        AstExprKind::ListLiteral { .. }
+        | AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+}
+
+fn function_call_arg_update_path(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    call_exprs: &[AstExpr],
+    args: &[AstCallArg],
+    formals: &[String],
+    input_name: &str,
+) -> Option<String> {
+    let named_arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(input_name))
+        .and_then(|arg| ast_argument_value_in_exprs(call_exprs, arg.value));
+    let positional_arg = formals
+        .iter()
+        .position(|formal| formal == input_name)
+        .and_then(|index| {
+            args.iter()
+                .filter(|arg| arg.name.is_none())
+                .nth(index)
+                .and_then(|arg| ast_argument_value_in_exprs(call_exprs, arg.value))
+        });
+    named_arg
+        .or(positional_arg)
+        .map(|path| canonical_scalar_update_path_with_fields(field, target, &path, fields))
+}
+
 fn match_const_input_is_row_scoped(program: &ParsedProgram, expression: &UpdateExpression) -> bool {
     let UpdateExpression::MatchConst { input, .. } = expression else {
         return false;
@@ -5148,6 +5396,7 @@ fn match_const_input_is_row_scoped(program: &ParsedProgram, expression: &UpdateE
 fn match_const_update_expression(
     field: &FieldDef,
     target: &str,
+    fields: &[FieldDef],
     source: &str,
     branch: &RoutedBranch,
 ) -> Option<UpdateExpression> {
@@ -5159,13 +5408,15 @@ fn match_const_update_expression(
                 return None;
             };
             expr_matches_source(field, input, source)
-                .then(|| match_const_update_expression_from_expr(field, target, expr.id))
+                .then(|| match_const_update_expression_from_expr(field, target, fields, expr.id))
                 .flatten()
         })
         .or_else(|| {
             branch.ast_exprs.iter().find_map(|expr| {
                 matches!(expr.kind, AstExprKind::When { .. })
-                    .then(|| match_const_update_expression_from_expr(field, target, expr.id))
+                    .then(|| {
+                        match_const_update_expression_from_expr(field, target, fields, expr.id)
+                    })
                     .flatten()
             })
         })
@@ -5179,11 +5430,13 @@ fn match_const_update_expression(
                         .ast_exprs
                         .iter()
                         .any(|branch_expr| branch_expr.id == expr.id))
-                .then(|| match_const_update_expression_from_then_expr(field, target, expr.id))
+                .then(|| {
+                    match_const_update_expression_from_then_expr(field, target, fields, expr.id)
+                })
                 .flatten()
             })
         })
-        .or_else(|| following_match_const_update_expression(field, target, source))
+        .or_else(|| following_match_const_update_expression(field, target, fields, source))
 }
 
 fn then_input_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
@@ -5223,6 +5476,7 @@ fn bool_toggle_when_matches_source(field: &FieldDef, source: &str) -> bool {
 fn match_const_update_expression_from_then_expr(
     field: &FieldDef,
     target: &str,
+    fields: &[FieldDef],
     expr_id: usize,
 ) -> Option<UpdateExpression> {
     let expr = field_expr(field, expr_id)?;
@@ -5230,12 +5484,13 @@ fn match_const_update_expression_from_then_expr(
         return None;
     };
     let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
-    match_const_update_expression_from_expr(field, target, output)
+    match_const_update_expression_from_expr(field, target, fields, output)
 }
 
 fn following_match_const_update_expression(
     field: &FieldDef,
     target: &str,
+    fields: &[FieldDef],
     source: &str,
 ) -> Option<UpdateExpression> {
     field.ast_exprs.iter().find_map(|expr| {
@@ -5245,7 +5500,7 @@ fn following_match_const_update_expression(
         let then = field.ast_exprs.iter().find(|candidate| {
             candidate.line > expr.line && matches!(candidate.kind, AstExprKind::Then { .. })
         })?;
-        match_const_update_expression_from_then_expr(field, target, then.id)
+        match_const_update_expression_from_then_expr(field, target, fields, then.id)
     })
 }
 
@@ -5262,20 +5517,25 @@ fn following_when_expr_id(field: &FieldDef, line: usize) -> Option<usize> {
 fn match_const_update_expression_from_expr(
     field: &FieldDef,
     target: &str,
+    fields: &[FieldDef],
     expr_id: usize,
 ) -> Option<UpdateExpression> {
     let expr = field_expr(field, expr_id)?;
     match &expr.kind {
         AstExprKind::When { input } => {
-            let input =
-                canonical_scalar_update_path(field, target, &ast_argument_value(field, *input)?);
+            let input = canonical_scalar_update_path_with_fields(
+                field,
+                target,
+                &ast_argument_value(field, *input)?,
+                fields,
+            );
             let arms = match_const_arms_for_when(field, expr.id);
             (!arms.is_empty()).then_some(UpdateExpression::MatchConst { input, arms })
         }
         AstExprKind::Then {
             output: Some(output),
             ..
-        } => match_const_update_expression_from_expr(field, target, *output),
+        } => match_const_update_expression_from_expr(field, target, fields, *output),
         _ => None,
     }
 }
@@ -5288,6 +5548,73 @@ fn match_const_arms_for_when(field: &FieldDef, when_expr_id: usize) -> Vec<Updat
     } else {
         arms
     }
+}
+
+fn match_const_arms_for_statement_exprs(
+    statement: &AstStatement,
+    exprs: &[AstExpr],
+    when_expr_id: usize,
+) -> Vec<UpdateMatchArm> {
+    let mut arms = Vec::new();
+    collect_match_const_arms_for_statement_exprs(statement, exprs, when_expr_id, &mut arms);
+    if arms.is_empty() {
+        match_const_arms_after_when_expr_in_exprs(exprs, when_expr_id)
+    } else {
+        arms
+    }
+}
+
+fn collect_match_const_arms_for_statement_exprs(
+    statement: &AstStatement,
+    exprs: &[AstExpr],
+    when_expr_id: usize,
+    arms: &mut Vec<UpdateMatchArm>,
+) -> bool {
+    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
+        expr_id == when_expr_id || expr_contains_expr_id_in_exprs(exprs, expr_id, when_expr_id)
+    });
+    if statement_contains_when {
+        for child in &statement.children {
+            if let Some(arm) = match_const_arm_in_exprs(exprs, child) {
+                arms.push(arm);
+            }
+        }
+        if !arms.is_empty() {
+            return true;
+        }
+    }
+    for child in &statement.children {
+        if collect_match_const_arms_for_statement_exprs(child, exprs, when_expr_id, arms) {
+            return true;
+        }
+    }
+    false
+}
+
+fn match_const_arms_after_when_expr_in_exprs(
+    exprs: &[AstExpr],
+    when_expr_id: usize,
+) -> Vec<UpdateMatchArm> {
+    let Some(when_expr) = exprs.iter().find(|expr| expr.id == when_expr_id) else {
+        return Vec::new();
+    };
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_expr.line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    exprs
+        .iter()
+        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
+        .filter_map(|expr| match_const_arm_expr_in_exprs(exprs, expr))
+        .collect()
 }
 
 fn match_const_arms_after_when_expr(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
@@ -5348,7 +5675,17 @@ fn match_const_arm(field: &FieldDef, statement: &AstStatement) -> Option<UpdateM
     match_const_arm_expr(field, expr)
 }
 
+fn match_const_arm_in_exprs(exprs: &[AstExpr], statement: &AstStatement) -> Option<UpdateMatchArm> {
+    let expr_id = statement.expr?;
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match_const_arm_expr_in_exprs(exprs, expr)
+}
+
 fn match_const_arm_expr(field: &FieldDef, expr: &AstExpr) -> Option<UpdateMatchArm> {
+    match_const_arm_expr_in_exprs(&field.ast_exprs, expr)
+}
+
+fn match_const_arm_expr_in_exprs(exprs: &[AstExpr], expr: &AstExpr) -> Option<UpdateMatchArm> {
     let AstExprKind::MatchArm {
         pattern,
         output: Some(output),
@@ -5356,11 +5693,82 @@ fn match_const_arm_expr(field: &FieldDef, expr: &AstExpr) -> Option<UpdateMatchA
     else {
         return None;
     };
-    let output = ast_simple_update_value_in_exprs(&field.ast_exprs, *output)?;
-    (!pattern.is_empty()).then(|| UpdateMatchArm {
-        pattern: pattern.join("."),
-        output,
-    })
+    let output = ast_simple_update_value_in_exprs(exprs, *output)?;
+    let pattern = match_const_pattern_label(pattern)?;
+    (!pattern.is_empty()).then(|| UpdateMatchArm { pattern, output })
+}
+
+fn match_const_pattern_label(pattern: &[String]) -> Option<String> {
+    if pattern.is_empty() {
+        None
+    } else if pattern.len() == 4 && pattern[0] == "TEXT" && pattern[1] == "{" && pattern[3] == "}" {
+        Some(pattern[2].clone())
+    } else if pattern.len() == 1 {
+        Some(pattern[0].clone())
+    } else {
+        Some(pattern.join("."))
+    }
+}
+
+fn expr_contains_expr_id_in_exprs(exprs: &[AstExpr], root: usize, needle: usize) -> bool {
+    if root == needle {
+        return true;
+    }
+    let Some(expr) = exprs.iter().find(|expr| expr.id == root) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| expr_contains_expr_id_in_exprs(exprs, arg.value, needle)),
+        AstExprKind::Pipe { input, args, .. } => {
+            expr_contains_expr_id_in_exprs(exprs, *input, needle)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_expr_id_in_exprs(exprs, arg.value, needle))
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            expr_contains_expr_id_in_exprs(exprs, *initial, needle)
+        }
+        AstExprKind::Then {
+            input,
+            output: Some(output),
+        } => {
+            expr_contains_expr_id_in_exprs(exprs, *input, needle)
+                || expr_contains_expr_id_in_exprs(exprs, *output, needle)
+        }
+        AstExprKind::Then {
+            input,
+            output: None,
+        } => expr_contains_expr_id_in_exprs(exprs, *input, needle),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expr_contains_expr_id_in_exprs(exprs, *output, needle),
+        AstExprKind::Infix { left, right, .. } => {
+            expr_contains_expr_id_in_exprs(exprs, *left, needle)
+                || expr_contains_expr_id_in_exprs(exprs, *right, needle)
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .any(|record_field| expr_contains_expr_id_in_exprs(exprs, record_field.value, needle)),
+        AstExprKind::ListLiteral { .. }
+        | AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => false,
+    }
 }
 
 fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
@@ -5424,7 +5832,12 @@ fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
     }
 }
 
-fn canonical_scalar_update_path(field: &FieldDef, target: &str, value: &str) -> String {
+fn canonical_scalar_update_path_with_fields(
+    field: &FieldDef,
+    target: &str,
+    value: &str,
+    fields: &[FieldDef],
+) -> String {
     let target_field = target
         .rsplit_once('.')
         .map(|(_, field)| field)
@@ -5434,6 +5847,13 @@ fn canonical_scalar_update_path(field: &FieldDef, target: &str, value: &str) -> 
         || field_hold_name(field).as_deref() == Some(value)
     {
         target.to_owned()
+    } else if !value.contains('.') {
+        let child_path = format!("{}.{}", field.path, value);
+        if fields.iter().any(|candidate| candidate.path == child_path) {
+            child_path
+        } else {
+            canonical_local_path(value, &field.parent_path)
+        }
     } else {
         canonical_local_path(value, &field.parent_path)
     }
@@ -5674,9 +6094,194 @@ impl RoutedBranch {
         bool_not_path_in_exprs(&self.ast_exprs)
     }
 
+    fn then_prefix_payload_concat_expression(
+        &self,
+        source_variants: &[String],
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then { output, .. } = expr.kind else {
+                return None;
+            };
+            output
+                .and_then(|output| {
+                    prefix_payload_concat_update_expression(
+                        &self.ast_exprs,
+                        output,
+                        source_variants,
+                    )
+                    .or_else(|| {
+                        prefix_payload_concat_update_expression_using_input(
+                            &self.ast_exprs,
+                            output,
+                            source_variants,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    prefix_payload_concat_update_expression_after_line(
+                        &self.ast_exprs,
+                        expr.line,
+                        source_variants,
+                    )
+                })
+                .or_else(|| {
+                    prefix_payload_concat_update_expression_from_items(&self.items, source_variants)
+                })
+        })
+    }
+
     fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+fn prefix_payload_concat_update_expression_using_input(
+    exprs: &[AstExpr],
+    input: usize,
+    source_variants: &[String],
+) -> Option<UpdateExpression> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Pipe {
+            input: pipe_input, ..
+        } = &expr.kind
+        else {
+            return None;
+        };
+        (*pipe_input == input)
+            .then(|| prefix_payload_concat_update_expression(exprs, expr.id, source_variants))
+            .flatten()
+    })
+}
+
+fn prefix_payload_concat_update_expression_from_items(
+    items: &[AstItem],
+    source_variants: &[String],
+) -> Option<UpdateExpression> {
+    items.iter().find_map(|item| {
+        let summary = item_summary(item);
+        let concat_marker = " |> Text/concat";
+        let prefix_start = summary
+            .find("|> THEN TEXT ")
+            .map(|start| start + "|> THEN TEXT ".len())
+            .or_else(|| summary.strip_prefix("TEXT ").map(|_| "TEXT ".len()))?;
+        let prefix_end = summary[prefix_start..].find(concat_marker)? + prefix_start;
+        let prefix = summary[prefix_start..prefix_end].trim().to_owned();
+        if prefix.is_empty() {
+            return None;
+        }
+        let with_marker = "with:";
+        let with_start = summary.find(with_marker)? + with_marker.len();
+        let payload_tail = &summary[with_start..];
+        let payload_path = payload_tail
+            .split([',', ')'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !source_payload_path_matches(&payload_path, source_variants, "text")
+            && !source_payload_path_matches(&payload_path, source_variants, "key")
+            && !source_payload_path_matches(&payload_path, source_variants, "address")
+        {
+            return None;
+        }
+        let separator = summary
+            .split_once("separator:")
+            .map(|(_, tail)| tail.trim())
+            .and_then(|tail| {
+                tail.strip_prefix('"')
+                    .and_then(|quoted| quoted.find('"').map(|end| quoted[..end].to_owned()))
+            })
+            .unwrap_or_default();
+        Some(UpdateExpression::PrefixPayloadConcat {
+            prefix,
+            payload_path,
+            separator,
+        })
+    })
+}
+
+fn prefix_payload_concat_update_expression_after_line(
+    exprs: &[AstExpr],
+    line: usize,
+    source_variants: &[String],
+) -> Option<UpdateExpression> {
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line && expr.line < end_line)
+        .find_map(|expr| prefix_payload_concat_update_expression(exprs, expr.id, source_variants))
+}
+
+fn prefix_payload_concat_update_expression(
+    exprs: &[AstExpr],
+    output: usize,
+    source_variants: &[String],
+) -> Option<UpdateExpression> {
+    let expr = exprs.iter().find(|expr| expr.id == output)?;
+    let AstExprKind::Pipe { op, input, args } = &expr.kind else {
+        return None;
+    };
+    if op != "Text/concat" {
+        return None;
+    }
+    let SimpleThenUpdateValue::Const(prefix) =
+        ast_simple_then_update_value_in_exprs(exprs, *input)?
+    else {
+        return None;
+    };
+    let payload_path = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("with"))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
+    if !source_payload_path_matches(&payload_path, source_variants, "text")
+        && !source_payload_path_matches(&payload_path, source_variants, "key")
+        && !source_payload_path_matches(&payload_path, source_variants, "address")
+    {
+        return None;
+    }
+    let separator = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("separator"))
+        .and_then(|arg| ast_simple_then_update_value_in_exprs(exprs, arg.value))
+        .and_then(|value| match value {
+            SimpleThenUpdateValue::Const(value) => Some(value),
+            SimpleThenUpdateValue::Path(_) => None,
+        })
+        .unwrap_or_default();
+    Some(UpdateExpression::PrefixPayloadConcat {
+        prefix,
+        payload_path,
+        separator,
+    })
+}
+
+fn source_payload_path_matches(
+    path: &str,
+    source_variants: &[String],
+    payload_field: &str,
+) -> bool {
+    source_variants.iter().any(|variant| {
+        path == format!("{variant}.{payload_field}")
+            || path == format!("{variant}.event.{payload_field}")
+            || (payload_field == "text"
+                && (path == format!("{variant}.event.change.text")
+                    || path == format!("{variant}.change.text")))
+            || (payload_field == "key"
+                && (path == format!("{variant}.event.key_down.key")
+                    || path == format!("{variant}.key_down.key")))
+    })
 }
 
 impl FieldDef {
@@ -5698,13 +6303,10 @@ impl FieldDef {
         operators.iter().any(|operator| self.has_operator(operator))
     }
 
-    fn has_when_or_then_expr(&self) -> bool {
-        self.ast_exprs.iter().any(|expr| {
-            matches!(
-                expr.kind,
-                AstExprKind::When { .. } | AstExprKind::Then { .. }
-            )
-        })
+    fn has_then_expr(&self) -> bool {
+        self.ast_exprs
+            .iter()
+            .any(|expr| matches!(expr.kind, AstExprKind::Then { .. }))
     }
 
     fn mentions_identifier(&self, identifier: &str) -> bool {
@@ -6856,6 +7458,56 @@ store: [
     }
 
     #[test]
+    fn then_call_to_pure_match_function_lowers_to_match_const() {
+        let source = r#"
+store: [
+    elements: [
+        format_cycle: SOURCE
+    ]
+    value_format:
+        TEXT { Hexadecimal } |> HOLD value_format {
+            LATEST {
+                elements.format_cycle.event.press |> THEN { next_format(format: value_format) }
+            }
+        }
+]
+
+FUNCTION next_format(format) {
+    format |> WHEN {
+        TEXT { Hexadecimal } => TEXT { Binary }
+        TEXT { Binary } => TEXT { GroupedBinary }
+        __ => TEXT { Hexadecimal }
+    }
+        }
+"#;
+        let parsed = boon_parser::parse_source("then-call-pure-match-function.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "store.value_format"
+                && branch.source == "store.elements.format_cycle"
+                && branch.expression
+                    == UpdateExpression::MatchConst {
+                        input: "store.value_format".to_owned(),
+                        arms: vec![
+                            UpdateMatchArm {
+                                pattern: "Hexadecimal".to_owned(),
+                                output: "Binary".to_owned(),
+                            },
+                            UpdateMatchArm {
+                                pattern: "Binary".to_owned(),
+                                output: "GroupedBinary".to_owned(),
+                            },
+                            UpdateMatchArm {
+                                pattern: "__".to_owned(),
+                                output: "Hexadecimal".to_owned(),
+                            },
+                        ],
+                    }
+        }));
+        verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
     fn state_initial_values_are_lowered_from_ast_exprs() {
         let source = r#"
 -- True False TEXT { comment } todo.title must not become an initializer
@@ -6916,6 +7568,10 @@ FUNCTION new_todo(todo) {
             "examples/todo_mvc_physical/RUN.bn",
             [
                 (
+                    "examples/todo_mvc_physical/Theme/Classic.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Classic.bn").to_owned(),
+                ),
+                (
                     "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
                     include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
                         .to_owned(),
@@ -6974,7 +7630,13 @@ FUNCTION new_todo(todo) {
             ],
         };
         assert_eq!(
-            match_const_update_expression(field, "theme_options.mode", source, &routed_branch),
+            match_const_update_expression(
+                field,
+                "theme_options.mode",
+                &fields,
+                source,
+                &routed_branch
+            ),
             Some(expected.clone())
         );
         let row_scopes = row_scopes(&parsed);
@@ -7118,6 +7780,27 @@ FUNCTION new_todo(todo) {
             })
             .expect("physical TodoMVC mode toggle update branch");
         assert_eq!(branch.expression, expected);
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "todo.edited_title.draft_title" && cell.indexed && cell.scope_id.is_some()
+        }));
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "todo.edited_title"
+                && branch.source == "todo.todo_elements.todo_title_element"
+                && branch.expression
+                    == UpdateExpression::ReadPath {
+                        path: "todo.edited_title.draft_title".to_owned(),
+                    }
+                && branch.indexed
+        }));
+        assert!(!ir.update_branches.iter().any(|branch| {
+            matches!(
+                &branch.expression,
+                UpdateExpression::ReadPath { path }
+                    | UpdateExpression::PreviousValue { path }
+                    | UpdateExpression::BoolNot { path }
+                    if path == "todo.draft_title"
+            )
+        }));
     }
 
     #[test]
@@ -7147,6 +7830,46 @@ FUNCTION new_todo(todo) {
                 value.path == "store.note" && value.kind == DerivedValueKind::Pure
             })
         );
+    }
+
+    #[test]
+    fn pure_when_over_root_state_lowers_as_pure_derived_value() {
+        let source = r#"
+store: [
+    sources: [
+        open: [press: SOURCE]
+    ]
+    dialog:
+        TEXT { Closed } |> HOLD dialog {
+        LATEST {
+            TEXT { Closed }
+            sources.open.press |> THEN { TEXT { Open } }
+        }
+        }
+    dialog_title:
+        dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Load files }
+            False => TEXT { No file dialog }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("pure-when-root-state.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            ir.state_cells
+                .iter()
+                .any(|cell| cell.path == "store.dialog")
+        );
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "store.dialog" && branch.source == "store.sources.open.press"
+        }));
+        let title = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.dialog_title")
+            .expect("dialog title should be a pure derived value");
+        assert_eq!(title.kind, DerivedValueKind::Pure);
+        assert!(title.sources.is_empty());
     }
 
     #[test]
@@ -7617,8 +8340,8 @@ FUNCTION new_todo(todo) {
             branch.target == "cell.editing_text"
                 && branch.source == "cell.sources.editor.cancel"
                 && branch.expression
-                    == UpdateExpression::PreviousValue {
-                        path: "formula_text".to_owned(),
+                    == UpdateExpression::ReadPath {
+                        path: "cell.formula_text".to_owned(),
                     }
         }));
         assert!(ir.update_branches.iter().any(|branch| {

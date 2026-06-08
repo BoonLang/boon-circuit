@@ -2855,13 +2855,27 @@ fn statement_row_scope_function(
                     .find(|arg| arg.name.as_deref() == Some("item"))
                     .and_then(|arg| function_name_from_expr(arg.value, ast))
             }?;
-            let row_scope = singular_row_scope(&list);
+            let row_scope = if op == "List/map" {
+                list_map_binding_name(args, ast).unwrap_or_else(|| singular_row_scope(&list))
+            } else {
+                singular_row_scope(&list)
+            };
             Some(ParsedRowScopeFunction {
                 function,
                 list,
                 row_scope,
             })
         }
+        _ => None,
+    }
+}
+
+fn list_map_binding_name(args: &[AstCallArg], ast: &AstProgram) -> Option<String> {
+    let arg = args.iter().find(|arg| arg.name.is_none())?;
+    let expr = ast.expressions.get(arg.value)?;
+    match &expr.kind {
+        AstExprKind::Identifier(name) => Some(name.clone()),
+        AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
         _ => None,
     }
 }
@@ -3527,6 +3541,45 @@ FUNCTION make_entry(entry) {
                 .state_cells
                 .iter()
                 .any(|cell| cell.path == "store.selected" && !cell.indexed)
+        );
+    }
+
+    #[test]
+    fn list_map_row_scope_prefers_item_binding_over_singular_list_name() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+store:
+    selected_waveform_segments:
+        LIST {
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
+        }
+        |> List/map(segment, new: new_waveform_segment(segment: segment))
+FUNCTION new_waveform_segment(segment) {
+    signal_id: segment.signal_id
+    width: segment.width
+    state: segment.state
+    label: segment.label
+}
+"#;
+        let program = parse_source("examples/novywave/RUN.bn", source).unwrap();
+        assert!(program.row_scope_functions.iter().any(|scope| {
+            scope.function == "new_waveform_segment"
+                && scope.list == "selected_waveform_segments"
+                && scope.row_scope == "segment"
+        }));
+        assert!(
+            program
+                .state_cells
+                .iter()
+                .all(|cell| !cell.path.starts_with("selected_waveform_segment."))
+        );
+        assert!(
+            program
+                .source_ports
+                .iter()
+                .all(|source| !source.path.starts_with("selected_waveform_segment."))
         );
     }
 

@@ -1283,6 +1283,38 @@ impl LiveSourceEvent {
             "target_text",
             self.target_text.as_deref(),
         )?;
+        if let Some(expected) = &step.expected_source_event {
+            assert_live_source_event_numeric_field(
+                &step.id,
+                toml_usize_ref(expected, "target_occurrence").map(|value| value as u64),
+                "target_occurrence",
+                self.target_occurrence.map(|value| value as u64),
+            )?;
+            assert_live_source_event_numeric_field(
+                &step.id,
+                toml_u64_ref(expected, "target_key"),
+                "target_key",
+                self.target_key,
+            )?;
+            assert_live_source_event_numeric_field(
+                &step.id,
+                toml_u64_ref(expected, "target_generation"),
+                "target_generation",
+                self.target_generation,
+            )?;
+            assert_live_source_event_numeric_field(
+                &step.id,
+                toml_u64_ref(expected, "bind_epoch"),
+                "bind_epoch",
+                self.bind_epoch,
+            )?;
+            assert_live_source_event_numeric_field(
+                &step.id,
+                toml_u64_ref(expected, "source_id"),
+                "source_id",
+                self.source_id,
+            )?;
+        }
         Ok(())
     }
 
@@ -1301,6 +1333,36 @@ impl LiveSourceEvent {
         if let Some(target_text) = self.target_text {
             expected_source_event
                 .insert("target_text".to_owned(), toml::Value::String(target_text));
+        }
+        if let Some(target_occurrence) = self.target_occurrence {
+            expected_source_event.insert(
+                "target_occurrence".to_owned(),
+                toml::Value::Integer(target_occurrence as i64),
+            );
+        }
+        if let Some(target_key) = self.target_key {
+            expected_source_event.insert(
+                "target_key".to_owned(),
+                toml::Value::Integer(target_key as i64),
+            );
+        }
+        if let Some(target_generation) = self.target_generation {
+            expected_source_event.insert(
+                "target_generation".to_owned(),
+                toml::Value::Integer(target_generation as i64),
+            );
+        }
+        if let Some(bind_epoch) = self.bind_epoch {
+            expected_source_event.insert(
+                "bind_epoch".to_owned(),
+                toml::Value::Integer(bind_epoch as i64),
+            );
+        }
+        if let Some(source_id) = self.source_id {
+            expected_source_event.insert(
+                "source_id".to_owned(),
+                toml::Value::Integer(source_id as i64),
+            );
         }
         expected_source_event
     }
@@ -1365,6 +1427,22 @@ fn assert_live_source_event_field(
     expected_value: Option<&str>,
     key: &str,
     actual_value: Option<&str>,
+) -> RuntimeResult<()> {
+    if expected_value.is_none() || expected_value == actual_value {
+        Ok(())
+    } else {
+        Err(format!(
+            "{step_id}: observed live source field `{key}` expected {expected_value:?}, got {actual_value:?}"
+        )
+        .into())
+    }
+}
+
+fn assert_live_source_event_numeric_field(
+    step_id: &str,
+    expected_value: Option<u64>,
+    key: &str,
+    actual_value: Option<u64>,
 ) -> RuntimeResult<()> {
     if expected_value.is_none() || expected_value == actual_value {
         Ok(())
@@ -2170,6 +2248,7 @@ struct RuntimeSymbols {
 #[derive(Clone, Debug)]
 struct ListSummaryFields {
     list: String,
+    row_scope: String,
     fields: Vec<String>,
 }
 
@@ -2205,6 +2284,15 @@ impl RuntimeSymbols {
                 UpdateExpression::TextTrimOrPrevious { path, previous } => {
                     symbols.intern(path);
                     symbols.intern(previous);
+                }
+                UpdateExpression::PrefixPayloadConcat {
+                    prefix,
+                    payload_path,
+                    separator,
+                } => {
+                    symbols.intern(prefix);
+                    symbols.intern(payload_path);
+                    symbols.intern(separator);
                 }
                 UpdateExpression::NumberInfix { left, right, .. } => {
                     symbols.intern(left);
@@ -2372,7 +2460,11 @@ impl CompiledProgram {
             ir.derived_values
                 .iter()
                 .filter(|value| {
-                    !value.indexed && value.kind == DerivedValueKind::SourceEventTransform
+                    !value.indexed
+                        && value.scope_id.is_none()
+                        && (value.kind == DerivedValueKind::SourceEventTransform
+                            || (value.kind == DerivedValueKind::Pure
+                                && statement_contains_latest(&value.statement, &ir.expressions)))
                 })
                 .map(|value| value.path.clone()),
         );
@@ -2597,7 +2689,7 @@ fn list_summary_fields_from_ir(ir: &TypedProgram) -> Vec<ListSummaryFields> {
     ir.lists
         .iter()
         .map(|list| {
-            let row_scope = row_scope_name(&list.name);
+            let row_scope = row_scope_name_for_ir_list(ir, list);
             let prefix = format!("{row_scope}.");
             let mut fields = ir
                 .state_cells
@@ -2614,6 +2706,7 @@ fn list_summary_fields_from_ir(ir: &TypedProgram) -> Vec<ListSummaryFields> {
             fields.dedup();
             ListSummaryFields {
                 list: list.name.clone(),
+                row_scope,
                 fields,
             }
         })
@@ -4257,6 +4350,56 @@ impl ListMemory {
         }
     }
 
+    fn set_or_replace_value(
+        &mut self,
+        index: usize,
+        field: &str,
+        value: FieldValue,
+    ) -> RuntimeResult<()> {
+        let slot = self
+            .visible_slot(index)
+            .ok_or_else(|| format!("generic list has no index {index}"))?;
+        let field_id = FieldSlotId::from_path(field);
+        match value {
+            FieldValue::Text(value) => {
+                if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+                    self.bool_columns.remove(index);
+                }
+                if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+                    self.enum_columns.remove(index);
+                }
+                let index = text_column_index(&self.text_columns, &field_id)
+                    .unwrap_or_else(|| self.insert_text_column(field_id, false));
+                self.text_columns[index].values[slot].clear();
+                self.text_columns[index].values[slot].push_str(&value);
+            }
+            FieldValue::Bool(value) => {
+                if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+                    self.text_columns.remove(index);
+                }
+                if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+                    self.enum_columns.remove(index);
+                }
+                let index = bool_column_index(&self.bool_columns, &field_id)
+                    .unwrap_or_else(|| self.insert_bool_column(field_id));
+                self.bool_columns[index].values.set(slot, value);
+            }
+            FieldValue::Enum(value) => {
+                if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+                    self.bool_columns.remove(index);
+                }
+                if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+                    self.text_columns.remove(index);
+                }
+                let index = text_column_index(&self.enum_columns, &field_id)
+                    .unwrap_or_else(|| self.insert_text_column(field_id, true));
+                self.enum_columns[index].values[slot].clear();
+                self.enum_columns[index].values[slot].push_str(&value);
+            }
+        }
+        Ok(())
+    }
+
     fn copy_textlike(
         &mut self,
         index: usize,
@@ -5247,14 +5390,21 @@ impl GenericScheduledRuntime {
             ) {
                 return Ok(SourceActionKind::IndexedTextCommit);
             }
+            if has_indexed_text_target(SourceRouteTextAction::ReadPath, indexed_commit_field) {
+                return Ok(SourceActionKind::IndexedTextCommit);
+            }
             if source_event.text.is_some() {
                 return Ok(SourceActionKind::IndexedTextChange);
             }
             let has_previous_text = has_indexed_text(SourceRouteTextAction::PreviousValue);
-            if has_const_true && has_previous_text {
+            let has_read_path_text = has_indexed_text(SourceRouteTextAction::ReadPath);
+            if has_const_true && (has_previous_text || has_read_path_text) {
                 return Ok(SourceActionKind::IndexedTextOpen);
             }
             if has_previous_text {
+                return Ok(SourceActionKind::IndexedTextIdentity);
+            }
+            if has_read_path_text {
                 return Ok(SourceActionKind::IndexedTextIdentity);
             }
         }
@@ -5485,8 +5635,8 @@ impl GenericScheduledRuntime {
                                 target,
                                 value: commit,
                             }))?;
-                            for commit in self.materialize_root_derived_field_commits()? {
-                                observe(GenericSourceMutation::RootText(commit))?;
+                            for mutation in self.materialize_root_derived_field_commits()? {
+                                observe(mutation)?;
                             }
                         }
                     }
@@ -5498,6 +5648,7 @@ impl GenericScheduledRuntime {
                         input.source,
                         input.key,
                         input.text,
+                        input.address,
                     )? {
                         let current = self.storage.root.textlike(target);
                         if current != Some(value.as_ref()) {
@@ -5508,29 +5659,39 @@ impl GenericScheduledRuntime {
                                 target: target.clone(),
                                 value,
                             }))?;
-                            for commit in self.materialize_root_derived_field_commits()? {
-                                observe(GenericSourceMutation::RootText(commit))?;
+                            for mutation in self.materialize_root_derived_field_commits()? {
+                                observe(mutation)?;
                             }
                         }
                     }
                 }
                 SourceAction::RootTextTransform { target, value } => {
-                    let current = self.storage.root.textlike(target);
-                    if current != Some(value.as_str()) {
+                    let current = self.storage.root.owned_value(target);
+                    if current.as_ref() != Some(value) {
                         self.storage
                             .root
-                            .insert_value(target.clone(), FieldValue::Text(value.clone()));
-                        observe(GenericSourceMutation::RootText(GenericRootTextCommit {
-                            target: target.clone(),
-                            value: Cow::Owned(value.clone()),
-                        }))?;
+                            .insert_value(target.clone(), value.clone());
+                        match value {
+                            FieldValue::Bool(value) => {
+                                observe(GenericSourceMutation::RootBool(GenericRootBoolCommit {
+                                    target: target.clone(),
+                                    value: *value,
+                                }))?;
+                            }
+                            FieldValue::Text(value) | FieldValue::Enum(value) => {
+                                observe(GenericSourceMutation::RootText(GenericRootTextCommit {
+                                    target: target.clone(),
+                                    value: Cow::Owned(value.clone()),
+                                }))?;
+                            }
+                        }
                     }
                 }
                 SourceAction::RouterRoute { path, .. } => {
                     if self.router_route != *path {
                         self.router_route.clone_from(path);
-                        for commit in self.materialize_root_derived_field_commits()? {
-                            observe(GenericSourceMutation::RootText(commit))?;
+                        for mutation in self.materialize_root_derived_field_commits()? {
+                            observe(mutation)?;
                         }
                     }
                 }
@@ -5546,6 +5707,7 @@ impl GenericScheduledRuntime {
                         input.source,
                         input.key,
                         input.text,
+                        input.address,
                     )?
                     else {
                         continue;
@@ -6034,13 +6196,13 @@ impl GenericScheduledRuntime {
 
     fn materialize_root_derived_field_commits(
         &mut self,
-    ) -> RuntimeResult<Vec<GenericRootTextCommit<'static>>> {
+    ) -> RuntimeResult<Vec<GenericSourceMutation<'static>>> {
         let fields = self.generic_derived.root_fields.clone();
         let mut commits = Vec::new();
         for field in fields {
             if field.kind == DerivedValueKind::SourceEventTransform
                 && field.has_sources
-                && self.storage.root.textlike(&field.path).is_some()
+                && self.storage.root.owned_value(&field.path).is_some()
             {
                 continue;
             }
@@ -6049,18 +6211,36 @@ impl GenericScheduledRuntime {
             if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
                 continue;
             }
-            if let Some(value) = value.as_text() {
-                let current = self.storage.root.textlike(&field.path).map(str::to_owned);
-                if current.as_deref() == Some(value.as_str()) {
-                    continue;
+            let field_value = boon_value_field_value(&value);
+            let current = self.storage.root.owned_value(&field.path);
+            if current.as_ref() == Some(&field_value) {
+                continue;
+            }
+            self.storage
+                .root
+                .insert_value(field.path.clone(), field_value);
+            match boon_value_protocol_value(&value) {
+                ProtocolValue::Bool(value) => {
+                    commits.push(GenericSourceMutation::RootBool(GenericRootBoolCommit {
+                        target: field.path,
+                        value,
+                    }));
                 }
-                self.storage
-                    .root
-                    .insert_value(field.path.clone(), FieldValue::Text(value.clone()));
-                commits.push(GenericRootTextCommit {
-                    target: field.path,
-                    value: Cow::Owned(value),
-                });
+                ProtocolValue::Text(value) => {
+                    commits.push(GenericSourceMutation::RootText(GenericRootTextCommit {
+                        target: field.path,
+                        value,
+                    }));
+                }
+                ProtocolValue::NumberText(value) => {
+                    commits.push(GenericSourceMutation::RootText(GenericRootTextCommit {
+                        target: field.path,
+                        value: Cow::Owned(value.to_string()),
+                    }));
+                }
+                ProtocolValue::Null
+                | ProtocolValue::SourceBinding { .. }
+                | ProtocolValue::CheckedProperty(_) => {}
             }
         }
         Ok(commits)
@@ -6133,6 +6313,12 @@ impl GenericScheduledRuntime {
                 reads.insert(GenericReadKey::Root {
                     field: field.to_string(),
                 });
+                let leaf = row_field_name(field);
+                if leaf != field {
+                    reads.insert(GenericReadKey::Root {
+                        field: leaf.to_string(),
+                    });
+                }
             }
         }
         Ok(reads)
@@ -6211,18 +6397,21 @@ impl GenericScheduledRuntime {
         let value = self.eval_statement_value(&plan.statement, &mut frame)?;
         self.generic_derived_state
             .replace_reads(key.clone(), frame.reads);
-        let visible = value.visible_text();
+        let field_value = boon_value_field_value(&value);
         let current = self
             .storage
-            .list_row_textlike_opt(&key.list, key.index, &key.field)
-            .unwrap_or_default();
+            .list_row_value_opt(&key.list, key.index, &key.field);
         let emit_unchanged_error = matches!(value, BoonValue::Error(_));
-        if current == visible && !emit_unchanged_error {
+        if current.as_ref() == Some(&field_value) && !emit_unchanged_error {
             return Ok((None, value));
         }
-        if current != visible {
-            self.storage
-                .set_or_insert_list_row_textlike(&key.list, key.index, &key.field, &visible)?;
+        if current.as_ref() != Some(&field_value) {
+            self.storage.set_or_replace_list_row_value(
+                &key.list,
+                key.index,
+                &key.field,
+                field_value,
+            )?;
         }
         let (row_key, generation) = self.storage.row_identity(&key.list, key.index)?;
         self.generic_derived_state.last_recomputed.push(key.clone());
@@ -6232,7 +6421,7 @@ impl GenericScheduledRuntime {
                 key: row_key,
                 generation,
                 field: key.field.clone(),
-                value: ProtocolValue::Text(Cow::Owned(visible)),
+                value: boon_value_protocol_value(&value),
             }),
             value,
         ))
@@ -6691,6 +6880,16 @@ impl GenericScheduledRuntime {
             index,
             field: field.to_owned(),
         });
+        if frame
+            .stack
+            .last()
+            .is_some_and(|key| key.list == list && key.index == index && key.field == field)
+        {
+            let base_field = base_row_field_name(field);
+            if let Ok(value) = self.storage.list_row_field(list, index, &base_field) {
+                return Ok(field_ref_to_boon(value));
+            }
+        }
         if self.generic_derived.contains_field(list, field) {
             let key = GenericDerivedKey {
                 list: list.to_owned(),
@@ -7096,7 +7295,17 @@ impl GenericScheduledRuntime {
         input: Option<BoonValue>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let Some(definition) = self.generic_derived.functions.get(function).cloned() else {
+        let definition = self
+            .generic_derived
+            .functions
+            .get(function)
+            .cloned()
+            .or_else(|| {
+                function
+                    .rsplit_once('/')
+                    .and_then(|(_, suffix)| self.generic_derived.functions.get(suffix).cloned())
+            });
+        let Some(definition) = definition else {
             return Ok(BoonValue::Error("parse_error".to_owned()));
         };
         if frame.call_depth > 128 {
@@ -7832,7 +8041,7 @@ impl GenericScheduledRuntime {
         };
         for candidate in &candidates {
             let mut frame = GenericEvalFrame::root();
-            if let Some(value) = self.root_derived_boon_value(candidate, &mut frame)?
+            if let Some(value) = self.root_pure_derived_boon_value(candidate, &mut frame)?
                 && !matches!(value, BoonValue::Error(_) | BoonValue::Empty)
                 && let Some(text) = value.as_text()
             {
@@ -8340,6 +8549,9 @@ impl GenericScheduledRuntime {
         let fields = self.generic_derived.root_fields.clone();
         let mut values = Vec::new();
         for field in fields {
+            if !matches!(field.kind, DerivedValueKind::Pure) {
+                continue;
+            }
             let mut frame = GenericEvalFrame::root();
             let value = self
                 .eval_statement_value(&field.statement, &mut frame)
@@ -8403,8 +8615,7 @@ impl GenericScheduledRuntime {
         }
         for (path, value) in self.root_derived_summary_values() {
             insert_nested_json(&mut root, &path, value.clone());
-            root.entry(row_field_name(&path).to_owned())
-                .or_insert(value);
+            root.insert(row_field_name(&path).to_owned(), value);
         }
         for (list, target) in self.list_equations.retain_targets() {
             let Some(summary) = self
@@ -8484,14 +8695,35 @@ impl GenericScheduledRuntime {
                     item_field,
                     label_field,
                 } => {
-                    let value = self.list_chunk_projection(
-                        &projection.list,
-                        projection.columns,
-                        projection.rows,
-                        item_field,
-                        label_field,
-                        limits,
-                    );
+                    let value = if self.storage.list_len(&projection.list).unwrap_or_default() > 0 {
+                        self.list_chunk_projection(
+                            &projection.list,
+                            projection.columns,
+                            projection.rows,
+                            item_field,
+                            label_field,
+                            limits,
+                        )
+                    } else if let Some(rows) = Self::summary_array_for_path(root, &projection.list)
+                    {
+                        Self::json_array_chunk_projection(
+                            rows,
+                            projection.columns,
+                            projection.rows,
+                            item_field,
+                            label_field,
+                            limits,
+                        )
+                    } else {
+                        self.list_chunk_projection(
+                            &projection.list,
+                            projection.columns,
+                            projection.rows,
+                            item_field,
+                            label_field,
+                            limits,
+                        )
+                    };
                     insert_nested_json(root, &projection.target, JsonValue::Array(value));
                 }
                 RuntimeListProjectionKind::Find { field, value } => {
@@ -8562,6 +8794,62 @@ impl GenericScheduledRuntime {
         projected_rows
     }
 
+    fn summary_array_for_path<'a>(
+        root: &'a serde_json::Map<String, JsonValue>,
+        path: &str,
+    ) -> Option<&'a Vec<JsonValue>> {
+        root.get(path).and_then(JsonValue::as_array).or_else(|| {
+            root.get("store")
+                .and_then(JsonValue::as_object)
+                .and_then(|store| store.get(path))
+                .and_then(JsonValue::as_array)
+        })
+    }
+
+    fn json_array_chunk_projection(
+        rows: &[JsonValue],
+        columns: usize,
+        row_count: usize,
+        item_field: &str,
+        label_field: &str,
+        limits: SummaryLimits,
+    ) -> Vec<JsonValue> {
+        let len = rows.len();
+        let row_count = if row_count > 0 {
+            row_count
+        } else if columns == 0 {
+            0
+        } else {
+            len.div_ceil(columns)
+        };
+        let projected_row_count = limits.chunk_rows.map_or(row_count, |limit| {
+            row_count.saturating_sub(limits.chunk_row_start).min(limit)
+        });
+        let projected_columns = limits.chunk_columns.map_or_else(
+            || columns.saturating_sub(limits.chunk_column_start),
+            |limit| columns.saturating_sub(limits.chunk_column_start).min(limit),
+        );
+        let mut projected_rows = Vec::with_capacity(projected_row_count);
+        for row_offset in 0..projected_row_count {
+            let row = limits.chunk_row_start.saturating_add(row_offset);
+            let mut row_object = serde_json::Map::new();
+            row_object.insert(label_field.to_owned(), json!(row.to_string()));
+            row_object.insert("index".to_owned(), json!(row));
+            let mut cells = Vec::with_capacity(projected_columns);
+            for column_offset in 0..projected_columns {
+                let column = limits.chunk_column_start.saturating_add(column_offset);
+                let index = row.saturating_mul(columns).saturating_add(column);
+                if index >= len {
+                    break;
+                }
+                cells.push(rows[index].clone());
+            }
+            row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
+            projected_rows.push(JsonValue::Object(row_object));
+        }
+        projected_rows
+    }
+
     fn list_find_projection(
         &self,
         list: &str,
@@ -8600,8 +8888,7 @@ impl GenericScheduledRuntime {
             }
         }
         if let Ok((key, generation)) = identity {
-            let row_scope = row_scope_name(&summary.list);
-            let prefix = format!("{row_scope}.");
+            let prefix = format!("{}.", summary.row_scope);
             for binding in self
                 .storage
                 .row_source_bindings(&summary.list, key, generation)
@@ -8651,6 +8938,47 @@ fn field_ref_to_boon(value: FieldValueRef<'_>) -> BoonValue {
             BoonValue::Text(value.to_owned())
         }
         FieldValueRef::Bool(value) => BoonValue::Bool(value),
+    }
+}
+
+fn statement_contains_latest(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| matches!(expr.kind, AstExprKind::Latest))
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_contains_latest(child, expressions))
+}
+
+fn boon_value_field_value(value: &BoonValue) -> FieldValue {
+    match value {
+        BoonValue::Text(value) => FieldValue::Text(value.clone()),
+        BoonValue::Number(value) => FieldValue::Text(value.to_string()),
+        BoonValue::Bool(value) => FieldValue::Bool(*value),
+        BoonValue::NaN => FieldValue::Text("NaN".to_owned()),
+        BoonValue::Empty => FieldValue::Text(String::new()),
+        BoonValue::Error(value) => FieldValue::Text(value.clone()),
+        BoonValue::Record(_)
+        | BoonValue::List(_)
+        | BoonValue::RowRef { .. }
+        | BoonValue::ListRef(_) => FieldValue::Text(String::new()),
+    }
+}
+
+fn boon_value_protocol_value(value: &BoonValue) -> ProtocolValue<'static> {
+    match value {
+        BoonValue::Text(value) => ProtocolValue::Text(Cow::Owned(value.clone())),
+        BoonValue::Number(value) => ProtocolValue::NumberText(*value),
+        BoonValue::Bool(value) => ProtocolValue::Bool(*value),
+        BoonValue::NaN => ProtocolValue::Text(Cow::Borrowed("NaN")),
+        BoonValue::Empty => ProtocolValue::Text(Cow::Borrowed("")),
+        BoonValue::Error(value) => ProtocolValue::Text(Cow::Owned(value.clone())),
+        BoonValue::Record(_)
+        | BoonValue::List(_)
+        | BoonValue::RowRef { .. }
+        | BoonValue::ListRef(_) => ProtocolValue::Text(Cow::Borrowed("")),
     }
 }
 
@@ -8817,7 +9145,7 @@ impl GenericCircuitRuntime {
             );
         }
         for list in &ir.lists {
-            let row_scope = row_scope_name(&list.name);
+            let row_scope = row_scope_name_for_ir_list(ir, list);
             let indexed_cells = ir
                 .state_cells
                 .iter()
@@ -8831,6 +9159,7 @@ impl GenericCircuitRuntime {
                     .map(|row| {
                         let initial_fields = list_initial_fields(row)?;
                         let mut row = row_template.materialize(initial_fields)?;
+                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
                         initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
                         Ok(row)
                     })
@@ -8851,6 +9180,7 @@ impl GenericCircuitRuntime {
                         initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
                         row_template.fill_missing_row_initial_fields(&mut initial_fields);
                         let mut row = row_template.materialize(initial_fields)?;
+                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
                         initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
                         range_rows.push(row);
                     }
@@ -9009,10 +9339,11 @@ impl GenericCircuitRuntime {
         equations: &DerivedEquationPlan,
         target: &str,
         source: &str,
-        key: Option<&str>,
+        key: Option<&'a str>,
         text: Option<&'a str>,
+        address: Option<&'a str>,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        equations.eval_text_transform(target, source, key, text, |path| {
+        equations.eval_text_transform(target, source, key, text, address, |path| {
             self.root_textlike(path).ok()
         })
     }
@@ -9298,6 +9629,19 @@ impl GenericCircuitRuntime {
             .set_value(index, field, value)
     }
 
+    fn set_or_replace_list_row_value(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+        value: FieldValue,
+    ) -> RuntimeResult<()> {
+        self.lists
+            .memory_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .set_or_replace_value(index, field, value)
+    }
+
     fn commit_indexed_text_field(
         &mut self,
         list: &str,
@@ -9546,10 +9890,12 @@ impl GenericCircuitRuntime {
                 }
                 Ok(IndexedTextCandidate::PreviousText(Cow::Borrowed(value)))
             }
-            ScalarUpdateExpression::ReadPath(path) => Err(format!(
-                "indexed text update `{target}` from `{source}` cannot read path `{path}`"
-            )
-            .into()),
+            ScalarUpdateExpression::ReadPath(path) => {
+                let current = self.list_row_textlike(list, index, row_field_name(path))?;
+                Ok(IndexedTextCandidate::PreviousText(Cow::Owned(
+                    current.to_owned(),
+                )))
+            }
             ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
                 let raw = match path.as_str() {
                     "text" => {
@@ -9584,6 +9930,23 @@ impl GenericCircuitRuntime {
                     }
                 };
                 Ok(IndexedTextCandidate::TrimmedOrSkip(value))
+            }
+            ScalarUpdateExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => {
+                let Some(payload) =
+                    source_payload_match_input(payload_path, source, None, payload_text, None)
+                else {
+                    return Err(format!(
+                        "indexed text update `{target}` from `{source}` requires text payload `{payload_path}`"
+                    )
+                    .into());
+                };
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(format!(
+                    "{prefix}{separator}{payload}"
+                ))))
             }
             ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::BoolNot(_)
@@ -9748,7 +10111,8 @@ impl GenericCircuitRuntime {
         source_paths: &[String],
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
         let (trigger, append_ordinal) = routes.list_append_target(source, list)?;
-        let Some(value) = self.eval_derived_text_transform(derived, trigger, source, key, text)?
+        let Some(value) =
+            self.eval_derived_text_transform(derived, trigger, source, key, text, None)?
         else {
             return Ok(None);
         };
@@ -10696,6 +11060,9 @@ impl RuntimeRowSnapshotTemplate {
     fn materialize(&self, mut initial_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
         for field in &self.fields {
             if initial_fields.contains_key_id(field.field_id.clone()) {
+                if let Some(value) = initial_fields.owned_value(&field.field_name) {
+                    initial_fields.insert_value(base_row_field_name(&field.field_name), value);
+                }
                 continue;
             }
             let value = runtime_value_from_initial(&field.initial_value, &initial_fields)
@@ -10769,9 +11136,9 @@ impl RuntimeRowSnapshot {
 }
 
 fn missing_row_initial_value(cell: &boon_ir::StateCell, ir: &TypedProgram) -> Option<FieldValue> {
-    if !matches!(cell.initial_value, InitialValue::RowInitialField { .. }) {
+    let InitialValue::RowInitialField { .. } = &cell.initial_value else {
         return None;
-    }
+    };
     ir.update_branches
         .iter()
         .any(|branch| {
@@ -10779,6 +11146,26 @@ fn missing_row_initial_value(cell: &boon_ir::StateCell, ir: &TypedProgram) -> Op
                 && matches!(branch.expression, UpdateExpression::BoolNot { .. })
         })
         .then_some(FieldValue::Bool(false))
+}
+
+fn initialize_indexed_derived_base_fields(
+    ir: &TypedProgram,
+    row_scope: &str,
+    row: &mut RuntimeRowSnapshot,
+) {
+    for value in ir.derived_values.iter().filter(|value| value.indexed) {
+        let Some(field) = value
+            .path
+            .strip_prefix(row_scope)
+            .and_then(|path| path.strip_prefix('.'))
+        else {
+            continue;
+        };
+        if let Some(base_value) = row.columns.owned_value(field) {
+            row.columns
+                .insert_value(base_row_field_name(field), base_value);
+        }
+    }
 }
 
 fn runtime_value_from_initial(
@@ -10825,6 +11212,17 @@ fn row_scope_name(list_name: &str) -> String {
         .map(|prefix| format!("{prefix}y"))
         .or_else(|| list_name.strip_suffix('s').map(str::to_owned))
         .unwrap_or_else(|| format!("{list_name}_item"))
+}
+
+fn row_scope_name_for_ir_list(ir: &TypedProgram, list: &boon_ir::ListMemory) -> String {
+    list.row_scope_id
+        .and_then(|scope_id| ir.row_scopes.get(scope_id.as_usize()))
+        .map(|scope| scope.row_scope.clone())
+        .unwrap_or_else(|| row_scope_name(&list.name))
+}
+
+fn base_row_field_name(field: &str) -> String {
+    format!("__base_{}", field.replace('.', "_"))
 }
 
 fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
@@ -10910,6 +11308,11 @@ enum ScalarUpdateExpression {
         path: String,
         previous: String,
     },
+    PrefixPayloadConcat {
+        prefix: String,
+        payload_path: String,
+        separator: String,
+    },
     BoolNot(String),
     MatchConst {
         input: String,
@@ -10925,7 +11328,9 @@ impl ScalarUpdateExpression {
             Self::SourceText
                 | Self::SourceKey
                 | Self::PreviousValue(_)
+                | Self::ReadPath(_)
                 | Self::TextTrimOrPrevious { .. }
+                | Self::PrefixPayloadConcat { .. }
         ) || matches!(self, Self::Const(value) if value != "True" && value != "False")
     }
 
@@ -11397,8 +11802,51 @@ impl<'a> GenericSourceMutationBatch<'a> {
             GenericSourceMutation::ListAppend(commit) => {
                 Self::insert_append(&mut self.list_appends, &commit.list, commit.clone())?;
             }
-            GenericSourceMutation::ValueField(_)
-            | GenericSourceMutation::ListRemove { .. }
+            GenericSourceMutation::ValueField(commit) => match &commit.value {
+                ProtocolValue::Bool(value) => {
+                    Self::insert_bool(
+                        &mut self.bool_fields,
+                        &commit.field,
+                        GenericBoolFieldCommit {
+                            list: commit.list.clone(),
+                            key: commit.key,
+                            generation: commit.generation,
+                            field: commit.field.clone(),
+                            value: *value,
+                        },
+                    )?;
+                }
+                ProtocolValue::Text(value) => {
+                    Self::insert_text(
+                        &mut self.text_fields,
+                        &commit.field,
+                        GenericTextFieldCommit {
+                            list: commit.list.clone(),
+                            key: commit.key,
+                            generation: commit.generation,
+                            field: commit.field.clone(),
+                            value: value.clone(),
+                        },
+                    )?;
+                }
+                ProtocolValue::NumberText(value) => {
+                    Self::insert_text(
+                        &mut self.text_fields,
+                        &commit.field,
+                        GenericTextFieldCommit {
+                            list: commit.list.clone(),
+                            key: commit.key,
+                            generation: commit.generation,
+                            field: commit.field.clone(),
+                            value: Cow::Owned(value.to_string()),
+                        },
+                    )?;
+                }
+                ProtocolValue::Null
+                | ProtocolValue::SourceBinding { .. }
+                | ProtocolValue::CheckedProperty(_) => {}
+            },
+            GenericSourceMutation::ListRemove { .. }
             | GenericSourceMutation::SourceBind(_)
             | GenericSourceMutation::SourceUnbind(_) => {}
         }
@@ -11815,10 +12263,25 @@ struct RuntimeDerivedTextTransform {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeDerivedTextExpression {
-    Const { value: String },
+    Const {
+        value: String,
+    },
+    MatchConst {
+        input: String,
+        arms: Vec<UpdateMatchArm>,
+    },
     EnterKeyPayloadTextTrimNonEmpty,
-    EnterKeyRootTextTrimNonEmpty { path: String },
-    SourceRootText { path: String },
+    EnterKeyRootTextTrimNonEmpty {
+        path: String,
+    },
+    SourceRootText {
+        path: String,
+    },
+    PrefixPayloadConcat {
+        prefix: String,
+        payload_path: String,
+        separator: String,
+    },
     Unsupported,
 }
 
@@ -11826,13 +12289,27 @@ fn source_event_transform_text_expression(
     value: &boon_ir::DerivedValue,
     source: &str,
     expressions: &[AstExpr],
+    functions: &[FunctionDefinition],
 ) -> RuntimeDerivedTextExpression {
     let exprs = statement_ast_exprs(&value.statement, expressions);
     let Some(path) = text_trim_input_path_from_exprs(&exprs) else {
+        if let Some(expression) = source_payload_when_match_const_expression(&exprs, source) {
+            return expression;
+        }
+        if let Some(expression) =
+            source_then_match_const_expression(&value.path, &exprs, source, expressions, functions)
+        {
+            return expression;
+        }
+        if let Some(expression) = source_then_prefix_payload_concat_expression(&exprs, source) {
+            return expression;
+        }
         if let Some(value) = source_then_const_text_value(&exprs, source) {
             return RuntimeDerivedTextExpression::Const { value };
         }
-        let Some(path) = source_then_text_value(&exprs, source) else {
+        let Some(path) = source_then_text_value(&exprs, source)
+            .or_else(|| source_direct_text_value(&exprs, source))
+        else {
             return RuntimeDerivedTextExpression::Unsupported;
         };
         return RuntimeDerivedTextExpression::SourceRootText {
@@ -11850,6 +12327,233 @@ fn source_event_transform_text_expression(
     }
     RuntimeDerivedTextExpression::EnterKeyRootTextTrimNonEmpty {
         path: canonical_transform_text_path(&value.path, &path),
+    }
+}
+
+fn source_payload_when_match_const_expression(
+    exprs: &[AstExpr],
+    source: &str,
+) -> Option<RuntimeDerivedTextExpression> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::When { input } = expr.kind else {
+            return None;
+        };
+        let input = ast_argument_value_in_exprs(exprs, input)?;
+        if source_payload_match_input(&input, source, Some("key"), Some("text"), Some("address"))
+            .is_none()
+        {
+            return None;
+        }
+        let arms = runtime_match_const_arms_after_when(exprs, expr.line);
+        (!arms.is_empty()).then_some(RuntimeDerivedTextExpression::MatchConst { input, arms })
+    })
+}
+
+fn source_then_match_const_expression(
+    target: &str,
+    exprs: &[AstExpr],
+    source: &str,
+    all_expressions: &[AstExpr],
+    functions: &[FunctionDefinition],
+) -> Option<RuntimeDerivedTextExpression> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        let input_path = ast_argument_value_in_exprs(exprs, input)?;
+        if !source_event_path_matches(&input_path, source) {
+            return None;
+        }
+        let output = output?;
+        let output_expr = exprs.iter().find(|candidate| candidate.id == output)?;
+        let AstExprKind::Call { function, args } = &output_expr.kind else {
+            return None;
+        };
+        let function = runtime_function_definition_for_call(functions, function)?;
+        let function_exprs = statement_ast_exprs(&function.statement, all_expressions);
+        let when = function_exprs
+            .iter()
+            .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))?;
+        let AstExprKind::When { input } = when.kind else {
+            return None;
+        };
+        let input_name = ast_argument_value_in_exprs(&function_exprs, input)?;
+        let input =
+            runtime_function_call_arg_path(target, exprs, args, &function.args, &input_name)?;
+        let arms = runtime_match_const_arms_after_when(&function_exprs, when.line);
+        (!arms.is_empty()).then_some(RuntimeDerivedTextExpression::MatchConst { input, arms })
+    })
+}
+
+fn source_then_prefix_payload_concat_expression(
+    exprs: &[AstExpr],
+    source: &str,
+) -> Option<RuntimeDerivedTextExpression> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        let input_path = ast_argument_value_in_exprs(exprs, input)?;
+        if !source_event_path_matches(&input_path, source) {
+            return None;
+        }
+        output
+            .and_then(|output| prefix_payload_concat_expression(exprs, output, source))
+            .or_else(|| prefix_payload_concat_expression_after_line(exprs, expr.line, source))
+    })
+}
+
+fn source_direct_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
+    exprs.iter().find_map(|expr| {
+        let path = ast_argument_value_in_exprs(exprs, expr.id)?;
+        source_payload_match_input(&path, source, Some("key"), Some("text"), Some("address"))?;
+        Some(path)
+    })
+}
+
+fn prefix_payload_concat_expression_after_line(
+    exprs: &[AstExpr],
+    line: usize,
+    source: &str,
+) -> Option<RuntimeDerivedTextExpression> {
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line && expr.line < end_line)
+        .find_map(|expr| prefix_payload_concat_expression(exprs, expr.id, source))
+}
+
+fn prefix_payload_concat_expression(
+    exprs: &[AstExpr],
+    output: usize,
+    source: &str,
+) -> Option<RuntimeDerivedTextExpression> {
+    let expr = exprs.iter().find(|expr| expr.id == output)?;
+    let AstExprKind::Pipe { op, input, args } = &expr.kind else {
+        return None;
+    };
+    if op != "Text/concat" {
+        return None;
+    }
+    let prefix = ast_const_text_value_in_exprs(exprs, *input)?;
+    let payload_path = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("with"))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
+    source_payload_match_input(
+        &payload_path,
+        source,
+        Some("key"),
+        Some("text"),
+        Some("address"),
+    )?;
+    let separator = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("separator"))
+        .and_then(|arg| ast_const_text_value_in_exprs(exprs, arg.value))
+        .unwrap_or_default();
+    Some(RuntimeDerivedTextExpression::PrefixPayloadConcat {
+        prefix,
+        payload_path,
+        separator,
+    })
+}
+
+fn runtime_function_definition_for_call<'a>(
+    functions: &'a [FunctionDefinition],
+    function: &str,
+) -> Option<&'a FunctionDefinition> {
+    functions
+        .iter()
+        .find(|definition| definition.name == function)
+        .or_else(|| {
+            let suffix = function.rsplit_once('/').map(|(_, name)| name)?;
+            functions
+                .iter()
+                .find(|definition| definition.name == suffix)
+        })
+}
+
+fn runtime_function_call_arg_path(
+    target: &str,
+    exprs: &[AstExpr],
+    args: &[AstCallArg],
+    formals: &[String],
+    input_name: &str,
+) -> Option<String> {
+    let named = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(input_name))
+        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value));
+    let positional = formals
+        .iter()
+        .position(|formal| formal == input_name)
+        .and_then(|index| {
+            args.iter()
+                .filter(|arg| arg.name.is_none())
+                .nth(index)
+                .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
+        });
+    named
+        .or(positional)
+        .map(|path| canonical_transform_text_path(target, &path))
+}
+
+fn runtime_match_const_arms_after_when(exprs: &[AstExpr], when_line: usize) -> Vec<UpdateMatchArm> {
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    exprs
+        .iter()
+        .filter(|expr| expr.line > when_line && expr.line < end_line)
+        .filter_map(|expr| {
+            let AstExprKind::MatchArm {
+                pattern,
+                output: Some(output),
+            } = &expr.kind
+            else {
+                return None;
+            };
+            let pattern = runtime_match_const_pattern_label(pattern)?;
+            let output = ast_simple_text_value_in_exprs(exprs, *output)?;
+            Some(UpdateMatchArm { pattern, output })
+        })
+        .collect()
+}
+
+fn runtime_match_const_pattern_label(pattern: &[String]) -> Option<String> {
+    if pattern == ["__"] {
+        Some("__".to_owned())
+    } else if pattern.first().map(String::as_str) == Some("TEXT")
+        && pattern.get(1).map(String::as_str) == Some("{")
+        && pattern.last().map(String::as_str) == Some("}")
+    {
+        Some(text_match_pattern_value(&pattern[2..pattern.len() - 1]))
+    } else if pattern.len() == 1 {
+        Some(pattern[0].clone())
+    } else {
+        Some(pattern.join("."))
     }
 }
 
@@ -12094,7 +12798,7 @@ struct SourceRouteRouterRoute {
 struct SourceRouteRootTextTransform {
     source: String,
     target: String,
-    value: String,
+    value: FieldValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12109,7 +12813,7 @@ enum SourceAction {
     },
     RootTextTransform {
         target: String,
-        value: String,
+        value: FieldValue,
     },
     ListRemove {
         list: String,
@@ -12134,6 +12838,7 @@ enum SourceRouteTextAction {
     Const,
     SourceText,
     PreviousValue,
+    ReadPath,
     TextTrimOrPrevious,
 }
 
@@ -12247,6 +12952,15 @@ impl ScalarEquationPlan {
                             previous: previous.clone(),
                         }
                     }
+                    UpdateExpression::PrefixPayloadConcat {
+                        prefix,
+                        payload_path,
+                        separator,
+                    } => ScalarUpdateExpression::PrefixPayloadConcat {
+                        prefix: prefix.clone(),
+                        payload_path: payload_path.clone(),
+                        separator: separator.clone(),
+                    },
                     UpdateExpression::BoolNot { path } => {
                         ScalarUpdateExpression::BoolNot(path.clone())
                     }
@@ -12367,7 +13081,10 @@ impl ScalarEquationPlan {
                     .iter()
                     .find(|arm| arm.pattern == current)
                     .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
-                    .map(|arm| ScalarTextValue::Text(Cow::Owned(arm.output.clone()))))
+                    .and_then(|arm| {
+                        (arm.output != "SKIP")
+                            .then(|| ScalarTextValue::Text(Cow::Owned(arm.output.clone())))
+                    }))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::ReadPath(path) => {
@@ -12382,6 +13099,25 @@ impl ScalarEquationPlan {
             }
             ScalarUpdateExpression::TextTrimOrPrevious { .. }
             | ScalarUpdateExpression::BoolNot(_) => Ok(None),
+            ScalarUpdateExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => {
+                let payload = source_payload_match_input(
+                    payload_path,
+                    source,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                )
+                .ok_or_else(|| {
+                    format!("source `{source}` for `{target}` requires payload `{payload_path}`")
+                })?;
+                Ok(Some(ScalarTextValue::Text(Cow::Owned(format!(
+                    "{prefix}{separator}{payload}"
+                )))))
+            }
             ScalarUpdateExpression::Unsupported => Ok(None),
         }
     }
@@ -12450,22 +13186,33 @@ impl DerivedEquationPlan {
             .iter()
             .filter(|value| {
                 value.kind == DerivedValueKind::SourceEventTransform
-                    && append_triggers.contains(value.path.as_str())
+                    && (!value.indexed || append_triggers.contains(value.path.as_str()))
             })
-            .flat_map(|value| {
-                value
+            .filter_map(|value| {
+                let transforms = value
                     .sources
                     .iter()
-                    .map(|source| RuntimeDerivedTextTransform {
-                        target: value.path.clone(),
-                        source: source.clone(),
-                        expression: source_event_transform_text_expression(
+                    .filter_map(|source| {
+                        let expression = source_event_transform_text_expression(
                             value,
                             source,
                             &ir.expressions,
-                        ),
+                            &ir.functions,
+                        );
+                        if !matches!(expression, RuntimeDerivedTextExpression::Unsupported) {
+                            Some(RuntimeDerivedTextTransform {
+                                target: value.path.clone(),
+                                source: source.clone(),
+                                expression,
+                            })
+                        } else {
+                            None
+                        }
                     })
+                    .collect::<Vec<_>>();
+                (!transforms.is_empty()).then_some(transforms)
             })
+            .flatten()
             .collect();
         Self { text_transforms }
     }
@@ -12474,8 +13221,9 @@ impl DerivedEquationPlan {
         &self,
         target: &str,
         source: &str,
-        key: Option<&str>,
+        key: Option<&'a str>,
         text: Option<&'a str>,
+        address: Option<&'a str>,
         read_root_text: impl Fn(&str) -> Option<String>,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(transform) = self
@@ -12487,6 +13235,21 @@ impl DerivedEquationPlan {
         };
         match &transform.expression {
             RuntimeDerivedTextExpression::Const { value } => Ok(Some(Cow::Owned(value.clone()))),
+            RuntimeDerivedTextExpression::MatchConst { input, arms } => {
+                let current = match source_payload_match_input(input, source, key, text, address) {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(read_root_text(input).ok_or_else(|| {
+                        format!(
+                            "derived text transform `{target}` from `{source}` requires match input `{input}`"
+                        )
+                    })?),
+                };
+                Ok(arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                    .and_then(|arm| (arm.output != "SKIP").then(|| Cow::Owned(arm.output.clone()))))
+            }
             RuntimeDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
                 if key != Some("Enter") {
                     return Ok(None);
@@ -12508,6 +13271,10 @@ impl DerivedEquationPlan {
                 Ok((!trimmed.is_empty()).then_some(Cow::Owned(trimmed)))
             }
             RuntimeDerivedTextExpression::SourceRootText { path } => {
+                if let Some(payload) = source_payload_match_input(path, source, key, text, address)
+                {
+                    return Ok(Some(Cow::Borrowed(payload)));
+                }
                 let text = read_root_text(path).ok_or_else(|| {
                     format!(
                         "derived text transform `{target}` from `{source}` requires root text `{path}`"
@@ -12515,6 +13282,20 @@ impl DerivedEquationPlan {
                 })?;
                 let trimmed = text.trim().to_owned();
                 Ok((!trimmed.is_empty()).then_some(Cow::Owned(trimmed)))
+            }
+            RuntimeDerivedTextExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => {
+                let payload =
+                    source_payload_match_input(payload_path, source, key, text, address)
+                        .ok_or_else(|| {
+                            format!(
+                                "derived text transform `{target}` from `{source}` requires payload `{payload_path}`"
+                            )
+                        })?;
+                Ok(Some(Cow::Owned(format!("{prefix}{separator}{payload}"))))
             }
             RuntimeDerivedTextExpression::Unsupported => Err(format!(
                 "derived text transform `{target}` from `{source}` is unsupported"
@@ -12537,6 +13318,7 @@ impl GenericDerivedPlan {
             .iter()
             .filter(|value| {
                 !value.indexed
+                    && value.scope_id.is_none()
                     && matches!(
                         value.kind,
                         DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
@@ -12553,7 +13335,7 @@ impl GenericDerivedPlan {
             .derived_values
             .iter()
             .filter(|value| {
-                value.indexed
+                (value.indexed || value.scope_id.is_some())
                     && matches!(
                         value.kind,
                         DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
@@ -13193,6 +13975,12 @@ fn root_text_transform_targets_from_ir(
             | ListOperationKind::Count { .. } => None,
         })
         .collect::<BTreeSet<_>>();
+    let statically_scheduled_root_updates = ir
+        .update_branches
+        .iter()
+        .filter(|branch| !branch.indexed)
+        .map(|branch| (branch.target.as_str(), branch.source.as_str()))
+        .collect::<BTreeSet<_>>();
     for value in &ir.derived_values {
         if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
             continue;
@@ -13208,7 +13996,24 @@ fn root_text_transform_targets_from_ir(
             if source_is_scoped(ir, source) {
                 continue;
             }
-            let Some(output) = source_then_text_value(&exprs, source) else {
+            if statically_scheduled_root_updates.contains(&(value.path.as_str(), source.as_str())) {
+                continue;
+            }
+            if source_payload_when_match_const_expression(&exprs, source).is_some() {
+                continue;
+            }
+            if source_then_match_const_expression(
+                &value.path,
+                &exprs,
+                source,
+                &ir.expressions,
+                &ir.functions,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            let Some(output) = source_then_field_value(&exprs, source) else {
                 continue;
             };
             targets.push(SourceRouteRootTextTransform {
@@ -13235,14 +14040,28 @@ fn source_then_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
             return None;
         };
         let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source)
-            && !source_path_before_line_matches(exprs, expr.line, source)
-        {
+        if !source_event_path_matches(&input_path, source) {
             return None;
         }
         output
             .and_then(|output| ast_argument_value_in_exprs(exprs, output))
             .or_else(|| simple_value_after_line(exprs, expr.line))
+    })
+}
+
+fn source_then_field_value(exprs: &[AstExpr], source: &str) -> Option<FieldValue> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        let input_path = ast_argument_value_in_exprs(exprs, input)?;
+        if !source_event_path_matches(&input_path, source) {
+            return None;
+        }
+        if let Some(output) = output {
+            return ast_simple_field_value_in_exprs(exprs, output);
+        }
+        simple_field_value_after_line(exprs, expr.line)
     })
 }
 
@@ -13252,9 +14071,7 @@ fn source_then_const_text_value(exprs: &[AstExpr], source: &str) -> Option<Strin
             return None;
         };
         let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source)
-            && !source_path_before_line_matches(exprs, expr.line, source)
-        {
+        if !source_event_path_matches(&input_path, source) {
             return None;
         }
         output
@@ -13289,10 +14106,23 @@ fn simple_value_after_line(exprs: &[AstExpr], line: usize) -> Option<String> {
         .find_map(|expr| ast_simple_text_value_in_exprs(exprs, expr.id))
 }
 
+fn simple_field_value_after_line(exprs: &[AstExpr], line: usize) -> Option<FieldValue> {
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line)
+        .find_map(|expr| ast_simple_field_value_in_exprs(exprs, expr.id))
+}
+
 fn ast_const_text_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
     let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
     match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
+        | AstExprKind::Number(value)
+        | AstExprKind::StringLiteral(value)
+        | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Bool(true) => Some("True".to_owned()),
+        AstExprKind::Bool(false) => Some("False".to_owned()),
         _ => None,
     }
 }
@@ -13303,9 +14133,25 @@ fn ast_simple_text_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<S
         AstExprKind::Identifier(value)
         | AstExprKind::Enum(value)
         | AstExprKind::Tag(value)
+        | AstExprKind::Number(value)
         | AstExprKind::StringLiteral(value)
         | AstExprKind::TextLiteral(value) => Some(value.clone()),
         AstExprKind::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
+fn ast_simple_field_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<FieldValue> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Bool(value) => Some(FieldValue::Bool(*value)),
+        AstExprKind::Identifier(value)
+        | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
+        | AstExprKind::Number(value)
+        | AstExprKind::StringLiteral(value)
+        | AstExprKind::TextLiteral(value) => Some(FieldValue::Text(value.clone())),
+        AstExprKind::Path(parts) if !parts.is_empty() => Some(FieldValue::Text(parts.join("."))),
         _ => None,
     }
 }
@@ -13447,9 +14293,12 @@ impl SourceRoute {
                     ScalarUpdateExpression::PreviousValue(_) => {
                         SourceRouteTextAction::PreviousValue
                     }
-                    ScalarUpdateExpression::ReadPath(_) => return None,
+                    ScalarUpdateExpression::ReadPath(_) => SourceRouteTextAction::ReadPath,
                     ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
                         SourceRouteTextAction::TextTrimOrPrevious
+                    }
+                    ScalarUpdateExpression::PrefixPayloadConcat { .. } => {
+                        SourceRouteTextAction::ReadPath
                     }
                     ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::SourceKey
@@ -13481,6 +14330,7 @@ impl SourceRoute {
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::ReadPath(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                    | ScalarUpdateExpression::PrefixPayloadConcat { .. }
                     | ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
@@ -15373,8 +16223,12 @@ mod tests {
         ] {
             let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
             assert!(
-                migrated.contains("CheckboxGlyph[checked]"),
-                "{relative} should declare the intentional themed checkbox glyph divergence"
+                migrated.contains("CheckboxGlyph =>"),
+                "{relative} should declare the intentional themed checkbox glyph material"
+            );
+            assert!(
+                migrated.contains("checked_border") && migrated.contains("check_color"),
+                "{relative} should declare checked checkbox colors for the themed glyph material"
             );
             assert!(
                 !migrated.contains("LINK"),
@@ -15532,7 +16386,7 @@ FUNCTION icon_code(item) {
             theme_targets.iter().any(|target| {
                 target.source == "store.elements.theme_switcher.classic"
                     && target.target == "theme_options.name"
-                    && target.value == "Classic"
+                    && target.value == FieldValue::Text("Classic".to_owned())
             }),
             "{theme_targets:#?}\n{theme_debug:#?}"
         );
@@ -15540,7 +16394,7 @@ FUNCTION icon_code(item) {
             theme_targets.iter().any(|target| {
                 target.source == "store.elements.theme_switcher.glassmorphism"
                     && target.target == "theme_options.name"
-                    && target.value == "Glassmorphism"
+                    && target.value == FieldValue::Text("Glassmorphism".to_owned())
             }),
             "{theme_targets:#?}\n{theme_debug:#?}"
         );
@@ -16478,6 +17332,86 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     }
 
     #[test]
+    fn live_runtime_applies_plain_latest_key_payload_match() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let parsed = parse_project(
+            "plain-latest-key-match-debug".to_owned(),
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+        .expect("NovyWave project should parse");
+        let (ir, _) = lower_profiled(&parsed).expect("NovyWave project should lower");
+        let cursor_branch_debug = ir
+            .update_branches
+            .iter()
+            .filter(|branch| {
+                branch.target == "store.cursor_position"
+                    && branch.source == "store.elements.keyboard_capture"
+            })
+            .map(|branch| format!("{:?}", branch.expression))
+            .collect::<Vec<_>>();
+        let mut runtime = LiveRuntime::from_project("plain-latest-key-match", &units)
+            .expect("runtime should initialize");
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.load_fixture".to_owned(),
+                target_text: Some("Load fixture".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("fixture load should apply");
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_data".to_owned(),
+                target_text: Some("data_bus[7:0]".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("data_bus selection should apply");
+        assert_eq!(
+            runtime.state_summary()["store"]["cursor_position"],
+            "Cursor42"
+        );
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("Q".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("keyboard source event should apply");
+        assert!(
+            output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.cursor_position")
+                    && matches!(&delta.value, ProtocolValue::Text(value) if value == "Cursor36")
+            }),
+            "cursor_position branch debug: {cursor_branch_debug:#?}; deltas: {:#?}",
+            output.semantic_deltas
+        );
+        assert_eq!(output.state_summary["store"]["cursor_position"], "Cursor36");
+        assert_eq!(output.state_summary["cursor_position"], "Cursor36");
+        assert_eq!(
+            output.state_summary["store"]["bridge_request_descriptor_label"],
+            "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
+        );
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("W".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("keyboard source event should apply");
+        assert_eq!(output.state_summary["store"]["cursor_position"], "Cursor36");
+        assert_eq!(
+            output.state_summary["store"]["bridge_request_descriptor_label"],
+            "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
+        );
+    }
+
+    #[test]
     fn live_runtime_applies_numeric_counter_hold_updates_generically() {
         let source = include_str!("../../../examples/counter.bn");
         let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
@@ -17285,6 +18219,65 @@ FUNCTION new_signal(signal) {
     }
 
     #[test]
+    fn list_chunk_projects_windowed_derived_record_lists() {
+        let source = r#"
+signals:
+    LIST {
+        [name: TEXT { clk }, family: TEXT { clock }]
+        [name: TEXT { data0 }, family: TEXT { data }]
+        [name: TEXT { data1 }, family: TEXT { data }]
+        [name: TEXT { data2 }, family: TEXT { data }]
+    }
+    |> List/map(signal, new: new_signal(signal: signal))
+
+store: [
+    sources: [
+        search: SOURCE
+    ]
+    query:
+        TEXT { data } |> HOLD query {
+            LATEST {
+                TEXT { data }
+            }
+        }
+    search_results:
+        signals |> List/filter_text_contains(field: "name", needle: query, prefer_field: "family", empty_field: "family", empty_value: TEXT { data })
+    visible_rows:
+        List/chunk(search_results, size: 1, items: signals, label: row_number)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Signals }))
+
+FUNCTION new_signal(signal) {
+    [
+        name: signal.name
+        family: signal.family
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("derived-list-chunk", source).unwrap();
+        let summary = runtime.document_state_summary();
+        assert_eq!(
+            summary["store"]["search_results"].as_array().unwrap().len(),
+            3
+        );
+        let rows = summary["store"]["visible_rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["row_number"], "0");
+        assert_eq!(rows[0]["signals"][0]["name"], "data0");
+        assert_eq!(rows[2]["row_number"], "2");
+        assert_eq!(rows[2]["signals"][0]["name"], "data2");
+
+        let windowed = runtime.document_state_summary_for_window(1, 2, 0, 10);
+        let windowed_rows = windowed["store"]["visible_rows"].as_array().unwrap();
+        assert_eq!(windowed_rows.len(), 2);
+        assert_eq!(windowed_rows[0]["row_number"], "1");
+        assert_eq!(windowed_rows[0]["signals"][0]["name"], "data1");
+        assert_eq!(windowed_rows[1]["row_number"], "2");
+        assert_eq!(windowed_rows[1]["signals"][0]["name"], "data2");
+    }
+
+    #[test]
     fn list_filter_field_and_move_project_selected_rows() {
         let source = r#"
 store: [
@@ -17762,9 +18755,9 @@ FUNCTION new_marker(marker) {
         assert_eq!(
             runtime
                 .generic
-                .list_row_textlike("todos", appended_index, "not_editing")
+                .list_row_bool("todos", appended_index, "not_editing")
                 .unwrap(),
-            "True"
+            true
         );
         assert_eq!(
             runtime
@@ -18396,9 +19389,9 @@ FUNCTION new_marker(marker) {
         assert_eq!(
             runtime
                 .generic
-                .list_row_textlike("todos", runtime.list_len_for_test() - 1, "not_editing")
+                .list_row_bool("todos", runtime.list_len_for_test() - 1, "not_editing")
                 .unwrap(),
-            "True"
+            true
         );
 
         deltas.clear();
@@ -18707,6 +19700,243 @@ FUNCTION new_marker(marker) {
             values["store.todos[0].completed"],
             json!({"kind": "bool", "value": false})
         );
+    }
+
+    #[test]
+    fn root_pure_boolean_materializes_as_bool() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    held:
+        Text/empty() |> HOLD held {
+            LATEST {}
+        }
+    ready:
+        held == Text/empty()
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-pure-bool", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["ready"], true);
+        assert_eq!(summary["ready"], true);
+
+        let values = runtime.runtime_value_summaries(&["store.ready".to_owned()], 4, 8, 2);
+        assert_eq!(
+            values["store.ready"],
+            json!({"kind": "bool", "value": true})
+        );
+    }
+
+    #[test]
+    fn indexed_plain_latest_boolean_materializes_as_bool() {
+        let source = r#"
+rows:
+    LIST {
+        [name: TEXT { clk }]
+    }
+    |> List/map(row, new: new_row(row: row))
+
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    held:
+        Text/empty() |> HOLD held {
+            LATEST {}
+        }
+    label: TEXT { rows }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+
+FUNCTION new_row(row) {
+    [
+        name: row.name
+        selected_once:
+            LATEST {
+                False
+            }
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("indexed-plain-latest-bool", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["rows"][0]["selected_once"], false);
+
+        let values =
+            runtime.runtime_value_summaries(&["rows[0].selected_once".to_owned()], 4, 8, 2);
+        assert_eq!(
+            values["rows[0].selected_once"],
+            json!({"kind": "bool", "value": false})
+        );
+    }
+
+    #[test]
+    fn root_plain_latest_boolean_materializes_as_bool() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    held:
+        Text/empty() |> HOLD held {
+            LATEST {}
+        }
+    ready:
+        LATEST {
+            True
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-plain-latest-bool", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["ready"], true);
+
+        let values = runtime.runtime_value_summaries(&["store.ready".to_owned()], 4, 8, 2);
+        assert_eq!(
+            values["store.ready"],
+            json!({"kind": "bool", "value": true})
+        );
+    }
+
+    #[test]
+    fn root_event_plain_latest_boolean_updates_as_bool() {
+        let source = r#"
+store: [
+    elements: [
+        probe: SOURCE
+    ]
+    held:
+        Text/empty() |> HOLD held {
+            LATEST {}
+        }
+    ready:
+        LATEST {
+            False
+            elements.probe.event.press |> THEN { True }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-event-plain-latest-bool", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["ready"], false);
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.probe".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["ready"], true);
+
+        let values = runtime.runtime_value_summaries(&["store.ready".to_owned()], 4, 8, 2);
+        assert_eq!(
+            values["store.ready"],
+            json!({"kind": "bool", "value": true})
+        );
+    }
+
+    #[test]
+    fn derived_root_summary_flat_alias_overrides_stale_materialized_value() {
+        let source = r#"
+store: [
+    elements: [
+        format_cycle: SOURCE
+    ]
+    value_format:
+        TEXT { Hexadecimal } |> HOLD value_format {
+            LATEST {
+                elements.format_cycle.event.press |> THEN { next_format(format: value_format) }
+            }
+        }
+    rendered_value:
+        selected_value(format: value_format)
+]
+
+FUNCTION next_format(format) {
+    format |> WHEN {
+        TEXT { Hexadecimal } => TEXT { Binary }
+        __ => TEXT { Hexadecimal }
+    }
+}
+
+FUNCTION selected_value(format) {
+    format |> WHEN {
+        TEXT { Binary } => TEXT { 00101010 }
+        __ => TEXT { 0x2a }
+    }
+}
+
+document: Document/new(root: Element/label(element: [], label: store.rendered_value))
+"#;
+        let mut runtime = LiveRuntime::from_source("derived-root-summary-flat-alias", source)
+            .expect("runtime should initialize");
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["rendered_value"], "0x2a");
+        assert_eq!(initial["rendered_value"], "0x2a");
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.format_cycle".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("format-cycle source event should apply");
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.field_path.as_deref() == Some("store.rendered_value")
+                && matches!(&delta.value, ProtocolValue::Text(value) if value == "00101010")
+        }));
+        assert_eq!(output.state_summary["store"]["rendered_value"], "00101010");
+        assert_eq!(output.state_summary["rendered_value"], "00101010");
+    }
+
+    #[test]
+    fn novywave_format_cycle_updates_summary_and_rendered_values() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-format-cycle-runtime", &units)
+            .expect("NovyWave runtime should initialize");
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.load_fixture".to_owned(),
+                target_text: Some("Load fixture".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("fixture load should apply");
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_data".to_owned(),
+                target_text: Some("data_bus[7:0]".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("data_bus selection should apply");
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.format_cycle".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("format cycle should apply");
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.field_path.as_deref() == Some("store.data_bus_rendered_value")
+                && matches!(&delta.value, ProtocolValue::Text(value) if value == "00101010")
+        }));
+        assert_eq!(output.state_summary["store"]["value_format"], "Binary");
+        assert_eq!(output.state_summary["value_format"], "Binary");
+        assert_eq!(
+            output.state_summary["store"]["data_bus_rendered_value"],
+            "00101010"
+        );
+        assert_eq!(output.state_summary["data_bus_rendered_value"], "00101010");
     }
 
     #[test]

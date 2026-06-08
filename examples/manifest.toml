@@ -248,6 +248,7 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
+  "begin-load-fixture",
   "load-fixture-from-empty",
   "select-compare-fixture",
   "select-primary-fixture",
@@ -284,11 +285,14 @@ input_scenarios = [
   "format-binary",
   "zoom-in",
   "zoom-out",
+  "cursor-left",
   "cursor-right",
   "pan-left",
+  "pan-right",
   "keyboard-pan-right",
   "keyboard-cursor-left",
   "keyboard-zoom-wide",
+  "keyboard-zoom-reset",
   "keyboard-zoom-close",
   "keyboard-cursor-right",
   "keyboard-pan-left",
@@ -308,6 +312,13 @@ input_scenarios = [
   "show-empty-state",
   "reload-fixture",
   "select-data-before-format",
+  "format-cycle-binary",
+  "format-cycle-grouped",
+  "format-cycle-octal",
+  "format-cycle-signed",
+  "format-cycle-unsigned",
+  "format-cycle-ascii",
+  "format-cycle-hex",
   "format-grouped-binary",
   "format-octal",
   "format-signed",
@@ -317,7 +328,21 @@ input_scenarios = [
   "switch-dark",
   "final-marker-jump",
 ]
-scroll_focus_scenarios = []
+scroll_focus_scenarios = [
+  "zoom-in",
+  "zoom-out",
+  "cursor-left",
+  "cursor-right",
+  "pan-left",
+  "pan-right",
+  "keyboard-pan-right",
+  "keyboard-cursor-left",
+  "keyboard-zoom-wide",
+  "keyboard-zoom-reset",
+  "keyboard-zoom-close",
+  "keyboard-cursor-right",
+  "keyboard-pan-left",
+]
 visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",
   "dev-app-owned-framebuffer",
@@ -337,7 +362,8 @@ performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",
   "preview-interaction-p99-frame-ms <= 25.0",
   "dev-editor-scroll-p95-frame-ms <= 16.7",
-  "timeline-pan-zoom-p95-frame-ms <= 16.7",
+  "timeline-pan-zoom-state-replay-p95-ms <= 120.0",
+  "preview-scroll-frame-p95-ms <= 16.7",
 ]
 
 [[example]]

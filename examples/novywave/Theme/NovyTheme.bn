@@ -335,6 +335,38 @@ FUNCTION trace_height(state) {
     }
 }
 
+FUNCTION trace_height_for_row(state, row_size) {
+    row_size |> WHEN {
+        Compact => trace_height_compact(state: state)
+        Tall => trace_height_tall(state: state)
+        __ => trace_height(state: state)
+    }
+}
+
+FUNCTION trace_height_compact(state) {
+    state |> WHEN {
+        High => 16
+        Low => 16
+        Unknown => 16
+        AnalogLow => 8
+        AnalogMid => 12
+        AnalogHigh => 16
+        __ => 14
+    }
+}
+
+FUNCTION trace_height_tall(state) {
+    state |> WHEN {
+        High => 34
+        Low => 34
+        Unknown => 34
+        AnalogLow => 18
+        AnalogMid => 26
+        AnalogHigh => 34
+        __ => 28
+    }
+}
+
 FUNCTION trace_fill_color(mode, tone) {
     tone |> WHEN {
         Blue => mode |> WHEN {

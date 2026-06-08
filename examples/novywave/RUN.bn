@@ -9,6 +9,8 @@ store: [
         }
 
     elements: [
+        open_load_files_dialog: SOURCE
+        close_load_files_dialog: SOURCE
         begin_load_fixture: SOURCE
         load_fixture: SOURCE
         show_empty: SOURCE
@@ -21,6 +23,7 @@ store: [
         mode_to_dark: SOURCE
         zoom_in: SOURCE
         zoom_out: SOURCE
+        zoom_reset: SOURCE
         pan_left: SOURCE
         pan_right: SOURCE
         cursor_left: SOURCE
@@ -36,13 +39,29 @@ store: [
         row_taller: SOURCE
         row_shorter: SOURCE
         selected_remove_data: SOURCE
+        selected_remove_clk: SOURCE
+        selected_remove_reset: SOURCE
+        selected_remove_data_valid: SOURCE
+        selected_remove_data_ready: SOURCE
+        selected_remove_state: SOURCE
+        selected_remove_error_count: SOURCE
+        selected_remove_temperature: SOURCE
+        selected_remove_tx_data: SOURCE
+        selected_remove_rx_data: SOURCE
+        selected_remove_baud_tick: SOURCE
+        selected_remove_uart_busy: SOURCE
+        selected_remove_ghw_counter: SOURCE
+        selected_remove_ghw_enable: SOURCE
+        selected_remove_ghw_state: SOURCE
         selected_restore_data: SOURCE
         selected_data_up: SOURCE
         selected_data_down: SOURCE
         analog_limits_auto: SOURCE
         analog_limits_manual: SOURCE
         analog_limits_invalid: SOURCE
+        format_dropdown_toggle: SOURCE
         format_cycle: SOURCE
+        format_binary: SOURCE
         format_hex: SOURCE
         format_grouped: SOURCE
         format_octal: SOURCE
@@ -50,6 +69,7 @@ store: [
         format_unsigned: SOURCE
         format_ascii: SOURCE
         keyboard_capture: SOURCE
+        waveform_click: SOURCE
         signal_search_input: SOURCE
         scope_cpu: SOURCE
         scope_cpu_expand: SOURCE
@@ -60,11 +80,111 @@ store: [
         select_reset: SOURCE
         select_data: SOURCE
         select_temperature: SOURCE
+        panels_files_wider: SOURCE
+        panels_variables_wider: SOURCE
+        panels_reset: SOURCE
+        panels_toggle_arrangement: SOURCE
     ]
+
+    load_files_dialog:
+        LATEST {
+            TEXT { Closed }
+            elements.open_load_files_dialog.event.press |> THEN { TEXT { Open } }
+            elements.close_load_files_dialog.event.press |> THEN { TEXT { Closed } }
+            elements.begin_load_fixture.event.press |> THEN { TEXT { Closed } }
+            elements.load_fixture.event.press |> THEN { TEXT { Closed } }
+            elements.show_empty.event.press |> THEN { TEXT { Closed } }
+            elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { Closed } }
+        }
+
+    panel_layout:
+        TEXT { Balanced } |> HOLD panel_layout {
+            LATEST {
+                elements.panels_files_wider.event.press |> THEN { TEXT { FilesWide } }
+                elements.panels_variables_wider.event.press |> THEN { TEXT { VariablesWide } }
+                elements.panels_reset.event.press |> THEN { TEXT { Balanced } }
+                elements.show_empty.event.press |> THEN { TEXT { Balanced } }
+                elements.load_fixture.event.press |> THEN { TEXT { Balanced } }
+            }
+        }
+
+    panel_layout_label:
+        panel_layout |> WHEN {
+            TEXT { FilesWide } => TEXT { Files panel wide }
+            TEXT { VariablesWide } => TEXT { Variables panel wide }
+            __ => TEXT { Panels balanced }
+        }
+
+    panel_arrangement:
+        TEXT { Stacked } |> HOLD panel_arrangement {
+            LATEST {
+                elements.panels_toggle_arrangement.event.press |> THEN {
+                    panel_arrangement |> WHEN {
+                        TEXT { Docked } => TEXT { Stacked }
+                        __ => TEXT { Docked }
+                    }
+                }
+                elements.show_empty.event.press |> THEN { TEXT { Stacked } }
+                elements.load_fixture.event.press |> THEN { TEXT { Stacked } }
+            }
+        }
+
+    panel_arrangement_label:
+        panel_arrangement |> WHEN {
+            TEXT { Docked } => TEXT { Docked panels }
+            __ => TEXT { Stacked panels }
+        }
+
+    panel_arrangement_button_label:
+        panel_arrangement |> WHEN {
+            TEXT { Docked } => TEXT { Stack }
+            __ => TEXT { Dock }
+        }
+
+    files_panel_width:
+        panel_layout |> WHEN {
+            TEXT { FilesWide } => 520
+            TEXT { VariablesWide } => 340
+            __ => 430
+        }
+
+    variables_panel_width:
+        panel_layout |> WHEN {
+            TEXT { FilesWide } => 390
+            TEXT { VariablesWide } => 570
+            __ => 480
+        }
+
+    browser_panel_width:
+        panel_layout |> WHEN {
+            TEXT { FilesWide } => 520
+            TEXT { VariablesWide } => 570
+            __ => 480
+        }
+
+    load_files_dialog_title:
+        load_files_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Load files }
+            False => TEXT { No file dialog }
+        }
+
+    load_files_dialog_hint:
+        load_files_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Choose waveform fixtures or confirm the bundled counter.vcd fixture. }
+            False => TEXT { File dialog closed }
+        }
+
+    load_files_dialog_selection:
+        load_files_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { counter.vcd, simple_test.ghw, uart_compare.fst }
+            False => TEXT { none }
+        }
 
     fixture_status:
         LATEST {
-            TEXT { Empty }
+            TEXT { Loaded }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
             elements.begin_load_fixture.event.press |> THEN { TEXT { Loading } }
             elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
@@ -86,7 +206,7 @@ store: [
 
     active_file:
         LATEST {
-            TEXT { none }
+            TEXT { counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
@@ -108,7 +228,7 @@ store: [
 
     file_compare_status:
         LATEST {
-            TEXT { no waveform loaded }
+            TEXT { single fixture: counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { single fixture: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing counter.vcd to uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { single fixture: simple_test.ghw } }
@@ -130,7 +250,7 @@ store: [
 
     bridge_file_format:
         LATEST {
-            TEXT { none }
+            TEXT { VCD }
             elements.select_counter_file.event.press |> THEN { TEXT { VCD } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
@@ -142,7 +262,7 @@ store: [
 
     bridge_file_digest:
         LATEST {
-            TEXT { sha256:none }
+            TEXT { sha256:fixture-counter-vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
@@ -154,7 +274,7 @@ store: [
 
     bridge_waveform_ref:
         LATEST {
-            TEXT { wave:none }
+            TEXT { wave:vcd:counter:0-240ns }
             elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
@@ -166,7 +286,7 @@ store: [
 
     bridge_descriptor_file:
         LATEST {
-            TEXT { none }
+            TEXT { counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
@@ -178,7 +298,7 @@ store: [
 
     bridge_open_status:
         LATEST {
-            TEXT { NOT_REQUESTED }
+            TEXT { FIXTURE_READY }
             elements.select_counter_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.select_ghw_file.event.press |> THEN { TEXT { FIXTURE_READY } }
@@ -190,7 +310,7 @@ store: [
 
     bridge_open_summary:
         LATEST {
-            TEXT { no file loaded }
+            TEXT { fixture VCD wave:vcd:counter:0-240ns }
             elements.select_counter_file.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { fixture FST wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { fixture GHW wave:ghw:simple-test:0-100ns } }
@@ -202,7 +322,7 @@ store: [
 
     bridge_hierarchy_page_label:
         LATEST {
-            TEXT { HIER:none }
+            TEXT { HIER:top.cpu/top.uart/top.analog }
             elements.select_counter_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
             elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
@@ -214,7 +334,7 @@ store: [
 
     bridge_file_stats_label:
         LATEST {
-            TEXT { no waveform stats }
+            TEXT { VCD 15 signals, 0-240ns, bounded pages }
             elements.select_counter_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
@@ -226,7 +346,7 @@ store: [
 
     bridge_large_fixture_contract:
         LATEST {
-            TEXT { no large file materialized }
+            TEXT { counter.vcd 311B -> bounded page requests only }
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd 311B -> bounded page requests only } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded compare page only } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
@@ -243,12 +363,13 @@ store: [
 
     bridge_page_window_label:
         LATEST {
-            TEXT { no page window scheduled }
+            TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
             elements.select_counter_file.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
             elements.select_ghw_file.event.press |> THEN { TEXT { window 0-100ns, max 256 transitions, payload <= 64KiB } }
             elements.zoom_in.event.press |> THEN { TEXT { window 36-60ns, max 256 transitions, payload <= 64KiB } }
             elements.zoom_out.event.press |> THEN { TEXT { window 0-240ns, max 256 transitions, payload <= 64KiB } }
+            elements.zoom_reset.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
             elements.pan_left.event.press |> THEN { TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB } }
             elements.pan_right.event.press |> THEN { TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB } }
             elements.show_empty.event.press |> THEN { TEXT { no page window scheduled } }
@@ -258,7 +379,7 @@ store: [
 
     bridge_hierarchy_page_cursor_label:
         LATEST {
-            TEXT { hierarchy cursor none }
+            TEXT { hierarchy cursor root:0..64 next=top.cpu }
             elements.select_counter_file.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { hierarchy cursor top.uart:0..64 next=none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
@@ -270,7 +391,7 @@ store: [
 
     bridge_materialization_bound_label:
         LATEST {
-            TEXT { visible rows 0/0, waveform segments 0/256 max }
+            TEXT { visible rows 8/15, waveform segments 64/256 max }
             elements.select_counter_file.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { visible rows 4/5, waveform segments 28/256 max } }
             elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
@@ -285,7 +406,7 @@ store: [
 
     compare_request_page:
         LATEST {
-            TEXT { compare:none }
+            TEXT { compare:counter.vcd:primary }
             elements.select_counter_file.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:counter.vcd+uart_compare.fst:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { compare:simple_test.ghw:primary } }
@@ -296,7 +417,7 @@ store: [
 
     compare_result_label:
         LATEST {
-            TEXT { no compare page }
+            TEXT { primary page: counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { primary page: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
             elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW fixture } }
@@ -313,7 +434,7 @@ store: [
 
     diagnostic_state:
         LATEST {
-            TEXT { Idle }
+            TEXT { OK }
             elements.diagnostic_probe.event.press |> THEN { TEXT { Unsupported } }
             elements.select_counter_file.event.press |> THEN { TEXT { OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
@@ -325,7 +446,7 @@ store: [
 
     diagnostic_label:
         LATEST {
-            TEXT { no file loaded }
+            TEXT { bridge diagnostics OK }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
@@ -364,7 +485,7 @@ store: [
 
     active_scope:
         LATEST {
-            TEXT { none }
+            TEXT { top_cpu }
             elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
             elements.scope_cpu_expand.event.press |> THEN { TEXT { top_cpu } }
             elements.scope_cpu_collapse.event.press |> THEN { TEXT { top_cpu } }
@@ -378,7 +499,7 @@ store: [
         }
 
     active_signal:
-        TEXT { none } |> HOLD active_signal {
+        TEXT { clk } |> HOLD active_signal {
             LATEST {
             signal_catalog
                 |> List/map(signal_catalog_item, new: LATEST {
@@ -469,102 +590,102 @@ store: [
 
     selected_waveform_segments:
         LIST {
-            [signal_id: TEXT { clk }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { reset_n }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { reset_n }, width: 84, state: Low, label: TEXT { reset }]
-            [signal_id: TEXT { reset_n }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { reset_n }, width: 252, state: High, label: TEXT { released }]
-            [signal_id: TEXT { data_bus }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { data_bus }, width: 56, state: Unknown, label: TEXT { XX }]
-            [signal_id: TEXT { data_bus }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { data_bus }, width: 56, state: High, label: TEXT { 0x12 }]
-            [signal_id: TEXT { data_bus }, width: 56, state: Low, label: TEXT { 0x00 }]
-            [signal_id: TEXT { data_bus }, width: 84, state: High, label: TEXT { 0x2a }]
-            [signal_id: TEXT { data_bus }, width: 84, state: Low, label: TEXT { 0x08 }]
-            [signal_id: TEXT { data_valid }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { data_valid }, width: 96, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { data_valid }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { data_valid }, width: 160, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { data_valid }, width: 80, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { data_ready }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { data_ready }, width: 48, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { data_ready }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { data_ready }, width: 144, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { data_ready }, width: 144, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { state }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { state }, width: 72, state: Unknown, label: TEXT { IDLE }]
-            [signal_id: TEXT { state }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { state }, width: 128, state: High, label: TEXT { RUN }]
-            [signal_id: TEXT { state }, width: 136, state: Low, label: TEXT { WAIT }]
-            [signal_id: TEXT { error_count }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { error_count }, width: 188, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { error_count }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { error_count }, width: 56, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { error_count }, width: 92, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { temperature }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 39 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 41 }]
-            [signal_id: TEXT { temperature }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 40 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 42 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }]
-            [signal_id: TEXT { tx_data }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { tx_data }, width: 48, state: Unknown, label: TEXT { idle }]
-            [signal_id: TEXT { tx_data }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { tx_data }, width: 88, state: High, label: TEXT { 0x55 }]
-            [signal_id: TEXT { tx_data }, width: 72, state: Low, label: TEXT { gap }]
-            [signal_id: TEXT { tx_data }, width: 104, state: High, label: TEXT { 0xa5 }]
-            [signal_id: TEXT { rx_data }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { rx_data }, width: 64, state: Low, label: TEXT { start }]
-            [signal_id: TEXT { rx_data }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { rx_data }, width: 96, state: High, label: TEXT { 0xaa }]
-            [signal_id: TEXT { rx_data }, width: 72, state: Low, label: TEXT { stop }]
-            [signal_id: TEXT { rx_data }, width: 80, state: High, label: TEXT { idle }]
-            [signal_id: TEXT { baud_tick }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { baud_tick }, width: 44, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { baud_tick }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }]
-            [signal_id: TEXT { baud_tick }, width: 78, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }]
-            [signal_id: TEXT { baud_tick }, width: 120, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { uart_busy }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { uart_busy }, width: 86, state: Low, label: TEXT { idle }]
-            [signal_id: TEXT { uart_busy }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { uart_busy }, width: 156, state: High, label: TEXT { busy }]
-            [signal_id: TEXT { uart_busy }, width: 92, state: Low, label: TEXT { idle }]
-            [signal_id: TEXT { ghw_counter }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { ghw_counter }, width: 64, state: Unknown, label: TEXT { init }]
-            [signal_id: TEXT { ghw_counter }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 1 }]
-            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 2 }]
-            [signal_id: TEXT { ghw_counter }, width: 98, state: High, label: TEXT { 3 }]
-            [signal_id: TEXT { ghw_enable }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { ghw_enable }, width: 72, state: Low, label: TEXT { 0 }]
-            [signal_id: TEXT { ghw_enable }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { ghw_enable }, width: 216, state: High, label: TEXT { enable }]
-            [signal_id: TEXT { ghw_state }, width: 0, state: CursorLine, label: TEXT { cursor }]
-            [signal_id: TEXT { ghw_state }, width: 72, state: Unknown, label: TEXT { Reset }]
-            [signal_id: TEXT { ghw_state }, width: 0, state: MarkerLine, label: TEXT { marker }]
-            [signal_id: TEXT { ghw_state }, width: 184, state: High, label: TEXT { Count }]
-            [signal_id: TEXT { ghw_state }, width: 72, state: Low, label: TEXT { Hold }]
+            [signal_id: TEXT { clk }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { reset_n }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { reset_n }, width: 84, state: Low, label: TEXT { reset }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { reset_n }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { reset_n }, width: 252, state: High, label: TEXT { released }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { data_bus }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_bus }, width: 56, state: Unknown, label: TEXT { XX }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_bus }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_bus }, width: 56, state: High, label: TEXT { 0x12 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { data_bus }, width: 56, state: Low, label: TEXT { 0x00 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_bus }, width: 84, state: High, label: TEXT { 0x2a }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { data_bus }, width: 84, state: Low, label: TEXT { 0x08 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_valid }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_valid }, width: 96, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_valid }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_valid }, width: 160, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { data_valid }, width: 80, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_ready }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_ready }, width: 48, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { data_ready }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { data_ready }, width: 144, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { data_ready }, width: 144, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { state }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { state }, width: 72, state: Unknown, label: TEXT { IDLE }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { state }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { state }, width: 128, state: High, label: TEXT { RUN }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { state }, width: 136, state: Low, label: TEXT { WAIT }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { error_count }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { error_count }, width: 188, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { error_count }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { error_count }, width: 56, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { error_count }, width: 92, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { temperature }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 39 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 41 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 40 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 42 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { tx_data }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { tx_data }, width: 48, state: Unknown, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { tx_data }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { tx_data }, width: 88, state: High, label: TEXT { 0x55 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { tx_data }, width: 72, state: Low, label: TEXT { gap }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { tx_data }, width: 104, state: High, label: TEXT { 0xa5 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { rx_data }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { rx_data }, width: 64, state: Low, label: TEXT { start }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { rx_data }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { rx_data }, width: 96, state: High, label: TEXT { 0xaa }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { rx_data }, width: 72, state: Low, label: TEXT { stop }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { rx_data }, width: 80, state: High, label: TEXT { idle }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { baud_tick }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { baud_tick }, width: 44, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { baud_tick }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { baud_tick }, width: 78, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { baud_tick }, width: 120, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { uart_busy }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { uart_busy }, width: 86, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { uart_busy }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { uart_busy }, width: 156, state: High, label: TEXT { busy }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { uart_busy }, width: 92, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 64, state: Unknown, label: TEXT { init }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 2 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { ghw_counter }, width: 98, state: High, label: TEXT { 3 }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { ghw_enable }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_enable }, width: 72, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { ghw_enable }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_enable }, width: 216, state: High, label: TEXT { enable }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { ghw_state }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_state }, width: 72, state: Unknown, label: TEXT { Reset }, click_time: TEXT { 36 ns }]
+            [signal_id: TEXT { ghw_state }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [signal_id: TEXT { ghw_state }, width: 184, state: High, label: TEXT { Count }, click_time: TEXT { 48 ns }]
+            [signal_id: TEXT { ghw_state }, width: 72, state: Low, label: TEXT { Hold }, click_time: TEXT { 36 ns }]
         }
-        |> List/map(segment, new: new_waveform_segment(segment: segment))
+        |> List/map(segment, new: new_waveform_segment(segment: segment, zoom: zoom_level))
 
     active_waveform_segment_labels:
         selected_waveform_segments
@@ -584,8 +705,22 @@ store: [
 
     selected_rows_profile:
         LATEST {
-            TEXT { Empty }
+            TEXT { DefaultOrder }
             elements.selected_remove_data.event.press |> THEN { TEXT { WithoutData } }
+            elements.selected_remove_clk.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_reset.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_data_valid.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_data_ready.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_state.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_error_count.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_temperature.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_tx_data.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_rx_data.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_baud_tick.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_uart_busy.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_ghw_counter.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_ghw_enable.event.press |> THEN { TEXT { WithoutSelection } }
+            elements.selected_remove_ghw_state.event.press |> THEN { TEXT { WithoutSelection } }
             elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
             elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
             elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
@@ -600,6 +735,20 @@ store: [
         LATEST {
             TEXT { none }
             elements.selected_remove_data.event.press |> THEN { TEXT { data_bus } }
+            elements.selected_remove_clk.event.press |> THEN { TEXT { clk } }
+            elements.selected_remove_reset.event.press |> THEN { TEXT { reset_n } }
+            elements.selected_remove_data_valid.event.press |> THEN { TEXT { data_valid } }
+            elements.selected_remove_data_ready.event.press |> THEN { TEXT { data_ready } }
+            elements.selected_remove_state.event.press |> THEN { TEXT { state } }
+            elements.selected_remove_error_count.event.press |> THEN { TEXT { error_count } }
+            elements.selected_remove_temperature.event.press |> THEN { TEXT { temperature } }
+            elements.selected_remove_tx_data.event.press |> THEN { TEXT { tx_data } }
+            elements.selected_remove_rx_data.event.press |> THEN { TEXT { rx_data } }
+            elements.selected_remove_baud_tick.event.press |> THEN { TEXT { baud_tick } }
+            elements.selected_remove_uart_busy.event.press |> THEN { TEXT { uart_busy } }
+            elements.selected_remove_ghw_counter.event.press |> THEN { TEXT { ghw_counter } }
+            elements.selected_remove_ghw_enable.event.press |> THEN { TEXT { ghw_enable } }
+            elements.selected_remove_ghw_state.event.press |> THEN { TEXT { ghw_state } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
@@ -663,6 +812,9 @@ store: [
         signal_catalog
         |> List/filter_text_contains(field: "name", needle: signal_search_text, prefer_field: "family", empty_field: "scope", empty_value: active_scope_label)
 
+    variable_rows:
+        List/chunk(search_results, size: 1, items: signals, label: row_number)
+
     search_results_count:
         search_results |> List/length()
 
@@ -700,6 +852,8 @@ store: [
             LATEST {
                 elements.diagnostic_probe.event.press |> THEN { TEXT { Probe } }
                 elements.format_cycle.event.press |> THEN { TEXT { Fmt } }
+                elements.format_dropdown_toggle.event.press |> THEN { TEXT { none } }
+                elements.format_binary.event.press |> THEN { TEXT { none } }
                 elements.format_hex.event.press |> THEN { TEXT { none } }
                 elements.format_grouped.event.press |> THEN { TEXT { none } }
                 elements.format_octal.event.press |> THEN { TEXT { none } }
@@ -745,6 +899,31 @@ store: [
             False => TEXT { PressedControl }
         }
 
+    format_dropdown_state:
+        TEXT { Closed } |> HOLD format_dropdown_state {
+            LATEST {
+                elements.format_dropdown_toggle.event.press |> THEN {
+                    format_dropdown_state |> WHEN {
+                        Open => TEXT { Closed }
+                        __ => TEXT { Open }
+                    }
+                }
+                elements.format_cycle.event.press |> THEN { TEXT { Closed } }
+                elements.format_binary.event.press |> THEN { TEXT { Closed } }
+                elements.format_hex.event.press |> THEN { TEXT { Closed } }
+                elements.format_grouped.event.press |> THEN { TEXT { Closed } }
+                elements.format_octal.event.press |> THEN { TEXT { Closed } }
+                elements.format_signed.event.press |> THEN { TEXT { Closed } }
+                elements.format_unsigned.event.press |> THEN { TEXT { Closed } }
+                elements.format_ascii.event.press |> THEN { TEXT { Closed } }
+                elements.load_fixture.event.press |> THEN { TEXT { Closed } }
+                elements.show_empty.event.press |> THEN { TEXT { Closed } }
+                elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { Closed } }
+            }
+        }
+
     search_result_label:
         signal_search_text |> Text/is_empty() |> WHEN {
             True =>
@@ -759,10 +938,15 @@ store: [
                     True =>
                         TEXT { 0 results: }
                         |> Text/concat(with: signal_search_text, separator: " ")
-                    False =>
-                        search_results_count
-                        |> Text/concat(with: TEXT { results: }, separator: " ")
-                        |> Text/concat(with: search_results_name_summary, separator: " ")
+                    False => search_results_count > 12 |> WHEN {
+                        True =>
+                            search_results_count
+                            |> Text/concat(with: TEXT { results: scroll variables list }, separator: " ")
+                        False =>
+                            search_results_count
+                            |> Text/concat(with: TEXT { results: }, separator: " ")
+                            |> Text/concat(with: search_results_name_summary, separator: " ")
+                    }
                 }
             }
         }
@@ -782,7 +966,9 @@ store: [
                 elements.select_reset.event.press |> THEN { Text/empty() }
                 elements.select_data.event.press |> THEN { Text/empty() }
                 elements.select_temperature.event.press |> THEN { Text/empty() }
+                elements.format_dropdown_toggle.event.press |> THEN { Text/empty() }
                 elements.format_cycle.event.press |> THEN { Text/empty() }
+                elements.format_binary.event.press |> THEN { Text/empty() }
                 elements.format_hex.event.press |> THEN { Text/empty() }
                 elements.format_grouped.event.press |> THEN { Text/empty() }
                 elements.format_octal.event.press |> THEN { Text/empty() }
@@ -951,61 +1137,57 @@ store: [
         ]
 
     marker_visibility:
-        TEXT { Hidden } |> HOLD marker_visibility {
+        TEXT { Visible } |> HOLD marker_visibility {
             LATEST {
             elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
             elements.marker_toggle.event.press |> THEN { TEXT { Visible } }
+            elements.waveform_click.text |> THEN { TEXT { Visible } }
             elements.load_fixture.event.press |> THEN { TEXT { Visible } }
             elements.show_empty.event.press |> THEN { TEXT { Hidden } }
             }
         }
 
     marker_current_label:
-        TEXT { No markers } |> HOLD marker_current_label {
+        TEXT { 42 ns } |> HOLD marker_current_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
-            elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
-            elements.load_fixture.event.press |> THEN { marker_default_label }
+            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+            elements.waveform_click.text
+            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
 
     marker_state:
-        Empty |> HOLD marker_state {
+        Default |> HOLD marker_state {
             LATEST {
             elements.marker_rename.event.press |> THEN { Renamed }
             elements.marker_remove.event.press |> THEN { Empty }
             elements.marker_toggle.event.press |> THEN { Added }
+            elements.waveform_click.text |> THEN { Added }
             elements.load_fixture.event.press |> THEN { Default }
             elements.show_empty.event.press |> THEN { Empty }
             }
         }
 
     marker_label:
-        TEXT { No markers } |> HOLD marker_label {
+        TEXT { M 42 ns } |> HOLD marker_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { M data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_jump.event.press |> THEN { marker_label }
             elements.marker_toggle.event.press |> THEN { TEXT { M 36 ns } }
+            elements.waveform_click.text |> THEN {
+                TEXT { M } |> Text/concat(with: elements.waveform_click.text, separator: " ")
+            }
             elements.load_fixture.event.press |> THEN { TEXT { M 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
 
-    marker_count_label:
-        TEXT { 0 markers } |> HOLD marker_count_label {
-            LATEST {
-            elements.marker_remove.event.press |> THEN { TEXT { 0 markers } }
-            elements.marker_toggle.event.press |> THEN { TEXT { 2 markers } }
-            elements.load_fixture.event.press |> THEN { TEXT { 1 marker } }
-            elements.show_empty.event.press |> THEN { TEXT { 0 markers } }
-            }
-        }
-
     marker_focus_label:
-        TEXT { no marker selected } |> HOLD marker_focus_label {
+        TEXT { marker at 42 ns } |> HOLD marker_focus_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { data stable at 42 ns } }
             elements.marker_jump.event.press |> THEN {
@@ -1018,6 +1200,9 @@ store: [
             }
             elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
             elements.marker_toggle.event.press |> THEN { TEXT { added marker at 36 ns } }
+            elements.waveform_click.text |> THEN {
+                TEXT { added marker at } |> Text/concat(with: elements.waveform_click.text, separator: " ")
+            }
             elements.load_fixture.event.press |> THEN { TEXT { marker at 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { no marker selected } }
             }
@@ -1028,14 +1213,38 @@ store: [
 
     marker_to_add:
         LATEST {
-            elements.load_fixture.event.press |> THEN { marker_default_label }
-            elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
+            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+            elements.waveform_click.text
+            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
+        }
+
+    marker_add_from_toggle:
+        LATEST {
+            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+        }
+
+    marker_add_from_waveform:
+        LATEST {
+            elements.waveform_click.text |> THEN { elements.waveform_click.text }
+        }
+
+    marker_add_from_load:
+        LATEST {
+            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
         }
 
     markers:
-        LIST {}
-        |> List/append(item: marker_to_add |> THEN {
-            [label: marker_to_add]
+        LIST {
+            [label: TEXT { 42 ns }]
+        }
+        |> List/append(item: marker_add_from_toggle |> THEN {
+            [label: marker_add_from_toggle]
+        })
+        |> List/append(item: marker_add_from_waveform |> THEN {
+            [label: marker_add_from_waveform]
+        })
+        |> List/append(item: marker_add_from_load |> THEN {
+            [label: marker_add_from_load]
         })
         |> List/map(marker, new: new_marker(marker: marker, store: store))
         |> List/remove(marker, when:
@@ -1051,6 +1260,13 @@ store: [
         |> List/retain(marker, if: marker.has_label)
         |> List/count()
 
+    marker_count_label:
+        active_marker_count |> WHEN {
+            0 => TEXT { 0 markers }
+            1 => TEXT { 1 marker }
+            __ => active_marker_count |> Text/concat(with: TEXT { markers }, separator: " ")
+        }
+
     row_size:
         LATEST {
             TEXT { Normal }
@@ -1061,7 +1277,8 @@ store: [
     value_format:
         LATEST {
             TEXT { Hexadecimal }
-            elements.format_cycle.event.press |> THEN { TEXT { Binary } }
+            elements.format_cycle.event.press |> THEN { NovyModel/next_format(format: value_format) }
+            elements.format_binary.event.press |> THEN { TEXT { Binary } }
             elements.format_hex.event.press |> THEN { TEXT { Hexadecimal } }
             elements.format_grouped.event.press |> THEN { TEXT { GroupedBinary } }
             elements.format_octal.event.press |> THEN { TEXT { Octal } }
@@ -1076,9 +1293,11 @@ store: [
             LATEST {
                 elements.zoom_in.event.press |> THEN { TEXT { Close } }
                 elements.zoom_out.event.press |> THEN { TEXT { Wide } }
+                elements.zoom_reset.event.press |> THEN { TEXT { Fit } }
                 elements.keyboard_capture.key |> WHEN {
                     W => TEXT { Close }
                     S => TEXT { Wide }
+                    R => TEXT { Fit }
                     D => TEXT { Close }
                     Q => TEXT { Close }
                     E => TEXT { Close }
@@ -1095,9 +1314,11 @@ store: [
             LATEST {
                 elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
                 elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
+                elements.zoom_reset.event.press |> THEN { TEXT { Center } }
                 elements.keyboard_capture.key |> WHEN {
                     A => TEXT { LeftWindow }
                     D => TEXT { RightWindow }
+                    R => TEXT { Center }
                     Q => TEXT { RightWindow }
                     W => TEXT { RightWindow }
                     S => TEXT { RightWindow }
@@ -1114,11 +1335,15 @@ store: [
             TEXT { Cursor42 }
             elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
             elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
+            elements.waveform_click.text |> THEN { NovyModel/cursor_from_label(label: elements.waveform_click.text) }
             elements.marker_jump.event.press |> THEN { TEXT { Cursor42 } }
+            elements.zoom_reset.event.press |> THEN { TEXT { Cursor42 } }
             elements.keyboard_capture.key |> WHEN {
                 D => TEXT { Cursor42 }
                 Q => TEXT { Cursor36 }
                 S => TEXT { Cursor36 }
+                R => TEXT { Cursor42 }
+                W => TEXT { Cursor36 }
                 E => TEXT { Cursor48 }
                 __ => SKIP
             }
@@ -1131,6 +1356,7 @@ store: [
             TEXT { 0 ns - 120 ns }
             elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
             elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+            elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
             elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
             elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
         }
@@ -1140,11 +1366,13 @@ store: [
             LATEST {
                 elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
                 elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
                 elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
             elements.keyboard_capture.key |> WHEN {
                 W => TEXT { 36 ns - 60 ns }
-                S => TEXT { 60 ns - 240 ns }
+                S => TEXT { 0 ns - 240 ns }
+                R => TEXT { 0 ns - 120 ns }
                 A => TEXT { 24 ns - 48 ns }
                 D => TEXT { 48 ns - 72 ns }
                 Q => TEXT { 48 ns - 72 ns }
@@ -1155,33 +1383,13 @@ store: [
         }
 
     cursor_label:
-        LATEST {
-            TEXT { 42 ns }
-            elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
-            elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
-            elements.marker_jump.event.press |> THEN { TEXT { 42 ns } }
-        }
+        NovyModel/cursor_label(cursor: cursor_position)
 
     keyboard_cursor_label:
-        TEXT { 42 ns } |> HOLD keyboard_cursor_label {
-            LATEST {
-                elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
-                elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
-                elements.marker_jump.event.press |> THEN { TEXT { 42 ns } }
-            elements.keyboard_capture.key |> WHEN {
-                D => TEXT { 42 ns }
-                Q => TEXT { 36 ns }
-                S => TEXT { 36 ns }
-                W => TEXT { 36 ns }
-                E => TEXT { 48 ns }
-                A => TEXT { 36 ns }
-                __ => SKIP
-            }
-            }
-        }
+        NovyModel/cursor_label(cursor: cursor_position)
 
     active_signal_label:
-        TEXT { none } |> HOLD active_signal_label {
+        TEXT { top.cpu.clk } |> HOLD active_signal_label {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -1216,7 +1424,7 @@ store: [
 
     active_scope_key:
         LATEST {
-            TEXT { NONE }
+            TEXT { TOP_CPU }
             elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_cpu_expand.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_cpu_collapse.event.press |> THEN { TEXT { TOP_CPU } }
@@ -1231,7 +1439,7 @@ store: [
 
     active_scope_label:
         LATEST {
-            TEXT { none }
+            TEXT { top.cpu }
             elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
             elements.scope_cpu_expand.event.press |> THEN { TEXT { top.cpu } }
             elements.scope_cpu_collapse.event.press |> THEN { TEXT { top.cpu } }
@@ -1246,7 +1454,7 @@ store: [
 
     active_scope_signal_count:
         LATEST {
-            TEXT { 0 signals }
+            TEXT { 8 signals }
             elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
             elements.scope_cpu_expand.event.press |> THEN { TEXT { 8 signals } }
             elements.scope_cpu_collapse.event.press |> THEN { TEXT { 8 signals } }
@@ -1316,7 +1524,7 @@ store: [
         }
 
     active_signal_key:
-        TEXT { NONE } |> HOLD active_signal_key {
+        TEXT { CLK } |> HOLD active_signal_key {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
@@ -1350,43 +1558,13 @@ store: [
         }
 
     format_label:
-        LATEST {
-            TEXT { Hex }
-            elements.format_cycle.event.press |> THEN { TEXT { Binary } }
-            elements.format_hex.event.press |> THEN { TEXT { Hex } }
-            elements.format_grouped.event.press |> THEN { TEXT { Grouped bin } }
-            elements.format_octal.event.press |> THEN { TEXT { Octal } }
-            elements.format_signed.event.press |> THEN { TEXT { Signed } }
-            elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
-            elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
-            elements.load_fixture.event.press |> THEN { TEXT { Hex } }
-        }
+        NovyModel/format_label(format: value_format)
 
     data_bus_rendered_value:
-        LATEST {
-            TEXT { 0x2a }
-            elements.format_cycle.event.press |> THEN { TEXT { 00101010 } }
-            elements.format_grouped.event.press |> THEN { TEXT { 0010 1010 } }
-            elements.format_octal.event.press |> THEN { TEXT { 052 } }
-            elements.format_signed.event.press |> THEN { TEXT { 42 } }
-            elements.format_unsigned.event.press |> THEN { TEXT { 42 } }
-            elements.format_ascii.event.press |> THEN { TEXT { * } }
-            elements.format_hex.event.press |> THEN { TEXT { 0x2a } }
-            elements.load_fixture.event.press |> THEN { TEXT { 0x2a } }
-        }
+        NovyFixtures/selected_data_value(format: value_format)
 
     temperature_rendered_value:
-        LATEST {
-            TEXT { 42.8 C }
-            elements.format_cycle.event.press |> THEN { TEXT { analog } }
-            elements.format_grouped.event.press |> THEN { TEXT { analog } }
-            elements.format_octal.event.press |> THEN { TEXT { analog } }
-            elements.format_signed.event.press |> THEN { TEXT { 43 } }
-            elements.format_unsigned.event.press |> THEN { TEXT { 43 } }
-            elements.format_ascii.event.press |> THEN { TEXT { temp } }
-            elements.format_hex.event.press |> THEN { TEXT { 42.8 C } }
-            elements.load_fixture.event.press |> THEN { TEXT { 42.8 C } }
-        }
+        NovyFixtures/selected_temperature_value(format: value_format)
 
     row_height:
         LATEST {
@@ -1399,10 +1577,10 @@ store: [
         bridge_request_descriptor_label
 
     bridge_request_page:
-        bridge_request_compact_label
+        NovyModel/request_page(compact: bridge_request_compact_label, format: value_format)
 
     bridge_response_scope:
-        TEXT { NONE } |> HOLD bridge_response_scope {
+        TEXT { TOP_CPU } |> HOLD bridge_response_scope {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
@@ -1417,7 +1595,7 @@ store: [
         }
 
     bridge_response_signal:
-        TEXT { NONE } |> HOLD bridge_response_signal {
+        TEXT { CLK } |> HOLD bridge_response_signal {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { CLK } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TX_DATA } }
@@ -1433,13 +1611,14 @@ store: [
         }
 
     bridge_response_zoom:
-        TEXT { None } |> HOLD bridge_response_zoom {
+        TEXT { Fit } |> HOLD bridge_response_zoom {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { Fit } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { Fit } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { Fit } }
                 elements.zoom_in.event.press |> THEN { TEXT { Close } }
                 elements.zoom_out.event.press |> THEN { TEXT { Wide } }
+                elements.zoom_reset.event.press |> THEN { TEXT { Fit } }
                 elements.cursor_left.event.press |> THEN { TEXT { Close } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Fit } }
                 elements.load_fixture.event.press |> THEN { TEXT { Fit } }
@@ -1448,13 +1627,14 @@ store: [
         }
 
     bridge_response_pan:
-        TEXT { None } |> HOLD bridge_response_pan {
+        TEXT { Center } |> HOLD bridge_response_pan {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { Center } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { Center } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { Center } }
                 elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
                 elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
+                elements.zoom_reset.event.press |> THEN { TEXT { Center } }
                 elements.cursor_left.event.press |> THEN { TEXT { RightWindow } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Center } }
                 elements.load_fixture.event.press |> THEN { TEXT { Center } }
@@ -1463,7 +1643,7 @@ store: [
         }
 
     bridge_response_cursor:
-        TEXT { None } |> HOLD bridge_response_cursor {
+        TEXT { Cursor42 } |> HOLD bridge_response_cursor {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { Cursor42 } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { Cursor42 } }
@@ -1477,12 +1657,12 @@ store: [
         }
 
     bridge_response_format:
-        TEXT { None } |> HOLD bridge_response_format {
+        TEXT { Hexadecimal } |> HOLD bridge_response_format {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.format_cycle.event.press |> THEN { TEXT { Binary } }
+                elements.format_cycle.event.press |> THEN { NovyModel/next_format(format: bridge_response_format) }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.load_fixture.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { None } }
@@ -1490,13 +1670,14 @@ store: [
         }
 
     bridge_response_window_label:
-        TEXT { no response window } |> HOLD bridge_response_window_label {
+        TEXT { 0 ns - 120 ns } |> HOLD bridge_response_window_label {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
                 elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
                 elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.pan_left.event.press |> THEN { TEXT { 0 ns - 80 ns } }
                 elements.pan_right.event.press |> THEN { TEXT { 80 ns - 160 ns } }
                 elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
@@ -1507,7 +1688,7 @@ store: [
         }
 
     bridge_request_window_label:
-        TEXT { no request window } |> HOLD bridge_request_window_label {
+        TEXT { 0 ns - 120 ns } |> HOLD bridge_request_window_label {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
@@ -1522,6 +1703,7 @@ store: [
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.format_cycle.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.format_binary.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.format_hex.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.format_grouped.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.format_octal.event.press |> THEN { TEXT { 0 ns - 120 ns } }
@@ -1530,15 +1712,18 @@ store: [
                 elements.format_ascii.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
                 elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
                 elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
+                elements.cursor_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
                 elements.keyboard_capture.key |> WHEN {
                     A => TEXT { 24 ns - 48 ns }
                     D => TEXT { 48 ns - 72 ns }
                     Q => TEXT { 48 ns - 72 ns }
                     E => TEXT { 48 ns - 72 ns }
                     W => TEXT { 36 ns - 60 ns }
-                    S => TEXT { 60 ns - 240 ns }
+                    S => TEXT { 0 ns - 240 ns }
+                    R => TEXT { 0 ns - 120 ns }
                     __ => SKIP
                 }
                 elements.load_fixture.event.press |> THEN { TEXT { 0 ns - 120 ns } }
@@ -1557,7 +1742,7 @@ store: [
         }
 
     bridge_response_file_digest:
-        TEXT { sha256:none } |> HOLD bridge_response_file_digest {
+        TEXT { sha256:fixture-counter-vcd } |> HOLD bridge_response_file_digest {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
@@ -1570,7 +1755,7 @@ store: [
         }
 
     bridge_response_waveform_ref:
-        TEXT { wave:none } |> HOLD bridge_response_waveform_ref {
+        TEXT { wave:vcd:counter:0-240ns } |> HOLD bridge_response_waveform_ref {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
@@ -1599,40 +1784,10 @@ store: [
         bridge_response_compact_label
 
     bridge_request_descriptor_label:
-        TEXT { No request scheduled } |> HOLD bridge_request_descriptor_label {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_clk.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_reset.event.press |> THEN { TEXT { TOP_CPU/RESET_N/Fit/Center/Cursor42/Hexadecimal } }
-                elements.select_data.event.press |> THEN {
-                    data_signal_toggle_state |> WHEN {
-                        On => TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Hexadecimal }
-                        Off => TEXT { No request scheduled }
-                    }
-                }
-                elements.select_temperature.event.press |> THEN { TEXT { TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal } }
-                elements.format_cycle.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Binary } }
-                elements.zoom_in.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/Center/Cursor42/Binary } }
-                elements.pan_right.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary } }
-                elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
-                elements.keyboard_capture.key |> WHEN {
-                    A => TEXT { TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary }
-                    Q => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary }
-                    E => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor48/Binary }
-                    D => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary }
-                    S => TEXT { TOP_CPU/DATA_BUS/Wide/RightWindow/Cursor36/Binary }
-                    W => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary }
-                    __ => SKIP
-                }
-                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.show_empty.event.press |> THEN { TEXT { No request scheduled } }
-            }
-        }
+        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: value_format)
 
     bridge_response_descriptor_label:
-        TEXT { No response available } |> HOLD bridge_response_descriptor_label {
+        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } }
@@ -1695,7 +1850,7 @@ store: [
 
     bridge_signal_page_label:
         LATEST {
-            TEXT { no-request }
+            TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal }
             elements.select_counter_file.event.press |> THEN { bridge_request_descriptor_label }
             elements.select_uart_compare_file.event.press |> THEN { bridge_request_descriptor_label }
             elements.select_ghw_file.event.press |> THEN { bridge_request_descriptor_label }
@@ -1705,7 +1860,7 @@ store: [
 
     bridge_cursor_values_label:
         LATEST {
-            TEXT { unavailable }
+            TEXT { clk=1 reset_n=1 data=0x2a temp=42C }
             elements.select_counter_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data=0x55 busy=0 at 42 ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
@@ -1734,7 +1889,7 @@ store: [
         bridge_request_fingerprint
 
     bridge_request_compact_label:
-        TEXT { NONE } |> HOLD bridge_request_compact_label {
+        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
@@ -1763,6 +1918,7 @@ store: [
                     )
                     |> List/latest()
                 elements.format_cycle.event.press |> THEN { TEXT { DATA_BIN } }
+                elements.format_binary.event.press |> THEN { TEXT { DATA_BIN } }
                 elements.format_hex.event.press |> THEN { TEXT { DATA_HEX } }
                 elements.format_grouped.event.press |> THEN { TEXT { DATA_GROUP } }
                 elements.format_octal.event.press |> THEN { TEXT { DATA_OCT } }
@@ -1770,11 +1926,14 @@ store: [
                 elements.format_unsigned.event.press |> THEN { TEXT { DATA_UNS } }
                 elements.format_ascii.event.press |> THEN { TEXT { DATA_ASC } }
                 elements.zoom_in.event.press |> THEN { TEXT { DATA_CLOSE } }
+                elements.zoom_reset.event.press |> THEN { TEXT { DATA_FIT } }
                 elements.pan_right.event.press |> THEN { TEXT { DATA_RIGHT } }
                 elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.cursor_right.event.press |> THEN { TEXT { DATA_48NS } }
                 elements.keyboard_capture.key |> WHEN {
                     W => TEXT { DATA_CLOSE }
                     S => TEXT { DATA_WIDE }
+                    R => TEXT { DATA_FIT }
                     Q => TEXT { DATA_36NS }
                     E => TEXT { DATA_48NS }
                     D => TEXT { DATA_RIGHT }
@@ -1787,7 +1946,7 @@ store: [
         }
 
     bridge_response_compact_label:
-        TEXT { NONE } |> HOLD bridge_response_compact_label {
+        TEXT { CLK_FIT } |> HOLD bridge_response_compact_label {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
@@ -1798,6 +1957,7 @@ store: [
                     Q => TEXT { DATA_36NS }
                     S => TEXT { DATA_36NS }
                     W => TEXT { DATA_36NS }
+                    R => TEXT { CLK_FIT }
                     E => TEXT { DATA_36NS }
                     A => TEXT { DATA_36NS }
                     __ => SKIP
@@ -1929,12 +2089,24 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION new_waveform_segment(segment) {
+FUNCTION zoomed_waveform_width(width, zoom) {
+    width == 0 |> WHEN {
+        True => width
+        False => zoom |> WHEN {
+            TEXT { Close } => width * 2
+            TEXT { Wide } => width / 2
+            __ => width
+        }
+    }
+}
+
+FUNCTION new_waveform_segment(segment, zoom) {
     [
         signal_id: segment.signal_id
-        width: segment.width
+        width: zoomed_waveform_width(width: segment.width, zoom: zoom)
         state: segment.state
         label: segment.label
+        click_time: segment.click_time
     ]
 }
 

@@ -24,6 +24,15 @@ FUNCTION cursor_label(cursor) {
     }
 }
 
+FUNCTION cursor_from_label(label) {
+    label |> WHEN {
+        TEXT { 36 ns } => TEXT { Cursor36 }
+        TEXT { 42 ns } => TEXT { Cursor42 }
+        TEXT { 48 ns } => TEXT { Cursor48 }
+        __ => TEXT { Cursor42 }
+    }
+}
+
 FUNCTION signal_label(signal) {
     signal |> WHEN {
         TEXT { clk } => TEXT { top.cpu.clk }
@@ -38,9 +47,25 @@ FUNCTION format_label(format) {
     format |> WHEN {
         TEXT { Hexadecimal } => TEXT { Hex }
         TEXT { Binary } => TEXT { Binary }
+        TEXT { GroupedBinary } => TEXT { Grouped bin }
+        TEXT { Octal } => TEXT { Octal }
         TEXT { Signed } => TEXT { Signed }
+        TEXT { Unsigned } => TEXT { Unsigned }
         TEXT { ASCII } => TEXT { ASCII }
         __ => TEXT { Hex }
+    }
+}
+
+FUNCTION next_format(format) {
+    format |> WHEN {
+        TEXT { Hexadecimal } => TEXT { Binary }
+        TEXT { Binary } => TEXT { GroupedBinary }
+        TEXT { GroupedBinary } => TEXT { Octal }
+        TEXT { Octal } => TEXT { Signed }
+        TEXT { Signed } => TEXT { Unsigned }
+        TEXT { Unsigned } => TEXT { ASCII }
+        TEXT { ASCII } => TEXT { Hexadecimal }
+        __ => TEXT { Binary }
     }
 }
 
@@ -76,5 +101,34 @@ FUNCTION request_label(signal, zoom, pan, format) {
             |> Text/concat(with: zoom, separator: "|")
             |> Text/concat(with: pan, separator: "|")
             |> Text/concat(with: format, separator: "|")
+    }
+}
+
+FUNCTION descriptor_label(scope, signal, zoom, pan, cursor, format) {
+    signal == TEXT { NONE } |> WHEN {
+        True => TEXT { No request scheduled }
+        False =>
+            scope
+            |> Text/concat(with: signal, separator: "/")
+            |> Text/concat(with: zoom, separator: "/")
+            |> Text/concat(with: pan, separator: "/")
+            |> Text/concat(with: cursor, separator: "/")
+            |> Text/concat(with: format, separator: "/")
+    }
+}
+
+FUNCTION request_page(compact, format) {
+    compact |> WHEN {
+        TEXT { DATA_BIN } => format |> WHEN {
+            TEXT { Binary } => TEXT { DATA_BIN }
+            TEXT { GroupedBinary } => TEXT { DATA_GROUP }
+            TEXT { Octal } => TEXT { DATA_OCT }
+            TEXT { Signed } => TEXT { DATA_SGN }
+            TEXT { Unsigned } => TEXT { DATA_UNS }
+            TEXT { ASCII } => TEXT { DATA_ASC }
+            TEXT { Hexadecimal } => TEXT { DATA_HEX }
+            __ => TEXT { DATA_BIN }
+        }
+        __ => compact
     }
 }

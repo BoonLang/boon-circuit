@@ -58,6 +58,18 @@ const DEV_WARN: &str = "#f4a261";
 const DEV_FAIL: &str = "#e63946";
 const DEV_DIRTY: &str = "#fcbf49";
 const DEV_ROOT_PADDING: u32 = 10;
+const DEV_HEADER_PADDING: u32 = 8;
+const DEV_HEADER_GAP: u32 = 8;
+const DEV_HEADER_ROW_HEIGHT: u32 = 30;
+const DEV_EXAMPLE_TAB_PADDING: u32 = 6;
+const DEV_EXAMPLE_TAB_GAP: u32 = 6;
+const DEV_EXAMPLE_TAB_HEIGHT: u32 = 30;
+const DEV_FILE_TAB_PADDING: u32 = 5;
+const DEV_FILE_TAB_GAP: u32 = 5;
+const DEV_FILE_TAB_HEIGHT: u32 = 24;
+const DEV_TOOLBAR_PADDING: u32 = 8;
+const DEV_TOOLBAR_GAP: u32 = 10;
+const DEV_TOOLBAR_ROW_HEIGHT: u32 = 32;
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
 const DEV_FOOTER_SCROLL_PADDING: u32 = 6;
@@ -506,14 +518,20 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
         Ok(mut runtime) => {
+            let restored_ui_state = restore_novywave_ui_state_for_runtime_best_effort(
+                Path::new(&code_file),
+                &mut runtime,
+            );
             let state_summary = runtime.state_summary();
             let document_state_summary = runtime.document_state_summary();
+            let mut runtime_summary = preview_runtime_summary_from_state_summary(
+                Path::new(&code_file),
+                &code_hash,
+                state_summary,
+            );
+            runtime_summary["restored_ui_state"] = json!(restored_ui_state.is_some());
             (
-                preview_runtime_summary_from_state_summary(
-                    Path::new(&code_file),
-                    &code_hash,
-                    state_summary,
-                ),
+                runtime_summary,
                 Some(document_state_summary),
                 Some(Arc::new(Mutex::new(runtime))),
             )
@@ -1789,6 +1807,361 @@ fn live_runtime_from_source_text_with_scenario(
             source,
             scenario_path,
         )?)
+    }
+}
+
+const NATIVE_UI_STATE_DIR_ENV: &str = "BOON_NATIVE_UI_STATE_DIR";
+const NOVYWAVE_ENTRYPOINT_SUFFIX: &str = "examples/novywave/RUN.bn";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NovyWavePersistedUiState {
+    schema_version: u32,
+    mode: Option<String>,
+    panel_layout: Option<String>,
+    panel_arrangement: Option<String>,
+    active_scope: Option<String>,
+    active_signal: Option<String>,
+    value_format: Option<String>,
+    row_size: Option<String>,
+    zoom_level: Option<String>,
+    pan_window: Option<String>,
+    cursor_position: Option<String>,
+    analog_limit_kind: Option<String>,
+    signal_search_text: Option<String>,
+    selected_rows_profile: Option<String>,
+    selected_rows_removed_signal_id: Option<String>,
+    added_marker_label: Option<String>,
+}
+
+fn source_path_is_novywave(source_path: &Path) -> bool {
+    let path = source_path.to_string_lossy().replace('\\', "/");
+    path.ends_with(NOVYWAVE_ENTRYPOINT_SUFFIX) || path.ends_with("novywave/RUN.bn")
+}
+
+#[cfg(not(test))]
+fn native_ui_state_base_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(NATIVE_UI_STATE_DIR_ENV) {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return Some(PathBuf::from(path).join("boon-circuit/native-playground"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/state/boon-circuit/native-playground"))
+}
+
+#[cfg(test)]
+fn native_ui_state_base_dir() -> Option<PathBuf> {
+    std::env::var_os(NATIVE_UI_STATE_DIR_ENV).map(PathBuf::from)
+}
+
+fn native_ui_state_path_for_example_in_dir(base_dir: &Path, example_id: &str) -> PathBuf {
+    base_dir.join(format!("{example_id}-ui-state.json"))
+}
+
+fn novywave_ui_state_path() -> Option<PathBuf> {
+    native_ui_state_base_dir()
+        .as_deref()
+        .map(|base_dir| native_ui_state_path_for_example_in_dir(base_dir, "novywave"))
+}
+
+fn state_summary_text(summary: &Value, pointer: &str) -> Option<String> {
+    summary
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+}
+
+fn state_summary_marker_label(summary: &Value) -> Option<String> {
+    summary
+        .pointer("/store/markers")
+        .and_then(Value::as_array)
+        .and_then(|markers| markers.get(1))
+        .and_then(|marker| marker.get("label"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|label| label.contains("ns"))
+}
+
+fn novywave_ui_state_from_summary(summary: &Value) -> Option<NovyWavePersistedUiState> {
+    let state = NovyWavePersistedUiState {
+        schema_version: 1,
+        mode: state_summary_text(summary, "/store/mode"),
+        panel_layout: state_summary_text(summary, "/store/panel_layout"),
+        panel_arrangement: state_summary_text(summary, "/store/panel_arrangement"),
+        active_scope: state_summary_text(summary, "/store/active_scope"),
+        active_signal: state_summary_text(summary, "/store/active_signal"),
+        value_format: state_summary_text(summary, "/store/value_format"),
+        row_size: state_summary_text(summary, "/store/row_size"),
+        zoom_level: state_summary_text(summary, "/store/zoom_level"),
+        pan_window: state_summary_text(summary, "/store/pan_window"),
+        cursor_position: state_summary_text(summary, "/store/cursor_position"),
+        analog_limit_kind: state_summary_text(summary, "/store/analog_limit_kind"),
+        signal_search_text: state_summary_text(summary, "/store/signal_search_text"),
+        selected_rows_profile: state_summary_text(summary, "/store/selected_rows_profile"),
+        selected_rows_removed_signal_id: state_summary_text(
+            summary,
+            "/store/selected_rows_removed_signal_id",
+        ),
+        added_marker_label: state_summary_marker_label(summary),
+    };
+    [
+        &state.mode,
+        &state.panel_layout,
+        &state.panel_arrangement,
+        &state.active_scope,
+        &state.active_signal,
+        &state.value_format,
+        &state.row_size,
+        &state.zoom_level,
+        &state.pan_window,
+        &state.cursor_position,
+        &state.analog_limit_kind,
+        &state.signal_search_text,
+        &state.selected_rows_profile,
+        &state.selected_rows_removed_signal_id,
+        &state.added_marker_label,
+    ]
+    .iter()
+    .any(|value| value.is_some())
+    .then_some(state)
+}
+
+fn save_novywave_ui_state_to_path(
+    path: &Path,
+    state: &NovyWavePersistedUiState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(state)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn load_novywave_ui_state_from_path(
+    path: &Path,
+) -> Result<Option<NovyWavePersistedUiState>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
+}
+
+fn persist_novywave_ui_state_for_summary(source_path: &Path, summary: &Value) {
+    if !source_path_is_novywave(source_path) {
+        return;
+    }
+    let Some(path) = novywave_ui_state_path() else {
+        return;
+    };
+    let Some(state) = novywave_ui_state_from_summary(summary) else {
+        return;
+    };
+    if let Err(error) = save_novywave_ui_state_to_path(&path, &state) {
+        eprintln!(
+            "boon_native_playground: failed to persist NovyWave UI state at {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn source_press_event(source: &str) -> boon_runtime::LiveSourceEvent {
+    boon_runtime::LiveSourceEvent {
+        source: source.to_owned(),
+        ..boon_runtime::LiveSourceEvent::default()
+    }
+}
+
+fn push_source_event_for_value(
+    events: &mut Vec<boon_runtime::LiveSourceEvent>,
+    value: Option<&str>,
+    mapping: &[(&str, &str)],
+) {
+    if let Some(source) = value.and_then(|value| {
+        mapping
+            .iter()
+            .find_map(|(candidate, source)| (*candidate == value).then_some(*source))
+    }) {
+        events.push(source_press_event(source));
+    }
+}
+
+fn novywave_restore_events_for_ui_state(
+    state: &NovyWavePersistedUiState,
+) -> Vec<boon_runtime::LiveSourceEvent> {
+    let mut events = Vec::new();
+    push_source_event_for_value(
+        &mut events,
+        state.mode.as_deref(),
+        &[("Light", "store.elements.mode_to_light")],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.panel_layout.as_deref(),
+        &[
+            ("FilesWide", "store.elements.panels_files_wider"),
+            ("VariablesWide", "store.elements.panels_variables_wider"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.panel_arrangement.as_deref(),
+        &[("Docked", "store.elements.panels_toggle_arrangement")],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.active_scope.as_deref(),
+        &[
+            ("top_uart", "store.elements.scope_uart"),
+            ("top_analog", "store.elements.scope_analog"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.active_signal.as_deref(),
+        &[
+            ("reset_n", "store.elements.select_reset"),
+            ("data_bus", "store.elements.select_data"),
+            ("temperature", "store.elements.select_temperature"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.value_format.as_deref(),
+        &[
+            ("Binary", "store.elements.format_binary"),
+            ("Hexadecimal", "store.elements.format_hex"),
+            ("GroupedBinary", "store.elements.format_grouped"),
+            ("Octal", "store.elements.format_octal"),
+            ("Signed", "store.elements.format_signed"),
+            ("Unsigned", "store.elements.format_unsigned"),
+            ("ASCII", "store.elements.format_ascii"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.row_size.as_deref(),
+        &[
+            ("Tall", "store.elements.row_taller"),
+            ("Compact", "store.elements.row_shorter"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.zoom_level.as_deref(),
+        &[
+            ("Close", "store.elements.zoom_in"),
+            ("Wide", "store.elements.zoom_out"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.pan_window.as_deref(),
+        &[
+            ("LeftWindow", "store.elements.pan_left"),
+            ("RightWindow", "store.elements.pan_right"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.cursor_position.as_deref(),
+        &[
+            ("Cursor36", "store.elements.cursor_left"),
+            ("Cursor48", "store.elements.cursor_right"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.analog_limit_kind.as_deref(),
+        &[("Manual", "store.elements.analog_limits_manual")],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.selected_rows_profile.as_deref(),
+        &[
+            ("DataFirst", "store.elements.selected_data_up"),
+            ("DataLast", "store.elements.selected_data_down"),
+        ],
+    );
+    push_source_event_for_value(
+        &mut events,
+        state.selected_rows_removed_signal_id.as_deref(),
+        &[
+            ("clk", "store.elements.selected_remove_clk"),
+            ("reset_n", "store.elements.selected_remove_reset"),
+            ("data_bus", "store.elements.selected_remove_data"),
+            ("data_valid", "store.elements.selected_remove_data_valid"),
+            ("data_ready", "store.elements.selected_remove_data_ready"),
+            ("state", "store.elements.selected_remove_state"),
+            ("error_count", "store.elements.selected_remove_error_count"),
+            ("temperature", "store.elements.selected_remove_temperature"),
+            ("tx_data", "store.elements.selected_remove_tx_data"),
+            ("rx_data", "store.elements.selected_remove_rx_data"),
+            ("baud_tick", "store.elements.selected_remove_baud_tick"),
+            ("uart_busy", "store.elements.selected_remove_uart_busy"),
+            ("ghw_counter", "store.elements.selected_remove_ghw_counter"),
+            ("ghw_enable", "store.elements.selected_remove_ghw_enable"),
+            ("ghw_state", "store.elements.selected_remove_ghw_state"),
+        ],
+    );
+    if let Some(label @ ("36 ns" | "42 ns" | "48 ns")) = state.added_marker_label.as_deref() {
+        events.push(boon_runtime::LiveSourceEvent {
+            source: "store.elements.waveform_click".to_owned(),
+            text: Some(label.to_owned()),
+            target_text: Some(label.to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        });
+    }
+    if let Some(text) = state
+        .signal_search_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        events.push(boon_runtime::LiveSourceEvent {
+            source: "store.elements.signal_search_input".to_owned(),
+            text: Some(text.to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        });
+    }
+    events
+}
+
+fn restore_novywave_ui_state_for_runtime(
+    source_path: &Path,
+    runtime: &mut boon_runtime::LiveRuntime,
+) -> Result<Option<NovyWavePersistedUiState>, Box<dyn std::error::Error>> {
+    if !source_path_is_novywave(source_path) {
+        return Ok(None);
+    }
+    let Some(path) = novywave_ui_state_path() else {
+        return Ok(None);
+    };
+    let Some(state) = load_novywave_ui_state_from_path(&path)? else {
+        return Ok(None);
+    };
+    for event in novywave_restore_events_for_ui_state(&state) {
+        runtime.apply_source_event_for_document(event)?;
+    }
+    Ok(Some(state))
+}
+
+fn restore_novywave_ui_state_for_runtime_best_effort(
+    source_path: &Path,
+    runtime: &mut boon_runtime::LiveRuntime,
+) -> Option<NovyWavePersistedUiState> {
+    match restore_novywave_ui_state_for_runtime(source_path, runtime) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "boon_native_playground: failed to restore NovyWave UI state for {}: {error}",
+                source_path.display()
+            );
+            None
+        }
     }
 }
 
@@ -5351,6 +5724,54 @@ fn visible_rows_for_scroll_area(height: u32, padding: u32, row_height: u32, row_
     let inner_height = height.saturating_sub(padding.saturating_mul(2));
     let row_stride = row_height.saturating_add(row_gap).max(1);
     ((inner_height.saturating_add(row_gap)) / row_stride).max(1) as usize
+}
+
+fn dev_tab_content_width(viewport_width: u32, padding: u32) -> u32 {
+    viewport_width
+        .saturating_sub(DEV_ROOT_PADDING.saturating_mul(2))
+        .saturating_sub(padding.saturating_mul(2))
+        .max(1)
+}
+
+fn dev_wrapped_row_indices(widths: &[u32], max_width: u32, gap: u32) -> (Vec<usize>, usize) {
+    if widths.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut rows = Vec::with_capacity(widths.len());
+    let mut row = 0usize;
+    let mut used_width = 0u32;
+    for width in widths {
+        let next_width = if used_width == 0 {
+            *width
+        } else {
+            used_width.saturating_add(gap).saturating_add(*width)
+        };
+        if used_width > 0 && next_width > max_width {
+            row += 1;
+            used_width = *width;
+        } else {
+            used_width = next_width;
+        }
+        rows.push(row);
+    }
+    (rows, row + 1)
+}
+
+fn dev_wrapped_tab_bar_height(
+    row_count: usize,
+    padding: u32,
+    row_height: u32,
+    row_gap: u32,
+    minimum_height: u32,
+) -> u32 {
+    if row_count == 0 {
+        return 0;
+    }
+    padding
+        .saturating_mul(2)
+        .saturating_add(row_height.saturating_mul(row_count as u32))
+        .saturating_add(row_gap.saturating_mul(row_count.saturating_sub(1) as u32))
+        .max(minimum_height)
 }
 
 fn clamp_type_inspector_width_for_viewport(width: u32, viewport_width: u32) -> u32 {
@@ -11799,13 +12220,87 @@ fn dev_shell_document(
     let mut frame = DocumentFrame::empty("dev-root");
     let root_height = viewport_height.max(360);
     let footer_height = 154_u32;
+    let header_file_width = dev_header_file_width(viewport_width);
+    let header_example_width = dev_header_example_width(viewport_width);
+    let header_widths = vec![82, header_file_width, 154, 86, header_example_width, 190];
+    let (header_rows, header_row_count) = dev_wrapped_row_indices(
+        &header_widths,
+        dev_tab_content_width(viewport_width, DEV_HEADER_PADDING),
+        DEV_HEADER_GAP,
+    );
+    let header_height = dev_wrapped_tab_bar_height(
+        header_row_count,
+        DEV_HEADER_PADDING,
+        DEV_HEADER_ROW_HEIGHT,
+        DEV_HEADER_GAP,
+        46,
+    );
+    let example_entries = shell
+        .catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.shown_by_default)
+        .collect::<Vec<_>>();
+    let mut example_tab_widths = example_entries
+        .iter()
+        .map(|entry| dev_example_tab_width(&entry.id))
+        .collect::<Vec<_>>();
+    example_tab_widths.push(42);
+    let (example_tab_rows, example_tab_row_count) = dev_wrapped_row_indices(
+        &example_tab_widths,
+        dev_tab_content_width(viewport_width, DEV_EXAMPLE_TAB_PADDING),
+        DEV_EXAMPLE_TAB_GAP,
+    );
+    let example_tabs_height = dev_wrapped_tab_bar_height(
+        example_tab_row_count,
+        DEV_EXAMPLE_TAB_PADDING,
+        DEV_EXAMPLE_TAB_HEIGHT,
+        DEV_EXAMPLE_TAB_GAP,
+        42,
+    );
     let project_file_tabs = shell.workspace.project_file_tabs(&shell.catalog);
-    let project_file_tabs_height = if project_file_tabs.len() > 1 { 36 } else { 0 };
+    let project_file_tab_widths = project_file_tabs
+        .iter()
+        .map(dev_project_file_tab_width)
+        .collect::<Vec<_>>();
+    let (project_file_tab_rows, project_file_tab_row_count) = dev_wrapped_row_indices(
+        &project_file_tab_widths,
+        dev_tab_content_width(viewport_width, DEV_FILE_TAB_PADDING),
+        DEV_FILE_TAB_GAP,
+    );
+    let project_file_tabs_height = if project_file_tabs.len() > 1 {
+        dev_wrapped_tab_bar_height(
+            project_file_tab_row_count,
+            DEV_FILE_TAB_PADDING,
+            DEV_FILE_TAB_HEIGHT,
+            DEV_FILE_TAB_GAP,
+            36,
+        )
+    } else {
+        0
+    };
+    let command_specs = ["run", "format", "reset", "remove_custom"];
+    let command_widths = command_specs
+        .iter()
+        .map(|command| if *command == "remove_custom" { 116 } else { 96 })
+        .collect::<Vec<_>>();
+    let (command_rows, command_row_count) = dev_wrapped_row_indices(
+        &command_widths,
+        dev_tab_content_width(viewport_width, DEV_TOOLBAR_PADDING),
+        DEV_TOOLBAR_GAP,
+    );
+    let toolbar_height = dev_wrapped_tab_bar_height(
+        command_row_count,
+        DEV_TOOLBAR_PADDING,
+        DEV_TOOLBAR_ROW_HEIGHT,
+        DEV_TOOLBAR_GAP,
+        44,
+    );
     let editor_height = viewport_height
-        .saturating_sub(46)
-        .saturating_sub(42)
+        .saturating_sub(header_height)
+        .saturating_sub(example_tabs_height)
         .saturating_sub(project_file_tabs_height)
-        .saturating_sub(44)
+        .saturating_sub(toolbar_height)
         .saturating_sub(footer_height)
         .max(160);
     set_style(
@@ -11822,21 +12317,21 @@ fn dev_shell_document(
 
     let header = dev_node(
         "dev-header",
-        DocumentNodeKind::Row,
+        DocumentNodeKind::Stack,
         None,
         &[
             ("bg", DEV_PANEL),
             ("color", DEV_TEXT),
             ("border", DEV_BORDER_MUTED),
-            ("padding", "8"),
-            ("gap", "12"),
-            ("height", "46"),
+            ("padding", &DEV_HEADER_PADDING.to_string()),
+            ("gap", &DEV_HEADER_GAP.to_string()),
+            ("height", &header_height.to_string()),
             ("width", "fill"),
         ],
     );
     let header_parent = header.id.clone();
-    let tabs = dev_tabs_node(shell);
-    let toolbar = dev_toolbar_node();
+    let tabs = dev_tabs_node(shell, example_tabs_height);
+    let toolbar = dev_toolbar_node(toolbar_height);
     let preview_status = shell
         .last_preview_transport
         .get("status")
@@ -11844,16 +12339,31 @@ fn dev_shell_document(
         .unwrap_or("not-run");
     let root = frame.root.clone();
     append_child(&mut frame, root.clone(), header);
-    append_child(
+    let header_row_parents = append_dev_tab_rows(
         &mut frame,
         header_parent.clone(),
+        "dev-header-row",
+        header_row_count,
+        DEV_HEADER_ROW_HEIGHT,
+        DEV_HEADER_GAP,
+    );
+    let header_control_parent = |index: usize| {
+        header_rows
+            .get(index)
+            .and_then(|row| header_row_parents.get(*row))
+            .cloned()
+            .unwrap_or_else(|| header_parent.clone())
+    };
+    append_child(
+        &mut frame,
+        header_control_parent(0),
         dev_text_node(
             "dev-header-title",
             "Boon Dev",
             DEV_TEXT,
             16,
             &[
-                ("width", "auto"),
+                ("width", "82"),
                 ("height", "30"),
                 ("font", BOON_EDITOR_FONT_FAMILY),
             ],
@@ -11861,14 +12371,14 @@ fn dev_shell_document(
     );
     append_child(
         &mut frame,
-        header_parent.clone(),
+        header_control_parent(1),
         dev_text_node(
             "dev-header-file",
             &one_line(&shell.workspace.current_file, 52),
             DEV_TEXT_MUTED,
             13,
             &[
-                ("width", "360"),
+                ("width", &header_file_width.to_string()),
                 ("height", "30"),
                 ("font", BOON_EDITOR_FONT_FAMILY),
             ],
@@ -11876,7 +12386,7 @@ fn dev_shell_document(
     );
     append_child(
         &mut frame,
-        header_parent.clone(),
+        header_control_parent(2),
         dev_status_pill(
             "dev-header-preview-status",
             &format!("Preview: {}", ui_status_label(preview_status)),
@@ -11886,7 +12396,7 @@ fn dev_shell_document(
     );
     append_child(
         &mut frame,
-        header_parent.clone(),
+        header_control_parent(3),
         dev_status_pill(
             "dev-header-dirty-status",
             if shell.workspace.dirty {
@@ -11904,28 +12414,35 @@ fn dev_shell_document(
     );
     append_child(
         &mut frame,
-        header_parent.clone(),
+        header_control_parent(4),
         dev_text_node(
             "dev-header-example",
             &one_line(&shell.workspace.selected_example_id, 24),
             DEV_TEXT_MUTED,
             12,
             &[
-                ("width", "220"),
+                ("width", &header_example_width.to_string()),
                 ("height", "30"),
                 ("font", BOON_EDITOR_FONT_FAMILY),
             ],
         ),
     );
-    append_child(&mut frame, header_parent, dev_custom_name_input(shell));
+    append_child(
+        &mut frame,
+        header_control_parent(5),
+        dev_custom_name_input(shell),
+    );
     let tabs_parent = tabs.id.clone();
     append_child(&mut frame, root.clone(), tabs);
-    for entry in shell
-        .catalog
-        .entries
-        .iter()
-        .filter(|entry| entry.shown_by_default)
-    {
+    let example_tab_row_parents = append_dev_tab_rows(
+        &mut frame,
+        tabs_parent.clone(),
+        "dev-example-tabs-row",
+        example_tab_row_count,
+        DEV_EXAMPLE_TAB_HEIGHT,
+        DEV_EXAMPLE_TAB_GAP,
+    );
+    for (tab_index, entry) in example_entries.iter().enumerate() {
         let max_label_chars = if entry.id.starts_with("custom:") {
             18
         } else {
@@ -11936,6 +12453,7 @@ fn dev_shell_document(
             label.push('*');
         }
         let selected = entry.id == shell.workspace.selected_example_id;
+        let tab_width = dev_example_tab_width(&entry.id).to_string();
         let mut tab = dev_button_node(
             &format!("dev-tab-{}", entry.id),
             label,
@@ -11952,14 +12470,7 @@ fn dev_shell_document(
                 ("border", if selected { DEV_ACCENT } else { DEV_BORDER }),
                 ("padding", "6"),
                 ("height", "30"),
-                (
-                    "width",
-                    if entry.id.starts_with("custom:") {
-                        "156"
-                    } else {
-                        "120"
-                    },
-                ),
+                ("width", &tab_width),
                 ("size", "13"),
                 ("font", BOON_EDITOR_FONT_FAMILY),
             ],
@@ -11969,7 +12480,12 @@ fn dev_shell_document(
             source_path: format!("dev.tabs.select.{}", entry.id),
             intent: "select".to_owned(),
         });
-        append_child(&mut frame, tabs_parent.clone(), tab);
+        let row_parent = example_tab_rows
+            .get(tab_index)
+            .and_then(|row| example_tab_row_parents.get(*row))
+            .cloned()
+            .unwrap_or_else(|| tabs_parent.clone());
+        append_child(&mut frame, row_parent, tab);
     }
     let mut new_tab = dev_button_node(
         "dev-tab-new",
@@ -11990,16 +12506,31 @@ fn dev_shell_document(
         source_path: "dev.tabs.new".to_owned(),
         intent: "select".to_owned(),
     });
-    append_child(&mut frame, tabs_parent.clone(), new_tab);
+    let new_tab_index = example_tab_widths.len().saturating_sub(1);
+    let new_tab_parent = example_tab_rows
+        .get(new_tab_index)
+        .and_then(|row| example_tab_row_parents.get(*row))
+        .cloned()
+        .unwrap_or(tabs_parent.clone());
+    append_child(&mut frame, new_tab_parent, new_tab);
     if project_file_tabs_height > 0 {
-        let file_tabs = dev_project_files_node(shell);
+        let file_tabs = dev_project_files_node(shell, project_file_tabs_height);
         let file_tabs_parent = file_tabs.id.clone();
         append_child(&mut frame, root.clone(), file_tabs);
-        for file in &project_file_tabs {
+        let file_tab_row_parents = append_dev_tab_rows(
+            &mut frame,
+            file_tabs_parent.clone(),
+            "dev-project-file-tabs-row",
+            project_file_tab_row_count,
+            DEV_FILE_TAB_HEIGHT,
+            DEV_FILE_TAB_GAP,
+        );
+        for (tab_index, file) in project_file_tabs.iter().enumerate() {
             let mut label = one_line(&file.label, 16);
             if file.dirty {
                 label.push('*');
             }
+            let tab_width = dev_project_file_tab_width(file).to_string();
             let mut tab = dev_button_node(
                 &project_file_tab_node_id(&file.path),
                 label,
@@ -12023,7 +12554,7 @@ fn dev_shell_document(
                     ("border", if file.active { DEV_ACCENT } else { DEV_BORDER }),
                     ("padding", "5"),
                     ("height", "24"),
-                    ("width", if file.role == "build" { "132" } else { "112" }),
+                    ("width", &tab_width),
                     ("size", "12"),
                     ("font", BOON_EDITOR_FONT_FAMILY),
                 ],
@@ -12036,17 +12567,37 @@ fn dev_shell_document(
                 source_path: format!("dev.project_files.select.{}", file.path),
                 intent: "select".to_owned(),
             });
-            append_child(&mut frame, file_tabs_parent.clone(), tab);
+            let row_parent = project_file_tab_rows
+                .get(tab_index)
+                .and_then(|row| file_tab_row_parents.get(*row))
+                .cloned()
+                .unwrap_or_else(|| file_tabs_parent.clone());
+            append_child(&mut frame, row_parent, tab);
         }
     }
     let toolbar_parent = toolbar.id.clone();
     append_child(&mut frame, root.clone(), toolbar);
+    let toolbar_row_parents = append_dev_tab_rows(
+        &mut frame,
+        toolbar_parent.clone(),
+        "dev-toolbar-row",
+        command_row_count,
+        DEV_TOOLBAR_ROW_HEIGHT,
+        DEV_TOOLBAR_GAP,
+    );
+    let toolbar_control_parent = |index: usize| {
+        command_rows
+            .get(index)
+            .and_then(|row| toolbar_row_parents.get(*row))
+            .cloned()
+            .unwrap_or_else(|| toolbar_parent.clone())
+    };
     let selected_is_custom = shell
         .catalog
         .entries
         .iter()
         .any(|entry| entry.id == shell.workspace.selected_example_id && entry.custom);
-    for command in ["run", "format", "reset", "remove_custom"] {
+    for (command_index, command) in command_specs.iter().copied().enumerate() {
         let label = match command {
             "remove_custom" => "REMOVE".to_owned(),
             other => other.to_ascii_uppercase(),
@@ -12114,7 +12665,7 @@ fn dev_shell_document(
                 intent: "press".to_owned(),
             });
         }
-        append_child(&mut frame, toolbar_parent.clone(), button);
+        append_child(&mut frame, toolbar_control_parent(command_index), button);
     }
     let main_gap = DEV_MAIN_GAP;
     let type_inspector_width = shell.type_inspector_width_for_viewport(viewport_width);
@@ -13829,17 +14380,79 @@ fn normalize_custom_example_label(value: &str) -> String {
     }
 }
 
-fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
+fn dev_example_tab_width(example_id: &str) -> u32 {
+    if example_id.starts_with("custom:") {
+        156
+    } else {
+        120
+    }
+}
+
+fn dev_project_file_tab_width(file: &ProjectFileTab) -> u32 {
+    if file.role == "build" { 132 } else { 112 }
+}
+
+fn dev_header_file_width(viewport_width: u32) -> u32 {
+    viewport_width
+        .saturating_sub(DEV_ROOT_PADDING.saturating_mul(2))
+        .saturating_sub(DEV_HEADER_PADDING.saturating_mul(2))
+        .min(360)
+        .max(180)
+}
+
+fn dev_header_example_width(viewport_width: u32) -> u32 {
+    viewport_width
+        .saturating_sub(DEV_ROOT_PADDING.saturating_mul(2))
+        .saturating_sub(DEV_HEADER_PADDING.saturating_mul(2))
+        .min(220)
+        .max(140)
+}
+
+fn append_dev_tab_rows(
+    frame: &mut boon_document_model::DocumentFrame,
+    parent: boon_document_model::DocumentNodeId,
+    prefix: &str,
+    row_count: usize,
+    row_height: u32,
+    row_gap: u32,
+) -> Vec<boon_document_model::DocumentNodeId> {
+    (0..row_count)
+        .map(|row| {
+            let row_height_text = row_height.to_string();
+            let row_gap_text = row_gap.to_string();
+            let node = dev_node(
+                &format!("{prefix}-{row}"),
+                boon_document_model::DocumentNodeKind::Row,
+                None,
+                &[
+                    ("bg", DEV_PANEL),
+                    ("padding", "0"),
+                    ("gap", &row_gap_text),
+                    ("height", &row_height_text),
+                    ("width", "fill"),
+                ],
+            );
+            let id = node.id.clone();
+            append_child(frame, parent.clone(), node);
+            id
+        })
+        .collect()
+}
+
+fn dev_tabs_node(_shell: &DevWindowShell, height: u32) -> boon_document_model::DocumentNode {
+    let padding = DEV_EXAMPLE_TAB_PADDING.to_string();
+    let gap = DEV_EXAMPLE_TAB_GAP.to_string();
+    let height = height.to_string();
     let mut tabs = dev_node(
         "dev-example-tabs",
-        boon_document_model::DocumentNodeKind::Row,
+        boon_document_model::DocumentNodeKind::Stack,
         None,
         &[
             ("bg", DEV_PANEL),
             ("border", DEV_BORDER_MUTED),
-            ("padding", "6"),
-            ("gap", "6"),
-            ("height", "42"),
+            ("padding", &padding),
+            ("gap", &gap),
+            ("height", &height),
             ("width", "fill"),
         ],
     );
@@ -13851,17 +14464,23 @@ fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
     tabs
 }
 
-fn dev_project_files_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
+fn dev_project_files_node(
+    _shell: &DevWindowShell,
+    height: u32,
+) -> boon_document_model::DocumentNode {
+    let padding = DEV_FILE_TAB_PADDING.to_string();
+    let gap = DEV_FILE_TAB_GAP.to_string();
+    let height = height.to_string();
     let mut tabs = dev_node(
         "dev-project-file-tabs",
-        boon_document_model::DocumentNodeKind::Row,
+        boon_document_model::DocumentNodeKind::Stack,
         None,
         &[
             ("bg", DEV_PANEL),
             ("border", DEV_BORDER_MUTED),
-            ("padding", "5"),
-            ("gap", "5"),
-            ("height", "36"),
+            ("padding", &padding),
+            ("gap", &gap),
+            ("height", &height),
             ("width", "fill"),
         ],
     );
@@ -13880,18 +14499,19 @@ fn project_file_tab_node_id(path: &str) -> String {
     )
 }
 
-fn dev_toolbar_node() -> boon_document_model::DocumentNode {
+fn dev_toolbar_node(height: u32) -> boon_document_model::DocumentNode {
+    let height = height.to_string();
     let mut toolbar = dev_node(
         "dev-toolbar",
-        boon_document_model::DocumentNodeKind::Row,
+        boon_document_model::DocumentNodeKind::Stack,
         None,
         &[
             ("bg", DEV_PANEL),
             ("border", DEV_BORDER_MUTED),
             ("color", DEV_TEXT),
-            ("padding", "8"),
-            ("gap", "10"),
-            ("height", "44"),
+            ("padding", &DEV_TOOLBAR_PADDING.to_string()),
+            ("gap", &DEV_TOOLBAR_GAP.to_string()),
+            ("height", &height),
             ("width", "fill"),
         ],
     );
@@ -18444,6 +19064,23 @@ fn lower_canonical_element_source_record(
                 "__hover_scope".to_owned(),
                 boon_document_model::StyleValue::Bool(true),
             );
+        } else if matches!(field.name.as_str(), "target" | "address") {
+            if let Some(value) = expressions
+                .get(field.value)
+                .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
+                .or_else(|| {
+                    expressions
+                        .get(field.value)
+                        .and_then(|expr| document_expr_value(expr, expressions))
+                })
+                .filter(|value| !value.is_empty())
+            {
+                source_intents.push(json!({
+                    "node": node_id,
+                    "intent": field.name,
+                    "source_path": value
+                }));
+            }
         } else if field.name == "event" {
             if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
                 for source_field in event_fields {
@@ -21450,6 +22087,7 @@ fn document_eval_pipe_value_from_input(
         "List/filter_field_not_equal" => {
             document_eval_list_filter_field(input, args, expressions, context, false)
         }
+        "List/map" => document_eval_list_map(input, args, expressions, context),
         "List/any" => document_eval_list_quantifier(input, args, expressions, context, true),
         "List/every" => document_eval_list_quantifier(input, args, expressions, context, false),
         "Text/is_not_empty" => input.as_str().map(|text| Value::Bool(!text.is_empty())),
@@ -21987,6 +22625,46 @@ fn document_eval_list_filter_field(
     Some(Value::Array(filtered))
 }
 
+fn document_eval_list_map(
+    input: Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let items = input.as_array()?;
+    let item_name = list_item_arg_name(args, expressions).unwrap_or("item");
+    let map_arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("new"))
+        .or_else(|| args.iter().find(|arg| arg.name.is_some()))?;
+    let mut mapped = Vec::with_capacity(items.len());
+    for item in items {
+        let mut scoped = DocumentEvalContext {
+            root: context.root,
+            locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
+            passed: context.passed.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
+        };
+        scoped.locals.insert(item_name.to_owned(), item.clone());
+        let value = expressions
+            .get(map_arg.value)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, &scoped))
+            .or_else(|| {
+                expressions
+                    .get(map_arg.value)
+                    .and_then(|expr| document_expr_value(expr, expressions).map(Value::String))
+            })
+            .unwrap_or(Value::Null);
+        mapped.push(value);
+    }
+    Some(Value::Array(mapped))
+}
+
 fn document_eval_list_quantifier(
     input: Value,
     args: &[AstCallArg],
@@ -22038,6 +22716,19 @@ fn list_item_arg_name<'a>(args: &'a [AstCallArg], expressions: &'a [AstExpr]) ->
 
 fn document_eval_infix(left: &Value, op: &str, right: &Value) -> Option<Value> {
     let result = match op {
+        "+" => return document_eval_number_infix(left, right, |left, right| Some(left + right)),
+        "-" => return document_eval_number_infix(left, right, |left, right| Some(left - right)),
+        "*" => return document_eval_number_infix(left, right, |left, right| Some(left * right)),
+        "/" => {
+            return document_eval_number_infix(left, right, |left, right| {
+                (right != 0.0).then_some(left / right)
+            });
+        }
+        "%" => {
+            return document_eval_number_infix(left, right, |left, right| {
+                (right != 0.0).then_some(left % right)
+            });
+        }
         "==" => json_values_equal(left, right),
         "!=" => !json_values_equal(left, right),
         ">" => json_values_cmp(left, right).is_some_and(|ordering| ordering.is_gt()),
@@ -22057,6 +22748,16 @@ fn document_eval_infix(left: &Value, op: &str, right: &Value) -> Option<Value> {
         _ => return None,
     };
     Some(Value::Bool(result))
+}
+
+fn document_eval_number_infix(
+    left: &Value,
+    right: &Value,
+    op: impl FnOnce(f64, f64) -> Option<f64>,
+) -> Option<Value> {
+    let left = left.as_f64()?;
+    let right = right.as_f64()?;
+    op(left, right).map(|value| json!(value))
 }
 
 fn json_values_equal(left: &Value, right: &Value) -> bool {
@@ -22179,6 +22880,8 @@ struct PreviewNativeInputState {
     focused_node: Option<String>,
     focused_address: Option<String>,
     focused_target_text: Option<String>,
+    focused_change_source: Option<String>,
+    focused_key_down_source: Option<String>,
     focused_text: String,
     focused_caret_index: usize,
     replace_focused_text_on_next_edit: bool,
@@ -22457,6 +23160,14 @@ fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -
     false
 }
 
+fn preview_key_down_source_for_node(layout_proof: &Value, node: &str) -> Option<String> {
+    live_source_for_node_intent(layout_proof, node, "key_down")
+}
+
+fn preview_node_accepts_key_focus(layout_proof: &Value, node: &str) -> bool {
+    preview_key_down_source_for_node(layout_proof, node).is_some()
+}
+
 fn preview_caret_index_for_text_hit_region(
     layout_proof: &Value,
     hit_region: &Value,
@@ -22584,6 +23295,8 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
     input_state.focused_node = None;
     input_state.focused_address = None;
     input_state.focused_target_text = None;
+    input_state.focused_change_source = None;
+    input_state.focused_key_down_source = None;
     input_state.focused_text.clear();
     input_state.focused_caret_index = 0;
     input_state.replace_focused_text_on_next_edit = false;
@@ -22635,6 +23348,10 @@ fn preview_refresh_retained_focus_after_enter(
     input_state.focused_node = Some(focused_node.to_owned());
     input_state.focused_address = focused_address(layout_proof, focused_node);
     input_state.focused_target_text = focused_target_text(layout_proof, focused_node);
+    input_state.focused_change_source =
+        live_source_for_node_intent(layout_proof, focused_node, "change");
+    input_state.focused_key_down_source =
+        preview_key_down_source_for_node(layout_proof, focused_node);
     input_state.focused_text =
         preview_focused_text_for_node(layout_proof, focused_node, live_runtime)
             .or_else(|| document_value_for_node(layout_proof, focused_node))
@@ -22854,6 +23571,10 @@ fn preview_apply_real_window_input_with_units(
                 input_state.focused_node = Some(node.clone());
                 input_state.focused_address = focused_address(layout, &node);
                 input_state.focused_target_text = focused_target_text(layout, &node);
+                input_state.focused_change_source =
+                    live_source_for_node_intent(layout, &node, "change");
+                input_state.focused_key_down_source =
+                    preview_key_down_source_for_node(layout, &node);
                 preview_clear_key_repeat(input_state);
                 input_state.focused_text =
                     preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
@@ -22904,6 +23625,26 @@ fn preview_apply_real_window_input_with_units(
                         pending_mouse_events.push(event);
                         defer_focusable_mouse_events = true;
                     }
+                }
+                input_state.last_click_node = Some(node);
+                input_state.last_click_sequence = mouse_release.sequence;
+            } else if preview_node_accepts_key_focus(layout, &node) {
+                if let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime) {
+                    pending_mouse_events.push(blur);
+                }
+                input_state.focused_node = Some(node.clone());
+                input_state.focused_address = focused_address(layout, &node);
+                input_state.focused_target_text = focused_target_text(layout, &node);
+                input_state.focused_change_source =
+                    live_source_for_node_intent(layout, &node, "change");
+                input_state.focused_key_down_source =
+                    preview_key_down_source_for_node(layout, &node);
+                input_state.focused_text.clear();
+                input_state.focused_caret_index = 0;
+                input_state.replace_focused_text_on_next_edit = false;
+                preview_clear_key_repeat(input_state);
+                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region, false) {
+                    pending_mouse_events.push(event);
                 }
                 input_state.last_click_node = Some(node);
                 input_state.last_click_sequence = mouse_release.sequence;
@@ -22996,10 +23737,15 @@ fn preview_apply_real_window_input_with_units(
             preview_clear_key_repeat(input_state);
             continue;
         }
-        let Some(focused_node) = input_state.focused_node.clone() else {
+        if input_state.focused_node.is_none() {
+            continue;
+        }
+        let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+        let Some(focused_node) = preview_resolve_input_focus_for_layout(layout, input_state) else {
+            preview_clear_focused_input_state(input_state);
+            preview_clear_key_repeat(input_state);
             continue;
         };
-        let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
         match event.key.as_str() {
             "Return" | "KeypadEnter" => {
                 if let Some(source) = live_source_for_node_intent(layout, &focused_node, "submit")
@@ -23080,26 +23826,82 @@ fn preview_apply_real_window_input_with_units(
                 }
             }
             key if preview_key_is_repeatable(key) => {
-                if let Some(next_layout) = preview_apply_repeatable_text_input_key(
-                    key,
-                    shift_pressed,
-                    layout,
-                    &focused_node,
-                    source_path,
-                    source_text,
-                    runtime_units,
-                    live_runtime,
-                    shared_render_state,
-                    input_state,
-                )? {
-                    latest_layout = Some(next_layout);
+                if live_source_for_node_intent(layout, &focused_node, "change").is_some() {
+                    if let Some(next_layout) = preview_apply_repeatable_text_input_key(
+                        key,
+                        shift_pressed,
+                        layout,
+                        &focused_node,
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        input_state,
+                    )? {
+                        latest_layout = Some(next_layout);
+                    }
+                    let now = Instant::now();
+                    input_state.held_repeat_key = Some(event.key.clone());
+                    input_state.held_repeat_next_at =
+                        now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
+                } else if let Some(source) = preview_key_down_source_for_node(layout, &focused_node)
+                {
+                    let key_down = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: Some(normalized_repeat_key(key)),
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &focused_node)),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    latest_layout = Some(preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        key_down,
+                    )?);
+                    let now = Instant::now();
+                    input_state.held_repeat_key = Some(event.key.clone());
+                    input_state.held_repeat_next_at =
+                        now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
                 }
-                let now = Instant::now();
-                input_state.held_repeat_key = Some(event.key.clone());
-                input_state.held_repeat_next_at =
-                    now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
             }
             _ => {
+                if let Some(source) = preview_key_down_source_for_node(layout, &focused_node) {
+                    let key_down = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: Some(normalized_repeat_key(event.key.as_str())),
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &focused_node)),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    latest_layout = Some(preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        key_down,
+                    )?);
+                }
                 preview_clear_key_repeat(input_state);
             }
         }
@@ -23118,24 +23920,62 @@ fn preview_apply_real_window_input_with_units(
                     .is_some_and(|next| now >= next)
                     && applied < BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP
                 {
-                    let Some(focused_node) = input_state.focused_node.clone() else {
+                    if input_state.focused_node.is_none() {
+                        preview_clear_key_repeat(input_state);
+                        break;
+                    }
+                    let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+                    let Some(focused_node) =
+                        preview_resolve_input_focus_for_layout(layout, input_state)
+                    else {
+                        preview_clear_focused_input_state(input_state);
                         preview_clear_key_repeat(input_state);
                         break;
                     };
-                    let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
-                    if let Some(next_layout) = preview_apply_repeatable_text_input_key(
-                        &key,
-                        shift_pressed,
-                        layout,
-                        &focused_node,
-                        source_path,
-                        source_text,
-                        runtime_units,
-                        live_runtime,
-                        shared_render_state,
-                        input_state,
-                    )? {
-                        latest_layout = Some(next_layout);
+                    if live_source_for_node_intent(layout, &focused_node, "change").is_some() {
+                        if let Some(next_layout) = preview_apply_repeatable_text_input_key(
+                            &key,
+                            shift_pressed,
+                            layout,
+                            &focused_node,
+                            source_path,
+                            source_text,
+                            runtime_units,
+                            live_runtime,
+                            shared_render_state,
+                            input_state,
+                        )? {
+                            latest_layout = Some(next_layout);
+                        }
+                    } else if let Some(source) =
+                        preview_key_down_source_for_node(layout, &focused_node)
+                    {
+                        let key_down = boon_runtime::LiveSourceEvent {
+                            source,
+                            text: None,
+                            key: Some(normalized_repeat_key(&key)),
+                            address: input_state
+                                .focused_address
+                                .clone()
+                                .or_else(|| focused_address(layout, &focused_node)),
+                            target_text: input_state
+                                .focused_target_text
+                                .clone()
+                                .or_else(|| focused_target_text(layout, &focused_node)),
+                            target_occurrence: None,
+                            ..boon_runtime::LiveSourceEvent::default()
+                        };
+                        latest_layout = Some(preview_apply_live_event(
+                            source_path,
+                            source_text,
+                            runtime_units,
+                            live_runtime,
+                            shared_render_state,
+                            key_down,
+                        )?);
+                    } else {
+                        preview_clear_key_repeat(input_state);
+                        break;
                     }
                     applied += 1;
                     input_state.held_repeat_next_at = input_state
@@ -23340,26 +24180,39 @@ fn preview_apply_hover_overlay(
                 })
             })
     });
-    let hovered_button_bounds = input_state.hovered_node.as_deref().and_then(|hovered| {
+    let hovered_button = input_state.hovered_node.as_deref().and_then(|hovered| {
+        let hovered_item = frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == hovered)?;
+        if matches!(
+            hovered_item.kind,
+            boon_document_model::DocumentNodeKind::Button
+        ) {
+            return Some((hovered_item.node.0.clone(), hovered_item.bounds));
+        }
         frame
             .display_list
             .iter()
             .find(|item| {
-                item.node.0 == hovered
-                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                    && rect_contains_bounds_with_epsilon(item.bounds, hovered_item.bounds, 0.5)
             })
-            .map(|item| item.bounds)
+            .map(|item| (item.node.0.clone(), item.bounds))
     });
     let mut changed = false;
     for item in &mut frame.display_list {
         let item_target = focused_target_text(&layout_proof, &item.node.0);
         let item_scope = display_style_text(&item.style, "__scope_key");
         let direct_hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
-        let button_text_hover = hovered_button_bounds.is_some_and(|bounds| {
+        let button_hover = hovered_button
+            .as_ref()
+            .is_some_and(|(node, _)| node == &item.node.0);
+        let button_text_hover = hovered_button.as_ref().is_some_and(|(_, bounds)| {
             matches!(item.kind, boon_document_model::DocumentNodeKind::Text)
-                && rect_contains_bounds_with_epsilon(bounds, item.bounds, 0.5)
+                && rect_contains_bounds_with_epsilon(*bounds, item.bounds, 0.5)
         });
-        let hover_active = direct_hover || button_text_hover;
+        let hover_active = direct_hover || button_hover || button_text_hover;
         let reveal_active = hover_active
             || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
             || (item_target.is_some()
@@ -23419,7 +24272,9 @@ fn preview_cursor_icon(
     };
     if document_node_wants_text_cursor(layout_proof, node) {
         boon_native_app_window::NativeCursorIcon::Text
-    } else if document_node_wants_pointer_cursor(layout_proof, node) {
+    } else if document_node_wants_pointer_cursor(layout_proof, node)
+        || document_containing_node_wants_pointer_cursor(layout_proof, node)
+    {
         boon_native_app_window::NativeCursorIcon::Pointer
     } else {
         boon_native_app_window::NativeCursorIcon::Default
@@ -23494,21 +24349,117 @@ fn document_node_wants_pointer_cursor(layout_proof: &Value, node: &str) -> bool 
             })
 }
 
+fn document_containing_node_wants_pointer_cursor(layout_proof: &Value, node: &str) -> bool {
+    let Some(hit_region) = document_hit_region_for_node(layout_proof, node) else {
+        return false;
+    };
+    let Some(bounds) = hit_region.get("bounds") else {
+        return false;
+    };
+    layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.get("node").and_then(serde_json::Value::as_str))
+        .filter(|candidate_node| *candidate_node != node)
+        .any(|candidate_node| {
+            document_node_wants_pointer_cursor(layout_proof, candidate_node)
+                && document_hit_region_for_node(layout_proof, candidate_node)
+                    .as_ref()
+                    .is_some_and(|candidate| {
+                        document_bounds_contains_bounds(candidate.get("bounds"), bounds)
+                    })
+        })
+}
+
 fn preview_resolved_focused_node(
     layout_proof: &Value,
     input_state: &PreviewNativeInputState,
 ) -> Option<String> {
     let requested_node = input_state.focused_node.as_deref()?;
-    let Some(address) = input_state.focused_address.as_deref() else {
-        return Some(requested_node.to_owned());
-    };
-    if focused_address(layout_proof, requested_node).as_deref() == Some(address) {
-        return Some(requested_node.to_owned());
+    if let Some(address) = input_state.focused_address.as_deref() {
+        if focused_address(layout_proof, requested_node).as_deref() == Some(address) {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) = focused_node_for_address(layout_proof, address) {
+            return Some(node);
+        }
     }
-    focused_node_for_address(layout_proof, address)
+    if let Some(target_text) = input_state.focused_target_text.as_deref() {
+        if focused_target_text(layout_proof, requested_node).as_deref() == Some(target_text) {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) = focused_node_for_target_text(layout_proof, target_text) {
+            return Some(node);
+        }
+    }
+    if let Some(change_source) = input_state.focused_change_source.as_deref() {
+        if live_source_for_node_intent(layout_proof, requested_node, "change").as_deref()
+            == Some(change_source)
+        {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) =
+            focused_node_for_source_identity(layout_proof, "change", change_source, None)
+        {
+            return Some(node);
+        }
+    }
+    if let Some(key_down_source) = input_state.focused_key_down_source.as_deref() {
+        if preview_key_down_source_for_node(layout_proof, requested_node).as_deref()
+            == Some(key_down_source)
+        {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) =
+            focused_node_for_source_identity(layout_proof, "key_down", key_down_source, None)
+        {
+            return Some(node);
+        }
+    }
+    Some(requested_node.to_owned())
+}
+
+fn preview_resolve_input_focus_for_layout(
+    layout_proof: &Value,
+    input_state: &mut PreviewNativeInputState,
+) -> Option<String> {
+    let resolved = preview_resolved_focused_node(layout_proof, input_state)?;
+    if input_state.focused_node.as_deref() != Some(resolved.as_str()) {
+        input_state.focused_node = Some(resolved.clone());
+    }
+    if input_state.focused_address.is_none() {
+        input_state.focused_address = focused_address(layout_proof, &resolved);
+    }
+    if input_state.focused_target_text.is_none() {
+        input_state.focused_target_text = focused_target_text(layout_proof, &resolved);
+    }
+    if input_state.focused_change_source.is_none() {
+        input_state.focused_change_source =
+            live_source_for_node_intent(layout_proof, &resolved, "change");
+    }
+    if input_state.focused_key_down_source.is_none() {
+        input_state.focused_key_down_source =
+            preview_key_down_source_for_node(layout_proof, &resolved);
+    }
+    Some(resolved)
 }
 
 fn focused_node_for_address(layout_proof: &Value, address: &str) -> Option<String> {
+    focused_node_for_source_identity(layout_proof, "address", address, Some(("target", address)))
+}
+
+fn focused_node_for_target_text(layout_proof: &Value, target_text: &str) -> Option<String> {
+    focused_node_for_source_identity(layout_proof, "target", target_text, None)
+}
+
+fn focused_node_for_source_identity(
+    layout_proof: &Value,
+    identity_intent: &str,
+    identity_value: &str,
+    required_extra: Option<(&str, &str)>,
+) -> Option<String> {
     let hit_nodes = layout_proof
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)
@@ -23521,19 +24472,22 @@ fn focused_node_for_address(layout_proof: &Value, address: &str) -> Option<Strin
         .and_then(serde_json::Value::as_array)?;
     intents.iter().find_map(|intent| {
         let node = intent.get("node").and_then(serde_json::Value::as_str)?;
-        if intent.get("intent").and_then(serde_json::Value::as_str) == Some("address")
+        if intent.get("intent").and_then(serde_json::Value::as_str) == Some(identity_intent)
             && intent
                 .get("source_path")
                 .and_then(serde_json::Value::as_str)
-                == Some(address)
+                == Some(identity_value)
             && hit_nodes.contains(node)
-            && intents.iter().any(|candidate| {
-                candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                    && candidate.get("intent").and_then(serde_json::Value::as_str) == Some("target")
-                    && candidate
-                        .get("source_path")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(address)
+            && required_extra.is_none_or(|(extra_intent, extra_value)| {
+                intents.iter().any(|candidate| {
+                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                        && candidate.get("intent").and_then(serde_json::Value::as_str)
+                            == Some(extra_intent)
+                        && candidate
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(extra_value)
+                })
             })
         {
             Some(node.to_owned())
@@ -24056,6 +25010,9 @@ fn preview_apply_live_events(
             changed,
         )
     };
+    if changed {
+        persist_novywave_ui_state_for_summary(source_path, &state_summary);
+    }
     if !changed {
         let mut shared = shared_render_state
             .lock()
@@ -24238,6 +25195,9 @@ fn live_source_event_for_hit_region(
     prefer_double_click: bool,
 ) -> Option<boon_runtime::LiveSourceEvent> {
     let node = hit_region.get("node")?.as_str()?;
+    let source_node =
+        live_source_node_for_hit_region(layout_proof, hit_region, prefer_double_click)
+            .unwrap_or_else(|| node.to_owned());
     let source_intents = if prefer_double_click {
         ["double_click", "source", "click", "press"]
     } else {
@@ -24245,17 +25205,89 @@ fn live_source_event_for_hit_region(
     };
     let source = source_intents
         .into_iter()
-        .find_map(|intent| live_source_for_node_intent(layout_proof, node, intent))?;
+        .find_map(|intent| live_source_for_node_intent(layout_proof, &source_node, intent))?;
+    let target_text = focused_target_text(layout_proof, &source_node);
     Some(boon_runtime::LiveSourceEvent {
         source,
-        text: prefer_double_click
-            .then(|| document_value_for_hit_region(layout_proof, hit_region).unwrap_or_default()),
+        text: if prefer_double_click {
+            Some(document_value_for_hit_region(layout_proof, hit_region).unwrap_or_default())
+        } else {
+            target_text.clone()
+        },
         key: None,
-        address: focused_address(layout_proof, node),
-        target_text: focused_target_text(layout_proof, node),
-        target_occurrence: None,
+        address: focused_address(layout_proof, &source_node),
+        target_text,
+        target_occurrence: focused_target_occurrence(layout_proof, &source_node),
         ..boon_runtime::LiveSourceEvent::default()
     })
+}
+
+fn live_source_node_for_hit_region(
+    layout_proof: &Value,
+    hit_region: &Value,
+    prefer_double_click: bool,
+) -> Option<String> {
+    let node = hit_region.get("node")?.as_str()?;
+    let source_intents = if prefer_double_click {
+        ["double_click", "source", "click", "press"]
+    } else {
+        ["source", "click", "press", "double_click"]
+    };
+    if source_intents
+        .iter()
+        .any(|intent| live_source_for_node_intent(layout_proof, node, intent).is_some())
+    {
+        return Some(node.to_owned());
+    }
+    let bounds = hit_region.get("bounds")?;
+    layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|candidate| {
+            candidate.get("node").and_then(serde_json::Value::as_str) != Some(node)
+                && document_bounds_contains_bounds(candidate.get("bounds"), bounds)
+        })
+        .filter_map(|candidate| {
+            let candidate_node = candidate.get("node")?.as_str()?;
+            source_intents
+                .iter()
+                .any(|intent| {
+                    live_source_for_node_intent(layout_proof, candidate_node, intent).is_some()
+                })
+                .then(|| {
+                    (
+                        candidate_node.to_owned(),
+                        document_bounds_area(candidate.get("bounds")).unwrap_or(f64::MAX),
+                    )
+                })
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(node, _)| node)
+}
+
+fn document_bounds_contains_bounds(outer: Option<&Value>, inner: &Value) -> bool {
+    let Some(outer) = outer else {
+        return false;
+    };
+    let left = inner
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let top = inner
+        .get("y")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let width = inner
+        .get("width")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let height = inner
+        .get("height")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    document_bounds_contains(outer, left, top)
+        && document_bounds_contains(outer, left + width, top + height)
 }
 
 fn preview_focused_blur_event(
@@ -24310,6 +25342,32 @@ fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str)
 fn focused_target_text(layout_proof: &Value, node: &str) -> Option<String> {
     focused_source_intent_value(layout_proof, node, "target")
         .or_else(|| focused_source_intent_value(layout_proof, node, "address"))
+}
+
+fn focused_target_occurrence(layout_proof: &Value, node: &str) -> Option<usize> {
+    let target_text = focused_target_text(layout_proof, node)?;
+    let target_intent = if focused_source_intent_value(layout_proof, node, "target").is_some() {
+        "target"
+    } else {
+        "address"
+    };
+    let mut occurrence = 0usize;
+    for intent in layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?
+    {
+        let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str);
+        let source_path = intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str);
+        if intent_kind == Some(target_intent) && source_path == Some(target_text.as_str()) {
+            occurrence = occurrence.saturating_add(1);
+            if intent.get("node").and_then(serde_json::Value::as_str) == Some(node) {
+                return Some(occurrence.max(1));
+            }
+        }
+    }
+    Some(1)
 }
 
 fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
@@ -25793,13 +26851,17 @@ where
     let (runtime_summary, document_state_summary, live_runtime, live_runtime_profile) =
         match live_runtime_result {
             Ok((mut runtime, profile)) => {
-                let state_summary = runtime.state_summary();
+                let restored_ui_state = restore_novywave_ui_state_for_runtime_best_effort(
+                    Path::new(&entrypoint.virtual_uri),
+                    &mut runtime,
+                );
                 let document_state_summary = runtime.document_state_summary();
-                let summary = preview_runtime_summary_from_state_summary(
+                let mut summary = preview_runtime_summary_from_state_summary(
                     Path::new(&entrypoint.virtual_uri),
                     &source_hash,
-                    state_summary,
+                    document_state_summary.clone(),
                 );
+                summary["restored_ui_state"] = json!(restored_ui_state.is_some());
                 (
                     summary,
                     Some(document_state_summary),
@@ -26046,12 +27108,16 @@ fn preview_apply_replace_code_to_state(
         .get("preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    state.live_runtime = boon_runtime::LiveRuntime::from_project(
+    state.live_runtime = match boon_runtime::LiveRuntime::from_project(
         &format!("native-preview-live:{source_path}"),
         &runtime_units,
-    )
-    .ok()
-    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    ) {
+        Ok(mut runtime) => {
+            restore_novywave_ui_state_for_runtime_best_effort(Path::new(source_path), &mut runtime);
+            Some(Arc::new(Mutex::new(runtime)))
+        }
+        Err(_) => None,
+    };
     if let Some(layout_proof) = response.get("document_layout_proof") {
         let mut shared = state
             .shared_render_state
@@ -26097,16 +27163,19 @@ fn preview_replace_code_response(
                 code,
             ) {
                 Ok(mut runtime) => {
+                    let restored_ui_state = restore_novywave_ui_state_for_runtime_best_effort(
+                        Path::new(source_path),
+                        &mut runtime,
+                    );
                     let state_summary = runtime.state_summary();
                     let document_state_summary = runtime.document_state_summary();
-                    (
-                        preview_runtime_summary_from_state_summary(
-                            Path::new(source_path),
-                            &project_hash,
-                            state_summary,
-                        ),
-                        Some(document_state_summary),
-                    )
+                    let mut runtime_summary = preview_runtime_summary_from_state_summary(
+                        Path::new(source_path),
+                        &project_hash,
+                        state_summary,
+                    );
+                    runtime_summary["restored_ui_state"] = json!(restored_ui_state.is_some());
+                    (runtime_summary, Some(document_state_summary))
                 }
                 Err(error) => (
                     json!({
@@ -37370,6 +38439,187 @@ mod tests {
     }
 
     #[test]
+    fn dev_example_and_file_tabs_wrap_inside_narrow_viewport() {
+        let source = std::fs::read_to_string(repo_path("examples/novywave/RUN.bn"))
+            .expect("NovyWave entry source should be readable");
+        let shell = DevWindowShell::new(
+            "examples/novywave/RUN.bn",
+            &source,
+            Some("novywave"),
+            PreviewTransport::new(None),
+        );
+        let viewport_width = 420;
+        let viewport_height = 825;
+        let document = shell.document_for_viewport(viewport_width, viewport_height);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: viewport_width as f32,
+                height: viewport_height as f32,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+
+        let header = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-header")
+            .expect("workspace header panel should be laid out")
+            .bounds;
+        let header_rows = layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-header-row-"))
+            .collect::<Vec<_>>();
+        assert!(
+            header_rows.len() > 1,
+            "narrow dev viewport should wrap workspace header controls"
+        );
+        for node_id in [
+            "dev-header-title",
+            "dev-header-file",
+            "dev-header-preview-status",
+            "dev-header-dirty-status",
+            "dev-header-example",
+            "dev-custom-name-input",
+        ] {
+            let item = layout
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == node_id)
+                .unwrap_or_else(|| panic!("{node_id} should be visible in workspace header"));
+            assert!(
+                item.bounds.x >= header.x - 0.5
+                    && item.bounds.x + item.bounds.width <= header.x + header.width + 0.5
+                    && item.bounds.y >= header.y - 0.5
+                    && item.bounds.y + item.bounds.height <= header.y + header.height + 0.5,
+                "{node_id} leaks outside wrapped workspace header: {:?} container={:?}",
+                item.bounds,
+                header
+            );
+        }
+
+        let example_tabs = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-example-tabs")
+            .expect("example tab bar should be laid out")
+            .bounds;
+        let example_rows = layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-example-tabs-row-"))
+            .collect::<Vec<_>>();
+        assert!(
+            example_rows.len() > 1,
+            "narrow dev viewport should wrap example tabs to multiple rows"
+        );
+        let new_example_tab = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-tab-new")
+            .expect("new example tab should be reachable");
+        assert!(
+            new_example_tab.bounds.x + new_example_tab.bounds.width
+                <= example_tabs.x + example_tabs.width + 0.5,
+            "new example tab leaks past tab bar: {:?} container={:?}",
+            new_example_tab.bounds,
+            example_tabs
+        );
+        for item in layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-tab-"))
+        {
+            assert!(
+                item.bounds.x >= example_tabs.x - 0.5
+                    && item.bounds.x + item.bounds.width
+                        <= example_tabs.x + example_tabs.width + 0.5
+                    && item.bounds.y >= example_tabs.y - 0.5
+                    && item.bounds.y + item.bounds.height
+                        <= example_tabs.y + example_tabs.height + 0.5,
+                "{} leaks outside wrapped example tab bar: {:?} container={:?}",
+                item.node.0,
+                item.bounds,
+                example_tabs
+            );
+        }
+
+        let file_tabs = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-project-file-tabs")
+            .expect("NovyWave file tab bar should be laid out")
+            .bounds;
+        let file_rows = layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-project-file-tabs-row-"))
+            .collect::<Vec<_>>();
+        assert!(
+            file_rows.len() > 1,
+            "narrow dev viewport should wrap NovyWave file tabs to multiple rows"
+        );
+        for item in layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-project-file-"))
+        {
+            assert!(
+                item.bounds.x >= file_tabs.x - 0.5
+                    && item.bounds.x + item.bounds.width <= file_tabs.x + file_tabs.width + 0.5
+                    && item.bounds.y >= file_tabs.y - 0.5
+                    && item.bounds.y + item.bounds.height <= file_tabs.y + file_tabs.height + 0.5,
+                "{} leaks outside wrapped file tab bar: {:?} container={:?}",
+                item.node.0,
+                item.bounds,
+                file_tabs
+            );
+        }
+
+        let toolbar = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-toolbar")
+            .expect("workspace command toolbar should be laid out")
+            .bounds;
+        let toolbar_rows = layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-toolbar-row-"))
+            .collect::<Vec<_>>();
+        assert!(
+            toolbar_rows.len() > 1,
+            "narrow dev viewport should wrap workspace command/dialog controls"
+        );
+        for node_id in [
+            "dev-command-run",
+            "dev-command-format",
+            "dev-command-reset",
+            "dev-command-remove_custom",
+        ] {
+            let item = layout
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == node_id)
+                .unwrap_or_else(|| panic!("{node_id} should be visible in command toolbar"));
+            assert!(
+                item.bounds.x >= toolbar.x - 0.5
+                    && item.bounds.x + item.bounds.width <= toolbar.x + toolbar.width + 0.5
+                    && item.bounds.y >= toolbar.y - 0.5
+                    && item.bounds.y + item.bounds.height <= toolbar.y + toolbar.height + 0.5,
+                "{node_id} leaks outside wrapped workspace toolbar: {:?} container={:?}",
+                item.bounds,
+                toolbar
+            );
+        }
+    }
+
+    #[test]
     fn editor_horizontal_scroll_updates_column_without_moving_lines() {
         let source = (0..24)
             .map(|index| {
@@ -38666,6 +39916,274 @@ mod tests {
         }
     }
 
+    fn novywave_units_with_bulk_signal_catalog(
+        source_path: &Path,
+        extra_count: usize,
+    ) -> Vec<boon_runtime::RuntimeSourceUnit> {
+        let mut units = boon_runtime::source_units_for_path(source_path)
+            .expect("NovyWave manifest source units should load");
+        let run_unit = units
+            .iter_mut()
+            .find(|unit| unit.path.ends_with("examples/novywave/RUN.bn"))
+            .expect("NovyWave RUN source unit should be present");
+        let insertion = (0..extra_count)
+            .map(|index| {
+                format!(
+                    "            [key: TEXT {{ bulk_{index:03} }}, scope: TEXT {{ top.cpu }}, name: TEXT {{ bulk_signal_{index:03} }}, kind: TEXT {{ Wire }}, bit_width: TEXT {{ 1-bit }}, direction: TEXT {{ Debug }}, family: TEXT {{ bulk }}]\n"
+                )
+            })
+            .collect::<String>();
+        let needle = "        }\n        |> List/map(signal, new: new_signal(signal: signal))";
+        run_unit.source = run_unit
+            .source
+            .replacen(needle, &format!("{insertion}{needle}"), 1);
+        assert!(
+            run_unit.source.contains("bulk_signal_079"),
+            "NovyWave test source should include the injected bulk signal catalog"
+        );
+        units
+    }
+
+    fn novywave_variable_labels(layout: &boon_document::LayoutFrame) -> Vec<&str> {
+        layout
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref())
+            .filter(|text| text.starts_with("bulk_signal_"))
+            .collect()
+    }
+
+    #[test]
+    fn novywave_variables_panel_uses_windowed_rows_for_large_catalog() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let units = novywave_units_with_bulk_signal_catalog(&source_path, 80);
+        let mut runtime =
+            boon_runtime::LiveRuntime::from_project("novywave-variable-virtual-scroll", &units)
+                .expect("NovyWave runtime should initialize from expanded manifest units");
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.signal_search_input".to_owned(),
+                text: Some("bulk".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave signal search should filter the expanded variable catalog");
+
+        let initial_summary = runtime.document_state_summary_for_window(0, 24, 0, 1);
+        assert_eq!(
+            initial_summary.pointer("/store/search_results_count"),
+            Some(&json!(80)),
+            "NovyWave expanded catalog should expose all matching variables as data"
+        );
+        assert_eq!(
+            initial_summary.pointer("/store/search_result_label"),
+            Some(&json!("80 results: scroll variables list")),
+            "NovyWave large-result label should not concatenate hundreds of variable names"
+        );
+        let initial_rows = initial_summary
+            .pointer("/store/variable_rows")
+            .and_then(Value::as_array)
+            .expect("NovyWave summary should expose virtual variable rows");
+        assert_eq!(
+            initial_rows.len(),
+            24,
+            "NovyWave should expose only the visible variable row window"
+        );
+        assert_eq!(
+            initial_rows[0].pointer("/signals/0/key"),
+            Some(&json!("bulk_000"))
+        );
+        assert_eq!(
+            initial_rows[23].pointer("/signals/0/key"),
+            Some(&json!("bulk_023"))
+        );
+
+        let scrolled_summary = runtime.document_state_summary_for_window(40, 24, 0, 1);
+        let scrolled_rows = scrolled_summary
+            .pointer("/store/variable_rows")
+            .and_then(Value::as_array)
+            .expect("NovyWave scrolled summary should expose virtual variable rows");
+        assert_eq!(scrolled_rows.len(), 24);
+        assert_eq!(
+            scrolled_rows[0].pointer("/signals/0/key"),
+            Some(&json!("bulk_040"))
+        );
+        assert_eq!(
+            scrolled_rows[23].pointer("/signals/0/key"),
+            Some(&json!("bulk_063"))
+        );
+
+        let (_, initial_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&initial_summary),
+        )
+        .expect("NovyWave initial virtual variable layout should lower");
+        let initial_labels = novywave_variable_labels(&initial_layout);
+        assert_eq!(
+            initial_labels.len(),
+            24,
+            "NovyWave initial variable layout should render only the visible row window: {initial_labels:?}"
+        );
+        assert!(initial_labels.contains(&"bulk_signal_000"));
+        assert!(initial_labels.contains(&"bulk_signal_023"));
+        assert!(!initial_labels.contains(&"bulk_signal_024"));
+        assert!(!initial_labels.contains(&"bulk_signal_040"));
+
+        let (_, scrolled_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&scrolled_summary),
+        )
+        .expect("NovyWave scrolled virtual variable layout should lower");
+        let scrolled_labels = novywave_variable_labels(&scrolled_layout);
+        assert_eq!(
+            scrolled_labels.len(),
+            24,
+            "NovyWave scrolled variable layout should render only the shifted visible row window: {scrolled_labels:?}"
+        );
+        assert!(scrolled_labels.contains(&"bulk_signal_040"));
+        assert!(scrolled_labels.contains(&"bulk_signal_063"));
+        assert!(!scrolled_labels.contains(&"bulk_signal_000"));
+        assert!(!scrolled_labels.contains(&"bulk_signal_064"));
+    }
+
+    #[test]
+    fn novywave_ui_state_persists_and_restores_through_boon_events() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-ui-state-save", &units)
+            .expect("NovyWave runtime should initialize from manifest units");
+        for event in [
+            "store.elements.mode_to_light",
+            "store.elements.panels_variables_wider",
+            "store.elements.panels_toggle_arrangement",
+            "store.elements.scope_analog",
+            "store.elements.select_temperature",
+            "store.elements.format_binary",
+            "store.elements.row_taller",
+            "store.elements.zoom_in",
+            "store.elements.pan_right",
+            "store.elements.analog_limits_manual",
+            "store.elements.selected_remove_temperature",
+        ] {
+            runtime
+                .apply_source_event_for_document(source_press_event(event))
+                .unwrap_or_else(|error| {
+                    panic!("NovyWave source event {event} should apply: {error}")
+                });
+        }
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.waveform_click".to_owned(),
+                text: Some("48 ns".to_owned()),
+                target_text: Some("48 ns".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave waveform click text payload source event should apply");
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.signal_search_input".to_owned(),
+                text: Some("temp".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave search text source event should apply");
+
+        let saved_summary = runtime.document_state_summary();
+        let saved_state = novywave_ui_state_from_summary(&saved_summary)
+            .expect("changed NovyWave state should be persistable");
+        assert_eq!(saved_state.mode.as_deref(), Some("Light"));
+        assert_eq!(saved_state.panel_layout.as_deref(), Some("VariablesWide"));
+        assert_eq!(saved_state.panel_arrangement.as_deref(), Some("Docked"));
+        assert_eq!(saved_state.active_scope.as_deref(), Some("top_analog"));
+        assert_eq!(saved_state.active_signal.as_deref(), Some("temperature"));
+        assert_eq!(saved_state.value_format.as_deref(), Some("Binary"));
+        assert_eq!(saved_state.row_size.as_deref(), Some("Tall"));
+        assert_eq!(saved_state.zoom_level.as_deref(), Some("Close"));
+        assert_eq!(saved_state.pan_window.as_deref(), Some("RightWindow"));
+        assert_eq!(saved_state.cursor_position.as_deref(), Some("Cursor48"));
+        assert_eq!(saved_state.analog_limit_kind.as_deref(), Some("Manual"));
+        assert_eq!(saved_state.signal_search_text.as_deref(), Some("temp"));
+        assert_eq!(
+            saved_state.selected_rows_removed_signal_id.as_deref(),
+            Some("temperature")
+        );
+        assert_eq!(saved_state.added_marker_label.as_deref(), Some("48 ns"));
+
+        let state_path = repo_path(&format!(
+            "target/tmp/novywave-ui-state-test-{}-{}.json",
+            std::process::id(),
+            current_unix_seconds()
+        ));
+        save_novywave_ui_state_to_path(&state_path, &saved_state)
+            .expect("NovyWave UI state should write to a JSON file");
+        let loaded_state = load_novywave_ui_state_from_path(&state_path)
+            .expect("NovyWave UI state JSON should read")
+            .expect("NovyWave UI state JSON should exist");
+        assert_eq!(loaded_state, saved_state);
+        let _ = std::fs::remove_file(&state_path);
+
+        let mut restored_runtime =
+            boon_runtime::LiveRuntime::from_project("novywave-ui-state-restore", &units)
+                .expect("fresh NovyWave runtime should initialize from manifest units");
+        for event in novywave_restore_events_for_ui_state(&loaded_state) {
+            restored_runtime
+                .apply_source_event_for_document(event)
+                .expect("persisted NovyWave UI restore event should apply");
+        }
+        let restored_summary = restored_runtime.document_state_summary();
+        for pointer in [
+            "/store/mode",
+            "/store/panel_layout",
+            "/store/panel_arrangement",
+            "/store/active_scope",
+            "/store/active_signal",
+            "/store/value_format",
+            "/store/row_size",
+            "/store/zoom_level",
+            "/store/pan_window",
+            "/store/cursor_position",
+            "/store/analog_limit_kind",
+            "/store/signal_search_text",
+            "/store/selected_rows_removed_signal_id",
+            "/store/markers/1/label",
+        ] {
+            assert_eq!(
+                restored_summary.pointer(pointer),
+                saved_summary.pointer(pointer),
+                "restored NovyWave state pointer {pointer} should match the saved Boon state"
+            );
+        }
+
+        let (_, restored_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&restored_summary),
+        )
+        .expect("restored NovyWave UI layout should lower");
+        assert!(
+            restored_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Stack")),
+            "restored docked arrangement should render Stack as the next panel-layout action"
+        );
+        assert!(
+            restored_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("48 ns")),
+            "restored marker state should render the added 48 ns marker"
+        );
+        assert!(
+            restored_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("1 result: temperature")),
+            "restored search text should render the filtered variable result"
+        );
+    }
+
     #[test]
     fn novywave_controls_lower_hover_material_and_pointer_contracts() {
         let source_path = repo_path("examples/novywave/RUN.bn");
@@ -38679,13 +40197,223 @@ mod tests {
             &units,
             Some(&initial_summary),
         )
-        .expect("NovyWave initial empty layout should lower");
+        .expect("NovyWave initial loaded layout should lower");
         assert!(
             initial_layout
                 .display_list
                 .iter()
-                .any(|item| item.text.as_deref() == Some("No waveform loaded")),
-            "NovyWave should boot into the reference empty state before the fixture is loaded"
+                .any(|item| item.text.as_deref() == Some("- counter.vcd")),
+            "NovyWave should boot into the loaded fixture view"
+        );
+        let fixtures_header =
+            physical_frame_text_item(&initial_layout, "Fixtures", "NovyWave file tree");
+        let scopes_header =
+            physical_frame_text_item(&initial_layout, "Scopes", "NovyWave file tree");
+        let counter_file =
+            physical_frame_text_item(&initial_layout, "- counter.vcd", "NovyWave file tree");
+        let counter_scope =
+            physical_frame_text_item(&initial_layout, "top.cpu 8 signals", "NovyWave file tree");
+        let cpu_signals = physical_frame_text_item(
+            &initial_layout,
+            "clk reset_n data_bus",
+            "NovyWave file tree",
+        );
+        assert!(
+            fixtures_header.bounds.y < counter_file.bounds.y
+                && counter_file.bounds.y < scopes_header.bounds.y,
+            "NovyWave file tree should group fixtures before scopes: fixtures={:?} counter={:?} scopes={:?}",
+            fixtures_header.bounds,
+            counter_file.bounds,
+            scopes_header.bounds
+        );
+        assert!(
+            counter_scope.bounds.x > counter_file.bounds.x + 12.0
+                && cpu_signals.bounds.x > counter_scope.bounds.x + 6.0,
+            "NovyWave file tree child rows should be visibly indented: file={:?} scope={:?} signals={:?}",
+            counter_file.bounds,
+            counter_scope.bounds,
+            cpu_signals.bounds
+        );
+        assert!(
+            initial_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("data_bus[7:0]")),
+            "NovyWave initial loaded view should expose waveform rows"
+        );
+        let initial_variables_title =
+            physical_frame_text_item(&initial_layout, "Variables", "NovyWave variables panel");
+        let initial_variables_x = initial_variables_title.bounds.x;
+        let initial_timeline_title =
+            physical_frame_text_item(&initial_layout, "Selected Variables", "NovyWave timeline");
+        let initial_timeline_x = initial_timeline_title.bounds.x;
+        let initial_timeline_y = initial_timeline_title.bounds.y;
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.panels_files_wider".to_owned(),
+                target_text: Some("Files+".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave Files+ panel resize source event should apply");
+        let files_wide_summary = runtime.document_state_summary();
+        assert_eq!(
+            files_wide_summary.pointer("/store/panel_layout"),
+            Some(&json!("FilesWide")),
+            "NovyWave Files+ should update Boon-owned panel layout state"
+        );
+        assert_eq!(
+            files_wide_summary.pointer("/store/files_panel_width"),
+            Some(&json!(520)),
+            "NovyWave Files+ should widen the files/scopes panel width"
+        );
+        let (_, files_wide_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&files_wide_summary),
+        )
+        .expect("NovyWave files-wide panel layout should lower");
+        let files_wide_variables_x =
+            physical_frame_text_item(&files_wide_layout, "Variables", "NovyWave variables panel")
+                .bounds
+                .x;
+        assert!(
+            files_wide_variables_x >= initial_variables_x + 80.0,
+            "Files+ should visibly move the Variables panel right: initial={initial_variables_x}, files_wide={files_wide_variables_x}"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.panels_variables_wider".to_owned(),
+                target_text: Some("Vars+".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave Vars+ panel resize source event should apply");
+        let vars_wide_summary = runtime.document_state_summary();
+        assert_eq!(
+            vars_wide_summary.pointer("/store/panel_layout"),
+            Some(&json!("VariablesWide")),
+            "NovyWave Vars+ should update Boon-owned panel layout state"
+        );
+        assert_eq!(
+            vars_wide_summary.pointer("/store/variables_panel_width"),
+            Some(&json!(570)),
+            "NovyWave Vars+ should widen the variables panel width"
+        );
+        let (_, vars_wide_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&vars_wide_summary),
+        )
+        .expect("NovyWave variables-wide panel layout should lower");
+        let vars_wide_variables_x =
+            physical_frame_text_item(&vars_wide_layout, "Variables", "NovyWave variables panel")
+                .bounds
+                .x;
+        assert!(
+            vars_wide_variables_x <= initial_variables_x - 80.0,
+            "Vars+ should visibly move the Variables panel left: initial={initial_variables_x}, vars_wide={vars_wide_variables_x}"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.panels_reset".to_owned(),
+                target_text: Some("Reset".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave panel reset source event should apply");
+        let reset_panel_summary = runtime.document_state_summary();
+        assert_eq!(
+            reset_panel_summary.pointer("/store/panel_layout"),
+            Some(&json!("Balanced")),
+            "NovyWave panel reset should restore balanced layout state"
+        );
+        let (_, reset_panel_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&reset_panel_summary),
+        )
+        .expect("NovyWave reset panel layout should lower");
+        let reset_variables_x =
+            physical_frame_text_item(&reset_panel_layout, "Variables", "NovyWave variables panel")
+                .bounds
+                .x;
+        assert!(
+            (reset_variables_x - initial_variables_x).abs() <= 1.0,
+            "Reset should restore initial Variables panel x: initial={initial_variables_x}, reset={reset_variables_x}"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.panels_toggle_arrangement".to_owned(),
+                target_text: Some("Dock".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave Dock panel arrangement source event should apply");
+        let docked_panel_summary = runtime.document_state_summary();
+        assert_eq!(
+            docked_panel_summary.pointer("/store/panel_arrangement"),
+            Some(&json!("Docked")),
+            "NovyWave Dock should switch to the docked panel arrangement"
+        );
+        assert_eq!(
+            docked_panel_summary.pointer("/store/panel_arrangement_button_label"),
+            Some(&json!("Stack")),
+            "NovyWave Dock should expose Stack as the next arrangement action"
+        );
+        let (_, docked_panel_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&docked_panel_summary),
+        )
+        .expect("NovyWave docked panel layout should lower");
+        let docked_variables_x = physical_frame_text_item(
+            &docked_panel_layout,
+            "Variables",
+            "NovyWave variables panel",
+        )
+        .bounds
+        .x;
+        let docked_timeline_title = physical_frame_text_item(
+            &docked_panel_layout,
+            "Selected Variables",
+            "NovyWave timeline",
+        );
+        assert!(
+            docked_variables_x <= initial_variables_x - 300.0,
+            "Dock should stack browser panels in the side column: initial_variables_x={initial_variables_x}, docked_variables_x={docked_variables_x}"
+        );
+        assert!(
+            docked_timeline_title.bounds.x >= initial_timeline_x + 430.0
+                && docked_timeline_title.bounds.y <= initial_timeline_y - 240.0,
+            "Dock should move the waveform beside the browser panels: initial=({initial_timeline_x},{initial_timeline_y}), docked={:?}",
+            docked_timeline_title.bounds
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.panels_toggle_arrangement".to_owned(),
+                target_text: Some("Stack".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave Stack panel arrangement source event should apply");
+        let stacked_panel_summary = runtime.document_state_summary();
+        assert_eq!(
+            stacked_panel_summary.pointer("/store/panel_arrangement"),
+            Some(&json!("Stacked")),
+            "NovyWave Stack should restore the stacked panel arrangement"
+        );
+        let (_, stacked_panel_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&stacked_panel_summary),
+        )
+        .expect("NovyWave restacked panel layout should lower");
+        let stacked_timeline_title = physical_frame_text_item(
+            &stacked_panel_layout,
+            "Selected Variables",
+            "NovyWave timeline",
+        );
+        assert!(
+            (stacked_timeline_title.bounds.x - initial_timeline_x).abs() <= 1.0
+                && (stacked_timeline_title.bounds.y - initial_timeline_y).abs() <= 1.0,
+            "Stack should restore initial waveform position: initial=({initial_timeline_x},{initial_timeline_y}), stacked={:?}",
+            stacked_timeline_title.bounds
         );
         runtime
             .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
@@ -38788,6 +40516,42 @@ mod tests {
             ],
             "NovyWave restore control should restore default selected_signals order"
         );
+        let remove_reset_output = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_remove_reset".to_owned(),
+                target_text: Some("rst".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave selected reset row remove source event should apply");
+        assert!(
+            remove_reset_output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.selected_rows_removed_signal_id")
+            }),
+            "NovyWave row remove control should update the Boon-owned removed signal id: {:?}",
+            remove_reset_output.semantic_deltas
+        );
+        let without_reset_summary = runtime.document_state_summary();
+        assert_eq!(
+            selected_ids(&without_reset_summary),
+            vec![
+                "clk",
+                "data_bus",
+                "data_valid",
+                "data_ready",
+                "state",
+                "error_count",
+                "temperature"
+            ],
+            "NovyWave row remove control should remove only reset_n from actual selected_signals"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.selected_restore_data".to_owned(),
+                target_text: Some("[Restore]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave restore should apply after row remove");
         let data_up_output = runtime
             .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                 source: "store.elements.selected_data_up".to_owned(),
@@ -38861,6 +40625,82 @@ mod tests {
             Some(&search_state_summary),
         )
         .expect("NovyWave layout should lower from live document state");
+        physical_frame_text_item(&layout, "Formatter", "NovyWave formatter dropdown");
+        source_hit_center(&layout_proof, "store.elements.format_dropdown_toggle")
+            .expect("NovyWave formatter dropdown should expose an open/close source");
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.format_dropdown_toggle".to_owned(),
+                target_text: Some("Formatter".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave formatter dropdown toggle should apply");
+        let open_format_summary = runtime.document_state_summary();
+        assert_eq!(
+            open_format_summary.pointer("/store/format_dropdown_state"),
+            Some(&json!("Open")),
+            "NovyWave formatter dropdown should be open after toggle"
+        );
+        let (open_format_proof, open_format_layout) =
+            native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&open_format_summary),
+            )
+            .expect("NovyWave open formatter dropdown layout should lower");
+        for option in ["Binary", "Grouped bin", "Octal", "Signed"] {
+            physical_frame_text_item(
+                &open_format_layout,
+                option,
+                "NovyWave formatter dropdown option",
+            );
+        }
+        source_hit_center(&open_format_proof, "store.elements.format_binary")
+            .expect("NovyWave formatter dropdown Binary option should expose a source");
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.format_binary".to_owned(),
+                target_text: Some("Binary".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave formatter dropdown Binary option should apply");
+        let binary_format_summary = runtime.document_state_summary();
+        assert_eq!(
+            binary_format_summary.pointer("/store/value_format"),
+            Some(&json!("Binary")),
+            "NovyWave formatter dropdown should set a specific format, not cycle"
+        );
+        assert_eq!(
+            binary_format_summary.pointer("/store/format_label"),
+            Some(&json!("Binary"))
+        );
+        assert_eq!(
+            binary_format_summary.pointer("/store/data_bus_rendered_value"),
+            Some(&json!("00101010"))
+        );
+        assert_eq!(
+            binary_format_summary.pointer("/store/format_dropdown_state"),
+            Some(&json!("Closed")),
+            "NovyWave formatter dropdown should close after an option is selected"
+        );
+        let (_, binary_format_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&binary_format_summary),
+        )
+        .expect("NovyWave closed Binary formatter layout should lower");
+        physical_frame_text_item(
+            &binary_format_layout,
+            "Binary",
+            "NovyWave selected formatter dropdown value",
+        );
+        assert!(
+            !binary_format_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Grouped bin")),
+            "NovyWave formatter option menu should not remain visible after choosing Binary"
+        );
         for selected_value in ["0x2a", "42.8 C"] {
             assert!(
                 layout
@@ -38893,6 +40733,92 @@ mod tests {
                 "NovyWave temperature row should lower analog trace color `{analog_color}`; paints={waveform_paints:?}"
             );
         }
+        let analog_trace_heights = |layout: &boon_document::LayoutFrame| -> Vec<f32> {
+            let row_text = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    item.text.as_deref() == Some("temperature")
+                        && item.bounds.x < 180.0
+                        && item.bounds.y > 450.0
+                })
+                .unwrap_or_else(|| panic!("missing selected analog waveform row label"));
+            let row_center_y = row_text.bounds.y + row_text.bounds.height * 0.5;
+            layout
+                .display_list
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        display_item_paint_color(item),
+                        Some("#1D4ED8" | "#0891B2" | "#7DD3FC")
+                    ) && item.bounds.x > 250.0
+                        && item.bounds.y > 450.0
+                        && ((item.bounds.y + item.bounds.height * 0.5) - row_center_y).abs() <= 24.0
+                })
+                .map(|item| item.bounds.height)
+                .collect()
+        };
+        let max_height = |heights: &[f32]| {
+            heights
+                .iter()
+                .copied()
+                .fold(0.0_f32, |max, height| max.max(height))
+        };
+        let normal_analog_heights = analog_trace_heights(&layout);
+        assert!(
+            normal_analog_heights.len() >= 3,
+            "NovyWave normal temperature row should render analog low/mid/high trace bands: {normal_analog_heights:?}"
+        );
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.row_taller".to_owned(),
+                target_text: Some("Tall".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave row taller source event should apply");
+        let tall_row_summary = runtime.document_state_summary();
+        assert_eq!(
+            tall_row_summary.pointer("/store/row_height"),
+            Some(&json!("44")),
+            "NovyWave row taller should update Boon-owned row height"
+        );
+        let (_, tall_row_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&tall_row_summary),
+        )
+        .expect("NovyWave tall analog waveform layout should lower");
+        let tall_analog_heights = analog_trace_heights(&tall_row_layout);
+        assert!(
+            max_height(&tall_analog_heights) >= max_height(&normal_analog_heights) + 5.0,
+            "NovyWave tall row should enlarge analog trace bands: normal={normal_analog_heights:?} tall={tall_analog_heights:?}"
+        );
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.row_shorter".to_owned(),
+                target_text: Some("Short".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave row shorter source event should apply");
+        let compact_row_summary = runtime.document_state_summary();
+        assert_eq!(
+            compact_row_summary.pointer("/store/row_height"),
+            Some(&json!("22")),
+            "NovyWave row shorter should update Boon-owned compact row height"
+        );
+        let (_, compact_row_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&compact_row_summary),
+        )
+        .expect("NovyWave compact analog waveform layout should lower");
+        let compact_analog_heights = analog_trace_heights(&compact_row_layout);
+        assert!(
+            max_height(&compact_analog_heights) + 4.0 <= max_height(&normal_analog_heights),
+            "NovyWave compact row should shrink analog trace bands: normal={normal_analog_heights:?} compact={compact_analog_heights:?}"
+        );
 
         for label in ["Probe", "Light", "Fmt"] {
             let context = format!("NovyWave control `{label}`");
@@ -39198,6 +41124,416 @@ mod tests {
     }
 
     #[test]
+    fn novywave_search_and_waveform_keyboard_work_from_real_preview_input() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let source =
+            boon_runtime::source_text_for_path(&source_path).expect("NovyWave source should load");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_project("novywave-real-input", &units)
+                .expect("NovyWave runtime should initialize"),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) =
+            native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&state_summary),
+            )
+            .expect("NovyWave initial layout should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let load_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (load_x, load_y, _) =
+            source_hit_center(&load_layout, "store.elements.open_load_files_dialog")
+                .expect("NovyWave Load button should expose the Load files dialog source");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, load_x, load_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking NovyWave Load should open the Load files dialog");
+        let load_dialog_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            load_dialog_summary.pointer("/store/load_files_dialog"),
+            Some(&json!("Open"))
+        );
+        assert_eq!(
+            load_dialog_summary.pointer("/store/load_files_dialog_title"),
+            Some(&json!("Load files"))
+        );
+        {
+            let shared = shared_render_state.lock().unwrap();
+            let frame = shared
+                .layout_frame_override
+                .as_ref()
+                .expect("Load files click should refresh the preview layout frame");
+            physical_frame_text_item(frame, "Load files", "NovyWave Load files dialog");
+            physical_frame_text_item(
+                frame,
+                "counter.vcd, simple_test.ghw, uart_compare.fst",
+                "NovyWave Load files dialog",
+            );
+        }
+        let dialog_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (cancel_x, cancel_y, _) =
+            source_hit_center(&dialog_layout, "store.elements.close_load_files_dialog")
+                .expect("NovyWave Load files dialog should expose a Cancel source");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, cancel_x, cancel_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking Cancel should close the Load files dialog");
+        let closed_dialog_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            closed_dialog_summary.pointer("/store/load_files_dialog"),
+            Some(&json!("Closed"))
+        );
+        let remove_reset_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (remove_reset_x, remove_reset_y, _) =
+            source_hit_center(&remove_reset_layout, "store.elements.selected_remove_reset")
+                .expect("NovyWave selected reset row should expose an individual remove source");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(20, remove_reset_x, remove_reset_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the selected reset row remove button should dispatch a Boon source");
+        let reset_removed_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            reset_removed_summary.pointer("/store/selected_rows_count"),
+            Some(&json!(7)),
+            "individual row remove should update selected row count through Boon state"
+        );
+        assert_eq!(
+            reset_removed_summary.pointer("/store/selected_rows_order_label"),
+            Some(&json!(
+                "clk, data_bus[7:0], data_valid, data_ready, state[2:0], error_count[15:0], temperature"
+            )),
+            "individual row remove should remove reset_n only"
+        );
+        let restore_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (restore_x, restore_y, _) =
+            source_hit_center(&restore_layout, "store.elements.selected_restore_data")
+                .expect("NovyWave restore control should remain hittable after row remove");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(21, restore_x, restore_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking restore after row remove should dispatch a Boon source");
+        let reset_restored_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            reset_restored_summary.pointer("/store/selected_rows_count"),
+            Some(&json!(8)),
+            "restore should bring the individually removed row back"
+        );
+        input_state = PreviewNativeInputState::default();
+
+        let search_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (search_x, search_y, _) =
+            source_hit_center(&search_layout, "store.elements.signal_search_input")
+                .expect("NovyWave search input should expose a change hit region");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(2, search_x, search_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the NovyWave search input should focus it");
+        assert_eq!(
+            input_state.focused_change_source.as_deref(),
+            Some("store.elements.signal_search_input"),
+            "search input should receive native text focus through its stable change source"
+        );
+        let typed_search = test_keyboard_input(
+            vec![test_key_press(3, "t"), test_key_press(4, "x")],
+            Vec::new(),
+        );
+        preview_apply_real_window_input(
+            &typed_search,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("typing into NovyWave search should dispatch change events");
+        let search_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            search_summary.pointer("/store/signal_search_text"),
+            Some(&json!("tx"))
+        );
+        assert_eq!(
+            search_summary.pointer("/store/search_result_label"),
+            Some(&json!("1 result: tx_data[7:0]"))
+        );
+
+        let waveform_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (wave_x, wave_y, wave_node) = source_hit_center_for_target(
+            &waveform_layout,
+            "store.elements.waveform_click",
+            Some("48 ns"),
+        )
+        .expect("NovyWave waveform cells should expose a 48 ns click target");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(5, wave_x, wave_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the waveform should dispatch cursor selection and keep key focus");
+        assert_eq!(
+            input_state.focused_node.as_deref().and_then(|node| {
+                preview_key_down_source_for_node(
+                    &shared_render_state.lock().unwrap().layout_proof,
+                    node,
+                )
+            }),
+            Some("store.elements.keyboard_capture".to_owned()),
+            "waveform click should keep keyboard focus on a clicked waveform key target near {wave_node}"
+        );
+        let clicked_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            clicked_summary.pointer("/store/keyboard_cursor_label"),
+            Some(&json!("48 ns")),
+            "waveform click should move the visible cursor selector"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/marker_visibility"),
+            Some(&json!("Visible")),
+            "waveform click should make the marker row visible"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/marker_to_add"),
+            Some(&json!("48 ns")),
+            "waveform click should use the clicked bucket as the marker insertion time"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/marker_label"),
+            Some(&json!("M 48 ns")),
+            "waveform click should update the active marker chip label"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/marker_count_label"),
+            Some(&json!("2 markers")),
+            "waveform click should append a marker rather than only moving the cursor"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/markers/0/label"),
+            Some(&json!("42 ns")),
+            "NovyWave should keep the default marker as an actual marker list row"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/markers/1/label"),
+            Some(&json!("48 ns")),
+            "waveform click should append the clicked 48 ns marker to store.markers"
+        );
+        assert_eq!(
+            clicked_summary.pointer("/store/marker_focus_label"),
+            Some(&json!("added marker at 48 ns")),
+            "waveform click should announce the inserted marker"
+        );
+        {
+            let clicked_frame = latest_preview_frame(&shared_render_state);
+            physical_frame_text_item(
+                &clicked_frame,
+                "M 48 ns",
+                "NovyWave waveform click should render the inserted 48 ns marker",
+            );
+        }
+
+        let cursor36_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (cursor36_x, cursor36_y, _) = source_hit_center_for_target(
+            &cursor36_layout,
+            "store.elements.waveform_click",
+            Some("36 ns"),
+        )
+        .expect("NovyWave waveform cells should expose a distinct 36 ns click target");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(6, cursor36_x, cursor36_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking a different waveform segment should select its cursor bucket");
+        let cursor36_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            cursor36_summary.pointer("/store/keyboard_cursor_label"),
+            Some(&json!("36 ns")),
+            "waveform click target should come from the clicked segment"
+        );
+        assert_eq!(
+            cursor36_summary.pointer("/store/marker_to_add"),
+            Some(&json!("36 ns")),
+            "second waveform click should insert a marker at the second clicked bucket"
+        );
+        assert_eq!(
+            cursor36_summary.pointer("/store/marker_label"),
+            Some(&json!("M 36 ns")),
+            "second waveform click should update the active marker label"
+        );
+        assert_eq!(
+            cursor36_summary.pointer("/store/marker_count_label"),
+            Some(&json!("3 markers")),
+            "waveform marker creation should keep the marker summary populated"
+        );
+        assert_eq!(
+            cursor36_summary.pointer("/store/markers/2/label"),
+            Some(&json!("36 ns")),
+            "second waveform click should append the clicked 36 ns marker to store.markers"
+        );
+        assert_eq!(
+            cursor36_summary.pointer("/store/marker_focus_label"),
+            Some(&json!("added marker at 36 ns")),
+            "second waveform click should announce the new marker"
+        );
+        {
+            let cursor36_frame = latest_preview_frame(&shared_render_state);
+            physical_frame_text_item(
+                &cursor36_frame,
+                "M 36 ns",
+                "NovyWave waveform click should render the inserted 36 ns marker",
+            );
+        }
+        let initial_waveform_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let initial_released_width =
+            max_source_hit_width(&initial_waveform_layout, "store.elements.waveform_click");
+
+        let zoom_key = test_keyboard_input(vec![test_key_press(7, "W")], vec!["W"]);
+        preview_apply_real_window_input(
+            &zoom_key,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("focused waveform should accept keyboard controls");
+        let keyboard_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            keyboard_summary.pointer("/store/zoom_level"),
+            Some(&json!("Close"))
+        );
+        assert_eq!(
+            keyboard_summary.pointer("/store/keyboard_viewport_label"),
+            Some(&json!("36 ns - 60 ns"))
+        );
+        assert_eq!(
+            keyboard_summary.pointer("/store/keyboard_cursor_label"),
+            Some(&json!("36 ns"))
+        );
+        let zoomed_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let zoomed_released_width =
+            max_source_hit_width(&zoomed_layout, "store.elements.waveform_click");
+        assert!(
+            zoomed_released_width > initial_released_width * 1.5,
+            "zoom-in should visibly expand waveform segment width: initial={initial_released_width}, zoomed={zoomed_released_width}"
+        );
+
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(1));
+        let repeat_key = test_keyboard_input(Vec::new(), vec!["W"]);
+        preview_apply_real_window_input(
+            &repeat_key,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("held waveform key should repeat through key_down");
+        assert!(
+            input_state.held_repeat_key.as_deref() == Some("W"),
+            "waveform key focus should keep repeat state while W is still held"
+        );
+
+        let zoom_out_key = test_keyboard_input(vec![test_key_press(8, "S")], vec!["S"]);
+        preview_apply_real_window_input(
+            &zoom_out_key,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("focused waveform should accept keyboard zoom-out");
+        let zoom_out_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            zoom_out_summary.pointer("/store/zoom_level"),
+            Some(&json!("Wide"))
+        );
+        assert_eq!(
+            zoom_out_summary.pointer("/store/keyboard_viewport_label"),
+            Some(&json!("0 ns - 240 ns"))
+        );
+        let zoomed_out_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let zoomed_out_released_width =
+            max_source_hit_width(&zoomed_out_layout, "store.elements.waveform_click");
+        assert!(
+            zoomed_out_released_width < initial_released_width * 0.75,
+            "zoom-out should visibly shrink waveform segment width: initial={initial_released_width}, zoomed_out={zoomed_out_released_width}"
+        );
+
+        let reset_key = test_keyboard_input(vec![test_key_press(9, "R")], vec!["R"]);
+        preview_apply_real_window_input(
+            &reset_key,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("focused waveform should accept keyboard reset");
+        let reset_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            reset_summary.pointer("/store/zoom_level"),
+            Some(&json!("Fit"))
+        );
+        assert_eq!(
+            reset_summary.pointer("/store/keyboard_viewport_label"),
+            Some(&json!("0 ns - 120 ns"))
+        );
+        let reset_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let reset_released_width =
+            max_source_hit_width(&reset_layout, "store.elements.waveform_click");
+        assert!(
+            (reset_released_width - initial_released_width).abs() <= 1.0,
+            "reset should restore initial waveform segment width: initial={initial_released_width}, reset={reset_released_width}"
+        );
+    }
+
+    #[test]
     fn novywave_dark_light_material_readbacks_cover_visual_regions() {
         futures::executor::block_on(async {
             let instance =
@@ -39229,83 +41565,384 @@ mod tests {
                 .expect("test WGPU device should be available when adapter exists");
 
             let source_path = repo_path("examples/novywave/RUN.bn");
+            let source = boon_runtime::source_text_for_path(&source_path)
+                .expect("NovyWave source should load");
             let units = boon_runtime::source_units_for_path(&source_path)
                 .expect("NovyWave manifest source units should load");
-            let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-visual", &units)
-                .expect("NovyWave runtime should initialize from manifest units");
-            let empty_state = runtime.document_state_summary();
+            let live_runtime = Arc::new(Mutex::new(
+                boon_runtime::LiveRuntime::from_project("novywave-visual", &units)
+                    .expect("NovyWave runtime should initialize from manifest units"),
+            ));
+            let initial_loaded_state = live_runtime.lock().unwrap().document_state_summary();
+            let (dark_proof, dark_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&initial_loaded_state),
+                )
+                .expect("NovyWave initial loaded layout should lower");
+            let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+                layout_proof: dark_proof.clone(),
+                layout_frame_override: Some(dark_layout.clone()),
+                update_count: 0,
+                scroll_x_px: 0.0,
+                scroll_y_px: 0.0,
+                last_error: None,
+                last_error_count: 0,
+                status_overlay: None,
+                last_dirty_reason: None,
+            }));
+            let mut input_state = PreviewNativeInputState::default();
+            let dark_render = render_physical_todomvc_frame_artifact(
+                &device,
+                &queue,
+                &dark_layout,
+                "novywave-initial-loaded-dark-material-regions",
+            );
+            let dark_image = dark_render.image.clone();
+            physical_frame_text_item(
+                &dark_layout,
+                "- counter.vcd",
+                "NovyWave initial loaded state",
+            );
+            physical_frame_text_item(
+                &dark_layout,
+                "data_bus[7:0]",
+                "NovyWave initial loaded state",
+            );
+            physical_frame_text_item(&dark_layout, "42 ns", "NovyWave initial loaded state");
+            let initial_released_width =
+                max_source_hit_width(&dark_proof, "store.elements.waveform_click") as f32;
+            let initial_waveform_canvas = dark_layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(
+                        display_item_paint_color(item),
+                        Some("#020817" | "#020817e6")
+                    ) && item.bounds.width > 300.0
+                        && item.bounds.height >= 20.0
+                })
+                .expect("NovyWave fit waveform canvas should be visible")
+                .bounds;
+
+            let load_dialog_state = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.open_load_files_dialog",
+                7,
+                "NovyWave Load button",
+            );
+            assert_eq!(
+                load_dialog_state.pointer("/store/load_files_dialog"),
+                Some(&json!("Open"))
+            );
+            let (_, load_dialog_layout) = native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&load_dialog_state),
+            )
+            .expect("NovyWave Load files dialog layout should lower");
+            let load_dialog_render = render_physical_todomvc_frame_artifact(
+                &device,
+                &queue,
+                &load_dialog_layout,
+                "novywave-load-files-dialog-material-region",
+            );
+            let load_dialog_image = load_dialog_render.image.clone();
+            let load_dialog_title = physical_frame_text_item(
+                &load_dialog_layout,
+                "Load files",
+                "NovyWave Load files dialog",
+            );
+            let load_dialog_selection = physical_frame_text_item(
+                &load_dialog_layout,
+                "counter.vcd, simple_test.ghw, uart_compare.fst",
+                "NovyWave Load files dialog",
+            );
+            let load_dialog_title_luma = assert_rendered_text_region_has_luma_contrast(
+                &load_dialog_image,
+                load_dialog_title.bounds,
+                16.0,
+                "NovyWave Load files dialog title readability",
+            );
+            let load_dialog_selection_luma = assert_rendered_text_region_has_luma_contrast(
+                &load_dialog_image,
+                load_dialog_selection.bounds,
+                12.0,
+                "NovyWave Load files dialog selection readability",
+            );
+            let load_dialog_metadata = visual_image_artifact_metadata(
+                "boon_load_files_dialog",
+                &load_dialog_render,
+                "Load files dialog readback",
+            );
+            let close_dialog_state = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.close_load_files_dialog",
+                8,
+                "NovyWave Load files Cancel button",
+            );
+            assert_eq!(
+                close_dialog_state.pointer("/store/load_files_dialog"),
+                Some(&json!("Closed"))
+            );
+
+            let zoom_in_state = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.zoom_in",
+                10,
+                "NovyWave zoom-in button",
+            );
+            assert_eq!(
+                zoom_in_state.pointer("/store/zoom_level"),
+                Some(&json!("Close"))
+            );
+            assert_eq!(
+                zoom_in_state.pointer("/store/keyboard_viewport_label"),
+                Some(&json!("36 ns - 60 ns"))
+            );
+            let (zoom_in_proof, zoom_in_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&zoom_in_state),
+                )
+                .expect("NovyWave zoom-in layout should lower");
+            let zoom_in_released_width =
+                max_source_hit_width(&zoom_in_proof, "store.elements.waveform_click") as f32;
+            assert!(
+                zoom_in_released_width > initial_released_width * 1.5,
+                "NovyWave zoom-in should expand rendered waveform segment width: fit={initial_released_width}, zoom_in={zoom_in_released_width}"
+            );
+            let zoom_in_render = render_physical_todomvc_frame_artifact(
+                &device,
+                &queue,
+                &zoom_in_layout,
+                "novywave-zoom-in-material-regions",
+            );
+            let zoom_in_image = zoom_in_render.image.clone();
+            let zoom_in_diff =
+                image_abs_diff_sum(&dark_image, &zoom_in_image, initial_waveform_canvas);
+            assert!(
+                zoom_in_diff >= 10_000,
+                "NovyWave zoom-in should visibly change waveform pixels: diff={zoom_in_diff}"
+            );
+
+            let zoom_out_state = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.zoom_out",
+                11,
+                "NovyWave zoom-out button",
+            );
+            assert_eq!(
+                zoom_out_state.pointer("/store/zoom_level"),
+                Some(&json!("Wide"))
+            );
+            assert_eq!(
+                zoom_out_state.pointer("/store/keyboard_viewport_label"),
+                Some(&json!("0 ns - 240 ns"))
+            );
+            let (zoom_out_proof, zoom_out_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&zoom_out_state),
+                )
+                .expect("NovyWave zoom-out layout should lower");
+            let zoom_out_released_width =
+                max_source_hit_width(&zoom_out_proof, "store.elements.waveform_click") as f32;
+            assert!(
+                zoom_out_released_width < initial_released_width * 0.75,
+                "NovyWave zoom-out should shrink rendered waveform segment width: fit={initial_released_width}, zoom_out={zoom_out_released_width}"
+            );
+            let zoom_out_render = render_physical_todomvc_frame_artifact(
+                &device,
+                &queue,
+                &zoom_out_layout,
+                "novywave-zoom-out-material-regions",
+            );
+            let zoom_out_image = zoom_out_render.image.clone();
+            let zoom_out_diff =
+                image_abs_diff_sum(&dark_image, &zoom_out_image, initial_waveform_canvas);
+            assert!(
+                zoom_out_diff >= 10_000,
+                "NovyWave zoom-out should visibly change waveform pixels: diff={zoom_out_diff}"
+            );
+
+            let zoom_reset_state = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.zoom_reset",
+                12,
+                "NovyWave zoom-reset button",
+            );
+            assert_eq!(
+                zoom_reset_state.pointer("/store/zoom_level"),
+                Some(&json!("Fit"))
+            );
+            assert_eq!(
+                zoom_reset_state.pointer("/store/keyboard_viewport_label"),
+                Some(&json!("0 ns - 120 ns"))
+            );
+            let (zoom_reset_proof, zoom_reset_layout) =
+                native_document_layout_proof_with_project_state_embedded(
+                    &source_path,
+                    &units,
+                    Some(&zoom_reset_state),
+                )
+                .expect("NovyWave zoom-reset layout should lower");
+            let reset_released_width =
+                max_source_hit_width(&zoom_reset_proof, "store.elements.waveform_click") as f32;
+            assert!(
+                (reset_released_width - initial_released_width).abs() <= 1.0,
+                "NovyWave zoom reset should restore fit waveform segment width: fit={initial_released_width}, reset={reset_released_width}"
+            );
+            let zoom_reset_render = render_physical_todomvc_frame_artifact(
+                &device,
+                &queue,
+                &zoom_reset_layout,
+                "novywave-zoom-reset-material-regions",
+            );
+            let zoom_reset_image = zoom_reset_render.image.clone();
+            let reset_diff =
+                image_abs_diff_sum(&dark_image, &zoom_reset_image, initial_waveform_canvas);
+            assert!(
+                reset_diff <= 1_000,
+                "NovyWave zoom reset should visually return near the initial waveform pixels: diff={reset_diff}"
+            );
+            let zoom_visual_metrics = vec![
+                json!({
+                    "metric": "waveform_zoom_width",
+                    "mode": "fit",
+                    "label": "released",
+                    "width": initial_released_width
+                }),
+                json!({
+                    "metric": "waveform_zoom_width",
+                    "mode": "zoom_in",
+                    "label": "released",
+                    "width": zoom_in_released_width
+                }),
+                json!({
+                    "metric": "waveform_zoom_width",
+                    "mode": "zoom_out",
+                    "label": "released",
+                    "width": zoom_out_released_width
+                }),
+                json!({
+                    "metric": "waveform_zoom_width",
+                    "mode": "reset",
+                    "label": "released",
+                    "width": reset_released_width
+                }),
+                json!({
+                    "metric": "waveform_zoom_pixel_diff",
+                    "mode": "zoom_in",
+                    "diff": zoom_in_diff,
+                    "min_diff": 10000,
+                    "bounds": rect_metric_json(initial_waveform_canvas)
+                }),
+                json!({
+                    "metric": "waveform_zoom_pixel_diff",
+                    "mode": "zoom_out",
+                    "diff": zoom_out_diff,
+                    "min_diff": 10000,
+                    "bounds": rect_metric_json(initial_waveform_canvas)
+                }),
+                json!({
+                    "metric": "waveform_zoom_pixel_diff",
+                    "mode": "reset",
+                    "diff": reset_diff,
+                    "max_diff": 1000,
+                    "bounds": rect_metric_json(initial_waveform_canvas)
+                }),
+            ];
+
+            live_runtime
+                .lock()
+                .unwrap()
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.show_empty".to_owned(),
+                    target_text: Some("Empty".to_owned()),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave empty source event should apply before empty readbacks");
+            let empty_state = live_runtime.lock().unwrap().document_state_summary();
             let (_, empty_layout) = native_document_layout_proof_with_project_state_embedded(
                 &source_path,
                 &units,
                 Some(&empty_state),
             )
             .expect("NovyWave empty layout should lower");
-            let empty_image = render_physical_todomvc_frame_image(
+            let empty_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &empty_layout,
                 "novywave-empty-reference-comparison",
             );
+            let empty_image = empty_render.image.clone();
             physical_frame_text_item(&empty_layout, "No waveform loaded", "NovyWave empty state");
-            runtime
+            live_runtime
+                .lock()
+                .unwrap()
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.mode_to_light".to_owned(),
                     ..boon_runtime::LiveSourceEvent::default()
                 })
                 .expect("NovyWave light empty-mode source event should apply");
-            let empty_light_state = runtime.document_state_summary();
+            let empty_light_state = live_runtime.lock().unwrap().document_state_summary();
             let (_, empty_light_layout) = native_document_layout_proof_with_project_state_embedded(
                 &source_path,
                 &units,
                 Some(&empty_light_state),
             )
             .expect("NovyWave empty light layout should lower");
-            let empty_light_image = render_physical_todomvc_frame_image(
+            let empty_light_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &empty_light_layout,
                 "novywave-empty-light-reference-comparison",
             );
+            let empty_light_image = empty_light_render.image.clone();
             physical_frame_text_item(
                 &empty_light_layout,
                 "No waveform loaded",
                 "NovyWave light empty state",
             );
-            runtime
-                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
-                    source: "store.elements.mode_to_dark".to_owned(),
-                    ..boon_runtime::LiveSourceEvent::default()
-                })
-                .expect("NovyWave dark-mode source event should restore before loaded readbacks");
-            runtime
+            live_runtime
+                .lock()
+                .unwrap()
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.load_fixture".to_owned(),
                     target_text: Some("Load fixture".to_owned()),
                     ..boon_runtime::LiveSourceEvent::default()
                 })
-                .expect("NovyWave load fixture source event should apply before visual readbacks");
-            let dark_state = runtime.document_state_summary();
-            let (dark_proof, dark_layout) =
-                native_document_layout_proof_with_project_state_embedded(
-                    &source_path,
-                    &units,
-                    Some(&dark_state),
-                )
-                .expect("NovyWave dark layout should lower");
-            let dark_image = render_physical_todomvc_frame_image(
-                &device,
-                &queue,
-                &dark_layout,
-                "novywave-dark-material-regions",
-            );
-
-            runtime
-                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
-                    source: "store.elements.mode_to_light".to_owned(),
-                    ..boon_runtime::LiveSourceEvent::default()
-                })
-                .expect("NovyWave light-mode source event should apply");
-            let light_state = runtime.document_state_summary();
+                .expect("NovyWave load fixture source event should restore loaded light readbacks");
+            let light_state = live_runtime.lock().unwrap().document_state_summary();
             let (light_proof, light_layout) =
                 native_document_layout_proof_with_project_state_embedded(
                     &source_path,
@@ -39313,12 +41950,13 @@ mod tests {
                     Some(&light_state),
                 )
                 .expect("NovyWave light layout should lower");
-            let light_image = render_physical_todomvc_frame_image(
+            let light_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &light_layout,
                 "novywave-light-material-regions",
             );
+            let light_image = light_render.image.clone();
             let reference_paths = [
                 (
                     "figma_dark_1440",
@@ -39428,17 +42066,64 @@ mod tests {
                 "Boon light lower waveform should preserve the reference dark data region; reference={light_reference_lower_waveform:.2}, rendered={boon_light_lower_waveform:.2}"
             );
             let boon_empty_metadata =
-                visual_image_metadata("boon_empty", &empty_image, "empty readback");
-            let boon_empty_light_metadata = visual_image_metadata(
+                visual_image_artifact_metadata("boon_empty", &empty_render, "empty readback");
+            let boon_empty_light_metadata = visual_image_artifact_metadata(
                 "boon_empty_light",
-                &empty_light_image,
+                &empty_light_render,
                 "empty light readback",
             );
             let boon_dark_metadata =
-                visual_image_metadata("boon_dark", &dark_image, "loaded dark readback");
-            let boon_light_metadata =
-                visual_image_metadata("boon_light", &light_image, "loaded light readback");
+                visual_image_artifact_metadata("boon_dark", &dark_render, "loaded dark readback");
+            let boon_light_metadata = visual_image_artifact_metadata(
+                "boon_light",
+                &light_render,
+                "loaded light readback",
+            );
+            let boon_zoom_in_metadata =
+                visual_image_artifact_metadata("boon_zoom_in", &zoom_in_render, "zoom-in readback");
+            let boon_zoom_out_metadata = visual_image_artifact_metadata(
+                "boon_zoom_out",
+                &zoom_out_render,
+                "zoom-out readback",
+            );
+            let boon_zoom_reset_metadata = visual_image_artifact_metadata(
+                "boon_zoom_reset",
+                &zoom_reset_render,
+                "zoom-reset readback",
+            );
+            let mut visual_artifacts = vec![
+                boon_empty_metadata.clone(),
+                boon_empty_light_metadata.clone(),
+                boon_dark_metadata.clone(),
+                boon_light_metadata.clone(),
+                load_dialog_metadata.clone(),
+                boon_zoom_in_metadata.clone(),
+                boon_zoom_out_metadata.clone(),
+                boon_zoom_reset_metadata.clone(),
+            ];
+            let fixture_artifacts = novywave_fixture_artifact_metadata();
             let mut visual_contract_metrics = Vec::new();
+            visual_contract_metrics.extend([
+                json!({
+                    "metric": "text_luma_range",
+                    "mode": "load_files_dialog",
+                    "label": "Load files",
+                    "luma_range": load_dialog_title_luma,
+                    "min_luma_range": 16.0,
+                    "bounds": rect_metric_json(load_dialog_title.bounds),
+                    "artifact": load_dialog_metadata.clone()
+                }),
+                json!({
+                    "metric": "text_luma_range",
+                    "mode": "load_files_dialog",
+                    "label": "counter.vcd, simple_test.ghw, uart_compare.fst",
+                    "luma_range": load_dialog_selection_luma,
+                    "min_luma_range": 12.0,
+                    "bounds": rect_metric_json(load_dialog_selection.bounds),
+                    "artifact": load_dialog_metadata.clone()
+                }),
+            ]);
+            visual_contract_metrics.extend(zoom_visual_metrics.clone());
             {
                 let mut record_text_metric =
                     |mode_label: &str,
@@ -39480,68 +42165,22 @@ mod tests {
                     record_text_metric("loaded_dark", &dark_layout, &dark_image, label, 14.0);
                     record_text_metric("loaded_light", &light_layout, &light_image, label, 14.0);
                 }
+                for label in [
+                    "Fmt",
+                    "Formatter",
+                    "Hex",
+                    "[NewGrp]",
+                    "[Rm data]",
+                    "[Restore]",
+                    "[Down]",
+                    "[Jump]",
+                ] {
+                    record_text_metric("loaded_dark", &dark_layout, &dark_image, label, 12.0);
+                    record_text_metric("loaded_light", &light_layout, &light_image, label, 12.0);
+                }
             }
-            let comparison_report = json!({
-                "status": "pass",
-                "reference_source": "decoded NovyWave screenshots only; no Rust/Tauri code imported",
-                "source_path": source_path.display().to_string(),
-                "source_units_hash": boon_runtime::source_units_hash(&units),
-                "source_unit_count": units.len(),
-                "source_unit_paths": units
-                    .iter()
-                    .map(|unit| unit.path.clone())
-                    .collect::<Vec<_>>(),
-                "generated_at_unix_ms": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system time should be after Unix epoch")
-                    .as_millis(),
-                "reference_images": reference_images,
-                "boon_readbacks": [
-                    boon_empty_metadata,
-                    boon_empty_light_metadata,
-                    boon_dark_metadata,
-                    boon_light_metadata
-                ],
-                "normalized_region_profiles": {
-                    "reference_dark": normalized_luma_profile_json(&dark_reference_profile),
-                    "reference_light": normalized_luma_profile_json(&light_reference_profile),
-                    "reference_empty_dark": normalized_luma_profile_json(&empty_dark_reference_profile),
-                    "reference_empty_light": normalized_luma_profile_json(&empty_light_reference_profile),
-                    "boon_empty": normalized_luma_profile_json(&boon_empty_profile),
-                    "boon_empty_light": normalized_luma_profile_json(&boon_empty_light_profile),
-                    "boon_dark": normalized_luma_profile_json(&boon_dark_profile),
-                    "boon_light": normalized_luma_profile_json(&boon_light_profile)
-                },
-                "normalized_region_luma_distance": {
-                    "loaded_dark_vs_reference_dark": dark_profile_distance,
-                    "loaded_light_vs_reference_light": light_profile_distance,
-                    "empty_vs_reference_empty_dark": empty_profile_distance,
-                    "empty_light_vs_reference_empty_light": empty_light_profile_distance,
-                    "loaded_light_timeline_delta": boon_light_timeline - light_reference_timeline,
-                    "loaded_light_lower_waveform_delta": boon_light_lower_waveform - light_reference_lower_waveform
-                },
-                "structural_checks": {
-                    "empty_state_text_visible": true,
-                    "loaded_dark_has_timeline_glass": true,
-                    "loaded_dark_has_cursor_marker_trace_glow": true,
-                    "loaded_light_has_distinct_background": true
-                },
-                "visual_contract_metrics": visual_contract_metrics.clone()
-            });
             let comparison_path =
                 repo_path("target/artifacts/native-gpu/tests/novywave-reference-comparison.json");
-            std::fs::create_dir_all(
-                comparison_path
-                    .parent()
-                    .expect("comparison artifact should have parent"),
-            )
-            .expect("NovyWave comparison artifact directory should be creatable");
-            std::fs::write(
-                &comparison_path,
-                serde_json::to_vec_pretty(&comparison_report)
-                    .expect("NovyWave comparison report should serialize"),
-            )
-            .expect("NovyWave comparison report should write");
 
             let largest_painted_color = |frame: &boon_document::LayoutFrame| {
                 frame
@@ -39584,8 +42223,24 @@ mod tests {
                         && item.bounds.height >= 20.0
                 })
                 .expect("NovyWave should lower a dark waveform canvas paint region");
+            let timeline_luma_range = image_luma_range(&dark_image, timeline_glass.bounds);
+            let timeline_crop = save_visual_crop_artifact(
+                &dark_image,
+                timeline_glass.bounds,
+                "novywave-timeline-glass-crop",
+            );
+            visual_artifacts.push(timeline_crop.clone());
+            visual_contract_metrics.push(json!({
+                "metric": "material_role_luma_range",
+                "role": "timeline_glass",
+                "mode": "loaded_dark",
+                "luma_range": timeline_luma_range,
+                "min_luma_range": 12.0,
+                "bounds": rect_metric_json(timeline_glass.bounds),
+                "crop_artifact": timeline_crop
+            }));
             assert!(
-                image_luma_range(&dark_image, timeline_glass.bounds) >= 12.0,
+                timeline_luma_range >= 12.0,
                 "waveform canvas crop should contain visible material/data variation, bounds={:?}",
                 timeline_glass.bounds
             );
@@ -39610,12 +42265,28 @@ mod tests {
                         && item.bounds.height >= 14.0
                 })
                 .expect("NovyWave marker chip should lower MarkerChip glow");
-            for (label, bounds) in [
-                ("cursor glow crop", cursor_glow.bounds),
-                ("marker glow crop", marker_glow.bounds),
+            for (label, role, bounds, min_luma_range) in [
+                ("cursor glow crop", "cursor_glow", cursor_glow.bounds, 18.0),
+                ("marker glow crop", "marker_glow", marker_glow.bounds, 18.0),
             ] {
+                let luma_range = image_luma_range(&dark_image, bounds);
+                let crop = save_visual_crop_artifact(
+                    &dark_image,
+                    bounds,
+                    &format!("novywave-{role}-crop"),
+                );
+                visual_artifacts.push(crop.clone());
+                visual_contract_metrics.push(json!({
+                    "metric": "material_role_luma_range",
+                    "role": role,
+                    "mode": "loaded_dark",
+                    "luma_range": luma_range,
+                    "min_luma_range": min_luma_range,
+                    "bounds": rect_metric_json(bounds),
+                    "crop_artifact": crop
+                }));
                 assert!(
-                    image_luma_range(&dark_image, bounds) >= 18.0,
+                    luma_range >= min_luma_range,
                     "{label} should contain visible glow/text contrast, bounds={bounds:?}"
                 );
             }
@@ -39629,8 +42300,24 @@ mod tests {
                         && item.bounds.height >= 10.0
                 })
                 .expect("NovyWave digital trace should lower TraceHigh glow");
+            let trace_luma_range = image_luma_range(&dark_image, trace_glow.bounds);
+            let trace_crop = save_visual_crop_artifact(
+                &dark_image,
+                trace_glow.bounds,
+                "novywave-trace-glow-crop",
+            );
+            visual_artifacts.push(trace_crop.clone());
+            visual_contract_metrics.push(json!({
+                "metric": "material_role_luma_range",
+                "role": "trace_glow",
+                "mode": "loaded_dark",
+                "luma_range": trace_luma_range,
+                "min_luma_range": 14.0,
+                "bounds": rect_metric_json(trace_glow.bounds),
+                "crop_artifact": trace_crop
+            }));
             assert!(
-                image_luma_range(&dark_image, trace_glow.bounds) >= 14.0,
+                trace_luma_range >= 14.0,
                 "waveform trace crop should contain visible high/low contrast, bounds={:?}",
                 trace_glow.bounds
             );
@@ -39668,12 +42355,16 @@ mod tests {
                 .expect("NovyWave hover overlay should update for readback")
             );
             let hover_frame = latest_preview_frame(&shared_render_state);
-            let hover_image = render_physical_todomvc_frame_image(
+            let hover_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &hover_frame,
                 "novywave-probe-hover-material-region",
             );
+            let hover_image = hover_render.image.clone();
+            let hover_metadata =
+                visual_image_artifact_metadata("boon_hover_probe", &hover_render, "Probe hover");
+            visual_artifacts.push(hover_metadata.clone());
             let hover_diff = image_abs_diff_sum(&dark_image, &hover_image, probe_button.bounds);
             assert!(
                 hover_diff >= 120,
@@ -39686,7 +42377,8 @@ mod tests {
                 "label": "Probe",
                 "diff": hover_diff,
                 "min_diff": 120,
-                "bounds": rect_metric_json(probe_button.bounds)
+                "bounds": rect_metric_json(probe_button.bounds),
+                "artifact": hover_metadata
             }));
 
             let fmt_button = physical_button_for_text(&light_layout, "Fmt", "NovyWave light hover");
@@ -39726,12 +42418,19 @@ mod tests {
                 .expect("NovyWave light hover overlay should update for readback")
             );
             let light_hover_frame = latest_preview_frame(&light_shared_render_state);
-            let light_hover_image = render_physical_todomvc_frame_image(
+            let light_hover_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &light_hover_frame,
                 "novywave-fmt-light-hover-material-region",
             );
+            let light_hover_image = light_hover_render.image.clone();
+            let light_hover_metadata = visual_image_artifact_metadata(
+                "boon_light_hover_fmt",
+                &light_hover_render,
+                "Fmt light hover",
+            );
+            visual_artifacts.push(light_hover_metadata.clone());
             let light_hover_diff =
                 image_abs_diff_sum(&light_image, &light_hover_image, fmt_button.bounds);
             assert!(
@@ -39745,28 +42444,38 @@ mod tests {
                 "label": "Fmt",
                 "diff": light_hover_diff,
                 "min_diff": 120,
-                "bounds": rect_metric_json(fmt_button.bounds)
+                "bounds": rect_metric_json(fmt_button.bounds),
+                "artifact": light_hover_metadata
             }));
 
-            runtime
+            live_runtime
+                .lock()
+                .unwrap()
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.format_cycle".to_owned(),
                     ..boon_runtime::LiveSourceEvent::default()
                 })
                 .expect("NovyWave format-cycle pressed source event should apply");
-            let pressed_fmt_state = runtime.document_state_summary();
+            let pressed_fmt_state = live_runtime.lock().unwrap().document_state_summary();
             let (_, pressed_fmt_layout) = native_document_layout_proof_with_project_state_embedded(
                 &source_path,
                 &units,
                 Some(&pressed_fmt_state),
             )
             .expect("NovyWave pressed Fmt layout should lower");
-            let pressed_fmt_image = render_physical_todomvc_frame_image(
+            let pressed_fmt_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &pressed_fmt_layout,
                 "novywave-fmt-pressed-material-region",
             );
+            let pressed_fmt_image = pressed_fmt_render.image.clone();
+            let pressed_fmt_metadata = visual_image_artifact_metadata(
+                "boon_pressed_fmt",
+                &pressed_fmt_render,
+                "Fmt pressed",
+            );
+            visual_artifacts.push(pressed_fmt_metadata.clone());
             let pressed_fmt_diff =
                 image_abs_diff_sum(&light_image, &pressed_fmt_image, fmt_button.bounds);
             assert!(
@@ -39780,29 +42489,39 @@ mod tests {
                 "label": "Fmt",
                 "diff": pressed_fmt_diff,
                 "min_diff": 120,
-                "bounds": rect_metric_json(fmt_button.bounds)
+                "bounds": rect_metric_json(fmt_button.bounds),
+                "artifact": pressed_fmt_metadata
             }));
 
-            runtime
+            live_runtime
+                .lock()
+                .unwrap()
                 .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                     source: "store.elements.signal_search_focus_probe".to_owned(),
                     target_text: Some("signal search".to_owned()),
                     ..boon_runtime::LiveSourceEvent::default()
                 })
                 .expect("NovyWave search focus source event should apply for visual readback");
-            let focused_state = runtime.document_state_summary();
+            let focused_state = live_runtime.lock().unwrap().document_state_summary();
             let (_, focused_layout) = native_document_layout_proof_with_project_state_embedded(
                 &source_path,
                 &units,
                 Some(&focused_state),
             )
             .expect("NovyWave focused search layout should lower");
-            let focused_image = render_physical_todomvc_frame_image(
+            let focused_render = render_physical_todomvc_frame_artifact(
                 &device,
                 &queue,
                 &focused_layout,
                 "novywave-search-focused-material-region",
             );
+            let focused_image = focused_render.image.clone();
+            let focused_metadata = visual_image_artifact_metadata(
+                "boon_search_focused",
+                &focused_render,
+                "signal search focus",
+            );
+            visual_artifacts.push(focused_metadata.clone());
             let focused_search = focused_layout
                 .display_list
                 .iter()
@@ -39821,28 +42540,107 @@ mod tests {
                 "label": "signal search",
                 "diff": focus_diff,
                 "min_diff": 120,
-                "bounds": rect_metric_json(focused_search.bounds)
+                "bounds": rect_metric_json(focused_search.bounds),
+                "artifact": focused_metadata
             }));
 
             let visual_contract_path = repo_path(
                 "target/artifacts/native-gpu/tests/novywave-visual-contract-metrics.json",
             );
+            let generated_at_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after Unix epoch")
+                .as_millis();
+            let source_unit_paths = units
+                .iter()
+                .map(|unit| unit.path.clone())
+                .collect::<Vec<_>>();
+            let source_units_hash = boon_runtime::source_units_hash(&units);
+            let test_binary_hash = std::env::current_exe()
+                .ok()
+                .and_then(|path| boon_runtime::sha256_file(&path).ok())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let playground_binary_path = repo_path("target/debug/boon_native_playground");
+            let playground_binary_hash = boon_runtime::sha256_file(&playground_binary_path)
+                .unwrap_or_else(|_| "missing".to_owned());
+            let comparison_report = json!({
+                "status": "pass",
+                "reference_source": "decoded NovyWave screenshots/docs and fixture files only; no Rust/Tauri code imported",
+                "source_path": source_path.display().to_string(),
+                "source_units_hash": source_units_hash.clone(),
+                "source_unit_count": units.len(),
+                "source_unit_paths": source_unit_paths.clone(),
+                "generated_at_unix_ms": generated_at_unix_ms,
+                "worktree_fingerprint": worktree_fingerprint(),
+                "test_binary_hash": test_binary_hash,
+                "playground_binary_path": playground_binary_path.display().to_string(),
+                "playground_binary_hash": playground_binary_hash,
+                "reference_images": reference_images,
+                "reference_fixture_files": fixture_artifacts,
+                "boon_readbacks": [
+                    boon_empty_metadata,
+                    boon_empty_light_metadata,
+                    boon_dark_metadata,
+                    boon_light_metadata,
+                    load_dialog_metadata,
+                    boon_zoom_in_metadata,
+                    boon_zoom_out_metadata,
+                    boon_zoom_reset_metadata
+                ],
+                "visual_artifacts": visual_artifacts,
+                "normalized_region_profiles": {
+                    "reference_dark": normalized_luma_profile_json(&dark_reference_profile),
+                    "reference_light": normalized_luma_profile_json(&light_reference_profile),
+                    "reference_empty_dark": normalized_luma_profile_json(&empty_dark_reference_profile),
+                    "reference_empty_light": normalized_luma_profile_json(&empty_light_reference_profile),
+                    "boon_empty": normalized_luma_profile_json(&boon_empty_profile),
+                    "boon_empty_light": normalized_luma_profile_json(&boon_empty_light_profile),
+                    "boon_dark": normalized_luma_profile_json(&boon_dark_profile),
+                    "boon_light": normalized_luma_profile_json(&boon_light_profile)
+                },
+                "normalized_region_luma_distance": {
+                    "loaded_dark_vs_reference_dark": dark_profile_distance,
+                    "loaded_light_vs_reference_light": light_profile_distance,
+                    "empty_vs_reference_empty_dark": empty_profile_distance,
+                    "empty_light_vs_reference_empty_light": empty_light_profile_distance,
+                    "loaded_light_timeline_delta": boon_light_timeline - light_reference_timeline,
+                    "loaded_light_lower_waveform_delta": boon_light_lower_waveform - light_reference_lower_waveform
+                },
+                "structural_checks": {
+                    "empty_state_text_visible": true,
+                    "loaded_dark_has_timeline_glass": true,
+                    "loaded_dark_has_cursor_marker_trace_glow": true,
+                    "loaded_light_has_distinct_background": true
+                },
+                "visual_contract_metrics": visual_contract_metrics.clone()
+            });
+            std::fs::create_dir_all(
+                comparison_path
+                    .parent()
+                    .expect("comparison artifact should have parent"),
+            )
+            .expect("NovyWave comparison artifact directory should be creatable");
+            std::fs::write(
+                &comparison_path,
+                serde_json::to_vec_pretty(&comparison_report)
+                    .expect("NovyWave comparison report should serialize"),
+            )
+            .expect("NovyWave comparison report should write");
             std::fs::write(
                 &visual_contract_path,
                 serde_json::to_vec_pretty(&json!({
                     "status": "pass",
                     "source": "app-owned WGPU readback crops from NovyWave Boon example",
                     "source_path": source_path.display().to_string(),
-                    "source_units_hash": boon_runtime::source_units_hash(&units),
+                    "source_units_hash": source_units_hash,
                     "source_unit_count": units.len(),
-                    "source_unit_paths": units
-                        .iter()
-                        .map(|unit| unit.path.clone())
-                        .collect::<Vec<_>>(),
-                    "generated_at_unix_ms": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("system time should be after Unix epoch")
-                        .as_millis(),
+                    "source_unit_paths": source_unit_paths,
+                    "generated_at_unix_ms": generated_at_unix_ms,
+                    "worktree_fingerprint": worktree_fingerprint(),
+                    "test_binary_hash": test_binary_hash,
+                    "playground_binary_path": playground_binary_path.display().to_string(),
+                    "playground_binary_hash": playground_binary_hash,
+                    "visual_artifacts": visual_artifacts,
                     "metrics": visual_contract_metrics
                 }))
                 .expect("NovyWave visual contract metrics should serialize"),
@@ -40243,6 +43041,75 @@ mod tests {
             .unwrap_or_else(|| panic!("missing display item text `{text}`"))
     }
 
+    fn apply_preview_click_source(
+        source_path: &Path,
+        source_text: &str,
+        runtime_units: &[boon_runtime::RuntimeSourceUnit],
+        live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+        shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+        input_state: &mut PreviewNativeInputState,
+        source_event: &str,
+        sequence: u64,
+        label: &str,
+    ) -> serde_json::Value {
+        let layout_proof = shared_render_state
+            .lock()
+            .expect("preview shared render state should lock")
+            .layout_proof
+            .clone();
+        let (x, y, _) = source_hit_center(&layout_proof, source_event)
+            .unwrap_or_else(|error| panic!("{label} should expose a hit region: {error}"));
+        let input = deterministic_click_input_from_index(sequence, x, y);
+        preview_apply_real_window_input_with_units(
+            &input,
+            source_path,
+            source_text,
+            runtime_units,
+            Some(live_runtime),
+            shared_render_state,
+            input_state,
+        )
+        .unwrap_or_else(|error| panic!("clicking {label} should dispatch real input: {error}"));
+        live_runtime
+            .lock()
+            .expect("NovyWave live runtime should lock after click")
+            .document_state_summary()
+    }
+
+    fn max_source_hit_width(layout: &serde_json::Value, source_event: &str) -> f64 {
+        let source_nodes = layout["source_intent_assertions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("layout should expose source intents for `{source_event}`"))
+            .iter()
+            .filter_map(|intent| {
+                let is_source = intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_event);
+                let is_press =
+                    intent.get("intent").and_then(serde_json::Value::as_str) == Some("press");
+                (is_source && is_press)
+                    .then(|| intent.get("node").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        layout["hit_target_assertions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("layout should expose hit targets for `{source_event}`"))
+            .iter()
+            .filter(|hit| {
+                hit.get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|node| source_nodes.contains(node))
+            })
+            .filter_map(|hit| {
+                hit.pointer("/bounds/width")
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or_else(|| panic!("source event `{source_event}` should have hit width"))
+    }
+
     fn hit_bounds_for_address(layout: &serde_json::Value, address: &str) -> serde_json::Value {
         let intents = layout["source_intent_assertions"].as_array().unwrap();
         let node = intents
@@ -40349,12 +43216,19 @@ mod tests {
         })
     }
 
-    fn render_physical_todomvc_frame_image(
+    #[derive(Clone)]
+    struct RenderedFrameImage {
+        image: image::RgbaImage,
+        artifact_path: PathBuf,
+        artifact_sha256: String,
+    }
+
+    fn render_physical_todomvc_frame_artifact(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frame: &boon_document::LayoutFrame,
         artifact_label: &str,
-    ) -> image::RgbaImage {
+    ) -> RenderedFrameImage {
         let artifact_dir = repo_path("target/artifacts/native-gpu/tests");
         let render_frame = preview_frame_with_viewport_background(
             frame,
@@ -40401,14 +43275,34 @@ mod tests {
                 panic!("{artifact_label} visual test should produce app-owned pixels")
             }
         };
-        image::open(&artifact_path)
+        let image = image::open(&artifact_path)
             .unwrap_or_else(|error| {
                 panic!(
                     "{artifact_label} app-owned readback should decode at {}: {error}",
                     artifact_path.display()
                 )
             })
-            .to_rgba8()
+            .to_rgba8();
+        let artifact_sha256 = boon_runtime::sha256_file(&artifact_path).unwrap_or_else(|error| {
+            panic!(
+                "{artifact_label} app-owned readback hash should compute at {}: {error}",
+                artifact_path.display()
+            )
+        });
+        RenderedFrameImage {
+            image,
+            artifact_path,
+            artifact_sha256,
+        }
+    }
+
+    fn render_physical_todomvc_frame_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &boon_document::LayoutFrame,
+        artifact_label: &str,
+    ) -> image::RgbaImage {
+        render_physical_todomvc_frame_artifact(device, queue, frame, artifact_label).image
     }
 
     fn image_luma_at(image: &image::RgbaImage, x: f32, y: f32) -> f32 {
@@ -40542,18 +43436,114 @@ mod tests {
         (total / (count.max(1) as f64)) as f32
     }
 
-    fn visual_image_metadata(
+    fn visual_image_artifact_metadata(
         label: &str,
-        image: &image::RgbaImage,
+        rendered: &RenderedFrameImage,
         source: &str,
     ) -> serde_json::Value {
         json!({
             "label": label,
-            "width": image.width(),
-            "height": image.height(),
-            "average_luma": full_image_average_luma(image),
+            "path": rendered.artifact_path.display().to_string(),
+            "sha256": rendered.artifact_sha256.clone(),
+            "width": rendered.image.width(),
+            "height": rendered.image.height(),
+            "average_luma": full_image_average_luma(&rendered.image),
             "source": source
         })
+    }
+
+    fn save_visual_crop_artifact(
+        image: &image::RgbaImage,
+        bounds: boon_document::Rect,
+        label: &str,
+    ) -> serde_json::Value {
+        let artifact_dir = repo_path("target/artifacts/native-gpu/tests");
+        std::fs::create_dir_all(&artifact_dir)
+            .expect("NovyWave visual crop artifact directory should be creatable");
+        let max_x0 = image.width().saturating_sub(1) as f32;
+        let max_y0 = image.height().saturating_sub(1) as f32;
+        let x0 = bounds.x.max(0.0).floor().min(max_x0) as u32;
+        let y0 = bounds.y.max(0.0).floor().min(max_y0) as u32;
+        let x1 = (bounds.x + bounds.width)
+            .max(0.0)
+            .ceil()
+            .min(image.width() as f32) as u32;
+        let y1 = (bounds.y + bounds.height)
+            .max(0.0)
+            .ceil()
+            .min(image.height() as f32) as u32;
+        let crop_width = x1
+            .saturating_sub(x0)
+            .max(1)
+            .min(image.width().saturating_sub(x0));
+        let crop_height = y1
+            .saturating_sub(y0)
+            .max(1)
+            .min(image.height().saturating_sub(y0));
+        let crop = image::imageops::crop_imm(image, x0, y0, crop_width, crop_height).to_image();
+        let artifact_path = artifact_dir.join(format!("{label}.png"));
+        crop.save(&artifact_path).unwrap_or_else(|error| {
+            panic!(
+                "NovyWave visual crop `{label}` should save at {}: {error}",
+                artifact_path.display()
+            )
+        });
+        let artifact_sha256 = boon_runtime::sha256_file(&artifact_path).unwrap_or_else(|error| {
+            panic!(
+                "NovyWave visual crop `{label}` hash should compute at {}: {error}",
+                artifact_path.display()
+            )
+        });
+        json!({
+            "label": label,
+            "path": artifact_path.display().to_string(),
+            "sha256": artifact_sha256,
+            "width": crop_width,
+            "height": crop_height,
+            "bounds": rect_metric_json(bounds),
+            "source": "NovyWave app-owned WGPU readback crop"
+        })
+    }
+
+    fn novywave_fixture_artifact_metadata() -> Vec<serde_json::Value> {
+        [
+            (
+                "counter_vcd",
+                "/home/martinkavik/repos/NovyWave/examples/verilog/counter/counter.vcd",
+            ),
+            (
+                "wave_27_fst",
+                "/home/martinkavik/repos/NovyWave/test_files/wave_27.fst",
+            ),
+            (
+                "simple_test_ghw",
+                "/home/martinkavik/repos/NovyWave/test_files/simple_test.ghw",
+            ),
+        ]
+        .iter()
+        .map(|(label, raw_path)| {
+            let path = Path::new(raw_path);
+            let metadata = std::fs::metadata(path).unwrap_or_else(|error| {
+                panic!(
+                    "NovyWave fixture reference `{label}` should exist at {}: {error}",
+                    path.display()
+                )
+            });
+            let sha256 = boon_runtime::sha256_file(path).unwrap_or_else(|error| {
+                panic!(
+                    "NovyWave fixture reference `{label}` hash should compute at {}: {error}",
+                    path.display()
+                )
+            });
+            json!({
+                "label": label,
+                "path": path.display().to_string(),
+                "sha256": sha256,
+                "bytes": metadata.len(),
+                "source": "NovyWave reference fixture file"
+            })
+        })
+        .collect()
     }
 
     fn average_image_luma(image: &image::RgbaImage, rect: boon_document::Rect) -> f32 {

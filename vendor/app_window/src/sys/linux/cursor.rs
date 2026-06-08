@@ -62,6 +62,21 @@ impl CursorRequest {
             hot_y: CURSOR_SIZE / 2,
         }
     }
+    pub fn row_resize() -> Self {
+        CursorRequest {
+            name: "sb_v_double_arrow",
+            fallback_names: &[
+                "v_double_arrow",
+                "row-resize",
+                "ns-resize",
+                "top_side",
+                "bottom_side",
+                "left_ptr",
+            ],
+            hot_x: CURSOR_SIZE / 2,
+            hot_y: CURSOR_SIZE / 2,
+        }
+    }
     pub fn pointer() -> Self {
         CursorRequest {
             name: "hand2",

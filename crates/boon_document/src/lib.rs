@@ -327,6 +327,7 @@ impl LayoutBuilder<'_, '_> {
             style: node.style.clone(),
             focused: self.document.focus.as_ref() == Some(&node.id),
         });
+        let subtree_display_start = self.display_list.len();
         let subtree_hit_start = self.hit_regions.len();
         let subtree_scroll_start = self.scroll_regions.len();
 
@@ -420,6 +421,37 @@ impl LayoutBuilder<'_, '_> {
                         height = (max_child_height + padding.vertical()).max(24.0);
                     }
                 }
+                _ if style_bool(&node.style, "overlay_children").unwrap_or(false) => {
+                    let mut max_child_width: f32 = 0.0;
+                    let mut max_child_height: f32 = 0.0;
+                    for child in &node.children {
+                        let child_rect = self.layout_node(
+                            child,
+                            content_x,
+                            content_y,
+                            content_width,
+                            (height - padding.vertical()).max(1.0),
+                        );
+                        max_child_width = max_child_width.max(child_rect.width);
+                        max_child_height = max_child_height.max(child_rect.height);
+                    }
+                    if explicit_width.is_none() {
+                        width = constrain_dimension(
+                            max_child_width.max(width).max(1.0) + padding.horizontal(),
+                            &node.style,
+                            "width",
+                            available_width,
+                        );
+                    }
+                    if explicit_height.is_none() {
+                        height = constrain_dimension(
+                            (max_child_height + padding.vertical()).max(24.0),
+                            &node.style,
+                            "height",
+                            available_height,
+                        );
+                    }
+                }
                 _ => {
                     let mut cursor_y = content_y;
                     let mut max_child_width: f32 = 0.0;
@@ -494,6 +526,9 @@ impl LayoutBuilder<'_, '_> {
             height,
         };
         self.display_list[display_index].bounds = rect;
+        if !node.materialized.is_empty() {
+            apply_clip_to_display_items(&mut self.display_list[subtree_display_start..], rect);
+        }
         if node.source_binding.is_some() || style_bool(&node.style, "__hover_scope") == Some(true) {
             self.hit_regions.push(HitRegion {
                 id: format!("hit:{}", node.id.0),
@@ -560,6 +595,48 @@ fn style_bool(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<bool> {
         StyleValue::Text(value) => value.parse::<bool>().ok(),
         StyleValue::Number(_) => None,
     }
+}
+
+fn apply_clip_to_display_items(items: &mut [DisplayItem], clip: Rect) {
+    for item in items {
+        let clip = item_clip_rect(item)
+            .and_then(|existing| rect_intersection(existing, clip))
+            .unwrap_or(clip);
+        item.style
+            .insert("__clip_x".to_owned(), StyleValue::Number(f64::from(clip.x)));
+        item.style
+            .insert("__clip_y".to_owned(), StyleValue::Number(f64::from(clip.y)));
+        item.style.insert(
+            "__clip_width".to_owned(),
+            StyleValue::Number(f64::from(clip.width)),
+        );
+        item.style.insert(
+            "__clip_height".to_owned(),
+            StyleValue::Number(f64::from(clip.height)),
+        );
+    }
+}
+
+fn item_clip_rect(item: &DisplayItem) -> Option<Rect> {
+    Some(Rect {
+        x: style_spacing(&item.style, "__clip_x")?,
+        y: style_spacing(&item.style, "__clip_y")?,
+        width: style_spacing(&item.style, "__clip_width")?,
+        height: style_spacing(&item.style, "__clip_height")?,
+    })
+}
+
+fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 > x0 && y1 > y0).then_some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 fn style_text<'a>(style: &'a BTreeMap<String, StyleValue>, key: &str) -> Option<&'a str> {
@@ -1046,5 +1123,149 @@ mod tests {
             .expect("stack should be laid out");
 
         assert_eq!(stack.bounds.height, 50.0);
+    }
+
+    #[test]
+    fn stack_overlay_children_share_parent_origin() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut stack = DocumentNode::new("stack", DocumentNodeKind::Stack);
+        stack.parent = Some(frame.root.clone());
+        stack
+            .style
+            .insert("width".to_owned(), StyleValue::Number(300.0));
+        stack
+            .style
+            .insert("height".to_owned(), StyleValue::Number(180.0));
+        stack
+            .style
+            .insert("overlay_children".to_owned(), StyleValue::Bool(true));
+        stack.children.push(DocumentNodeId("content".to_owned()));
+        stack.children.push(DocumentNodeId("modal".to_owned()));
+
+        let mut content = DocumentNode::new("content", DocumentNodeKind::Stack);
+        content.parent = Some(stack.id.clone());
+        content
+            .style
+            .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+        content
+            .style
+            .insert("height".to_owned(), StyleValue::Text("Fill".to_owned()));
+
+        let mut modal = DocumentNode::new("modal", DocumentNodeKind::Stack);
+        modal.parent = Some(stack.id.clone());
+        modal
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        modal
+            .style
+            .insert("height".to_owned(), StyleValue::Number(60.0));
+        modal
+            .style
+            .insert("center".to_owned(), StyleValue::Bool(true));
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(stack.id.clone());
+        frame.nodes.insert(stack.id.clone(), stack);
+        frame.nodes.insert(content.id.clone(), content);
+        frame.nodes.insert(modal.id.clone(), modal);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 180.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let content = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "content")
+            .expect("content layer should be laid out");
+        let modal = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "modal")
+            .expect("modal layer should be laid out");
+
+        assert_eq!(content.bounds.x, 0.0);
+        assert_eq!(content.bounds.y, 0.0);
+        assert_eq!(content.bounds.height, 180.0);
+        assert_eq!(modal.bounds.x, 90.0);
+        assert_eq!(modal.bounds.y, 0.0);
+        assert_eq!(modal.bounds.height, 60.0);
+    }
+
+    #[test]
+    fn materialized_scroll_node_marks_descendants_with_clip_rect() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut scroll = DocumentNode::new("scroll", DocumentNodeKind::Stack);
+        scroll.parent = Some(frame.root.clone());
+        scroll
+            .style
+            .insert("width".to_owned(), StyleValue::Number(200.0));
+        scroll
+            .style
+            .insert("height".to_owned(), StyleValue::Number(80.0));
+        scroll.materialized.push(MaterializedRange {
+            axis: Axis::Vertical,
+            visible: 0..4,
+            overscan: 0..8,
+        });
+        scroll.children.push(DocumentNodeId("row".to_owned()));
+
+        let mut row = DocumentNode::new("row", DocumentNodeKind::Text);
+        row.parent = Some(scroll.id.clone());
+        row.text = Some(TextValue {
+            text: "oversized row".to_owned(),
+        });
+        row.style
+            .insert("width".to_owned(), StyleValue::Number(200.0));
+        row.style
+            .insert("height".to_owned(), StyleValue::Number(160.0));
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(scroll.id.clone());
+        frame.nodes.insert(scroll.id.clone(), scroll);
+        frame.nodes.insert(row.id.clone(), row);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 200.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let row = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "row")
+            .expect("scroll child should be laid out");
+
+        assert_eq!(style_spacing(&row.style, "__clip_x"), Some(0.0));
+        assert_eq!(style_spacing(&row.style, "__clip_y"), Some(0.0));
+        assert_eq!(style_spacing(&row.style, "__clip_width"), Some(200.0));
+        assert_eq!(style_spacing(&row.style, "__clip_height"), Some(80.0));
     }
 }

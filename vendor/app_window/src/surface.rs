@@ -18,6 +18,7 @@ pub struct SurfaceContentReport {
 pub enum SurfaceCursorIcon {
     Default,
     ColumnResize,
+    RowResize,
     Pointer,
     Text,
 }

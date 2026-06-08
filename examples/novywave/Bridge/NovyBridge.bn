@@ -5,7 +5,7 @@ FUNCTION contract_summary() {
 }
 
 FUNCTION page_status() {
-    TEXT { fixture-page: bridge-ready }
+    TEXT { page: bridge-ready }
 }
 
 FUNCTION provider_version() {
@@ -13,7 +13,7 @@ FUNCTION provider_version() {
 }
 
 FUNCTION schema_version() {
-    TEXT { wellen.v1 fixture schema draft; hashes required before live bridge }
+    TEXT { wellen.v1 waveform schema; real file hashes in descriptors }
 }
 
 FUNCTION effect_exports_label() {

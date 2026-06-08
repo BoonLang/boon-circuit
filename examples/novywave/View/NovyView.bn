@@ -15,6 +15,40 @@ FUNCTION root() {
     Scene/Element/stripe(
         element: []
         direction: Column
+        gap: 0
+        style: [
+            width: Fill
+            height: [sizing: Fill, minimum: Screen]
+            padding: 0
+            overlay_children: True
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f4f7fb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: AppBackground)
+        ]
+        items: LIST {
+            app_shell_for_dialog_state()
+            workspace_dialog()
+            load_files_dialog()
+        }
+    )
+}
+
+FUNCTION app_shell_for_dialog_state() {
+    PASSED.store.workspace_dialog == TEXT { Open } |> WHEN {
+        True => modal_app_shell()
+        False => PASSED.store.load_files_dialog == TEXT { Open } |> WHEN {
+            True => modal_app_shell()
+            False => app_shell()
+        }
+    }
+}
+
+FUNCTION app_shell() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
         gap: 10
         style: [
             width: Fill
@@ -28,15 +62,53 @@ FUNCTION root() {
         ]
         items: LIST {
             header()
-            load_files_dialog()
-            PASSED.store.fixture_status == TEXT { Empty } |> WHEN {
+            PASSED.store.waveform_status == TEXT { Empty } |> WHEN {
                 True => empty_state()
-                False => PASSED.store.fixture_status == TEXT { Loading } |> WHEN {
+                False => PASSED.store.waveform_status == TEXT { Loading } |> WHEN {
                     True => loading_state()
                     False => loaded_app()
                 }
             }
         }
+    )
+}
+
+FUNCTION modal_app_shell() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: Fill
+            height: [sizing: Fill, minimum: Screen]
+            padding: 0
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f4f7fb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: AppBackground)
+        ]
+        items: LIST {
+            header()
+            modal_content_underlay()
+        }
+    )
+}
+
+FUNCTION modal_content_underlay() {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            rounded_corners: 0
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f4f7fb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: AppBackground)
+        ]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
 
@@ -67,7 +139,7 @@ FUNCTION header() {
                 element: []
                 style: [
                     ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
-                    width: 72
+                    width: 42
                     height: Fill
                     vertical_align: Center
                     color: PASSED.store.mode |> WHEN {
@@ -81,10 +153,10 @@ FUNCTION header() {
                 element: []
                 style: [
                     ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
-                    width: Fill
+                    width: 132
                     height: Fill
-                    center: True
                     vertical_align: Center
+                    size: 18
                     color: PASSED.store.mode |> WHEN {
                         Dark => TEXT { #d2def0 }
                         Light => TEXT { #475569 }
@@ -92,11 +164,550 @@ FUNCTION header() {
                 ]
                 text: TEXT { NovyWave.io }
             )
+            header_workspace_button()
+            header_workspace_path()
             header_load_button()
             header_empty_button()
-            header_panel_resize_controls()
+            header_files_wider_button()
+            header_variables_wider_button()
+            header_panels_reset_button()
+            header_panel_arrangement_button()
             header_mode_button()
         }
+    )
+}
+
+FUNCTION workspace_dialog() {
+    PASSED.store.workspace_dialog == TEXT { Open } |> WHEN {
+        True => Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 12
+            style: [
+                width: Fill
+                height: [sizing: Fill, minimum: Screen]
+                padding: [left: 28, right: 28, top: 70, bottom: 28]
+                background: [color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #020817e8 }
+                    Light => TEXT { #e2e8f0e0 }
+                }]
+                material: NovyTheme/material(mode: PASSED.store.mode, of: DialogBackdrop)
+            ]
+            items: LIST {
+                workspace_dialog_panel()
+            }
+        )
+        __ => NoElement
+    }
+}
+
+FUNCTION workspace_dialog_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: [sizing: Fill, maximum: 820]
+            height: 610
+            center: True
+            depth: 30
+            move: [closer: 13]
+            rounded_corners: 14
+            padding: [left: 16, right: 16, top: 14, bottom: 14]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #07111fff }
+                Light => TEXT { #ffffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #365a83 }
+                Light => TEXT { #b7c9dd }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: Dialog)
+        ]
+        items: LIST {
+            workspace_dialog_title()
+            workspace_dialog_hint()
+            workspace_recent_section()
+            workspace_tree_section()
+            workspace_dialog_selection()
+            workspace_dialog_actions()
+        }
+    )
+}
+
+FUNCTION workspace_dialog_title() {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Heading)
+            width: Fill
+            height: 30
+            vertical_align: Center
+            size: 18
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #10243a }
+            }
+        ]
+        text: PASSED.store.workspace_dialog_title
+    )
+}
+
+FUNCTION workspace_dialog_hint() {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+            width: Fill
+            height: 42
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #92a4bb }
+                Light => TEXT { #42566d }
+            }
+        ]
+        text: PASSED.store.workspace_dialog_hint
+    )
+}
+
+FUNCTION workspace_recent_section() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [
+            width: Fill
+            height: 118
+            padding: [left: 10, right: 10, top: 8, bottom: 8]
+            rounded_corners: 8
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #09111f }
+                Light => TEXT { #f4f8fc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #152236 }
+                Light => TEXT { #d7dde8 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        items: LIST {
+            workspace_section_title(label_text: TEXT { Recent workspaces })
+            workspace_recent_repo_button()
+            workspace_recent_b_button()
+        }
+    )
+}
+
+FUNCTION workspace_tree_section() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: Fill
+            height: 292
+            padding: [left: 10, right: 10, top: 8, bottom: 8]
+            rounded_corners: 8
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #030813 }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1d2d45 }
+                Light => TEXT { #c9d7ea }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        items: LIST {
+            workspace_tree_static_row(label_text: TEXT { > target }, indent_width: 92)
+            workspace_tree_static_row(label_text: TEXT { v test_files }, indent_width: 92)
+            workspace_tree_static_row(label_text: TEXT { > dir_a }, indent_width: 116)
+            workspace_tree_static_row(label_text: TEXT { > dir_b }, indent_width: 116)
+            workspace_tree_static_row(label_text: TEXT { v my_workspaces }, indent_width: 116)
+            workspace_tree_workspace_a_button()
+            workspace_tree_workspace_b_button()
+            workspace_tree_static_row(label_text: TEXT { > nested_dir }, indent_width: 116)
+            workspace_tree_static_row(label_text: TEXT { > to_discover }, indent_width: 116)
+            workspace_tree_repo_button()
+        }
+    )
+}
+
+FUNCTION workspace_section_title(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Heading)
+            width: Fill
+            height: 22
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #10243a }
+            }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION workspace_recent_repo_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_repo]
+            hovered: PASSED.store.elements.select_workspace_repo
+        ]
+        style: [width: Fill, height: 34, paint: False]
+        label: workspace_recent_label(label_text: TEXT { /home/martinkavik/repos/NovyWave })
+    )
+}
+
+FUNCTION workspace_recent_b_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_b]
+            hovered: PASSED.store.elements.select_workspace_b
+        ]
+        style: [width: Fill, height: 34, paint: False]
+        label: workspace_recent_label(label_text: TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b })
+    )
+}
+
+FUNCTION workspace_recent_label(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #38a6ff }
+                Light => TEXT { #1267aa }
+            }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION workspace_tree_static_row(label_text, indent_width) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 27, padding: [left: 0, right: 6], paint: False]
+        items: LIST {
+            workspace_tree_indent(width_value: indent_width)
+            workspace_tree_static_label(label_text: label_text)
+        }
+    )
+}
+
+FUNCTION workspace_tree_static_label(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 14
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #c6d7ee }
+                Light => TEXT { #334155 }
+            }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION workspace_tree_workspace_a_button() {
+    PASSED.store.workspace_selected_key == TEXT { WorkspaceA } |> WHEN {
+        True => workspace_tree_workspace_a_selected()
+        False => workspace_tree_workspace_a_resting()
+    }
+}
+
+FUNCTION workspace_tree_workspace_a_selected() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_a]
+            hovered: PASSED.store.elements.select_workspace_a
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_selected_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 140)
+            workspace_tree_check(selected: True)
+            workspace_tree_selected_label(label_text: TEXT { workspace_a })
+        }
+    )
+}
+
+FUNCTION workspace_tree_workspace_a_resting() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_a]
+            hovered: PASSED.store.elements.select_workspace_a
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_resting_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 140)
+            workspace_tree_check(selected: False)
+            workspace_tree_label(label_text: TEXT { workspace_a })
+        }
+    )
+}
+
+FUNCTION workspace_tree_workspace_b_button() {
+    PASSED.store.workspace_selected_key == TEXT { WorkspaceB } |> WHEN {
+        True => workspace_tree_workspace_b_selected()
+        False => workspace_tree_workspace_b_resting()
+    }
+}
+
+FUNCTION workspace_tree_workspace_b_selected() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_b]
+            hovered: PASSED.store.elements.select_workspace_b
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_selected_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 140)
+            workspace_tree_check(selected: True)
+            workspace_tree_selected_label(label_text: TEXT { workspace_b })
+        }
+    )
+}
+
+FUNCTION workspace_tree_workspace_b_resting() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_b]
+            hovered: PASSED.store.elements.select_workspace_b
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_resting_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 140)
+            workspace_tree_check(selected: False)
+            workspace_tree_label(label_text: TEXT { workspace_b })
+        }
+    )
+}
+
+FUNCTION workspace_tree_repo_button() {
+    PASSED.store.workspace_selected_key == TEXT { Repo } |> WHEN {
+        True => workspace_tree_repo_selected()
+        False => workspace_tree_repo_resting()
+    }
+}
+
+FUNCTION workspace_tree_repo_selected() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_repo]
+            hovered: PASSED.store.elements.select_workspace_repo
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_selected_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 92)
+            workspace_tree_check(selected: True)
+            workspace_tree_selected_label(label_text: TEXT { NovyWave repo })
+        }
+    )
+}
+
+FUNCTION workspace_tree_repo_resting() {
+    Scene/Element/stripe(
+        element: [
+            event: [press: PASSED.store.elements.select_workspace_repo]
+            hovered: PASSED.store.elements.select_workspace_repo
+        ]
+        direction: Row
+        gap: 6
+        style: workspace_tree_resting_button_style()
+        items: LIST {
+            workspace_tree_indent(width_value: 92)
+            workspace_tree_check(selected: False)
+            workspace_tree_label(label_text: TEXT { NovyWave repo })
+        }
+    )
+}
+
+FUNCTION workspace_tree_selected_button_style() {
+    [
+        width: Fill
+        height: 27
+        padding: 0
+        rounded_corners: 5
+        background: [color: TEXT { #0b3f78 }]
+        border: [color: TEXT { #66c4ff }]
+        material: NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+    ]
+}
+
+FUNCTION workspace_tree_resting_button_style() {
+    [
+        width: Fill
+        height: 27
+        padding: 0
+        rounded_corners: 5
+        paint: False
+    ]
+}
+
+FUNCTION workspace_tree_indent(width_value) {
+    Scene/Element/label(
+        element: []
+        style: [width: width_value, height: Fill, paint: False]
+        label: Scene/Element/text(
+            element: []
+            style: [width: Fill, height: Fill, color: TEXT { #00000000 }]
+            text: Text/empty()
+        )
+    )
+}
+
+FUNCTION workspace_tree_check(selected) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 24
+            height: 24
+            rounded_corners: 5
+            background: [color: selected |> WHEN {
+                True => TEXT { #169cff }
+                False => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #07316e }
+                    Light => TEXT { #d8ecff }
+                }
+            }]
+            border: [color: selected |> WHEN {
+                True => TEXT { #66c4ff }
+                False => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #144a90 }
+                    Light => TEXT { #90bfe8 }
+                }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: selected |> WHEN {
+                    True => TEXT { #ffffff }
+                    False => TEXT { #00000000 }
+                }
+            ]
+            text: selected |> WHEN {
+                True => TEXT { ✓ }
+                False => Text/empty()
+            }
+        )
+    )
+}
+
+FUNCTION workspace_tree_label(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 14
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #eaf4ff }
+                Light => TEXT { #10243a }
+            }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION workspace_tree_selected_label(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 14
+            color: TEXT { #ffffff }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION workspace_dialog_selection() {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: 28
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #8fa0b5 }
+                Light => TEXT { #42566d }
+            }
+        ]
+        text: PASSED.store.workspace_dialog_selection
+    )
+}
+
+FUNCTION workspace_dialog_actions() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 34, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [width: Fill, height: Fill, color: TEXT { #00000000 }]
+                text: Text/empty()
+            )
+            workspace_cancel_button()
+            workspace_open_button()
+        }
+    )
+}
+
+FUNCTION workspace_cancel_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.close_workspace_dialog]
+            hovered: PASSED.store.elements.close_workspace_dialog
+        ]
+        style: compact_button_style(button_width: 104, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Cancel })
+    )
+}
+
+FUNCTION workspace_open_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.open_selected_workspace]
+            hovered: PASSED.store.elements.open_selected_workspace
+        ]
+        style: compact_button_style(button_width: 96, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Open })
     )
 }
 
@@ -105,33 +716,91 @@ FUNCTION load_files_dialog() {
         True => Scene/Element/stripe(
             element: []
             direction: Column
-            gap: 8
+            gap: 12
             style: [
-                width: [sizing: Fill, maximum: 640]
-                height: 176
-                depth: 20
-                move: [closer: 8]
-                rounded_corners: 12
-                padding: [left: 16, right: 16, top: 14, bottom: 14]
+                width: Fill
+                height: [sizing: Fill, minimum: Screen]
+                padding: [left: 28, right: 28, top: 92, bottom: 28]
                 background: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #0f172acc }
-                    Light => TEXT { #fffffff2 }
+                    Dark => TEXT { #020817e0 }
+                    Light => TEXT { #e2e8f0d8 }
                 }]
-                border: [color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #65b8ff }
-                    Light => TEXT { #2474bb }
-                }]
-                material: NovyTheme/material(mode: PASSED.store.mode, of: Dialog)
+                material: NovyTheme/material(mode: PASSED.store.mode, of: DialogBackdrop)
             ]
             items: LIST {
-                load_files_dialog_title()
-                load_files_dialog_hint()
-                load_files_dialog_selection()
-                load_files_dialog_actions()
+                load_files_dialog_panel()
             }
         )
         __ => NoElement
     }
+}
+
+FUNCTION load_files_dialog_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: [sizing: Fill, maximum: 720]
+            height: 246
+            center: True
+            depth: 28
+            move: [closer: 12]
+            rounded_corners: 14
+            padding: [left: 16, right: 16, top: 14, bottom: 14]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #07111fff }
+                Light => TEXT { #ffffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #65b8ff }
+                Light => TEXT { #2474bb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: Dialog)
+        ]
+        items: LIST {
+            load_files_dialog_title()
+            load_files_dialog_hint()
+            load_files_path_input()
+            load_files_dialog_selection()
+            load_files_dialog_actions()
+        }
+    )
+}
+
+FUNCTION load_files_path_input() {
+    Scene/Element/text_input(
+        element: [
+            event: [
+                click: PASSED.store.elements.load_file_path_focus_probe
+                change: PASSED.store.elements.load_file_path_input
+            ]
+        ]
+        style: [
+            width: Fill
+            height: 38
+            padding: [left: 10, right: 10]
+            text_inset: 4
+            rounded_corners: 9
+            font: NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #eaf4ff }
+                Light => TEXT { #172033 }
+            }
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #08111f }
+                Light => TEXT { #f3f7fc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #65b8ff }
+                Light => TEXT { #2474bb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Hidden[text: TEXT { waveform file path }]
+        text: PASSED.store.load_files_path
+        placeholder: [text: TEXT { /path/to/waveform.vcd }]
+    )
 }
 
 FUNCTION load_files_dialog_title() {
@@ -189,9 +858,14 @@ FUNCTION load_files_dialog_actions() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 8
+        gap: 12
         style: [width: Fill, height: 32, paint: False]
         items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [width: Fill, height: Fill, color: TEXT { #00000000 }]
+                text: Text/empty()
+            )
             load_files_confirm_button()
             load_files_cancel_button()
         }
@@ -201,11 +875,11 @@ FUNCTION load_files_dialog_actions() {
 FUNCTION load_files_confirm_button() {
     Scene/Element/button(
         element: [
-            event: [press: PASSED.store.elements.load_fixture]
-            hovered: PASSED.store.elements.load_fixture
+            event: [press: PASSED.store.elements.load_external_file]
+            hovered: PASSED.store.elements.load_external_file
         ]
-        style: compact_button_style(button_width: 104, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Load fixture })
+        style: compact_button_style(button_width: 96, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Open })
     )
 }
 
@@ -215,7 +889,7 @@ FUNCTION load_files_cancel_button() {
             event: [press: PASSED.store.elements.close_load_files_dialog]
             hovered: PASSED.store.elements.close_load_files_dialog
         ]
-        style: compact_button_style(button_width: 76, hovered: element.hovered)
+        style: compact_button_style(button_width: 104, hovered: element.hovered)
         label: button_label(button_text: TEXT { Cancel })
     )
 }
@@ -250,7 +924,7 @@ FUNCTION loaded_app_stacked() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 8
+        gap: 0
         style: [
             width: Fill
             height: Fill
@@ -258,6 +932,7 @@ FUNCTION loaded_app_stacked() {
         ]
         items: LIST {
             browser_band()
+            files_panel_secondary_divider()
             selected_waveform_band()
         }
     )
@@ -267,7 +942,7 @@ FUNCTION loaded_app_docked() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 8
+        gap: 0
         style: [
             width: Fill
             height: Fill
@@ -275,6 +950,7 @@ FUNCTION loaded_app_docked() {
         ]
         items: LIST {
             browser_band_docked()
+            files_panel_main_divider()
             selected_waveform_band()
         }
     )
@@ -284,14 +960,15 @@ FUNCTION browser_band() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 8
+        gap: 0
         style: [
             width: Fill
-            height: 286
+            height: 346
             paint: False
         ]
         items: LIST {
             left_panel()
+            files_panel_main_divider()
             variables_panel()
         }
     )
@@ -301,7 +978,7 @@ FUNCTION browser_band_docked() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 8
+        gap: 0
         style: [
             width: PASSED.store.browser_panel_width
             height: 650
@@ -309,6 +986,7 @@ FUNCTION browser_band_docked() {
         ]
         items: LIST {
             left_panel_docked()
+            files_panel_secondary_divider()
             variables_panel_docked()
         }
     )
@@ -321,7 +999,7 @@ FUNCTION selected_waveform_band() {
         gap: 8
         style: [
             width: Fill
-            height: 650
+            height: Fill
             gap: 0
             paint: False
         ]
@@ -329,6 +1007,125 @@ FUNCTION selected_waveform_band() {
             timeline_panel()
         }
     )
+}
+
+FUNCTION files_panel_main_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.files_main_resize_drag]
+            hovered: PASSED.store.elements.files_main_resize_drag
+            target: TEXT { files panel main divider }
+        ]
+        style: column_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION files_panel_secondary_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.files_secondary_resize_drag]
+            hovered: PASSED.store.elements.files_secondary_resize_drag
+            target: TEXT { files panel secondary divider }
+        ]
+        style: row_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION variables_name_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.variables_name_resize_drag]
+            hovered: PASSED.store.elements.variables_name_resize_drag
+            target: TEXT { variables name column divider }
+        ]
+        style: column_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION variables_value_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.variables_value_resize_drag]
+            hovered: PASSED.store.elements.variables_value_resize_drag
+            target: TEXT { variables value column divider }
+        ]
+        style: column_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION signal_row_divider(signal) {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.signal_row_resize_drag]
+            hovered: PASSED.store.elements.signal_row_resize_drag
+            target: signal.id
+        ]
+        style: signal_row_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION column_divider_style() {
+    [
+        width: 4
+        height: Fill
+        rounded_corners: 0
+        cursor: TEXT { col-resize }
+        background: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #3b82f6 }
+            Light => TEXT { #60a5fa }
+        }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #93c5fd }
+            Light => TEXT { #2563eb }
+        }
+        glow: [color: TEXT { #60a5fa66 }, intensity: 0.08]
+        material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
+        __hover_gloss: 0.12
+    ]
+}
+
+FUNCTION row_divider_style() {
+    [
+        width: Fill
+        height: 4
+        rounded_corners: 0
+        cursor: TEXT { row-resize }
+        background: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #3b82f6 }
+            Light => TEXT { #60a5fa }
+        }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #93c5fd }
+            Light => TEXT { #2563eb }
+        }
+        glow: [color: TEXT { #60a5fa66 }, intensity: 0.08]
+        material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
+        __hover_gloss: 0.12
+    ]
+}
+
+FUNCTION signal_row_divider_style() {
+    [
+        width: Fill
+        height: 3
+        rounded_corners: 0
+        cursor: TEXT { row-resize }
+        background: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #1d4ed8 }
+            Light => TEXT { #60a5fa }
+        }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #93c5fd }
+            Light => TEXT { #2563eb }
+        }
+        material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)
+        __hover_gloss: 0.10
+    ]
 }
 
 FUNCTION empty_state() {
@@ -494,7 +1291,7 @@ FUNCTION left_panel() {
 }
 
 FUNCTION left_panel_docked() {
-    left_panel_base(panel_width: Fill, panel_height: 284)
+    left_panel_base(panel_width: Fill, panel_height: PASSED.store.files_panel_height)
 }
 
 FUNCTION left_panel_base(panel_width, panel_height) {
@@ -611,17 +1408,13 @@ FUNCTION files_list() {
         element: []
         direction: Column
         gap: 2
-        style: [width: Fill, height: Fill, paint: False, scroll_y: True, scrollbars: True]
+        style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
         items: LIST {
-            tree_section_header(label_text: TEXT { Fixtures })
+            tree_section_header(label_text: TEXT { Files })
+            external_file_row()
             file_counter_button()
-            tree_child_row(label_text: TEXT { top.cpu 8 signals }, indent_width: 20)
-            tree_child_row(label_text: TEXT { top.uart 5 signals }, indent_width: 20)
-            tree_child_row(label_text: TEXT { top.analog 2 signals }, indent_width: 20)
             file_uart_compare_button()
-            tree_child_row(label_text: TEXT { top.uart compare page }, indent_width: 20)
             file_ghw_button()
-            tree_child_row(label_text: TEXT { ghw.simple 4 signals }, indent_width: 20)
             tree_section_header(label_text: TEXT { Scopes })
             scope_cpu_button()
             scope_cpu_signal_rows()
@@ -629,6 +1422,13 @@ FUNCTION files_list() {
             scope_analog_button()
         }
     )
+}
+
+FUNCTION external_file_row() {
+    PASSED.store.external_file_active == TEXT { Yes } |> WHEN {
+        True => tree_row(label_text: PASSED.store.external_file_tree_label, indent_width: 0, selected: True)
+        __ => NoElement
+    }
 }
 
 FUNCTION file_load_button() {
@@ -675,7 +1475,7 @@ FUNCTION file_counter_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_counter_file], hovered: PASSED.store.elements.select_counter_file]
         style: [width: Fill, height: 22, paint: False]
-        label: tree_row(label_text: TEXT { - counter.vcd }, indent_width: 0, selected: PASSED.store.active_file == TEXT { counter.vcd })
+        label: tree_row(label_text: TEXT { - simple.vcd }, indent_width: 0, selected: PASSED.store.active_file == TEXT { simple.vcd })
     )
 }
 
@@ -683,7 +1483,7 @@ FUNCTION file_uart_compare_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_uart_compare_file], hovered: PASSED.store.elements.select_uart_compare_file]
         style: [width: Fill, height: 22, paint: False]
-        label: tree_row(label_text: TEXT { - uart_compare.fst }, indent_width: 0, selected: PASSED.store.active_file == TEXT { uart_compare.fst })
+        label: tree_row(label_text: TEXT { - wave_27.fst }, indent_width: 0, selected: PASSED.store.active_file == TEXT { wave_27.fst })
     )
 }
 
@@ -739,7 +1539,7 @@ FUNCTION tree_row(label_text, indent_width, selected) {
         element: []
         style: [
             width: Fill
-            height: 21
+            height: 22
             padding: [left: 5, right: 6]
             rounded_corners: 4
             background: [color: selected |> WHEN {
@@ -775,28 +1575,82 @@ FUNCTION tree_row(label_text, indent_width, selected) {
             items: LIST {
                 tree_indent(width_value: indent_width)
                 tree_bullet(selected: selected)
-                Scene/Element/text(
-                    element: []
-                    style: [
-                        ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
-                        width: Fill
-                        height: Fill
-                        vertical_align: Center
-                        color: selected |> WHEN {
-                            True => PASSED.store.mode |> WHEN {
-                                Dark => TEXT { #e0f2fe }
-                                Light => TEXT { #10243a }
-                            }
-                            False => PASSED.store.mode |> WHEN {
-                                Dark => TEXT { #dbeafe }
-                                Light => TEXT { #172033 }
-                            }
-                        }
-                    ]
-                    text: label_text
-                )
+                tree_row_text(label_text: label_text, selected: selected)
             }
         )
+    )
+}
+
+FUNCTION tree_row_text(label_text, selected) {
+    selected |> WHEN {
+        True => PASSED.store.mode |> WHEN {
+            Dark => tree_row_text_selected_dark(label_text: label_text)
+            Light => tree_row_text_selected_light(label_text: label_text)
+        }
+        False => PASSED.store.mode |> WHEN {
+            Dark => tree_row_text_resting_dark(label_text: label_text)
+            Light => tree_row_text_resting_light(label_text: label_text)
+        }
+    }
+}
+
+FUNCTION tree_row_text_selected_dark(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 12
+            color: TEXT { #f4fbff }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION tree_row_text_selected_light(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 12
+            color: TEXT { #10243a }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION tree_row_text_resting_dark(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 12
+            color: TEXT { #eaf3ff }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION tree_row_text_resting_light(label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: Fill
+            height: Fill
+            vertical_align: Center
+            size: 12
+            color: TEXT { #172033 }
+        ]
+        text: label_text
     )
 }
 
@@ -829,7 +1683,7 @@ FUNCTION tree_bullet(selected) {
                     Light => TEXT { #2474bb }
                 }
                 False => PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #334761 }
+                    Dark => TEXT { #5f7898 }
                     Light => TEXT { #b8cbe0 }
                 }
             }]
@@ -1178,11 +2032,12 @@ FUNCTION timeline_toolbar() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 6
-        style: [width: Fill, height: 94, paint: False]
+        gap: 5
+        style: [width: Fill, height: 100, paint: False]
         items: LIST {
             timeline_navigation_controls()
-            selected_row_controls()
+            selected_data_controls()
+            selected_marker_controls()
             analog_limit_controls()
             keyboard_capture()
         }
@@ -1193,12 +2048,20 @@ FUNCTION timeline_navigation_controls() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 14
+        gap: 24
         style: [width: Fill, height: 28, paint: False, align: [row: Center]]
         items: LIST {
-            zoom_pan_controls()
-            cursor_marker_controls()
-            group_format_controls()
+            zoom_in_button()
+            zoom_out_button()
+            zoom_reset_button()
+            pan_left_button()
+            pan_right_button()
+            cursor_left_button()
+            cursor_right_button()
+            marker_button()
+            create_group_button()
+            group_button()
+            format_button()
         }
     )
 }
@@ -1208,7 +2071,7 @@ FUNCTION zoom_pan_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 232)
+        style: control_group_style(group_width: 246)
         items: LIST {
             zoom_in_button()
             zoom_out_button()
@@ -1224,7 +2087,7 @@ FUNCTION cursor_marker_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 138)
+        style: control_group_style(group_width: 150)
         items: LIST {
             cursor_left_button()
             cursor_right_button()
@@ -1238,7 +2101,7 @@ FUNCTION group_format_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 212)
+        style: control_group_style(group_width: 220)
         items: LIST {
             create_group_button()
             group_button()
@@ -1247,17 +2110,39 @@ FUNCTION group_format_controls() {
     )
 }
 
-FUNCTION selected_row_controls() {
+FUNCTION selected_data_controls() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 14
+        gap: 18
         style: [width: Fill, height: 28, paint: False, align: [row: Center]]
         items: LIST {
-            row_membership_controls()
-            row_order_controls()
-            individual_remove_controls()
-            marker_edit_controls()
+            remove_data_button()
+            restore_data_button()
+            data_up_button()
+            data_down_button()
+            selected_signal_remove_clk_button()
+            selected_signal_remove_reset_button()
+            selected_signal_remove_data_button()
+            selected_signal_remove_data_valid_button()
+            selected_signal_remove_data_ready_button()
+            selected_signal_remove_state_button()
+            selected_signal_remove_error_count_button()
+            selected_signal_remove_temperature_button()
+        }
+    )
+}
+
+FUNCTION selected_marker_controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 18
+        style: [width: Fill, height: 28, paint: False, align: [row: Center]]
+        items: LIST {
+            rename_marker_button()
+            jump_marker_button()
+            remove_marker_button()
             marker_rows_panel()
         }
     )
@@ -1268,7 +2153,7 @@ FUNCTION row_membership_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 168)
+        style: control_group_style(group_width: 180)
         items: LIST {
             remove_data_button()
             restore_data_button()
@@ -1281,7 +2166,7 @@ FUNCTION row_order_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 118)
+        style: control_group_style(group_width: 132)
         items: LIST {
             data_up_button()
             data_down_button()
@@ -1298,7 +2183,7 @@ FUNCTION individual_remove_counter_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 386)
+        style: control_group_style(group_width: 394)
         items: LIST {
             selected_signal_remove_clk_button()
             selected_signal_remove_reset_button()
@@ -1346,7 +2231,7 @@ FUNCTION marker_edit_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 178)
+        style: control_group_style(group_width: 192)
         items: LIST {
             rename_marker_button()
             jump_marker_button()
@@ -1361,13 +2246,13 @@ FUNCTION marker_rows_panel() {
             element: []
             direction: Row
             gap: 4
-            style: [width: 220, height: 28, paint: False, scroll_x: True, scrollbars: True]
+            style: [width: 180, height: 28, paint: False, scroll_x: True, scrollbars: True]
             items:
                 PASSED.store.markers |> List/map(marker, new: marker_row(marker: marker))
         )
         False => Scene/Element/label(
             element: []
-            style: [width: 220, height: 28, paint: False]
+            style: [width: 180, height: 28, paint: False]
             label: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
         )
     }
@@ -1411,7 +2296,9 @@ FUNCTION analog_limit_controls() {
         gap: 12
         style: [width: Fill, height: 28, paint: False, align: [row: Center]]
         items: LIST {
-            analog_limit_button_group()
+            analog_auto_button()
+            analog_manual_button()
+            analog_invalid_button()
             analog_limit_summary_text()
         }
     )
@@ -1422,7 +2309,7 @@ FUNCTION analog_limit_button_group() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 186)
+        style: control_group_style(group_width: 198)
         items: LIST {
             analog_auto_button()
             analog_manual_button()
@@ -1684,10 +2571,10 @@ FUNCTION waveform_rows_expanded() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 1
+        gap: 0
         style: [
             width: Fill
-            height: 360
+            height: 124
             padding: 0
             rounded_corners: 0
             scroll_y: True
@@ -1705,17 +2592,59 @@ FUNCTION waveform_rows_expanded() {
 }
 
 FUNCTION selected_waveform_row(row) {
-    waveform_row(signal: row)
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [width: Fill, height: PASSED.store.row_height + 3, paint: False]
+        items: LIST {
+            waveform_row(signal: row)
+            signal_row_divider(signal: row)
+        }
+    )
 }
 
-FUNCTION waveform_cursor_line() {
-    Scene/Element/block(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: TEXT { 42 ns }]
+FUNCTION waveform_cursor_line(segment) {
+    Scene/Element/stripe(
+        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: PASSED.store.keyboard_cursor_label]
+        direction: Row
+        gap: 0
         style: [
-            width: 2
+            width: segment.width + 3
+            height: Fill
+            paint: False
+        ]
+        items: LIST {
+            waveform_cursor_spacer(width_value: segment.width)
+            waveform_cursor_line_core()
+        }
+    )
+}
+
+FUNCTION waveform_cursor_spacer(width_value) {
+    Scene/Element/block(
+        element: []
+        style: [width: width_value, height: Fill, paint: False]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_cursor_line_core() {
+    Scene/Element/block(
+        element: [target: PASSED.store.keyboard_cursor_label]
+        style: [
+            width: 3
             height: Fill
             rounded_corners: 1
-            background: [color: TEXT { #FDE68A }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #FDE68A }
+                Light => TEXT { #B45309 }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #FEF3C7 }
+                Light => TEXT { #FDE68A }
+            }]
+            glow: [color: TEXT { #FDE68A99 }, intensity: 0.22]
             material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
@@ -1761,7 +2690,21 @@ FUNCTION waveform_row(signal) {
             ]
             items: LIST {
                 signal_select_button(signal: signal)
-                value_pill(signal: signal)
+                variables_name_divider()
+                signal.id == TEXT { clk } |> WHEN {
+                    True => value_pill_text(value_text: NovyModel/selected_clk_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
+                    False => signal.id == TEXT { reset_n } |> WHEN {
+                        True => value_pill_text(value_text: NovyModel/selected_reset_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
+                        False => signal.id == TEXT { data_bus } |> WHEN {
+                            True => value_pill_text(value_text: PASSED.store.data_bus_rendered_value)
+                            False => signal.id == TEXT { temperature } |> WHEN {
+                                True => value_pill_text(value_text: PASSED.store.temperature_rendered_value)
+                                False => value_pill_text(value_text: NovyModel/cursor_signal_value(signal_id: signal.id, cursor: PASSED.store.cursor_position, format: PASSED.store.value_format, fallback: signal.current_value))
+                            }
+                        }
+                    }
+                }
+                variables_value_divider()
                 wave_area(signal: signal)
             }
         )
@@ -1772,7 +2715,7 @@ FUNCTION signal_select_button(signal) {
     Scene/Element/label(
         element: []
         style: [
-            width: 145
+            width: PASSED.store.selected_name_column_width
             height: Fill
             padding: [left: 10, right: 8]
             rounded_corners: 0
@@ -1827,7 +2770,7 @@ FUNCTION selected_signal_remove_button(signal) {
 FUNCTION selected_signal_remove_clk_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_clk], hovered: PASSED.store.elements.selected_remove_clk]
-        style: compact_button_style(button_width: 42, hovered: element.hovered)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { clk })
     )
 }
@@ -1835,7 +2778,7 @@ FUNCTION selected_signal_remove_clk_button() {
 FUNCTION selected_signal_remove_reset_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_reset], hovered: PASSED.store.elements.selected_remove_reset]
-        style: compact_button_style(button_width: 42, hovered: element.hovered)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: TEXT { rst })
     )
 }
@@ -1843,7 +2786,7 @@ FUNCTION selected_signal_remove_reset_button() {
 FUNCTION selected_signal_remove_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_data], hovered: PASSED.store.elements.selected_remove_data]
-        style: compact_button_style(button_width: 48, hovered: element.hovered)
+        style: compact_button_style(button_width: 52, hovered: element.hovered)
         label: button_label(button_text: TEXT { data })
     )
 }
@@ -1867,7 +2810,7 @@ FUNCTION selected_signal_remove_data_ready_button() {
 FUNCTION selected_signal_remove_state_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_state], hovered: PASSED.store.elements.selected_remove_state]
-        style: compact_button_style(button_width: 36, hovered: element.hovered)
+        style: compact_button_style(button_width: 40, hovered: element.hovered)
         label: button_label(button_text: TEXT { st })
     )
 }
@@ -1883,7 +2826,7 @@ FUNCTION selected_signal_remove_error_count_button() {
 FUNCTION selected_signal_remove_temperature_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_temperature], hovered: PASSED.store.elements.selected_remove_temperature]
-        style: compact_button_style(button_width: 42, hovered: element.hovered)
+        style: compact_button_style(button_width: 46, hovered: element.hovered)
         label: button_label(button_text: TEXT { tmp })
     )
 }
@@ -1944,12 +2887,19 @@ FUNCTION selected_signal_remove_ghw_state_button() {
     )
 }
 
-FUNCTION value_pill(signal) {
+FUNCTION value_pill_text(value_text) {
     Scene/Element/label(
         element: []
         style: [
-            width: 86
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+            width: PASSED.store.selected_value_column_width
             height: Fill
+            center: True
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
+            }
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
@@ -1961,27 +2911,7 @@ FUNCTION value_pill(signal) {
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
-        label: Scene/Element/text(
-            element: []
-            style: [
-                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
-                width: Fill
-                height: Fill
-                center: True
-                vertical_align: Center
-                color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #dbeafe }
-                    Light => TEXT { #172033 }
-                }
-            ]
-            text: signal.id |> WHEN {
-                TEXT { clk } => NovyFixtures/selected_clk_value(format: PASSED.store.value_format)
-                TEXT { reset_n } => NovyFixtures/selected_reset_value(format: PASSED.store.value_format)
-                TEXT { data_bus } => PASSED.store.data_bus_rendered_value
-                TEXT { temperature } => PASSED.store.temperature_rendered_value
-                __ => signal.current_value
-            }
-        )
+        text: value_text
     )
 }
 
@@ -2066,7 +2996,7 @@ FUNCTION waveform_marker_list_line(marker) {
 
 FUNCTION waveform_segment(segment) {
     segment.state |> WHEN {
-        CursorLine => waveform_cursor_line()
+        CursorLine => waveform_cursor_line(segment: segment)
         MarkerLine => waveform_marker_line()
         High => waveform_segment_blue(segment: segment)
         Low => waveform_segment_dark(segment: segment)
@@ -2305,7 +3235,7 @@ FUNCTION waveform_trace_cell_pale_base(segment) {
 }
 
 FUNCTION variables_panel() {
-    variables_panel_base(panel_width: PASSED.store.variables_panel_width, panel_height: Fill)
+    variables_panel_base(panel_width: Fill, panel_height: Fill)
 }
 
 FUNCTION variables_panel_docked() {
@@ -2367,7 +3297,7 @@ FUNCTION variables_virtual_list() {
         element: []
         direction: Column
         gap: 4
-        style: [width: Fill, height: 150, paint: False, scroll_y: True, scrollbars: True]
+        style: [width: Fill, height: 112, paint: False, scroll_y: True, scrollbars: True]
         items:
             PASSED.store.variable_rows |> List/map(row, new: variables_virtual_row(row: row))
     )
@@ -2879,7 +3809,7 @@ FUNCTION inspector_strip() {
                 items: LIST {
                     compact_inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label, row_width: 76)
                     compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
-                    compact_inspector_row(row_label: TEXT { Fixture }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
+                    compact_inspector_row(row_label: TEXT { Response }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
                     compact_inspector_row(row_label: TEXT { Match }, row_value: PASSED.store.bridge_response_status_compact_label, row_width: 82)
                 }
             )
@@ -2908,9 +3838,9 @@ FUNCTION inspector_panel() {
             inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.keyboard_viewport_label)
             inspector_row(row_label: TEXT { Open result }, row_value: PASSED.store.bridge_waveform_ref)
             inspector_row(row_label: TEXT { Hierarchy }, row_value: PASSED.store.bridge_hierarchy_page_label)
-            inspector_row(row_label: TEXT { Fixture request }, row_value: PASSED.store.bridge_request_label)
-            inspector_row(row_label: TEXT { Fixture page }, row_value: PASSED.store.bridge_response_fingerprint)
-            inspector_row(row_label: TEXT { Fixture match }, row_value: PASSED.store.bridge_response_status)
+            inspector_row(row_label: TEXT { Page request }, row_value: PASSED.store.bridge_request_label)
+            inspector_row(row_label: TEXT { Page response }, row_value: PASSED.store.bridge_response_fingerprint)
+            inspector_row(row_label: TEXT { Page match }, row_value: PASSED.store.bridge_response_status)
             inspector_row(row_label: TEXT { Cursor values }, row_value: PASSED.store.bridge_cursor_values_label)
             inspector_row(row_label: TEXT { Bridge policy }, row_value: PASSED.store.bridge_data_policy)
             inspector_row(row_label: TEXT { Payload bound }, row_value: PASSED.store.bridge_payload_bound_label)
@@ -3343,7 +4273,7 @@ FUNCTION probe_button_pressed_style() {
 
 FUNCTION format_button_pressed_style() {
     [
-        width: 48
+        width: 112
         height: 28
         rounded_corners: 8
         spring_range: 3
@@ -3380,6 +4310,53 @@ FUNCTION header_load_button() {
     )
 }
 
+FUNCTION header_workspace_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.open_workspace_dialog]
+            hovered: PASSED.store.elements.open_workspace_dialog
+        ]
+        style: compact_button_style(button_width: 142, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Open Workspace... })
+    )
+}
+
+FUNCTION header_workspace_path() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            padding: [left: 10, right: 10]
+            rounded_corners: 7
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #142235 }
+                Light => TEXT { #eef5fc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #365a83 }
+                Light => TEXT { #b7c9dd }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                width: Fill
+                height: Fill
+                vertical_align: Center
+                size: 10
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #d7e8ff }
+                    Light => TEXT { #24364b }
+                }
+            ]
+            text: PASSED.store.workspace_header_path
+        )
+    )
+}
+
 FUNCTION header_empty_button() {
     Scene/Element/button(
         element: [
@@ -3404,7 +4381,7 @@ FUNCTION header_panel_resize_controls() {
         element: []
         direction: Row
         gap: 4
-        style: [width: 244, height: Fill, paint: False]
+        style: [width: 214, height: Fill, paint: False]
         items: LIST {
             header_files_wider_button()
             header_variables_wider_button()
@@ -3420,7 +4397,7 @@ FUNCTION header_files_wider_button() {
             event: [press: PASSED.store.elements.panels_files_wider]
             hovered: PASSED.store.elements.panels_files_wider
         ]
-        style: compact_button_style(button_width: 58, hovered: element.hovered)
+        style: compact_button_style(button_width: 52, hovered: element.hovered)
         label: button_label(button_text: TEXT { Files+ })
     )
 }
@@ -3431,7 +4408,7 @@ FUNCTION header_variables_wider_button() {
             event: [press: PASSED.store.elements.panels_variables_wider]
             hovered: PASSED.store.elements.panels_variables_wider
         ]
-        style: compact_button_style(button_width: 58, hovered: element.hovered)
+        style: compact_button_style(button_width: 52, hovered: element.hovered)
         label: button_label(button_text: TEXT { Vars+ })
     )
 }
@@ -3453,7 +4430,7 @@ FUNCTION header_panel_arrangement_button() {
             event: [press: PASSED.store.elements.panels_toggle_arrangement]
             hovered: PASSED.store.elements.panels_toggle_arrangement
         ]
-        style: compact_button_style(button_width: 58, hovered: element.hovered)
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
         label: button_label(button_text: PASSED.store.panel_arrangement_button_label)
     )
 }
@@ -3483,22 +4460,22 @@ FUNCTION header_mode_to_dark_button() {
 FUNCTION empty_load_button() {
     Scene/Element/button(
         element: [
-            event: [press: PASSED.store.elements.load_fixture]
-            hovered: PASSED.store.elements.load_fixture
+            event: [press: PASSED.store.elements.load_default_file]
+            hovered: PASSED.store.elements.load_default_file
         ]
-        style: compact_button_style(button_width: 96, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Load fixture })
+        style: compact_button_style(button_width: 104, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Open default })
     )
 }
 
 FUNCTION empty_open_button() {
     Scene/Element/button(
         element: [
-            event: [press: PASSED.store.elements.begin_load_fixture]
-            hovered: PASSED.store.elements.begin_load_fixture
+            event: [press: PASSED.store.elements.open_load_files_dialog]
+            hovered: PASSED.store.elements.open_load_files_dialog
         ]
         style: compact_button_style(button_width: 96, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Open fixture })
+        label: button_label(button_text: TEXT { Open file })
     )
 }
 
@@ -3572,7 +4549,7 @@ FUNCTION cursor_right_button() {
 FUNCTION marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_toggle], hovered: PASSED.store.elements.marker_toggle]
-        style: compact_button_style(button_width: 42, hovered: element.hovered)
+        style: compact_button_style(button_width: 50, hovered: element.hovered)
         label: button_label(button_text: TEXT { M })
     )
 }
@@ -3580,48 +4557,48 @@ FUNCTION marker_button() {
 FUNCTION create_group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_create], hovered: PASSED.store.elements.group_create]
-        style: compact_button_style(button_width: 76, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [NewGrp] })
+        style: compact_button_style(button_width: 104, hovered: element.hovered)
+        label: button_label(button_text: TEXT { New group })
     )
 }
 
 FUNCTION group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
-        style: compact_button_style(button_width: 72, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Group] })
+        style: compact_button_style(button_width: 82, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Group })
     )
 }
 
 FUNCTION remove_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_data], hovered: PASSED.store.elements.selected_remove_data]
-        style: compact_button_style(button_width: 78, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Rm data] })
+        style: compact_button_style(button_width: 112, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Remove data })
     )
 }
 
 FUNCTION restore_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_restore_data], hovered: PASSED.store.elements.selected_restore_data]
-        style: compact_button_style(button_width: 82, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Restore] })
+        style: compact_button_style(button_width: 88, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Restore })
     )
 }
 
 FUNCTION data_up_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_up], hovered: PASSED.store.elements.selected_data_up]
-        style: compact_button_style(button_width: 50, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Up] })
+        style: compact_button_style(button_width: 44, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Up })
     )
 }
 
 FUNCTION data_down_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_down], hovered: PASSED.store.elements.selected_data_down]
-        style: compact_button_style(button_width: 62, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Down] })
+        style: compact_button_style(button_width: 60, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Down })
     )
 }
 
@@ -3629,47 +4606,47 @@ FUNCTION analog_auto_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_auto], hovered: PASSED.store.elements.analog_limits_auto]
         style: compact_button_style(button_width: 58, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Auto] })
+        label: button_label(button_text: TEXT { Auto })
     )
 }
 
 FUNCTION analog_manual_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_manual], hovered: PASSED.store.elements.analog_limits_manual]
-        style: compact_button_style(button_width: 58, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Man] })
+        style: compact_button_style(button_width: 76, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Manual })
     )
 }
 
 FUNCTION analog_invalid_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_invalid], hovered: PASSED.store.elements.analog_limits_invalid]
-        style: compact_button_style(button_width: 58, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Bad] })
+        style: compact_button_style(button_width: 72, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Invalid })
     )
 }
 
 FUNCTION rename_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_rename], hovered: PASSED.store.elements.marker_rename]
-        style: compact_button_style(button_width: 52, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Ren] })
+        style: compact_button_style(button_width: 80, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Rename })
     )
 }
 
 FUNCTION jump_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_jump], hovered: PASSED.store.elements.marker_jump]
-        style: compact_button_style(button_width: 62, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Jump] })
+        style: compact_button_style(button_width: 64, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Jump })
     )
 }
 
 FUNCTION remove_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_remove], hovered: PASSED.store.elements.marker_remove]
-        style: compact_button_style(button_width: 52, hovered: element.hovered)
-        label: button_label(button_text: TEXT { [Del] })
+        style: compact_button_style(button_width: 70, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Delete })
     )
 }
 
@@ -3683,8 +4660,8 @@ FUNCTION format_button() {
 FUNCTION format_button_resting() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
-        style: compact_button_style(button_width: 48, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Fmt })
+        style: compact_button_style(button_width: 112, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Next format })
     )
 }
 
@@ -3692,7 +4669,7 @@ FUNCTION format_button_pressed() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
         style: format_button_pressed_style()
-        label: button_label(button_text: TEXT { Fmt })
+        label: button_label(button_text: TEXT { Next format })
     )
 }
 

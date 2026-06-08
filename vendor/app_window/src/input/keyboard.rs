@@ -92,8 +92,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
 
 /// Keyboard key definitions and enumerations.
 pub mod key;

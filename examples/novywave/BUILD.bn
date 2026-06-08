@@ -1,4 +1,4 @@
--- Generates fixture assets for the NovyWave playground example.
+-- Generates static assets for the NovyWave playground example.
 -- This is intentionally generic build glue, not a port of NovyWave Rust code.
 
 icons_directory: TEXT { ./assets/icons }

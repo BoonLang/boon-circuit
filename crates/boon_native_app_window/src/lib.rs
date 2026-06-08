@@ -430,6 +430,7 @@ impl NativePollResult {
 pub enum NativeCursorIcon {
     Default,
     ColumnResize,
+    RowResize,
     Pointer,
     Text,
 }
@@ -1918,6 +1919,7 @@ fn apply_native_cursor_icon(surface: &app_window::surface::Surface, icon: Native
         let surface_icon = match icon {
             NativeCursorIcon::Default => app_window::surface::SurfaceCursorIcon::Default,
             NativeCursorIcon::ColumnResize => app_window::surface::SurfaceCursorIcon::ColumnResize,
+            NativeCursorIcon::RowResize => app_window::surface::SurfaceCursorIcon::RowResize,
             NativeCursorIcon::Pointer => app_window::surface::SurfaceCursorIcon::Pointer,
             NativeCursorIcon::Text => app_window::surface::SurfaceCursorIcon::Text,
         };

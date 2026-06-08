@@ -1210,6 +1210,10 @@ struct TextRunPlacementSignature {
     align: TextAlign,
     vertical_align: TextVerticalAlign,
     rotate_degrees: u32,
+    clip_x: Option<u32>,
+    clip_y: Option<u32>,
+    clip_width: Option<u32>,
+    clip_height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1277,6 +1281,10 @@ impl TextRunPlacementSignature {
             align: run.align,
             vertical_align: run.vertical_align,
             rotate_degrees: run.rotate_degrees,
+            clip_x: run.clip.map(|clip| clip.x.to_bits()),
+            clip_y: run.clip.map(|clip| clip.y.to_bits()),
+            clip_width: run.clip.map(|clip| clip.width.to_bits()),
+            clip_height: run.clip.map(|clip| clip.height.to_bits()),
         }
     }
 }
@@ -1748,6 +1756,7 @@ fn editor_font_system() -> FontSystem {
 struct TextRun {
     node: DocumentNodeId,
     bounds: Rect,
+    clip: Option<Rect>,
     text: String,
     rich_spans: Vec<RichTextSpan>,
     font_family: String,
@@ -1791,6 +1800,9 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         .iter()
         .filter(|item| rect_intersects(item.bounds, viewport))
     {
+        let Some(_) = clipped_item_bounds(item) else {
+            continue;
+        };
         let size = style_number(&item.style, "size").unwrap_or(14.0);
         let line_height = style_line_height(&item.style, size);
         let raw_text = item.text.as_deref().unwrap_or_default();
@@ -1857,6 +1869,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         runs.push(TextRun {
             node: item.node.clone(),
             bounds: text_content_bounds_for_item(item),
+            clip: clip_rect_for_style(&item.style),
             text,
             rich_spans,
             font_family: font_family.to_owned(),
@@ -1949,6 +1962,7 @@ fn editor_type_hint_runs(item: &DisplayItem, _width: u32, _height: u32) -> Vec<T
                     width: available_width,
                     height: item.bounds.height,
                 },
+                clip: clip_rect_for_style(&item.style),
                 text,
                 rich_spans: Vec::new(),
                 font_family: font_family.to_owned(),
@@ -2556,13 +2570,31 @@ fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
 }
 
 fn text_bounds(run: &TextRun, width: u32, height: u32) -> TextBounds {
-    let bounds = run.bounds;
+    let bounds = run
+        .clip
+        .and_then(|clip| rect_intersection(run.bounds, clip))
+        .unwrap_or(run.bounds);
     TextBounds {
         left: (bounds.x - run.text_clip_padding).max(0.0) as i32,
         top: (bounds.y - run.text_clip_padding).max(0.0) as i32,
         right: (bounds.x + bounds.width + run.text_clip_padding).clamp(0.0, width as f32) as i32,
         bottom: (bounds.y + bounds.height + run.text_clip_padding).clamp(0.0, height as f32) as i32,
     }
+}
+
+fn clipped_item_bounds(item: &DisplayItem) -> Option<Rect> {
+    clip_rect_for_style(&item.style).map_or(Some(item.bounds), |clip| {
+        rect_intersection(item.bounds, clip)
+    })
+}
+
+fn clip_rect_for_style(style: &StyleMap) -> Option<Rect> {
+    Some(Rect {
+        x: style_number(style, "__clip_x")?,
+        y: style_number(style, "__clip_y")?,
+        width: style_number(style, "__clip_width")?,
+        height: style_number(style, "__clip_height")?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2630,6 +2662,9 @@ fn rect_vertices(
         .enumerate()
     {
         metrics.visible_display_item_count += 1;
+        let Some(item_bounds) = clipped_item_bounds(item) else {
+            continue;
+        };
         if style_bool(&item.style, "paint") == Some(false)
             || (style_bool(&item.style, "__hover_visible") == Some(true)
                 && style_bool(&item.style, "__hover_paint") != Some(true))
@@ -2639,7 +2674,7 @@ fn rect_vertices(
         let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
         push_shadows(
             &mut builder,
-            item.bounds,
+            item_bounds,
             width,
             height,
             &item.style,
@@ -2647,7 +2682,7 @@ fn rect_vertices(
         );
         metrics.rendered_rect_count += push_frosted_material_layers(
             &mut builder,
-            item.bounds,
+            item_bounds,
             width,
             height,
             &item.style,
@@ -2659,7 +2694,7 @@ fn rect_vertices(
         let fill = material_adjusted_fill(fill, &item.style);
         push_styled_rect(
             &mut builder,
-            item.bounds,
+            item_bounds,
             width,
             height,
             fill,
@@ -2668,18 +2703,18 @@ fn rect_vertices(
         metrics.rendered_rect_count += 1;
         push_material_highlights(
             &mut builder,
-            item.bounds,
+            item_bounds,
             width,
             height,
             &item.style,
             border_radius,
         );
         if let Some(asset_url) = style_asset_url(&item.style) {
-            push_asset_rect(&mut builder, item.bounds, width, height, asset_url);
+            push_asset_rect(&mut builder, item_bounds, width, height, asset_url);
             metrics.rendered_rect_count += 1;
         }
         if let Some(decoration) =
-            border_decoration_for_style(item.bounds, &item.style, border_radius)
+            border_decoration_for_style(item_bounds, &item.style, border_radius)
         {
             metrics.rendered_rect_count += decoration.metric_rect_count();
             border_decorations.push(decoration);
@@ -5064,6 +5099,7 @@ mod tests {
                 width: 45.0,
                 height: 65.0,
             },
+            clip: None,
             text: "❯".to_owned(),
             rich_spans: Vec::new(),
             font_family: "Helvetica Neue, Helvetica, Arial, SansSerif".to_owned(),
@@ -6026,6 +6062,7 @@ mod tests {
                 width: 40.0,
                 height: 10.0,
             },
+            clip: None,
             text: "Kavík".to_owned(),
             rich_spans: Vec::new(),
             font_family: "Nimbus Sans".to_owned(),

@@ -6,8 +6,9 @@ use bitvec::prelude::*;
 use boon_ir::{
     DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListAppendFieldValue, ListId,
     ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, SourceId,
-    SourcePayloadField, TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower,
-    lower_profiled, lower_runtime_profiled, verify_hidden_identity, verify_static_schedule,
+    SourcePayloadField, TypedProgram, UpdateExpression, UpdateMatchArm, UpdateValueExpression,
+    UpdateValueMatchArm, debug_tables, lower, lower_profiled, lower_runtime_profiled,
+    verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, DocumentAst,
@@ -2298,11 +2299,28 @@ impl RuntimeSymbols {
                     symbols.intern(left);
                     symbols.intern(right);
                 }
+                UpdateExpression::MatchNumberInfixConst {
+                    left, right, arms, ..
+                } => {
+                    symbols.intern(left);
+                    symbols.intern(right);
+                    for arm in arms {
+                        symbols.intern(&arm.pattern);
+                        intern_update_value_expression_symbols(&mut symbols, &arm.output);
+                    }
+                }
                 UpdateExpression::MatchConst { input, arms } => {
                     symbols.intern(input);
                     for arm in arms {
                         symbols.intern(&arm.pattern);
                         symbols.intern(&arm.output);
+                    }
+                }
+                UpdateExpression::MatchValueConst { input, arms } => {
+                    symbols.intern(input);
+                    for arm in arms {
+                        symbols.intern(&arm.pattern);
+                        intern_update_value_expression_symbols(&mut symbols, &arm.output);
                     }
                 }
                 UpdateExpression::Unknown { summary } => {
@@ -2378,6 +2396,41 @@ impl RuntimeSymbols {
 
     fn len(&self) -> usize {
         self.paths.len()
+    }
+}
+
+fn intern_update_value_expression_symbols(
+    symbols: &mut RuntimeSymbols,
+    value: &UpdateValueExpression,
+) {
+    match value {
+        UpdateValueExpression::Const { value } => {
+            symbols.intern(value);
+        }
+        UpdateValueExpression::ReadPath { path } => {
+            symbols.intern(path);
+        }
+        UpdateValueExpression::MatchConst { input, arms } => {
+            symbols.intern(input);
+            for arm in arms {
+                symbols.intern(&arm.pattern);
+                intern_update_value_expression_symbols(symbols, &arm.output);
+            }
+        }
+        UpdateValueExpression::NumberInfix { left, right, .. } => {
+            symbols.intern(left);
+            symbols.intern(right);
+        }
+        UpdateValueExpression::MatchNumberInfixConst {
+            left, right, arms, ..
+        } => {
+            symbols.intern(left);
+            symbols.intern(right);
+            for arm in arms {
+                symbols.intern(&arm.pattern);
+                intern_update_value_expression_symbols(symbols, &arm.output);
+            }
+        }
     }
 }
 
@@ -5888,6 +5941,12 @@ impl GenericScheduledRuntime {
             |path| self.textlike_with_row_context(path, input.list.as_deref(), input.index),
         )?
         else {
+            if self
+                .scalar_equations
+                .has_root_text_branch(target, input.source)
+            {
+                return Ok(None);
+            }
             return Err(format!(
                 "no supported scalar update branch for `{target}` from `{}`",
                 input.source
@@ -5970,7 +6029,7 @@ impl GenericScheduledRuntime {
         &mut self,
         list: &str,
         source: &str,
-        key: Option<&str>,
+        key: Option<&'a str>,
         text: Option<&'a str>,
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
         let source_paths = self.list_source_bindings.source_paths(list)?;
@@ -6521,6 +6580,10 @@ impl GenericScheduledRuntime {
             let input = self.eval_first_arg(args, frame)?;
             return self.eval_while(input, children, frame);
         }
+        if self.children_are_match_arms(children) {
+            let input = self.eval_expr(expr_id, frame)?;
+            return self.eval_while(input, children, frame);
+        }
         if let AstExprKind::Record(fields) | AstExprKind::Object(fields) = &expr.kind {
             return self.eval_object_expr(fields, Some(children), frame);
         }
@@ -6594,6 +6657,15 @@ impl GenericScheduledRuntime {
             .collect()
     }
 
+    fn children_are_match_arms(&self, children: &[AstStatement]) -> bool {
+        children.iter().any(|child| {
+            child
+                .expr
+                .and_then(|expr_id| self.generic_derived.expressions.get(expr_id))
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
+        })
+    }
+
     fn eval_expr(
         &mut self,
         expr_id: usize,
@@ -6651,7 +6723,13 @@ impl GenericScheduledRuntime {
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
                 self.eval_object_expr(&fields, None, frame)
             }
-            AstExprKind::ListLiteral { .. } => Ok(BoonValue::List(Vec::new())),
+            AstExprKind::ListLiteral { items, .. } => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(item, frame)?);
+                }
+                Ok(BoonValue::List(values))
+            }
             AstExprKind::Source
             | AstExprKind::Hold { .. }
             | AstExprKind::Latest
@@ -9060,6 +9138,19 @@ fn generic_pattern_binding(
     if pattern == ["__"] {
         return Some(None);
     }
+    if let Some(item_patterns) = generic_list_pattern_items(pattern) {
+        let BoonValue::List(values) = input else {
+            return None;
+        };
+        return (item_patterns.len() == values.len()
+            && item_patterns
+                .iter()
+                .zip(values)
+                .all(|(item_pattern, value)| {
+                    generic_pattern_binding(item_pattern, value).is_some()
+                }))
+        .then_some(None);
+    }
     if pattern.len() == 1 {
         let token = pattern[0].as_str();
         if token == "True" {
@@ -9094,6 +9185,43 @@ fn generic_pattern_binding(
             .map(|_| None);
     }
     None
+}
+
+fn generic_list_pattern_items(pattern: &[String]) -> Option<Vec<Vec<String>>> {
+    if pattern.first().map(String::as_str) != Some("LIST") {
+        return None;
+    }
+    let open = pattern.iter().position(|token| token == "{")?;
+    let close = pattern.iter().rposition(|token| token == "}")?;
+    if close <= open {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+    for token in &pattern[open + 1..close] {
+        match token.as_str() {
+            "," if depth == 0 => {
+                if !current.is_empty() {
+                    items.push(current);
+                    current = Vec::new();
+                }
+            }
+            "{" => {
+                depth = depth.saturating_add(1);
+                current.push(token.clone());
+            }
+            "}" => {
+                depth = depth.saturating_sub(1);
+                current.push(token.clone());
+            }
+            _ => current.push(token.clone()),
+        }
+    }
+    if !current.is_empty() {
+        items.push(current);
+    }
+    Some(items)
 }
 
 fn text_match_pattern_value(tokens: &[String]) -> String {
@@ -9263,6 +9391,9 @@ impl GenericCircuitRuntime {
             |path| self.root_textlike(path).ok(),
         )?
         else {
+            if equations.has_root_text_branch(target, source) {
+                return Ok(None);
+            }
             return Err(format!(
                 "no supported scalar update branch for `{target}` from `{source}`"
             )
@@ -9949,8 +10080,10 @@ impl GenericCircuitRuntime {
                 ))))
             }
             ScalarUpdateExpression::NumberInfix { .. }
+            | ScalarUpdateExpression::MatchNumberInfixConst { .. }
             | ScalarUpdateExpression::BoolNot(_)
             | ScalarUpdateExpression::MatchConst { .. }
+            | ScalarUpdateExpression::MatchValueConst { .. }
             | ScalarUpdateExpression::Unsupported => Err(format!(
                 "text branch for `{target}` from `{source}` is not a supported indexed text expression"
             )
@@ -10106,7 +10239,7 @@ impl GenericCircuitRuntime {
         lists: &ListEquationPlan,
         list: &str,
         source: &str,
-        key: Option<&str>,
+        key: Option<&'a str>,
         text: Option<&'a str>,
         source_paths: &[String],
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
@@ -11302,6 +11435,12 @@ enum ScalarUpdateExpression {
         op: String,
         right: String,
     },
+    MatchNumberInfixConst {
+        left: String,
+        op: String,
+        right: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
     PreviousValue(String),
     ReadPath(String),
     TextTrimOrPrevious {
@@ -11318,10 +11457,31 @@ enum ScalarUpdateExpression {
         input: String,
         arms: Vec<UpdateMatchArm>,
     },
+    MatchValueConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
     Unsupported,
 }
 
 impl ScalarUpdateExpression {
+    fn is_root_text_expression(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceText
+                | Self::SourceKey
+                | Self::SourceAddress
+                | Self::Const(_)
+                | Self::NumberInfix { .. }
+                | Self::MatchNumberInfixConst { .. }
+                | Self::PreviousValue(_)
+                | Self::ReadPath(_)
+                | Self::PrefixPayloadConcat { .. }
+                | Self::MatchConst { .. }
+                | Self::MatchValueConst { .. }
+        )
+    }
+
     fn is_indexed_text_expression(&self) -> bool {
         matches!(
             self,
@@ -12640,6 +12800,11 @@ fn collect_expr_tree(
                 collect_expr_tree(field.value, expressions, seen, ids);
             }
         }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                collect_expr_tree(*item, expressions, seen, ids);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::StringLiteral(_)
@@ -12650,7 +12815,6 @@ fn collect_expr_tree(
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest
-        | AstExprKind::ListLiteral { .. }
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_) => {}
     }
@@ -12940,8 +13104,73 @@ impl ScalarEquationPlan {
                             right: right.clone(),
                         }
                     }
+                    UpdateExpression::MatchNumberInfixConst {
+                        left,
+                        op,
+                        right,
+                        arms,
+                    } => ScalarUpdateExpression::MatchNumberInfixConst {
+                        left: left.clone(),
+                        op: op.clone(),
+                        right: right.clone(),
+                        arms: arms.clone(),
+                    },
+                    UpdateExpression::PreviousValue { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".text", ".event.change.text", ".change.text"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceText
+                    }
+                    UpdateExpression::PreviousValue { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".key", ".event.key_down.key", ".key_down.key"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceKey
+                    }
+                    UpdateExpression::PreviousValue { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".address", ".event.address"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceAddress
+                    }
                     UpdateExpression::PreviousValue { path } => {
                         ScalarUpdateExpression::PreviousValue(path.clone())
+                    }
+                    UpdateExpression::ReadPath { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".text", ".event.change.text", ".change.text"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceText
+                    }
+                    UpdateExpression::ReadPath { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".key", ".event.key_down.key", ".key_down.key"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceKey
+                    }
+                    UpdateExpression::ReadPath { path }
+                        if source_payload_input_matches(
+                            path,
+                            &branch.source,
+                            &[".address", ".event.address"],
+                        ) =>
+                    {
+                        ScalarUpdateExpression::SourceAddress
                     }
                     UpdateExpression::ReadPath { path } => {
                         ScalarUpdateExpression::ReadPath(path.clone())
@@ -12970,11 +13199,25 @@ impl ScalarEquationPlan {
                             arms: arms.clone(),
                         }
                     }
+                    UpdateExpression::MatchValueConst { input, arms } => {
+                        ScalarUpdateExpression::MatchValueConst {
+                            input: input.clone(),
+                            arms: arms.clone(),
+                        }
+                    }
                     _ => ScalarUpdateExpression::Unsupported,
                 },
             })
             .collect();
         Self { branches }
+    }
+
+    fn has_root_text_branch(&self, target: &str, source: &str) -> bool {
+        self.branches.iter().any(|branch| {
+            branch.target == target
+                && branch.source == source
+                && branch.expression.is_root_text_expression()
+        })
     }
 
     fn eval_text<'a>(
@@ -13042,25 +13285,38 @@ impl ScalarEquationPlan {
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.clone()))))
             }
             ScalarUpdateExpression::NumberInfix { left, op, right } => {
-                let left = scalar_number_operand_value(left, read_textlike).ok_or_else(|| {
-                    format!("source `{source}` for `{target}` cannot read numeric operand `{left}`")
-                })?;
-                let right = scalar_number_operand_value(right, read_textlike).ok_or_else(|| {
-                    format!(
-                        "source `{source}` for `{target}` cannot read numeric operand `{right}`"
-                    )
-                })?;
-                let value = match op.as_str() {
-                    "+" => left + right,
-                    "-" => left - right,
-                    _ => {
-                        return Err(format!(
-                            "source `{source}` for `{target}` uses unsupported numeric operator `{op}`"
+                let value = scalar_number_infix_value(left, op, right, read_textlike)
+                    .ok_or_else(|| {
+                        format!(
+                            "source `{source}` for `{target}` cannot evaluate numeric infix `{left} {op} {right}`"
                         )
-                        .into());
-                    }
-                };
+                    })?;
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.to_string()))))
+            }
+            ScalarUpdateExpression::MatchNumberInfixConst {
+                left,
+                op,
+                right,
+                arms,
+            } => {
+                let current = scalar_number_infix_value(left, op, right, read_textlike)
+                    .map(|value| value.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "source `{source}` for `{target}` cannot evaluate match numeric infix `{left} {op} {right}`"
+                        )
+                    })?;
+                let Some(value) = arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                    .map(|arm| scalar_update_value_to_text(&arm.output, read_textlike))
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ScalarTextValue::Text(value)))
             }
             ScalarUpdateExpression::MatchConst { input, arms } => {
                 let current = match source_payload_match_input(
@@ -13085,6 +13341,33 @@ impl ScalarEquationPlan {
                         (arm.output != "SKIP")
                             .then(|| ScalarTextValue::Text(Cow::Owned(arm.output.clone())))
                     }))
+            }
+            ScalarUpdateExpression::MatchValueConst { input, arms } => {
+                let current = match source_payload_match_input(
+                    input,
+                    source,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                ) {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(read_textlike(input).ok_or_else(|| {
+                        format!(
+                            "source `{source}` for `{target}` cannot read match input `{input}`"
+                        )
+                    })?),
+                };
+                let Some(value) = arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                    .map(|arm| scalar_update_value_to_text(&arm.output, read_textlike))
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ScalarTextValue::Text(value)))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::ReadPath(path) => {
@@ -13167,6 +13450,86 @@ fn scalar_number_operand_value(
         .parse::<i64>()
         .ok()
         .or_else(|| read_textlike(operand)?.parse::<i64>().ok())
+}
+
+fn scalar_update_value_to_text(
+    value: &UpdateValueExpression,
+    read_textlike: impl Fn(&str) -> Option<String> + Copy,
+) -> RuntimeResult<Option<Cow<'static, str>>> {
+    match value {
+        UpdateValueExpression::Const { value } if value == "SKIP" => Ok(None),
+        UpdateValueExpression::Const { value } => Ok(Some(Cow::Owned(value.clone()))),
+        UpdateValueExpression::ReadPath { path } => {
+            let value = read_textlike(path)
+                .ok_or_else(|| format!("cannot read update value path `{path}`"))?;
+            Ok(Some(Cow::Owned(value)))
+        }
+        UpdateValueExpression::MatchConst { input, arms } => {
+            let current = read_textlike(input)
+                .ok_or_else(|| format!("cannot read update value match input `{input}`"))?;
+            let Some(arm) = arms
+                .iter()
+                .find(|arm| arm.pattern == current)
+                .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+            else {
+                return Ok(None);
+            };
+            scalar_update_value_to_text(&arm.output, read_textlike)
+        }
+        UpdateValueExpression::NumberInfix { left, op, right } => {
+            let value =
+                scalar_number_infix_value(left, op, right, read_textlike).ok_or_else(|| {
+                    format!("cannot evaluate update value numeric infix `{left} {op} {right}`")
+                })?;
+            Ok(Some(Cow::Owned(value)))
+        }
+        UpdateValueExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => {
+            let current =
+                scalar_number_infix_value(left, op, right, read_textlike).ok_or_else(|| {
+                    format!(
+                        "cannot evaluate update value match numeric infix `{left} {op} {right}`"
+                    )
+                })?;
+            let Some(arm) = arms
+                .iter()
+                .find(|arm| arm.pattern == current)
+                .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+            else {
+                return Ok(None);
+            };
+            scalar_update_value_to_text(&arm.output, read_textlike)
+        }
+    }
+}
+
+fn scalar_number_infix_value(
+    left: &str,
+    op: &str,
+    right: &str,
+    read_textlike: impl Fn(&str) -> Option<String> + Copy,
+) -> Option<String> {
+    let left = scalar_number_operand_value(left, read_textlike)?;
+    let right = scalar_number_operand_value(right, read_textlike)?;
+    Some(match op {
+        "+" => (left + right).to_string(),
+        "-" => (left - right).to_string(),
+        ">" => bool_label(left > right),
+        ">=" => bool_label(left >= right),
+        "<" => bool_label(left < right),
+        "<=" => bool_label(left <= right),
+        "==" => bool_label(left == right),
+        "!=" => bool_label(left != right),
+        _ => return None,
+    })
+}
+
+fn bool_label(value: bool) -> String {
+    if value { "True" } else { "False" }.to_owned()
 }
 
 impl DerivedEquationPlan {
@@ -14301,10 +14664,12 @@ impl SourceRoute {
                         SourceRouteTextAction::ReadPath
                     }
                     ScalarUpdateExpression::NumberInfix { .. }
+                    | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::BoolNot(_)
                     | ScalarUpdateExpression::MatchConst { .. }
+                    | ScalarUpdateExpression::MatchValueConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
                 Some(SourceAction::IndexedText {
@@ -14327,11 +14692,13 @@ impl SourceRoute {
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::NumberInfix { .. }
+                    | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::ReadPath(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
                     | ScalarUpdateExpression::PrefixPayloadConcat { .. }
                     | ScalarUpdateExpression::MatchConst { .. }
+                    | ScalarUpdateExpression::MatchValueConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
                 Some(SourceAction::IndexedBool {
@@ -15312,7 +15679,7 @@ impl ListScenarioHarness {
     fn append_text_row_from_source<'a>(
         &mut self,
         source: &str,
-        key: &str,
+        key: &'a str,
         title: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
@@ -17224,6 +17591,62 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn source_text_payload_can_be_read_inside_then_update_expression() {
+        let source = r#"
+store: [
+    elements: [
+        path_input: SOURCE
+    ]
+    path:
+        TEXT { default-path } |> HOLD path {
+            LATEST {
+                elements.path_input.text |> THEN { elements.path_input.text }
+            }
+        }
+    label:
+        TEXT { Path: } |> Text/concat(with: path, separator: " ")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.path))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("source-text-then-update-expression", source).unwrap();
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/path"),
+            Some(&json!("default-path"))
+        );
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/label"),
+            Some(&json!("Path: default-path"))
+        );
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.path_input".to_owned(),
+                text: Some("/tmp/wave.vcd".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/path"),
+            Some(&json!("/tmp/wave.vcd"))
+        );
+
+        let source_with_path_default =
+            source.replace("default-path", "~/repos/NovyWave/test_files/simple.vcd");
+        let mut runtime =
+            LiveRuntime::from_source("source-text-path-default", &source_with_path_default)
+                .unwrap();
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/path"),
+            Some(&json!("~/repos/NovyWave/test_files/simple.vcd"))
+        );
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/label"),
+            Some(&json!("Path: ~/repos/NovyWave/test_files/simple.vcd"))
+        );
+    }
+
+    #[test]
     fn live_runtime_applies_observed_todomvc_source_events() {
         let source = include_str!("../../../examples/todomvc.bn");
         let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
@@ -17357,11 +17780,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
             .expect("runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
-                source: "store.elements.load_fixture".to_owned(),
-                target_text: Some("Load fixture".to_owned()),
+                source: "store.elements.load_default_file".to_owned(),
+                target_text: Some("Open default".to_owned()),
                 ..LiveSourceEvent::default()
             })
-            .expect("fixture load should apply");
+            .expect("default file load should apply");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select_data".to_owned(),
@@ -17394,7 +17817,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         assert_eq!(output.state_summary["cursor_position"], "Cursor36");
         assert_eq!(
             output.state_summary["store"]["bridge_request_descriptor_label"],
-            "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
+            "TOP_CPU/DATA_BUS/Fit/RightWindow/Cursor36/Hexadecimal"
         );
 
         let output = runtime
@@ -18282,7 +18705,7 @@ FUNCTION new_signal(signal) {
         let source = r#"
 store: [
     elements: [
-        load_fixture: SOURCE
+        load_default_file: SOURCE
         show_empty: SOURCE
         selected_remove_data: SOURCE
         selected_restore_data: SOURCE
@@ -18299,7 +18722,7 @@ store: [
     selected_rows_enabled_value:
         TEXT { none } |> HOLD selected_rows_enabled_value {
             LATEST {
-                elements.load_fixture.event.press |> THEN { TEXT { loaded } }
+                elements.load_default_file.event.press |> THEN { TEXT { loaded } }
                 elements.selected_remove_data.event.press |> THEN { TEXT { loaded } }
                 elements.selected_restore_data.event.press |> THEN { TEXT { loaded } }
                 elements.selected_data_up.event.press |> THEN { TEXT { loaded } }
@@ -18314,7 +18737,7 @@ store: [
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
     selected_rows_first_signal_id:
@@ -18324,7 +18747,7 @@ store: [
             elements.selected_remove_data.event.press |> THEN { TEXT { none } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
     selected_rows_last_signal_id:
@@ -18334,7 +18757,7 @@ store: [
             elements.selected_remove_data.event.press |> THEN { TEXT { none } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
     selected_signals:
@@ -18359,7 +18782,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Selected r
 
         for (source, expected_count, expected_order) in [
             (
-                "store.elements.load_fixture",
+                "store.elements.load_default_file",
                 4,
                 "clk, reset_n, data_bus[7:0], data_valid",
             ),
@@ -19845,6 +20268,196 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
     }
 
     #[test]
+    fn root_latest_numeric_infix_when_updates_and_clamps() {
+        let source = r#"
+store: [
+    elements: [
+        zoom_in: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.zoom_in.event.press |> THEN {
+                    zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-numeric-infix-when-clamp", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "0");
+
+        for expected in ["1", "2", "3", "3"] {
+            runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: "store.elements.zoom_in".to_owned(),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap();
+            assert_eq!(runtime.state_summary()["store"]["zoom_step"], expected);
+        }
+    }
+
+    #[test]
+    fn root_latest_key_match_nested_numeric_infix_updates_and_clamps() {
+        let source = r#"
+store: [
+    elements: [
+        keyboard_capture: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                    R => 0
+                    __ => SKIP
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-key-match-nested-numeric-infix-clamp", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "0");
+
+        for expected in ["1", "2", "3", "3"] {
+            runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: "store.elements.keyboard_capture".to_owned(),
+                    key: Some("W".to_owned()),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap();
+            assert_eq!(runtime.state_summary()["store"]["zoom_step"], expected);
+        }
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("R".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "0");
+    }
+
+    #[test]
+    fn root_latest_shared_key_skip_branches_do_not_abort_other_targets() {
+        let source = r#"
+store: [
+    elements: [
+        keyboard_capture: SOURCE
+    ]
+    cursor_position:
+        LATEST {
+            TEXT { Cursor42 }
+            elements.keyboard_capture.key |> WHEN {
+                Q => TEXT { Cursor36 }
+                E => TEXT { Cursor48 }
+                __ => SKIP
+            }
+        }
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step + 1
+                    S => zoom_step - 1
+                    __ => SKIP
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-shared-key-skip-noop", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["cursor_position"],
+            "Cursor42"
+        );
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "0");
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("Q".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["cursor_position"],
+            "Cursor36"
+        );
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "0");
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("W".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["cursor_position"],
+            "Cursor36"
+        );
+        assert_eq!(runtime.state_summary()["store"]["zoom_step"], "1");
+    }
+
+    #[test]
+    fn root_derived_list_literal_when_matches_runtime_values() {
+        let source = r#"
+store: [
+    elements: [
+        probe: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready {
+            LATEST {
+                TEXT { ready }
+            }
+        }
+    zoom_level: TEXT { Close }
+    pan_window: TEXT { Center }
+    keyboard_viewport_label:
+        viewport_label(zoom: zoom_level, pan: pan_window)
+]
+
+FUNCTION viewport_label(zoom, pan) {
+    LIST { zoom, pan } |> WHEN {
+        LIST { TEXT { Fit }, TEXT { Center } } => TEXT { 0 ns - 120 ns }
+        LIST { TEXT { Close }, TEXT { Center } } => TEXT { 36 ns - 60 ns }
+        LIST { TEXT { Close }, TEXT { RightWindow } } => TEXT { 48 ns - 72 ns }
+        __ => TEXT { fallback }
+    }
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-list-when-derived", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["keyboard_viewport_label"],
+            "36 ns - 60 ns"
+        );
+        assert_eq!(
+            runtime.document_state_summary()["store"]["keyboard_viewport_label"],
+            "36 ns - 60 ns"
+        );
+    }
+
+    #[test]
     fn derived_root_summary_flat_alias_overrides_stale_materialized_value() {
         let source = r#"
 store: [
@@ -19907,11 +20520,11 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
-                source: "store.elements.load_fixture".to_owned(),
-                target_text: Some("Load fixture".to_owned()),
+                source: "store.elements.load_default_file".to_owned(),
+                target_text: Some("Open default".to_owned()),
                 ..LiveSourceEvent::default()
             })
-            .expect("fixture load should apply");
+            .expect("default file load should apply");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select_data".to_owned(),
@@ -20758,6 +21371,50 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             )
             .unwrap();
         assert_eq!(value, Some(Cow::Owned("data_bus".to_owned())));
+    }
+
+    #[test]
+    fn scalar_match_value_reports_bad_nested_output_instead_of_skip() {
+        let equations = ScalarEquationPlan {
+            branches: vec![ScalarUpdateBranch {
+                target: "store.zoom_step".to_owned(),
+                source: "store.elements.keyboard_capture".to_owned(),
+                expression: ScalarUpdateExpression::MatchValueConst {
+                    input: "elements.keyboard_capture.key".to_owned(),
+                    arms: vec![
+                        UpdateValueMatchArm {
+                            pattern: "W".to_owned(),
+                            output: UpdateValueExpression::NumberInfix {
+                                left: "store.zoom_step".to_owned(),
+                                op: "*".to_owned(),
+                                right: "2".to_owned(),
+                            },
+                        },
+                        UpdateValueMatchArm {
+                            pattern: "__".to_owned(),
+                            output: UpdateValueExpression::Const {
+                                value: "SKIP".to_owned(),
+                            },
+                        },
+                    ],
+                },
+            }],
+        };
+        let error = equations
+            .eval_text(
+                "store.zoom_step",
+                "store.elements.keyboard_capture",
+                Some("W"),
+                None,
+                None,
+                |path| (path == "store.zoom_step").then(|| "1".to_owned()),
+            )
+            .expect_err("unsupported nested update operator should not silently skip");
+        let error = error.to_string();
+        assert!(
+            error.contains("cannot evaluate update value numeric infix `store.zoom_step * 2`"),
+            "unexpected runtime error: {error}"
+        );
     }
 
     fn cell_address_hash_for_test(address: &str) -> u64 {

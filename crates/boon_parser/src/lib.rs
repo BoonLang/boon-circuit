@@ -1729,13 +1729,16 @@ fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Opt
     {
         return None;
     }
-    if let Some(text) = text_literal_source_value(tokens, item, source) {
-        return Some(text);
-    }
     if tokens == ["TEXT", "{"] {
         return text_literal_source_value_from_start(item.start, source);
     }
     let close = tokens.iter().rposition(|token| token == "}")?;
+    if close + 1 != tokens.len() {
+        return None;
+    }
+    if let Some(text) = text_literal_source_value(tokens, item, source) {
+        return Some(text);
+    }
     Some(join_text_literal_tokens(&tokens[2..close]))
 }
 
@@ -3859,6 +3862,35 @@ document: Document/new(root: Element/label(element: [], style: [], label: name))
         assert!(texts.contains(&"0x2a"), "{texts:#?}");
         assert!(texts.contains(&"42.8 C"), "{texts:#?}");
         assert!(texts.contains(&"data_bus[7:0]"), "{texts:#?}");
+    }
+
+    #[test]
+    fn text_literal_pipe_on_same_line_is_parsed_as_pipe() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+store: [
+    path: TEXT { /tmp/wave.vcd }
+    label: TEXT { Path: } |> Text/concat(with: path, separator: " ")
+]
+document: Document/new(root: Element/label(element: [], label: store.label))
+"#;
+        let program = parse_source("examples/text-literal-pipe.bn", source).unwrap();
+        let concat = program
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "Text/concat"))
+            .expect("same-line text literal pipe should be preserved");
+        let AstExprKind::Pipe { input, .. } = concat.kind else {
+            unreachable!("checked pipe expression");
+        };
+        assert!(matches!(
+            &program.ast.expressions[input].kind,
+            AstExprKind::TextLiteral(text) if text == "Path:"
+        ));
     }
 
     #[test]

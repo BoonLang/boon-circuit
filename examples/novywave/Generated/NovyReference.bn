@@ -1,5 +1,5 @@
 -- Pure reference descriptors for the Boon NovyWave rewrite.
--- These identify original NovyWave fixtures without porting implementation code.
+-- These identify original NovyWave reference captures without porting implementation code.
 
 FUNCTION visual_basis_label() {
     TEXT { figma dark/light loaded + empty, docs full UI }
@@ -22,7 +22,7 @@ FUNCTION waveform_basis_label() {
 }
 
 FUNCTION comparison_compact_label() {
-    TEXT { ref: figma/docs + fixture files }
+    TEXT { ref: figma/docs + waveform files }
 }
 
 FUNCTION reference_descriptor() {

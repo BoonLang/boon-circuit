@@ -219,6 +219,9 @@ impl Surface {
             crate::surface::SurfaceCursorIcon::ColumnResize => {
                 Some(cursor::CursorRequest::column_resize())
             }
+            crate::surface::SurfaceCursorIcon::RowResize => {
+                Some(cursor::CursorRequest::row_resize())
+            }
             crate::surface::SurfaceCursorIcon::Pointer => Some(cursor::CursorRequest::pointer()),
             crate::surface::SurfaceCursorIcon::Text => Some(cursor::CursorRequest::text()),
         };

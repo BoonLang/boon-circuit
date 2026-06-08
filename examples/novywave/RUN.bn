@@ -5,14 +5,31 @@ store: [
     visible_editor_pipe_probe:
         LATEST {
             TEXT { Visible editor syntax probe }
-            elements.load_fixture.event.press |> THEN { TEXT { Fixture syntax path exercised } }
+            elements.load_default_file.event.press |> THEN { TEXT { Default file path exercised } }
         }
 
     elements: [
+        open_workspace_dialog: SOURCE
+        close_workspace_dialog: SOURCE
+        select_workspace_repo: SOURCE
+        select_workspace_a: SOURCE
+        select_workspace_b: SOURCE
+        open_selected_workspace: SOURCE
         open_load_files_dialog: SOURCE
         close_load_files_dialog: SOURCE
-        begin_load_fixture: SOURCE
-        load_fixture: SOURCE
+        load_file_path_focus_probe: SOURCE
+        load_file_path_input: SOURCE
+        load_external_file: SOURCE
+        external_file_loaded_name: SOURCE
+        external_file_loaded_path: SOURCE
+        external_file_loaded_format: SOURCE
+        external_file_loaded_digest: SOURCE
+        external_file_loaded_waveform_ref: SOURCE
+        external_file_loaded_stats: SOURCE
+        external_file_loaded_contract: SOURCE
+        external_file_load_error: SOURCE
+        begin_default_file_load: SOURCE
+        load_default_file: SOURCE
         show_empty: SOURCE
         select_counter_file: SOURCE
         select_uart_compare_file: SOURCE
@@ -84,19 +101,98 @@ store: [
         panels_variables_wider: SOURCE
         panels_reset: SOURCE
         panels_toggle_arrangement: SOURCE
+        files_main_resize_drag: SOURCE
+        files_secondary_resize_drag: SOURCE
+        variables_name_resize_drag: SOURCE
+        variables_value_resize_drag: SOURCE
+        signal_row_resize_drag: SOURCE
     ]
+
+    workspace_dialog:
+        LATEST {
+            TEXT { Closed }
+            elements.open_workspace_dialog.event.press |> THEN { TEXT { Open } }
+            elements.close_workspace_dialog.event.press |> THEN { TEXT { Closed } }
+            elements.open_selected_workspace.event.press |> THEN { TEXT { Closed } }
+            elements.open_load_files_dialog.event.press |> THEN { TEXT { Closed } }
+        }
+
+    workspace_path_key:
+        TEXT { WorkspaceA } |> HOLD workspace_path_key {
+            LATEST {
+                elements.open_selected_workspace.event.press |> THEN { workspace_selected_key }
+            }
+        }
+
+    workspace_selected_key:
+        TEXT { WorkspaceA } |> HOLD workspace_selected_key {
+            LATEST {
+                elements.open_workspace_dialog.event.press |> THEN { workspace_path_key }
+                elements.select_workspace_repo.event.press |> THEN { TEXT { Repo } }
+                elements.select_workspace_a.event.press |> THEN { TEXT { WorkspaceA } }
+                elements.select_workspace_b.event.press |> THEN { TEXT { WorkspaceB } }
+            }
+        }
+
+    workspace_path:
+        workspace_path_key |> WHEN {
+            TEXT { WorkspaceB } => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
+            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            __ => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a }
+        }
+
+    workspace_header_path:
+        workspace_path_key |> WHEN {
+            TEXT { WorkspaceB } => TEXT { .../test_files/my_workspaces/workspace_b }
+            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            __ => TEXT { .../test_files/my_workspaces/workspace_a }
+        }
+
+    workspace_selected_path:
+        workspace_selected_key |> WHEN {
+            TEXT { WorkspaceB } => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
+            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            __ => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a }
+        }
+
+    workspace_dialog_title:
+        workspace_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Open Workspace }
+            False => TEXT { Workspace dialog closed }
+        }
+
+    workspace_dialog_hint:
+        workspace_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Pick a directory to use as your workspace. NovyWave will create the .novywave file automatically if it is missing. }
+            False => TEXT { No workspace picker }
+        }
+
+    workspace_dialog_selection:
+        workspace_dialog == TEXT { Open } |> WHEN {
+            True => TEXT { Selected: } |> Text/concat(with: workspace_selected_path, separator: " ")
+            False => TEXT { none }
+        }
+
+    workspace_status_label:
+        workspace_path_key |> WHEN {
+            TEXT { WorkspaceB } => TEXT { workspace_b ready }
+            TEXT { Repo } => TEXT { NovyWave repo ready }
+            __ => TEXT { workspace_a ready }
+        }
 
     load_files_dialog:
         LATEST {
             TEXT { Closed }
             elements.open_load_files_dialog.event.press |> THEN { TEXT { Open } }
             elements.close_load_files_dialog.event.press |> THEN { TEXT { Closed } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { Closed } }
-            elements.load_fixture.event.press |> THEN { TEXT { Closed } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { Closed } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { Closed } }
+            elements.load_default_file.event.press |> THEN { TEXT { Closed } }
             elements.show_empty.event.press |> THEN { TEXT { Closed } }
             elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
             elements.select_ghw_file.event.press |> THEN { TEXT { Closed } }
+            elements.open_workspace_dialog.event.press |> THEN { TEXT { Closed } }
         }
 
     panel_layout:
@@ -105,14 +201,35 @@ store: [
                 elements.panels_files_wider.event.press |> THEN { TEXT { FilesWide } }
                 elements.panels_variables_wider.event.press |> THEN { TEXT { VariablesWide } }
                 elements.panels_reset.event.press |> THEN { TEXT { Balanced } }
+                elements.files_main_resize_drag.text |> THEN {
+                    elements.files_main_resize_drag.text |> WHEN {
+                        TEXT { Grow } => panel_layout |> WHEN {
+                            TEXT { VariablesWidest } => TEXT { VariablesWide }
+                            TEXT { VariablesWide } => TEXT { Balanced }
+                            TEXT { Balanced } => TEXT { FilesWide }
+                            TEXT { FilesWide } => TEXT { FilesWidest }
+                            __ => TEXT { FilesWidest }
+                        }
+                        TEXT { Shrink } => panel_layout |> WHEN {
+                            TEXT { FilesWidest } => TEXT { FilesWide }
+                            TEXT { FilesWide } => TEXT { Balanced }
+                            TEXT { Balanced } => TEXT { VariablesWide }
+                            TEXT { VariablesWide } => TEXT { VariablesWidest }
+                            __ => TEXT { VariablesWidest }
+                        }
+                        __ => panel_layout
+                    }
+                }
                 elements.show_empty.event.press |> THEN { TEXT { Balanced } }
-                elements.load_fixture.event.press |> THEN { TEXT { Balanced } }
+                elements.load_default_file.event.press |> THEN { TEXT { Balanced } }
             }
         }
 
     panel_layout_label:
         panel_layout |> WHEN {
+            TEXT { FilesWidest } => TEXT { Files panel widest }
             TEXT { FilesWide } => TEXT { Files panel wide }
+            TEXT { VariablesWidest } => TEXT { Variables panel widest }
             TEXT { VariablesWide } => TEXT { Variables panel wide }
             __ => TEXT { Panels balanced }
         }
@@ -127,7 +244,7 @@ store: [
                     }
                 }
                 elements.show_empty.event.press |> THEN { TEXT { Stacked } }
-                elements.load_fixture.event.press |> THEN { TEXT { Stacked } }
+                elements.load_default_file.event.press |> THEN { TEXT { Stacked } }
             }
         }
 
@@ -145,23 +262,170 @@ store: [
 
     files_panel_width:
         panel_layout |> WHEN {
+            TEXT { FilesWidest } => 650
             TEXT { FilesWide } => 520
+            TEXT { VariablesWidest } => 260
             TEXT { VariablesWide } => 340
             __ => 430
         }
 
     variables_panel_width:
         panel_layout |> WHEN {
+            TEXT { FilesWidest } => 300
             TEXT { FilesWide } => 390
+            TEXT { VariablesWidest } => 650
             TEXT { VariablesWide } => 570
             __ => 480
         }
 
     browser_panel_width:
         panel_layout |> WHEN {
+            TEXT { FilesWidest } => 650
             TEXT { FilesWide } => 520
-            TEXT { VariablesWide } => 570
-            __ => 480
+            TEXT { VariablesWidest } => 260
+            TEXT { VariablesWide } => 340
+            __ => 430
+        }
+
+    files_panel_height_key:
+        TEXT { Balanced } |> HOLD files_panel_height_key {
+            LATEST {
+                elements.panels_reset.event.press |> THEN { TEXT { Balanced } }
+                elements.files_secondary_resize_drag.text |> THEN {
+                    elements.files_secondary_resize_drag.text |> WHEN {
+                        TEXT { Grow } => files_panel_height_key |> WHEN {
+                            TEXT { Short } => TEXT { Balanced }
+                            TEXT { Balanced } => TEXT { Tall }
+                            TEXT { Tall } => TEXT { Tallest }
+                            __ => TEXT { Tallest }
+                        }
+                        TEXT { Shrink } => files_panel_height_key |> WHEN {
+                            TEXT { Tallest } => TEXT { Tall }
+                            TEXT { Tall } => TEXT { Balanced }
+                            TEXT { Balanced } => TEXT { Short }
+                            __ => TEXT { Short }
+                        }
+                        __ => files_panel_height_key
+                    }
+                }
+                elements.show_empty.event.press |> THEN { TEXT { Balanced } }
+                elements.load_default_file.event.press |> THEN { TEXT { Balanced } }
+            }
+        }
+
+    files_panel_height:
+        files_panel_height_key |> WHEN {
+            TEXT { Short } => 284
+            TEXT { Tall } => 520
+            TEXT { Tallest } => 650
+            __ => 390
+        }
+
+    selected_name_column_width_key:
+        TEXT { Normal } |> HOLD selected_name_column_width_key {
+            LATEST {
+                elements.variables_name_resize_drag.text |> THEN {
+                    elements.variables_name_resize_drag.text |> WHEN {
+                        TEXT { Grow } => selected_name_column_width_key |> WHEN {
+                            TEXT { Compact } => TEXT { Normal }
+                            TEXT { Normal } => TEXT { Wide }
+                            TEXT { Wide } => TEXT { Widest }
+                            __ => TEXT { Widest }
+                        }
+                        TEXT { Shrink } => selected_name_column_width_key |> WHEN {
+                            TEXT { Widest } => TEXT { Wide }
+                            TEXT { Wide } => TEXT { Normal }
+                            TEXT { Normal } => TEXT { Compact }
+                            __ => TEXT { Compact }
+                        }
+                        __ => selected_name_column_width_key
+                    }
+                }
+                elements.panels_reset.event.press |> THEN { TEXT { Normal } }
+            }
+        }
+
+    selected_name_column_width:
+        selected_name_column_width_key |> WHEN {
+            TEXT { Compact } => 130
+            TEXT { Wide } => 250
+            TEXT { Widest } => 340
+            __ => 190
+        }
+
+    selected_value_column_width_key:
+        TEXT { Normal } |> HOLD selected_value_column_width_key {
+            LATEST {
+                elements.variables_value_resize_drag.text |> THEN {
+                    elements.variables_value_resize_drag.text |> WHEN {
+                        TEXT { Grow } => selected_value_column_width_key |> WHEN {
+                            TEXT { Compact } => TEXT { Normal }
+                            TEXT { Normal } => TEXT { Wide }
+                            TEXT { Wide } => TEXT { Widest }
+                            __ => TEXT { Widest }
+                        }
+                        TEXT { Shrink } => selected_value_column_width_key |> WHEN {
+                            TEXT { Widest } => TEXT { Wide }
+                            TEXT { Wide } => TEXT { Normal }
+                            TEXT { Normal } => TEXT { Compact }
+                            __ => TEXT { Compact }
+                        }
+                        __ => selected_value_column_width_key
+                    }
+                }
+                elements.panels_reset.event.press |> THEN { TEXT { Normal } }
+            }
+        }
+
+    selected_value_column_width:
+        selected_value_column_width_key |> WHEN {
+            TEXT { Compact } => 120
+            TEXT { Wide } => 300
+            TEXT { Widest } => 400
+            __ => 220
+        }
+
+    load_files_path:
+        TEXT { ~/repos/NovyWave/test_files/simple.vcd } |> HOLD load_files_path {
+            LATEST {
+                elements.load_file_path_input.text |> THEN { elements.load_file_path_input.text }
+                elements.select_counter_file.event.press |> THEN { TEXT { ~/repos/NovyWave/test_files/simple.vcd } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { ~/repos/NovyWave/test_files/wave_27.fst } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { ~/repos/NovyWave/test_files/simple_test.ghw } }
+            }
+        }
+
+    external_file_error:
+        Text/empty() |> HOLD external_file_error {
+            LATEST {
+                elements.external_file_load_error.text
+                elements.open_load_files_dialog.event.press |> THEN { Text/empty() }
+                elements.load_file_path_input.text |> THEN { Text/empty() }
+                elements.external_file_loaded_name.text |> THEN { Text/empty() }
+                elements.close_load_files_dialog.event.press |> THEN { Text/empty() }
+            }
+        }
+
+    external_file_active:
+        TEXT { No } |> HOLD external_file_active {
+            LATEST {
+                elements.external_file_loaded_name.text |> THEN { TEXT { Yes } }
+                elements.select_counter_file.event.press |> THEN { TEXT { No } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { No } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { No } }
+                elements.load_default_file.event.press |> THEN { TEXT { No } }
+                elements.show_empty.event.press |> THEN { TEXT { No } }
+            }
+        }
+
+    external_file_tree_label:
+        TEXT { - local file } |> HOLD external_file_tree_label {
+            LATEST {
+                elements.external_file_loaded_name.text |> THEN {
+                    TEXT { - } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+                }
+                elements.show_empty.event.press |> THEN { TEXT { - local file } }
+            }
         }
 
     load_files_dialog_title:
@@ -172,30 +436,34 @@ store: [
 
     load_files_dialog_hint:
         load_files_dialog == TEXT { Open } |> WHEN {
-            True => TEXT { Choose waveform fixtures or confirm the bundled counter.vcd fixture. }
+            True => TEXT { Enter a local VCD, FST, or GHW path. The native host validates the file and sends pure metadata to Boon. }
             False => TEXT { File dialog closed }
         }
 
     load_files_dialog_selection:
         load_files_dialog == TEXT { Open } |> WHEN {
-            True => TEXT { counter.vcd, simple_test.ghw, uart_compare.fst }
+            True => external_file_error |> Text/is_empty() |> WHEN {
+                True => TEXT { Path: } |> Text/concat(with: load_files_path, separator: " ")
+                False => external_file_error
+            }
             False => TEXT { none }
         }
 
-    fixture_status:
+    waveform_status:
         LATEST {
             TEXT { Loaded }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { Loading } }
-            elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { Loading } }
+            elements.load_default_file.event.press |> THEN { TEXT { Loaded } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { Loaded } }
         }
 
     empty_state_title: TEXT { No waveform loaded }
     empty_state_hint: TEXT { Drop or load a VCD, FST, or GHW waveform to inspect signals. }
     empty_state_bridge_label: TEXT { Bridge state: no request scheduled; pure descriptor is wave:none }
-    empty_state_formats_label: TEXT { Supported fixture contracts: VCD, FST, GHW }
+    empty_state_formats_label: TEXT { Supported waveform formats: VCD, FST, GHW }
     loading_state_title: TEXT { Loading waveform }
-    loading_state_hint: TEXT { Opening counter.vcd through wellen.v1 descriptor handshake. }
+    loading_state_hint: TEXT { Opening simple.vcd through wellen.v1 descriptor handshake. }
     reference_visual_basis: NovyReference/visual_basis_label()
     reference_loaded_basis: NovyReference/loaded_reference_label()
     reference_empty_basis: NovyReference/empty_reference_label()
@@ -206,12 +474,13 @@ store: [
 
     active_file:
         LATEST {
-            TEXT { counter.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
+            TEXT { simple.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.external_file_loaded_name.text
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -219,21 +488,25 @@ store: [
         LATEST {
             TEXT { none }
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { counter.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { simple.vcd } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     file_compare_status:
         LATEST {
-            TEXT { single fixture: counter.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { single fixture: counter.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing counter.vcd to uart_compare.fst } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { single fixture: simple_test.ghw } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { opening counter.vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { single fixture: counter.vcd } }
+            TEXT { single file: simple.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { single file: simple.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing simple.vcd to wave_27.fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { single file: simple_test.ghw } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { opening simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { single file: simple.vcd } }
+            elements.external_file_loaded_name.text |> THEN {
+                TEXT { local file: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+            }
             elements.show_empty.event.press |> THEN { TEXT { no waveform loaded } }
         }
 
@@ -243,7 +516,7 @@ store: [
             compare: compare_file
             status: file_compare_status
             page: compare_request_page
-            source: TEXT { generated-fixture-page }
+            source: TEXT { wellen-page-data }
             bridge_contract: TEXT { wellen.v1 }
             waveform_ref: bridge_waveform_ref
         ]
@@ -255,68 +528,76 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { VCD } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { VCD } }
-            elements.load_fixture.event.press |> THEN { TEXT { VCD } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { VCD } }
+            elements.load_default_file.event.press |> THEN { TEXT { VCD } }
+            elements.external_file_loaded_format.text
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     bridge_file_digest:
         LATEST {
-            TEXT { sha256:fixture-counter-vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { sha256:fixture-corrupted-vcd } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+            TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de }
+            elements.select_counter_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172 } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491 } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { sha256:78e6f482fe39dd5ae04a7162d27f513d6a57be6e9d1a948b916167459bead01e } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+            elements.load_default_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+            elements.external_file_loaded_digest.text
             elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
         }
 
     bridge_waveform_ref:
         LATEST {
-            TEXT { wave:vcd:counter:0-240ns }
-            elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
+            TEXT { wave:vcd:simple:0-240ns }
+            elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:wave-27:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { diagnostic:unsupported-corrupted-vcd } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { wave:opening:counter } }
-            elements.load_fixture.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { wave:opening:simple } }
+            elements.load_default_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+            elements.external_file_loaded_waveform_ref.text
             elements.show_empty.event.press |> THEN { TEXT { wave:none } }
         }
 
     bridge_descriptor_file:
         LATEST {
-            TEXT { counter.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
+            TEXT { simple.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.external_file_loaded_name.text
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     bridge_open_status:
         LATEST {
-            TEXT { FIXTURE_READY }
-            elements.select_counter_file.event.press |> THEN { TEXT { FIXTURE_READY } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { FIXTURE_READY } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { FIXTURE_READY } }
+            TEXT { FILE_READY }
+            elements.select_counter_file.event.press |> THEN { TEXT { FILE_READY } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { FILE_READY } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { FILE_READY } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { DIAGNOSTIC } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { OPENING } }
-            elements.load_fixture.event.press |> THEN { TEXT { FIXTURE_READY } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { OPENING } }
+            elements.load_default_file.event.press |> THEN { TEXT { FILE_READY } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { FILE_READY } }
             elements.show_empty.event.press |> THEN { TEXT { NOT_REQUESTED } }
         }
 
     bridge_open_summary:
         LATEST {
-            TEXT { fixture VCD wave:vcd:counter:0-240ns }
-            elements.select_counter_file.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { fixture FST wave:fst:uart-compare:0-240ns } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { fixture GHW wave:ghw:simple-test:0-100ns } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { opening VCD counter.vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
+            TEXT { opened VCD wave:vcd:simple:0-240ns }
+            elements.select_counter_file.event.press |> THEN { TEXT { opened VCD wave:vcd:simple:0-240ns } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { opened FST wave:fst:wave-27:0-240ns } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { opened GHW wave:ghw:simple-test:0-100ns } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported waveform file: corrupted.vcd } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { opening VCD simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { opened VCD wave:vcd:simple:0-240ns } }
+            elements.external_file_loaded_name.text |> THEN {
+                TEXT { local file } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+            }
             elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
 
@@ -327,8 +608,9 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
             elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { HIER:none } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { HIER:opening } }
-            elements.load_fixture.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { HIER:opening } }
+            elements.load_default_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { HIER:local file metadata } }
             elements.show_empty.event.press |> THEN { TEXT { HIER:none } }
         }
 
@@ -339,21 +621,23 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { no waveform stats } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { loading waveform stats } }
-            elements.load_fixture.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { loading waveform stats } }
+            elements.load_default_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
+            elements.external_file_loaded_stats.text
             elements.show_empty.event.press |> THEN { TEXT { no waveform stats } }
         }
 
-    bridge_large_fixture_contract:
+    bridge_large_file_contract:
         LATEST {
-            TEXT { counter.vcd 311B -> bounded page requests only }
-            elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd 311B -> bounded page requests only } }
+            TEXT { simple.vcd 311B -> bounded page requests only }
+            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd 311B -> bounded page requests only } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded compare page only } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd 25B -> diagnostic only } }
             elements.show_empty.event.press |> THEN { TEXT { no large file materialized } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { counter.vcd pending -> no page materialized } }
-            elements.load_fixture.event.press |> THEN { TEXT { counter.vcd 311B -> bounded page requests only } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd pending -> no page materialized } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd 311B -> bounded page requests only } }
+            elements.external_file_loaded_contract.text
         }
 
     bridge_payload_limit_bytes: 65536
@@ -362,20 +646,7 @@ store: [
     bridge_segment_limit: 256
 
     bridge_page_window_label:
-        LATEST {
-            TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
-            elements.select_counter_file.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { window 0-100ns, max 256 transitions, payload <= 64KiB } }
-            elements.zoom_in.event.press |> THEN { TEXT { window 36-60ns, max 256 transitions, payload <= 64KiB } }
-            elements.zoom_out.event.press |> THEN { TEXT { window 0-240ns, max 256 transitions, payload <= 64KiB } }
-            elements.zoom_reset.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
-            elements.pan_left.event.press |> THEN { TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB } }
-            elements.pan_right.event.press |> THEN { TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB } }
-            elements.show_empty.event.press |> THEN { TEXT { no page window scheduled } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { no page window scheduled } }
-            elements.load_fixture.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
-        }
+        NovyModel/page_window_label(window: bridge_request_window_label)
 
     bridge_hierarchy_page_cursor_label:
         LATEST {
@@ -385,8 +656,9 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { hierarchy cursor none } }
             elements.show_empty.event.press |> THEN { TEXT { hierarchy cursor none } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { hierarchy cursor opening } }
-            elements.load_fixture.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { hierarchy cursor opening } }
+            elements.load_default_file.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { hierarchy cursor root:0..64 next=local } }
         }
 
     bridge_materialization_bound_label:
@@ -397,8 +669,9 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
             elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 7/15, waveform segments 56/256 max } }
             elements.show_empty.event.press |> THEN { TEXT { visible rows 0/0, waveform segments 0/256 max } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { visible rows 0/15, waveform segments 0/256 max } }
-            elements.load_fixture.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { visible rows 0/15, waveform segments 0/256 max } }
+            elements.load_default_file.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
         }
 
     bridge_payload_bound_label:
@@ -406,23 +679,29 @@ store: [
 
     compare_request_page:
         LATEST {
-            TEXT { compare:counter.vcd:primary }
-            elements.select_counter_file.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:counter.vcd+uart_compare.fst:0-240ns } }
+            TEXT { compare:simple.vcd:primary }
+            elements.select_counter_file.event.press |> THEN { TEXT { compare:simple.vcd:primary } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:simple.vcd+wave_27.fst:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { compare:simple_test.ghw:primary } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { compare:counter.vcd:opening } }
-            elements.load_fixture.event.press |> THEN { TEXT { compare:counter.vcd:primary } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { compare:simple.vcd:opening } }
+            elements.load_default_file.event.press |> THEN { TEXT { compare:simple.vcd:primary } }
+            elements.external_file_loaded_name.text |> THEN {
+                TEXT { compare: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: "") |> Text/concat(with: TEXT { primary }, separator: ":")
+            }
             elements.show_empty.event.press |> THEN { TEXT { compare:none } }
         }
 
     compare_result_label:
         LATEST {
-            TEXT { primary page: counter.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { primary page: counter.vcd } }
+            TEXT { primary page: simple.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { primary page: simple.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW fixture } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { opening page: counter.vcd } }
-            elements.load_fixture.event.press |> THEN { TEXT { primary page: counter.vcd } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW file } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { opening page: simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { primary page: simple.vcd } }
+            elements.external_file_loaded_name.text |> THEN {
+                TEXT { primary page: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+            }
             elements.show_empty.event.press |> THEN { TEXT { no compare page } }
         }
 
@@ -439,20 +718,24 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
             elements.select_ghw_file.event.press |> THEN { TEXT { OK } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { Loading } }
-            elements.load_fixture.event.press |> THEN { TEXT { OK } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { Loading } }
+            elements.load_default_file.event.press |> THEN { TEXT { OK } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { OK } }
+            elements.external_file_load_error.text |> THEN { TEXT { Unsupported } }
             elements.show_empty.event.press |> THEN { TEXT { Idle } }
         }
 
     diagnostic_label:
         LATEST {
             TEXT { bridge diagnostics OK }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported waveform file: corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_ghw_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { loading waveform } }
-            elements.load_fixture.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { loading waveform } }
+            elements.load_default_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.external_file_loaded_name.text |> THEN { TEXT { local file metadata OK } }
+            elements.external_file_load_error.text
             elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
 
@@ -463,8 +746,10 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            elements.begin_load_fixture.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.begin_default_file_load.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
+            elements.external_file_loaded_path.text
+            elements.external_file_load_error.text |> THEN { load_files_path }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -494,7 +779,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { top_cpu } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { top_uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_simple } }
-            elements.load_fixture.event.press |> THEN { TEXT { top_cpu } }
+            elements.load_default_file.event.press |> THEN { TEXT { top_cpu } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -519,7 +804,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { clk } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter } }
-            elements.load_fixture.event.press |> THEN { TEXT { clk } }
+            elements.load_default_file.event.press |> THEN { TEXT { clk } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
@@ -559,33 +844,33 @@ store: [
         })
         |> List/latest()
 
-    selected_signal_fixture:
+    selected_signal_family:
         LATEST {
             TEXT { counter }
             elements.select_counter_file.event.press |> THEN { TEXT { counter } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw } }
-            elements.load_fixture.event.press |> THEN { TEXT { counter } }
+            elements.load_default_file.event.press |> THEN { TEXT { counter } }
             elements.show_empty.event.press |> THEN { TEXT { counter } }
         }
 
     selected_signal_defaults:
         LIST {
-            [fixture: TEXT { counter }, id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { counter }, id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
-            [fixture: TEXT { uart }, id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { uart }, id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { uart }, id: TEXT { baud_tick }, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { uart }, id: TEXT { uart_busy }, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { ghw }, id: TEXT { ghw_counter }, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { ghw }, id: TEXT { ghw_enable }, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [fixture: TEXT { ghw }, id: TEXT { ghw_state }, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { counter }, id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
+            [family: TEXT { uart }, id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { uart }, id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { uart }, id: TEXT { baud_tick }, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { uart }, id: TEXT { uart_busy }, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { ghw }, id: TEXT { ghw_counter }, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { ghw }, id: TEXT { ghw_enable }, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { ghw }, id: TEXT { ghw_state }, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }]
         }
 
     selected_waveform_segments:
@@ -685,7 +970,7 @@ store: [
             [signal_id: TEXT { ghw_state }, width: 184, state: High, label: TEXT { Count }, click_time: TEXT { 48 ns }]
             [signal_id: TEXT { ghw_state }, width: 72, state: Low, label: TEXT { Hold }, click_time: TEXT { 36 ns }]
         }
-        |> List/map(segment, new: new_waveform_segment(segment: segment, zoom: zoom_level))
+        |> List/map(segment, new: new_waveform_segment(segment: segment, store: store))
 
     active_waveform_segment_labels:
         selected_waveform_segments
@@ -698,7 +983,7 @@ store: [
         |> List/length()
 
     selected_rows_enabled_value:
-        fixture_status == TEXT { Loaded } |> WHEN {
+        waveform_status == TEXT { Loaded } |> WHEN {
             True => TEXT { loaded }
             False => TEXT { none }
         }
@@ -727,7 +1012,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { DefaultOrder } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { DefaultOrder } }
             elements.select_ghw_file.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.load_fixture.event.press |> THEN { TEXT { DefaultOrder } }
+            elements.load_default_file.event.press |> THEN { TEXT { DefaultOrder } }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
         }
 
@@ -755,7 +1040,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -769,7 +1054,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -783,13 +1068,13 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     selected_signal_rows:
         selected_signal_defaults
-        |> List/filter_field_equal(field: "fixture", value: selected_signal_fixture)
+        |> List/filter_field_equal(field: "family", value: selected_signal_family)
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
         |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
@@ -836,7 +1121,7 @@ store: [
                 elements.select_counter_file.event.press |> THEN { TEXT { none } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-                elements.load_fixture.event.press |> THEN { TEXT { none } }
+                elements.load_default_file.event.press |> THEN { TEXT { none } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
@@ -862,7 +1147,7 @@ store: [
                 elements.format_ascii.event.press |> THEN { TEXT { none } }
                 elements.mode_to_light.event.press |> THEN { TEXT { none } }
                 elements.mode_to_dark.event.press |> THEN { TEXT { none } }
-                elements.load_fixture.event.press |> THEN { TEXT { none } }
+                elements.load_default_file.event.press |> THEN { TEXT { none } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
                 elements.signal_search_focus_probe.event.click |> THEN { TEXT { none } }
                 elements.scope_cpu.event.press |> THEN { TEXT { none } }
@@ -916,7 +1201,7 @@ store: [
                 elements.format_signed.event.press |> THEN { TEXT { Closed } }
                 elements.format_unsigned.event.press |> THEN { TEXT { Closed } }
                 elements.format_ascii.event.press |> THEN { TEXT { Closed } }
-                elements.load_fixture.event.press |> THEN { TEXT { Closed } }
+                elements.load_default_file.event.press |> THEN { TEXT { Closed } }
                 elements.show_empty.event.press |> THEN { TEXT { Closed } }
                 elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
@@ -957,7 +1242,7 @@ store: [
         Text/empty() |> HOLD keyboard_last_key {
             LATEST {
                 elements.keyboard_capture.key
-                elements.load_fixture.event.press |> THEN { Text/empty() }
+                elements.load_default_file.event.press |> THEN { Text/empty() }
                 elements.show_empty.event.press |> THEN { Text/empty() }
                 elements.select_counter_file.event.press |> THEN { Text/empty() }
                 elements.select_uart_compare_file.event.press |> THEN { Text/empty() }
@@ -984,7 +1269,7 @@ store: [
             elements.group_create.event.press |> THEN { TEXT { Expanded } }
             elements.group_toggle.event.press |> THEN { TEXT { Collapsed } }
             elements.group_expand.event.press |> THEN { TEXT { Expanded } }
-            elements.load_fixture.event.press |> THEN { TEXT { Expanded } }
+            elements.load_default_file.event.press |> THEN { TEXT { Expanded } }
             elements.show_empty.event.press |> THEN { TEXT { None } }
         }
 
@@ -992,7 +1277,7 @@ store: [
         LATEST {
             TEXT { None }
             elements.group_create.event.press |> THEN { TEXT { Created } }
-            elements.load_fixture.event.press |> THEN { TEXT { None } }
+            elements.load_default_file.event.press |> THEN { TEXT { None } }
             elements.show_empty.event.press |> THEN { TEXT { None } }
         }
 
@@ -1000,7 +1285,7 @@ store: [
         LATEST {
             TEXT { No group }
             elements.group_create.event.press |> THEN { TEXT { Core bus group } }
-            elements.load_fixture.event.press |> THEN { TEXT { No group } }
+            elements.load_default_file.event.press |> THEN { TEXT { No group } }
             elements.show_empty.event.press |> THEN { TEXT { No group } }
         }
 
@@ -1008,7 +1293,7 @@ store: [
         LATEST {
             TEXT { 0 groups }
             elements.group_create.event.press |> THEN { TEXT { 1 group } }
-            elements.load_fixture.event.press |> THEN { TEXT { 0 groups } }
+            elements.load_default_file.event.press |> THEN { TEXT { 0 groups } }
             elements.show_empty.event.press |> THEN { TEXT { 0 groups } }
         }
 
@@ -1016,7 +1301,7 @@ store: [
         LATEST {
             TEXT { none }
             elements.group_create.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -1024,7 +1309,7 @@ store: [
         LATEST {
             TEXT { no group }
             elements.group_create.event.press |> THEN { TEXT { 1 group } }
-            elements.load_fixture.event.press |> THEN { TEXT { no group } }
+            elements.load_default_file.event.press |> THEN { TEXT { no group } }
             elements.show_empty.event.press |> THEN { TEXT { no group } }
         }
 
@@ -1044,7 +1329,7 @@ store: [
         |> List/map(group, new: new_signal_group(group: group, store: store))
         |> List/remove(group, when:
             LATEST {
-                elements.load_fixture.event.press |> THEN { True }
+                elements.load_default_file.event.press |> THEN { True }
                 elements.show_empty.event.press |> THEN { True }
             }
         )
@@ -1063,7 +1348,7 @@ store: [
             LATEST {
             elements.analog_limits_auto.event.press |> THEN { TEXT { Auto } }
             elements.analog_limits_manual.event.press |> THEN { TEXT { Manual } }
-            elements.load_fixture.event.press |> THEN { TEXT { Auto } }
+            elements.load_default_file.event.press |> THEN { TEXT { Auto } }
             }
         }
 
@@ -1073,7 +1358,7 @@ store: [
             elements.analog_limits_auto.event.press |> THEN { TEXT { Valid } }
             elements.analog_limits_manual.event.press |> THEN { TEXT { Valid } }
             elements.analog_limits_invalid.event.press |> THEN { TEXT { Rejected } }
-            elements.load_fixture.event.press |> THEN { TEXT { Valid } }
+            elements.load_default_file.event.press |> THEN { TEXT { Valid } }
             }
         }
 
@@ -1086,7 +1371,7 @@ store: [
             elements.zoom_out.event.press |> THEN { TEXT { 38 C } }
             elements.pan_left.event.press |> THEN { TEXT { 39 C } }
             elements.pan_right.event.press |> THEN { TEXT { 40 C } }
-            elements.load_fixture.event.press |> THEN { TEXT { 39 C } }
+            elements.load_default_file.event.press |> THEN { TEXT { 39 C } }
             }
         }
 
@@ -1099,7 +1384,7 @@ store: [
             elements.zoom_out.event.press |> THEN { TEXT { 45 C } }
             elements.pan_left.event.press |> THEN { TEXT { 43 C } }
             elements.pan_right.event.press |> THEN { TEXT { 44 C } }
-            elements.load_fixture.event.press |> THEN { TEXT { 44 C } }
+            elements.load_default_file.event.press |> THEN { TEXT { 44 C } }
             }
         }
 
@@ -1112,7 +1397,7 @@ store: [
             elements.zoom_out.event.press |> THEN { TEXT { Auto 38 C .. 45 C } }
             elements.pan_left.event.press |> THEN { TEXT { Auto 39 C .. 43 C } }
             elements.pan_right.event.press |> THEN { TEXT { Auto 40 C .. 44 C } }
-            elements.load_fixture.event.press |> THEN { TEXT { Auto 39 C .. 44 C } }
+            elements.load_default_file.event.press |> THEN { TEXT { Auto 39 C .. 44 C } }
             }
         }
 
@@ -1122,7 +1407,7 @@ store: [
             elements.analog_limits_invalid.event.press |> THEN { TEXT { rejected min >= max } }
             elements.analog_limits_auto.event.press |> THEN { TEXT { none } }
             elements.analog_limits_manual.event.press |> THEN { TEXT { none } }
-            elements.load_fixture.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { none } }
             }
         }
 
@@ -1142,7 +1427,7 @@ store: [
             elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
             elements.marker_toggle.event.press |> THEN { TEXT { Visible } }
             elements.waveform_click.text |> THEN { TEXT { Visible } }
-            elements.load_fixture.event.press |> THEN { TEXT { Visible } }
+            elements.load_default_file.event.press |> THEN { TEXT { Visible } }
             elements.show_empty.event.press |> THEN { TEXT { Hidden } }
             }
         }
@@ -1154,7 +1439,7 @@ store: [
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
             elements.waveform_click.text
-            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
@@ -1166,7 +1451,7 @@ store: [
             elements.marker_remove.event.press |> THEN { Empty }
             elements.marker_toggle.event.press |> THEN { Added }
             elements.waveform_click.text |> THEN { Added }
-            elements.load_fixture.event.press |> THEN { Default }
+            elements.load_default_file.event.press |> THEN { Default }
             elements.show_empty.event.press |> THEN { Empty }
             }
         }
@@ -1181,7 +1466,7 @@ store: [
             elements.waveform_click.text |> THEN {
                 TEXT { M } |> Text/concat(with: elements.waveform_click.text, separator: " ")
             }
-            elements.load_fixture.event.press |> THEN { TEXT { M 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { M 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
@@ -1203,7 +1488,7 @@ store: [
             elements.waveform_click.text |> THEN {
                 TEXT { added marker at } |> Text/concat(with: elements.waveform_click.text, separator: " ")
             }
-            elements.load_fixture.event.press |> THEN { TEXT { marker at 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { marker at 42 ns } }
             elements.show_empty.event.press |> THEN { TEXT { no marker selected } }
             }
         }
@@ -1215,7 +1500,7 @@ store: [
         LATEST {
             elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
             elements.waveform_click.text
-            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
         }
 
     marker_add_from_toggle:
@@ -1230,7 +1515,7 @@ store: [
 
     marker_add_from_load:
         LATEST {
-            elements.load_fixture.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
         }
 
     markers:
@@ -1268,10 +1553,24 @@ store: [
         }
 
     row_size:
-        LATEST {
-            TEXT { Normal }
-            elements.row_taller.event.press |> THEN { TEXT { Tall } }
-            elements.row_shorter.event.press |> THEN { TEXT { Compact } }
+        TEXT { Normal } |> HOLD row_size {
+            LATEST {
+                elements.row_taller.event.press |> THEN { TEXT { Tall } }
+                elements.row_shorter.event.press |> THEN { TEXT { Compact } }
+                elements.signal_row_resize_drag.text |> THEN {
+                    elements.signal_row_resize_drag.text |> WHEN {
+                        TEXT { Grow } => row_size |> WHEN {
+                            TEXT { Compact } => TEXT { Normal }
+                            __ => TEXT { Tall }
+                        }
+                        TEXT { Shrink } => row_size |> WHEN {
+                            TEXT { Tall } => TEXT { Normal }
+                            __ => TEXT { Compact }
+                        }
+                        __ => row_size
+                    }
+                }
+            }
         }
 
     value_format:
@@ -1285,29 +1584,44 @@ store: [
             elements.format_signed.event.press |> THEN { TEXT { Signed } }
             elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
             elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
-            elements.load_fixture.event.press |> THEN { TEXT { Hexadecimal } }
+            elements.load_default_file.event.press |> THEN { TEXT { Hexadecimal } }
+        }
+
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.zoom_in.event.press |> THEN {
+                    zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                }
+                elements.zoom_out.event.press |> THEN {
+                    zoom_step <= -2 |> WHEN {
+                        True => -2
+                        False => zoom_step - 1
+                    }
+                }
+                elements.zoom_reset.event.press |> THEN { 0 }
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                    S => zoom_step <= -2 |> WHEN {
+                        True => -2
+                        False => zoom_step - 1
+                    }
+                    R => 0
+                    __ => SKIP
+                }
+                elements.load_default_file.event.press |> THEN { 0 }
+                elements.show_empty.event.press |> THEN { 0 }
+            }
         }
 
     zoom_level:
-        TEXT { Fit } |> HOLD zoom_level {
-            LATEST {
-                elements.zoom_in.event.press |> THEN { TEXT { Close } }
-                elements.zoom_out.event.press |> THEN { TEXT { Wide } }
-                elements.zoom_reset.event.press |> THEN { TEXT { Fit } }
-                elements.keyboard_capture.key |> WHEN {
-                    W => TEXT { Close }
-                    S => TEXT { Wide }
-                    R => TEXT { Fit }
-                    D => TEXT { Close }
-                    Q => TEXT { Close }
-                    E => TEXT { Close }
-                    A => TEXT { Close }
-                    __ => SKIP
-                }
-                elements.load_fixture.event.press |> THEN { TEXT { Fit } }
-                elements.show_empty.event.press |> THEN { TEXT { Fit } }
-            }
-        }
+        NovyModel/zoom_level_from_step(step: zoom_step)
 
     pan_window:
         TEXT { Center } |> HOLD pan_window {
@@ -1320,12 +1634,10 @@ store: [
                     D => TEXT { RightWindow }
                     R => TEXT { Center }
                     Q => TEXT { RightWindow }
-                    W => TEXT { RightWindow }
-                    S => TEXT { RightWindow }
                     E => TEXT { RightWindow }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { Center } }
+                elements.load_default_file.event.press |> THEN { TEXT { Center } }
                 elements.show_empty.event.press |> THEN { TEXT { Center } }
             }
         }
@@ -1341,46 +1653,19 @@ store: [
             elements.keyboard_capture.key |> WHEN {
                 D => TEXT { Cursor42 }
                 Q => TEXT { Cursor36 }
-                S => TEXT { Cursor36 }
                 R => TEXT { Cursor42 }
-                W => TEXT { Cursor36 }
                 E => TEXT { Cursor48 }
                 __ => SKIP
             }
-            elements.load_fixture.event.press |> THEN { TEXT { Cursor42 } }
+            elements.load_default_file.event.press |> THEN { TEXT { Cursor42 } }
             elements.show_empty.event.press |> THEN { TEXT { Cursor42 } }
         }
 
     viewport_label:
-        LATEST {
-            TEXT { 0 ns - 120 ns }
-            elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
-            elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
-            elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-            elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
-            elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-        }
+        NovyModel/viewport_label(zoom: zoom_level, pan: pan_window)
 
     keyboard_viewport_label:
-        TEXT { 0 ns - 120 ns } |> HOLD keyboard_viewport_label {
-            LATEST {
-                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
-                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
-                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
-                elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-            elements.keyboard_capture.key |> WHEN {
-                W => TEXT { 36 ns - 60 ns }
-                S => TEXT { 0 ns - 240 ns }
-                R => TEXT { 0 ns - 120 ns }
-                A => TEXT { 24 ns - 48 ns }
-                D => TEXT { 48 ns - 72 ns }
-                Q => TEXT { 48 ns - 72 ns }
-                E => TEXT { 48 ns - 72 ns }
-                __ => SKIP
-            }
-            }
-        }
+        NovyModel/viewport_label(zoom: zoom_level, pan: pan_window)
 
     cursor_label:
         NovyModel/cursor_label(cursor: cursor_position)
@@ -1417,7 +1702,7 @@ store: [
                 elements.select_counter_file.event.press |> THEN { TEXT { top.cpu.clk } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart.tx_data[7:0] } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple.counter[3:0] } }
-                elements.load_fixture.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.load_default_file.event.press |> THEN { TEXT { top.cpu.clk } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
@@ -1433,7 +1718,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE } }
-            elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU } }
             elements.show_empty.event.press |> THEN { TEXT { NONE } }
         }
 
@@ -1448,7 +1733,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { top.cpu } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple } }
-            elements.load_fixture.event.press |> THEN { TEXT { top.cpu } }
+            elements.load_default_file.event.press |> THEN { TEXT { top.cpu } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
@@ -1463,7 +1748,7 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { 8 signals } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { 5 signals } }
             elements.select_ghw_file.event.press |> THEN { TEXT { 4 signals } }
-            elements.load_fixture.event.press |> THEN { TEXT { 8 signals } }
+            elements.load_default_file.event.press |> THEN { TEXT { 8 signals } }
             elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
         }
 
@@ -1474,7 +1759,7 @@ store: [
             elements.scope_cpu_expand.event.press |> THEN { TEXT { Expanded } }
             elements.scope_cpu_collapse.event.press |> THEN { TEXT { Collapsed } }
             elements.select_counter_file.event.press |> THEN { TEXT { Expanded } }
-            elements.load_fixture.event.press |> THEN { TEXT { Expanded } }
+            elements.load_default_file.event.press |> THEN { TEXT { Expanded } }
             elements.show_empty.event.press |> THEN { TEXT { Collapsed } }
         }
 
@@ -1518,7 +1803,7 @@ store: [
                 elements.select_clk.event.press |> THEN { TEXT { Off } }
                 elements.select_reset.event.press |> THEN { TEXT { Off } }
                 elements.select_temperature.event.press |> THEN { TEXT { Off } }
-                elements.load_fixture.event.press |> THEN { TEXT { Off } }
+                elements.load_default_file.event.press |> THEN { TEXT { Off } }
                 elements.show_empty.event.press |> THEN { TEXT { Off } }
             }
         }
@@ -1552,7 +1837,7 @@ store: [
                 elements.select_counter_file.event.press |> THEN { TEXT { CLK } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TX_DATA } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_COUNTER } }
-                elements.load_fixture.event.press |> THEN { TEXT { CLK } }
+                elements.load_default_file.event.press |> THEN { TEXT { CLK } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -1561,23 +1846,19 @@ store: [
         NovyModel/format_label(format: value_format)
 
     data_bus_rendered_value:
-        NovyFixtures/selected_data_value(format: value_format)
+        NovyModel/selected_data_value_at_cursor(format: value_format, cursor: cursor_position)
 
     temperature_rendered_value:
-        NovyFixtures/selected_temperature_value(format: value_format)
+        NovyModel/selected_temperature_value_at_cursor(format: value_format, cursor: cursor_position)
 
     row_height:
-        LATEST {
-            28
-            elements.row_taller.event.press |> THEN { 44 }
-            elements.row_shorter.event.press |> THEN { 22 }
-        }
+        NovyModel/row_height(size: row_size)
 
     bridge_request_fingerprint:
         bridge_request_descriptor_label
 
     bridge_request_page:
-        NovyModel/request_page(compact: bridge_request_compact_label, format: value_format)
+        bridge_request_compact_label
 
     bridge_response_scope:
         TEXT { TOP_CPU } |> HOLD bridge_response_scope {
@@ -1589,7 +1870,7 @@ store: [
                 elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
                 elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU } }
-                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
+                elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -1605,7 +1886,7 @@ store: [
                 elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK } }
-                elements.load_fixture.event.press |> THEN { TEXT { CLK } }
+                elements.load_default_file.event.press |> THEN { TEXT { CLK } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -1621,7 +1902,7 @@ store: [
                 elements.zoom_reset.event.press |> THEN { TEXT { Fit } }
                 elements.cursor_left.event.press |> THEN { TEXT { Close } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Fit } }
-                elements.load_fixture.event.press |> THEN { TEXT { Fit } }
+                elements.load_default_file.event.press |> THEN { TEXT { Fit } }
                 elements.show_empty.event.press |> THEN { TEXT { None } }
             }
         }
@@ -1637,7 +1918,7 @@ store: [
                 elements.zoom_reset.event.press |> THEN { TEXT { Center } }
                 elements.cursor_left.event.press |> THEN { TEXT { RightWindow } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Center } }
-                elements.load_fixture.event.press |> THEN { TEXT { Center } }
+                elements.load_default_file.event.press |> THEN { TEXT { Center } }
                 elements.show_empty.event.press |> THEN { TEXT { None } }
             }
         }
@@ -1651,7 +1932,7 @@ store: [
                 elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
                 elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Cursor42 } }
-                elements.load_fixture.event.press |> THEN { TEXT { Cursor42 } }
+                elements.load_default_file.event.press |> THEN { TEXT { Cursor42 } }
                 elements.show_empty.event.press |> THEN { TEXT { None } }
             }
         }
@@ -1664,7 +1945,7 @@ store: [
                 elements.select_ghw_file.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.format_cycle.event.press |> THEN { NovyModel/next_format(format: bridge_response_format) }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.load_fixture.event.press |> THEN { TEXT { Hexadecimal } }
+                elements.load_default_file.event.press |> THEN { TEXT { Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { None } }
             }
         }
@@ -1675,59 +1956,28 @@ store: [
                 elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
-                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
-                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
+                elements.zoom_in.event.press |> THEN {
+                    NovyModel/viewport_label(zoom: NovyModel/zoom_in_level(zoom: zoom_level), pan: pan_window)
+                }
+                elements.zoom_out.event.press |> THEN {
+                    NovyModel/viewport_label(zoom: NovyModel/zoom_out_level(zoom: zoom_level), pan: pan_window)
+                }
                 elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.pan_left.event.press |> THEN { TEXT { 0 ns - 80 ns } }
                 elements.pan_right.event.press |> THEN { TEXT { 80 ns - 160 ns } }
                 elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.load_fixture.event.press |> THEN { TEXT { 0 ns - 120 ns } }
+                elements.load_default_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
                 elements.show_empty.event.press |> THEN { TEXT { no response window } }
             }
         }
 
     bridge_request_window_label:
-        TEXT { 0 ns - 120 ns } |> HOLD bridge_request_window_label {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
-                elements.select_clk.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_data.event.press |> THEN {
-                    data_signal_toggle_state |> WHEN {
-                        On => TEXT { 0 ns - 120 ns }
-                        Off => TEXT { no request window }
-                    }
-                }
-                elements.select_temperature.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_cycle.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_binary.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_hex.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_grouped.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_octal.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_signed.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_unsigned.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.format_ascii.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.zoom_in.event.press |> THEN { TEXT { 36 ns - 60 ns } }
-                elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
-                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-                elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-                elements.cursor_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-                elements.keyboard_capture.key |> WHEN {
-                    A => TEXT { 24 ns - 48 ns }
-                    D => TEXT { 48 ns - 72 ns }
-                    Q => TEXT { 48 ns - 72 ns }
-                    E => TEXT { 48 ns - 72 ns }
-                    W => TEXT { 36 ns - 60 ns }
-                    S => TEXT { 0 ns - 240 ns }
-                    R => TEXT { 0 ns - 120 ns }
-                    __ => SKIP
-                }
-                elements.load_fixture.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.show_empty.event.press |> THEN { TEXT { no request window } }
+        active_signal_key == TEXT { NONE } |> WHEN {
+            True => TEXT { no request window }
+            False => active_file == TEXT { simple_test.ghw } |> WHEN {
+                True => TEXT { 0 ns - 100 ns }
+                False => keyboard_viewport_label
             }
         }
 
@@ -1742,27 +1992,29 @@ store: [
         }
 
     bridge_response_file_digest:
-        TEXT { sha256:fixture-counter-vcd } |> HOLD bridge_response_file_digest {
+        TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } |> HOLD bridge_response_file_digest {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
-                elements.cursor_left.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
-                elements.load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+                elements.select_counter_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172 } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491 } }
+                elements.cursor_left.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+                elements.load_default_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
+                elements.external_file_loaded_digest.text
                 elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
             }
         }
 
     bridge_response_waveform_ref:
-        TEXT { wave:vcd:counter:0-240ns } |> HOLD bridge_response_waveform_ref {
+        TEXT { wave:vcd:simple:0-240ns } |> HOLD bridge_response_waveform_ref {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
+                elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:wave-27:0-240ns } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
-                elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
-                elements.load_fixture.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+                elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.load_default_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.external_file_loaded_waveform_ref.text
                 elements.show_empty.event.press |> THEN { TEXT { wave:none } }
             }
         }
@@ -1794,7 +2046,7 @@ store: [
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } }
                 elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { No response available } }
             }
         }
@@ -1866,7 +2118,7 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unavailable } }
             elements.show_empty.event.press |> THEN { TEXT { unavailable } }
-            elements.load_fixture.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+            elements.load_default_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.cursor_left.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.cursor_right.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
         }
@@ -1888,8 +2140,8 @@ store: [
     bridge_request_label:
         bridge_request_fingerprint
 
-    bridge_request_compact_label:
-        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label {
+    bridge_request_compact_label_raw:
+        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label_raw {
             LATEST {
                 elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
@@ -1926,6 +2178,7 @@ store: [
                 elements.format_unsigned.event.press |> THEN { TEXT { DATA_UNS } }
                 elements.format_ascii.event.press |> THEN { TEXT { DATA_ASC } }
                 elements.zoom_in.event.press |> THEN { TEXT { DATA_CLOSE } }
+                elements.zoom_out.event.press |> THEN { TEXT { DATA_WIDE } }
                 elements.zoom_reset.event.press |> THEN { TEXT { DATA_FIT } }
                 elements.pan_right.event.press |> THEN { TEXT { DATA_RIGHT } }
                 elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
@@ -1940,10 +2193,13 @@ store: [
                     A => TEXT { DATA_LEFT }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.load_default_file.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
+
+    bridge_request_compact_label:
+        NovyModel/request_page(compact: bridge_request_compact_label_raw, format: value_format, zoom: zoom_level)
 
     bridge_response_compact_label:
         TEXT { CLK_FIT } |> HOLD bridge_response_compact_label {
@@ -1963,7 +2219,7 @@ store: [
                     __ => SKIP
                 }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
-                elements.load_fixture.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.load_default_file.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -1977,7 +2233,7 @@ store: [
     stale_response_policy: TEXT { canonical structural request equality required }
     bridge_contract: TEXT { wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats }
     bridge_provider_version: TEXT { planned official wellen 0.24.x provider }
-    bridge_schema_version: TEXT { wellen.v1 fixture schema draft; hashes required before live bridge }
+    bridge_schema_version: TEXT { wellen.v1 waveform schema; real file hashes in descriptors }
     bridge_effect_exports: TEXT { open/hierarchy/signal/cursor/stats }
     bridge_data_policy: TEXT { comparable descriptors only; no Rust handles }
 ]
@@ -2089,21 +2345,13 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION zoomed_waveform_width(width, zoom) {
-    width == 0 |> WHEN {
-        True => width
-        False => zoom |> WHEN {
-            TEXT { Close } => width * 2
-            TEXT { Wide } => width / 2
-            __ => width
-        }
-    }
-}
-
-FUNCTION new_waveform_segment(segment, zoom) {
+FUNCTION new_waveform_segment(segment, store) {
     [
         signal_id: segment.signal_id
-        width: zoomed_waveform_width(width: segment.width, zoom: zoom)
+        width: segment.state |> WHEN {
+            CursorLine => NovyModel/cursor_offset_width(cursor: store.cursor_position, zoom: store.zoom_level)
+            __ => NovyModel/zoomed_waveform_width(width: segment.width, zoom: store.zoom_level)
+        }
         state: segment.state
         label: segment.label
         click_time: segment.click_time

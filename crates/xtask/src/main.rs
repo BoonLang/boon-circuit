@@ -9811,7 +9811,7 @@ fn physical_todomvc_reference_freshness_evidence(
         && artifact_mtime.is_some_and(|mtime| mtime >= newest_source_mtime);
     json!({
         "pass": pass,
-        "basis": "physical TodoMVC preview E2E report and app-owned framebuffer artifact must be newer than physical source, native runtime, and reference fixture files",
+        "basis": "physical TodoMVC preview E2E report and app-owned framebuffer artifact must be newer than physical source, native runtime, and reference waveform files",
         "newest_source_mtime": newest_source_mtime,
         "source_mtimes": source_mtimes
             .into_iter()
@@ -10182,8 +10182,8 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "Files and scopes",
         "Variables",
         "Selected Variables",
-        "single fixture: counter.vcd",
-        "- counter.vcd",
+        "single file: simple.vcd",
+        "- simple.vcd",
         "data_bus[7:0]",
         "0x2a",
         "42 ns",
@@ -10212,8 +10212,8 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "No waveform loaded",
         "Drop or load a VCD, FST, or GHW waveform to inspect signals.",
         "Bridge state: no request scheduled; pure descriptor is wave:none",
-        "Supported fixture contracts: VCD, FST, GHW",
-        "Load fixture",
+        "Supported waveform formats: VCD, FST, GHW",
+        "Open default",
     ];
     let mut empty_layout_path = None;
     let mut empty_texts = Vec::new();
@@ -10244,10 +10244,10 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "Files and scopes",
         "Variables",
         "Selected Variables",
-        "single fixture: counter.vcd",
-        "fixture VCD wave:vcd:counter:0-240ns",
-        "- counter.vcd",
-        "- uart_compare.fst",
+        "single file: simple.vcd",
+        "opened VCD wave:vcd:simple:0-240ns",
+        "- simple.vcd",
+        "- wave_27.fst",
         "- simple_test.ghw",
         "+ top.cpu",
         "+ top.uart",
@@ -10311,7 +10311,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .collect::<Vec<_>>();
 
     let required_runtime_sources = [
-        "store.elements.load_fixture",
+        "store.elements.load_default_file",
         "store.elements.select_uart_compare_file",
         "store.elements.select_ghw_file",
         "store.elements.scope_uart",
@@ -10475,7 +10475,7 @@ fn novywave_bridge_pure_data_evidence(
         .collect::<Vec<_>>();
     let required_policy_labels = [
         "Bridge state: no request scheduled; pure descriptor is wave:none",
-        "Supported fixture contracts: VCD, FST, GHW",
+        "Supported waveform formats: VCD, FST, GHW",
     ];
     let missing_policy_labels = required_policy_labels
         .iter()
@@ -10676,9 +10676,9 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         .filter(|label| !visual_artifact_labels.contains(**label))
         .map(|label| json!(label))
         .collect::<Vec<_>>();
-    let reference_fixture_count = comparison
+    let reference_waveform_count = comparison
         .as_ref()
-        .and_then(|artifact| artifact.get("reference_fixture_files"))
+        .and_then(|artifact| artifact.get("reference_waveform_files"))
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
     let metrics_count = metrics
@@ -10700,19 +10700,14 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         .filter_map(|metric| metric.get("label").and_then(serde_json::Value::as_str))
         .collect::<BTreeSet<_>>();
     let required_dense_labels = [
-        "Fmt",
+        "Next format",
+        "Formatter",
         "Hex",
-        "Bin",
-        "Grp",
-        "Oct",
-        "Sgn",
-        "Uns",
-        "Asc",
-        "[NewGrp]",
-        "[Rm data]",
-        "[Restore]",
-        "[Down]",
-        "[Jump]",
+        "New group",
+        "Remove data",
+        "Restore",
+        "Down",
+        "Jump",
     ];
     let missing_dense_text_labels = required_dense_labels
         .iter()
@@ -10745,7 +10740,7 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         && missing_readback_labels.is_empty()
         && readback_artifact_failures.is_empty()
         && missing_artifact_labels.is_empty()
-        && reference_fixture_count >= 3
+        && reference_waveform_count >= 3
         && missing_dense_text_labels.is_empty()
         && missing_material_roles.is_empty()
         && metrics_count >= 34;
@@ -10781,7 +10776,7 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         "readback_artifact_failures": readback_artifact_failures,
         "required_artifact_labels": required_artifact_labels,
         "missing_artifact_labels": missing_artifact_labels,
-        "reference_fixture_count": reference_fixture_count,
+        "reference_waveform_count": reference_waveform_count,
         "required_dense_text_labels": required_dense_labels,
         "missing_dense_text_labels": missing_dense_text_labels,
         "required_material_roles": required_material_roles,

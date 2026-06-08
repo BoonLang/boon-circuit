@@ -388,6 +388,37 @@ pub struct UpdateMatchArm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateValueMatchArm {
+    pub pattern: String,
+    pub output: UpdateValueExpression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UpdateValueExpression {
+    Const {
+        value: String,
+    },
+    ReadPath {
+        path: String,
+    },
+    MatchConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
+    NumberInfix {
+        left: String,
+        op: String,
+        right: String,
+    },
+    MatchNumberInfixConst {
+        left: String,
+        op: String,
+        right: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UpdateExpression {
     SourcePayload {
         path: String,
@@ -421,6 +452,16 @@ pub enum UpdateExpression {
     MatchConst {
         input: String,
         arms: Vec<UpdateMatchArm>,
+    },
+    MatchValueConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
+    MatchNumberInfixConst {
+        left: String,
+        op: String,
+        right: String,
+        arms: Vec<UpdateValueMatchArm>,
     },
     Unknown {
         summary: String,
@@ -2972,7 +3013,8 @@ fn verify_scheduled_update_expression(
 ) -> Result<(), String> {
     match value {
         UpdateExpression::SourcePayload { .. } | UpdateExpression::Const { .. } => Ok(()),
-        UpdateExpression::NumberInfix { left, right, .. } => {
+        UpdateExpression::NumberInfix { left, op, right } => {
+            require_supported_numeric_update_op(op, "number infix")?;
             if left.parse::<i64>().is_err() {
                 require_known_symbol("number infix left", left, known_symbols)?;
             }
@@ -2981,9 +3023,36 @@ fn verify_scheduled_update_expression(
             }
             Ok(())
         }
-        UpdateExpression::PreviousValue { path }
-        | UpdateExpression::ReadPath { path }
-        | UpdateExpression::BoolNot { path } => {
+        UpdateExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => {
+            require_supported_numeric_update_op(op, "match number infix")?;
+            if left.parse::<i64>().is_err() {
+                require_known_symbol("match number infix left", left, known_symbols)?;
+            }
+            if right.parse::<i64>().is_err() {
+                require_known_symbol("match number infix right", right, known_symbols)?;
+            }
+            for arm in arms {
+                verify_update_value_expression(
+                    &arm.output,
+                    known_symbols,
+                    "match number infix arm",
+                )?;
+            }
+            Ok(())
+        }
+        UpdateExpression::PreviousValue { path } | UpdateExpression::ReadPath { path } => {
+            if source_payload_input_matches(path, source) {
+                Ok(())
+            } else {
+                require_known_symbol("update expression path", path, known_symbols)
+            }
+        }
+        UpdateExpression::BoolNot { path } => {
             require_known_symbol("update expression path", path, known_symbols)
         }
         UpdateExpression::TextTrimOrPrevious { path, previous } => {
@@ -3010,10 +3079,93 @@ fn verify_scheduled_update_expression(
                 require_known_symbol("match input", input, known_symbols)
             }
         }
+        UpdateExpression::MatchValueConst { input, arms } => {
+            if !source_payload_input_matches(input, source) {
+                require_known_symbol("match value input", input, known_symbols)?;
+            }
+            for arm in arms {
+                verify_update_value_expression(&arm.output, known_symbols, "match value arm")?;
+            }
+            Ok(())
+        }
         UpdateExpression::Unknown { summary } => Err(format!(
             "static schedule contains unsupported update expression for `{target}` from `{source}`: `{summary}`"
         )),
     }
+}
+
+fn verify_update_value_expression(
+    value: &UpdateValueExpression,
+    known_symbols: &BTreeSet<&str>,
+    context: &str,
+) -> Result<(), String> {
+    match value {
+        UpdateValueExpression::Const { .. } => Ok(()),
+        UpdateValueExpression::ReadPath { path } => {
+            require_known_symbol(&format!("{context} path"), path, known_symbols)
+        }
+        UpdateValueExpression::MatchConst { input, arms } => {
+            require_known_symbol(&format!("{context} match input"), input, known_symbols)?;
+            for arm in arms {
+                verify_update_value_expression(
+                    &arm.output,
+                    known_symbols,
+                    "nested match const arm",
+                )?;
+            }
+            Ok(())
+        }
+        UpdateValueExpression::NumberInfix { left, op, right } => {
+            require_supported_numeric_update_op(op, &format!("{context} number infix"))?;
+            if left.parse::<i64>().is_err() {
+                require_known_symbol(&format!("{context} number infix left"), left, known_symbols)?;
+            }
+            if right.parse::<i64>().is_err() {
+                require_known_symbol(
+                    &format!("{context} number infix right"),
+                    right,
+                    known_symbols,
+                )?;
+            }
+            Ok(())
+        }
+        UpdateValueExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => {
+            require_supported_numeric_update_op(op, &format!("{context} match number infix"))?;
+            if left.parse::<i64>().is_err() {
+                require_known_symbol(
+                    &format!("{context} match number infix left"),
+                    left,
+                    known_symbols,
+                )?;
+            }
+            if right.parse::<i64>().is_err() {
+                require_known_symbol(
+                    &format!("{context} match number infix right"),
+                    right,
+                    known_symbols,
+                )?;
+            }
+            for arm in arms {
+                verify_update_value_expression(
+                    &arm.output,
+                    known_symbols,
+                    "nested match number infix arm",
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn require_supported_numeric_update_op(op: &str, context: &str) -> Result<(), String> {
+    matches!(op, "+" | "-" | ">" | ">=" | "<" | "<=" | "==" | "!=")
+        .then_some(())
+        .ok_or_else(|| format!("{context} uses unsupported numeric operator `{op}`"))
 }
 
 fn source_payload_input_matches(input: &str, source: &str) -> bool {
@@ -3264,6 +3416,17 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             reject_hidden_identity_identifier("number infix left", left)?;
             reject_hidden_identity_identifier("number infix right", right)
         }
+        UpdateExpression::MatchNumberInfixConst {
+            left, right, arms, ..
+        } => {
+            reject_hidden_identity_identifier("match number infix left", left)?;
+            reject_hidden_identity_identifier("match number infix right", right)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
+        }
         UpdateExpression::MatchConst { input, arms } => {
             reject_hidden_identity_identifier("match input", input)?;
             for arm in arms {
@@ -3272,11 +3435,53 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             }
             Ok(())
         }
+        UpdateExpression::MatchValueConst { input, arms } => {
+            reject_hidden_identity_identifier("match value input", input)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
+        }
         UpdateExpression::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown update expression", summary)
         }
         UpdateExpression::Const { value } => {
             reject_hidden_identity_identifier("const value", value)
+        }
+    }
+}
+
+fn reject_update_value_expression_identity(value: &UpdateValueExpression) -> Result<(), String> {
+    match value {
+        UpdateValueExpression::Const { value } => {
+            reject_hidden_identity_identifier("match output const", value)
+        }
+        UpdateValueExpression::ReadPath { path } => {
+            reject_hidden_identity_identifier("match output path", path)
+        }
+        UpdateValueExpression::MatchConst { input, arms } => {
+            reject_hidden_identity_identifier("match output match input", input)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
+        }
+        UpdateValueExpression::NumberInfix { left, right, .. } => {
+            reject_hidden_identity_identifier("match output number infix left", left)?;
+            reject_hidden_identity_identifier("match output number infix right", right)
+        }
+        UpdateValueExpression::MatchNumberInfixConst {
+            left, right, arms, ..
+        } => {
+            reject_hidden_identity_identifier("match output match number infix left", left)?;
+            reject_hidden_identity_identifier("match output match number infix right", right)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
         }
     }
 }
@@ -5523,6 +5728,11 @@ fn match_const_update_expression_from_expr(
     let expr = field_expr(field, expr_id)?;
     match &expr.kind {
         AstExprKind::When { input } => {
+            if let Some(expression) = match_number_infix_const_update_expression_from_input(
+                field, target, fields, *input, expr.id,
+            ) {
+                return Some(expression);
+            }
             let input = canonical_scalar_update_path_with_fields(
                 field,
                 target,
@@ -5530,7 +5740,18 @@ fn match_const_update_expression_from_expr(
                 fields,
             );
             let arms = match_const_arms_for_when(field, expr.id);
-            (!arms.is_empty()).then_some(UpdateExpression::MatchConst { input, arms })
+            if arms.is_empty() {
+                return None;
+            }
+            let value_arms = match_value_arms_for_when(field, target, fields, expr.id);
+            if match_value_arms_need_structured_update(&arms, &value_arms) {
+                Some(UpdateExpression::MatchValueConst {
+                    input,
+                    arms: value_arms,
+                })
+            } else {
+                Some(UpdateExpression::MatchConst { input, arms })
+            }
         }
         AstExprKind::Then {
             output: Some(output),
@@ -5538,6 +5759,128 @@ fn match_const_update_expression_from_expr(
         } => match_const_update_expression_from_expr(field, target, fields, *output),
         _ => None,
     }
+}
+
+fn match_number_infix_const_update_expression_from_input(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    input: usize,
+    when_expr_id: usize,
+) -> Option<UpdateExpression> {
+    let input = field_expr(field, input)?;
+    let AstExprKind::Infix { left, op, right } = &input.kind else {
+        return None;
+    };
+    let left = scalar_number_operand(field, *left, target)?;
+    let right = scalar_number_operand(field, *right, target)?;
+    let arms = match_value_arms_for_when(field, target, fields, when_expr_id);
+    (!arms.is_empty()).then_some(UpdateExpression::MatchNumberInfixConst {
+        left,
+        op: op.clone(),
+        right,
+        arms,
+    })
+}
+
+fn match_value_arms_for_when(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    when_expr_id: usize,
+) -> Vec<UpdateValueMatchArm> {
+    let mut arms = Vec::new();
+    collect_match_value_arms_for_when(
+        field,
+        target,
+        fields,
+        &field.statement,
+        when_expr_id,
+        &mut arms,
+    );
+    if arms.is_empty() {
+        match_value_arms_after_when_expr(field, target, fields, when_expr_id)
+    } else {
+        arms
+    }
+}
+
+fn match_value_arms_need_structured_update(
+    const_arms: &[UpdateMatchArm],
+    value_arms: &[UpdateValueMatchArm],
+) -> bool {
+    if value_arms.len() != const_arms.len() {
+        return !value_arms.is_empty();
+    }
+    value_arms
+        .iter()
+        .zip(const_arms)
+        .any(|(value_arm, const_arm)| {
+            value_arm.pattern != const_arm.pattern
+                || !matches!(
+                    &value_arm.output,
+                    UpdateValueExpression::Const { value } if value == &const_arm.output
+                )
+        })
+}
+
+fn collect_match_value_arms_for_when(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    statement: &AstStatement,
+    when_expr_id: usize,
+    arms: &mut Vec<UpdateValueMatchArm>,
+) -> bool {
+    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
+        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
+    });
+    if statement_contains_when {
+        for child in &statement.children {
+            if let Some(arm) = match_value_arm(field, target, fields, child) {
+                arms.push(arm);
+            }
+        }
+        if !arms.is_empty() {
+            return true;
+        }
+    }
+    for child in &statement.children {
+        if collect_match_value_arms_for_when(field, target, fields, child, when_expr_id, arms) {
+            return true;
+        }
+    }
+    false
+}
+
+fn match_value_arms_after_when_expr(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    when_expr_id: usize,
+) -> Vec<UpdateValueMatchArm> {
+    let Some(when_expr) = field_expr(field, when_expr_id) else {
+        return Vec::new();
+    };
+    let end_line = field
+        .ast_exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_expr.line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
+        .filter_map(|expr| match_value_arm_expr(field, target, fields, expr))
+        .collect()
 }
 
 fn match_const_arms_for_when(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
@@ -5683,6 +6026,103 @@ fn match_const_arm_in_exprs(exprs: &[AstExpr], statement: &AstStatement) -> Opti
 
 fn match_const_arm_expr(field: &FieldDef, expr: &AstExpr) -> Option<UpdateMatchArm> {
     match_const_arm_expr_in_exprs(&field.ast_exprs, expr)
+}
+
+fn match_value_arm(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    statement: &AstStatement,
+) -> Option<UpdateValueMatchArm> {
+    let expr_id = statement.expr?;
+    let expr = field_expr(field, expr_id)?;
+    match_value_arm_expr(field, target, fields, expr)
+}
+
+fn match_value_arm_expr(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr: &AstExpr,
+) -> Option<UpdateValueMatchArm> {
+    let AstExprKind::MatchArm {
+        pattern,
+        output: Some(output),
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let output = update_value_expression_from_expr(field, target, fields, *output)?;
+    let pattern = match_const_pattern_label(pattern)?;
+    (!pattern.is_empty()).then(|| UpdateValueMatchArm { pattern, output })
+}
+
+fn update_value_expression_from_expr(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr_id: usize,
+) -> Option<UpdateValueExpression> {
+    let expr = field_expr(field, expr_id)?;
+    if matches!(expr.kind, AstExprKind::Identifier(_) | AstExprKind::Path(_)) {
+        let raw = ast_argument_value(field, expr_id)?;
+        let path = canonical_scalar_update_path_with_fields(field, target, &raw, fields);
+        if path == target || fields.iter().any(|candidate| candidate.path == path) {
+            return Some(UpdateValueExpression::ReadPath { path });
+        }
+    }
+    if let Some(value) = ast_simple_update_value_in_exprs(&field.ast_exprs, expr_id) {
+        return Some(UpdateValueExpression::Const { value });
+    }
+    if let AstExprKind::When { input } = expr.kind {
+        if let Some(expression) =
+            update_value_match_number_infix_from_input(field, target, fields, input, expr.id)
+        {
+            return Some(expression);
+        }
+        let input = canonical_scalar_update_path_with_fields(
+            field,
+            target,
+            &ast_argument_value(field, input)?,
+            fields,
+        );
+        let arms = match_value_arms_for_when(field, target, fields, expr.id);
+        if !arms.is_empty() {
+            return Some(UpdateValueExpression::MatchConst { input, arms });
+        }
+    }
+    let AstExprKind::Infix { left, op, right } = &expr.kind else {
+        return None;
+    };
+    let left = scalar_number_operand(field, *left, target)?;
+    let right = scalar_number_operand(field, *right, target)?;
+    Some(UpdateValueExpression::NumberInfix {
+        left,
+        op: op.clone(),
+        right,
+    })
+}
+
+fn update_value_match_number_infix_from_input(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    input: usize,
+    when_expr_id: usize,
+) -> Option<UpdateValueExpression> {
+    let input = field_expr(field, input)?;
+    let AstExprKind::Infix { left, op, right } = &input.kind else {
+        return None;
+    };
+    let left = scalar_number_operand(field, *left, target)?;
+    let right = scalar_number_operand(field, *right, target)?;
+    let arms = match_value_arms_for_when(field, target, fields, when_expr_id);
+    (!arms.is_empty()).then_some(UpdateValueExpression::MatchNumberInfixConst {
+        left,
+        op: op.clone(),
+        right,
+        arms,
+    })
 }
 
 fn match_const_arm_expr_in_exprs(exprs: &[AstExpr], expr: &AstExpr) -> Option<UpdateMatchArm> {
@@ -7046,10 +7486,6 @@ FUNCTION wrapped_button(source) {
                     include_str!("../../../examples/novywave/Generated/Assets.bn").to_owned(),
                 ),
                 (
-                    "examples/novywave/Generated/NovyFixtures.bn".to_owned(),
-                    include_str!("../../../examples/novywave/Generated/NovyFixtures.bn").to_owned(),
-                ),
-                (
                     "examples/novywave/Generated/NovyReference.bn".to_owned(),
                     include_str!("../../../examples/novywave/Generated/NovyReference.bn")
                         .to_owned(),
@@ -7076,7 +7512,7 @@ FUNCTION wrapped_button(source) {
         let ir = lower(&parsed).unwrap();
 
         for expected_path in [
-            "store.elements.load_fixture",
+            "store.elements.load_default_file",
             "store.elements.signal_search_input",
             "store.elements.keyboard_capture",
             "store.elements.select_data",
@@ -7505,6 +7941,169 @@ FUNCTION next_format(format) {
                     }
         }));
         verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
+    fn numeric_infix_when_with_arithmetic_arm_lowers_to_structured_update() {
+        let source = r#"
+store: [
+    elements: [
+        zoom_in: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.zoom_in.event.press |> THEN {
+                    zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                }
+            }
+        }
+]
+"#;
+        let parsed =
+            boon_parser::parse_source("numeric-infix-when-arithmetic-arm.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "store.zoom_step"
+                && branch.source == "store.elements.zoom_in"
+                && branch.expression
+                    == UpdateExpression::MatchNumberInfixConst {
+                        left: "store.zoom_step".to_owned(),
+                        op: ">=".to_owned(),
+                        right: "3".to_owned(),
+                        arms: vec![
+                            UpdateValueMatchArm {
+                                pattern: "True".to_owned(),
+                                output: UpdateValueExpression::Const {
+                                    value: "3".to_owned(),
+                                },
+                            },
+                            UpdateValueMatchArm {
+                                pattern: "False".to_owned(),
+                                output: UpdateValueExpression::NumberInfix {
+                                    left: "store.zoom_step".to_owned(),
+                                    op: "+".to_owned(),
+                                    right: "1".to_owned(),
+                                },
+                            },
+                        ],
+                    }
+        }));
+        verify_hidden_identity(&ir).unwrap();
+        verify_static_schedule(&ir).unwrap();
+    }
+
+    #[test]
+    fn source_payload_match_can_emit_nested_numeric_infix_match_update() {
+        let source = r#"
+store: [
+    elements: [
+        keyboard_capture: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                    R => 0
+                    __ => SKIP
+                }
+            }
+        }
+]
+"#;
+        let parsed =
+            boon_parser::parse_source("source-payload-nested-match-value.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.zoom_step"
+                    && branch.source == "store.elements.keyboard_capture"
+            })
+            .expect("keyboard_capture should route to zoom_step");
+        let expected = UpdateExpression::MatchValueConst {
+            input: "elements.keyboard_capture.key".to_owned(),
+            arms: vec![
+                UpdateValueMatchArm {
+                    pattern: "W".to_owned(),
+                    output: UpdateValueExpression::MatchNumberInfixConst {
+                        left: "store.zoom_step".to_owned(),
+                        op: ">=".to_owned(),
+                        right: "3".to_owned(),
+                        arms: vec![
+                            UpdateValueMatchArm {
+                                pattern: "True".to_owned(),
+                                output: UpdateValueExpression::Const {
+                                    value: "3".to_owned(),
+                                },
+                            },
+                            UpdateValueMatchArm {
+                                pattern: "False".to_owned(),
+                                output: UpdateValueExpression::NumberInfix {
+                                    left: "store.zoom_step".to_owned(),
+                                    op: "+".to_owned(),
+                                    right: "1".to_owned(),
+                                },
+                            },
+                        ],
+                    },
+                },
+                UpdateValueMatchArm {
+                    pattern: "R".to_owned(),
+                    output: UpdateValueExpression::Const {
+                        value: "0".to_owned(),
+                    },
+                },
+                UpdateValueMatchArm {
+                    pattern: "__".to_owned(),
+                    output: UpdateValueExpression::Const {
+                        value: "SKIP".to_owned(),
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            branch.expression, expected,
+            "keyboard branch expression should preserve nested structured outputs; actual={:#?}",
+            branch.expression
+        );
+        verify_static_schedule(&ir).unwrap();
+    }
+
+    #[test]
+    fn source_payload_match_rejects_unsupported_nested_numeric_infix_operator() {
+        let source = r#"
+store: [
+    elements: [
+        keyboard_capture: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step * 2
+                    __ => SKIP
+                }
+            }
+        }
+]
+"#;
+        let parsed =
+            boon_parser::parse_source("source-payload-unsupported-nested-op.bn", source).unwrap();
+        let error =
+            lower(&parsed).expect_err("unsupported nested numeric operator should fail lowering");
+        assert!(
+            error.contains("unsupported numeric operator `*`"),
+            "unexpected static verification error: {error}"
+        );
     }
 
     #[test]

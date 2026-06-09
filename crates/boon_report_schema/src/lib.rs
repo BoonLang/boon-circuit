@@ -213,6 +213,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-idle-wake"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
+                | "verify-native-gpu-novywave-interaction-speed"
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-dev-editor-scroll-speed"
                 | "verify-native-example-switch-speed"

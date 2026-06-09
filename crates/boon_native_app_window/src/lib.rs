@@ -667,6 +667,7 @@ pub struct NativeInputAdapterProof {
 pub struct NativeInputCursor {
     pub last_mouse_button_sequence: u64,
     pub last_keyboard_sequence: u64,
+    pub last_mouse_motion_event_count: u64,
     pub last_mouse_scroll_event_count: u64,
 }
 
@@ -691,6 +692,9 @@ impl NativeInputCursor {
         self.last_mouse_scroll_event_count = self
             .last_mouse_scroll_event_count
             .max(input.mouse_scroll_event_count);
+        self.last_mouse_motion_event_count = self
+            .last_mouse_motion_event_count
+            .max(input.mouse_motion_event_count);
     }
 }
 
@@ -2291,8 +2295,11 @@ fn sample_input_adapter_delta(
     let new_scroll_observed = mouse_provenance.scroll_event_count
         > cursor.last_mouse_scroll_event_count
         && (scroll_delta_x != 0.0 || scroll_delta_y != 0.0);
+    let new_motion_observed =
+        mouse_provenance.motion_event_count > cursor.last_mouse_motion_event_count;
     let real_os_events_observed = !mouse_button_events.is_empty()
         || !keyboard_events.is_empty()
+        || new_motion_observed
         || new_scroll_observed
         || !mouse_buttons_down.is_empty()
         || !pressed_keys.is_empty();

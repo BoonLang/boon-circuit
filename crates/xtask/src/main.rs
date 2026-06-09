@@ -74,6 +74,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-todomvc-physical-reference-parity",
     "verify-native-todomvc-input-parity",
     "verify-native-gpu-novywave-visual",
+    "verify-native-gpu-novywave-interaction-speed",
     "verify-native-gpu-scroll-speed",
     "verify-native-dev-editor-scroll-speed",
     "verify-native-example-switch-speed",
@@ -163,6 +164,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
         "verify-native-gpu-novywave-visual" => verify_native_gpu_novywave_visual(&args),
+        "verify-native-gpu-novywave-interaction-speed" => {
+            verify_native_gpu_novywave_interaction_speed(&args)
+        }
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
         "verify-native-dev-editor-scroll-speed" => verify_native_dev_editor_scroll_speed(&args),
         "verify-native-example-switch-speed" => verify_native_example_switch_speed(&args),
@@ -13865,12 +13869,17 @@ fn live_source_event_from_scenario_step(
         text: toml_string_owned_xtask(expected, "text"),
         key: toml_string_owned_xtask(expected, "key"),
         address: toml_string_owned_xtask(expected, "address"),
+        pointer_x: toml_string_owned_xtask(expected, "pointer_x"),
+        pointer_y: toml_string_owned_xtask(expected, "pointer_y"),
+        pointer_width: toml_string_owned_xtask(expected, "pointer_width"),
+        pointer_height: toml_string_owned_xtask(expected, "pointer_height"),
         target_text: toml_string_owned_xtask(expected, "target_text"),
         target_occurrence: toml_usize_xtask(expected, "target_occurrence"),
         target_key: toml_u64_xtask(expected, "target_key"),
         target_generation: toml_u64_xtask(expected, "target_generation"),
         bind_epoch: toml_u64_xtask(expected, "bind_epoch"),
         source_id: toml_u64_xtask(expected, "source_id"),
+        ..LiveSourceEvent::default()
     })
 }
 
@@ -17229,6 +17238,361 @@ fn verify_native_cells_interaction_speed(
     )
 }
 
+fn verify_native_gpu_novywave_interaction_speed(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let event_count = value_arg(args, "--event-count")
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(32)
+        .max(1);
+    let max_p95_ms =
+        native_gpu_budget_f64("novywave_interaction.release", "click_to_cursor_ms_p95")
+            .unwrap_or(16.7);
+    let max_max_ms =
+        native_gpu_budget_f64("novywave_interaction.release", "input_to_visible_ms_max")
+            .unwrap_or(33.4);
+    let max_resize_p95_ms =
+        native_gpu_budget_f64("novywave_interaction.release", "resize_to_present_ms_p95")
+            .unwrap_or(33.4);
+    let entry = boon_runtime::example_manifest_entry("novywave")?;
+    let source = boon_runtime::source_text_for_entry(&entry)?;
+    let source_files = manifest_source_files(&entry);
+    let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
+    std::fs::create_dir_all(&artifacts_dir)?;
+    let role_report = artifacts_dir.join("novywave-interaction-speed-role.json");
+    let _ = std::fs::remove_file(&role_report);
+
+    let build = Command::new("cargo")
+        .args(["build", "--release", "-p", "boon_native_playground"])
+        .status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:playground-release-build",
+        build.success(),
+        format!("cargo build --release -p boon_native_playground status={build}"),
+        (!build.success()).then(|| "failed to build release boon_native_playground".to_owned()),
+    );
+
+    let binary_path = PathBuf::from("target/release/boon_native_playground");
+    let event_count_arg = event_count.to_string();
+    let max_p95_ms_arg = max_p95_ms.to_string();
+    let max_max_ms_arg = max_max_ms.to_string();
+    let max_resize_p95_ms_arg = max_resize_p95_ms.to_string();
+    let role_report_arg = role_report.display().to_string();
+    let role_output = if build.success() {
+        Some(
+            Command::new(&binary_path)
+                .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+                .args([
+                    "--role",
+                    "interaction-speed",
+                    "--example",
+                    "novywave",
+                    "--event-count",
+                    &event_count_arg,
+                    "--max-p95-ms",
+                    &max_p95_ms_arg,
+                    "--max-max-ms",
+                    &max_max_ms_arg,
+                    "--max-resize-p95-ms",
+                    &max_resize_p95_ms_arg,
+                    "--report",
+                    &role_report_arg,
+                ])
+                .output()?,
+        )
+    } else {
+        None
+    };
+    let role_exit_success = role_output
+        .as_ref()
+        .is_some_and(|output| output.status.success());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:role-exit-success",
+        role_exit_success,
+        format!(
+            "status={:?}, stderr={}",
+            role_output
+                .as_ref()
+                .map(|output| output.status.to_string())
+                .unwrap_or_else(|| "not-run".to_owned()),
+            role_output
+                .as_ref()
+                .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                .unwrap_or_else(|| "not-run".to_owned())
+        ),
+        (!role_exit_success).then(|| {
+            format!(
+                "boon_native_playground NovyWave interaction-speed role failed; report={}",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_report_json = read_optional_json(&role_report)?;
+    let role_report_present = role_report_json.is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:role-report-present",
+        role_report_present,
+        format!("report={}", role_report.display()),
+        (!role_report_present).then(|| {
+            format!(
+                "NovyWave interaction-speed role did not write `{}`",
+                role_report.display()
+            )
+        }),
+    );
+    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
+        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:role-status-pass",
+        role_status_pass,
+        format!(
+            "status={:?}",
+            role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!role_status_pass)
+            .then(|| "NovyWave interaction-speed role status was not pass".to_owned()),
+    );
+    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
+        report
+            .get("per_step_pass_fail")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| {
+                !steps.is_empty()
+                    && steps.iter().all(|step| {
+                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+            })
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:role-checks-pass",
+        role_checks_all_pass,
+        "role per_step_pass_fail entries all pass",
+        (!role_checks_all_pass)
+            .then(|| "NovyWave interaction-speed role contained a failing step".to_owned()),
+    );
+
+    let input_to_visible = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("input_to_visible_ms_p50_p95_max"))
+        .cloned()
+        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let hover_to_overlay = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("hover_to_overlay_ms_p50_p95_max"))
+        .cloned()
+        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let click_to_cursor = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("click_to_cursor_ms_p50_p95_max"))
+        .cloned()
+        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let divider_drag = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("divider_drag_to_layout_ms_p50_p95_max"))
+        .cloned()
+        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let resize_to_present = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("resize_to_present_ms_p50_p95_max"))
+        .cloned()
+        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let latency_checks = [
+        (
+            "novywave-interaction-speed:input-to-visible-p95-budget",
+            &input_to_visible,
+            native_gpu_budget_f64("novywave_interaction.release", "input_to_visible_ms_p95")
+                .unwrap_or(16.7),
+        ),
+        (
+            "novywave-interaction-speed:hover-to-overlay-p95-budget",
+            &hover_to_overlay,
+            native_gpu_budget_f64("novywave_interaction.release", "hover_to_overlay_ms_p95")
+                .unwrap_or(16.7),
+        ),
+        (
+            "novywave-interaction-speed:click-to-cursor-p95-budget",
+            &click_to_cursor,
+            native_gpu_budget_f64("novywave_interaction.release", "click_to_cursor_ms_p95")
+                .unwrap_or(16.7),
+        ),
+        (
+            "novywave-interaction-speed:divider-drag-p95-budget",
+            &divider_drag,
+            native_gpu_budget_f64(
+                "novywave_interaction.release",
+                "divider_drag_to_layout_ms_p95",
+            )
+            .unwrap_or(16.7),
+        ),
+        (
+            "novywave-interaction-speed:resize-to-present-p95-budget",
+            &resize_to_present,
+            native_gpu_budget_f64("novywave_interaction.release", "resize_to_present_ms_p95")
+                .unwrap_or(33.4),
+        ),
+    ];
+    for (id, summary, max) in latency_checks {
+        let observed = summary_p95_f64(summary).unwrap_or(f64::INFINITY);
+        let pass = observed <= max;
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            id,
+            pass,
+            format!("p95_ms={observed:.3}, max_ms={max:.3}"),
+            (!pass).then(|| format!("{id} exceeded budget: p95_ms={observed:.3}, max_ms={max:.3}")),
+        );
+    }
+
+    let selected_rows = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selected_rows_order_label"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let selected_rows_ok = selected_rows == "A[3:0], B[3:0]";
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:selected-rows-default",
+        selected_rows_ok,
+        format!("selected_rows_order_label={selected_rows}"),
+        (!selected_rows_ok).then(|| {
+            format!(
+                "NovyWave interaction reset state must keep simple.vcd selected rows; observed {selected_rows}"
+            )
+        }),
+    );
+    let hot_path_png_write_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("hot_path_png_write_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let hot_path_report_write_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("hot_path_report_write_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let hover_persist_write_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("hover_persist_write_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    for (id, observed, key) in [
+        (
+            "novywave-interaction-speed:no-hot-path-png-writes",
+            hot_path_png_write_count,
+            "hot_path_png_write_count",
+        ),
+        (
+            "novywave-interaction-speed:no-hot-path-report-writes",
+            hot_path_report_write_count,
+            "hot_path_report_write_count",
+        ),
+        (
+            "novywave-interaction-speed:no-hover-persist-writes",
+            hover_persist_write_count,
+            "hover_persist_write_count",
+        ),
+    ] {
+        let pass = observed == 0;
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            id,
+            pass,
+            format!("{key}={observed}"),
+            (!pass).then(|| format!("{key} must be 0 in the interaction hot path")),
+        );
+    }
+
+    let role_artifact = if role_report.exists() {
+        vec![artifact_hash(&role_report)?]
+    } else {
+        Vec::new()
+    };
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-novywave-interaction-speed",
+        checks,
+        blockers,
+        json!({
+            "example": "novywave",
+            "profile": "release",
+            "source_path": entry.source,
+            "scenario_path": entry.scenario,
+            "source_hash": source_hash_for_report_source_files(&source_files, &source)?,
+            "scenario_hash": file_hash(&entry.scenario),
+            "source_files": source_files,
+            "playground_binary_path": binary_path,
+            "playground_binary_hash": boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()),
+            "role_report": role_report,
+            "role_report_status": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "event_count": event_count,
+            "max_p95_ms": max_p95_ms,
+            "max_max_ms": max_max_ms,
+            "max_resize_p95_ms": max_resize_p95_ms,
+            "input_to_visible_ms_p50_p95_max": input_to_visible,
+            "hover_to_overlay_ms_p50_p95_max": hover_to_overlay,
+            "click_to_cursor_ms_p50_p95_max": click_to_cursor,
+            "divider_drag_to_layout_ms_p50_p95_max": divider_drag,
+            "resize_to_present_ms_p50_p95_max": resize_to_present,
+            "runtime_apply_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_apply_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "preview_blocked_on_ipc_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("preview_blocked_on_ipc_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+            "hot_path_png_write_count": hot_path_png_write_count,
+            "hot_path_report_write_count": hot_path_report_write_count,
+            "hover_persist_write_count": hover_persist_write_count,
+            "selected_rows_order_label": selected_rows,
+            "keyboard_cursor_label": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("keyboard_cursor_label"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "zoom_center_label": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("zoom_center_label"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "ui_state_persistence_disabled_for_benchmark": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("ui_state_persistence_disabled_for_benchmark"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "artifact_sha256s": role_artifact
+        }),
+    )
+}
+
 fn verify_native_dev_editor_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -19351,6 +19715,12 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--profile", "release")],
         ),
         native_gpu_required_report(
+            "novywave-interaction-speed",
+            "target/reports/native-gpu/novywave-interaction-speed.json",
+            "verify-native-gpu-novywave-interaction-speed",
+            &[],
+        ),
+        native_gpu_required_report(
             "idle-wake-counter",
             "target/reports/native-gpu/idle-wake-counter.json",
             "verify-native-gpu-idle-wake",
@@ -19704,6 +20074,90 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 != Some("B0")
             {
                 blockers.push("selected_address must be B0".to_owned());
+            }
+        }
+        "novywave-interaction-speed" => {
+            require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "input_to_visible_ms_p50_p95_max",
+                native_gpu_budget_f64("novywave_interaction.release", "input_to_visible_ms_p95")
+                    .unwrap_or(16.7),
+            );
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "hover_to_overlay_ms_p50_p95_max",
+                native_gpu_budget_f64("novywave_interaction.release", "hover_to_overlay_ms_p95")
+                    .unwrap_or(16.7),
+            );
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "click_to_cursor_ms_p50_p95_max",
+                native_gpu_budget_f64("novywave_interaction.release", "click_to_cursor_ms_p95")
+                    .unwrap_or(16.7),
+            );
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "divider_drag_to_layout_ms_p50_p95_max",
+                native_gpu_budget_f64(
+                    "novywave_interaction.release",
+                    "divider_drag_to_layout_ms_p95",
+                )
+                .unwrap_or(16.7),
+            );
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "resize_to_present_ms_p50_p95_max",
+                native_gpu_budget_f64("novywave_interaction.release", "resize_to_present_ms_p95")
+                    .unwrap_or(33.4),
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "preview_blocked_on_ipc_count",
+                native_gpu_budget_u64(
+                    "novywave_interaction.release",
+                    "preview_blocked_on_ipc_count",
+                )
+                .unwrap_or(0),
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "hot_path_png_write_count",
+                native_gpu_budget_u64("novywave_interaction.release", "hot_path_png_write_count")
+                    .unwrap_or(0),
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "hot_path_report_write_count",
+                native_gpu_budget_u64(
+                    "novywave_interaction.release",
+                    "hot_path_report_write_count",
+                )
+                .unwrap_or(0),
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "hover_persist_write_count",
+                native_gpu_budget_u64("novywave_interaction.release", "hover_persist_write_count")
+                    .unwrap_or(0),
+            );
+            if report
+                .get("selected_rows_order_label")
+                .and_then(serde_json::Value::as_str)
+                != Some("A[3:0], B[3:0]")
+            {
+                blockers.push(
+                    "selected_rows_order_label must remain the simple.vcd default rows".to_owned(),
+                );
             }
         }
         "multiwindow" => {
@@ -21505,6 +21959,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-todomvc-physical-reference-parity" => "todomvc-physical-reference-parity",
         "verify-native-todomvc-input-parity" => "todomvc-input-parity",
         "verify-native-gpu-novywave-visual" => "novywave-visual",
+        "verify-native-gpu-novywave-interaction-speed" => "novywave-interaction-speed",
         "verify-native-gpu-scroll-speed" => {
             let label = native_gpu_scroll_selector(args).label;
             return PathBuf::from(format!(

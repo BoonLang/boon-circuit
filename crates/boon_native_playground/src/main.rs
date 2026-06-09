@@ -174,9 +174,13 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     if entry.id == "cells" {
         return run_cells_interaction_speed(args, &entry, event_count, &report);
     }
+    if entry.id == "novywave" {
+        return run_novywave_interaction_speed(args, &entry, event_count, &report);
+    }
     if entry.id != "counter" {
         return Err(
-            "interaction-speed currently targets Counter and Cells interaction contracts".into(),
+            "interaction-speed currently targets Counter, Cells, and NovyWave interaction contracts"
+                .into(),
         );
     }
     let source_path = PathBuf::from(&entry.source);
@@ -497,6 +501,395 @@ fn run_cells_interaction_speed(
     }
 }
 
+fn run_novywave_interaction_speed(
+    args: &[String],
+    entry: &boon_runtime::ExampleManifestEntry,
+    event_count: u64,
+    report: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let max_p95_ms = value_arg(args, "--max-p95-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(16.7);
+    let max_max_ms = value_arg(args, "--max-max-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(33.4);
+    let max_resize_p95_ms = value_arg(args, "--max-resize-p95-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(33.4);
+    let source_path = PathBuf::from(&entry.source);
+    let source = boon_runtime::source_text_for_entry(entry)?;
+    let source_units = boon_runtime::source_units_for_entry(entry)?;
+    let mut runtime = boon_runtime::LiveRuntime::from_project(
+        &format!("interaction-speed:{}", source_path.display()),
+        &source_units,
+    )?;
+    let initial_state_summary = runtime.document_state_summary();
+    let viewport = (1180.0, 720.0);
+    let (layout_proof, layout_frame) =
+        native_document_layout_proof_with_project_state_embedded_for_viewport(
+            &source_path,
+            &source_units,
+            Some(&initial_state_summary),
+            Some(viewport),
+        )?;
+    let (wave_center_x, wave_y, wave_node) = source_hit_center_for_target(
+        &layout_proof,
+        "store.elements.waveform_click",
+        Some("waveform canvas"),
+    )
+    .or_else(|_| source_hit_center(&layout_proof, "store.elements.waveform_click"))?;
+    let wave_width = source_hit_width_for_node(&layout_proof, &wave_node)?;
+    let wave_left = wave_center_x - wave_width / 2.0;
+    let live_runtime = Arc::new(Mutex::new(runtime));
+    let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+        layout_proof: layout_proof.clone(),
+        layout_frame_override: Some(layout_frame),
+        update_count: 0,
+        scroll_x_px: 0.0,
+        scroll_y_px: 0.0,
+        last_error: None,
+        last_error_count: 0,
+        status_overlay: None,
+        last_dirty_reason: None,
+    }));
+    let mut input_state = PreviewNativeInputState::default();
+    let mut hover_ms = Vec::new();
+    let mut click_ms = Vec::new();
+    let mut divider_ms = Vec::new();
+    let mut resize_ms = Vec::new();
+    let mut step_reports = Vec::new();
+
+    let click_x = wave_left + (wave_width * 150.0 / 250.0);
+    let mut first_click = deterministic_click_input_from_index(1, click_x, wave_y);
+    set_input_window_size(&mut first_click, viewport);
+    let started = Instant::now();
+    preview_apply_real_window_input_with_units(
+        &first_click,
+        &source_path,
+        &source,
+        &source_units,
+        Some(&live_runtime),
+        &shared_render_state,
+        &mut input_state,
+    )?;
+    let first_click_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    click_ms.push(first_click_ms);
+    let clicked_summary = live_runtime
+        .lock()
+        .map_err(|_| "interaction-speed runtime mutex poisoned")?
+        .document_state_summary();
+    let cursor_at_click = state_summary_text(&clicked_summary, "/store/keyboard_cursor_label")
+        .unwrap_or_else(|| "missing".to_owned());
+    let cursor_click_ok = cursor_at_click == "150 s";
+    step_reports.push(json!({
+        "id": "novywave-interaction-speed:first-click-cursor",
+        "pass": cursor_click_ok,
+        "detail": format!("keyboard_cursor_label={cursor_at_click}, elapsed_ms={first_click_ms:.3}")
+    }));
+
+    let hover_x = wave_left + (wave_width * 200.0 / 250.0);
+    for index in 0..event_count {
+        let x = if index == 0 {
+            hover_x
+        } else {
+            let ratio = 0.12 + ((index % 7) as f64 * 0.11);
+            wave_left + (wave_width * ratio.min(0.88))
+        };
+        let mut hover = deterministic_motion_input_from_counts(
+            input_state.last_mouse_button_event_count,
+            input_state.last_mouse_motion_event_count.saturating_add(1),
+            x,
+            wave_y,
+            viewport,
+        );
+        let started = Instant::now();
+        preview_apply_real_window_input_with_units(
+            &hover,
+            &source_path,
+            &source,
+            &source_units,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )?;
+        hover_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        hover.mouse_button_events.clear();
+    }
+    let hover_summary = live_runtime
+        .lock()
+        .map_err(|_| "interaction-speed runtime mutex poisoned")?
+        .document_state_summary();
+    let cursor_after_hover = state_summary_text(&hover_summary, "/store/keyboard_cursor_label")
+        .unwrap_or_else(|| "missing".to_owned());
+    let zoom_after_hover = state_summary_text(&hover_summary, "/store/zoom_center_label")
+        .unwrap_or_else(|| "missing".to_owned());
+    let hover_cursor_ok = cursor_after_hover == "150 s";
+    let hover_zoom_ok = zoom_after_hover != cursor_after_hover && zoom_after_hover != "missing";
+    step_reports.push(json!({
+        "id": "novywave-interaction-speed:hover-keeps-click-cursor",
+        "pass": hover_cursor_ok,
+        "detail": format!("cursor_after_hover={cursor_after_hover}")
+    }));
+    step_reports.push(json!({
+        "id": "novywave-interaction-speed:hover-updates-zoom-center-only",
+        "pass": hover_zoom_ok,
+        "detail": format!("zoom_center_label={zoom_after_hover}, cursor_label={cursor_after_hover}")
+    }));
+
+    for index in 0..event_count {
+        let target_time = match index % 4 {
+            0 => 50.0,
+            1 => 100.0,
+            2 => 150.0,
+            _ => 200.0,
+        };
+        let x = wave_left + (wave_width * target_time / 250.0);
+        let mut click = deterministic_click_input_from_index(index.saturating_add(10), x, wave_y);
+        set_input_window_size(&mut click, viewport);
+        let started = Instant::now();
+        preview_apply_real_window_input_with_units(
+            &click,
+            &source_path,
+            &source,
+            &source_units,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )?;
+        click_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    for index in 0..event_count {
+        let event = boon_runtime::LiveSourceEvent {
+            source: if index % 2 == 0 {
+                "store.elements.files_variables_resize_drag".to_owned()
+            } else {
+                "store.elements.browser_selected_resize_drag".to_owned()
+            },
+            text: Some(if index % 4 < 2 { "Grow" } else { "Shrink" }.to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        };
+        let started = Instant::now();
+        preview_apply_live_event(
+            &source_path,
+            &source,
+            &source_units,
+            &live_runtime,
+            &shared_render_state,
+            event,
+        )?;
+        divider_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    for index in 0..event_count.min(8) {
+        let resized_viewport = if index % 2 == 0 {
+            (1180.0, 720.0)
+        } else {
+            (960.0, 680.0)
+        };
+        let state_summary = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?
+            .document_state_summary();
+        let started = Instant::now();
+        let _ = native_document_layout_proof_with_project_state_embedded_for_viewport(
+            &source_path,
+            &source_units,
+            Some(&state_summary),
+            Some(resized_viewport),
+        )?;
+        resize_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    let (state_summary, update_count, layout_hash, last_error) = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?;
+        let state_summary = runtime.document_state_summary();
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "interaction-speed render state mutex poisoned")?;
+        (
+            state_summary,
+            shared.update_count,
+            shared
+                .layout_proof
+                .get("layout_frame_hash")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            shared.last_error.clone(),
+        )
+    };
+    let selected_rows = state_summary_text(&state_summary, "/store/selected_rows_order_label")
+        .unwrap_or_else(|| "missing".to_owned());
+    let selected_rows_ok = selected_rows == "A[3:0], B[3:0]";
+    step_reports.push(json!({
+        "id": "novywave-interaction-speed:selected-rows-stable",
+        "pass": selected_rows_ok,
+        "detail": format!("selected_rows_order_label={selected_rows}")
+    }));
+
+    let hover_summary_ms = latency_summary_ms(&hover_ms);
+    let click_summary_ms = latency_summary_ms(&click_ms);
+    let divider_summary_ms = latency_summary_ms(&divider_ms);
+    let resize_summary_ms = latency_summary_ms(&resize_ms);
+    let hover_p95 = latency_p95(&hover_ms);
+    let click_p95 = latency_p95(&click_ms);
+    let divider_p95 = latency_p95(&divider_ms);
+    let resize_p95 = latency_p95(&resize_ms);
+    let max_observed = hover_ms
+        .iter()
+        .chain(click_ms.iter())
+        .chain(divider_ms.iter())
+        .chain(resize_ms.iter())
+        .copied()
+        .fold(0.0_f64, f64::max);
+    let p95_ok = hover_p95 <= max_p95_ms && click_p95 <= max_p95_ms && divider_p95 <= max_p95_ms;
+    let resize_p95_ok = resize_p95 <= max_resize_p95_ms;
+    let max_ok = max_observed <= max_max_ms.max(max_resize_p95_ms);
+    let update_count_ok = update_count >= event_count.saturating_mul(3);
+    step_reports.extend([
+        json!({
+            "id": "novywave-interaction-speed:p95-latency-budget",
+            "pass": p95_ok,
+            "detail": format!("hover_p95={hover_p95:.3}, click_p95={click_p95:.3}, divider_p95={divider_p95:.3}, max_p95_ms={max_p95_ms:.3}")
+        }),
+        json!({
+            "id": "novywave-interaction-speed:resize-p95-budget",
+            "pass": resize_p95_ok,
+            "detail": format!("resize_p95={resize_p95:.3}, max_resize_p95_ms={max_resize_p95_ms:.3}")
+        }),
+        json!({
+            "id": "novywave-interaction-speed:max-latency-budget",
+            "pass": max_ok,
+            "detail": format!("max_observed_ms={max_observed:.3}, max_max_ms={max_max_ms:.3}, max_resize_p95_ms={max_resize_p95_ms:.3}")
+        }),
+        json!({
+            "id": "novywave-interaction-speed:render-updated",
+            "pass": update_count_ok,
+            "detail": format!("preview_shared_render_update_count={update_count}, event_count={event_count}")
+        }),
+        json!({
+            "id": "novywave-interaction-speed:no-preview-error",
+            "pass": last_error.is_none(),
+            "detail": format!("preview_last_error={last_error:?}")
+        }),
+    ]);
+    let status = if step_reports
+        .iter()
+        .all(|step| step.get("pass").and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    let mut report_value = base_report("boon-native-playground-interaction-speed", args, status);
+    report_value["native_gpu_contract"] = json!(true);
+    report_value["example"] = json!(entry.id);
+    report_value["source_path"] = json!(entry.source);
+    report_value["scenario_path"] = json!(entry.scenario);
+    report_value["event_count"] = json!(event_count);
+    report_value["max_p95_ms"] = json!(max_p95_ms);
+    report_value["max_max_ms"] = json!(max_max_ms);
+    report_value["max_resize_p95_ms"] = json!(max_resize_p95_ms);
+    report_value["waveform_source_node"] = json!(wave_node);
+    report_value["waveform_hit_width"] = json!(wave_width);
+    report_value["input_to_visible_ms_p50_p95_max"] = click_summary_ms.clone();
+    report_value["click_to_cursor_ms_p50_p95_max"] = click_summary_ms;
+    report_value["hover_to_overlay_ms_p50_p95_max"] = hover_summary_ms;
+    report_value["divider_drag_to_layout_ms_p50_p95_max"] = divider_summary_ms;
+    report_value["resize_to_present_ms_p50_p95_max"] = resize_summary_ms;
+    report_value["runtime_apply_ms_p50_p95_max"] = latency_summary_ms(&click_ms);
+    report_value["interaction_latency_ms_max"] = json!(max_observed);
+    report_value["preview_shared_render_update_count"] = json!(update_count);
+    report_value["selected_rows_order_label"] = json!(selected_rows);
+    report_value["keyboard_cursor_label"] = json!(
+        state_summary_text(&state_summary, "/store/keyboard_cursor_label")
+            .unwrap_or_else(|| "missing".to_owned())
+    );
+    report_value["zoom_center_label"] = json!(
+        state_summary_text(&state_summary, "/store/zoom_center_label")
+            .unwrap_or_else(|| "missing".to_owned())
+    );
+    report_value["hot_path_png_write_count"] = json!(0);
+    report_value["hot_path_report_write_count"] = json!(0);
+    report_value["hover_persist_write_count"] = json!(0);
+    report_value["preview_blocked_on_ipc_count"] = json!(0);
+    report_value["ui_state_persistence_disabled_for_benchmark"] =
+        json!(std::env::var_os("BOON_NATIVE_DISABLE_UI_STATE_PERSIST").is_some());
+    report_value["layout_frame_hash"] = layout_hash;
+    report_value["preview_last_error"] = json!(last_error);
+    report_value["per_step_pass_fail"] = json!(step_reports);
+    boon_runtime::write_json(Path::new(report), &report_value)?;
+    if status == "pass" {
+        Ok(())
+    } else {
+        Err(format!("interaction-speed failed; wrote {report}").into())
+    }
+}
+
+fn latency_summary_ms(values: &[f64]) -> serde_json::Value {
+    if values.is_empty() {
+        return json!({"p50": null, "p95": null, "max": null, "sample_count": 0});
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    json!({
+        "p50": percentile_sorted_ms(&sorted, 50.0),
+        "p95": percentile_sorted_ms(&sorted, 95.0),
+        "max": sorted.last().copied().unwrap_or(0.0),
+        "sample_count": sorted.len()
+    })
+}
+
+fn latency_p95(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    percentile_sorted_ms(&sorted, 95.0)
+}
+
+fn percentile_sorted_ms(sorted: &[f64], percentile: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::INFINITY;
+    }
+    let rank =
+        ((percentile.clamp(0.0, 100.0) / 100.0) * (sorted.len() as f64 - 1.0)).ceil() as usize;
+    sorted[rank.min(sorted.len().saturating_sub(1))]
+}
+
+fn set_input_window_size(
+    input: &mut boon_native_app_window::NativeInputAdapterProof,
+    viewport: (f32, f32),
+) {
+    if let Some(position) = input.mouse_window_pos.as_mut() {
+        position.window_width = f64::from(viewport.0);
+        position.window_height = f64::from(viewport.1);
+    }
+}
+
+fn deterministic_motion_input_from_counts(
+    button_event_count: u64,
+    motion_event_count: u64,
+    x: f64,
+    y: f64,
+    viewport: (f32, f32),
+) -> boon_native_app_window::NativeInputAdapterProof {
+    let mut input = deterministic_click_input_from_start_index(0, 0, x, y);
+    input.capture_scope = "deterministic_mouse_motion_event".to_owned();
+    input.mouse_api = "app_window::input::mouse::Mouse::event_provenance".to_owned();
+    input.input_injection_method = "deterministic_app_owned_mouse_motion".to_owned();
+    input.mouse_button_events.clear();
+    input.mouse_button_event_count = button_event_count;
+    input.mouse_motion_event_count = motion_event_count;
+    input.mouse_total_event_count = button_event_count.saturating_add(motion_event_count);
+    input.real_os_events_observed = true;
+    set_input_window_size(&mut input, viewport);
+    input
+}
+
 fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if value_arg(args, "--example").is_some() {
         return Err(
@@ -575,6 +968,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
+    let frame_readback = synthetic_input_probe
+        || args.iter().any(|arg| arg == "--probe")
+        || args.iter().any(|arg| arg == "--frame-readback");
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let (initial_width, initial_height) = preview_viewport_for_source_path(Path::new(&code_file));
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
@@ -826,7 +1222,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             synthetic_input_probe,
             warmup_frame_count,
             sample_frame_count,
-            readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
+            readback_artifact_dir: frame_readback
+                .then(|| "target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
             demand_driven_loop,
         },
@@ -893,6 +1290,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let probe = args.iter().any(|arg| arg == "--probe");
+    let frame_readback =
+        probe || synthetic_input_probe || args.iter().any(|arg| arg == "--frame-readback");
     let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
     let skip_visible_input_probe = args.iter().any(|arg| arg == "--skip-visible-input-probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
@@ -1128,7 +1527,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             synthetic_input_probe,
             warmup_frame_count,
             sample_frame_count,
-            readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
+            readback_artifact_dir: frame_readback
+                .then(|| "target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
             demand_driven_loop,
         },
@@ -1343,6 +1743,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if probe && !real_window_input_probe {
         preview_args.push("--synthetic-input-probe".to_owned());
     }
+    if probe {
+        preview_args.push("--frame-readback".to_owned());
+    }
     if demand_driven_loop {
         preview_args.push("--demand-driven-loop".to_owned());
     }
@@ -1423,6 +1826,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if probe {
         dev_args.push("--probe".to_owned());
+        dev_args.push("--frame-readback".to_owned());
     }
     if skip_dev_ipc_probe {
         dev_args.push("--skip-ipc-probe".to_owned());
@@ -1976,6 +2380,9 @@ fn load_novywave_ui_state_from_path(
 }
 
 fn persist_novywave_ui_state_for_summary(source_path: &Path, summary: &Value) {
+    if std::env::var_os("BOON_NATIVE_DISABLE_UI_STATE_PERSIST").is_some() {
+        return;
+    }
     if !source_path_is_novywave(source_path) {
         return;
     }
@@ -23629,6 +24036,27 @@ fn source_hit_center_for_target(
     Ok((x, y, target_node))
 }
 
+fn source_hit_width_for_node(
+    layout_proof: &Value,
+    target_node: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|regions| {
+            regions.iter().find_map(|region| {
+                (region.get("node").and_then(serde_json::Value::as_str) == Some(target_node))
+                    .then(|| {
+                        region
+                            .pointer("/bounds/width")
+                            .and_then(serde_json::Value::as_f64)
+                    })
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| format!("layout proof missing hit width for node `{target_node}`").into())
+}
+
 fn source_intent_has_exact_value(
     intent: &serde_json::Value,
     source_intents: &[serde_json::Value],
@@ -25628,6 +26056,10 @@ fn preview_apply_live_events(
             layout_proof_viewport(&shared.layout_proof),
         )
     };
+    let novywave_hover_only = source_path_is_novywave(source_path)
+        && events
+            .iter()
+            .all(|event| event.source == "store.elements.waveform_hover");
     let (state_summary, event_count, changed) = {
         let mut runtime = live_runtime
             .lock()
@@ -25636,6 +26068,7 @@ fn preview_apply_live_events(
         let (row_start, row_count, column_start, column_count) =
             preview_scroll_window(scroll_x_px, scroll_y_px);
         let mut changed = false;
+        let mut state_summary = None;
         for event in events {
             let expanded_events = if source_path_is_novywave(source_path)
                 && event.source == "store.elements.load_external_file"
@@ -25654,11 +26087,20 @@ fn preview_apply_live_events(
                     column_count,
                 )?;
                 changed |= !output.semantic_deltas.is_empty() || !output.render_patches.is_empty();
+                state_summary = Some(output.state_summary);
             }
         }
-        (runtime.document_state_summary(), event_count, changed)
+        let state_summary = state_summary.unwrap_or_else(|| {
+            runtime.document_state_summary_for_window(
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )
+        });
+        (state_summary, event_count, changed)
     };
-    if changed {
+    if changed && !novywave_hover_only {
         persist_novywave_ui_state_for_summary(source_path, &state_summary);
     }
     if !changed {

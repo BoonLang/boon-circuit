@@ -80,3 +80,15 @@ sync_ack_ms_max = 50.0
 click_to_preview_new_frame_presented_ms_p95_bundled = 120.0
 click_to_preview_new_frame_presented_ms_p95_large_custom = 200.0
 sync_ack_payload_bytes_max = 16384
+
+[novywave_interaction.release]
+input_to_visible_ms_p95 = 16.7
+input_to_visible_ms_max = 33.4
+hover_to_overlay_ms_p95 = 16.7
+click_to_cursor_ms_p95 = 16.7
+divider_drag_to_layout_ms_p95 = 16.7
+resize_to_present_ms_p95 = 33.4
+preview_blocked_on_ipc_count = 0
+hot_path_png_write_count = 0
+hot_path_report_write_count = 0
+hover_persist_write_count = 0

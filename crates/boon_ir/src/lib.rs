@@ -290,6 +290,7 @@ pub enum InitialValue {
     Number { value: i64 },
     Bool { value: bool },
     Enum { value: String },
+    RootInitialField { path: String },
     RowInitialField { path: String },
     Unknown { summary: String },
 }
@@ -3347,9 +3348,19 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
     for projection in &program.list_projections {
         reject_hidden_identity_identifier("list projection target", &projection.target)?;
         reject_hidden_identity_identifier("list projection list", &projection.list)?;
-        if let ListProjectionKind::Find { field, value } = &projection.kind {
-            reject_hidden_identity_identifier("list find field", field)?;
-            reject_hidden_identity_identifier("list find value", value)?;
+        match &projection.kind {
+            ListProjectionKind::Chunk {
+                item_field,
+                label_field,
+                ..
+            } => {
+                reject_hidden_identity_identifier("list chunk item field", item_field)?;
+                reject_hidden_identity_identifier("list chunk label field", label_field)?;
+            }
+            ListProjectionKind::Find { field, value } => {
+                reject_hidden_identity_identifier("list find field", field)?;
+                reject_hidden_identity_identifier("list find value", value)?;
+            }
         }
     }
     Ok(())
@@ -3357,6 +3368,9 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
 
 fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
     match value {
+        InitialValue::RootInitialField { path } => {
+            reject_hidden_identity_identifier("root initial field", path)
+        }
         InitialValue::RowInitialField { path } => {
             reject_hidden_identity_identifier("row initial field", path)
         }
@@ -3546,16 +3560,21 @@ fn reject_hidden_identity_identifier(context: &str, value: &str) -> Result<(), S
 
 fn hidden_identity_token(value: &str) -> Option<&'static str> {
     let lower = value.to_ascii_lowercase();
+    if lower.contains("$boon") {
+        return Some("$boon");
+    }
     let tokens = lower
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|token| !token.is_empty());
     const FORBIDDEN: &[&str] = &[
         "runtime_key",
         "item_key",
+        "row_key",
         "hidden_key",
         "hidden_keys",
         "generation",
         "hidden_generation",
+        "target_key",
         "target_generation",
         "source_id",
         "bind_epoch",
@@ -4222,6 +4241,9 @@ fn ast_initial_value(
                 value: parts[0].clone(),
             }
         }
+        AstExprKind::Path(parts) => InitialValue::RootInitialField {
+            path: parts.join("."),
+        },
         AstExprKind::Identifier(value)
             if current_row_scope.is_some() && !value_starts_uppercase_identifier(value) =>
         {
@@ -4234,6 +4256,9 @@ fn ast_initial_value(
                 value: value.clone(),
             }
         }
+        AstExprKind::Identifier(value) => InitialValue::RootInitialField {
+            path: value.clone(),
+        },
         _ => InitialValue::Unknown {
             summary: ast_expr_label(expr),
         },
@@ -7901,7 +7926,7 @@ store: [
         format_cycle: SOURCE
     ]
     value_format:
-        TEXT { Hexadecimal } |> HOLD value_format {
+        Hexadecimal |> HOLD value_format {
             LATEST {
                 elements.format_cycle.event.press |> THEN { next_format(format: value_format) }
             }
@@ -7910,9 +7935,9 @@ store: [
 
 FUNCTION next_format(format) {
     format |> WHEN {
-        TEXT { Hexadecimal } => TEXT { Binary }
-        TEXT { Binary } => TEXT { GroupedBinary }
-        __ => TEXT { Hexadecimal }
+        Hexadecimal => Binary
+        Binary => GroupedBinary
+        __ => Hexadecimal
     }
         }
 "#;
@@ -8439,14 +8464,14 @@ store: [
         open: [press: SOURCE]
     ]
     dialog:
-        TEXT { Closed } |> HOLD dialog {
+        Closed |> HOLD dialog {
         LATEST {
-            TEXT { Closed }
-            sources.open.press |> THEN { TEXT { Open } }
+            Closed
+            sources.open.press |> THEN { Open }
         }
         }
     dialog_title:
-        dialog == TEXT { Open } |> WHEN {
+        dialog == Open |> WHEN {
             True => TEXT { Load files }
             False => TEXT { No file dialog }
         }
@@ -9073,6 +9098,22 @@ FUNCTION row(item) {
                 .contains("bind_epoch")
         );
 
+        let mut with_bad_row_key = ir.clone();
+        with_bad_row_key.sources[0].path = "todo.sources.$boon.row_key.press".to_owned();
+        let row_key_error = verify_hidden_identity(&with_bad_row_key).unwrap_err();
+        assert!(
+            row_key_error.contains("$boon") || row_key_error.contains("row_key"),
+            "{row_key_error}"
+        );
+
+        let mut with_bad_target_key = ir.clone();
+        with_bad_target_key.update_branches[0].target = "store.target_key".to_owned();
+        assert!(
+            verify_hidden_identity(&with_bad_target_key)
+                .unwrap_err()
+                .contains("target_key")
+        );
+
         let mut with_bad_list_operation = ir.clone();
         with_bad_list_operation.list_operations[0].kind = ListOperationKind::Retain {
             target: "store.visible_todos".to_owned(),
@@ -9084,6 +9125,24 @@ FUNCTION row(item) {
             verify_hidden_identity(&with_bad_list_operation)
                 .unwrap_err()
                 .contains("hidden_key")
+        );
+
+        let mut with_bad_chunk_projection = ir.clone();
+        with_bad_chunk_projection
+            .list_projections
+            .push(ListProjection {
+                target: "store.rows".to_owned(),
+                list: "store.todos".to_owned(),
+                kind: ListProjectionKind::Chunk {
+                    size: Some(4),
+                    item_field: "row_key".to_owned(),
+                    label_field: "row_number".to_owned(),
+                },
+            });
+        assert!(
+            verify_hidden_identity(&with_bad_chunk_projection)
+                .unwrap_err()
+                .contains("row_key")
         );
     }
 

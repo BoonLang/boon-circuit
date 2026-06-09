@@ -276,6 +276,13 @@ pub struct LiveStepOutput {
 }
 
 #[derive(Clone, Debug)]
+pub struct LiveSparseStepOutput {
+    pub semantic_delta_count: usize,
+    pub render_patch_count: usize,
+    pub value_summaries: JsonValue,
+}
+
+#[derive(Clone, Debug)]
 pub struct SemanticDelta<'a> {
     pub kind: &'static str,
     pub list_id: Option<Cow<'a, str>>,
@@ -1132,6 +1139,42 @@ impl LiveRuntime {
         self.apply_checked_step(&live_step)
     }
 
+    pub fn apply_source_event_for_step_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        event.assert_matches_step(step)?;
+        let mut live_step = step.clone();
+        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+        live_step.expected_source_event = Some(event.into_expected_source_event());
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step_with_value_summaries(&live_step, paths)
+    }
+
+    pub fn apply_source_event_for_step_projected_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        event.assert_matches_step(step)?;
+        let mut live_step = step.clone();
+        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+        live_step.expected_source_event = Some(event.into_expected_source_event());
+        self.next_step = self.next_step.saturating_add(1);
+        let counts = self
+            .runtime
+            .apply_source_action_only_counted_step(&live_step)?;
+        let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+        Ok(LiveSparseStepOutput {
+            semantic_delta_count: counts.semantic_delta_count,
+            render_patch_count: counts.render_patch_count,
+            value_summaries,
+        })
+    }
+
     pub fn apply_source_event_for_step_with_document_window(
         &mut self,
         step: &ScenarioStep,
@@ -1222,6 +1265,37 @@ impl LiveRuntime {
         })
     }
 
+    fn apply_checked_step_with_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        if step.expect_semantic_delta_contains.is_empty()
+            && step.expect_render_delta_contains.is_empty()
+        {
+            let counts = self.runtime.apply_counted_step(step)?;
+            self.runtime.assert_step_after_measurement(step)?;
+            let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+            return Ok(LiveSparseStepOutput {
+                semantic_delta_count: counts.semantic_delta_count,
+                render_patch_count: counts.render_patch_count,
+                value_summaries,
+            });
+        }
+        let mut semantic_deltas = Vec::new();
+        let mut render_patches = Vec::new();
+        self.runtime
+            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+        self.runtime.assert_step_after_measurement(step)?;
+        let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+        Ok(LiveSparseStepOutput {
+            semantic_delta_count: semantic_deltas.len(),
+            render_patch_count: render_patches.len(),
+            value_summaries,
+        })
+    }
+
     pub fn state_summary(&mut self) -> JsonValue {
         self.runtime.state_summary()
     }
@@ -1243,6 +1317,10 @@ impl LiveRuntime {
 
     pub fn source_payload_has_text(&self, source: &str) -> bool {
         self.runtime.source_payload_has_text(source)
+    }
+
+    pub fn has_source_path(&self, source: &str) -> bool {
+        self.runtime.has_source_path(source)
     }
 
     pub fn document_state_summary_for_window(
@@ -2051,6 +2129,11 @@ struct LoadedRuntime {
     generic: Option<GenericScheduledRuntime>,
 }
 
+struct CountedStepOutput {
+    semantic_delta_count: usize,
+    render_patch_count: usize,
+}
+
 impl LoadedRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
         Ok(Self::new_profiled(ir, compiled)?.0)
@@ -2098,6 +2181,12 @@ impl LoadedRuntime {
             .is_some_and(|generic| generic.source_payload_has_text(source))
     }
 
+    fn has_source_path(&self, source: &str) -> bool {
+        self.generic
+            .as_ref()
+            .is_some_and(|generic| generic.has_source_path(source))
+    }
+
     fn document_state_summary_for_window(
         &mut self,
         row_start: usize,
@@ -2112,16 +2201,146 @@ impl LoadedRuntime {
     }
 
     fn runtime_value_summaries(
-        &self,
+        &mut self,
         paths: &[String],
         max_depth: usize,
         max_fields: usize,
         max_list_items: usize,
     ) -> JsonValue {
-        let Some(generic) = self.generic.as_ref() else {
+        let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
+    }
+
+    fn apply_counted_step(&mut self, step: &ScenarioStep) -> RuntimeResult<CountedStepOutput> {
+        let Some(source_event) = GenericSourceEvent::from_step(step)? else {
+            return Ok(CountedStepOutput {
+                semantic_delta_count: 0,
+                render_patch_count: 0,
+            });
+        };
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        let input = generic.source_action_input_for_event(
+            &step.id,
+            source_event,
+            TickSeq(0),
+            |list, event| generic.resolve_generic_step_index(list, step, event),
+        )?;
+        let source_list = input.list.clone();
+        let source_index = input.index;
+        let bool_context = generic.generic_bool_contexts();
+        let mut delta_parts = Vec::new();
+        let mut semantic_delta_count = 0usize;
+        generic
+            .apply_source_actions(
+                input,
+                |path| bool_context.get(path).copied(),
+                SourceActionApplyMode::FullPropagation,
+                |mutation| {
+                    if let Some(delta) = mutation.semantic_delta() {
+                        semantic_delta_count = semantic_delta_count.saturating_add(1);
+                        if delta.kind == "FieldSet"
+                            && let Some(field) = delta.field_path.as_ref()
+                        {
+                            delta_parts.push(GenericDeltaPart {
+                                list: delta.list_id.as_ref().map(|value| value.to_string()),
+                                key: delta.key,
+                                generation: delta.generation,
+                                field: field.to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| format!("{}: {error}", step.id))?;
+        if source_event.key == Some("Enter")
+            && let (Some(list), Some(index)) = (source_list.as_deref(), source_index)
+            && let Some(commit) = generic.commit_edit_draft_title_for_index(list, index)?
+        {
+            let mutation = GenericSourceMutation::TextField(commit);
+            if let Some(delta) = mutation.semantic_delta() {
+                semantic_delta_count = semantic_delta_count.saturating_add(1);
+                if let Some(field) = delta.field_path.as_ref() {
+                    delta_parts.push(GenericDeltaPart {
+                        list: delta.list_id.as_ref().map(|value| value.to_string()),
+                        key: delta.key,
+                        generation: delta.generation,
+                        field: field.to_string(),
+                    });
+                }
+            }
+        }
+        let changed_reads = generic.read_keys_from_delta_parts(&delta_parts)?;
+        let (derived_commits, _recompute_metrics) =
+            generic.recompute_generic_derived_after_changes(changed_reads)?;
+        semantic_delta_count = semantic_delta_count.saturating_add(derived_commits.len());
+        let root_commits = generic.materialize_root_derived_field_commits()?;
+        semantic_delta_count = semantic_delta_count.saturating_add(
+            root_commits
+                .iter()
+                .filter(|mutation| mutation.semantic_delta().is_some())
+                .count(),
+        );
+        Ok(CountedStepOutput {
+            semantic_delta_count,
+            render_patch_count: semantic_delta_count,
+        })
+    }
+
+    fn apply_source_action_only_counted_step(
+        &mut self,
+        step: &ScenarioStep,
+    ) -> RuntimeResult<CountedStepOutput> {
+        let Some(source_event) = GenericSourceEvent::from_step(step)? else {
+            return Ok(CountedStepOutput {
+                semantic_delta_count: 0,
+                render_patch_count: 0,
+            });
+        };
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        let input = generic.source_action_input_for_event(
+            &step.id,
+            source_event,
+            TickSeq(0),
+            |list, event| generic.resolve_generic_step_index(list, step, event),
+        )?;
+        let source_list = input.list.clone();
+        let source_index = input.index;
+        let bool_context = generic.generic_bool_contexts();
+        let mut semantic_delta_count = 0usize;
+        generic
+            .apply_source_actions(
+                input,
+                |path| bool_context.get(path).copied(),
+                SourceActionApplyMode::SourceInputsOnly,
+                |mutation| {
+                    if mutation.semantic_delta().is_some() {
+                        semantic_delta_count = semantic_delta_count.saturating_add(1);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| format!("{}: {error}", step.id))?;
+        if source_event.key == Some("Enter")
+            && let (Some(list), Some(index)) = (source_list.as_deref(), source_index)
+            && generic
+                .commit_edit_draft_title_for_index(list, index)?
+                .is_some()
+        {
+            semantic_delta_count = semantic_delta_count.saturating_add(1);
+        }
+        Ok(CountedStepOutput {
+            semantic_delta_count,
+            render_patch_count: semantic_delta_count,
+        })
     }
 
     fn apply_generic_step<'a>(
@@ -2157,6 +2376,7 @@ impl LoadedRuntime {
             .apply_source_actions(
                 input,
                 |path| bool_context.get(path).copied(),
+                SourceActionApplyMode::FullPropagation,
                 |mutation| {
                     if let Some(delta) = mutation.semantic_delta() {
                         deltas.push(delta);
@@ -2181,6 +2401,12 @@ impl LoadedRuntime {
             generic.recompute_generic_derived_after_changes(changed_reads)?;
         for commit in derived_commits {
             let mutation = GenericSourceMutation::ValueField(commit);
+            if let Some(delta) = mutation.semantic_delta() {
+                deltas.push(delta);
+            }
+            patches.push(generic_document_invalidation_patch(&mutation));
+        }
+        for mutation in generic.materialize_root_derived_field_commits()? {
             if let Some(delta) = mutation.semantic_delta() {
                 deltas.push(delta);
             }
@@ -2675,6 +2901,7 @@ impl TypedStorageLayoutCounts {
                     false,
                     InitialValue::Text { .. }
                     | InitialValue::Number { .. }
+                    | InitialValue::RootInitialField { .. }
                     | InitialValue::RowInitialField { .. },
                 ) => {
                     counts.root_text_slot_count += 1;
@@ -2692,6 +2919,7 @@ impl TypedStorageLayoutCounts {
                     true,
                     InitialValue::Text { .. }
                     | InitialValue::Number { .. }
+                    | InitialValue::RootInitialField { .. }
                     | InitialValue::RowInitialField { .. },
                 ) => {
                     counts.list_row_template_field_count += 1;
@@ -2753,6 +2981,13 @@ fn list_summary_fields_from_ir(ir: &TypedProgram) -> Vec<ListSummaryFields> {
             for value in &ir.derived_values {
                 if value.indexed && value.path.starts_with(&prefix) {
                     fields.push(row_field_name(&value.path).to_owned());
+                }
+            }
+            if let boon_ir::ListInitializer::RecordLiteral { rows } = &list.initializer {
+                for row in rows {
+                    for field in &row.fields {
+                        fields.push(field.name.clone());
+                    }
                 }
             }
             fields.sort();
@@ -5206,6 +5441,9 @@ impl GenericScheduledRuntime {
             list_summary_fields: compiled.list_summary_fields.clone(),
         };
         let clone_ms = runtime_elapsed_ms(clone_started);
+        let root_initial_started = Instant::now();
+        runtime.initialize_root_holds_from_root_initial_fields(ir)?;
+        let initialize_root_holds_ms = runtime_elapsed_ms(root_initial_started);
         let bind_started = Instant::now();
         runtime.bind_initial_list_sources()?;
         let bind_initial_list_sources_ms = runtime_elapsed_ms(bind_started);
@@ -5223,6 +5461,7 @@ impl GenericScheduledRuntime {
             json!({
                 "storage_ms": storage_ms,
                 "clone_plans_ms": clone_ms,
+                "initialize_root_holds_ms": initialize_root_holds_ms,
                 "bind_initial_list_sources_ms": bind_initial_list_sources_ms,
                 "initialize_generic_derived_first_ms": first_derived_ms,
                 "reset_indexed_holds_ms": reset_indexed_holds_ms,
@@ -5232,8 +5471,47 @@ impl GenericScheduledRuntime {
         ))
     }
 
+    fn initialize_root_holds_from_root_initial_fields(
+        &mut self,
+        ir: &TypedProgram,
+    ) -> RuntimeResult<()> {
+        for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
+            let InitialValue::RootInitialField { path } = &cell.initial_value else {
+                continue;
+            };
+            let value = self.resolve_root_initial_field_value(path)?;
+            self.storage.root.insert_value(cell.path.clone(), value);
+        }
+        Ok(())
+    }
+
+    fn resolve_root_initial_field_value(&mut self, path: &str) -> RuntimeResult<FieldValue> {
+        if let Some(value) = self.storage.root.owned_value(path) {
+            return Ok(value);
+        }
+        let mut frame = GenericEvalFrame::root();
+        if let Some(value) = self.root_pure_derived_boon_value(path, &mut frame)? {
+            return Ok(boon_value_field_value(&value));
+        }
+        if !path.contains('.') {
+            let store_path = format!("store.{path}");
+            if let Some(value) = self.storage.root.owned_value(&store_path) {
+                return Ok(value);
+            }
+            let mut frame = GenericEvalFrame::root();
+            if let Some(value) = self.root_pure_derived_boon_value(&store_path, &mut frame)? {
+                return Ok(boon_value_field_value(&value));
+            }
+        }
+        Err(format!("root initial field `{path}` is missing").into())
+    }
+
     fn source_payload_has_text(&self, source: &str) -> bool {
         self.source_routes.source_payload_has_text(source)
+    }
+
+    fn has_source_path(&self, source: &str) -> bool {
+        self.source_routes.has_source_path(source)
     }
 
     fn reset_indexed_holds_from_row_initial_fields(
@@ -5656,6 +5934,7 @@ impl GenericScheduledRuntime {
         &mut self,
         input: GenericSourceActionInput<'a>,
         read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        mode: SourceActionApplyMode,
         mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
         let actions = self
@@ -5680,6 +5959,11 @@ impl GenericScheduledRuntime {
                                 input.seq,
                             )? {
                                 observe(GenericSourceMutation::RootBool(commit))?;
+                                if mode.materializes_derived() {
+                                    for mutation in self.materialize_root_derived_field_commits()? {
+                                        observe(mutation)?;
+                                    }
+                                }
                             }
                         } else if let Some(commit) =
                             self.apply_root_text_source_with_row_context(&target, &input)?
@@ -5688,8 +5972,10 @@ impl GenericScheduledRuntime {
                                 target,
                                 value: commit,
                             }))?;
-                            for mutation in self.materialize_root_derived_field_commits()? {
-                                observe(mutation)?;
+                            if mode.materializes_derived() {
+                                for mutation in self.materialize_root_derived_field_commits()? {
+                                    observe(mutation)?;
+                                }
                             }
                         }
                     }
@@ -5712,8 +5998,10 @@ impl GenericScheduledRuntime {
                                 target: target.clone(),
                                 value,
                             }))?;
-                            for mutation in self.materialize_root_derived_field_commits()? {
-                                observe(mutation)?;
+                            if mode.materializes_derived() {
+                                for mutation in self.materialize_root_derived_field_commits()? {
+                                    observe(mutation)?;
+                                }
                             }
                         }
                     }
@@ -5738,13 +6026,20 @@ impl GenericScheduledRuntime {
                                 }))?;
                             }
                         }
+                        if mode.materializes_derived() {
+                            for mutation in self.materialize_root_derived_field_commits()? {
+                                observe(mutation)?;
+                            }
+                        }
                     }
                 }
                 SourceAction::RouterRoute { path, .. } => {
                     if self.router_route != *path {
                         self.router_route.clone_from(path);
-                        for mutation in self.materialize_root_derived_field_commits()? {
-                            observe(mutation)?;
+                        if mode.materializes_derived() {
+                            for mutation in self.materialize_root_derived_field_commits()? {
+                                observe(mutation)?;
+                            }
                         }
                     }
                 }
@@ -5789,10 +6084,14 @@ impl GenericScheduledRuntime {
                     for binding in bindings {
                         observe(GenericSourceMutation::SourceBind(binding))?;
                     }
-                    for commit in
-                        self.recompute_generic_derived_for_row(list, insert.key, insert.generation)?
-                    {
-                        observe(GenericSourceMutation::ValueField(commit))?;
+                    if mode.materializes_derived() {
+                        for commit in self.recompute_generic_derived_for_row(
+                            list,
+                            insert.key,
+                            insert.generation,
+                        )? {
+                            observe(GenericSourceMutation::ValueField(commit))?;
+                        }
                     }
                 }
                 SourceAction::ListRemove { list } => {
@@ -6017,10 +6316,15 @@ impl GenericScheduledRuntime {
         mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
     ) -> RuntimeResult<GenericSourceMutationBatch<'a>> {
         let mut batch = GenericSourceMutationBatch::new();
-        self.apply_source_actions(input, read_extra_bool, |mutation| {
-            batch.observe(&mutation)?;
-            observe(mutation)
-        })?;
+        self.apply_source_actions(
+            input,
+            read_extra_bool,
+            SourceActionApplyMode::FullPropagation,
+            |mutation| {
+                batch.observe(&mutation)?;
+                observe(mutation)
+            },
+        )?;
         Ok(batch)
     }
 
@@ -6259,6 +6563,9 @@ impl GenericScheduledRuntime {
         let fields = self.generic_derived.root_fields.clone();
         let mut commits = Vec::new();
         for field in fields {
+            if matches!(field.kind, DerivedValueKind::ListView) {
+                continue;
+            }
             if field.kind == DerivedValueKind::SourceEventTransform
                 && field.has_sources
                 && self.storage.root.owned_value(&field.path).is_some()
@@ -6374,6 +6681,40 @@ impl GenericScheduledRuntime {
                 });
                 let leaf = row_field_name(field);
                 if leaf != field {
+                    reads.insert(GenericReadKey::Root {
+                        field: leaf.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(reads)
+    }
+
+    fn read_keys_from_delta_parts(
+        &self,
+        deltas: &[GenericDeltaPart],
+    ) -> RuntimeResult<BTreeSet<GenericReadKey>> {
+        let mut reads = BTreeSet::new();
+        for delta in deltas {
+            if let Some(list) = delta.list.as_ref() {
+                let Some(key) = delta.key else {
+                    continue;
+                };
+                let generation = delta.generation.unwrap_or(1);
+                let Some(index) = self.storage.bound_index(list, key, generation)? else {
+                    continue;
+                };
+                reads.insert(GenericReadKey::ListField {
+                    list: list.to_string(),
+                    index,
+                    field: delta.field.to_string(),
+                });
+            } else {
+                reads.insert(GenericReadKey::Root {
+                    field: delta.field.to_string(),
+                });
+                let leaf = row_field_name(&delta.field);
+                if leaf != delta.field {
                     reads.insert(GenericReadKey::Root {
                         field: leaf.to_string(),
                     });
@@ -6533,6 +6874,12 @@ impl GenericScheduledRuntime {
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
         frame.consume_budget()?;
+        if matches!(statement.kind, AstStatementKind::List { field: None, .. })
+            && !statement.children.is_empty()
+            && record_statement_children(&statement.children)
+        {
+            return self.eval_record_statement_children(&statement.children, frame);
+        }
         if let Some(expr_id) = statement.expr {
             if self.generic_derived.expr_is_block_marker(expr_id) {
                 return self.eval_statement_block(&statement.children, frame);
@@ -6689,7 +7036,7 @@ impl GenericScheduledRuntime {
                 .map(BoonValue::Number)
                 .unwrap_or(BoonValue::NaN)),
             AstExprKind::Bool(value) => Ok(BoonValue::Bool(value)),
-            AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(BoonValue::Text(value)),
+            AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(BoonValue::Enum(value)),
             AstExprKind::TaggedObject { tag, fields } => {
                 let mut body = Vec::new();
                 for field in fields {
@@ -7023,6 +7370,22 @@ impl GenericScheduledRuntime {
                     right.as_text().unwrap_or_default()
                 )))
             }
+            "Text/time_range_label" => {
+                let piped = input.is_some();
+                let start = self.call_input_or_first(input, args, frame)?;
+                let end_position = if piped { 0 } else { 1 };
+                let unit_position = if piped { 1 } else { 2 };
+                let end = self.named_or_positional_arg_value(args, "end", end_position, frame)?;
+                let unit =
+                    self.named_or_positional_arg_value(args, "unit", unit_position, frame)?;
+                Ok(BoonValue::Text(format!(
+                    "{} {} - {} {}",
+                    boon_value_scalar_text(&start),
+                    boon_value_scalar_text(&unit),
+                    boon_value_scalar_text(&end),
+                    boon_value_scalar_text(&unit)
+                )))
+            }
             "Text/trim" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Text(
@@ -7102,6 +7465,75 @@ impl GenericScheduledRuntime {
                     !value.as_text().unwrap_or_default().is_empty(),
                 ))
             }
+            "Number/project_width" => {
+                let start = self
+                    .named_or_positional_arg_value(args, "start_time", 0, frame)?
+                    .number()?;
+                let end = self
+                    .named_or_positional_arg_value(args, "end_time", 1, frame)?
+                    .number()?;
+                let viewport_start = self
+                    .named_or_positional_arg_value(args, "viewport_start", 2, frame)?
+                    .number()?;
+                let viewport_end = self
+                    .named_or_positional_arg_value(args, "viewport_end", 3, frame)?
+                    .number()?;
+                let canvas_width = self
+                    .named_or_positional_arg_value(args, "canvas_width", 4, frame)?
+                    .number()?;
+                let fallback = self
+                    .named_or_positional_arg_value(args, "fallback", 5, frame)
+                    .map(|value| value.number().unwrap_or(0))
+                    .unwrap_or(0);
+                let zoom = self
+                    .named_arg_value(args, "zoom", frame)
+                    .ok()
+                    .and_then(|value| value.as_text());
+                let viewport_span = viewport_end - viewport_start;
+                let width = if viewport_span <= 0 || end <= start {
+                    fallback
+                } else {
+                    ((end - start) * canvas_width) / viewport_span
+                };
+                Ok(BoonValue::Number(zoom_projected_number(
+                    width,
+                    zoom.as_deref(),
+                )))
+            }
+            "Number/project_offset" => {
+                let time = self
+                    .named_or_positional_arg_value(args, "time", 0, frame)?
+                    .number()?;
+                let viewport_start = self
+                    .named_or_positional_arg_value(args, "viewport_start", 1, frame)?
+                    .number()?;
+                let viewport_end = self
+                    .named_or_positional_arg_value(args, "viewport_end", 2, frame)?
+                    .number()?;
+                let canvas_width = self
+                    .named_or_positional_arg_value(args, "canvas_width", 3, frame)?
+                    .number()?;
+                let fallback = self
+                    .named_or_positional_arg_value(args, "fallback", 4, frame)
+                    .map(|value| value.number().unwrap_or(0))
+                    .unwrap_or(0);
+                let zoom = self
+                    .named_arg_value(args, "zoom", frame)
+                    .ok()
+                    .and_then(|value| value.as_text());
+                let viewport_span = viewport_end - viewport_start;
+                let width = if viewport_span <= 0 {
+                    fallback
+                } else if time <= viewport_start {
+                    0
+                } else {
+                    ((time - viewport_start) * canvas_width) / viewport_span
+                };
+                Ok(BoonValue::Number(zoom_projected_number(
+                    width,
+                    zoom.as_deref(),
+                )))
+            }
             "Bool/not" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Bool(!value.bool_value().unwrap_or(false)))
@@ -7168,7 +7600,7 @@ impl GenericScheduledRuntime {
             "List/find" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let field = self
-                    .raw_named_arg(args, "field")
+                    .field_name_arg(args, "field", frame)?
                     .ok_or("List/find requires field")?;
                 let expected = self.named_arg_value(args, "value", frame)?;
                 self.list_find(list, &field, expected, frame)
@@ -7176,11 +7608,11 @@ impl GenericScheduledRuntime {
             "List/find_value" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let field = self
-                    .raw_named_arg(args, "field")
+                    .field_name_arg(args, "field", frame)?
                     .ok_or("List/find_value requires field")?;
                 let expected = self.named_arg_value(args, "value", frame)?;
                 let target = self
-                    .raw_named_arg(args, "target")
+                    .field_name_arg(args, "target", frame)?
                     .ok_or("List/find_value requires target")?;
                 let fallback = self
                     .named_arg_value(args, "fallback", frame)
@@ -7408,9 +7840,37 @@ impl GenericScheduledRuntime {
             }
             child.env.insert(name, value);
         }
-        let value = self.eval_statement_block(&definition.statement.children, &mut child)?;
+        let value = if definition.statement.children.len() == 1
+            && matches!(
+                definition.statement.children[0].kind,
+                AstStatementKind::Block
+            )
+            && record_statement_children(&definition.statement.children[0].children)
+        {
+            self.eval_record_statement_children(
+                &definition.statement.children[0].children,
+                &mut child,
+            )?
+        } else {
+            self.eval_statement_block(&definition.statement.children, &mut child)?
+        };
         frame.reads.extend(child.reads);
         Ok(value)
+    }
+
+    fn eval_record_statement_children(
+        &mut self,
+        children: &[AstStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        for child in children {
+            let AstStatementKind::Field { name } = &child.kind else {
+                unreachable!("record children checked by caller");
+            };
+            record.insert(name.clone(), self.eval_statement_value(child, frame)?);
+        }
+        Ok(BoonValue::Record(record))
     }
 
     fn eval_first_arg(
@@ -7493,16 +7953,16 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<Option<String>> {
         if let Some(raw) = self.raw_named_arg(args, name) {
             if raw != "TEXT" {
-                return Ok(Some(normalized_field_name(&raw)));
+                return Ok(Some(checked_boon_field_name(&raw)?));
             }
         }
         let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) else {
             return Ok(None);
         };
-        Ok(self
-            .eval_expr(arg.value, frame)?
+        self.eval_expr(arg.value, frame)?
             .as_text()
-            .map(|value| normalized_field_name(&value)))
+            .map(|value| checked_boon_field_name(&value))
+            .transpose()
     }
 
     fn list_find(
@@ -8194,7 +8654,7 @@ impl GenericScheduledRuntime {
     }
 
     fn runtime_value_summaries(
-        &self,
+        &mut self,
         paths: &[String],
         max_depth: usize,
         max_fields: usize,
@@ -8211,7 +8671,7 @@ impl GenericScheduledRuntime {
     }
 
     fn runtime_path_summary(
-        &self,
+        &mut self,
         path: &str,
         depth: usize,
         max_depth: usize,
@@ -8223,6 +8683,29 @@ impl GenericScheduledRuntime {
                 "kind": self.runtime_path_kind(path).unwrap_or("value"),
                 "collapsed": true
             }));
+        }
+        let mut frame = GenericEvalFrame::root();
+        if let Ok(Some(value)) = self.root_pure_derived_boon_value(path, &mut frame) {
+            return Some(runtime_json_value_summary(
+                &boon_value_json(&value),
+                depth,
+                max_depth,
+                max_fields,
+                max_list_items,
+            ));
+        }
+        if !path.contains('.') {
+            let store_path = format!("store.{path}");
+            let mut frame = GenericEvalFrame::root();
+            if let Ok(Some(value)) = self.root_pure_derived_boon_value(&store_path, &mut frame) {
+                return Some(runtime_json_value_summary(
+                    &boon_value_json(&value),
+                    depth,
+                    max_depth,
+                    max_fields,
+                    max_list_items,
+                ));
+            }
         }
         if let Some(value) = self.runtime_scalar_json(path) {
             return Some(runtime_json_value_summary(
@@ -8551,7 +9034,7 @@ impl GenericScheduledRuntime {
     }
 
     fn runtime_object_summary(
-        &self,
+        &mut self,
         path: &str,
         depth: usize,
         max_depth: usize,
@@ -8627,7 +9110,10 @@ impl GenericScheduledRuntime {
         let fields = self.generic_derived.root_fields.clone();
         let mut values = Vec::new();
         for field in fields {
-            if !matches!(field.kind, DerivedValueKind::Pure) {
+            if !matches!(
+                field.kind,
+                DerivedValueKind::Pure | DerivedValueKind::ListView
+            ) {
                 continue;
             }
             let mut frame = GenericEvalFrame::root();
@@ -8953,8 +9439,13 @@ impl GenericScheduledRuntime {
         let mut row = serde_json::Map::new();
         let identity = self.storage.row_identity(&summary.list, index);
         if let Ok((key, generation)) = identity {
-            row.insert("key".to_owned(), json!(key));
-            row.insert("generation".to_owned(), json!(generation));
+            row.insert(
+                "$boon".to_owned(),
+                json!({
+                    "row_key": key,
+                    "generation": generation
+                }),
+            );
         }
         for field in &summary.fields {
             if let Ok(value) = self.storage.list_row_field(&summary.list, index, field) {
@@ -9005,16 +9496,16 @@ impl GenericScheduledRuntime {
 
 fn field_value_to_boon(value: FieldValue) -> BoonValue {
     match value {
-        FieldValue::Text(value) | FieldValue::Enum(value) => BoonValue::Text(value),
+        FieldValue::Text(value) => BoonValue::Text(value),
+        FieldValue::Enum(value) => BoonValue::Enum(value),
         FieldValue::Bool(value) => BoonValue::Bool(value),
     }
 }
 
 fn field_ref_to_boon(value: FieldValueRef<'_>) -> BoonValue {
     match value {
-        FieldValueRef::Text(value) | FieldValueRef::Enum(value) => {
-            BoonValue::Text(value.to_owned())
-        }
+        FieldValueRef::Text(value) => BoonValue::Text(value.to_owned()),
+        FieldValueRef::Enum(value) => BoonValue::Enum(value.to_owned()),
         FieldValueRef::Bool(value) => BoonValue::Bool(value),
     }
 }
@@ -9030,9 +9521,16 @@ fn statement_contains_latest(statement: &AstStatement, expressions: &[AstExpr]) 
             .any(|child| statement_contains_latest(child, expressions))
 }
 
+fn record_statement_children(children: &[AstStatement]) -> bool {
+    children
+        .iter()
+        .all(|child| matches!(child.kind, AstStatementKind::Field { .. }))
+}
+
 fn boon_value_field_value(value: &BoonValue) -> FieldValue {
     match value {
         BoonValue::Text(value) => FieldValue::Text(value.clone()),
+        BoonValue::Enum(value) => FieldValue::Enum(value.clone()),
         BoonValue::Number(value) => FieldValue::Text(value.to_string()),
         BoonValue::Bool(value) => FieldValue::Bool(*value),
         BoonValue::NaN => FieldValue::Text("NaN".to_owned()),
@@ -9047,7 +9545,9 @@ fn boon_value_field_value(value: &BoonValue) -> FieldValue {
 
 fn boon_value_protocol_value(value: &BoonValue) -> ProtocolValue<'static> {
     match value {
-        BoonValue::Text(value) => ProtocolValue::Text(Cow::Owned(value.clone())),
+        BoonValue::Text(value) | BoonValue::Enum(value) => {
+            ProtocolValue::Text(Cow::Owned(value.clone()))
+        }
         BoonValue::Number(value) => ProtocolValue::NumberText(*value),
         BoonValue::Bool(value) => ProtocolValue::Bool(*value),
         BoonValue::NaN => ProtocolValue::Text(Cow::Borrowed("NaN")),
@@ -9118,9 +9618,24 @@ fn generic_infix_value(left: BoonValue, op: &str, right: BoonValue) -> BoonValue
     }
 }
 
+fn zoom_projected_number(width: i64, zoom: Option<&str>) -> i64 {
+    if width == 0 {
+        return width;
+    }
+    match zoom {
+        Some("Closest") => width * 4,
+        Some("Closer") => width * 3,
+        Some("Close") => width * 2,
+        Some("Wide") => width / 2,
+        Some("Widest") => width / 3,
+        _ => width,
+    }
+}
+
 fn generic_values_equal(left: &BoonValue, right: &BoonValue) -> bool {
     match (left, right) {
         (BoonValue::Text(left), BoonValue::Text(right)) => left == right,
+        (BoonValue::Enum(left), BoonValue::Enum(right)) => left == right,
         (BoonValue::Number(left), BoonValue::Number(right)) => left == right,
         (BoonValue::Bool(left), BoonValue::Bool(right)) => left == right,
         (BoonValue::NaN, BoonValue::NaN) => true,
@@ -9237,7 +9752,10 @@ fn statement_is_row_initial_passthrough(
     row_scope: &str,
     field: &str,
 ) -> bool {
-    let Some(expr_id) = statement.expr else {
+    let expr_id = statement
+        .expr
+        .or_else(|| statement.children.iter().find_map(|child| child.expr));
+    let Some(expr_id) = expr_id else {
         return false;
     };
     expressions.get(expr_id).is_some_and(|expr| {
@@ -10762,7 +11280,7 @@ fn field_value_json(value: FieldValue) -> JsonValue {
 fn boon_value_json(value: &BoonValue) -> JsonValue {
     match value {
         BoonValue::Empty => JsonValue::Null,
-        BoonValue::Text(value) => json!(value),
+        BoonValue::Text(value) | BoonValue::Enum(value) => json!(value),
         BoonValue::Number(value) => json!(value),
         BoonValue::Bool(value) => json!(value),
         BoonValue::Record(fields) => JsonValue::Object(
@@ -11243,6 +11761,15 @@ impl RuntimeRowSnapshotTemplate {
                 InitialValue::Enum { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
+                InitialValue::RootInitialField { path } => {
+                    if let Some(value) = initial_text(path) {
+                        row.columns.set_textlike(&field.field_name, value)?;
+                    } else if let Some(value) = field.missing_row_initial_value.clone() {
+                        row.columns.set_value(&field.field_name, value)?;
+                    } else {
+                        return Err(format!("root initial field `{path}` is missing").into());
+                    }
+                }
                 InitialValue::RowInitialField { path } => {
                     if let Some(value) = initial_text(path) {
                         row.columns.set_textlike(&field.field_name, value)?;
@@ -11310,6 +11837,9 @@ fn runtime_value_from_initial(
         InitialValue::Number { value } => Ok(FieldValue::Text(value.to_string())),
         InitialValue::Bool { value } => Ok(FieldValue::Bool(*value)),
         InitialValue::Enum { value } => Ok(FieldValue::Enum(value.clone())),
+        InitialValue::RootInitialField { path } => Ok(initial_fields
+            .owned_value(path)
+            .unwrap_or_else(|| FieldValue::Text(String::new()))),
         InitialValue::RowInitialField { path } => initial_fields
             .owned_value(path)
             .ok_or_else(|| format!("row initial field `{path}` is missing").into()),
@@ -12280,6 +12810,25 @@ enum GenericReadKey {
     },
 }
 
+struct GenericDeltaPart {
+    list: Option<String>,
+    key: Option<u64>,
+    generation: Option<u64>,
+    field: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceActionApplyMode {
+    FullPropagation,
+    SourceInputsOnly,
+}
+
+impl SourceActionApplyMode {
+    fn materializes_derived(self) -> bool {
+        matches!(self, Self::FullPropagation)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct GenericRecomputeMetrics {
     recomputed_field_count: usize,
@@ -12290,6 +12839,7 @@ struct GenericRecomputeMetrics {
 enum BoonValue {
     Empty,
     Text(String),
+    Enum(String),
     Number(i64),
     Bool(bool),
     Record(BTreeMap<String, BoonValue>),
@@ -12302,7 +12852,7 @@ enum BoonValue {
 
 fn boon_value_scalar_text(value: &BoonValue) -> String {
     match value {
-        BoonValue::Text(value) => value.clone(),
+        BoonValue::Text(value) | BoonValue::Enum(value) => value.clone(),
         BoonValue::Number(value) => value.to_string(),
         BoonValue::Bool(true) => "True".to_owned(),
         BoonValue::Bool(false) => "False".to_owned(),
@@ -12520,8 +13070,8 @@ fn source_then_match_const_expression(
         let AstExprKind::Then { input, output } = expr.kind else {
             return None;
         };
-        let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source) {
+        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
+        if !input_matches {
             return None;
         }
         let output = output?;
@@ -12553,8 +13103,8 @@ fn source_then_prefix_payload_concat_expression(
         let AstExprKind::Then { input, output } = expr.kind else {
             return None;
         };
-        let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source) {
+        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
+        if !input_matches {
             return None;
         }
         output
@@ -13684,7 +14234,9 @@ impl GenericDerivedPlan {
                     && value.scope_id.is_none()
                     && matches!(
                         value.kind,
-                        DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
+                        DerivedValueKind::Pure
+                            | DerivedValueKind::SourceEventTransform
+                            | DerivedValueKind::ListView
                     )
             })
             .map(|value| GenericDerivedRootField {
@@ -13913,7 +14465,7 @@ impl GenericEvalFrame {
 impl BoonValue {
     fn as_text(&self) -> Option<String> {
         match self {
-            Self::Text(value) => Some(value.clone()),
+            Self::Text(value) | Self::Enum(value) => Some(value.clone()),
             Self::Number(value) => Some(value.to_string()),
             Self::Bool(true) => Some("True".to_owned()),
             Self::Bool(false) => Some("False".to_owned()),
@@ -13930,7 +14482,7 @@ impl BoonValue {
     fn visible_text(&self) -> String {
         match self {
             Self::Error(_) | Self::Empty | Self::NaN => String::new(),
-            Self::Text(value) => value.clone(),
+            Self::Text(value) | Self::Enum(value) => value.clone(),
             Self::Number(value) => value.to_string(),
             Self::Bool(true) => "True".to_owned(),
             Self::Bool(false) => "False".to_owned(),
@@ -13947,6 +14499,7 @@ impl BoonValue {
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| "type_error".to_owned()),
+            Self::Enum(_) => Err("type_error".to_owned()),
             Self::NaN => Err("type_error".to_owned()),
             Self::Error(error) => Err(error.clone()),
             _ => Err("type_error".to_owned()),
@@ -13958,6 +14511,8 @@ impl BoonValue {
             Self::Bool(value) => Ok(*value),
             Self::Text(value) if value == "True" => Ok(true),
             Self::Text(value) if value == "False" => Ok(false),
+            Self::Enum(value) if value == "True" => Ok(true),
+            Self::Enum(value) if value == "False" => Ok(false),
             Self::Error(error) => Err(error.clone()),
             _ => Err("type_error".to_owned()),
         }
@@ -14156,11 +14711,35 @@ impl SourceRoutePlan {
     }
 
     fn source_id(&self, source: &str) -> Option<SourceId> {
+        source_event_ref_variants(source)
+            .into_iter()
+            .find_map(|variant| {
+                self.source_id_exact(&variant)
+                    .or_else(|| self.source_id_unique_event_child(&variant))
+            })
+    }
+
+    fn source_id_exact(&self, source: &str) -> Option<SourceId> {
         self.label_slots
             .binary_search_by(|label| label.source.as_str().cmp(source))
             .ok()
             .and_then(|index| self.label_slots.get(index))
             .map(|label| label.source_id)
+    }
+
+    fn source_id_unique_event_child(&self, source: &str) -> Option<SourceId> {
+        let mut matches = [
+            ".event.press",
+            ".event.click",
+            ".event.double_click",
+            ".event.blur",
+            ".event.change",
+            ".event.key_down",
+        ]
+        .iter()
+        .filter_map(|suffix| self.source_id_exact(&format!("{source}{suffix}")));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
 
     fn require_source_id(&self, source: &str) -> RuntimeResult<SourceId> {
@@ -14232,6 +14811,10 @@ impl SourceRoutePlan {
                     .iter()
                     .any(|field| matches!(field, SourcePayloadField::Text))
             })
+    }
+
+    fn has_source_path(&self, source: &str) -> bool {
+        self.source_id(source).is_some()
     }
 
     fn route_mut(&mut self, source: &str, source_id: SourceId) -> &mut SourceRoute {
@@ -14402,8 +14985,8 @@ fn source_then_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
         let AstExprKind::Then { input, output } = expr.kind else {
             return None;
         };
-        let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source) {
+        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
+        if !input_matches {
             return None;
         }
         output
@@ -14417,12 +15000,14 @@ fn source_then_field_value(exprs: &[AstExpr], source: &str) -> Option<FieldValue
         let AstExprKind::Then { input, output } = expr.kind else {
             return None;
         };
-        let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source) {
+        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
+        if !input_matches {
             return None;
         }
-        if let Some(output) = output {
-            return ast_simple_field_value_in_exprs(exprs, output);
+        if let Some(output) = output
+            && let Some(value) = ast_simple_field_value_in_exprs(exprs, output)
+        {
+            return Some(value);
         }
         simple_field_value_after_line(exprs, expr.line)
     })
@@ -14433,8 +15018,8 @@ fn source_then_const_text_value(exprs: &[AstExpr], source: &str) -> Option<Strin
         let AstExprKind::Then { input, output } = expr.kind else {
             return None;
         };
-        let input_path = ast_argument_value_in_exprs(exprs, input)?;
-        if !source_event_path_matches(&input_path, source) {
+        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
+        if !input_matches {
             return None;
         }
         output
@@ -14453,6 +15038,16 @@ fn source_path_before_line_matches(exprs: &[AstExpr], line: usize, source: &str)
             _ => None,
         })
         .is_some_and(|path| source_event_path_matches(&path, source))
+}
+
+fn source_then_input_matches(exprs: &[AstExpr], input: usize, line: usize, source: &str) -> bool {
+    match ast_argument_value_in_exprs(exprs, input) {
+        Some(input_path) if !input_path.is_empty() => {
+            source_event_path_matches(&input_path, source)
+        }
+        None => source_path_before_line_matches(exprs, line, source),
+        Some(_) => source_path_before_line_matches(exprs, line, source),
+    }
 }
 
 fn const_text_value_after_line(exprs: &[AstExpr], line: usize) -> Option<String> {
@@ -15113,6 +15708,46 @@ fn normalized_field_name(value: &str) -> String {
         .to_owned()
 }
 
+fn checked_boon_field_name(value: &str) -> RuntimeResult<String> {
+    let field = normalized_field_name(value);
+    if let Some(token) = hidden_runtime_identity_field_token(&field) {
+        Err(format!("Boon field selector exposes hidden runtime identity `{token}`").into())
+    } else {
+        Ok(field)
+    }
+}
+
+fn hidden_runtime_identity_field_token(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("$boon") {
+        return Some("$boon");
+    }
+    let tokens = lower
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty());
+    const FORBIDDEN: &[&str] = &[
+        "runtime_key",
+        "item_key",
+        "row_key",
+        "hidden_key",
+        "hidden_keys",
+        "generation",
+        "hidden_generation",
+        "target_key",
+        "target_generation",
+        "source_id",
+        "bind_epoch",
+        "listkey",
+        "slot",
+    ];
+    tokens.into_iter().find_map(|token| {
+        FORBIDDEN
+            .iter()
+            .copied()
+            .find(|forbidden| token == *forbidden)
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct ListScenarioHarness {
@@ -15204,6 +15839,7 @@ impl ListScenarioHarness {
                 self.generic.apply_source_actions(
                     input,
                     |_| None,
+                    SourceActionApplyMode::FullPropagation,
                     |mutation| {
                         emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
@@ -15250,6 +15886,7 @@ impl ListScenarioHarness {
                 self.generic.apply_source_actions(
                     input,
                     |_| None,
+                    SourceActionApplyMode::FullPropagation,
                     |mutation| {
                         emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
@@ -15278,6 +15915,7 @@ impl ListScenarioHarness {
                         "store.all_completed" => Some(all_completed),
                         _ => None,
                     },
+                    SourceActionApplyMode::FullPropagation,
                     |mutation| {
                         emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
@@ -15372,6 +16010,7 @@ impl ListScenarioHarness {
                 self.generic.apply_source_actions(
                     input,
                     |_| None,
+                    SourceActionApplyMode::FullPropagation,
                     |mutation| {
                         emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
@@ -15735,6 +16374,7 @@ impl ListScenarioHarness {
                 "store.all_completed" => Some(all_completed_snapshot),
                 _ => None,
             },
+            SourceActionApplyMode::FullPropagation,
             |mutation| {
                 emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
@@ -15767,6 +16407,7 @@ impl ListScenarioHarness {
         self.generic.apply_source_actions(
             input,
             |_| None,
+            SourceActionApplyMode::FullPropagation,
             |mutation| {
                 emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
@@ -15801,6 +16442,7 @@ impl ListScenarioHarness {
         self.generic.apply_source_actions(
             input,
             |_| None,
+            SourceActionApplyMode::FullPropagation,
             |mutation| {
                 if matches!(mutation, GenericSourceMutation::ListRemove { .. }) {
                     removed = true;
@@ -16765,6 +17407,25 @@ FUNCTION icon_code(item) {
             }),
             "{theme_targets:#?}\n{theme_debug:#?}"
         );
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let glassmorphism_source_id = compiled
+            .source_routes
+            .source_id("store.elements.theme_switcher.glassmorphism")
+            .expect("theme switcher source should compile to a SourceId route");
+        assert!(
+            compiled
+                .source_routes
+                .actions_for_source_id(glassmorphism_source_id)
+                .unwrap()
+                .iter()
+                .any(|action| matches!(
+                    action,
+                    SourceAction::RootTextTransform { target, value }
+                        if target == "theme_options.name"
+                            && value == &FieldValue::Text("Glassmorphism".to_owned())
+                )),
+            "theme switcher source should dispatch through the SourceId action table"
+        );
         let mut runtime = list_scenario_harness_from_parsed(&parsed);
         assert_eq!(
             runtime
@@ -17701,11 +18362,11 @@ store: [
             }
         }
     pan_window:
-        TEXT { Center } |> HOLD pan_window {
+        Center |> HOLD pan_window {
             LATEST {
                 sources.keyboard.key |> WHEN {
-                    A => TEXT { LeftWindow }
-                    D => TEXT { RightWindow }
+                    A => LeftWindow
+                    D => RightWindow
                     __ => SKIP
                 }
             }
@@ -17950,7 +18611,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         )
         .unwrap();
         let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
-            row.get(field)
+            row.pointer(&format!("/$boon/{field}"))
                 .and_then(|value| {
                     value
                         .as_u64()
@@ -17960,7 +18621,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         };
         let initial = runtime.state_summary();
         let first_todo = &initial["todos"][0];
-        let target_key = json_u64_field(first_todo, "key");
+        let target_key = json_u64_field(first_todo, "row_key");
         let target_generation = json_u64_field(first_todo, "generation");
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
@@ -18022,7 +18683,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         )
         .unwrap();
         let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
-            row.get(field)
+            row.pointer(&format!("/$boon/{field}"))
                 .and_then(|value| {
                     value
                         .as_u64()
@@ -18032,7 +18693,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         };
         let initial = runtime.state_summary();
         let first_todo = &initial["todos"][0];
-        let target_key = json_u64_field(first_todo, "key");
+        let target_key = json_u64_field(first_todo, "row_key");
         let target_generation = json_u64_field(first_todo, "generation");
 
         let output = runtime
@@ -18592,6 +19253,10 @@ FUNCTION new_signal(signal) {
             "clk,data_bus"
         );
         assert_eq!(initial["store"]["search_results"][0]["key"], "clk");
+        assert_eq!(initial["store"]["signals"][0]["key"], "clk");
+        assert_eq!(initial["store"]["signals"][0]["$boon"]["row_key"], 1);
+        assert_eq!(initial["store"]["signals"][0]["$boon"]["generation"], 1);
+        assert!(initial["store"]["signals"][0]["generation"].is_null());
         assert_eq!(initial["store"]["search_results"][0]["name"], "clk");
         assert!(initial["store"]["search_results"][0]["list"].is_null());
 
@@ -18638,6 +19303,113 @@ FUNCTION new_signal(signal) {
         assert_eq!(
             family_preferred["store"]["search_results"][0]["name"],
             "data_bus[7:0]"
+        );
+    }
+
+    #[test]
+    fn list_user_key_fields_do_not_collide_with_runtime_identity() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected:
+        TEXT { clk } |> HOLD selected {
+            LATEST {
+                elements.noop.event.press |> THEN { TEXT { clk } }
+            }
+        }
+    records:
+        LIST {
+            [key: TEXT { clk }, window_key: "simple.vcd|Close|Center", value: TEXT { signal }, end: 150]
+            [key: TEXT { reset_n }, window_key: "simple.vcd|Fit|Center", value: TEXT { reset }, end: 250]
+        }
+    selected_value:
+        List/find_value(records, field: "key", value: selected, target: "value", fallback: TEXT { missing })
+    selected_end:
+        List/find_value(records, field: "window_key", value: TEXT { simple.vcd|Close|Center }, target: "end", fallback: 0)
+        |> Text/to_number()
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("list-user-key-fields", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["selected_value"], "signal");
+        assert_eq!(summary["store"]["selected_end"], 150);
+        assert_eq!(summary["store"]["records"][0]["key"], "clk");
+        assert_eq!(
+            summary["store"]["records"][0]["window_key"],
+            "simple.vcd|Close|Center"
+        );
+        assert_eq!(summary["store"]["records"][0]["$boon"]["row_key"], 1);
+        assert!(summary["store"]["records"][0]["generation"].is_null());
+    }
+
+    #[test]
+    fn list_field_selectors_cannot_name_runtime_identity_fields() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected:
+        TEXT { clk } |> HOLD selected {
+            LATEST {
+                elements.noop.event.press |> THEN { TEXT { clk } }
+            }
+        }
+    records:
+        LIST {
+            [key: TEXT { clk }, value: TEXT { signal }]
+        }
+    bad_lookup:
+        List/find_value(records, field: "row_key", value: TEXT { 1 }, target: "value", fallback: TEXT { missing })
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let error = match LiveRuntime::from_source("bad-list-field-selector", source) {
+            Ok(_) => panic!("hidden row_key selector should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("hidden runtime identity `row_key`"),
+            "{error}"
+        );
+
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected:
+        TEXT { clk } |> HOLD selected {
+            LATEST {
+                elements.noop.event.press |> THEN { TEXT { clk } }
+            }
+        }
+    records:
+        LIST {
+            [key: TEXT { clk }, value: TEXT { signal }]
+        }
+    bad_target:
+        List/find_value(records, field: "key", value: TEXT { clk }, target: "generation", fallback: TEXT { missing })
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let error = match LiveRuntime::from_source("bad-list-target-selector", source) {
+            Ok(_) => panic!("hidden generation selector should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("hidden runtime identity `generation`"),
+            "{error}"
         );
     }
 
@@ -19021,6 +19793,10 @@ FUNCTION new_marker(marker) {
                 && delta.list_id.as_deref() == Some("groups")
                 && matches!(&delta.value, ProtocolValue::Text(value) if value == "Core bus group")
         }));
+        assert_eq!(
+            create_output.state_summary["groups"][0]["name"],
+            "Core bus group"
+        );
         assert_eq!(create_output.state_summary["groups"][0]["role"], "Bus");
 
         let mut collapse_expected = BTreeMap::new();
@@ -20361,10 +21137,10 @@ store: [
     ]
     cursor_position:
         LATEST {
-            TEXT { Cursor42 }
+            Cursor42
             elements.keyboard_capture.key |> WHEN {
-                Q => TEXT { Cursor36 }
-                E => TEXT { Cursor48 }
+                Q => Cursor36
+                E => Cursor48
                 __ => SKIP
             }
         }
@@ -20429,17 +21205,17 @@ store: [
                 TEXT { ready }
             }
         }
-    zoom_level: TEXT { Close }
-    pan_window: TEXT { Center }
-    keyboard_viewport_label:
-        viewport_label(zoom: zoom_level, pan: pan_window)
+    mode: Compact
+    side: Primary
+    derived_pair_label:
+        pair_label(mode: mode, side: side)
 ]
 
-FUNCTION viewport_label(zoom, pan) {
-    LIST { zoom, pan } |> WHEN {
-        LIST { TEXT { Fit }, TEXT { Center } } => TEXT { 0 ns - 120 ns }
-        LIST { TEXT { Close }, TEXT { Center } } => TEXT { 36 ns - 60 ns }
-        LIST { TEXT { Close }, TEXT { RightWindow } } => TEXT { 48 ns - 72 ns }
+FUNCTION pair_label(mode, side) {
+    LIST { mode, side } |> WHEN {
+        LIST { Expanded, Primary } => TEXT { expanded primary }
+        LIST { Compact, Primary } => TEXT { compact primary }
+        LIST { Compact, Secondary } => TEXT { compact secondary }
         __ => TEXT { fallback }
     }
 }
@@ -20448,12 +21224,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
         let mut runtime = LiveRuntime::from_source("root-list-when-derived", source).unwrap();
         assert_eq!(
-            runtime.state_summary()["store"]["keyboard_viewport_label"],
-            "36 ns - 60 ns"
+            runtime.state_summary()["store"]["derived_pair_label"],
+            "compact primary"
         );
         assert_eq!(
-            runtime.document_state_summary()["store"]["keyboard_viewport_label"],
-            "36 ns - 60 ns"
+            runtime.document_state_summary()["store"]["derived_pair_label"],
+            "compact primary"
         );
     }
 
@@ -20465,7 +21241,7 @@ store: [
         format_cycle: SOURCE
     ]
     value_format:
-        TEXT { Hexadecimal } |> HOLD value_format {
+        Hexadecimal |> HOLD value_format {
             LATEST {
                 elements.format_cycle.event.press |> THEN { next_format(format: value_format) }
             }
@@ -20476,14 +21252,14 @@ store: [
 
 FUNCTION next_format(format) {
     format |> WHEN {
-        TEXT { Hexadecimal } => TEXT { Binary }
-        __ => TEXT { Hexadecimal }
+        Hexadecimal => Binary
+        __ => Hexadecimal
     }
 }
 
 FUNCTION selected_value(format) {
     format |> WHEN {
-        TEXT { Binary } => TEXT { 00101010 }
+        Binary => TEXT { 00101010 }
         __ => TEXT { 0x2a }
     }
 }
@@ -20550,6 +21326,273 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             "00101010"
         );
         assert_eq!(output.state_summary["data_bus_rendered_value"], "00101010");
+    }
+
+    #[test]
+    fn novywave_selected_visible_items_model_group_headers_and_collapse() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-selected-visible-items", &units)
+            .expect("NovyWave runtime should initialize");
+
+        let initial = runtime.document_state_summary();
+        let visible = initial["store"]["selected_visible_items"]
+            .as_array()
+            .expect("selected_visible_items should be a list");
+        assert_eq!(
+            visible.first().and_then(|row| row["item_kind"].as_str()),
+            Some("GroupHeader")
+        );
+        assert_eq!(
+            visible.first().and_then(|row| row["id"].as_str()),
+            Some("group_core_bus")
+        );
+        assert_eq!(
+            visible.first().and_then(|row| row["name"].as_str()),
+            Some("simple_tb.s group")
+        );
+        assert!(visible.iter().any(|row| row["id"] == "clk"));
+        assert!(visible.iter().any(|row| row["id"] == "reset_n"));
+        let selected_signals = initial["store"]["selected_signal_rows"]
+            .as_array()
+            .expect("selected_signal_rows should be a list");
+        assert!(
+            selected_signals
+                .iter()
+                .all(|row| row["item_kind"] == "VariableRow")
+        );
+
+        let collapsed = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.group_toggle".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("group toggle should collapse grouped selected rows")
+            .state_summary;
+        let collapsed_visible = collapsed["store"]["selected_visible_items"]
+            .as_array()
+            .expect("collapsed selected_visible_items should be a list");
+        assert_eq!(
+            collapsed_visible
+                .first()
+                .and_then(|row| row["item_kind"].as_str()),
+            Some("GroupHeader")
+        );
+        assert!(!collapsed_visible.iter().any(|row| row["id"] == "clk"));
+        assert!(!collapsed_visible.iter().any(|row| row["id"] == "reset_n"));
+
+        let expanded = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.group_expand".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("group expand should restore grouped selected rows")
+            .state_summary;
+        let expanded_visible = expanded["store"]["selected_visible_items"]
+            .as_array()
+            .expect("expanded selected_visible_items should be a list");
+        assert!(expanded_visible.iter().any(|row| row["id"] == "clk"));
+        assert!(expanded_visible.iter().any(|row| row["id"] == "reset_n"));
+
+        let removed = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.group_remove".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("group remove should remove only the group header")
+            .state_summary;
+        let removed_visible = removed["store"]["selected_visible_items"]
+            .as_array()
+            .expect("removed selected_visible_items should be a list");
+        assert!(
+            !removed_visible
+                .iter()
+                .any(|row| row["id"] == "group_core_bus")
+        );
+        assert!(removed_visible.iter().any(|row| row["id"] == "clk"));
+        assert!(removed_visible.iter().any(|row| row["id"] == "reset_n"));
+    }
+
+    #[test]
+    fn novywave_waveform_metadata_drives_selected_file_and_timeline_window() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let source_text =
+            fs::read_to_string(&source_path).expect("NovyWave source should be readable");
+        let segment_records_source = source_text
+            .split("waveform_segment_records:")
+            .nth(1)
+            .and_then(|tail| tail.split("\n\n").next())
+            .expect("NovyWave source should define waveform segment startup records");
+        assert!(
+            !segment_records_source.contains("width:"),
+            "waveform_segment_records must store transition times, not preprojected pixel widths"
+        );
+        assert!(segment_records_source.contains("start_time_value:"));
+        assert!(segment_records_source.contains("end_time_value:"));
+        assert!(
+            source_text.contains("startup_selected_file |> HOLD active_file"),
+            "active_file reset state must restore from startup config, not a duplicated file literal"
+        );
+        assert!(
+            source_text.contains("startup_selected_scope_key |> HOLD active_scope"),
+            "active_scope reset state must restore from startup config"
+        );
+        assert!(
+            source_text.contains("startup_primary_signal |> HOLD active_signal"),
+            "active_signal reset state must restore from startup config"
+        );
+        assert!(
+            source_text.contains("startup_selected_file_path |> HOLD load_files_path"),
+            "load_files_path reset state must restore from startup config"
+        );
+        assert!(
+            source_text.contains("startup_selected_family |> HOLD selected_signal_family"),
+            "selected signal family reset state must restore from startup config"
+        );
+        assert!(
+            !source_text.contains("NovyModel/viewport_label_for_unit"),
+            "viewport labels must derive from numeric selected-file metadata, not label-specific helper tables"
+        );
+        assert!(
+            source_text.contains("viewport_label_start")
+                && source_text.contains("viewport_label_end")
+                && source_text.contains("selected_timeline_time_unit"),
+            "viewport labels should compose numeric metadata and the selected file unit"
+        );
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-waveform-metadata", &units)
+            .expect("NovyWave runtime should initialize");
+
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["selected_variable_file"], "simple.vcd");
+        assert_eq!(initial["store"]["active_metadata_file"], "simple.vcd");
+        assert_eq!(initial["store"]["bridge_file_format"], "VCD");
+        assert_eq!(
+            initial["store"]["active_metadata_full_range"],
+            "0 s - 250 s"
+        );
+        assert_eq!(
+            initial["store"]["bridge_request_window_label"],
+            "0 s - 250 s"
+        );
+        assert_eq!(
+            initial["store"]["active_metadata_range_source"],
+            "FileHeader"
+        );
+        assert_eq!(initial["store"]["active_metadata_time_unit"], "s");
+        assert_eq!(initial["store"]["active_scope"], "simple_tb_s");
+        assert_eq!(initial["store"]["active_scope_label"], "simple_tb.s");
+        assert_eq!(
+            initial["store"]["selected_rows_order_label"],
+            "A[3:0], B[3:0]"
+        );
+        assert_eq!(initial["store"]["startup_selected_file"], "simple.vcd");
+        assert_eq!(
+            initial["store"]["startup_selected_file_path"],
+            "~/repos/NovyWave/test_files/simple.vcd"
+        );
+        assert_eq!(
+            initial["store"]["startup_restore_summary"],
+            "config restore: simple.vcd opened, simple_tb.s expanded, A[3:0]/B[3:0] selected, cursor 50 s"
+        );
+        assert_eq!(
+            initial["store"]["startup_waveform_transition_summary"],
+            "simple.vcd transitions: A[3:0] 0-50=0xa,50-150=0xc,150-250=0x0; B[3:0] 0-50=0x3,50-150=0x5,150-250=0x0"
+        );
+        assert_eq!(
+            initial["store"]["startup_waveform_projection_summary"],
+            "projection from startup timeline metadata: segment widths derive from start/end/window/canvas at runtime"
+        );
+        assert_eq!(
+            initial["store"]["selected_waveform_segments"][1]["width"],
+            72
+        );
+        assert_eq!(
+            initial["store"]["selected_waveform_segments"][3]["width"],
+            144
+        );
+
+        let zoomed = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.zoom_in".to_owned(),
+                target_text: Some("Zoom+".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("zoom-in should apply")
+            .state_summary;
+        assert_eq!(zoomed["store"]["zoom_level"], "Close");
+        assert_eq!(
+            zoomed["store"]["viewport_window_key"],
+            "simple.vcd|Close|Center"
+        );
+        assert_eq!(zoomed["store"]["viewport_label"], "0 s - 150 s");
+        assert_eq!(zoomed["store"]["keyboard_viewport_label"], "0 s - 150 s");
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.zoom_reset".to_owned(),
+                target_text: Some("Reset".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("zoom reset should apply");
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.show_empty".to_owned(),
+                target_text: Some("Empty".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("empty state should apply");
+        let restored = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.load_default_file".to_owned(),
+                target_text: Some("Open default".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("default file restore should apply")
+            .state_summary;
+        assert_eq!(restored["store"]["active_scope"], "simple_tb_s");
+        assert_eq!(restored["store"]["scope_cpu_expansion_state"], "Expanded");
+
+        let uart = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_uart_compare_file".to_owned(),
+                target_text: Some("Compare UART".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("UART file selection should apply")
+            .state_summary;
+        assert_eq!(uart["store"]["selected_variable_file"], "wave_27.fst");
+        assert_eq!(uart["store"]["active_metadata_file"], "wave_27.fst");
+        assert_eq!(uart["store"]["bridge_file_format"], "FST");
+        assert_eq!(
+            uart["store"]["bridge_waveform_ref"],
+            "wave:fst:wave-27:0-240ns"
+        );
+        assert_eq!(
+            uart["store"]["bridge_request_window_label"],
+            "0 ns - 120 ns"
+        );
+
+        let ghw = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_ghw_file".to_owned(),
+                target_text: Some("Open GHW".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("GHW file selection should apply")
+            .state_summary;
+        assert_eq!(ghw["store"]["selected_variable_file"], "simple_test.ghw");
+        assert_eq!(ghw["store"]["active_metadata_file"], "simple_test.ghw");
+        assert_eq!(ghw["store"]["bridge_file_format"], "GHW");
+        assert_eq!(ghw["store"]["active_metadata_full_range"], "0 ns - 100 ns");
+        assert_eq!(ghw["store"]["bridge_request_window_label"], "0 ns - 100 ns");
+        assert_eq!(
+            ghw["store"]["bridge_page_window_label"],
+            "window 0 ns - 100 ns, max 256 transitions, payload <= 64KiB"
+        );
     }
 
     #[test]

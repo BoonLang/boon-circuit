@@ -1176,7 +1176,9 @@ async fn run_surface_probe_inner(
                 None
             }
         };
-        if frame_index + 1 == total_frame_count && options.readback_artifact_dir.is_some() {
+        let readback_sample_frame =
+            frame_index + 1 == total_frame_count && options.readback_artifact_dir.is_some();
+        if readback_sample_frame {
             pending_readback = Some(queue_visible_surface_readback(
                 &device,
                 &mut encoder,
@@ -1217,7 +1219,9 @@ async fn run_surface_probe_inner(
             present_submit_ms = current_present_submit_ms;
             first_presented_frame_ms = current_surface_acquire_ms + current_present_submit_ms;
         }
-        if frame_index >= warmup_frame_count {
+        let include_timing_sample =
+            frame_index >= warmup_frame_count && !(readback_sample_frame && sample_frame_count > 1);
+        if include_timing_sample {
             presented_frame_samples.push(current_surface_acquire_ms + current_present_submit_ms);
             if let Some(render_hook_ms) = render_hook_ms {
                 render_hook_samples.push(render_hook_ms);
@@ -1383,9 +1387,9 @@ async fn run_surface_probe_inner(
                 external_render_proof = Some(render_result.proof);
                 post_input_render_hook_ms = Some(elapsed_ms(render_start));
             }
-            if frame_index + 1 == post_input_total_frame_count
-                && options.readback_artifact_dir.is_some()
-            {
+            let readback_sample_frame = frame_index + 1 == post_input_total_frame_count
+                && options.readback_artifact_dir.is_some();
+            if readback_sample_frame {
                 post_input_readback = Some(queue_visible_surface_readback(
                     &device,
                     &mut encoder,
@@ -1406,7 +1410,9 @@ async fn run_surface_probe_inner(
             if frame_index == 0 {
                 post_input_first_frame_ms = frame_ms;
             }
-            if frame_index >= post_input_warmup_frame_count {
+            let include_timing_sample = frame_index >= post_input_warmup_frame_count
+                && !(readback_sample_frame && post_input_sample_count > 1);
+            if include_timing_sample {
                 post_input_presented_frame_samples.push(frame_ms);
                 if let Some(render_hook_ms) = post_input_render_hook_ms {
                     post_input_render_hook_samples.push(render_hook_ms);

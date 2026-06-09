@@ -2234,16 +2234,8 @@ fn reducer_update_signature(item: &ParserItem) -> bool {
 }
 
 fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    let forbidden = [
-        "runtime_key",
-        "item_key",
-        "ListKey",
-        "Option[ListKey",
-        "generation:",
-        "source_id:",
-    ];
-    for needle in forbidden {
-        if ast_has_lexeme(ast, needle) {
+    for token in ast.semantic_tokens() {
+        if let Some(needle) = hidden_runtime_identity_token(&token.lexeme) {
             return Err(ParseError {
                 path: path.to_owned(),
                 message: format!("Boon source exposes hidden runtime identity `{needle}`"),
@@ -2262,6 +2254,37 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn hidden_runtime_identity_token(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("$boon") {
+        return Some("$boon");
+    }
+    let tokens = lower
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty());
+    const FORBIDDEN: &[&str] = &[
+        "runtime_key",
+        "item_key",
+        "row_key",
+        "hidden_key",
+        "hidden_keys",
+        "generation",
+        "hidden_generation",
+        "target_key",
+        "target_generation",
+        "source_id",
+        "bind_epoch",
+        "listkey",
+        "slot",
+    ];
+    tokens.into_iter().find_map(|token| {
+        FORBIDDEN
+            .iter()
+            .copied()
+            .find(|forbidden| token == *forbidden)
+    })
 }
 
 fn collect_sources(ast: &AstProgram) -> Vec<String> {
@@ -2316,6 +2339,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/latest"
             | "Text/empty"
             | "Text/concat"
+            | "Text/time_range_label"
             | "Text/trim"
             | "Text/substring"
             | "Text/length"
@@ -2325,6 +2349,8 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/to_number"
             | "Text/is_empty"
             | "Text/is_not_empty"
+            | "Number/project_width"
+            | "Number/project_offset"
             | "Bool/not"
             | "Bool/and"
             | "Bool/toggle"
@@ -4126,6 +4152,25 @@ todos |> List/map(todo, new: new_todo(todo: todo))
         );
         let err = parse_source("bad-runtime-key.bn", source).unwrap_err();
         assert!(err.message.contains("hidden runtime identity"));
+    }
+
+    #[test]
+    fn rejects_runtime_identity_collision_names_but_permits_user_key_fields() {
+        parse_source(
+            "user-key-is-data.bn",
+            "LIST {}\nrecord: [key: TEXT { visible }]\nSOURCE\nHOLD\nLATEST\nList/map",
+        )
+        .unwrap();
+
+        for hidden in ["row_key", "target_key", "target_generation", "bind_epoch"] {
+            let source =
+                format!("LIST {{}}\n{hidden}: TEXT {{ leak }}\nSOURCE\nHOLD\nLATEST\nList/map");
+            let err = parse_source("bad-hidden-identity.bn", &source).unwrap_err();
+            assert!(
+                err.message.contains(hidden),
+                "expected `{hidden}` to be rejected, got {err}"
+            );
+        }
     }
 
     #[test]

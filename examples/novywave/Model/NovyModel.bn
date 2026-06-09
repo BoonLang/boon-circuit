@@ -1,50 +1,26 @@
 -- Boon-owned NovyWave app model helpers.
 
-FUNCTION viewport_label(zoom, pan) {
-    LIST { zoom, pan } |> WHEN {
-        LIST { TEXT { Fit }, TEXT { Center } } => TEXT { 0 ns - 120 ns }
-        LIST { TEXT { Close }, TEXT { Center } } => TEXT { 36 ns - 60 ns }
-        LIST { TEXT { Closer }, TEXT { Center } } => TEXT { 40 ns - 52 ns }
-        LIST { TEXT { Closest }, TEXT { Center } } => TEXT { 42 ns - 48 ns }
-        LIST { TEXT { Wide }, TEXT { Center } } => TEXT { 0 ns - 240 ns }
-        LIST { TEXT { Widest }, TEXT { Center } } => TEXT { 0 ns - 240 ns }
-        LIST { TEXT { Fit }, TEXT { LeftWindow } } => TEXT { 0 ns - 80 ns }
-        LIST { TEXT { Fit }, TEXT { RightWindow } } => TEXT { 80 ns - 160 ns }
-        LIST { TEXT { Close }, TEXT { LeftWindow } } => TEXT { 24 ns - 48 ns }
-        LIST { TEXT { Close }, TEXT { RightWindow } } => TEXT { 48 ns - 72 ns }
-        LIST { TEXT { Closer }, TEXT { LeftWindow } } => TEXT { 30 ns - 42 ns }
-        LIST { TEXT { Closer }, TEXT { RightWindow } } => TEXT { 42 ns - 54 ns }
-        LIST { TEXT { Closest }, TEXT { LeftWindow } } => TEXT { 36 ns - 42 ns }
-        LIST { TEXT { Closest }, TEXT { RightWindow } } => TEXT { 44 ns - 50 ns }
-        LIST { TEXT { Wide }, TEXT { LeftWindow } } => TEXT { 0 ns - 180 ns }
-        LIST { TEXT { Wide }, TEXT { RightWindow } } => TEXT { 60 ns - 240 ns }
-        LIST { TEXT { Widest }, TEXT { LeftWindow } } => TEXT { 0 ns - 240 ns }
-        LIST { TEXT { Widest }, TEXT { RightWindow } } => TEXT { 0 ns - 240 ns }
-        __ => TEXT { 0 ns - 120 ns }
-    }
-}
-
 FUNCTION zoom_in_level(zoom) {
     zoom |> WHEN {
-        TEXT { Widest } => TEXT { Wide }
-        TEXT { Wide } => TEXT { Fit }
-        TEXT { Fit } => TEXT { Close }
-        TEXT { Close } => TEXT { Closer }
-        TEXT { Closer } => TEXT { Closest }
-        TEXT { Closest } => TEXT { Closest }
-        __ => TEXT { Close }
+        Widest => Wide
+        Wide => Fit
+        Fit => Close
+        Close => Closer
+        Closer => Closest
+        Closest => Closest
+        __ => Close
     }
 }
 
 FUNCTION zoom_out_level(zoom) {
     zoom |> WHEN {
-        TEXT { Closest } => TEXT { Closer }
-        TEXT { Closer } => TEXT { Close }
-        TEXT { Close } => TEXT { Fit }
-        TEXT { Fit } => TEXT { Wide }
-        TEXT { Wide } => TEXT { Widest }
-        TEXT { Widest } => TEXT { Widest }
-        __ => TEXT { Wide }
+        Closest => Closer
+        Closer => Close
+        Close => Fit
+        Fit => Wide
+        Wide => Widest
+        Widest => Widest
+        __ => Wide
     }
 }
 
@@ -52,11 +28,11 @@ FUNCTION zoomed_waveform_width(width, zoom) {
     width == 0 |> WHEN {
         True => width
         False => zoom |> WHEN {
-            TEXT { Closest } => width * 4
-            TEXT { Closer } => width * 3
-            TEXT { Close } => width * 2
-            TEXT { Wide } => width / 2
-            TEXT { Widest } => width / 3
+            Closest => width * 4
+            Closer => width * 3
+            Close => width * 2
+            Wide => width / 2
+            Widest => width / 3
             __ => width
         }
     }
@@ -64,9 +40,9 @@ FUNCTION zoomed_waveform_width(width, zoom) {
 
 FUNCTION cursor_base_offset(cursor) {
     cursor |> WHEN {
-        TEXT { Cursor36 } => 84
-        TEXT { Cursor42 } => 140
-        TEXT { Cursor48 } => 196
+        Cursor36 => 84
+        Cursor42 => 140
+        Cursor48 => 196
         __ => 140
     }
 }
@@ -75,18 +51,27 @@ FUNCTION cursor_offset_width(cursor, zoom) {
     zoomed_waveform_width(width: cursor_base_offset(cursor: cursor), zoom: zoom)
 }
 
+FUNCTION cursor_time_value(cursor, left_value, default_value, right_value) {
+    cursor |> WHEN {
+        Cursor36 => left_value
+        Cursor42 => default_value
+        Cursor48 => right_value
+        __ => default_value
+    }
+}
+
 FUNCTION zoom_level_from_step(step) {
     step <= -2 |> WHEN {
-        True => TEXT { Widest }
+        True => Widest
         False => step == -1 |> WHEN {
-            True => TEXT { Wide }
+            True => Wide
             False => step == 0 |> WHEN {
-                True => TEXT { Fit }
+                True => Fit
                 False => step == 1 |> WHEN {
-                    True => TEXT { Close }
+                    True => Close
                     False => step == 2 |> WHEN {
-                        True => TEXT { Closer }
-                        False => TEXT { Closest }
+                        True => Closer
+                        False => Closest
                     }
                 }
             }
@@ -94,159 +79,165 @@ FUNCTION zoom_level_from_step(step) {
     }
 }
 
-FUNCTION cursor_label(cursor) {
-    cursor |> WHEN {
-        TEXT { Cursor36 } => TEXT { 36 ns }
-        TEXT { Cursor42 } => TEXT { 42 ns }
-        TEXT { Cursor48 } => TEXT { 48 ns }
-        __ => TEXT { 42 ns }
-    }
-}
-
 FUNCTION cursor_from_label(label) {
     label |> WHEN {
-        TEXT { 36 ns } => TEXT { Cursor36 }
-        TEXT { 42 ns } => TEXT { Cursor42 }
-        TEXT { 48 ns } => TEXT { Cursor48 }
-        __ => TEXT { Cursor42 }
+        TEXT { 0 s } => Cursor36
+        TEXT { 50 s } => Cursor42
+        TEXT { 150 s } => Cursor48
+        TEXT { 36 ns } => Cursor36
+        TEXT { 42 ns } => Cursor42
+        TEXT { 48 ns } => Cursor48
+        __ => Cursor42
     }
 }
 
 FUNCTION signal_label(signal) {
     signal |> WHEN {
-        TEXT { clk } => TEXT { top.cpu.clk }
-        TEXT { reset_n } => TEXT { top.cpu.reset_n }
+        TEXT { clk } => TEXT { simple_tb.s.A[3:0] }
+        TEXT { reset_n } => TEXT { simple_tb.s.B[3:0] }
         TEXT { data_bus } => TEXT { top.cpu.data_bus[7:0] }
         TEXT { temperature } => TEXT { top.analog.temperature }
-        __ => TEXT { top.cpu.clk }
+        __ => TEXT { simple_tb.s.A[3:0] }
     }
 }
 
 FUNCTION format_label(format) {
     format |> WHEN {
-        TEXT { Hexadecimal } => TEXT { Hex }
-        TEXT { Binary } => TEXT { Binary }
-        TEXT { GroupedBinary } => TEXT { Grouped bin }
-        TEXT { Octal } => TEXT { Octal }
-        TEXT { Signed } => TEXT { Signed }
-        TEXT { Unsigned } => TEXT { Unsigned }
-        TEXT { ASCII } => TEXT { ASCII }
+        Hexadecimal => TEXT { Hex }
+        Binary => TEXT { Binary }
+        GroupedBinary => TEXT { Grouped bin }
+        Octal => TEXT { Octal }
+        Signed => TEXT { Signed }
+        Unsigned => TEXT { Unsigned }
+        ASCII => TEXT { ASCII }
         __ => TEXT { Hex }
     }
 }
 
 FUNCTION next_format(format) {
     format |> WHEN {
-        TEXT { Hexadecimal } => TEXT { Binary }
-        TEXT { Binary } => TEXT { GroupedBinary }
-        TEXT { GroupedBinary } => TEXT { Octal }
-        TEXT { Octal } => TEXT { Signed }
-        TEXT { Signed } => TEXT { Unsigned }
-        TEXT { Unsigned } => TEXT { ASCII }
-        TEXT { ASCII } => TEXT { Hexadecimal }
-        __ => TEXT { Binary }
+        Hexadecimal => Binary
+        Binary => GroupedBinary
+        GroupedBinary => Octal
+        Octal => Signed
+        Signed => Unsigned
+        Unsigned => ASCII
+        ASCII => Hexadecimal
+        __ => Binary
     }
 }
 
 FUNCTION selected_clk_value(format) {
     format |> WHEN {
-        TEXT { Binary } => TEXT { 1b }
-        TEXT { GroupedBinary } => TEXT { 1b }
-        TEXT { Octal } => TEXT { 1 }
-        TEXT { Signed } => TEXT { 1 }
-        TEXT { Unsigned } => TEXT { 1 }
-        TEXT { ASCII } => TEXT { . }
-        __ => TEXT { 1 }
+        Binary => TEXT { 1100 }
+        GroupedBinary => TEXT { 1100 }
+        Octal => TEXT { 014 }
+        Signed => TEXT { 12 }
+        Unsigned => TEXT { 12 }
+        ASCII => TEXT { . }
+        __ => TEXT { 0xc }
     }
 }
 
 FUNCTION selected_reset_value(format) {
     format |> WHEN {
-        TEXT { Binary } => TEXT { 1b }
-        TEXT { GroupedBinary } => TEXT { 1b }
-        TEXT { Octal } => TEXT { 1 }
-        TEXT { Signed } => TEXT { 1 }
-        TEXT { Unsigned } => TEXT { 1 }
-        TEXT { ASCII } => TEXT { . }
-        __ => TEXT { 1 }
+        Binary => TEXT { 0101 }
+        GroupedBinary => TEXT { 0101 }
+        Octal => TEXT { 005 }
+        Signed => TEXT { 5 }
+        Unsigned => TEXT { 5 }
+        ASCII => TEXT { . }
+        __ => TEXT { 0x5 }
     }
 }
 
 FUNCTION selected_data_value(format) {
     format |> WHEN {
-        TEXT { Binary } => TEXT { 00101010 }
-        TEXT { GroupedBinary } => TEXT { 0010 1010 }
-        TEXT { Octal } => TEXT { 052 }
-        TEXT { Signed } => TEXT { 42 }
-        TEXT { Unsigned } => TEXT { 42 }
-        TEXT { ASCII } => TEXT { * }
+        Binary => TEXT { 00101010 }
+        GroupedBinary => TEXT { 0010 1010 }
+        Octal => TEXT { 052 }
+        Signed => TEXT { 42 }
+        Unsigned => TEXT { 42 }
+        ASCII => TEXT { * }
         __ => TEXT { 0x2a }
     }
 }
 
 FUNCTION selected_data_value_at_cursor(format, cursor) {
     cursor |> WHEN {
-        TEXT { Cursor36 } => format |> WHEN {
-            TEXT { Binary } => TEXT { 00000000 }
-            TEXT { GroupedBinary } => TEXT { 0000 0000 }
-            TEXT { Octal } => TEXT { 000 }
-            TEXT { Signed } => TEXT { 0 }
-            TEXT { Unsigned } => TEXT { 0 }
-            TEXT { ASCII } => TEXT { . }
+        Cursor36 => format |> WHEN {
+            Binary => TEXT { 00000000 }
+            GroupedBinary => TEXT { 0000 0000 }
+            Octal => TEXT { 000 }
+            Signed => TEXT { 0 }
+            Unsigned => TEXT { 0 }
+            ASCII => TEXT { . }
             __ => TEXT { 0x00 }
         }
-        TEXT { Cursor48 } => format |> WHEN {
-            TEXT { Binary } => TEXT { 00010010 }
-            TEXT { GroupedBinary } => TEXT { 0001 0010 }
-            TEXT { Octal } => TEXT { 022 }
-            TEXT { Signed } => TEXT { 18 }
-            TEXT { Unsigned } => TEXT { 18 }
-            TEXT { ASCII } => TEXT { . }
+        Cursor48 => format |> WHEN {
+            Binary => TEXT { 00010010 }
+            GroupedBinary => TEXT { 0001 0010 }
+            Octal => TEXT { 022 }
+            Signed => TEXT { 18 }
+            Unsigned => TEXT { 18 }
+            ASCII => TEXT { . }
             __ => TEXT { 0x12 }
         }
-        TEXT { Cursor42 } => selected_data_value(format: format)
+        Cursor42 => selected_data_value(format: format)
         __ => selected_data_value(format: format)
     }
 }
 
 FUNCTION selected_temperature_value(format) {
     format |> WHEN {
-        TEXT { Binary } => TEXT { analog }
-        TEXT { GroupedBinary } => TEXT { analog }
-        TEXT { Octal } => TEXT { analog }
-        TEXT { Signed } => TEXT { 43 }
-        TEXT { Unsigned } => TEXT { 43 }
-        TEXT { ASCII } => TEXT { temp }
+        Binary => TEXT { analog }
+        GroupedBinary => TEXT { analog }
+        Octal => TEXT { analog }
+        Signed => TEXT { 43 }
+        Unsigned => TEXT { 43 }
+        ASCII => TEXT { temp }
         __ => TEXT { 42.8 C }
     }
 }
 
 FUNCTION selected_temperature_value_at_cursor(format, cursor) {
     cursor |> WHEN {
-        TEXT { Cursor36 } => format |> WHEN {
-            TEXT { Signed } => TEXT { 41 }
-            TEXT { Unsigned } => TEXT { 41 }
-            TEXT { ASCII } => TEXT { temp }
+        Cursor36 => format |> WHEN {
+            Signed => TEXT { 41 }
+            Unsigned => TEXT { 41 }
+            ASCII => TEXT { temp }
             __ => TEXT { 41.0 C }
         }
-        TEXT { Cursor48 } => format |> WHEN {
-            TEXT { Signed } => TEXT { 44 }
-            TEXT { Unsigned } => TEXT { 44 }
-            TEXT { ASCII } => TEXT { temp }
+        Cursor48 => format |> WHEN {
+            Signed => TEXT { 44 }
+            Unsigned => TEXT { 44 }
+            ASCII => TEXT { temp }
             __ => TEXT { 44.0 C }
         }
-        TEXT { Cursor42 } => selected_temperature_value(format: format)
+        Cursor42 => selected_temperature_value(format: format)
         __ => selected_temperature_value(format: format)
     }
 }
 
 FUNCTION selected_clk_value_at_cursor(format, cursor) {
     cursor |> WHEN {
-        TEXT { Cursor36 } => format |> WHEN {
-            TEXT { Binary } => TEXT { 0b }
-            TEXT { GroupedBinary } => TEXT { 0b }
-            TEXT { ASCII } => TEXT { . }
-            __ => TEXT { 0 }
+        Cursor36 => format |> WHEN {
+            Binary => TEXT { 1010 }
+            GroupedBinary => TEXT { 1010 }
+            Octal => TEXT { 012 }
+            Signed => TEXT { 10 }
+            Unsigned => TEXT { 10 }
+            ASCII => TEXT { . }
+            __ => TEXT { 0xa }
+        }
+        Cursor48 => format |> WHEN {
+            Binary => TEXT { 0000 }
+            GroupedBinary => TEXT { 0000 }
+            Octal => TEXT { 000 }
+            Signed => TEXT { 0 }
+            Unsigned => TEXT { 0 }
+            ASCII => TEXT { . }
+            __ => TEXT { 0x0 }
         }
         __ => selected_clk_value(format: format)
     }
@@ -254,11 +245,23 @@ FUNCTION selected_clk_value_at_cursor(format, cursor) {
 
 FUNCTION selected_reset_value_at_cursor(format, cursor) {
     cursor |> WHEN {
-        TEXT { Cursor36 } => format |> WHEN {
-            TEXT { Binary } => TEXT { 0b }
-            TEXT { GroupedBinary } => TEXT { 0b }
-            TEXT { ASCII } => TEXT { . }
-            __ => TEXT { 0 }
+        Cursor36 => format |> WHEN {
+            Binary => TEXT { 0011 }
+            GroupedBinary => TEXT { 0011 }
+            Octal => TEXT { 003 }
+            Signed => TEXT { 3 }
+            Unsigned => TEXT { 3 }
+            ASCII => TEXT { . }
+            __ => TEXT { 0x3 }
+        }
+        Cursor48 => format |> WHEN {
+            Binary => TEXT { 0000 }
+            GroupedBinary => TEXT { 0000 }
+            Octal => TEXT { 000 }
+            Signed => TEXT { 0 }
+            Unsigned => TEXT { 0 }
+            ASCII => TEXT { . }
+            __ => TEXT { 0x0 }
         }
         __ => selected_reset_value(format: format)
     }
@@ -270,21 +273,21 @@ FUNCTION cursor_signal_value(signal_id, cursor, format, fallback) {
         TEXT { reset_n } => selected_reset_value_at_cursor(format: format, cursor: cursor)
         TEXT { data_bus } => selected_data_value_at_cursor(format: format, cursor: cursor)
         TEXT { data_valid } => cursor |> WHEN {
-            TEXT { Cursor36 } => TEXT { 0 }
+            Cursor36 => TEXT { 0 }
             __ => TEXT { 1 }
         }
         TEXT { data_ready } => cursor |> WHEN {
-            TEXT { Cursor36 } => TEXT { 1 }
-            TEXT { Cursor48 } => TEXT { 0 }
+            Cursor36 => TEXT { 1 }
+            Cursor48 => TEXT { 0 }
             __ => TEXT { 0 }
         }
         TEXT { state } => cursor |> WHEN {
-            TEXT { Cursor36 } => TEXT { IDLE }
-            TEXT { Cursor48 } => TEXT { RUN }
+            Cursor36 => TEXT { IDLE }
+            Cursor48 => TEXT { RUN }
             __ => TEXT { Run }
         }
         TEXT { error_count } => cursor |> WHEN {
-            TEXT { Cursor48 } => TEXT { 1 }
+            Cursor48 => TEXT { 1 }
             __ => TEXT { 0 }
         }
         TEXT { temperature } => selected_temperature_value_at_cursor(format: format, cursor: cursor)
@@ -294,9 +297,9 @@ FUNCTION cursor_signal_value(signal_id, cursor, format, fallback) {
 
 FUNCTION row_height(size) {
     size |> WHEN {
-        TEXT { Compact } => 22
-        TEXT { Normal } => 28
-        TEXT { Tall } => 44
+        Compact => 22
+        Normal => 28
+        Tall => 44
         __ => 28
     }
 }
@@ -346,13 +349,13 @@ FUNCTION request_page(compact, format, zoom) {
         TEXT { DATA_CLOSE } => request_zoom_page(zoom: zoom)
         TEXT { DATA_WIDE } => request_zoom_page(zoom: zoom)
         TEXT { DATA_BIN } => format |> WHEN {
-            TEXT { Binary } => TEXT { DATA_BIN }
-            TEXT { GroupedBinary } => TEXT { DATA_GROUP }
-            TEXT { Octal } => TEXT { DATA_OCT }
-            TEXT { Signed } => TEXT { DATA_SGN }
-            TEXT { Unsigned } => TEXT { DATA_UNS }
-            TEXT { ASCII } => TEXT { DATA_ASC }
-            TEXT { Hexadecimal } => TEXT { DATA_HEX }
+            Binary => TEXT { DATA_BIN }
+            GroupedBinary => TEXT { DATA_GROUP }
+            Octal => TEXT { DATA_OCT }
+            Signed => TEXT { DATA_SGN }
+            Unsigned => TEXT { DATA_UNS }
+            ASCII => TEXT { DATA_ASC }
+            Hexadecimal => TEXT { DATA_HEX }
             __ => TEXT { DATA_BIN }
         }
         __ => compact
@@ -361,35 +364,12 @@ FUNCTION request_page(compact, format, zoom) {
 
 FUNCTION request_zoom_page(zoom) {
     zoom |> WHEN {
-        TEXT { Widest } => TEXT { DATA_WIDE }
-        TEXT { Wide } => TEXT { DATA_WIDE }
-        TEXT { Fit } => TEXT { DATA_FIT }
-        TEXT { Close } => TEXT { DATA_CLOSE }
-        TEXT { Closer } => TEXT { DATA_CLOSE }
-        TEXT { Closest } => TEXT { DATA_CLOSE }
+        Widest => TEXT { DATA_WIDE }
+        Wide => TEXT { DATA_WIDE }
+        Fit => TEXT { DATA_FIT }
+        Close => TEXT { DATA_CLOSE }
+        Closer => TEXT { DATA_CLOSE }
+        Closest => TEXT { DATA_CLOSE }
         __ => TEXT { DATA_FIT }
-    }
-}
-
-FUNCTION page_window_label(window) {
-    window |> WHEN {
-        TEXT { no request window } => TEXT { no page window scheduled }
-        TEXT { 0 ns - 120 ns } => TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 36 ns - 60 ns } => TEXT { window 36-60ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 40 ns - 52 ns } => TEXT { window 40-52ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 42 ns - 48 ns } => TEXT { window 42-48ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 0 ns - 240 ns } => TEXT { window 0-240ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 0 ns - 80 ns } => TEXT { window 0-80ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 80 ns - 160 ns } => TEXT { window 80-160ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 24 ns - 48 ns } => TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 48 ns - 72 ns } => TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 30 ns - 42 ns } => TEXT { window 30-42ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 42 ns - 54 ns } => TEXT { window 42-54ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 36 ns - 42 ns } => TEXT { window 36-42ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 44 ns - 50 ns } => TEXT { window 44-50ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 0 ns - 180 ns } => TEXT { window 0-180ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 60 ns - 240 ns } => TEXT { window 60-240ns, max 256 transitions, payload <= 64KiB }
-        TEXT { 0 ns - 100 ns } => TEXT { window 0-100ns, max 256 transitions, payload <= 64KiB }
-        __ => TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
     }
 }

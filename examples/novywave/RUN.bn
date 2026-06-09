@@ -52,6 +52,7 @@ store: [
         group_create: SOURCE
         group_toggle: SOURCE
         group_expand: SOURCE
+        group_remove: SOURCE
         stale_response_probe: SOURCE
         row_taller: SOURCE
         row_shorter: SOURCE
@@ -110,283 +111,358 @@ store: [
 
     workspace_dialog:
         LATEST {
-            TEXT { Closed }
-            elements.open_workspace_dialog.event.press |> THEN { TEXT { Open } }
-            elements.close_workspace_dialog.event.press |> THEN { TEXT { Closed } }
-            elements.open_selected_workspace.event.press |> THEN { TEXT { Closed } }
-            elements.open_load_files_dialog.event.press |> THEN { TEXT { Closed } }
+            Closed
+            elements.open_workspace_dialog.event.press |> THEN { Open }
+            elements.close_workspace_dialog.event.press |> THEN { Closed }
+            elements.open_selected_workspace.event.press |> THEN { Closed }
+            elements.open_load_files_dialog.event.press |> THEN { Closed }
         }
 
     workspace_path_key:
-        TEXT { WorkspaceA } |> HOLD workspace_path_key {
+        WorkspaceA |> HOLD workspace_path_key {
             LATEST {
                 elements.open_selected_workspace.event.press |> THEN { workspace_selected_key }
             }
         }
 
     workspace_selected_key:
-        TEXT { WorkspaceA } |> HOLD workspace_selected_key {
+        WorkspaceA |> HOLD workspace_selected_key {
             LATEST {
                 elements.open_workspace_dialog.event.press |> THEN { workspace_path_key }
-                elements.select_workspace_repo.event.press |> THEN { TEXT { Repo } }
-                elements.select_workspace_a.event.press |> THEN { TEXT { WorkspaceA } }
-                elements.select_workspace_b.event.press |> THEN { TEXT { WorkspaceB } }
+                elements.select_workspace_repo.event.press |> THEN { Repo }
+                elements.select_workspace_a.event.press |> THEN { WorkspaceA }
+                elements.select_workspace_b.event.press |> THEN { WorkspaceB }
             }
         }
 
     workspace_path:
         workspace_path_key |> WHEN {
-            TEXT { WorkspaceB } => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
-            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            WorkspaceB => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
+            Repo => TEXT { /home/martinkavik/repos/NovyWave }
             __ => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a }
         }
 
     workspace_header_path:
         workspace_path_key |> WHEN {
-            TEXT { WorkspaceB } => TEXT { .../test_files/my_workspaces/workspace_b }
-            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            WorkspaceB => TEXT { .../test_files/my_workspaces/workspace_b }
+            Repo => TEXT { /home/martinkavik/repos/NovyWave }
             __ => TEXT { .../test_files/my_workspaces/workspace_a }
         }
 
     workspace_selected_path:
         workspace_selected_key |> WHEN {
-            TEXT { WorkspaceB } => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
-            TEXT { Repo } => TEXT { /home/martinkavik/repos/NovyWave }
+            WorkspaceB => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b }
+            Repo => TEXT { /home/martinkavik/repos/NovyWave }
             __ => TEXT { /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a }
         }
 
     workspace_dialog_title:
-        workspace_dialog == TEXT { Open } |> WHEN {
+        workspace_dialog == Open |> WHEN {
             True => TEXT { Open Workspace }
             False => TEXT { Workspace dialog closed }
         }
 
     workspace_dialog_hint:
-        workspace_dialog == TEXT { Open } |> WHEN {
+        workspace_dialog == Open |> WHEN {
             True => TEXT { Pick a directory to use as your workspace. NovyWave will create the .novywave file automatically if it is missing. }
             False => TEXT { No workspace picker }
         }
 
     workspace_dialog_selection:
-        workspace_dialog == TEXT { Open } |> WHEN {
+        workspace_dialog == Open |> WHEN {
             True => TEXT { Selected: } |> Text/concat(with: workspace_selected_path, separator: " ")
             False => TEXT { none }
         }
 
     workspace_status_label:
         workspace_path_key |> WHEN {
-            TEXT { WorkspaceB } => TEXT { workspace_b ready }
-            TEXT { Repo } => TEXT { NovyWave repo ready }
+            WorkspaceB => TEXT { workspace_b ready }
+            Repo => TEXT { NovyWave repo ready }
             __ => TEXT { workspace_a ready }
         }
 
     load_files_dialog:
         LATEST {
-            TEXT { Closed }
-            elements.open_load_files_dialog.event.press |> THEN { TEXT { Open } }
-            elements.close_load_files_dialog.event.press |> THEN { TEXT { Closed } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { Closed } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { Closed } }
-            elements.load_default_file.event.press |> THEN { TEXT { Closed } }
-            elements.show_empty.event.press |> THEN { TEXT { Closed } }
-            elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { Closed } }
-            elements.open_workspace_dialog.event.press |> THEN { TEXT { Closed } }
+            Closed
+            elements.open_load_files_dialog.event.press |> THEN { Open }
+            elements.close_load_files_dialog.event.press |> THEN { Closed }
+            elements.external_file_loaded_name.text |> THEN { Closed }
+            elements.begin_default_file_load.event.press |> THEN { Closed }
+            elements.load_default_file.event.press |> THEN { Closed }
+            elements.show_empty.event.press |> THEN { Closed }
+            elements.select_counter_file.event.press |> THEN { Closed }
+            elements.select_uart_compare_file.event.press |> THEN { Closed }
+            elements.select_ghw_file.event.press |> THEN { Closed }
+            elements.open_workspace_dialog.event.press |> THEN { Closed }
         }
 
     panel_layout:
-        TEXT { Balanced } |> HOLD panel_layout {
+        Balanced |> HOLD panel_layout {
             LATEST {
-                elements.panels_files_wider.event.press |> THEN { TEXT { FilesWide } }
-                elements.panels_variables_wider.event.press |> THEN { TEXT { VariablesWide } }
-                elements.panels_reset.event.press |> THEN { TEXT { Balanced } }
+                elements.panels_files_wider.event.press |> THEN { FilesWide }
+                elements.panels_variables_wider.event.press |> THEN { VariablesWide }
+                elements.panels_reset.event.press |> THEN { Balanced }
                 elements.files_main_resize_drag.text |> THEN {
                     elements.files_main_resize_drag.text |> WHEN {
                         TEXT { Grow } => panel_layout |> WHEN {
-                            TEXT { VariablesWidest } => TEXT { VariablesWide }
-                            TEXT { VariablesWide } => TEXT { Balanced }
-                            TEXT { Balanced } => TEXT { FilesWide }
-                            TEXT { FilesWide } => TEXT { FilesWidest }
-                            __ => TEXT { FilesWidest }
+                            VariablesWidest => VariablesWide
+                            VariablesWide => Balanced
+                            Balanced => FilesWide
+                            FilesWide => FilesWidest
+                            __ => FilesWidest
                         }
                         TEXT { Shrink } => panel_layout |> WHEN {
-                            TEXT { FilesWidest } => TEXT { FilesWide }
-                            TEXT { FilesWide } => TEXT { Balanced }
-                            TEXT { Balanced } => TEXT { VariablesWide }
-                            TEXT { VariablesWide } => TEXT { VariablesWidest }
-                            __ => TEXT { VariablesWidest }
+                            FilesWidest => FilesWide
+                            FilesWide => Balanced
+                            Balanced => VariablesWide
+                            VariablesWide => VariablesWidest
+                            __ => VariablesWidest
                         }
                         __ => panel_layout
                     }
                 }
-                elements.show_empty.event.press |> THEN { TEXT { Balanced } }
-                elements.load_default_file.event.press |> THEN { TEXT { Balanced } }
+                elements.show_empty.event.press |> THEN { Balanced }
+                elements.load_default_file.event.press |> THEN { Balanced }
             }
         }
 
     panel_layout_label:
         panel_layout |> WHEN {
-            TEXT { FilesWidest } => TEXT { Files panel widest }
-            TEXT { FilesWide } => TEXT { Files panel wide }
-            TEXT { VariablesWidest } => TEXT { Variables panel widest }
-            TEXT { VariablesWide } => TEXT { Variables panel wide }
+            FilesWidest => TEXT { Files panel widest }
+            FilesWide => TEXT { Files panel wide }
+            VariablesWidest => TEXT { Variables panel widest }
+            VariablesWide => TEXT { Variables panel wide }
             __ => TEXT { Panels balanced }
         }
 
     panel_arrangement:
-        TEXT { Stacked } |> HOLD panel_arrangement {
+        Stacked |> HOLD panel_arrangement {
             LATEST {
                 elements.panels_toggle_arrangement.event.press |> THEN {
                     panel_arrangement |> WHEN {
-                        TEXT { Docked } => TEXT { Stacked }
-                        __ => TEXT { Docked }
+                        Docked => Stacked
+                        __ => Docked
                     }
                 }
-                elements.show_empty.event.press |> THEN { TEXT { Stacked } }
-                elements.load_default_file.event.press |> THEN { TEXT { Stacked } }
+                elements.show_empty.event.press |> THEN { Stacked }
+                elements.load_default_file.event.press |> THEN { Stacked }
             }
         }
 
     panel_arrangement_label:
         panel_arrangement |> WHEN {
-            TEXT { Docked } => TEXT { Docked panels }
+            Docked => TEXT { Docked panels }
             __ => TEXT { Stacked panels }
         }
 
     panel_arrangement_button_label:
         panel_arrangement |> WHEN {
-            TEXT { Docked } => TEXT { Stack }
+            Docked => TEXT { Stack }
             __ => TEXT { Dock }
         }
 
     files_panel_width:
         panel_layout |> WHEN {
-            TEXT { FilesWidest } => 650
-            TEXT { FilesWide } => 520
-            TEXT { VariablesWidest } => 260
-            TEXT { VariablesWide } => 340
+            FilesWidest => 650
+            FilesWide => 520
+            VariablesWidest => 260
+            VariablesWide => 340
             __ => 430
         }
 
     variables_panel_width:
         panel_layout |> WHEN {
-            TEXT { FilesWidest } => 300
-            TEXT { FilesWide } => 390
-            TEXT { VariablesWidest } => 650
-            TEXT { VariablesWide } => 570
+            FilesWidest => 300
+            FilesWide => 390
+            VariablesWidest => 650
+            VariablesWide => 570
             __ => 480
         }
 
     browser_panel_width:
         panel_layout |> WHEN {
-            TEXT { FilesWidest } => 650
-            TEXT { FilesWide } => 520
-            TEXT { VariablesWidest } => 260
-            TEXT { VariablesWide } => 340
+            FilesWidest => 650
+            FilesWide => 520
+            VariablesWidest => 260
+            VariablesWide => 340
             __ => 430
         }
 
     files_panel_height_key:
-        TEXT { Balanced } |> HOLD files_panel_height_key {
+        Balanced |> HOLD files_panel_height_key {
             LATEST {
-                elements.panels_reset.event.press |> THEN { TEXT { Balanced } }
+                elements.panels_reset.event.press |> THEN { Balanced }
                 elements.files_secondary_resize_drag.text |> THEN {
                     elements.files_secondary_resize_drag.text |> WHEN {
                         TEXT { Grow } => files_panel_height_key |> WHEN {
-                            TEXT { Short } => TEXT { Balanced }
-                            TEXT { Balanced } => TEXT { Tall }
-                            TEXT { Tall } => TEXT { Tallest }
-                            __ => TEXT { Tallest }
+                            Short => Balanced
+                            Balanced => Tall
+                            Tall => Tallest
+                            __ => Tallest
                         }
                         TEXT { Shrink } => files_panel_height_key |> WHEN {
-                            TEXT { Tallest } => TEXT { Tall }
-                            TEXT { Tall } => TEXT { Balanced }
-                            TEXT { Balanced } => TEXT { Short }
-                            __ => TEXT { Short }
+                            Tallest => Tall
+                            Tall => Balanced
+                            Balanced => Short
+                            __ => Short
                         }
                         __ => files_panel_height_key
                     }
                 }
-                elements.show_empty.event.press |> THEN { TEXT { Balanced } }
-                elements.load_default_file.event.press |> THEN { TEXT { Balanced } }
+                elements.show_empty.event.press |> THEN { Balanced }
+                elements.load_default_file.event.press |> THEN { Balanced }
             }
         }
 
     files_panel_height:
         files_panel_height_key |> WHEN {
-            TEXT { Short } => 284
-            TEXT { Tall } => 520
-            TEXT { Tallest } => 650
+            Short => 284
+            Tall => 520
+            Tallest => 650
             __ => 390
         }
 
     selected_name_column_width_key:
-        TEXT { Normal } |> HOLD selected_name_column_width_key {
+        Normal |> HOLD selected_name_column_width_key {
             LATEST {
                 elements.variables_name_resize_drag.text |> THEN {
                     elements.variables_name_resize_drag.text |> WHEN {
                         TEXT { Grow } => selected_name_column_width_key |> WHEN {
-                            TEXT { Compact } => TEXT { Normal }
-                            TEXT { Normal } => TEXT { Wide }
-                            TEXT { Wide } => TEXT { Widest }
-                            __ => TEXT { Widest }
+                            Compact => Normal
+                            Normal => Wide
+                            Wide => Widest
+                            __ => Widest
                         }
                         TEXT { Shrink } => selected_name_column_width_key |> WHEN {
-                            TEXT { Widest } => TEXT { Wide }
-                            TEXT { Wide } => TEXT { Normal }
-                            TEXT { Normal } => TEXT { Compact }
-                            __ => TEXT { Compact }
+                            Widest => Wide
+                            Wide => Normal
+                            Normal => Compact
+                            __ => Compact
                         }
                         __ => selected_name_column_width_key
                     }
                 }
-                elements.panels_reset.event.press |> THEN { TEXT { Normal } }
+                elements.panels_reset.event.press |> THEN { Normal }
             }
         }
 
     selected_name_column_width:
         selected_name_column_width_key |> WHEN {
-            TEXT { Compact } => 130
-            TEXT { Wide } => 250
-            TEXT { Widest } => 340
+            Compact => 130
+            Wide => 250
+            Widest => 340
             __ => 190
         }
 
     selected_value_column_width_key:
-        TEXT { Normal } |> HOLD selected_value_column_width_key {
+        Normal |> HOLD selected_value_column_width_key {
             LATEST {
                 elements.variables_value_resize_drag.text |> THEN {
                     elements.variables_value_resize_drag.text |> WHEN {
                         TEXT { Grow } => selected_value_column_width_key |> WHEN {
-                            TEXT { Compact } => TEXT { Normal }
-                            TEXT { Normal } => TEXT { Wide }
-                            TEXT { Wide } => TEXT { Widest }
-                            __ => TEXT { Widest }
+                            Compact => Normal
+                            Normal => Wide
+                            Wide => Widest
+                            __ => Widest
                         }
                         TEXT { Shrink } => selected_value_column_width_key |> WHEN {
-                            TEXT { Widest } => TEXT { Wide }
-                            TEXT { Wide } => TEXT { Normal }
-                            TEXT { Normal } => TEXT { Compact }
-                            __ => TEXT { Compact }
+                            Widest => Wide
+                            Wide => Normal
+                            Normal => Compact
+                            __ => Compact
                         }
                         __ => selected_value_column_width_key
                     }
                 }
-                elements.panels_reset.event.press |> THEN { TEXT { Normal } }
+                elements.panels_reset.event.press |> THEN { Normal }
             }
         }
 
     selected_value_column_width:
         selected_value_column_width_key |> WHEN {
-            TEXT { Compact } => 120
-            TEXT { Wide } => 300
-            TEXT { Widest } => 400
+            Compact => 120
+            Wide => 300
+            Widest => 400
             __ => 220
         }
 
+    startup_workspace_opened_files:
+        LIST {
+            [file: "simple.vcd", canonical_path: "~/repos/NovyWave/test_files/simple.vcd", family: "simple_vcd", selected_scope_key: "simple_tb_s", selected_scope_label: "simple_tb.s", primary_signal: "clk"]
+            [file: "wave_27.fst", canonical_path: "~/repos/NovyWave/test_files/wave_27.fst", family: "uart", selected_scope_key: "top_uart", selected_scope_label: "top.uart", primary_signal: "tx_data"]
+            [file: "simple_test.ghw", canonical_path: "~/repos/NovyWave/test_files/simple_test.ghw", family: "ghw", selected_scope_key: "ghw_simple", selected_scope_label: "ghw.simple", primary_signal: "ghw_counter"]
+        }
+
+    startup_selected_file:
+        TEXT { simple.vcd }
+
+    startup_selected_file_path:
+        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "canonical_path", fallback: TEXT { ~/repos/NovyWave/test_files/simple.vcd })
+
+    startup_selected_family:
+        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "family", fallback: TEXT { simple_vcd })
+
+    startup_selected_scope_key:
+        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "selected_scope_key", fallback: TEXT { simple_tb_s })
+
+    startup_selected_scope_label:
+        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "selected_scope_label", fallback: TEXT { simple_tb.s })
+
+    startup_primary_signal:
+        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "primary_signal", fallback: TEXT { clk })
+
+    startup_expanded_scopes:
+        LIST {
+            [file: TEXT { simple.vcd }, scope_key: TEXT { simple_tb_s }, scope_label: TEXT { simple_tb.s }]
+            [file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, scope_label: TEXT { ghw.simple }]
+        }
+
+    startup_file_tree_rows:
+        LIST {
+            [kind: FileTreeFile, file: TEXT { simple.vcd }, label: TEXT { - simple.vcd }, indent_width: 0, selected_file: TEXT { simple.vcd }, source_key: SelectCounterFile]
+            [kind: FileTreeScope, file: TEXT { simple.vcd }, scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18, source_key: SelectSimpleScope]
+            [kind: FileTreeSignals, file: TEXT { simple.vcd }, scope_key: TEXT { simple_tb_s }, label: TEXT { A[3:0] B[3:0] }, expanded_label: TEXT { A[3:0] B[3:0] }, collapsed_label: TEXT { collapsed }, indent_width: 38]
+            [kind: FileTreeFile, file: TEXT { wave_27.fst }, label: TEXT { - wave_27.fst }, indent_width: 0, selected_file: TEXT { wave_27.fst }, source_key: SelectUartCompareFile]
+            [kind: FileTreeScope, file: TEXT { wave_27.fst }, scope_key: TEXT { top_uart }, label: TEXT { + top.uart }, indent_width: 18, source_key: SelectUartScope]
+            [kind: FileTreeScope, file: TEXT { wave_27.fst }, scope_key: TEXT { top_analog }, label: TEXT { + top.analog }, indent_width: 18, source_key: SelectAnalogScope]
+            [kind: FileTreeFile, file: TEXT { simple_test.ghw }, label: TEXT { - simple_test.ghw }, indent_width: 0, selected_file: TEXT { simple_test.ghw }, source_key: SelectGhwFile]
+            [kind: FileTreeScope, file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, indent_width: 18, source_key: SelectGhwFile]
+            [kind: FileTreeSignals, file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, label: TEXT { ghw.counter[3:0] ghw.enable ghw.state }, indent_width: 38]
+        }
+
+    file_tree_rows:
+        startup_file_tree_rows
+
+    startup_selected_variable_config:
+        LIST {
+            [file: TEXT { simple.vcd }, unique_id: TEXT { ~/repos/NovyWave/test_files/simple.vcd|simple_tb.s|A[3:0] }, signal_id: TEXT { clk }, formatter: Hexadecimal, row_height: 28, group: TEXT { simple_tb.s group }]
+            [file: TEXT { simple.vcd }, unique_id: TEXT { ~/repos/NovyWave/test_files/simple.vcd|simple_tb.s|B[3:0] }, signal_id: TEXT { reset_n }, formatter: Hexadecimal, row_height: 28, group: TEXT { simple_tb.s group }]
+        }
+
+    startup_signal_group_config:
+        LIST {
+            [name: TEXT { simple_tb.s group }, member_ids: TEXT { clk, reset_n }, collapsed: False]
+        }
+
+    startup_timeline_config:
+        [
+            file: startup_selected_file
+            cursor: TEXT { 50 s }
+            visible_range: TEXT { 0 s - 250 s }
+            zoom_center: TEXT { 50 s }
+            tooltip_enabled: True
+        ]
+
+    startup_marker_config:
+        LIST {
+            [time: TEXT { 50 s }, name: TEXT { 50 s }]
+        }
+
+    startup_restore_summary:
+        TEXT { config restore: simple.vcd opened, simple_tb.s expanded, A[3:0]/B[3:0] selected, cursor 50 s }
+
     load_files_path:
-        TEXT { ~/repos/NovyWave/test_files/simple.vcd } |> HOLD load_files_path {
+        startup_selected_file_path |> HOLD load_files_path {
             LATEST {
                 elements.load_file_path_input.text |> THEN { elements.load_file_path_input.text }
                 elements.select_counter_file.event.press |> THEN { TEXT { ~/repos/NovyWave/test_files/simple.vcd } }
@@ -407,14 +483,14 @@ store: [
         }
 
     external_file_active:
-        TEXT { No } |> HOLD external_file_active {
+        No |> HOLD external_file_active {
             LATEST {
-                elements.external_file_loaded_name.text |> THEN { TEXT { Yes } }
-                elements.select_counter_file.event.press |> THEN { TEXT { No } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { No } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { No } }
-                elements.load_default_file.event.press |> THEN { TEXT { No } }
-                elements.show_empty.event.press |> THEN { TEXT { No } }
+                elements.external_file_loaded_name.text |> THEN { Yes }
+                elements.select_counter_file.event.press |> THEN { No }
+                elements.select_uart_compare_file.event.press |> THEN { No }
+                elements.select_ghw_file.event.press |> THEN { No }
+                elements.load_default_file.event.press |> THEN { No }
+                elements.show_empty.event.press |> THEN { No }
             }
         }
 
@@ -429,19 +505,19 @@ store: [
         }
 
     load_files_dialog_title:
-        load_files_dialog == TEXT { Open } |> WHEN {
+        load_files_dialog == Open |> WHEN {
             True => TEXT { Load files }
             False => TEXT { No file dialog }
         }
 
     load_files_dialog_hint:
-        load_files_dialog == TEXT { Open } |> WHEN {
+        load_files_dialog == Open |> WHEN {
             True => TEXT { Enter a local VCD, FST, or GHW path. The native host validates the file and sends pure metadata to Boon. }
             False => TEXT { File dialog closed }
         }
 
     load_files_dialog_selection:
-        load_files_dialog == TEXT { Open } |> WHEN {
+        load_files_dialog == Open |> WHEN {
             True => external_file_error |> Text/is_empty() |> WHEN {
                 True => TEXT { Path: } |> Text/concat(with: load_files_path, separator: " ")
                 False => external_file_error
@@ -451,11 +527,11 @@ store: [
 
     waveform_status:
         LATEST {
-            TEXT { Loaded }
-            elements.show_empty.event.press |> THEN { TEXT { Empty } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { Loading } }
-            elements.load_default_file.event.press |> THEN { TEXT { Loaded } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { Loaded } }
+            Loaded
+            elements.show_empty.event.press |> THEN { Empty }
+            elements.begin_default_file_load.event.press |> THEN { Loading }
+            elements.load_default_file.event.press |> THEN { Loaded }
+            elements.external_file_loaded_name.text |> THEN { Loaded }
         }
 
     empty_state_title: TEXT { No waveform loaded }
@@ -473,15 +549,189 @@ store: [
     reference_descriptor: NovyReference/reference_descriptor()
 
     active_file:
-        LATEST {
-            TEXT { simple.vcd }
+        startup_selected_file |> HOLD active_file {
+            LATEST {
             elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd } }
-            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.scope_uart.event.press |> THEN { TEXT { wave_27.fst } }
+            elements.scope_analog.event.press |> THEN { TEXT { wave_27.fst } }
+            elements.begin_default_file_load.event.press |> THEN { store.startup_selected_file }
+            elements.load_default_file.event.press |> THEN { store.startup_selected_file }
             elements.external_file_loaded_name.text
             elements.show_empty.event.press |> THEN { TEXT { none } }
+            }
+        }
+
+    waveform_file_metadata:
+        LIST {
+            [file: "simple.vcd", format: "VCD", digest: "sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de", waveform_ref: "wave:vcd:simple:0-250s", full_range: "0 s - 250 s", initial_window: "0 s - 250 s", range_start: 0, range_end: 250, initial_start: 0, initial_end: 250, canvas_width: 360, cursor_left: 0, cursor_default: 50, cursor_right: 150, tick_0: 0, tick_1: 50, tick_2: 100, tick_3: 150, tick_4: 250, stats: "VCD 2 signals, 0-250s, bounded pages", large_file_contract: "simple.vcd 311B -> bounded page requests only", hierarchy_page: "HIER:simple_tb/s", hierarchy_cursor: "hierarchy cursor simple_tb.s:0..64 next=none", materialization_bound: "visible rows 2/2, waveform segments 6/256 max", time_unit: "s", timescale: "1 s/native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "wave_27.fst", format: "FST", digest: "sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172", waveform_ref: "wave:fst:wave-27:0-240ns", full_range: "0 ns - 240 ns", initial_window: "0 ns - 120 ns", range_start: 0, range_end: 240, initial_start: 0, initial_end: 120, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, tick_0: 0, tick_1: 40, tick_2: 80, tick_3: 120, tick_4: 160, stats: "FST 5 signals, 0-240ns, bounded pages", large_file_contract: "wave_27.fst 28860652B -> bounded compare page only", hierarchy_page: "HIER:top.uart compare page", hierarchy_cursor: "hierarchy cursor top.uart:0..64 next=none", materialization_bound: "visible rows 4/5, waveform segments 28/256 max", time_unit: "ns", timescale: "inferred FST native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "simple_test.ghw", format: "GHW", digest: "sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491", waveform_ref: "wave:ghw:simple-test:0-100ns", full_range: "0 ns - 100 ns", initial_window: "0 ns - 100 ns", range_start: 0, range_end: 100, initial_start: 0, initial_end: 100, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, tick_0: 0, tick_1: 25, tick_2: 50, tick_3: 75, tick_4: 100, stats: "GHW 4 signals, 0-100ns, bounded pages", large_file_contract: "simple_test.ghw 833B -> bounded page requests only", hierarchy_page: "HIER:ghw.simple/counter", hierarchy_cursor: "hierarchy cursor ghw.simple:0..64 next=none", materialization_bound: "visible rows 3/4, waveform segments 20/256 max", time_unit: "ns", timescale: "GHW native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, tick_0: 0, tick_1: 0, tick_2: 0, tick_3: 0, tick_4: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
+        }
+
+    viewport_window_records:
+        LIST {
+            [window_key: "simple.vcd|Fit|Center", start: 0, end: 250]
+            [window_key: "simple.vcd|Close|Center", start: 0, end: 150]
+            [window_key: "simple.vcd|Closer|Center", start: 40, end: 80]
+            [window_key: "simple.vcd|Closest|Center", start: 50, end: 60]
+            [window_key: "simple.vcd|Wide|Center", start: 0, end: 250]
+            [window_key: "simple.vcd|Widest|Center", start: 0, end: 250]
+            [window_key: "simple.vcd|Fit|LeftWindow", start: 0, end: 150]
+            [window_key: "simple.vcd|Fit|RightWindow", start: 50, end: 250]
+            [window_key: "simple.vcd|Close|LeftWindow", start: 0, end: 50]
+            [window_key: "simple.vcd|Close|RightWindow", start: 50, end: 150]
+            [window_key: "wave_27.fst|Fit|Center", start: 0, end: 120]
+            [window_key: "wave_27.fst|Close|Center", start: 36, end: 60]
+            [window_key: "wave_27.fst|Closer|Center", start: 40, end: 52]
+            [window_key: "wave_27.fst|Closest|Center", start: 42, end: 48]
+            [window_key: "wave_27.fst|Wide|Center", start: 0, end: 240]
+            [window_key: "wave_27.fst|Widest|Center", start: 0, end: 240]
+            [window_key: "wave_27.fst|Fit|LeftWindow", start: 0, end: 80]
+            [window_key: "wave_27.fst|Fit|RightWindow", start: 80, end: 160]
+            [window_key: "wave_27.fst|Close|LeftWindow", start: 24, end: 48]
+            [window_key: "wave_27.fst|Close|RightWindow", start: 48, end: 72]
+            [window_key: "wave_27.fst|Closer|LeftWindow", start: 30, end: 42]
+            [window_key: "wave_27.fst|Closer|RightWindow", start: 42, end: 54]
+            [window_key: "wave_27.fst|Closest|LeftWindow", start: 36, end: 42]
+            [window_key: "wave_27.fst|Closest|RightWindow", start: 44, end: 50]
+            [window_key: "wave_27.fst|Wide|LeftWindow", start: 0, end: 180]
+            [window_key: "wave_27.fst|Wide|RightWindow", start: 60, end: 240]
+            [window_key: "wave_27.fst|Widest|LeftWindow", start: 0, end: 240]
+            [window_key: "wave_27.fst|Widest|RightWindow", start: 0, end: 240]
+            [window_key: "simple_test.ghw|Fit|Center", start: 0, end: 100]
+            [window_key: "simple_test.ghw|Close|Center", start: 30, end: 60]
+            [window_key: "simple_test.ghw|Closer|Center", start: 36, end: 52]
+            [window_key: "simple_test.ghw|Closest|Center", start: 42, end: 48]
+            [window_key: "simple_test.ghw|Wide|Center", start: 0, end: 100]
+            [window_key: "simple_test.ghw|Widest|Center", start: 0, end: 100]
+        }
+
+    active_metadata_file:
+        active_file
+
+    active_metadata_format:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "format", fallback: TEXT { none })
+
+    active_metadata_digest:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "digest", fallback: TEXT { sha256:none })
+
+    active_metadata_waveform_ref:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "waveform_ref", fallback: TEXT { wave:none })
+
+    active_metadata_full_range:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "full_range", fallback: TEXT { no waveform range })
+
+    active_metadata_initial_window:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_window", fallback: TEXT { no request window })
+
+    active_metadata_range_start:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_start", fallback: 0)
+        |> Text/to_number()
+
+    active_metadata_range_end:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_end", fallback: 0)
+        |> Text/to_number()
+
+    active_metadata_initial_start:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_start", fallback: 0)
+        |> Text/to_number()
+
+    active_metadata_initial_end:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_end", fallback: 0)
+        |> Text/to_number()
+
+    active_metadata_canvas_width:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "canvas_width", fallback: 360)
+        |> Text/to_number()
+
+    active_metadata_stats:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "stats", fallback: TEXT { no waveform stats })
+
+    active_metadata_large_file_contract:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "large_file_contract", fallback: TEXT { no large file materialized })
+
+    active_metadata_hierarchy_page:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "hierarchy_page", fallback: TEXT { HIER:none })
+
+    active_metadata_hierarchy_cursor:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "hierarchy_cursor", fallback: TEXT { hierarchy cursor none })
+
+    active_metadata_materialization_bound:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "materialization_bound", fallback: TEXT { visible rows 0/0, waveform segments 0/256 max })
+
+    active_metadata_time_unit:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "time_unit", fallback: TEXT { none })
+
+    active_metadata_timescale:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "timescale", fallback: TEXT { no timescale })
+
+    active_metadata_range_source:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_source", fallback: NoFile)
+
+    active_metadata_source:
+        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "metadata_source", fallback: NoFile)
+
+    external_loaded_metadata_format:
+        elements.external_file_loaded_format.text
+
+    external_loaded_metadata_digest:
+        elements.external_file_loaded_digest.text
+
+    external_loaded_metadata_waveform_ref:
+        elements.external_file_loaded_waveform_ref.text
+
+    external_loaded_metadata_stats:
+        elements.external_file_loaded_stats.text
+
+    external_loaded_metadata_large_file_contract:
+        elements.external_file_loaded_contract.text
+
+    effective_metadata_format:
+        active_file |> WHEN {
+            TEXT { none } => active_metadata_format
+            __ => external_file_active == Yes |> WHEN {
+                True => external_loaded_metadata_format
+                False => active_metadata_format
+            }
+        }
+
+    effective_metadata_digest:
+        active_file |> WHEN {
+            TEXT { none } => active_metadata_digest
+            __ => external_file_active == Yes |> WHEN {
+                True => external_loaded_metadata_digest
+                False => active_metadata_digest
+            }
+        }
+
+    effective_metadata_waveform_ref:
+        active_file |> WHEN {
+            TEXT { none } => active_metadata_waveform_ref
+            __ => external_file_active == Yes |> WHEN {
+                True => external_loaded_metadata_waveform_ref
+                False => active_metadata_waveform_ref
+            }
+        }
+
+    effective_metadata_stats:
+        active_file |> WHEN {
+            TEXT { none } => active_metadata_stats
+            __ => external_file_active == Yes |> WHEN {
+                True => external_loaded_metadata_stats
+                False => active_metadata_stats
+            }
+        }
+
+    effective_metadata_large_file_contract:
+        active_file |> WHEN {
+            TEXT { none } => active_metadata_large_file_contract
+            __ => external_file_active == Yes |> WHEN {
+                True => external_loaded_metadata_large_file_contract
+                False => active_metadata_large_file_contract
+            }
         }
 
     compare_file:
@@ -522,55 +772,30 @@ store: [
         ]
 
     bridge_file_format:
-        LATEST {
-            TEXT { VCD }
-            elements.select_counter_file.event.press |> THEN { TEXT { VCD } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { VCD } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { VCD } }
-            elements.load_default_file.event.press |> THEN { TEXT { VCD } }
-            elements.external_file_loaded_format.text
-            elements.show_empty.event.press |> THEN { TEXT { none } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { VCD }
+            False => effective_metadata_format
         }
 
     bridge_file_digest:
-        LATEST {
-            TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de }
-            elements.select_counter_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172 } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491 } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { sha256:78e6f482fe39dd5ae04a7162d27f513d6a57be6e9d1a948b916167459bead01e } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
-            elements.load_default_file.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
-            elements.external_file_loaded_digest.text
-            elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { sha256:78e6f482fe39dd5ae04a7162d27f513d6a57be6e9d1a948b916167459bead01e }
+            False => effective_metadata_digest
         }
 
     bridge_waveform_ref:
-        LATEST {
-            TEXT { wave:vcd:simple:0-240ns }
-            elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:wave-27:0-240ns } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { diagnostic:unsupported-corrupted-vcd } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { wave:opening:simple } }
-            elements.load_default_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
-            elements.external_file_loaded_waveform_ref.text
-            elements.show_empty.event.press |> THEN { TEXT { wave:none } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { diagnostic:unsupported-corrupted-vcd }
+            False => waveform_status == Loading |> WHEN {
+                True => TEXT { wave:opening:simple }
+                False => effective_metadata_waveform_ref
+            }
         }
 
     bridge_descriptor_file:
-        LATEST {
-            TEXT { simple.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd } }
-            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd } }
-            elements.external_file_loaded_name.text
-            elements.show_empty.event.press |> THEN { TEXT { none } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { corrupted.vcd }
+            False => active_file
         }
 
     bridge_open_status:
@@ -587,57 +812,49 @@ store: [
         }
 
     bridge_open_summary:
-        LATEST {
-            TEXT { opened VCD wave:vcd:simple:0-240ns }
-            elements.select_counter_file.event.press |> THEN { TEXT { opened VCD wave:vcd:simple:0-240ns } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { opened FST wave:fst:wave-27:0-240ns } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { opened GHW wave:ghw:simple-test:0-100ns } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported waveform file: corrupted.vcd } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { opening VCD simple.vcd } }
-            elements.load_default_file.event.press |> THEN { TEXT { opened VCD wave:vcd:simple:0-240ns } }
-            elements.external_file_loaded_name.text |> THEN {
-                TEXT { local file } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { unsupported waveform file: corrupted.vcd }
+            False => waveform_status |> WHEN {
+                Empty => TEXT { no file loaded }
+                Loading => TEXT { opening VCD simple.vcd }
+                __ => external_file_active == Yes |> WHEN {
+                    True => TEXT { local file } |> Text/concat(with: active_file, separator: " ")
+                    False => TEXT { opened } |> Text/concat(with: bridge_file_format, separator: " ") |> Text/concat(with: bridge_waveform_ref, separator: " ")
+                }
             }
-            elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
 
     bridge_hierarchy_page_label:
-        LATEST {
-            TEXT { HIER:top.cpu/top.uart/top.analog }
-            elements.select_counter_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { HIER:none } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { HIER:opening } }
-            elements.load_default_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { HIER:local file metadata } }
-            elements.show_empty.event.press |> THEN { TEXT { HIER:none } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { HIER:none }
+            False => waveform_status |> WHEN {
+                Empty => TEXT { HIER:none }
+                Loading => TEXT { HIER:opening }
+                __ => external_file_active == Yes |> WHEN {
+                    True => TEXT { HIER:local file metadata }
+                    False => active_metadata_hierarchy_page
+                }
+            }
         }
 
     bridge_file_stats_label:
-        LATEST {
-            TEXT { VCD 15 signals, 0-240ns, bounded pages }
-            elements.select_counter_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { no waveform stats } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { loading waveform stats } }
-            elements.load_default_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
-            elements.external_file_loaded_stats.text
-            elements.show_empty.event.press |> THEN { TEXT { no waveform stats } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { no waveform stats }
+            False => waveform_status |> WHEN {
+                Empty => TEXT { no waveform stats }
+                Loading => TEXT { loading waveform stats }
+                __ => effective_metadata_stats
+            }
         }
 
     bridge_large_file_contract:
-        LATEST {
-            TEXT { simple.vcd 311B -> bounded page requests only }
-            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd 311B -> bounded page requests only } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded compare page only } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd 25B -> diagnostic only } }
-            elements.show_empty.event.press |> THEN { TEXT { no large file materialized } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd pending -> no page materialized } }
-            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd 311B -> bounded page requests only } }
-            elements.external_file_loaded_contract.text
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { corrupted.vcd 25B -> diagnostic only }
+            False => waveform_status |> WHEN {
+                Empty => TEXT { no large file materialized }
+                Loading => TEXT { simple.vcd pending -> no page materialized }
+                __ => effective_metadata_large_file_contract
+            }
         }
 
     bridge_payload_limit_bytes: 65536
@@ -646,32 +863,35 @@ store: [
     bridge_segment_limit: 256
 
     bridge_page_window_label:
-        NovyModel/page_window_label(window: bridge_request_window_label)
+        bridge_request_window_label == TEXT { no request window } |> WHEN {
+            True => TEXT { no page window scheduled }
+            False =>
+                TEXT { window }
+                |> Text/concat(with: bridge_request_window_label, separator: " ")
+                |> Text/concat(with: bridge_transition_limit, separator: ", max ")
+                |> Text/concat(with: TEXT { transitions, payload <= 64KiB }, separator: " ")
+        }
 
     bridge_hierarchy_page_cursor_label:
-        LATEST {
-            TEXT { hierarchy cursor root:0..64 next=top.cpu }
-            elements.select_counter_file.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { hierarchy cursor top.uart:0..64 next=none } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { hierarchy cursor none } }
-            elements.show_empty.event.press |> THEN { TEXT { hierarchy cursor none } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { hierarchy cursor opening } }
-            elements.load_default_file.event.press |> THEN { TEXT { hierarchy cursor root:0..64 next=top.cpu } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { hierarchy cursor root:0..64 next=local } }
+        diagnostic_state == Unsupported |> WHEN {
+            True => TEXT { hierarchy cursor none }
+            False => waveform_status |> WHEN {
+                Empty => TEXT { hierarchy cursor none }
+                Loading => TEXT { hierarchy cursor opening }
+                __ => external_file_active == Yes |> WHEN {
+                    True => TEXT { hierarchy cursor root:0..64 next=local }
+                    False => active_metadata_hierarchy_cursor
+                }
+            }
         }
 
     bridge_materialization_bound_label:
-        LATEST {
-            TEXT { visible rows 8/15, waveform segments 64/256 max }
-            elements.select_counter_file.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { visible rows 4/5, waveform segments 28/256 max } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
-            elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 7/15, waveform segments 56/256 max } }
-            elements.show_empty.event.press |> THEN { TEXT { visible rows 0/0, waveform segments 0/256 max } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { visible rows 0/15, waveform segments 0/256 max } }
-            elements.load_default_file.event.press |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { visible rows 8/15, waveform segments 64/256 max } }
+        selected_rows_removed_signal_id == TEXT { reset_n } |> WHEN {
+            True => TEXT { visible rows 1/2, waveform segments 3/256 max }
+            False => waveform_status == Loading |> WHEN {
+                True => TEXT { visible rows 0/2, waveform segments 0/256 max }
+                False => active_metadata_materialization_bound
+            }
         }
 
     bridge_payload_bound_label:
@@ -706,23 +926,23 @@ store: [
         }
 
     file_status_detail:
-        diagnostic_state == TEXT { Unsupported } |> WHEN {
+        diagnostic_state == Unsupported |> WHEN {
             True => diagnostic_label
             False => compare_result_label
         }
 
     diagnostic_state:
         LATEST {
-            TEXT { OK }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { Unsupported } }
-            elements.select_counter_file.event.press |> THEN { TEXT { OK } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { OK } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { Loading } }
-            elements.load_default_file.event.press |> THEN { TEXT { OK } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { OK } }
-            elements.external_file_load_error.text |> THEN { TEXT { Unsupported } }
-            elements.show_empty.event.press |> THEN { TEXT { Idle } }
+            OK
+            elements.diagnostic_probe.event.press |> THEN { Unsupported }
+            elements.select_counter_file.event.press |> THEN { OK }
+            elements.select_uart_compare_file.event.press |> THEN { OK }
+            elements.select_ghw_file.event.press |> THEN { OK }
+            elements.begin_default_file_load.event.press |> THEN { Loading }
+            elements.load_default_file.event.press |> THEN { OK }
+            elements.external_file_loaded_name.text |> THEN { OK }
+            elements.external_file_load_error.text |> THEN { Unsupported }
+            elements.show_empty.event.press |> THEN { Idle }
         }
 
     diagnostic_label:
@@ -769,22 +989,23 @@ store: [
         }
 
     active_scope:
-        LATEST {
-            TEXT { top_cpu }
-            elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { top_cpu } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { top_cpu } }
+        startup_selected_scope_key |> HOLD active_scope {
+            LATEST {
+            elements.scope_cpu.event.press |> THEN { TEXT { simple_tb_s } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_tb_s } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_tb_s } }
             elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top_analog } }
-            elements.select_counter_file.event.press |> THEN { TEXT { top_cpu } }
+            elements.select_counter_file.event.press |> THEN { store.startup_selected_scope_key }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { top_uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_simple } }
-            elements.load_default_file.event.press |> THEN { TEXT { top_cpu } }
+            elements.load_default_file.event.press |> THEN { store.startup_selected_scope_key }
             elements.show_empty.event.press |> THEN { TEXT { none } }
+            }
         }
 
     active_signal:
-        TEXT { clk } |> HOLD active_signal {
+        startup_primary_signal |> HOLD active_signal {
             LATEST {
             signal_catalog
                 |> List/map(signal_catalog_item, new: LATEST {
@@ -804,21 +1025,15 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { clk } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter } }
-            elements.load_default_file.event.press |> THEN { TEXT { clk } }
+            elements.load_default_file.event.press |> THEN { store.startup_primary_signal }
             elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
 
     signal_catalog:
         LIST {
-            [key: TEXT { clk }, scope: TEXT { top.cpu }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { clock }]
-            [key: TEXT { reset_n }, scope: TEXT { top.cpu }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { reset }]
-            [key: TEXT { data_bus }, scope: TEXT { top.cpu }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { data }]
-            [key: TEXT { data_valid }, scope: TEXT { top.cpu }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { data }]
-            [key: TEXT { data_ready }, scope: TEXT { top.cpu }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { data }]
-            [key: TEXT { data_parity }, scope: TEXT { top.cpu }, name: TEXT { data_parity }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { data }]
-            [key: TEXT { state }, scope: TEXT { top.cpu }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, bit_width: TEXT { 3-bit }, direction: TEXT { State }, family: TEXT { state }]
-            [key: TEXT { error_count }, scope: TEXT { top.cpu }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, bit_width: TEXT { 16-bit }, direction: TEXT { Counter }, family: TEXT { state }]
+            [key: TEXT { clk }, scope: TEXT { simple_tb.s }, name: TEXT { A[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }]
+            [key: TEXT { reset_n }, scope: TEXT { simple_tb.s }, name: TEXT { B[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }]
             [key: TEXT { tx_data }, scope: TEXT { top.uart }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { uart }]
             [key: TEXT { rx_data }, scope: TEXT { top.uart }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }, family: TEXT { uart }]
             [key: TEXT { baud_tick }, scope: TEXT { top.uart }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { uart }]
@@ -845,175 +1060,182 @@ store: [
         |> List/latest()
 
     selected_signal_family:
-        LATEST {
-            TEXT { counter }
-            elements.select_counter_file.event.press |> THEN { TEXT { counter } }
+        startup_selected_family |> HOLD selected_signal_family {
+            LATEST {
+            elements.select_counter_file.event.press |> THEN { TEXT { simple_vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw } }
-            elements.load_default_file.event.press |> THEN { TEXT { counter } }
-            elements.show_empty.event.press |> THEN { TEXT { counter } }
+            elements.scope_cpu.event.press |> THEN { TEXT { simple_vcd } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_vcd } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_vcd } }
+            elements.scope_uart.event.press |> THEN { TEXT { uart } }
+            elements.scope_analog.event.press |> THEN { TEXT { analog } }
+            elements.load_default_file.event.press |> THEN { store.startup_selected_family }
+            elements.show_empty.event.press |> THEN { store.startup_selected_family }
+            }
         }
 
     selected_signal_defaults:
         LIST {
-            [family: TEXT { counter }, id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { data_valid }, name: TEXT { data_valid }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { data_ready }, name: TEXT { data_ready }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { state }, name: TEXT { state[2:0] }, current_value: TEXT { Run }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { error_count }, name: TEXT { error_count[15:0] }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { counter }, id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog, enabled: TEXT { loaded }]
-            [family: TEXT { uart }, id: TEXT { tx_data }, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { uart }, id: TEXT { rx_data }, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { uart }, id: TEXT { baud_tick }, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { uart }, id: TEXT { uart_busy }, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { ghw }, id: TEXT { ghw_counter }, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { ghw }, id: TEXT { ghw_enable }, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }]
-            [family: TEXT { ghw }, id: TEXT { ghw_state }, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }]
+            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { group_core_bus }, name: TEXT { simple_tb.s group }, current_value: TEXT { A[3:0], B[3:0] }, kind: GroupHeader, enabled: TEXT { loaded }, item_kind: GroupHeader, grouped: False, hidden_when_group: None, member_count_label: TEXT { 2 }, row_count_label: TEXT { 2 grouped signals }, divider_height_after: 0]
+            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { clk }, remove_kind: RemoveClk, name: TEXT { A[3:0] }, current_value: TEXT { 0xc }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { reset_n }, remove_kind: RemoveReset, name: TEXT { B[3:0] }, current_value: TEXT { 0x5 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { tx_data }, remove_kind: RemoveTxData, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { rx_data }, remove_kind: RemoveRxData, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { baud_tick }, remove_kind: RemoveBaudTick, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { uart_busy }, remove_kind: RemoveUartBusy, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_counter }, remove_kind: RemoveGhwCounter, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_enable }, remove_kind: RemoveGhwEnable, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_state }, remove_kind: RemoveGhwState, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
         }
 
-    selected_waveform_segments:
+    startup_waveform_transition_records:
         LIST {
-            [signal_id: TEXT { clk }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { clk }, width: 28, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { reset_n }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { reset_n }, width: 84, state: Low, label: TEXT { reset }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { reset_n }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { reset_n }, width: 252, state: High, label: TEXT { released }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { data_bus }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_bus }, width: 56, state: Unknown, label: TEXT { XX }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_bus }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_bus }, width: 56, state: High, label: TEXT { 0x12 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { data_bus }, width: 56, state: Low, label: TEXT { 0x00 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_bus }, width: 84, state: High, label: TEXT { 0x2a }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { data_bus }, width: 84, state: Low, label: TEXT { 0x08 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_valid }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_valid }, width: 96, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_valid }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_valid }, width: 160, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { data_valid }, width: 80, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_ready }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_ready }, width: 48, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { data_ready }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { data_ready }, width: 144, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { data_ready }, width: 144, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { state }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { state }, width: 72, state: Unknown, label: TEXT { IDLE }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { state }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { state }, width: 128, state: High, label: TEXT { RUN }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { state }, width: 136, state: Low, label: TEXT { WAIT }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { error_count }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { error_count }, width: 188, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { error_count }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { error_count }, width: 56, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { error_count }, width: 92, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { temperature }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 39 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 41 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogLow, label: TEXT { 40 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 42 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { temperature }, width: 42, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { tx_data }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { tx_data }, width: 48, state: Unknown, label: TEXT { idle }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { tx_data }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { tx_data }, width: 88, state: High, label: TEXT { 0x55 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { tx_data }, width: 72, state: Low, label: TEXT { gap }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { tx_data }, width: 104, state: High, label: TEXT { 0xa5 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { rx_data }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { rx_data }, width: 64, state: Low, label: TEXT { start }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { rx_data }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { rx_data }, width: 96, state: High, label: TEXT { 0xaa }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { rx_data }, width: 72, state: Low, label: TEXT { stop }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { rx_data }, width: 80, state: High, label: TEXT { idle }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { baud_tick }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { baud_tick }, width: 44, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { baud_tick }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { baud_tick }, width: 78, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { baud_tick }, width: 22, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { baud_tick }, width: 120, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { uart_busy }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { uart_busy }, width: 86, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { uart_busy }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { uart_busy }, width: 156, state: High, label: TEXT { busy }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { uart_busy }, width: 92, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 64, state: Unknown, label: TEXT { init }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 70, state: High, label: TEXT { 2 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { ghw_counter }, width: 98, state: High, label: TEXT { 3 }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { ghw_enable }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_enable }, width: 72, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { ghw_enable }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_enable }, width: 216, state: High, label: TEXT { enable }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { ghw_state }, width: 0, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_state }, width: 72, state: Unknown, label: TEXT { Reset }, click_time: TEXT { 36 ns }]
-            [signal_id: TEXT { ghw_state }, width: 0, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
-            [signal_id: TEXT { ghw_state }, width: 184, state: High, label: TEXT { Count }, click_time: TEXT { 48 ns }]
-            [signal_id: TEXT { ghw_state }, width: 72, state: Low, label: TEXT { Hold }, click_time: TEXT { 36 ns }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, name: TEXT { A[3:0] }, start_time: TEXT { 0 s }, end_time: TEXT { 50 s }, value: TEXT { 0xa }, state: High]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, name: TEXT { A[3:0] }, start_time: TEXT { 50 s }, end_time: TEXT { 150 s }, value: TEXT { 0xc }, state: High]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, name: TEXT { A[3:0] }, start_time: TEXT { 150 s }, end_time: TEXT { 250 s }, value: TEXT { 0x0 }, state: Low]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, name: TEXT { B[3:0] }, start_time: TEXT { 0 s }, end_time: TEXT { 50 s }, value: TEXT { 0x3 }, state: High]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, name: TEXT { B[3:0] }, start_time: TEXT { 50 s }, end_time: TEXT { 150 s }, value: TEXT { 0x5 }, state: High]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, name: TEXT { B[3:0] }, start_time: TEXT { 150 s }, end_time: TEXT { 250 s }, value: TEXT { 0x0 }, state: Low]
         }
-        |> List/map(segment, new: new_waveform_segment(segment: segment, store: store))
 
-    active_waveform_segment_labels:
-        selected_waveform_segments
-        |> List/filter_field_equal(field: "signal_id", value: active_signal)
-        |> List/join_field(field: "label", separator: ",", empty: "none")
+    startup_waveform_transition_summary:
+        TEXT { simple.vcd transitions: A[3:0] 0-50=0xa,50-150=0xc,150-250=0x0; B[3:0] 0-50=0x3,50-150=0x5,150-250=0x0 }
 
-    active_waveform_segment_count:
-        selected_waveform_segments
-        |> List/filter_field_equal(field: "signal_id", value: active_signal)
-        |> List/length()
+    startup_waveform_projection_summary:
+        TEXT { projection from startup timeline metadata: segment widths derive from start/end/window/canvas at runtime }
+
+    waveform_segment_records:
+        LIST {
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 50, end_time_value: 50, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 0, end_time_value: 50, state: High, label: TEXT { 0xa }, click_time: TEXT { 0 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 50, end_time_value: 50, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 50, end_time_value: 150, state: High, label: TEXT { 0xc }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 150, end_time_value: 250, state: Low, label: TEXT { 0x0 }, click_time: TEXT { 150 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, start_time_value: 50, end_time_value: 50, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, start_time_value: 0, end_time_value: 50, state: High, label: TEXT { 0x3 }, click_time: TEXT { 0 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, start_time_value: 50, end_time_value: 50, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, start_time_value: 50, end_time_value: 150, state: High, label: TEXT { 0x5 }, click_time: TEXT { 50 s }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { reset_n }, start_time_value: 150, end_time_value: 250, state: Low, label: TEXT { 0x0 }, click_time: TEXT { 150 s }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 0, end_time_value: 19, state: Unknown, label: TEXT { XX }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 19, end_time_value: 38, state: High, label: TEXT { 0x12 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 38, end_time_value: 57, state: Low, label: TEXT { 0x00 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 57, end_time_value: 85, state: High, label: TEXT { 0x2a }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_bus }, start_time_value: 85, end_time_value: 113, state: Low, label: TEXT { 0x08 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_valid }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_valid }, start_time_value: 0, end_time_value: 32, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_valid }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_valid }, start_time_value: 32, end_time_value: 85, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_valid }, start_time_value: 85, end_time_value: 112, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_ready }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_ready }, start_time_value: 0, end_time_value: 16, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_ready }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_ready }, start_time_value: 16, end_time_value: 64, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { data_ready }, start_time_value: 64, end_time_value: 112, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { state }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { state }, start_time_value: 0, end_time_value: 24, state: Unknown, label: TEXT { IDLE }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { state }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { state }, start_time_value: 24, end_time_value: 67, state: High, label: TEXT { RUN }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { state }, start_time_value: 67, end_time_value: 112, state: Low, label: TEXT { WAIT }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { error_count }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { error_count }, start_time_value: 0, end_time_value: 63, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { error_count }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { error_count }, start_time_value: 63, end_time_value: 82, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { error_count }, start_time_value: 82, end_time_value: 113, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 0, end_time_value: 13, state: AnalogLow, label: TEXT { 39 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 13, end_time_value: 26, state: AnalogMid, label: TEXT { 41 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 26, end_time_value: 39, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 39, end_time_value: 52, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 52, end_time_value: 65, state: AnalogLow, label: TEXT { 40 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 65, end_time_value: 78, state: AnalogMid, label: TEXT { 42 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 78, end_time_value: 91, state: AnalogHigh, label: TEXT { 44 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { temperature }, start_time_value: 91, end_time_value: 104, state: AnalogMid, label: TEXT { 43 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 0, end_time_value: 16, state: Unknown, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 16, end_time_value: 45, state: High, label: TEXT { 0x55 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 45, end_time_value: 69, state: Low, label: TEXT { gap }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { tx_data }, start_time_value: 69, end_time_value: 104, state: High, label: TEXT { 0xa5 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 0, end_time_value: 21, state: Low, label: TEXT { start }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 21, end_time_value: 53, state: High, label: TEXT { 0xaa }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 53, end_time_value: 77, state: Low, label: TEXT { stop }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { rx_data }, start_time_value: 77, end_time_value: 104, state: High, label: TEXT { idle }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 0, end_time_value: 15, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 15, end_time_value: 22, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 22, end_time_value: 48, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 48, end_time_value: 55, state: High, label: TEXT { tick }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { baud_tick }, start_time_value: 55, end_time_value: 95, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { uart_busy }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { uart_busy }, start_time_value: 0, end_time_value: 29, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { uart_busy }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { uart_busy }, start_time_value: 29, end_time_value: 81, state: High, label: TEXT { busy }, click_time: TEXT { 48 ns }]
+            [file: TEXT { wave_27.fst }, signal_id: TEXT { uart_busy }, start_time_value: 81, end_time_value: 112, state: Low, label: TEXT { idle }, click_time: TEXT { 36 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 0, end_time_value: 18, state: Unknown, label: TEXT { init }, click_time: TEXT { 36 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 18, end_time_value: 38, state: High, label: TEXT { 1 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 38, end_time_value: 58, state: High, label: TEXT { 2 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_counter }, start_time_value: 58, end_time_value: 85, state: High, label: TEXT { 3 }, click_time: TEXT { 48 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_enable }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_enable }, start_time_value: 0, end_time_value: 20, state: Low, label: TEXT { 0 }, click_time: TEXT { 36 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_enable }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_enable }, start_time_value: 20, end_time_value: 80, state: High, label: TEXT { enable }, click_time: TEXT { 48 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_state }, start_time_value: 42, end_time_value: 42, state: CursorLine, label: TEXT { cursor }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_state }, start_time_value: 0, end_time_value: 20, state: Unknown, label: TEXT { Reset }, click_time: TEXT { 36 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_state }, start_time_value: 42, end_time_value: 42, state: MarkerLine, label: TEXT { marker }, click_time: TEXT { 42 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_state }, start_time_value: 20, end_time_value: 71, state: High, label: TEXT { Count }, click_time: TEXT { 48 ns }]
+            [file: TEXT { simple_test.ghw }, signal_id: TEXT { ghw_state }, start_time_value: 71, end_time_value: 91, state: Low, label: TEXT { Hold }, click_time: TEXT { 36 ns }]
+        }
 
     selected_rows_enabled_value:
-        waveform_status == TEXT { Loaded } |> WHEN {
+        waveform_status == Loaded |> WHEN {
             True => TEXT { loaded }
             False => TEXT { none }
         }
 
+    group_header_collapsed:
+        selected_group == Collapsed
+
+    group_header_chevron:
+        group_header_collapsed |> WHEN {
+            True => TEXT { > }
+            False => TEXT { v }
+        }
+
     selected_rows_profile:
         LATEST {
-            TEXT { DefaultOrder }
-            elements.selected_remove_data.event.press |> THEN { TEXT { WithoutData } }
-            elements.selected_remove_clk.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_reset.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_data_valid.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_data_ready.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_state.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_error_count.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_temperature.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_tx_data.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_rx_data.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_baud_tick.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_uart_busy.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_ghw_counter.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_ghw_enable.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_remove_ghw_state.event.press |> THEN { TEXT { WithoutSelection } }
-            elements.selected_restore_data.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.selected_data_up.event.press |> THEN { TEXT { DataFirst } }
-            elements.selected_data_down.event.press |> THEN { TEXT { DataLast } }
-            elements.select_counter_file.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.load_default_file.event.press |> THEN { TEXT { DefaultOrder } }
-            elements.show_empty.event.press |> THEN { TEXT { Empty } }
+            DefaultOrder
+            elements.selected_remove_data.event.press |> THEN { WithoutData }
+            elements.selected_remove_clk.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_reset.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_data_valid.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_data_ready.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_state.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_error_count.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_temperature.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_tx_data.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_rx_data.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_baud_tick.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_uart_busy.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_ghw_counter.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_ghw_enable.event.press |> THEN { WithoutSelection }
+            elements.selected_remove_ghw_state.event.press |> THEN { WithoutSelection }
+            elements.selected_restore_data.event.press |> THEN { DefaultOrder }
+            elements.selected_data_up.event.press |> THEN { DataFirst }
+            elements.selected_data_down.event.press |> THEN { DataLast }
+            elements.select_counter_file.event.press |> THEN { DefaultOrder }
+            elements.select_uart_compare_file.event.press |> THEN { DefaultOrder }
+            elements.select_ghw_file.event.press |> THEN { DefaultOrder }
+            elements.load_default_file.event.press |> THEN { DefaultOrder }
+            elements.show_empty.event.press |> THEN { Empty }
         }
 
     selected_rows_removed_signal_id:
@@ -1076,12 +1298,138 @@ store: [
         selected_signal_defaults
         |> List/filter_field_equal(field: "family", value: selected_signal_family)
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
+        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
+        |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
         |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
         |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
 
     selected_signals:
         selected_signal_rows
+
+    selected_visible_items:
+        selected_signal_defaults
+        |> List/filter_field_equal(field: "family", value: selected_signal_family)
+        |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
+        |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
+        |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+
+    selected_variable_file:
+        active_signal == TEXT { none } |> WHEN {
+            True => active_file
+            False => List/find_value(selected_signal_defaults, field: "id", value: active_signal, target: "file", fallback: active_file)
+        }
+
+    selected_timeline_metadata_file:
+        external_file_active == Yes |> WHEN {
+            True => active_file
+            False => selected_variable_file
+        }
+
+    selected_timeline_full_range:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "full_range", fallback: active_metadata_full_range)
+
+    selected_timeline_initial_window:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "initial_window", fallback: active_metadata_initial_window)
+
+    selected_timeline_range_start:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "range_start", fallback: active_metadata_range_start)
+        |> Text/to_number()
+
+    selected_timeline_range_end:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "range_end", fallback: active_metadata_range_end)
+        |> Text/to_number()
+
+    selected_timeline_window_start:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "initial_start", fallback: active_metadata_initial_start)
+        |> Text/to_number()
+
+    selected_timeline_window_end:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "initial_end", fallback: active_metadata_initial_end)
+        |> Text/to_number()
+
+    selected_waveform_canvas_width:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "canvas_width", fallback: active_metadata_canvas_width)
+        |> Text/to_number()
+
+    selected_timeline_time_unit:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "time_unit", fallback: active_metadata_time_unit)
+
+    selected_timeline_timescale:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "timescale", fallback: active_metadata_timescale)
+
+    selected_timeline_range_source:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "range_source", fallback: active_metadata_range_source)
+
+    selected_timeline_metadata_source:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "metadata_source", fallback: active_metadata_source)
+
+    selected_timeline_cursor_left:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "cursor_left", fallback: 0)
+        |> Text/to_number()
+
+    selected_timeline_cursor_default:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "cursor_default", fallback: 0)
+        |> Text/to_number()
+
+    selected_timeline_cursor_right:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "cursor_right", fallback: 0)
+        |> Text/to_number()
+
+    selected_timeline_tick_0:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_0", fallback: selected_timeline_range_start)
+        |> Text/to_number()
+
+    selected_timeline_tick_1:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_1", fallback: selected_timeline_range_start)
+        |> Text/to_number()
+
+    selected_timeline_tick_2:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_2", fallback: selected_timeline_range_start)
+        |> Text/to_number()
+
+    selected_timeline_tick_3:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_3", fallback: selected_timeline_range_end)
+        |> Text/to_number()
+
+    selected_timeline_tick_4:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_4", fallback: selected_timeline_range_end)
+        |> Text/to_number()
+
+    selected_timeline_cursor_value:
+        NovyModel/cursor_time_value(cursor: cursor_position, left_value: selected_timeline_cursor_left, default_value: selected_timeline_cursor_default, right_value: selected_timeline_cursor_right)
+
+    selected_waveform_segments:
+        waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/map(segment, new: new_waveform_segment(segment: segment))
+
+    active_waveform_segment_labels:
+        waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/filter_field_equal(field: "signal_id", value: active_signal)
+        |> List/join_field(field: "label", separator: ",", empty: "none")
+
+    active_waveform_segment_count:
+        waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/filter_field_equal(field: "signal_id", value: active_signal)
+        |> List/length()
+
+    timeline_axis_tick_0:
+        selected_timeline_tick_0 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
+    timeline_axis_tick_1:
+        selected_timeline_tick_1 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
+    timeline_axis_tick_2:
+        selected_timeline_tick_2 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
+    timeline_axis_tick_3:
+        selected_timeline_tick_3 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
+    timeline_axis_tick_4:
+        selected_timeline_tick_4 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
     data_bus_alias:
         List/find_value(signal_catalog, field: key, value: TEXT { data_bus }, target: alias, fallback: Text/empty())
@@ -1185,27 +1533,27 @@ store: [
         }
 
     format_dropdown_state:
-        TEXT { Closed } |> HOLD format_dropdown_state {
+        Closed |> HOLD format_dropdown_state {
             LATEST {
                 elements.format_dropdown_toggle.event.press |> THEN {
                     format_dropdown_state |> WHEN {
-                        Open => TEXT { Closed }
-                        __ => TEXT { Open }
+                        Open => Closed
+                        __ => Open
                     }
                 }
-                elements.format_cycle.event.press |> THEN { TEXT { Closed } }
-                elements.format_binary.event.press |> THEN { TEXT { Closed } }
-                elements.format_hex.event.press |> THEN { TEXT { Closed } }
-                elements.format_grouped.event.press |> THEN { TEXT { Closed } }
-                elements.format_octal.event.press |> THEN { TEXT { Closed } }
-                elements.format_signed.event.press |> THEN { TEXT { Closed } }
-                elements.format_unsigned.event.press |> THEN { TEXT { Closed } }
-                elements.format_ascii.event.press |> THEN { TEXT { Closed } }
-                elements.load_default_file.event.press |> THEN { TEXT { Closed } }
-                elements.show_empty.event.press |> THEN { TEXT { Closed } }
-                elements.select_counter_file.event.press |> THEN { TEXT { Closed } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { Closed } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { Closed } }
+                elements.format_cycle.event.press |> THEN { Closed }
+                elements.format_binary.event.press |> THEN { Closed }
+                elements.format_hex.event.press |> THEN { Closed }
+                elements.format_grouped.event.press |> THEN { Closed }
+                elements.format_octal.event.press |> THEN { Closed }
+                elements.format_signed.event.press |> THEN { Closed }
+                elements.format_unsigned.event.press |> THEN { Closed }
+                elements.format_ascii.event.press |> THEN { Closed }
+                elements.load_default_file.event.press |> THEN { Closed }
+                elements.show_empty.event.press |> THEN { Closed }
+                elements.select_counter_file.event.press |> THEN { Closed }
+                elements.select_uart_compare_file.event.press |> THEN { Closed }
+                elements.select_ghw_file.event.press |> THEN { Closed }
             }
         }
 
@@ -1265,57 +1613,63 @@ store: [
 
     selected_group:
         LATEST {
-            TEXT { None }
-            elements.group_create.event.press |> THEN { TEXT { Expanded } }
-            elements.group_toggle.event.press |> THEN { TEXT { Collapsed } }
-            elements.group_expand.event.press |> THEN { TEXT { Expanded } }
-            elements.load_default_file.event.press |> THEN { TEXT { Expanded } }
-            elements.show_empty.event.press |> THEN { TEXT { None } }
+            Expanded
+            elements.group_create.event.press |> THEN { Expanded }
+            elements.group_toggle.event.press |> THEN { Collapsed }
+            elements.group_expand.event.press |> THEN { Expanded }
+            elements.group_remove.event.press |> THEN { None }
+            elements.load_default_file.event.press |> THEN { Expanded }
+            elements.show_empty.event.press |> THEN { None }
         }
 
     group_creation_state:
         LATEST {
-            TEXT { None }
-            elements.group_create.event.press |> THEN { TEXT { Created } }
-            elements.load_default_file.event.press |> THEN { TEXT { None } }
-            elements.show_empty.event.press |> THEN { TEXT { None } }
+            Created
+            elements.group_create.event.press |> THEN { Created }
+            elements.group_remove.event.press |> THEN { None }
+            elements.load_default_file.event.press |> THEN { Created }
+            elements.show_empty.event.press |> THEN { None }
         }
 
     group_name:
         LATEST {
-            TEXT { No group }
-            elements.group_create.event.press |> THEN { TEXT { Core bus group } }
-            elements.load_default_file.event.press |> THEN { TEXT { No group } }
+            TEXT { simple_tb.s group }
+            elements.group_create.event.press |> THEN { TEXT { simple_tb.s group } }
+            elements.group_remove.event.press |> THEN { TEXT { No group } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple_tb.s group } }
             elements.show_empty.event.press |> THEN { TEXT { No group } }
         }
 
     group_count_label:
         LATEST {
-            TEXT { 0 groups }
+            TEXT { 1 group }
             elements.group_create.event.press |> THEN { TEXT { 1 group } }
-            elements.load_default_file.event.press |> THEN { TEXT { 0 groups } }
+            elements.group_remove.event.press |> THEN { TEXT { 0 groups } }
+            elements.load_default_file.event.press |> THEN { TEXT { 1 group } }
             elements.show_empty.event.press |> THEN { TEXT { 0 groups } }
         }
 
     group_members_label:
         LATEST {
-            TEXT { none }
-            elements.group_create.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
-            elements.load_default_file.event.press |> THEN { TEXT { none } }
+            TEXT { A[3:0], B[3:0] }
+            elements.group_create.event.press |> THEN { TEXT { A[3:0], B[3:0] } }
+            elements.group_remove.event.press |> THEN { TEXT { none } }
+            elements.load_default_file.event.press |> THEN { TEXT { A[3:0], B[3:0] } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     group_status_label:
         LATEST {
-            TEXT { no group }
+            TEXT { 1 group }
             elements.group_create.event.press |> THEN { TEXT { 1 group } }
-            elements.load_default_file.event.press |> THEN { TEXT { no group } }
+            elements.group_remove.event.press |> THEN { TEXT { no group } }
+            elements.load_default_file.event.press |> THEN { TEXT { 1 group } }
             elements.show_empty.event.press |> THEN { TEXT { no group } }
         }
 
     group_to_create:
         LATEST {
-            elements.group_create.event.press |> THEN { TEXT { Core bus group } }
+            elements.group_create.event.press |> THEN { TEXT { simple_tb.s group } }
         }
 
     groups:
@@ -1323,12 +1677,13 @@ store: [
         |> List/append(item: group_to_create |> THEN {
             [
                 name: group_to_create
-                members_label: TEXT { clk, reset_n, data_bus[7:0], temperature }
+                members_label: TEXT { A[3:0], B[3:0] }
             ]
         })
         |> List/map(group, new: new_signal_group(group: group, store: store))
         |> List/remove(group, when:
             LATEST {
+                elements.group_remove.event.press |> THEN { True }
                 elements.load_default_file.event.press |> THEN { True }
                 elements.show_empty.event.press |> THEN { True }
             }
@@ -1344,21 +1699,21 @@ store: [
         selected_rows_count |> Text/concat(with: TEXT { selected }, separator: " ")
 
     analog_limit_kind:
-        TEXT { Auto } |> HOLD analog_limit_kind {
+        Auto |> HOLD analog_limit_kind {
             LATEST {
-            elements.analog_limits_auto.event.press |> THEN { TEXT { Auto } }
-            elements.analog_limits_manual.event.press |> THEN { TEXT { Manual } }
-            elements.load_default_file.event.press |> THEN { TEXT { Auto } }
+            elements.analog_limits_auto.event.press |> THEN { Auto }
+            elements.analog_limits_manual.event.press |> THEN { Manual }
+            elements.load_default_file.event.press |> THEN { Auto }
             }
         }
 
     analog_limit_validity:
-        TEXT { Valid } |> HOLD analog_limit_validity {
+        Valid |> HOLD analog_limit_validity {
             LATEST {
-            elements.analog_limits_auto.event.press |> THEN { TEXT { Valid } }
-            elements.analog_limits_manual.event.press |> THEN { TEXT { Valid } }
-            elements.analog_limits_invalid.event.press |> THEN { TEXT { Rejected } }
-            elements.load_default_file.event.press |> THEN { TEXT { Valid } }
+            elements.analog_limits_auto.event.press |> THEN { Valid }
+            elements.analog_limits_manual.event.press |> THEN { Valid }
+            elements.analog_limits_invalid.event.press |> THEN { Rejected }
+            elements.load_default_file.event.press |> THEN { Valid }
             }
         }
 
@@ -1422,24 +1777,24 @@ store: [
         ]
 
     marker_visibility:
-        TEXT { Visible } |> HOLD marker_visibility {
+        Visible |> HOLD marker_visibility {
             LATEST {
-            elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
-            elements.marker_toggle.event.press |> THEN { TEXT { Visible } }
-            elements.waveform_click.text |> THEN { TEXT { Visible } }
-            elements.load_default_file.event.press |> THEN { TEXT { Visible } }
-            elements.show_empty.event.press |> THEN { TEXT { Hidden } }
+            elements.marker_remove.event.press |> THEN { Hidden }
+            elements.marker_toggle.event.press |> THEN { Visible }
+            elements.waveform_click.text |> THEN { Visible }
+            elements.load_default_file.event.press |> THEN { Visible }
+            elements.show_empty.event.press |> THEN { Hidden }
             }
         }
 
     marker_current_label:
-        TEXT { 42 ns } |> HOLD marker_current_label {
+        TEXT { 50 s } |> HOLD marker_current_label {
             LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
-            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+            elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
             elements.waveform_click.text
-            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
@@ -1457,55 +1812,55 @@ store: [
         }
 
     marker_label:
-        TEXT { M 42 ns } |> HOLD marker_label {
+        TEXT { M 50 s } |> HOLD marker_label {
             LATEST {
-            elements.marker_rename.event.press |> THEN { TEXT { M data stable } }
+            elements.marker_rename.event.press |> THEN { TEXT { M simple transition } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_jump.event.press |> THEN { marker_label }
-            elements.marker_toggle.event.press |> THEN { TEXT { M 36 ns } }
+            elements.marker_toggle.event.press |> THEN { TEXT { M 0 s } }
             elements.waveform_click.text |> THEN {
                 TEXT { M } |> Text/concat(with: elements.waveform_click.text, separator: " ")
             }
-            elements.load_default_file.event.press |> THEN { TEXT { M 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { M 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
         }
 
     marker_focus_label:
-        TEXT { marker at 42 ns } |> HOLD marker_focus_label {
+        TEXT { marker at 50 s } |> HOLD marker_focus_label {
             LATEST {
-            elements.marker_rename.event.press |> THEN { TEXT { data stable at 42 ns } }
+            elements.marker_rename.event.press |> THEN { TEXT { simple transition at 50 s } }
             elements.marker_jump.event.press |> THEN {
                 marker_state |> WHEN {
-                    Renamed => TEXT { jumped to data stable at 42 ns }
-                    Default => TEXT { jumped to 42 ns }
-                    Added => TEXT { jumped to 36 ns }
-                    __ => TEXT { jumped to 42 ns }
+                    Renamed => TEXT { jumped to simple transition at 50 s }
+                    Default => TEXT { jumped to 50 s }
+                    Added => TEXT { jumped to 0 s }
+                    __ => TEXT { jumped to 50 s }
                 }
             }
             elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
-            elements.marker_toggle.event.press |> THEN { TEXT { added marker at 36 ns } }
+            elements.marker_toggle.event.press |> THEN { TEXT { added marker at 0 s } }
             elements.waveform_click.text |> THEN {
                 TEXT { added marker at } |> Text/concat(with: elements.waveform_click.text, separator: " ")
             }
-            elements.load_default_file.event.press |> THEN { TEXT { marker at 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { marker at 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { no marker selected } }
             }
         }
 
     marker_default_label:
-        TEXT { 42 ns }
+        TEXT { 50 s }
 
     marker_to_add:
         LATEST {
-            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+            elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
             elements.waveform_click.text
-            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 50 s } }
         }
 
     marker_add_from_toggle:
         LATEST {
-            elements.marker_toggle.event.press |> THEN { TEXT { 36 ns } }
+            elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
         }
 
     marker_add_from_waveform:
@@ -1515,21 +1870,21 @@ store: [
 
     marker_add_from_load:
         LATEST {
-            elements.load_default_file.event.press |> THEN { TEXT { 42 ns } }
+            elements.load_default_file.event.press |> THEN { TEXT { 50 s } }
         }
 
     markers:
         LIST {
-            [label: TEXT { 42 ns }]
+            [label: TEXT { 50 s }]
         }
         |> List/append(item: marker_add_from_toggle |> THEN {
-            [label: marker_add_from_toggle]
+            [label: TEXT { 0 s }]
         })
         |> List/append(item: marker_add_from_waveform |> THEN {
             [label: marker_add_from_waveform]
         })
         |> List/append(item: marker_add_from_load |> THEN {
-            [label: marker_add_from_load]
+            [label: TEXT { 50 s }]
         })
         |> List/map(marker, new: new_marker(marker: marker, store: store))
         |> List/remove(marker, when:
@@ -1553,19 +1908,19 @@ store: [
         }
 
     row_size:
-        TEXT { Normal } |> HOLD row_size {
+        Normal |> HOLD row_size {
             LATEST {
-                elements.row_taller.event.press |> THEN { TEXT { Tall } }
-                elements.row_shorter.event.press |> THEN { TEXT { Compact } }
+                elements.row_taller.event.press |> THEN { Tall }
+                elements.row_shorter.event.press |> THEN { Compact }
                 elements.signal_row_resize_drag.text |> THEN {
                     elements.signal_row_resize_drag.text |> WHEN {
                         TEXT { Grow } => row_size |> WHEN {
-                            TEXT { Compact } => TEXT { Normal }
-                            __ => TEXT { Tall }
+                            Compact => Normal
+                            __ => Tall
                         }
                         TEXT { Shrink } => row_size |> WHEN {
-                            TEXT { Tall } => TEXT { Normal }
-                            __ => TEXT { Compact }
+                            Tall => Normal
+                            __ => Compact
                         }
                         __ => row_size
                     }
@@ -1575,16 +1930,16 @@ store: [
 
     value_format:
         LATEST {
-            TEXT { Hexadecimal }
+            Hexadecimal
             elements.format_cycle.event.press |> THEN { NovyModel/next_format(format: value_format) }
-            elements.format_binary.event.press |> THEN { TEXT { Binary } }
-            elements.format_hex.event.press |> THEN { TEXT { Hexadecimal } }
-            elements.format_grouped.event.press |> THEN { TEXT { GroupedBinary } }
-            elements.format_octal.event.press |> THEN { TEXT { Octal } }
-            elements.format_signed.event.press |> THEN { TEXT { Signed } }
-            elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
-            elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
-            elements.load_default_file.event.press |> THEN { TEXT { Hexadecimal } }
+            elements.format_binary.event.press |> THEN { Binary }
+            elements.format_hex.event.press |> THEN { Hexadecimal }
+            elements.format_grouped.event.press |> THEN { GroupedBinary }
+            elements.format_octal.event.press |> THEN { Octal }
+            elements.format_signed.event.press |> THEN { Signed }
+            elements.format_unsigned.event.press |> THEN { Unsigned }
+            elements.format_ascii.event.press |> THEN { ASCII }
+            elements.load_default_file.event.press |> THEN { Hexadecimal }
         }
 
     zoom_step:
@@ -1624,65 +1979,85 @@ store: [
         NovyModel/zoom_level_from_step(step: zoom_step)
 
     pan_window:
-        TEXT { Center } |> HOLD pan_window {
+        Center |> HOLD pan_window {
             LATEST {
-                elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
-                elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
-                elements.zoom_reset.event.press |> THEN { TEXT { Center } }
+                elements.pan_left.event.press |> THEN { LeftWindow }
+                elements.pan_right.event.press |> THEN { RightWindow }
+                elements.zoom_reset.event.press |> THEN { Center }
                 elements.keyboard_capture.key |> WHEN {
-                    A => TEXT { LeftWindow }
-                    D => TEXT { RightWindow }
-                    R => TEXT { Center }
-                    Q => TEXT { RightWindow }
-                    E => TEXT { RightWindow }
+                    A => LeftWindow
+                    D => RightWindow
+                    R => Center
+                    Q => RightWindow
+                    E => RightWindow
                     __ => SKIP
                 }
-                elements.load_default_file.event.press |> THEN { TEXT { Center } }
-                elements.show_empty.event.press |> THEN { TEXT { Center } }
+                elements.load_default_file.event.press |> THEN { Center }
+                elements.show_empty.event.press |> THEN { Center }
             }
         }
 
     cursor_position:
         LATEST {
-            TEXT { Cursor42 }
-            elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
-            elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
+            Cursor42
             elements.waveform_click.text |> THEN { NovyModel/cursor_from_label(label: elements.waveform_click.text) }
-            elements.marker_jump.event.press |> THEN { TEXT { Cursor42 } }
-            elements.zoom_reset.event.press |> THEN { TEXT { Cursor42 } }
+            elements.cursor_left.event.press |> THEN { Cursor36 }
+            elements.cursor_right.event.press |> THEN { Cursor48 }
+            elements.marker_jump.event.press |> THEN { Cursor42 }
+            elements.zoom_reset.event.press |> THEN { Cursor42 }
             elements.keyboard_capture.key |> WHEN {
-                D => TEXT { Cursor42 }
-                Q => TEXT { Cursor36 }
-                R => TEXT { Cursor42 }
-                E => TEXT { Cursor48 }
+                D => Cursor42
+                Q => Cursor36
+                R => Cursor42
+                E => Cursor48
                 __ => SKIP
             }
-            elements.load_default_file.event.press |> THEN { TEXT { Cursor42 } }
-            elements.show_empty.event.press |> THEN { TEXT { Cursor42 } }
+            elements.load_default_file.event.press |> THEN { Cursor42 }
+            elements.show_empty.event.press |> THEN { Cursor42 }
         }
 
+    viewport_window_key:
+        selected_timeline_metadata_file
+        |> Text/concat(with: zoom_level, separator: "|")
+        |> Text/concat(with: pan_window, separator: "|")
+
+    viewport_label_start:
+        List/find_value(viewport_window_records, field: "window_key", value: viewport_window_key, target: "start", fallback: selected_timeline_window_start)
+        |> Text/to_number()
+
+    viewport_label_end:
+        List/find_value(viewport_window_records, field: "window_key", value: viewport_window_key, target: "end", fallback: selected_timeline_window_end)
+        |> Text/to_number()
+
     viewport_label:
-        NovyModel/viewport_label(zoom: zoom_level, pan: pan_window)
+        viewport_label_start
+        |> Text/time_range_label(end: viewport_label_end, unit: selected_timeline_time_unit)
 
     keyboard_viewport_label:
-        NovyModel/viewport_label(zoom: zoom_level, pan: pan_window)
+        viewport_label
 
     cursor_label:
-        NovyModel/cursor_label(cursor: cursor_position)
+        selected_timeline_cursor_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
     keyboard_cursor_label:
-        NovyModel/cursor_label(cursor: cursor_position)
+        selected_timeline_cursor_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
+    waveform_cursor_offset:
+        Number/project_offset(time: selected_timeline_cursor_value, viewport_start: selected_timeline_window_start, viewport_end: selected_timeline_window_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: zoom_level)
+
+    waveform_marker_offset:
+        Number/project_offset(time: selected_timeline_cursor_default, viewport_start: selected_timeline_window_start, viewport_end: selected_timeline_window_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: zoom_level)
 
     active_signal_label:
-        TEXT { top.cpu.clk } |> HOLD active_signal_label {
+        TEXT { simple_tb.s.A[3:0] } |> HOLD active_signal_label {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
                         signal_catalog_item.signal_elements.select_signal.event.press
                         |> THEN {
                             signal_catalog_item.key |> WHEN {
-                                clk => TEXT { top.cpu.clk }
-                                reset_n => TEXT { top.cpu.reset_n }
+                                clk => TEXT { simple_tb.s.A[3:0] }
+                                reset_n => TEXT { simple_tb.s.B[3:0] }
                                 data_bus => TEXT { top.cpu.data_bus[7:0] }
                                 temperature => TEXT { top.analog.temperature }
                                 __ => SKIP
@@ -1690,8 +2065,8 @@ store: [
                         }
                     )
                     |> List/latest()
-                elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
-                elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
+                elements.select_clk.event.press |> THEN { TEXT { simple_tb.s.A[3:0] } }
+                elements.select_reset.event.press |> THEN { TEXT { simple_tb.s.B[3:0] } }
                 elements.select_data.event.press |> THEN {
                     active_signal_key |> WHEN {
                         DATA_BUS => TEXT { none }
@@ -1699,83 +2074,83 @@ store: [
                     }
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
-                elements.select_counter_file.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.select_counter_file.event.press |> THEN { TEXT { simple_tb.s.A[3:0] } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart.tx_data[7:0] } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple.counter[3:0] } }
-                elements.load_default_file.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.load_default_file.event.press |> THEN { TEXT { simple_tb.s.A[3:0] } }
                 elements.show_empty.event.press |> THEN { TEXT { none } }
             }
         }
 
     active_scope_key:
         LATEST {
-            TEXT { TOP_CPU }
-            elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { TOP_CPU } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { TOP_CPU } }
+            TEXT { SIMPLE_TB_S }
+            elements.scope_cpu.event.press |> THEN { TEXT { SIMPLE_TB_S } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { SIMPLE_TB_S } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { SIMPLE_TB_S } }
             elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
             elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
-            elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.select_counter_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE } }
-            elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.load_default_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
             elements.show_empty.event.press |> THEN { TEXT { NONE } }
         }
 
     active_scope_label:
         LATEST {
-            TEXT { top.cpu }
-            elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { top.cpu } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { top.cpu } }
+            TEXT { simple_tb.s }
+            elements.scope_cpu.event.press |> THEN { TEXT { simple_tb.s } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_tb.s } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_tb.s } }
             elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
-            elements.select_counter_file.event.press |> THEN { TEXT { top.cpu } }
+            elements.select_counter_file.event.press |> THEN { TEXT { simple_tb.s } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple } }
-            elements.load_default_file.event.press |> THEN { TEXT { top.cpu } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple_tb.s } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
     active_scope_signal_count:
         LATEST {
-            TEXT { 8 signals }
-            elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { 8 signals } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { 8 signals } }
+            TEXT { 2 signals }
+            elements.scope_cpu.event.press |> THEN { TEXT { 2 signals } }
+            elements.scope_cpu_expand.event.press |> THEN { TEXT { 2 signals } }
+            elements.scope_cpu_collapse.event.press |> THEN { TEXT { 2 signals } }
             elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
             elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
-            elements.select_counter_file.event.press |> THEN { TEXT { 8 signals } }
+            elements.select_counter_file.event.press |> THEN { TEXT { 2 signals } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { 5 signals } }
             elements.select_ghw_file.event.press |> THEN { TEXT { 4 signals } }
-            elements.load_default_file.event.press |> THEN { TEXT { 8 signals } }
+            elements.load_default_file.event.press |> THEN { TEXT { 2 signals } }
             elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
         }
 
     scope_cpu_expansion_state:
         LATEST {
-            TEXT { Expanded }
-            elements.scope_cpu.event.press |> THEN { TEXT { Expanded } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { Expanded } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { Collapsed } }
-            elements.select_counter_file.event.press |> THEN { TEXT { Expanded } }
-            elements.load_default_file.event.press |> THEN { TEXT { Expanded } }
-            elements.show_empty.event.press |> THEN { TEXT { Collapsed } }
+            Expanded
+            elements.scope_cpu.event.press |> THEN { Expanded }
+            elements.scope_cpu_expand.event.press |> THEN { Expanded }
+            elements.scope_cpu_collapse.event.press |> THEN { Collapsed }
+            elements.select_counter_file.event.press |> THEN { Expanded }
+            elements.load_default_file.event.press |> THEN { Expanded }
+            elements.show_empty.event.press |> THEN { Collapsed }
         }
 
     active_scope_expansion_label:
-        active_scope == TEXT { top_cpu } |> WHEN {
+        active_scope == TEXT { simple_tb_s } |> WHEN {
             True => scope_cpu_expansion_state
             False => active_scope == TEXT { none } |> WHEN {
-                True => TEXT { None }
-                False => TEXT { Expanded }
+                True => None
+                False => Expanded
             }
         }
 
     active_scope_visible_signal_count:
-        active_scope == TEXT { top_cpu } |> WHEN {
-            True => scope_cpu_expansion_state == TEXT { Expanded } |> WHEN {
-                True => TEXT { 8 visible }
+        active_scope == TEXT { simple_tb_s } |> WHEN {
+            True => scope_cpu_expansion_state == Expanded |> WHEN {
+                True => TEXT { 2 visible }
                 False => TEXT { 0 visible }
             }
             False => active_scope == TEXT { top_uart } |> WHEN {
@@ -1809,15 +2184,15 @@ store: [
         }
 
     active_signal_key:
-        TEXT { CLK } |> HOLD active_signal_key {
+        TEXT { A_SIGNAL } |> HOLD active_signal_key {
             LATEST {
                 signal_catalog
                     |> List/map(signal_catalog_item, new:
                         signal_catalog_item.signal_elements.select_signal.event.press
                         |> THEN {
                             signal_catalog_item.key |> WHEN {
-                                clk => TEXT { CLK }
-                                reset_n => TEXT { RESET_N }
+                                clk => TEXT { A_SIGNAL }
+                                reset_n => TEXT { B_SIGNAL }
                                 data_bus => TEXT { DATA_BUS }
                                 temperature => TEXT { TEMPERATURE }
                                 __ => SKIP
@@ -1825,8 +2200,8 @@ store: [
                         }
                     )
                     |> List/latest()
-                elements.select_clk.event.press |> THEN { TEXT { CLK } }
-                elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
+                elements.select_clk.event.press |> THEN { TEXT { A_SIGNAL } }
+                elements.select_reset.event.press |> THEN { TEXT { B_SIGNAL } }
                 elements.select_data.event.press |> THEN {
                     active_signal_key |> WHEN {
                         DATA_BUS => TEXT { NONE }
@@ -1834,10 +2209,10 @@ store: [
                     }
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
-                elements.select_counter_file.event.press |> THEN { TEXT { CLK } }
+                elements.select_counter_file.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TX_DATA } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_COUNTER } }
-                elements.load_default_file.event.press |> THEN { TEXT { CLK } }
+                elements.load_default_file.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -1861,124 +2236,118 @@ store: [
         bridge_request_compact_label
 
     bridge_response_scope:
-        TEXT { TOP_CPU } |> HOLD bridge_response_scope {
+        TEXT { SIMPLE_TB_S } |> HOLD bridge_response_scope {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU } }
+                elements.select_counter_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE } }
-                elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
+                elements.scope_cpu.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
                 elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU } }
-                elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { SIMPLE_TB_S } }
+                elements.load_default_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 
     bridge_response_signal:
-        TEXT { CLK } |> HOLD bridge_response_signal {
+        TEXT { A_SIGNAL } |> HOLD bridge_response_signal {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { CLK } }
+                elements.select_counter_file.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TX_DATA } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_COUNTER } }
-                elements.select_clk.event.press |> THEN { TEXT { CLK } }
-                elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
+                elements.select_clk.event.press |> THEN { TEXT { A_SIGNAL } }
+                elements.select_reset.event.press |> THEN { TEXT { B_SIGNAL } }
                 elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { CLK } }
-                elements.load_default_file.event.press |> THEN { TEXT { CLK } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { A_SIGNAL } }
+                elements.load_default_file.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 
     bridge_response_zoom:
-        TEXT { Fit } |> HOLD bridge_response_zoom {
+        Fit |> HOLD bridge_response_zoom {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { Fit } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { Fit } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { Fit } }
-                elements.zoom_in.event.press |> THEN { TEXT { Close } }
-                elements.zoom_out.event.press |> THEN { TEXT { Wide } }
-                elements.zoom_reset.event.press |> THEN { TEXT { Fit } }
-                elements.cursor_left.event.press |> THEN { TEXT { Close } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { Fit } }
-                elements.load_default_file.event.press |> THEN { TEXT { Fit } }
-                elements.show_empty.event.press |> THEN { TEXT { None } }
+                elements.select_counter_file.event.press |> THEN { Fit }
+                elements.select_uart_compare_file.event.press |> THEN { Fit }
+                elements.select_ghw_file.event.press |> THEN { Fit }
+                elements.zoom_in.event.press |> THEN { Close }
+                elements.zoom_out.event.press |> THEN { Wide }
+                elements.zoom_reset.event.press |> THEN { Fit }
+                elements.cursor_left.event.press |> THEN { Close }
+                elements.stale_response_probe.event.press |> THEN { Fit }
+                elements.load_default_file.event.press |> THEN { Fit }
+                elements.show_empty.event.press |> THEN { None }
             }
         }
 
     bridge_response_pan:
-        TEXT { Center } |> HOLD bridge_response_pan {
+        Center |> HOLD bridge_response_pan {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { Center } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { Center } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { Center } }
-                elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
-                elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
-                elements.zoom_reset.event.press |> THEN { TEXT { Center } }
-                elements.cursor_left.event.press |> THEN { TEXT { RightWindow } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { Center } }
-                elements.load_default_file.event.press |> THEN { TEXT { Center } }
-                elements.show_empty.event.press |> THEN { TEXT { None } }
+                elements.select_counter_file.event.press |> THEN { Center }
+                elements.select_uart_compare_file.event.press |> THEN { Center }
+                elements.select_ghw_file.event.press |> THEN { Center }
+                elements.pan_left.event.press |> THEN { LeftWindow }
+                elements.pan_right.event.press |> THEN { RightWindow }
+                elements.zoom_reset.event.press |> THEN { Center }
+                elements.cursor_left.event.press |> THEN { RightWindow }
+                elements.stale_response_probe.event.press |> THEN { Center }
+                elements.load_default_file.event.press |> THEN { Center }
+                elements.show_empty.event.press |> THEN { None }
             }
         }
 
+    bridge_response_window_key:
+        selected_timeline_metadata_file
+        |> Text/concat(with: bridge_response_zoom, separator: "|")
+        |> Text/concat(with: bridge_response_pan, separator: "|")
+
+    bridge_response_window_start:
+        List/find_value(viewport_window_records, field: "window_key", value: bridge_response_window_key, target: "start", fallback: selected_timeline_window_start)
+        |> Text/to_number()
+
+    bridge_response_window_end:
+        List/find_value(viewport_window_records, field: "window_key", value: bridge_response_window_key, target: "end", fallback: selected_timeline_window_end)
+        |> Text/to_number()
+
     bridge_response_cursor:
-        TEXT { Cursor42 } |> HOLD bridge_response_cursor {
+        Cursor42 |> HOLD bridge_response_cursor {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { Cursor42 } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { Cursor42 } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { Cursor42 } }
-                elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
-                elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { Cursor42 } }
-                elements.load_default_file.event.press |> THEN { TEXT { Cursor42 } }
-                elements.show_empty.event.press |> THEN { TEXT { None } }
+                elements.select_counter_file.event.press |> THEN { Cursor42 }
+                elements.select_uart_compare_file.event.press |> THEN { Cursor42 }
+                elements.select_ghw_file.event.press |> THEN { Cursor42 }
+                elements.cursor_left.event.press |> THEN { Cursor36 }
+                elements.cursor_right.event.press |> THEN { Cursor48 }
+                elements.stale_response_probe.event.press |> THEN { Cursor42 }
+                elements.load_default_file.event.press |> THEN { Cursor42 }
+                elements.show_empty.event.press |> THEN { None }
             }
         }
 
     bridge_response_format:
-        TEXT { Hexadecimal } |> HOLD bridge_response_format {
+        Hexadecimal |> HOLD bridge_response_format {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { Hexadecimal } }
+                elements.select_counter_file.event.press |> THEN { Hexadecimal }
+                elements.select_uart_compare_file.event.press |> THEN { Hexadecimal }
+                elements.select_ghw_file.event.press |> THEN { Hexadecimal }
                 elements.format_cycle.event.press |> THEN { NovyModel/next_format(format: bridge_response_format) }
-                elements.stale_response_probe.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.load_default_file.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.show_empty.event.press |> THEN { TEXT { None } }
+                elements.stale_response_probe.event.press |> THEN { Hexadecimal }
+                elements.load_default_file.event.press |> THEN { Hexadecimal }
+                elements.show_empty.event.press |> THEN { None }
             }
         }
 
     bridge_response_window_label:
-        TEXT { 0 ns - 120 ns } |> HOLD bridge_response_window_label {
-            LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_uart_compare_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.select_ghw_file.event.press |> THEN { TEXT { 0 ns - 100 ns } }
-                elements.zoom_in.event.press |> THEN {
-                    NovyModel/viewport_label(zoom: NovyModel/zoom_in_level(zoom: zoom_level), pan: pan_window)
-                }
-                elements.zoom_out.event.press |> THEN {
-                    NovyModel/viewport_label(zoom: NovyModel/zoom_out_level(zoom: zoom_level), pan: pan_window)
-                }
-                elements.zoom_reset.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.pan_left.event.press |> THEN { TEXT { 0 ns - 80 ns } }
-                elements.pan_right.event.press |> THEN { TEXT { 80 ns - 160 ns } }
-                elements.cursor_left.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.load_default_file.event.press |> THEN { TEXT { 0 ns - 120 ns } }
-                elements.show_empty.event.press |> THEN { TEXT { no response window } }
-            }
+        active_signal_key == TEXT { NONE } |> WHEN {
+            True => TEXT { no response window }
+            False => bridge_response_window_start |> Text/time_range_label(end: bridge_response_window_end, unit: selected_timeline_time_unit)
         }
 
     bridge_request_window_label:
         active_signal_key == TEXT { NONE } |> WHEN {
             True => TEXT { no request window }
-            False => active_file == TEXT { simple_test.ghw } |> WHEN {
-                True => TEXT { 0 ns - 100 ns }
-                False => keyboard_viewport_label
-            }
+            False => keyboard_viewport_label
         }
 
     bridge_request_structural_key:
@@ -2006,14 +2375,14 @@ store: [
         }
 
     bridge_response_waveform_ref:
-        TEXT { wave:vcd:simple:0-240ns } |> HOLD bridge_response_waveform_ref {
+        TEXT { wave:vcd:simple:0-250s } |> HOLD bridge_response_waveform_ref {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:wave-27:0-240ns } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
-                elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
-                elements.load_default_file.event.press |> THEN { TEXT { wave:vcd:simple:0-240ns } }
+                elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
+                elements.load_default_file.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
                 elements.external_file_loaded_waveform_ref.text
                 elements.show_empty.event.press |> THEN { TEXT { wave:none } }
             }
@@ -2039,14 +2408,14 @@ store: [
         NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: value_format)
 
     bridge_response_descriptor_label:
-        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_counter_file.event.press |> THEN { TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } }
-                elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.load_default_file.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.cursor_left.event.press |> THEN { TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } }
+                elements.load_default_file.event.press |> THEN { TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { No response available } }
             }
         }
@@ -2060,6 +2429,13 @@ store: [
                 module: TEXT { wellen.v1 }
                 file_digest: bridge_file_digest
                 waveform_ref: bridge_waveform_ref
+                selected_file: selected_variable_file
+                timeline_metadata_file: selected_timeline_metadata_file
+                metadata_source: selected_timeline_metadata_source
+                range_source: selected_timeline_range_source
+                time_unit: selected_timeline_time_unit
+                timescale: selected_timeline_timescale
+                file_range: selected_timeline_full_range
                 scope: active_scope_key
                 signal: active_signal_key
                 zoom: zoom_level
@@ -2086,6 +2462,12 @@ store: [
                 module: TEXT { wellen.v1 }
                 file_digest: bridge_response_file_digest
                 waveform_ref: bridge_response_waveform_ref
+                timeline_metadata_file: selected_timeline_metadata_file
+                metadata_source: selected_timeline_metadata_source
+                range_source: selected_timeline_range_source
+                time_unit: selected_timeline_time_unit
+                timescale: selected_timeline_timescale
+                file_range: selected_timeline_full_range
                 scope: bridge_descriptor_scope_label(descriptor: bridge_response_descriptor_label)
                 signal: bridge_descriptor_signal_label(descriptor: bridge_response_descriptor_label)
                 zoom: bridge_descriptor_zoom_label(descriptor: bridge_response_descriptor_label)
@@ -2101,26 +2483,30 @@ store: [
         ]
 
     bridge_signal_page_label:
-        LATEST {
-            TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal }
-            elements.select_counter_file.event.press |> THEN { bridge_request_descriptor_label }
-            elements.select_uart_compare_file.event.press |> THEN { bridge_request_descriptor_label }
-            elements.select_ghw_file.event.press |> THEN { bridge_request_descriptor_label }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { no-request } }
-            elements.show_empty.event.press |> THEN { TEXT { no-request } }
+        bridge_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
+            True => TEXT { no-request }
+            False => bridge_request_descriptor_label
         }
 
     bridge_cursor_values_label:
         LATEST {
-            TEXT { clk=1 reset_n=1 data=0x2a temp=42C }
-            elements.select_counter_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+            TEXT { A=0xc B=0x5 at 50 s }
+            elements.select_counter_file.event.press |> THEN { TEXT { A=0xc B=0x5 at 50 s } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data=0x55 busy=0 at 42 ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unavailable } }
             elements.show_empty.event.press |> THEN { TEXT { unavailable } }
-            elements.load_default_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
-            elements.cursor_left.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
-            elements.cursor_right.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+            elements.load_default_file.event.press |> THEN { TEXT { A=0xc B=0x5 at 50 s } }
+            elements.cursor_left.event.press |> THEN { TEXT { A=0xa B=0x3 at 0 s } }
+            elements.cursor_right.event.press |> THEN { TEXT { A=0x0 B=0x0 at 150 s } }
+            elements.waveform_click.text |> THEN {
+                elements.waveform_click.text |> WHEN {
+                    TEXT { 0 s } => TEXT { A=0xa B=0x3 at 0 s }
+                    TEXT { 50 s } => TEXT { A=0xc B=0x5 at 50 s }
+                    TEXT { 150 s } => TEXT { A=0x0 B=0x0 at 150 s }
+                    __ => bridge_cursor_values_label
+                }
+            }
         }
 
     bridge_open_descriptor:
@@ -2133,6 +2519,12 @@ store: [
             format: bridge_file_format
             digest: bridge_file_digest
             waveform_ref: bridge_waveform_ref
+            metadata_file: active_metadata_file
+            metadata_source: active_metadata_source
+            range_source: active_metadata_range_source
+            time_unit: active_metadata_time_unit
+            timescale: active_metadata_timescale
+            file_range: active_metadata_full_range
             status: bridge_open_status
             policy: NovyBridge/data_policy_label()
         ]
@@ -2141,13 +2533,13 @@ store: [
         bridge_request_fingerprint
 
     bridge_request_compact_label_raw:
-        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label_raw {
+        TEXT { A_FIT } |> HOLD bridge_request_compact_label_raw {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.select_counter_file.event.press |> THEN { TEXT { A_FIT } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_MAIN } }
-                elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
-                elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
+                elements.select_clk.event.press |> THEN { TEXT { A_FIT } }
+                elements.select_reset.event.press |> THEN { TEXT { B_FIT } }
                 elements.select_data.event.press |> THEN {
                     data_signal_toggle_state |> WHEN {
                         On => TEXT { DATA_FIT }
@@ -2160,8 +2552,8 @@ store: [
                         signal_catalog_item.signal_elements.select_signal.event.press
                         |> THEN {
                             signal_catalog_item.key |> WHEN {
-                                clk => TEXT { CLK_FIT }
-                                reset_n => TEXT { RESET_FIT }
+                                clk => TEXT { A_FIT }
+                                reset_n => TEXT { B_FIT }
                                 data_bus => TEXT { DATA_FIT }
                                 temperature => TEXT { TEMP_FIT }
                                 __ => SKIP
@@ -2193,7 +2585,7 @@ store: [
                     A => TEXT { DATA_LEFT }
                     __ => SKIP
                 }
-                elements.load_default_file.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.load_default_file.event.press |> THEN { TEXT { A_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -2202,24 +2594,24 @@ store: [
         NovyModel/request_page(compact: bridge_request_compact_label_raw, format: value_format, zoom: zoom_level)
 
     bridge_response_compact_label:
-        TEXT { CLK_FIT } |> HOLD bridge_response_compact_label {
+        TEXT { A_FIT } |> HOLD bridge_response_compact_label {
             LATEST {
-                elements.select_counter_file.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.select_counter_file.event.press |> THEN { TEXT { A_FIT } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { CMP_UART } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { GHW_MAIN } }
-                elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.cursor_left.event.press |> THEN { TEXT { A_0S } }
                 elements.keyboard_capture.key |> WHEN {
-                    D => TEXT { CLK_FIT }
-                    Q => TEXT { DATA_36NS }
-                    S => TEXT { DATA_36NS }
-                    W => TEXT { DATA_36NS }
-                    R => TEXT { CLK_FIT }
-                    E => TEXT { DATA_36NS }
-                    A => TEXT { DATA_36NS }
+                    D => TEXT { A_FIT }
+                    Q => TEXT { A_0S }
+                    S => TEXT { A_0S }
+                    W => TEXT { A_0S }
+                    R => TEXT { A_FIT }
+                    E => TEXT { A_150S }
+                    A => TEXT { A_0S }
                     __ => SKIP
                 }
-                elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
-                elements.load_default_file.event.press |> THEN { TEXT { CLK_FIT } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { A_FIT } }
+                elements.load_default_file.event.press |> THEN { TEXT { A_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
@@ -2263,7 +2655,7 @@ FUNCTION bridge_descriptor_scope_label(descriptor) {
         TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } => TEXT { TOP_UART }
         TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { GHW_SIMPLE }
         TEXT { No response available } => TEXT { NONE }
-        __ => TEXT { TOP_CPU }
+        __ => TEXT { SIMPLE_TB_S }
     }
 }
 
@@ -2271,50 +2663,50 @@ FUNCTION bridge_descriptor_signal_label(descriptor) {
     descriptor |> WHEN {
         TEXT { TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal } => TEXT { TX_DATA }
         TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { GHW_COUNTER }
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { DATA_BUS }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => TEXT { A_SIGNAL }
         TEXT { No response available } => TEXT { NONE }
-        __ => TEXT { CLK }
+        __ => TEXT { A_SIGNAL }
     }
 }
 
 FUNCTION bridge_descriptor_zoom_label(descriptor) {
     descriptor |> WHEN {
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Close }
-        TEXT { No response available } => TEXT { None }
-        __ => TEXT { Fit }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => Close
+        TEXT { No response available } => None
+        __ => Fit
     }
 }
 
 FUNCTION bridge_descriptor_pan_label(descriptor) {
     descriptor |> WHEN {
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { RightWindow }
-        TEXT { No response available } => TEXT { None }
-        __ => TEXT { Center }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => RightWindow
+        TEXT { No response available } => None
+        __ => Center
     }
 }
 
 FUNCTION bridge_descriptor_cursor_label(descriptor) {
     descriptor |> WHEN {
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Cursor36 }
-        TEXT { No response available } => TEXT { None }
-        __ => TEXT { Cursor42 }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => Cursor36
+        TEXT { No response available } => None
+        __ => Cursor42
     }
 }
 
 FUNCTION bridge_descriptor_format_label(descriptor) {
     descriptor |> WHEN {
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { Binary }
-        TEXT { No response available } => TEXT { None }
-        __ => TEXT { Hexadecimal }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => Binary
+        TEXT { No response available } => None
+        __ => Hexadecimal
     }
 }
 
 FUNCTION bridge_descriptor_window_label(descriptor) {
     descriptor |> WHEN {
-        TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } => TEXT { 48 ns - 72 ns }
+        TEXT { SIMPLE_TB_S/A_SIGNAL/Close/RightWindow/Cursor36/Binary } => TEXT { 50 s - 150 s }
         TEXT { GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal } => TEXT { 0 ns - 100 ns }
         TEXT { No response available } => TEXT { no response window }
-        __ => TEXT { 0 ns - 120 ns }
+        __ => TEXT { 0 s - 250 s }
     }
 }
 
@@ -2345,12 +2737,17 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION new_waveform_segment(segment, store) {
+FUNCTION new_waveform_segment(segment) {
     [
+        file: segment.file
         signal_id: segment.signal_id
+        start_time_value: segment.start_time_value
+        end_time_value: segment.end_time_value
+        projection_source: RuntimeTimelineMetadata
         width: segment.state |> WHEN {
-            CursorLine => NovyModel/cursor_offset_width(cursor: store.cursor_position, zoom: store.zoom_level)
-            __ => NovyModel/zoomed_waveform_width(width: segment.width, zoom: store.zoom_level)
+            CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.selected_timeline_window_start, viewport_end: store.selected_timeline_window_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.zoom_level)
+            MarkerLine => 0
+            __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.selected_timeline_window_start, viewport_end: store.selected_timeline_window_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.zoom_level)
         }
         state: segment.state
         label: segment.label
@@ -2364,11 +2761,7 @@ FUNCTION new_marker(marker, store) {
             remove_marker: SOURCE
         ]
         label:
-            marker.label |> HOLD label {
-                LATEST {
-                    store.elements.marker_rename.event.press |> THEN { TEXT { data stable } }
-                }
-            }
+            marker.label
         has_label: True
     ]
 }
@@ -2390,8 +2783,8 @@ FUNCTION new_signal_group(group, store) {
             }
         state_label:
             collapsed |> WHEN {
-                True => TEXT { Collapsed }
-                False => TEXT { Expanded }
+                True => Collapsed
+                False => Expanded
             }
         row_count_label: TEXT { 4 grouped signals }
     ]

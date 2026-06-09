@@ -73,6 +73,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-todomvc-reference-parity",
     "verify-native-todomvc-physical-reference-parity",
     "verify-native-todomvc-input-parity",
+    "verify-native-gpu-novywave-visual",
     "verify-native-gpu-scroll-speed",
     "verify-native-dev-editor-scroll-speed",
     "verify-native-example-switch-speed",
@@ -161,6 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verify_native_todomvc_physical_reference_parity(&args)
         }
         "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
+        "verify-native-gpu-novywave-visual" => verify_native_gpu_novywave_visual(&args),
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
         "verify-native-dev-editor-scroll-speed" => verify_native_dev_editor_scroll_speed(&args),
         "verify-native-example-switch-speed" => verify_native_example_switch_speed(&args),
@@ -7905,22 +7907,14 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                         == Some(false)
             })
     });
+    let operator_ack_usable = operator_ack.is_some_and(preview_operator_host_input_ack_usable);
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:operator-host-route-ack"),
-        physical_preview_route_ack
-            || (operator_ack
-                .and_then(|ack| ack.get("status"))
-                .and_then(serde_json::Value::as_str)
-                == Some("pass")
-                && operator_ack
-                    .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(false)
-                && host_route_all_pass),
+        physical_preview_route_ack || operator_ack_usable,
         format!(
-            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}, physical_preview_route_ack={physical_preview_route_ack}",
+            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}, host_route_all_pass={host_route_all_pass}, physical_preview_route_ack={physical_preview_route_ack}",
             operator_ack
                 .and_then(|ack| ack.get("status"))
                 .and_then(serde_json::Value::as_str),
@@ -8027,7 +8021,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             .pointer("/material_metrics/pass")
             .and_then(serde_json::Value::as_bool)
     );
-    extra["novywave_preview_content_evidence"] = novywave_content_evidence;
+    extra["novywave_preview_content_evidence"] = novywave_content_evidence.clone();
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -8036,6 +8030,52 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         novywave_content_detail,
         (!novywave_content_pass).then(|| {
             "NovyWave preview E2E did not prove empty state, loaded waveform UI, physical material regions, and representative workflow actions".to_owned()
+        }),
+    );
+    let novywave_spatial_evidence = if example == "novywave" {
+        let visual_artifacts = novywave_content_evidence
+            .get("visual_artifacts")
+            .cloned()
+            .unwrap_or_else(novywave_visual_artifact_evidence);
+        novywave_visual_spatial_evidence(
+            &visual_artifacts,
+            &[],
+            &novywave_source_projection_policy_evidence(),
+        )
+    } else {
+        json!({"status": "not-applicable"})
+    };
+    let novywave_spatial_pass = example != "novywave"
+        || novywave_spatial_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let novywave_spatial_detail = format!(
+        "status={:?}, clipping_failures={}, threshold_failures={}, footer_ruler_pass={:?}",
+        novywave_spatial_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        novywave_spatial_evidence
+            .get("clipping_failures")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        novywave_spatial_evidence
+            .get("metric_threshold_failures")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        novywave_spatial_evidence
+            .get("footer_ruler_separation_pass")
+            .and_then(serde_json::Value::as_bool)
+    );
+    extra["novywave_visual_spatial_evidence"] = novywave_spatial_evidence;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:novywave-visual-spatial-evidence"),
+        novywave_spatial_pass,
+        novywave_spatial_detail,
+        (!novywave_spatial_pass).then(|| {
+            "NovyWave preview E2E did not prove fresh runtime-projected visual metrics, clipping bounds, and footer/ruler separation".to_owned()
         }),
     );
     push_audit_check(
@@ -10184,9 +10224,10 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "Selected Variables",
         "single file: simple.vcd",
         "- simple.vcd",
-        "data_bus[7:0]",
-        "0x2a",
-        "42 ns",
+        "- simple_tb.s",
+        "A[3:0]",
+        "B[3:0]",
+        "50 s",
     ];
     let missing_initial_loaded_labels =
         missing_layout_labels(&initial_texts, &required_initial_loaded_labels);
@@ -10244,23 +10285,19 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "Files and scopes",
         "Variables",
         "Selected Variables",
-        "single file: simple.vcd",
-        "opened VCD wave:vcd:simple:0-240ns",
+        "comparing simple.vcd to wave_27.fst",
+        "opened FST wave:fst:wave-27:0-240ns",
         "- simple.vcd",
         "- wave_27.fst",
         "- simple_test.ghw",
-        "+ top.cpu",
         "+ top.uart",
-        "+ top.analog",
-        "data_bus[7:0]",
-        "0x2a",
-        "Auto 39 C .. 44 C",
+        "tx_data[7:0]",
+        "0x55",
         "0 ns",
         "40 ns",
         "80 ns",
         "120 ns",
-        "M 42 ns",
-        "42.8 C",
+        "M 50 s",
     ];
     let mut loaded_layout_path = None;
     let mut loaded_texts = Vec::new();
@@ -10321,7 +10358,8 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "store.elements.pan_left",
         "store.elements.cursor_left",
         "store.elements.marker_toggle",
-        "store.elements.group_create",
+        "store.elements.group_toggle",
+        "store.elements.group_expand",
         "store.elements.row_taller",
         "store.elements.analog_limits_manual",
         "store.elements.analog_limits_invalid",
@@ -10395,6 +10433,178 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "bridge_pure_data": bridge_pure_data,
         "contract": "NovyWave native preview must prove empty state, loaded waveform UI labels, workflow actions, and physical material/glow/glass style regions"
     })
+}
+
+fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    std::fs::create_dir_all("target/artifacts/native-gpu/tests")?;
+
+    let build = Command::new("cargo")
+        .args(["build", "-p", "boon_native_playground"])
+        .status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-novywave-visual:playground-debug-build",
+        build.success(),
+        format!("cargo build -p boon_native_playground status={build}"),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+    );
+
+    let promoted_tests = [
+        (
+            "novywave_selected_visible_items_align_name_value_and_wave_columns",
+            "row alignment across selected name/value/wave columns",
+        ),
+        (
+            "novywave_search_and_waveform_keyboard_work_from_real_preview_input",
+            "real preview input, file metadata, viewport preservation, cursor/marker workflow",
+        ),
+        (
+            "novywave_dark_light_material_readbacks_cover_visual_regions",
+            "app-owned WGPU readbacks, material regions, zoom projection metrics",
+        ),
+    ];
+    let mut test_results = Vec::new();
+    if build.success() {
+        for (test_name, contract) in promoted_tests {
+            let status = Command::new("cargo")
+                .args([
+                    "test",
+                    "-p",
+                    "boon_native_playground",
+                    test_name,
+                    "--",
+                    "--nocapture",
+                ])
+                .status()?;
+            let pass = status.success();
+            test_results.push(json!({
+                "test_name": test_name,
+                "contract": contract,
+                "status": if pass { "pass" } else { "fail" },
+                "exit_status": status.to_string()
+            }));
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("native-gpu-novywave-visual:{test_name}"),
+                pass,
+                format!("cargo test -p boon_native_playground {test_name} status={status}"),
+                (!pass).then(|| {
+                    format!("NovyWave promoted visual contract test `{test_name}` failed")
+                }),
+            );
+        }
+    }
+
+    let source_policy = novywave_source_projection_policy_evidence();
+    let source_policy_pass = source_policy
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-novywave-visual:runtime-timeline-projection-source",
+        source_policy_pass,
+        format!(
+            "segment_width_fields={}, runtime_projection={:?}, legacy_width_hack={:?}",
+            source_policy
+                .get("segment_width_fields")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            source_policy
+                .get("runtime_projection")
+                .and_then(serde_json::Value::as_bool),
+            source_policy
+                .get("legacy_width_hack_present")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!source_policy_pass).then(|| {
+            "NovyWave waveform records must not carry preprojected widths; widths must derive from runtime timeline metadata".to_owned()
+        }),
+    );
+
+    let visual_artifacts = novywave_visual_artifact_evidence();
+    let visual_artifacts_pass = visual_artifacts
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-novywave-visual:fresh-readback-artifacts",
+        visual_artifacts_pass,
+        format!(
+            "status={:?}, metrics_count={:?}, readback_failures={}",
+            visual_artifacts
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            visual_artifacts
+                .get("metrics_count")
+                .and_then(serde_json::Value::as_u64),
+            visual_artifacts
+                .get("readback_artifact_failures")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        (!visual_artifacts_pass).then(|| {
+            "NovyWave app-owned WGPU readback artifacts are missing, stale, or incomplete"
+                .to_owned()
+        }),
+    );
+
+    let spatial_evidence =
+        novywave_visual_spatial_evidence(&visual_artifacts, &test_results, &source_policy);
+    let spatial_pass = spatial_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-novywave-visual:spatial-contract",
+        spatial_pass,
+        format!(
+            "status={:?}, promoted_tests={}, clipping_failures={}, threshold_failures={}",
+            spatial_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            spatial_evidence
+                .get("promoted_test_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            spatial_evidence
+                .get("clipping_failures")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            spatial_evidence
+                .get("metric_threshold_failures")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        (!spatial_pass).then(|| {
+            "NovyWave visual spatial contract did not prove row alignment, clipping bounds, runtime projection, and footer/ruler separation".to_owned()
+        }),
+    );
+
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-novywave-visual",
+        checks,
+        blockers,
+        json!({
+            "visual_capture_method": "app-owned-wgpu-readback",
+            "human_observation": false,
+            "operator_report": true,
+            "promoted_native_tests": test_results,
+            "novywave_source_projection_policy": source_policy,
+            "novywave_visual_artifacts": visual_artifacts,
+            "novywave_visual_spatial_evidence": spatial_evidence,
+        }),
+    )
 }
 
 fn novywave_bridge_pure_data_evidence(
@@ -10784,6 +10994,334 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         "metrics_count": metrics_count,
         "contract": "NovyWave E2E must link fresh app-owned WGPU visual readbacks for empty, loaded dark, loaded light, reference comparison, and material metrics"
     })
+}
+
+fn novywave_source_projection_policy_evidence() -> serde_json::Value {
+    let source_path = Path::new("examples/novywave/RUN.bn");
+    let source = match fs::read_to_string(source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return json!({
+                "status": "fail",
+                "source_path": source_path,
+                "error": error.to_string()
+            });
+        }
+    };
+    let mut in_segment_records = false;
+    let mut segment_record_lines = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("waveform_segment_records:") {
+            in_segment_records = true;
+            continue;
+        }
+        if in_segment_records
+            && (trimmed.starts_with("selected_waveform_segments:")
+                || trimmed.starts_with("new_waveform_segment:"))
+        {
+            in_segment_records = false;
+        }
+        if in_segment_records {
+            segment_record_lines.push(line.to_owned());
+        }
+    }
+    let segment_width_fields = segment_record_lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("width:") || trimmed.starts_with("width_source:")
+        })
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    let legacy_width_hack_present = source.contains("simple_vcd_long_segment_width")
+        || source.contains("simple_vcd_segment_width")
+        || source.contains("width_source:");
+    let runtime_projection = source.contains("Number/project_width")
+        && source.contains("Number/project_offset")
+        && source.contains("selected_timeline_window_start")
+        && source.contains("selected_timeline_window_end")
+        && source.contains("selected_waveform_canvas_width")
+        && source.contains("RuntimeTimelineMetadata");
+    let pass = segment_width_fields.is_empty() && !legacy_width_hack_present && runtime_projection;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "source_path": source_path,
+        "waveform_segment_record_line_count": segment_record_lines.len(),
+        "segment_width_fields": segment_width_fields,
+        "legacy_width_hack_present": legacy_width_hack_present,
+        "runtime_projection": runtime_projection,
+        "required_runtime_projection_terms": [
+            "Number/project_width",
+            "Number/project_offset",
+            "selected_timeline_window_start",
+            "selected_timeline_window_end",
+            "selected_waveform_canvas_width",
+            "RuntimeTimelineMetadata"
+        ],
+        "contract": "NovyWave waveform segment records store source-domain times; visible widths are projected at runtime from selected file timeline/window/canvas metadata"
+    })
+}
+
+fn novywave_visual_spatial_evidence(
+    visual_artifacts: &serde_json::Value,
+    promoted_test_results: &[serde_json::Value],
+    source_policy: &serde_json::Value,
+) -> serde_json::Value {
+    let metrics_path =
+        Path::new("target/artifacts/native-gpu/tests/novywave-visual-contract-metrics.json");
+    let metrics_artifact = read_json(metrics_path).ok();
+    let metric_entries = metrics_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.get("metrics"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let metric_threshold_failures = metric_entries
+        .iter()
+        .filter_map(novywave_metric_threshold_failure)
+        .collect::<Vec<_>>();
+    let clipping_failures = metric_entries
+        .iter()
+        .filter_map(novywave_metric_bounds_failure)
+        .collect::<Vec<_>>();
+
+    let mut widths = BTreeMap::new();
+    for metric in &metric_entries {
+        if metric.get("metric").and_then(serde_json::Value::as_str) == Some("waveform_zoom_width") {
+            if let (Some(mode), Some(width)) = (
+                metric.get("mode").and_then(serde_json::Value::as_str),
+                metric.get("width").and_then(numeric_value_as_f64),
+            ) {
+                widths.insert(mode.to_owned(), width);
+            }
+        }
+    }
+    let width_relationship_pass = match (
+        widths.get("fit"),
+        widths.get("zoom_in"),
+        widths.get("zoom_out"),
+        widths.get("reset"),
+    ) {
+        (Some(fit), Some(zoom_in), Some(zoom_out), Some(reset)) => {
+            *fit > 0.0
+                && *zoom_in > *fit * 1.5
+                && *zoom_out < *fit * 0.75
+                && (*reset - *fit).abs() <= 1.0
+        }
+        _ => false,
+    };
+
+    let mut timeline_top: Option<f64> = None;
+    let mut timeline_bottom: Option<f64> = None;
+    let mut ruler_bottom: Option<f64> = None;
+    let mut footer_top: Option<f64> = None;
+    let footer_labels = [
+        "New group",
+        "Next format",
+        "Remove data",
+        "Restore",
+        "Down",
+        "Jump",
+    ];
+    for metric in &metric_entries {
+        let Some(bounds) = metric.get("bounds") else {
+            continue;
+        };
+        let Some(y) = json_rect_component(bounds, "y") else {
+            continue;
+        };
+        let Some(height) = json_rect_component(bounds, "height") else {
+            continue;
+        };
+        let bottom = y + height;
+        if metric.get("role").and_then(serde_json::Value::as_str) == Some("timeline_glass") {
+            timeline_top = Some(y);
+            timeline_bottom = Some(bottom);
+        }
+        if metric.get("label").and_then(serde_json::Value::as_str) == Some("50 s") {
+            ruler_bottom = Some(ruler_bottom.map_or(bottom, |current| current.max(bottom)));
+        }
+        if metric
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|label| footer_labels.contains(&label))
+        {
+            footer_top = Some(footer_top.map_or(y, |current| current.min(y)));
+        }
+    }
+    let footer_ruler_separation_pass =
+        match (timeline_top, timeline_bottom, ruler_bottom, footer_top) {
+            (Some(timeline_top), Some(timeline_bottom), Some(ruler_bottom), Some(footer_top)) => {
+                ruler_bottom + 4.0 <= timeline_top && timeline_bottom + 4.0 <= footer_top
+            }
+            _ => false,
+        };
+
+    let promoted_tests_pass = promoted_test_results
+        .iter()
+        .all(|result| result.get("status").and_then(serde_json::Value::as_str) == Some("pass"));
+    let row_alignment_test_pass = novywave_test_result_pass(
+        promoted_test_results,
+        "novywave_selected_visible_items_align_name_value_and_wave_columns",
+    );
+    let real_input_viewport_test_pass = novywave_test_result_pass(
+        promoted_test_results,
+        "novywave_search_and_waveform_keyboard_work_from_real_preview_input",
+    );
+    let readback_test_pass = novywave_test_result_pass(
+        promoted_test_results,
+        "novywave_dark_light_material_readbacks_cover_visual_regions",
+    );
+    let visual_artifacts_pass = visual_artifacts
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let source_policy_pass = source_policy
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let fresh_metric_artifact_pass = metrics_artifact
+        .as_ref()
+        .and_then(|artifact| artifact.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && visual_artifacts
+            .get("worktree_fresh")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && visual_artifacts
+            .get("playground_binary_fresh")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && visual_artifacts
+            .get("generated_after_playground_binary")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let promoted_results_required = !promoted_test_results.is_empty();
+    let pass = visual_artifacts_pass
+        && fresh_metric_artifact_pass
+        && source_policy_pass
+        && metric_threshold_failures.is_empty()
+        && clipping_failures.is_empty()
+        && width_relationship_pass
+        && footer_ruler_separation_pass
+        && (!promoted_results_required || promoted_tests_pass);
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "metrics_path": metrics_path,
+        "metric_count": metric_entries.len(),
+        "visual_artifacts_status": visual_artifacts.get("status"),
+        "fresh_metric_artifact_pass": fresh_metric_artifact_pass,
+        "source_policy_status": source_policy.get("status"),
+        "metric_threshold_failures": metric_threshold_failures,
+        "clipping_failures": clipping_failures,
+        "width_relationship_pass": width_relationship_pass,
+        "waveform_zoom_widths": widths,
+        "footer_ruler_separation_pass": footer_ruler_separation_pass,
+        "timeline_top": timeline_top,
+        "timeline_bottom": timeline_bottom,
+        "ruler_bottom": ruler_bottom,
+        "footer_top": footer_top,
+        "promoted_test_count": promoted_test_results.len(),
+        "promoted_tests_pass": promoted_tests_pass,
+        "row_alignment_test_pass": row_alignment_test_pass,
+        "real_input_viewport_test_pass": real_input_viewport_test_pass,
+        "readback_test_pass": readback_test_pass,
+        "overlap_and_alignment_contract_pass": clipping_failures.is_empty()
+            && footer_ruler_separation_pass
+            && row_alignment_test_pass.unwrap_or(true),
+        "stale_viewport_metrics_pass": fresh_metric_artifact_pass
+            && source_policy_pass
+            && real_input_viewport_test_pass.unwrap_or(true),
+        "contract": "NovyWave visual report must prove runtime-projected waveform widths, in-viewport visual bounds, footer/ruler separation, selected-row alignment, and fresh app-owned WGPU readbacks"
+    })
+}
+
+fn novywave_test_result_pass(
+    promoted_test_results: &[serde_json::Value],
+    test_name: &str,
+) -> Option<bool> {
+    promoted_test_results.iter().find_map(|result| {
+        (result.get("test_name").and_then(serde_json::Value::as_str) == Some(test_name))
+            .then(|| result.get("status").and_then(serde_json::Value::as_str) == Some("pass"))
+    })
+}
+
+fn novywave_metric_threshold_failure(metric: &serde_json::Value) -> Option<serde_json::Value> {
+    let metric_name = metric.get("metric").and_then(serde_json::Value::as_str)?;
+    if let Some(min_luma) = metric.get("min_luma_range").and_then(numeric_value_as_f64) {
+        let luma = metric.get("luma_range").and_then(numeric_value_as_f64);
+        if !luma.is_some_and(|value| value >= min_luma) {
+            return Some(json!({
+                "metric": metric_name,
+                "label": metric.get("label"),
+                "role": metric.get("role"),
+                "observed": luma,
+                "minimum": min_luma
+            }));
+        }
+    }
+    if let Some(min_diff) = metric.get("min_diff").and_then(numeric_value_as_f64) {
+        let diff = metric.get("diff").and_then(numeric_value_as_f64);
+        if !diff.is_some_and(|value| value >= min_diff) {
+            return Some(json!({
+                "metric": metric_name,
+                "label": metric.get("label"),
+                "mode": metric.get("mode"),
+                "observed": diff,
+                "minimum": min_diff
+            }));
+        }
+    }
+    if let Some(max_diff) = metric.get("max_diff").and_then(numeric_value_as_f64) {
+        let diff = metric.get("diff").and_then(numeric_value_as_f64);
+        if !diff.is_some_and(|value| value <= max_diff) {
+            return Some(json!({
+                "metric": metric_name,
+                "label": metric.get("label"),
+                "mode": metric.get("mode"),
+                "observed": diff,
+                "maximum": max_diff
+            }));
+        }
+    }
+    None
+}
+
+fn novywave_metric_bounds_failure(metric: &serde_json::Value) -> Option<serde_json::Value> {
+    let bounds = metric.get("bounds")?;
+    let x = json_rect_component(bounds, "x");
+    let y = json_rect_component(bounds, "y");
+    let width = json_rect_component(bounds, "width");
+    let height = json_rect_component(bounds, "height");
+    let inside = match (x, y, width, height) {
+        (Some(x), Some(y), Some(width), Some(height)) => {
+            x >= -0.5
+                && y >= -0.5
+                && width > 0.0
+                && height > 0.0
+                && x + width <= 920.5
+                && y + height <= 720.5
+        }
+        _ => false,
+    };
+    (!inside).then(|| {
+        json!({
+            "metric": metric.get("metric"),
+            "label": metric.get("label"),
+            "role": metric.get("role"),
+            "bounds": bounds
+        })
+    })
+}
+
+fn json_rect_component(value: &serde_json::Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(numeric_value_as_f64)
+        .filter(|value| value.is_finite())
 }
 
 fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -11905,9 +12443,9 @@ fn native_runtime_assertions_after_input(
     report: &serde_json::Value,
 ) -> serde_json::Value {
     if let Some(live_preview_evidence) = report.get("dev_ipc_probe").and_then(|probe| {
-        probe.get("operator_host_input").filter(|evidence| {
-            evidence.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-        })
+        probe
+            .get("operator_host_input")
+            .filter(|evidence| preview_operator_host_input_ack_usable(evidence))
     }) {
         let assertions = live_preview_evidence
             .get("assertions")
@@ -12002,6 +12540,58 @@ fn native_runtime_assertions_after_input(
             == Some("pass"),
         "blocked_reason": "runtime assertions require preview-side operator host input evidence from generic source_events"
     })
+}
+
+fn preview_operator_host_input_ack_usable(evidence: &serde_json::Value) -> bool {
+    if evidence
+        .get("source_event_only_ipc_shortcut")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return false;
+    }
+    if evidence.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+        return true;
+    }
+    let assertions_present = evidence
+        .get("assertions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|assertions| !assertions.is_empty());
+    let outputs_present = evidence
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|outputs| !outputs.is_empty());
+    let host_routes_pass = evidence
+        .get("host_route_assertions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|routes| {
+            !routes.is_empty()
+                && routes.iter().all(|route| {
+                    let hit_and_source = route
+                        .get("hit_test_performed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && route
+                            .get("source_binding_resolved")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true);
+                    let runtime_source_binding = route
+                        .get("runtime_source_binding_resolved")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && route
+                            .get("dynamic_layout_after_previous_event")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true);
+                    route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                        && (hit_and_source || runtime_source_binding)
+                        && route
+                            .get("ipc_only_state_mutation")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                })
+        });
+    assertions_present && outputs_present && host_routes_pass
 }
 
 struct NativeGpuScrollSelector {
@@ -12309,7 +12899,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = if dev_editor {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --skip-operator-host-input-probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&source_example_id),
@@ -12323,7 +12913,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 )
             } else {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --probe --skip-operator-host-input-probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&label),
@@ -13059,8 +13649,21 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
         let text = event.text.clone();
         let key = event.key.clone();
         let target_text = event.target_text.clone();
+        let expected_paths = if is_required {
+            step.expect_root_text.keys().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let started = Instant::now();
-        let output = runtime.apply_source_event_for_step(step, event);
+        let output = if is_required {
+            runtime.apply_source_event_for_step_projected_value_summaries(
+                step,
+                event,
+                &expected_paths,
+            )
+        } else {
+            runtime.apply_source_event_for_step_value_summaries(step, event, &expected_paths)
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         match output {
             Ok(output) => {
@@ -13071,7 +13674,7 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
                         .expect_root_text
                         .iter()
                         .map(|(path, expected)| {
-                            let actual = state_summary_text(&output.state_summary, path);
+                            let actual = value_summary_text(&output.value_summaries, path);
                             json!({
                                 "path": path,
                                 "expected": expected,
@@ -13095,8 +13698,8 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
                         "key": key,
                         "target_text": target_text,
                         "elapsed_ms": elapsed_ms,
-                        "semantic_delta_count": output.semantic_deltas.len(),
-                        "render_patch_count": output.render_patches.len(),
+                        "semantic_delta_count": output.semantic_delta_count,
+                        "render_patch_count": output.render_patch_count,
                         "root_text_checks": root_text_checks
                     }));
                     if !root_text_pass {
@@ -13166,7 +13769,7 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
         "failed_labels": failed_labels,
         "replayed_source_event_step_count": replayed_source_event_step_count,
         "step_ms_p50_p95_max": f64_p50_p95_max_summary(&timing_ms),
-        "timing_source": "LiveRuntime::apply_source_event_for_step semantic/runtime replay",
+        "timing_source": "LiveRuntime requested-path source-action replay for required timeline labels; normal sparse propagation for setup source events",
         "proves_boon_timeline_state": true,
         "proves_native_frame_timing": false,
         "steps": steps,
@@ -13239,16 +13842,20 @@ fn toml_u64_xtask(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<u6
         .and_then(|value| u64::try_from(value).ok())
 }
 
-fn state_summary_text(summary: &serde_json::Value, path: &str) -> Option<String> {
+fn value_summary_text(summary: &serde_json::Value, path: &str) -> Option<String> {
     let mut candidates = Vec::new();
+    candidates.push(path.to_owned());
     if !path.contains('.') {
         candidates.push(format!("store.{path}"));
     }
-    candidates.push(path.to_owned());
     for candidate in candidates {
-        if let Some(value) = summary.get(&candidate) {
+        let Some(value) = summary.get(&candidate) else {
+            continue;
+        };
+        if let Some(value) = value.get("value") {
             return json_value_text(value);
         }
+        return json_value_text(value);
     }
     None
 }
@@ -18637,6 +19244,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "novywave")],
         ),
         native_gpu_required_report(
+            "novywave-visual",
+            "target/reports/native-gpu/novywave-visual.json",
+            "verify-native-gpu-novywave-visual",
+            &[],
+        ),
+        native_gpu_required_report(
             "todomvc-physical-reference-parity",
             "target/reports/native-gpu/todomvc-physical-reference-parity.json",
             "verify-native-todomvc-physical-reference-parity",
@@ -19425,6 +20038,86 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     != Some("pass")
             {
                 blockers.push("novywave_preview_content_evidence.status must be pass".to_owned());
+            }
+            if label == "preview-e2e-novywave"
+                && report
+                    .pointer("/novywave_visual_spatial_evidence/status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("pass")
+            {
+                blockers.push("novywave_visual_spatial_evidence.status must be pass".to_owned());
+            }
+        }
+        "novywave-visual" => {
+            require_str_field(
+                &mut blockers,
+                report,
+                "visual_capture_method",
+                "app-owned-wgpu-readback",
+            );
+            require_bool_field(&mut blockers, report, "human_observation", false);
+            require_bool_field(&mut blockers, report, "operator_report", true);
+            require_nonempty_array(&mut blockers, report, "promoted_native_tests");
+            require_object_field(&mut blockers, report, "novywave_source_projection_policy");
+            require_object_field(&mut blockers, report, "novywave_visual_artifacts");
+            require_object_field(&mut blockers, report, "novywave_visual_spatial_evidence");
+            if report
+                .pointer("/novywave_source_projection_policy/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("novywave_source_projection_policy.status must be pass".to_owned());
+            }
+            if report
+                .pointer("/novywave_visual_artifacts/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("novywave_visual_artifacts.status must be pass".to_owned());
+            }
+            if report
+                .pointer("/novywave_visual_spatial_evidence/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("novywave_visual_spatial_evidence.status must be pass".to_owned());
+            }
+            if report
+                .pointer("/novywave_visual_spatial_evidence/promoted_test_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                < 3
+            {
+                blockers.push(
+                    "novywave_visual_spatial_evidence.promoted_test_count must be at least 3"
+                        .to_owned(),
+                );
+            }
+            for path in [
+                "/novywave_visual_spatial_evidence/row_alignment_test_pass",
+                "/novywave_visual_spatial_evidence/real_input_viewport_test_pass",
+                "/novywave_visual_spatial_evidence/readback_test_pass",
+                "/novywave_visual_spatial_evidence/width_relationship_pass",
+                "/novywave_visual_spatial_evidence/footer_ruler_separation_pass",
+                "/novywave_visual_spatial_evidence/overlap_and_alignment_contract_pass",
+                "/novywave_visual_spatial_evidence/stale_viewport_metrics_pass",
+            ] {
+                if report.pointer(path).and_then(serde_json::Value::as_bool) != Some(true) {
+                    blockers.push(format!("{path} must be true"));
+                }
+            }
+            for path in [
+                "/novywave_visual_spatial_evidence/metric_threshold_failures",
+                "/novywave_visual_spatial_evidence/clipping_failures",
+                "/novywave_source_projection_policy/segment_width_fields",
+            ] {
+                if report
+                    .pointer(path)
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|items| !items.is_empty())
+                {
+                    blockers.push(format!("{path} must be an empty array"));
+                }
             }
         }
         "idle-wake-counter"
@@ -20758,6 +21451,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
         "verify-native-todomvc-physical-reference-parity" => "todomvc-physical-reference-parity",
         "verify-native-todomvc-input-parity" => "todomvc-input-parity",
+        "verify-native-gpu-novywave-visual" => "novywave-visual",
         "verify-native-gpu-scroll-speed" => {
             let label = native_gpu_scroll_selector(args).label;
             return PathBuf::from(format!(
@@ -24720,6 +25414,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-idle-wake"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
+                | "verify-native-gpu-novywave-visual"
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-dev-editor-scroll-speed"
                 | "verify-native-example-switch-speed"

@@ -3319,6 +3319,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/space",
                 "Text/trim",
                 "Text/concat",
+                "Text/time_range_label",
                 "Text/substring",
                 "List/join_field",
                 "Error/text",
@@ -3331,6 +3332,8 @@ impl Default for BuiltinSignatureRegistry {
             number_functions: [
                 "Number/add",
                 "Number/subtract",
+                "Number/project_width",
+                "Number/project_offset",
                 "List/count",
                 "List/length",
                 "List/sum",
@@ -4559,7 +4562,13 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if matches!(
                 function.as_str(),
-                "List/count" | "List/sum" | "Text/find" | "Text/length" | "Text/to_number"
+                "Number/project_width"
+                    | "Number/project_offset"
+                    | "List/count"
+                    | "List/sum"
+                    | "Text/find"
+                    | "Text/length"
+                    | "Text/to_number"
             ) =>
         {
             Type::Number
@@ -4571,6 +4580,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Text/space"
                     | "Text/trim"
                     | "Text/concat"
+                    | "Text/time_range_label"
                     | "Text/substring"
                     | "Error/text"
                     | "Router/route"

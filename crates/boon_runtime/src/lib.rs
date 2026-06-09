@@ -2282,6 +2282,7 @@ impl LoadedRuntime {
         let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
+        generic.generic_derived_state.root_value_cache.clear();
         let mut summary = generic.generic_summary();
         generic.insert_list_projection_summary(&mut summary);
         summary
@@ -2291,6 +2292,7 @@ impl LoadedRuntime {
         let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
+        generic.generic_derived_state.root_value_cache.clear();
         generic.document_summary()
     }
 
@@ -2316,6 +2318,7 @@ impl LoadedRuntime {
         let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
+        generic.generic_derived_state.root_value_cache.clear();
         generic.document_summary_for_window(row_start, row_count, column_start, column_count)
     }
 
@@ -7550,6 +7553,16 @@ impl GenericScheduledRuntime {
         if let Some(value) = self.root_pure_derived_boon_value(name, frame)? {
             return Ok(value);
         }
+        let store_name = format!("store.{name}");
+        if let Some(value) = self.root_pure_derived_boon_value(&store_name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_non_list_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_non_list_derived_boon_value(&store_name, frame)? {
+            return Ok(value);
+        }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
             frame.reads.insert(GenericReadKey::Root {
                 field: name.to_owned(),
@@ -7589,6 +7602,9 @@ impl GenericScheduledRuntime {
             return Ok(value);
         }
         if let Some(value) = self.root_pure_derived_boon_value(&full_path, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_non_list_derived_boon_value(&full_path, frame)? {
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(&full_path) {
@@ -7823,6 +7839,24 @@ impl GenericScheduledRuntime {
                         start + ((end - start) * numerator) / denominator,
                     ))
                 }
+            }
+            "Number/min" => {
+                let left = self
+                    .named_or_positional_arg_value(args, "left", 0, frame)?
+                    .number()?;
+                let right = self
+                    .named_or_positional_arg_value(args, "right", 1, frame)?
+                    .number()?;
+                Ok(BoonValue::Number(left.min(right)))
+            }
+            "Number/max" => {
+                let left = self
+                    .named_or_positional_arg_value(args, "left", 0, frame)?
+                    .number()?;
+                let right = self
+                    .named_or_positional_arg_value(args, "right", 1, frame)?
+                    .number()?;
+                Ok(BoonValue::Number(left.max(right)))
             }
             "Number/project_width" => {
                 let start = self
@@ -8087,11 +8121,15 @@ impl GenericScheduledRuntime {
             }
             "List/length" => {
                 let list = self.call_input_or_first(input, args, frame)?;
-                Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
+                Ok(BoonValue::Number(
+                    self.list_values_for_iteration(list, frame)?.len() as i64,
+                ))
             }
             "List/is_not_empty" => {
                 let list = self.call_input_or_first(input, args, frame)?;
-                Ok(BoonValue::Bool(self.list_len_for_value(list)? > 0))
+                Ok(BoonValue::Bool(
+                    !self.list_values_for_iteration(list, frame)?.is_empty(),
+                ))
             }
             "List/map" => {
                 let list = self.call_input_or_first(input, args, frame)?;
@@ -8398,7 +8436,7 @@ impl GenericScheduledRuntime {
         empty_value: Option<BoonValue>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = self.list_values_for_iteration(list)?;
+        let values = self.list_values_for_iteration(list, frame)?;
         let needle = normalized_search_text(&needle.as_text().unwrap_or_default());
         let empty_value = empty_value
             .and_then(|value| value.as_text())
@@ -8453,7 +8491,7 @@ impl GenericScheduledRuntime {
         equal: bool,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = self.list_values_for_iteration(list)?;
+        let values = self.list_values_for_iteration(list, frame)?;
         let expected = value.as_text().unwrap_or_default();
         let mut output = Vec::new();
         for value in values {
@@ -8472,7 +8510,7 @@ impl GenericScheduledRuntime {
         first: bool,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = self.list_values_for_iteration(list)?;
+        let values = self.list_values_for_iteration(list, frame)?;
         let expected = value.as_text().unwrap_or_default();
         let mut matched = Vec::new();
         let mut rest = Vec::new();
@@ -8502,7 +8540,7 @@ impl GenericScheduledRuntime {
         empty: BoonValue,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = self.list_values_for_iteration(list)?;
+        let values = self.list_values_for_iteration(list, frame)?;
         let separator = separator.as_text().unwrap_or_else(|| ",".to_owned());
         let mut parts = Vec::new();
         for value in values {
@@ -8517,7 +8555,11 @@ impl GenericScheduledRuntime {
         Ok(BoonValue::Text(parts.join(&separator)))
     }
 
-    fn list_values_for_iteration(&self, list: BoonValue) -> RuntimeResult<Vec<BoonValue>> {
+    fn list_values_for_iteration(
+        &mut self,
+        list: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Vec<BoonValue>> {
         match list {
             BoonValue::List(values) => Ok(values),
             BoonValue::ListRef(list) => {
@@ -8528,6 +8570,26 @@ impl GenericScheduledRuntime {
                         index,
                     })
                     .collect())
+            }
+            BoonValue::Text(path) => {
+                match self.root_derived_boon_value(&path, frame)?.or_else(|| {
+                    let store_path = format!("store.{path}");
+                    self.root_derived_boon_value(&store_path, frame)
+                        .ok()
+                        .flatten()
+                }) {
+                    Some(BoonValue::List(values)) => Ok(values),
+                    Some(BoonValue::ListRef(list)) => {
+                        let len = self.storage.list_len(&list)?;
+                        Ok((0..len)
+                            .map(|index| BoonValue::RowRef {
+                                list: list.clone(),
+                                index,
+                            })
+                            .collect())
+                    }
+                    _ => Ok(Vec::new()),
+                }
             }
             _ => Ok(Vec::new()),
         }
@@ -8670,19 +8732,7 @@ impl GenericScheduledRuntime {
         new_expr: usize,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = match list {
-            BoonValue::List(values) => values,
-            BoonValue::ListRef(list) => {
-                let len = self.storage.list_len(&list)?;
-                (0..len)
-                    .map(|index| BoonValue::RowRef {
-                        list: list.clone(),
-                        index,
-                    })
-                    .collect()
-            }
-            _ => return Ok(BoonValue::Error("type_error".to_owned())),
-        };
+        let values = self.list_values_for_iteration(list, frame)?;
         let mut output = Vec::with_capacity(values.len());
         let previous = frame.env.get(binding).cloned();
         for value in values {
@@ -9269,6 +9319,23 @@ impl GenericScheduledRuntime {
             return Ok(None);
         };
         if !matches!(plan.kind, DerivedValueKind::Pure) {
+            return Ok(None);
+        }
+        match self.root_derived_boon_value(path, frame)? {
+            Some(BoonValue::List(_) | BoonValue::ListRef(_)) => Ok(None),
+            value => Ok(value),
+        }
+    }
+
+    fn root_non_list_derived_boon_value(
+        &mut self,
+        path: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        let Some(plan) = self.generic_derived.root_field_plan(path) else {
+            return Ok(None);
+        };
+        if matches!(plan.kind, DerivedValueKind::ListView) {
             return Ok(None);
         }
         self.root_derived_boon_value(path, frame)
@@ -14913,9 +14980,14 @@ impl GenericDerivedPlan {
     }
 
     fn root_field_plan(&self, path: &str) -> Option<&GenericDerivedRootField> {
-        self.root_fields
-            .iter()
-            .find(|field| field.path == path || row_field_name(&field.path) == path)
+        let local_store_path = path.strip_prefix("store.");
+        self.root_fields.iter().find(|field| {
+            field.path == path
+                || row_field_name(&field.path) == path
+                || local_store_path.is_some_and(|local| {
+                    field.path == local || row_field_name(&field.path) == local
+                })
+        })
     }
 
     fn contains_field(&self, list: &str, field: &str) -> bool {
@@ -19988,10 +20060,14 @@ store: [
         }
     search_results:
         signals |> List/filter_text_contains(field: "name", needle: search_text, prefer_field: "family", empty_field: "scope", empty_value: active_scope_label)
+    search_result_labels:
+        search_results |> List/map(signal, new: signal_label(signal: signal))
     search_results_count:
         search_results |> List/length()
     search_results_key_summary:
         search_results |> List/join_field(field: "key", separator: ",", empty: "none")
+    search_results_label_summary:
+        search_result_labels |> List/join_field(field: "label", separator: " ", empty: "none")
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Search }))
@@ -20004,6 +20080,12 @@ FUNCTION new_signal(signal) {
         family: signal.family
     ]
 }
+
+FUNCTION signal_label(signal) {
+    [
+        label: signal.key |> Text/concat(with: signal.scope, separator: "@")
+    ]
+}
 "#;
         let mut runtime = LiveRuntime::from_source("derived-list-search", source).unwrap();
         let initial = runtime.state_summary();
@@ -20011,6 +20093,10 @@ FUNCTION new_signal(signal) {
         assert_eq!(
             initial["store"]["search_results_key_summary"],
             "clk,data_bus"
+        );
+        assert_eq!(
+            initial["store"]["search_results_label_summary"],
+            "clk@top.cpu data_bus@top.cpu"
         );
         assert_eq!(initial["store"]["search_results"][0]["key"], "clk");
         assert_eq!(initial["store"]["signals"][0]["key"], "clk");
@@ -20033,6 +20119,10 @@ FUNCTION new_signal(signal) {
             scoped["store"]["search_results_key_summary"],
             "tx_data,uart_busy"
         );
+        assert_eq!(
+            scoped["store"]["search_results_label_summary"],
+            "tx_data@top.uart uart_busy@top.uart"
+        );
 
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -20044,6 +20134,10 @@ FUNCTION new_signal(signal) {
         let searched = runtime.state_summary();
         assert_eq!(searched["store"]["search_results_count"], 1);
         assert_eq!(searched["store"]["search_results_key_summary"], "tx_data");
+        assert_eq!(
+            searched["store"]["search_results_label_summary"],
+            "tx_data@top.uart"
+        );
         assert_eq!(searched["store"]["search_results"][0]["key"], "tx_data");
         assert_eq!(searched["store"]["search_results"][0]["scope"], "top.uart");
 
@@ -22226,6 +22320,37 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             .expect("NovyWave runtime should initialize");
 
         let initial = runtime.state_summary();
+        let waveform_value_labels = |summary: &serde_json::Value, signal_id: &str| -> Vec<String> {
+            summary["store"]["selected_waveform_segments"]
+                .as_array()
+                .expect("selected waveform segments should be an array")
+                .iter()
+                .filter(|segment| segment["signal_id"].as_str() == Some(signal_id))
+                .filter(|segment| {
+                    !matches!(segment["state"].as_str(), Some("CursorLine" | "MarkerLine"))
+                })
+                .filter_map(|segment| segment["label"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let waveform_value_width =
+            |summary: &serde_json::Value, signal_id: &str, label: &str| -> i64 {
+                summary["store"]["selected_waveform_segments"]
+                    .as_array()
+                    .expect("selected waveform segments should be an array")
+                    .iter()
+                    .find_map(|segment| {
+                        let matches_signal = segment["signal_id"].as_str() == Some(signal_id);
+                        let matches_label = segment["label"].as_str() == Some(label);
+                        (matches_signal && matches_label).then(|| {
+                            segment["width"]
+                                .as_i64()
+                                .unwrap_or_else(|| panic!("segment width should be numeric"))
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("missing selected waveform segment signal={signal_id} label={label}")
+                    })
+            };
         assert_eq!(initial["store"]["selected_variable_file"], "simple.vcd");
         assert_eq!(initial["store"]["active_metadata_file"], "simple.vcd");
         assert_eq!(initial["store"]["bridge_file_format"], "VCD");
@@ -22248,6 +22373,10 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             initial["store"]["selected_rows_order_label"],
             "A[3:0], B[3:0]"
         );
+        assert_eq!(
+            initial["store"]["bridge_cursor_values_label"],
+            "A[3:0]=0xc B[3:0]=0x5 at 50 s"
+        );
         assert_eq!(initial["store"]["startup_selected_file"], "simple.vcd");
         assert_eq!(
             initial["store"]["startup_selected_file_path"],
@@ -22266,13 +22395,11 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             "projection from startup timeline metadata: segment widths derive from start/end/window/canvas at runtime"
         );
         assert_eq!(
-            initial["store"]["selected_waveform_segments"][1]["width"],
-            72
+            waveform_value_labels(&initial, "clk"),
+            ["0xa", "0xc", "0x0"]
         );
-        assert_eq!(
-            initial["store"]["selected_waveform_segments"][3]["width"],
-            144
-        );
+        assert_eq!(waveform_value_width(&initial, "clk", "0xa"), 72);
+        assert_eq!(waveform_value_width(&initial, "clk", "0xc"), 144);
 
         let zoomed = runtime
             .apply_source_event(LiveSourceEvent {
@@ -22289,6 +22416,23 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
         );
         assert_eq!(zoomed["store"]["viewport_label"], "0 s - 150 s");
         assert_eq!(zoomed["store"]["keyboard_viewport_label"], "0 s - 150 s");
+        assert_eq!(waveform_value_labels(&zoomed, "clk"), ["0xa", "0xc"]);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0xa"), 120);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0xc"), 240);
+
+        let closer = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.zoom_in".to_owned(),
+                target_text: Some("Zoom+".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("second zoom-in should apply")
+            .state_summary;
+        assert_eq!(closer["store"]["zoom_level"], "Closer");
+        assert_eq!(closer["store"]["viewport_label"], "40 s - 80 s");
+        assert_eq!(waveform_value_labels(&closer, "clk"), ["0xa", "0xc"]);
+        assert_eq!(waveform_value_width(&closer, "clk", "0xa"), 90);
+        assert_eq!(waveform_value_width(&closer, "clk", "0xc"), 270);
 
         runtime
             .apply_source_event(LiveSourceEvent {

@@ -4145,7 +4145,17 @@ fn collect_function_definitions(
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
     if field.has_operator("List/count") || field.has_operator("List/every") {
         DerivedValueKind::Aggregate
-    } else if field.has_any_operator(&["List/retain", "List/map", "List/chunk", "List/find"]) {
+    } else if field.has_any_operator(&[
+        "List/retain",
+        "List/map",
+        "List/chunk",
+        "List/find",
+        "List/filter_text_contains",
+        "List/filter_field_equal",
+        "List/filter_field_not_equal",
+        "List/move_field_first",
+        "List/move_field_last",
+    ]) {
         DerivedValueKind::ListView
     } else if !sources.is_empty() || field.has_then_expr() {
         DerivedValueKind::SourceEventTransform
@@ -5106,7 +5116,13 @@ fn count_or_retain_source_list(field: &FieldDef, program: &ParsedProgram) -> Opt
                 if op == "List/count" || op == "List/retain" || op == "List/every"
         )
     })?;
-    source_list_from_expr(field, count_or_retain.id)
+    let source = source_list_from_expr(field, count_or_retain.id)?;
+    let list_name = source.strip_prefix("store.").unwrap_or(&source);
+    program
+        .list_memories
+        .iter()
+        .any(|list| list.name == list_name)
+        .then(|| list_name.to_owned())
 }
 
 fn source_list_from_expr(field: &FieldDef, expr_id: usize) -> Option<String> {
@@ -9337,6 +9353,51 @@ document:
                             path: "entry.completed".to_owned(),
                         },
                     }
+        }));
+    }
+
+    #[test]
+    fn derived_retain_views_do_not_register_as_list_memory_operations() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+store:
+    active_file:
+        TEXT { simple.vcd }
+    viewport_label_start:
+        0
+    waveform_segment_records:
+        [
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 0, end_time_value: 50, label: TEXT { 0xa }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, start_time_value: 50, end_time_value: 150, label: TEXT { 0xc }]
+        ]
+    selected_waveform_segments:
+        waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/retain(segment, if: segment.end_time_value > viewport_label_start)
+        |> List/map(segment, new: segment)
+document:
+    children:
+        []
+"#;
+        let parsed = boon_parser::parse_source("derived-retain-view.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        verify_static_schedule(&ir).unwrap();
+        assert!(
+            ir.list_operations.iter().all(|operation| {
+                operation.list != "waveform_segment_records"
+                    && !matches!(
+                        operation.kind,
+                        ListOperationKind::Retain { ref target, .. }
+                            if target == "store.selected_waveform_segments"
+                    )
+            }),
+            "derived retain/map views should stay derived values, not scheduled list memory operations"
+        );
+        assert!(ir.derived_values.iter().any(|value| {
+            value.path == "store.selected_waveform_segments"
+                && value.kind == DerivedValueKind::ListView
         }));
     }
 }

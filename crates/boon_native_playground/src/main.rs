@@ -26988,7 +26988,10 @@ fn preview_apply_live_events(
             event_count = event_count.saturating_add(expanded_events.len() as u64);
             for expanded_event in expanded_events {
                 let output = runtime.apply_source_event_turn(expanded_event)?;
-                changed |= !output.semantic_deltas.is_empty() || !output.render_patches.is_empty();
+                changed |= !output.semantic_deltas.is_empty()
+                    || !output.render_patches.is_empty()
+                    || output.dirty_key_count > 0
+                    || output.recomputed_field_count > 0;
                 runtime_step_apply_ms += output.apply_step_ms;
                 runtime_dirty_key_count =
                     runtime_dirty_key_count.saturating_add(output.dirty_key_count as u64);
@@ -27038,23 +27041,36 @@ fn preview_apply_live_events(
                 }
             }
         }
+        if !novywave_hover_only && event_count > 0 {
+            changed = true;
+        }
         let state_summary = changed.then(|| {
             let patch_started = Instant::now();
-            if let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
-                patched_window_state_summary_for_render_patches(summary, &render_patches_for_layout)
-            }) {
+            if !render_patches_for_layout.is_empty()
+                && let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
+                    patched_window_state_summary_for_render_patches(
+                        summary,
+                        &render_patches_for_layout,
+                    )
+                })
+            {
                 summary_source = "patched_previous_window";
                 runtime_state_summary_ms += elapsed_ms(patch_started);
                 return patched;
             }
-            summary_source = "post_turn_window";
             let summary_started = Instant::now();
-            let summary = runtime.document_state_summary_for_window(
-                row_start,
-                row_count,
-                column_start,
-                column_count,
-            );
+            let summary = if render_patches_for_layout.is_empty() {
+                summary_source = "post_turn_full_document";
+                runtime.document_state_summary()
+            } else {
+                summary_source = "post_turn_window";
+                runtime.document_state_summary_for_window(
+                    row_start,
+                    row_count,
+                    column_start,
+                    column_count,
+                )
+            };
             runtime_state_summary_ms += elapsed_ms(summary_started);
             summary
         });
@@ -27111,15 +27127,16 @@ fn preview_apply_live_events(
     let Some(state_summary) = state_summary.as_ref() else {
         return Err("changed preview turn did not produce a state summary".into());
     };
-    if let Some((patched_layout, patched_frame, patched_target_count)) =
-        preview_try_patch_document_layout_for_root_deltas(
-            &previous_layout_proof,
-            state_summary,
-            &render_patches_for_layout,
-            viewport,
-            scroll_x_px,
-            scroll_y_px,
-        )?
+    if preview_document_patch_fast_path_allowed(&render_patches_for_layout)
+        && let Some((patched_layout, patched_frame, patched_target_count)) =
+            preview_try_patch_document_layout_for_root_deltas(
+                &previous_layout_proof,
+                state_summary,
+                &render_patches_for_layout,
+                viewport,
+                scroll_x_px,
+                scroll_y_px,
+            )?
     {
         let layout_rebuild_ms = elapsed_ms(layout_started);
         let shared_update_started = Instant::now();
@@ -28970,6 +28987,14 @@ fn preview_try_patch_document_layout_for_root_deltas(
         },
     );
     Ok(Some((proof, layout, patched_targets)))
+}
+
+fn preview_document_patch_fast_path_allowed(
+    _patches: &[boon_runtime::RenderPatch<'static>],
+) -> bool {
+    // Data-binding patches do not yet carry structural invalidation metadata.
+    // Rebuild the document tree so conditional nodes and hit regions cannot stay stale.
+    false
 }
 
 fn preview_note_render_error(
@@ -33950,13 +33975,8 @@ mod tests {
         }));
         let mut clear_input_state = PreviewNativeInputState::default();
         assert!(
-            preview_update_hover_from_input(
-                &layout_proof,
-                &clear_hover,
-                &clear_shared_render_state,
-                &mut clear_input_state
-            )
-            .expect("physical Clear completed hover overlay should update")
+            preview_update_hover_from_input(&layout_proof, &clear_hover, &mut clear_input_state)
+                .expect("physical Clear completed hover overlay should update")
         );
         let hovered_clear_completed = clear_shared_render_state
             .lock()
@@ -35422,7 +35442,6 @@ mod tests {
                             preview_update_hover_from_input(
                                 &layout_proof,
                                 &hover_input,
-                                &shared_render_state,
                                 &mut input_state
                             )
                             .expect("theme switcher hover overlay should update")
@@ -40218,23 +40237,11 @@ mod tests {
                 window_width: 920.0,
                 window_height: 720.0,
             });
-        let text_input_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-            layout_proof: layout_proof.clone(),
-            layout_frame_override: Some(layout.clone()),
-            update_count: 0,
-            scroll_x_px: 0.0,
-            scroll_y_px: 0.0,
-            last_error: None,
-            last_error_count: 0,
-            status_overlay: None,
-            last_dirty_reason: None,
-        }));
         let mut text_input_state = PreviewNativeInputState::default();
         assert!(
             preview_update_hover_from_input(
                 &layout_proof,
                 &text_input_hover,
-                &text_input_shared_render_state,
                 &mut text_input_state
             )
             .expect("text input hover overlay should update")
@@ -40523,13 +40530,8 @@ mod tests {
         }));
         let mut filter_input_state = PreviewNativeInputState::default();
         assert!(
-            preview_update_hover_from_input(
-                &layout_proof,
-                &filter_hover,
-                &filter_shared_render_state,
-                &mut filter_input_state
-            )
-            .expect("filter hover overlay should update")
+            preview_update_hover_from_input(&layout_proof, &filter_hover, &mut filter_input_state)
+                .expect("filter hover overlay should update")
         );
         let hovered_active_filter = filter_shared_render_state
             .lock()
@@ -40563,26 +40565,10 @@ mod tests {
             window_width: 920.0,
             window_height: 720.0,
         });
-        let link_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-            layout_proof: layout_proof.clone(),
-            layout_frame_override: Some(layout.clone()),
-            update_count: 0,
-            scroll_x_px: 0.0,
-            scroll_y_px: 0.0,
-            last_error: None,
-            last_error_count: 0,
-            status_overlay: None,
-            last_dirty_reason: None,
-        }));
         let mut link_input_state = PreviewNativeInputState::default();
         assert!(
-            preview_update_hover_from_input(
-                &layout_proof,
-                &link_hover,
-                &link_shared_render_state,
-                &mut link_input_state
-            )
-            .expect("footer link hover overlay should update")
+            preview_update_hover_from_input(&layout_proof, &link_hover, &mut link_input_state)
+                .expect("footer link hover overlay should update")
         );
         assert_eq!(
             preview_cursor_icon(&layout_proof, &link_input_state),
@@ -40682,7 +40668,7 @@ mod tests {
             "a changed app-owned mouse position must wake hover even without a new motion counter"
         );
         assert!(
-            preview_update_hover_from_input(&proof, &hover, &shared_render_state, &mut input_state)
+            preview_update_hover_from_input(&proof, &hover, &mut input_state)
                 .expect("hover overlay should update")
         );
         let shared = shared_render_state.lock().expect("render state");
@@ -40752,13 +40738,8 @@ mod tests {
         }));
         let mut delete_input_state = PreviewNativeInputState::default();
         assert!(
-            preview_update_hover_from_input(
-                &layout_proof,
-                &delete_hover,
-                &delete_shared_render_state,
-                &mut delete_input_state
-            )
-            .expect("delete hover overlay should update")
+            preview_update_hover_from_input(&layout_proof, &delete_hover, &mut delete_input_state)
+                .expect("delete hover overlay should update")
         );
         let direct_hover_delete = delete_shared_render_state
             .lock()
@@ -43995,13 +43976,8 @@ mod tests {
             }));
             let mut input_state = PreviewNativeInputState::default();
             assert!(
-                preview_update_hover_from_input(
-                    &layout_proof,
-                    &hover_input,
-                    &shared_render_state,
-                    &mut input_state,
-                )
-                .expect("NovyWave hover overlay should update"),
+                preview_update_hover_from_input(&layout_proof, &hover_input, &mut input_state,)
+                    .expect("NovyWave hover overlay should update"),
                 "{context} should change the preview frame on first hover"
             );
             assert_eq!(
@@ -44288,13 +44264,8 @@ mod tests {
             );
             let mut hover_input = deterministic_click_input(0, x, y);
             hover_input.mouse_motion_event_count = 1;
-            preview_update_hover_from_input(
-                &initial_proof,
-                &hover_input,
-                &shared_render_state,
-                &mut input_state,
-            )
-            .expect("hovering divider should update native hover state");
+            preview_update_hover_from_input(&initial_proof, &hover_input, &mut input_state)
+                .expect("hovering divider should update native hover state");
             assert_eq!(
                 preview_cursor_icon(&initial_proof, &input_state),
                 expected_icon,
@@ -45169,6 +45140,37 @@ mod tests {
             search_summary.pointer("/store/search_result_label"),
             Some(&json!("1 result: tx_data[7:0]"))
         );
+        preview_apply_live_event(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            boon_runtime::LiveSourceEvent {
+                source: "store.elements.signal_search_input".to_owned(),
+                text: Some(String::new()),
+                ..boon_runtime::LiveSourceEvent::default()
+            },
+        )
+        .expect("clearing NovyWave search should apply before waveform checks");
+        preview_apply_live_event(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            boon_runtime::LiveSourceEvent {
+                source: "store.elements.select_counter_file".to_owned(),
+                ..boon_runtime::LiveSourceEvent::default()
+            },
+        )
+        .expect("restoring simple.vcd should apply before waveform checks");
+        let waveform_ready_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            waveform_ready_summary.pointer("/store/bridge_cursor_values_label"),
+            Some(&json!("A[3:0]=0xc B[3:0]=0x5 at 50 s"))
+        );
+        input_state = PreviewNativeInputState::default();
 
         let assert_waveform_cursor_lines = |frame: &boon_document::LayoutFrame,
                                             label: &str|
@@ -45246,17 +45248,10 @@ mod tests {
 
         let before_wave_click_summary = live_runtime.lock().unwrap().document_state_summary();
         let waveform_layout = shared_render_state.lock().unwrap().layout_proof.clone();
-        let (wave_center_x, wave_y, wave_node) = source_hit_center_for_target(
-            &waveform_layout,
-            "store.elements.waveform_click",
-            Some("waveform canvas"),
-        )
-        .expect("NovyWave waveform should expose a canvas click target");
-        let wave_width = source_hit_width_for_target(
-            &waveform_layout,
-            "store.elements.waveform_click",
-            "waveform canvas",
-        );
+        let (wave_center_x, wave_y, wave_node) =
+            source_hit_center(&waveform_layout, "store.elements.waveform_click")
+                .expect("NovyWave waveform should expose a canvas click target");
+        let wave_width = hit_width_for_node(&waveform_layout, &wave_node);
         let wave_left = wave_center_x - (wave_width / 2.0);
         let wave_x = wave_left + (wave_width * 150.0 / 250.0);
         preview_apply_real_window_input(
@@ -45388,17 +45383,10 @@ mod tests {
         }
 
         let cursor36_layout = shared_render_state.lock().unwrap().layout_proof.clone();
-        let (cursor36_center_x, cursor36_y, _) = source_hit_center_for_target(
-            &cursor36_layout,
-            "store.elements.waveform_click",
-            Some("waveform canvas"),
-        )
-        .expect("NovyWave waveform should expose a canvas click target");
-        let cursor36_width = source_hit_width_for_target(
-            &cursor36_layout,
-            "store.elements.waveform_click",
-            "waveform canvas",
-        );
+        let (cursor36_center_x, cursor36_y, cursor36_node) =
+            source_hit_center(&cursor36_layout, "store.elements.waveform_click")
+                .expect("NovyWave waveform should expose a canvas click target");
+        let cursor36_width = hit_width_for_node(&cursor36_layout, &cursor36_node);
         let cursor36_x = cursor36_center_x - (cursor36_width / 2.0) + 1.0;
         preview_apply_real_window_input(
             &deterministic_click_input_from_index(7, cursor36_x, cursor36_y),
@@ -45459,10 +45447,13 @@ mod tests {
                 "0 s waveform cursor should move left from the 150 s cursor bucket: cursor36={cursor36_line_x}, cursor48={cursor48_line_x}"
             );
         }
-        let initial_released_width = summary_number(
+        assert_waveform_value_labels(
             &cursor36_summary,
-            "/store/selected_waveform_segments/4/width",
+            "clk",
+            &["0xa", "0xc", "0x0"],
+            "Fit viewport",
         );
+        let initial_released_width = waveform_value_segment_width(&cursor36_summary, "clk", "0xc");
 
         let zoom_key = test_keyboard_input(vec![test_key_press(7, "W")], vec!["W"]);
         preview_apply_real_window_input(
@@ -45487,10 +45478,8 @@ mod tests {
             keyboard_summary.pointer("/store/keyboard_cursor_label"),
             Some(&json!("0 s"))
         );
-        let zoomed_released_width = summary_number(
-            &keyboard_summary,
-            "/store/selected_waveform_segments/4/width",
-        );
+        assert_waveform_value_labels(&keyboard_summary, "clk", &["0xa", "0xc"], "Close viewport");
+        let zoomed_released_width = waveform_value_segment_width(&keyboard_summary, "clk", "0xc");
         assert!(
             zoomed_released_width > initial_released_width * 1.5,
             "zoom-in should visibly expand waveform segment width: initial={initial_released_width}, zoomed={zoomed_released_width}"
@@ -45522,9 +45511,19 @@ mod tests {
             Some(&json!("40 s - 80 s")),
             "held W should move to the closer viewport without jumping back"
         );
-        let repeated_zoom_released_width = summary_number(
+        assert_waveform_value_labels(
             &repeated_zoom_summary,
-            "/store/selected_waveform_segments/4/width",
+            "clk",
+            &["0xa", "0xc"],
+            "Closer viewport",
+        );
+        let repeated_zoom_leading_width =
+            waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xa");
+        let repeated_zoom_released_width =
+            waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xc");
+        assert!(
+            (repeated_zoom_leading_width - 90.0).abs() <= 1.0,
+            "held W should clip the leading 0xa segment to the 40 s - 80 s viewport: width={repeated_zoom_leading_width}"
         );
         assert!(
             repeated_zoom_released_width > zoomed_released_width * 1.2,
@@ -45550,10 +45549,14 @@ mod tests {
             zoom_out_summary.pointer("/store/keyboard_viewport_label"),
             Some(&json!("0 s - 150 s"))
         );
-        let zoomed_out_released_width = summary_number(
+        assert_waveform_value_labels(
             &zoom_out_summary,
-            "/store/selected_waveform_segments/4/width",
+            "clk",
+            &["0xa", "0xc"],
+            "Close viewport after zoom-out",
         );
+        let zoomed_out_released_width =
+            waveform_value_segment_width(&zoom_out_summary, "clk", "0xc");
         assert!(
             zoomed_out_released_width < repeated_zoom_released_width * 0.85
                 && zoomed_out_released_width > initial_released_width * 1.5,
@@ -45581,10 +45584,14 @@ mod tests {
             repeated_zoom_out_summary.pointer("/store/keyboard_viewport_label"),
             Some(&json!("0 s - 250 s"))
         );
-        let repeated_zoom_out_width = summary_number(
+        assert_waveform_value_labels(
             &repeated_zoom_out_summary,
-            "/store/selected_waveform_segments/4/width",
+            "clk",
+            &["0xa", "0xc", "0x0"],
+            "Fit viewport after zoom-out repeat",
         );
+        let repeated_zoom_out_width =
+            waveform_value_segment_width(&repeated_zoom_out_summary, "clk", "0xc");
         assert!(
             (repeated_zoom_out_width - initial_released_width).abs() <= 1.0,
             "held S should return to Fit width without a jump: initial={initial_released_width}, repeated_out={repeated_zoom_out_width}"
@@ -45609,8 +45616,13 @@ mod tests {
             reset_summary.pointer("/store/keyboard_viewport_label"),
             Some(&json!("0 s - 250 s"))
         );
-        let reset_released_width =
-            summary_number(&reset_summary, "/store/selected_waveform_segments/4/width");
+        assert_waveform_value_labels(
+            &reset_summary,
+            "clk",
+            &["0xa", "0xc", "0x0"],
+            "Fit viewport after reset",
+        );
+        let reset_released_width = waveform_value_segment_width(&reset_summary, "clk", "0xc");
         assert!(
             (reset_released_width - initial_released_width).abs() <= 1.0,
             "reset should restore initial waveform segment width: initial={initial_released_width}, reset={reset_released_width}"
@@ -45701,10 +45713,14 @@ mod tests {
                 "NovyWave initial loaded state",
             );
             physical_frame_text_item(&dark_layout, "50 s", "NovyWave initial loaded state");
-            let initial_released_width = summary_number(
+            assert_waveform_value_labels(
                 &initial_loaded_state,
-                "/store/selected_waveform_segments/4/width",
-            ) as f32;
+                "clk",
+                &["0xa", "0xc", "0x0"],
+                "Fit visual readback",
+            );
+            let initial_released_width =
+                waveform_value_segment_width(&initial_loaded_state, "clk", "0xc") as f32;
             let initial_waveform_canvas = dark_layout
                 .display_list
                 .iter()
@@ -45896,8 +45912,14 @@ mod tests {
                 Some(&zoom_in_state),
             )
             .expect("NovyWave zoom-in layout should lower");
+            assert_waveform_value_labels(
+                &zoom_in_state,
+                "clk",
+                &["0xa", "0xc"],
+                "Close visual readback",
+            );
             let zoom_in_released_width =
-                summary_number(&zoom_in_state, "/store/selected_waveform_segments/4/width") as f32;
+                waveform_value_segment_width(&zoom_in_state, "clk", "0xc") as f32;
             assert!(
                 zoom_in_released_width > initial_released_width * 1.5,
                 "NovyWave zoom-in should expand rendered waveform segment width: fit={initial_released_width}, zoom_in={zoom_in_released_width}"
@@ -45941,10 +45963,14 @@ mod tests {
                 Some(&fit_zoom_out_state),
             )
             .expect("NovyWave fit zoom-out layout should lower");
-            let fit_zoom_out_width = summary_number(
+            assert_waveform_value_labels(
                 &fit_zoom_out_state,
-                "/store/selected_waveform_segments/4/width",
-            ) as f32;
+                "clk",
+                &["0xa", "0xc", "0x0"],
+                "Fit visual readback after zoom-out",
+            );
+            let fit_zoom_out_width =
+                waveform_value_segment_width(&fit_zoom_out_state, "clk", "0xc") as f32;
             assert!(
                 (fit_zoom_out_width - initial_released_width).abs() <= 1.0,
                 "NovyWave first zoom-out from Close should return to Fit width: fit={initial_released_width}, after={fit_zoom_out_width}"
@@ -45975,8 +46001,14 @@ mod tests {
                 Some(&zoom_out_state),
             )
             .expect("NovyWave zoom-out layout should lower");
+            assert_waveform_value_labels(
+                &zoom_out_state,
+                "clk",
+                &["0xa", "0xc", "0x0"],
+                "Wide visual readback",
+            );
             let zoom_out_released_width =
-                summary_number(&zoom_out_state, "/store/selected_waveform_segments/4/width") as f32;
+                waveform_value_segment_width(&zoom_out_state, "clk", "0xc") as f32;
             assert!(
                 zoom_out_released_width < initial_released_width * 0.75,
                 "NovyWave zoom-out should shrink rendered waveform segment width: fit={initial_released_width}, zoom_out={zoom_out_released_width}"
@@ -46020,10 +46052,14 @@ mod tests {
                 Some(&zoom_reset_state),
             )
             .expect("NovyWave zoom-reset layout should lower");
-            let reset_released_width = summary_number(
+            assert_waveform_value_labels(
                 &zoom_reset_state,
-                "/store/selected_waveform_segments/4/width",
-            ) as f32;
+                "clk",
+                &["0xa", "0xc", "0x0"],
+                "Fit visual readback after reset",
+            );
+            let reset_released_width =
+                waveform_value_segment_width(&zoom_reset_state, "clk", "0xc") as f32;
             assert!(
                 (reset_released_width - initial_released_width).abs() <= 1.0,
                 "NovyWave zoom reset should restore fit waveform segment width: fit={initial_released_width}, reset={reset_released_width}"
@@ -46611,11 +46647,12 @@ mod tests {
                 preview_update_hover_from_input(
                     &hover_layout_proof,
                     &hover_input,
-                    &shared_render_state,
                     &mut input_state,
                 )
                 .expect("NovyWave hover overlay should update for readback")
             );
+            preview_apply_hover_overlay(&shared_render_state, &input_state)
+                .expect("NovyWave hover overlay should apply for readback");
             let hover_frame = latest_preview_frame(&shared_render_state);
             let hover_render = render_novywave_frame_artifact(
                 &device,
@@ -46679,11 +46716,12 @@ mod tests {
                 preview_update_hover_from_input(
                     &light_hover_layout_proof,
                     &light_hover_input,
-                    &light_shared_render_state,
                     &mut light_input_state,
                 )
                 .expect("NovyWave light hover overlay should update for readback")
             );
+            preview_apply_hover_overlay(&light_shared_render_state, &light_input_state)
+                .expect("NovyWave light hover overlay should apply for readback");
             let light_hover_frame = latest_preview_frame(&light_shared_render_state);
             let light_hover_render = render_novywave_frame_artifact(
                 &device,
@@ -47512,10 +47550,11 @@ mod tests {
             input_state,
         )
         .unwrap_or_else(|error| panic!("clicking {label} should dispatch real input: {error}"));
-        live_runtime
+        let state = live_runtime
             .lock()
             .expect("NovyWave live runtime should lock after click")
-            .document_state_summary()
+            .document_state_summary();
+        state
     }
 
     fn apply_preview_drag_source(
@@ -47611,49 +47650,20 @@ mod tests {
             .document_state_summary()
     }
 
-    fn source_hit_width_for_target(
-        layout: &serde_json::Value,
-        source_event: &str,
-        target: &str,
-    ) -> f64 {
-        let source_intents = layout["source_intent_assertions"]
-            .as_array()
-            .unwrap_or_else(|| panic!("layout should expose source intents for `{source_event}`"));
-        let target_nodes = source_intents
-            .iter()
-            .filter_map(|intent| {
-                if intent
-                    .get("source_path")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(source_event)
-                    && source_intent_has_exact_value(intent, source_intents, "target", target)
-                {
-                    intent.get("node").and_then(serde_json::Value::as_str)
-                } else {
-                    None
-                }
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            !target_nodes.is_empty(),
-            "source event `{source_event}` should expose target `{target}`"
-        );
+    fn hit_width_for_node(layout: &serde_json::Value, node: &str) -> f64 {
         layout["hit_target_assertions"]
             .as_array()
-            .unwrap_or_else(|| panic!("layout should expose hit targets for `{source_event}`"))
+            .unwrap_or_else(|| panic!("layout should expose hit targets for `{node}`"))
             .iter()
             .filter_map(|hit| {
-                let node = hit.get("node").and_then(serde_json::Value::as_str)?;
-                target_nodes.contains(node).then(|| {
+                (hit.get("node").and_then(serde_json::Value::as_str) == Some(node)).then(|| {
                     hit.pointer("/bounds/width")
                         .and_then(serde_json::Value::as_f64)
                         .unwrap_or_default()
                 })
             })
             .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or_else(|| {
-                panic!("source event `{source_event}` target `{target}` should have hit width")
-            })
+            .unwrap_or_else(|| panic!("node `{node}` should have hit width"))
     }
 
     fn summary_number(summary: &serde_json::Value, path: &str) -> f64 {
@@ -47661,6 +47671,83 @@ mod tests {
             .pointer(path)
             .and_then(serde_json::Value::as_f64)
             .unwrap_or_else(|| panic!("state summary should expose numeric `{path}`"))
+    }
+
+    fn waveform_value_segment_width(
+        summary: &serde_json::Value,
+        signal_id: &str,
+        label: &str,
+    ) -> f64 {
+        waveform_value_segments(summary)
+            .iter()
+            .find_map(|segment| {
+                let matches_signal =
+                    segment.get("signal_id").and_then(serde_json::Value::as_str)
+                        == Some(signal_id);
+                let matches_label =
+                    segment.get("label").and_then(serde_json::Value::as_str) == Some(label);
+                (matches_signal && matches_label).then(|| {
+                    segment
+                        .get("width")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or_else(|| {
+                            panic!("waveform value segment should expose width: {segment:?}")
+                        })
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing visible waveform segment signal={signal_id} label={label}; segments={:?}",
+                    summary.pointer("/store/selected_waveform_segments")
+                )
+            })
+    }
+
+    fn waveform_value_segment_labels(summary: &serde_json::Value, signal_id: &str) -> Vec<String> {
+        waveform_value_segments(summary)
+            .iter()
+            .filter(|segment| {
+                segment.get("signal_id").and_then(serde_json::Value::as_str) == Some(signal_id)
+            })
+            .filter_map(|segment| {
+                segment
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn waveform_value_segments(summary: &serde_json::Value) -> Vec<&serde_json::Value> {
+        summary
+            .pointer("/store/selected_waveform_segments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("state summary should expose selected waveform segments"))
+            .iter()
+            .filter(|segment| {
+                !matches!(
+                    segment.get("state").and_then(serde_json::Value::as_str),
+                    Some("CursorLine" | "MarkerLine")
+                )
+            })
+            .collect()
+    }
+
+    fn assert_waveform_value_labels(
+        summary: &serde_json::Value,
+        signal_id: &str,
+        expected_labels: &[&str],
+        context: &str,
+    ) {
+        let labels = waveform_value_segment_labels(summary, signal_id);
+        let expected = expected_labels
+            .iter()
+            .map(|label| (*label).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels, expected,
+            "{context}: visible waveform labels should match the current viewport"
+        );
     }
 
     fn hit_bounds_for_address(layout: &serde_json::Value, address: &str) -> serde_json::Value {

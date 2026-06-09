@@ -3332,6 +3332,8 @@ impl Default for BuiltinSignatureRegistry {
             number_functions: [
                 "Number/add",
                 "Number/subtract",
+                "Number/min",
+                "Number/max",
                 "Number/interpolate",
                 "Number/project_width",
                 "Number/project_offset",
@@ -4568,6 +4570,8 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Number/project_offset"
                     | "Number/project_time"
                     | "Number/interpolate"
+                    | "Number/min"
+                    | "Number/max"
                     | "List/count"
                     | "List/sum"
                     | "Text/find"

@@ -154,21 +154,36 @@ store: [
         }
 
     workspace_dialog_title:
-        workspace_dialog == Open |> WHEN {
-            True => TEXT { Open Workspace }
-            False => TEXT { Workspace dialog closed }
+        TEXT { Workspace dialog closed } |> HOLD workspace_dialog_title {
+            LATEST {
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { Open Workspace } }
+                elements.close_workspace_dialog.event.press |> THEN { TEXT { Workspace dialog closed } }
+                elements.open_selected_workspace.event.press |> THEN { TEXT { Workspace dialog closed } }
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { Workspace dialog closed } }
+            }
         }
 
     workspace_dialog_hint:
-        workspace_dialog == Open |> WHEN {
-            True => TEXT { Pick a directory to use as your workspace. NovyWave will create the .novywave file automatically if it is missing. }
-            False => TEXT { No workspace picker }
+        TEXT { No workspace picker } |> HOLD workspace_dialog_hint {
+            LATEST {
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { Pick a directory to use as your workspace. NovyWave will create the .novywave file automatically if it is missing. } }
+                elements.close_workspace_dialog.event.press |> THEN { TEXT { No workspace picker } }
+                elements.open_selected_workspace.event.press |> THEN { TEXT { No workspace picker } }
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { No workspace picker } }
+            }
         }
 
     workspace_dialog_selection:
-        workspace_dialog == Open |> WHEN {
-            True => TEXT { Selected: } |> Text/concat(with: workspace_selected_path, separator: " ")
-            False => TEXT { none }
+        TEXT { none } |> HOLD workspace_dialog_selection {
+            LATEST {
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { Selected: /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a } }
+                elements.select_workspace_repo.event.press |> THEN { TEXT { Selected: /home/martinkavik/repos/NovyWave } }
+                elements.select_workspace_a.event.press |> THEN { TEXT { Selected: /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_a } }
+                elements.select_workspace_b.event.press |> THEN { TEXT { Selected: /home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b } }
+                elements.close_workspace_dialog.event.press |> THEN { TEXT { none } }
+                elements.open_selected_workspace.event.press |> THEN { TEXT { none } }
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { none } }
+            }
         }
 
     workspace_status_label:
@@ -532,24 +547,44 @@ store: [
         }
 
     load_files_dialog_title:
-        load_files_dialog == Open |> WHEN {
-            True => TEXT { Load files }
-            False => TEXT { No file dialog }
+        TEXT { No file dialog } |> HOLD load_files_dialog_title {
+            LATEST {
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { Load files } }
+                elements.close_load_files_dialog.event.press |> THEN { TEXT { No file dialog } }
+                elements.external_file_loaded_name.text |> THEN { TEXT { No file dialog } }
+                elements.begin_default_file_load.event.press |> THEN { TEXT { No file dialog } }
+                elements.load_default_file.event.press |> THEN { TEXT { No file dialog } }
+                elements.show_empty.event.press |> THEN { TEXT { No file dialog } }
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { No file dialog } }
+            }
         }
 
     load_files_dialog_hint:
-        load_files_dialog == Open |> WHEN {
-            True => TEXT { Enter a local VCD, FST, or GHW path. The native host validates the file and sends pure metadata to Boon. }
-            False => TEXT { File dialog closed }
+        TEXT { File dialog closed } |> HOLD load_files_dialog_hint {
+            LATEST {
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { Enter a local VCD, FST, or GHW path. The native host validates the file and sends pure metadata to Boon. } }
+                elements.close_load_files_dialog.event.press |> THEN { TEXT { File dialog closed } }
+                elements.external_file_loaded_name.text |> THEN { TEXT { File dialog closed } }
+                elements.begin_default_file_load.event.press |> THEN { TEXT { File dialog closed } }
+                elements.load_default_file.event.press |> THEN { TEXT { File dialog closed } }
+                elements.show_empty.event.press |> THEN { TEXT { File dialog closed } }
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { File dialog closed } }
+            }
         }
 
     load_files_dialog_selection:
-        load_files_dialog == Open |> WHEN {
-            True => external_file_error |> Text/is_empty() |> WHEN {
-                True => TEXT { Path: } |> Text/concat(with: load_files_path, separator: " ")
-                False => external_file_error
+        TEXT { none } |> HOLD load_files_dialog_selection {
+            LATEST {
+                elements.open_load_files_dialog.event.press |> THEN { TEXT { Path: ~/repos/NovyWave/test_files/simple.vcd } }
+                elements.load_file_path_input.text |> THEN { TEXT { Path: } |> Text/concat(with: elements.load_file_path_input.text, separator: " ") }
+                elements.external_file_load_error.text |> THEN { elements.external_file_load_error.text }
+                elements.close_load_files_dialog.event.press |> THEN { TEXT { none } }
+                elements.external_file_loaded_name.text |> THEN { TEXT { none } }
+                elements.begin_default_file_load.event.press |> THEN { TEXT { none } }
+                elements.load_default_file.event.press |> THEN { TEXT { none } }
+                elements.show_empty.event.press |> THEN { TEXT { none } }
+                elements.open_workspace_dialog.event.press |> THEN { TEXT { none } }
             }
-            False => TEXT { none }
         }
 
     waveform_status:
@@ -1219,9 +1254,16 @@ store: [
         }
 
     selected_rows_enabled_value:
-        waveform_status == Loaded |> WHEN {
-            True => TEXT { loaded }
-            False => TEXT { none }
+        TEXT { loaded } |> HOLD selected_rows_enabled_value {
+            LATEST {
+                elements.show_empty.event.press |> THEN { TEXT { none } }
+                elements.begin_default_file_load.event.press |> THEN { TEXT { none } }
+                elements.load_default_file.event.press |> THEN { TEXT { loaded } }
+                elements.external_file_loaded_name.text |> THEN { TEXT { loaded } }
+                elements.select_counter_file.event.press |> THEN { TEXT { loaded } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { loaded } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { loaded } }
+            }
         }
 
     group_header_collapsed:
@@ -1515,6 +1557,7 @@ store: [
     selected_waveform_segments:
         waveform_segment_records
         |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/retain(segment, if: waveform_segment_is_visible(segment: segment))
         |> List/map(segment, new: new_waveform_segment(segment: segment))
 
     active_waveform_segment_labels:
@@ -2838,12 +2881,14 @@ FUNCTION new_waveform_segment(segment) {
         signal_id: segment.signal_id
         start_time_value: segment.start_time_value
         end_time_value: segment.end_time_value
+        visible_start_time_value: Number/max(left: segment.start_time_value, right: store.viewport_label_start)
+        visible_end_time_value: Number/min(left: segment.end_time_value, right: store.viewport_label_end)
         projection_source: RuntimeTimelineMetadata
         width: segment.file == store.active_file |> WHEN {
             True => segment.state |> WHEN {
                 CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
                 MarkerLine => 0
-                __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
+                __ => Number/project_width(start_time: Number/max(left: segment.start_time_value, right: store.viewport_label_start), end_time: Number/min(left: segment.end_time_value, right: store.viewport_label_end), viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
             }
             __ => 0
         }
@@ -2851,6 +2896,17 @@ FUNCTION new_waveform_segment(segment) {
         label: segment.label
         click_time: segment.click_time
     ]
+}
+
+FUNCTION waveform_segment_is_visible(segment) {
+    segment.state |> WHEN {
+        CursorLine => True
+        MarkerLine => True
+        __ => segment.end_time_value > store.viewport_label_start |> WHEN {
+            True => segment.start_time_value < store.viewport_label_end
+            False => False
+        }
+    }
 }
 
 FUNCTION new_marker(marker, store) {

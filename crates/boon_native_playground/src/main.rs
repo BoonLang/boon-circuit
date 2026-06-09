@@ -42596,12 +42596,12 @@ mod tests {
                 .display_list
                 .iter()
                 .filter(|item| {
-                    display_item_paint_color(item) == Some("#FDE68A")
+                    display_item_paint_color(item) == Some("#D6B73F")
                         && item.text.is_none()
                         && item.bounds.x > 250.0
                         && item.bounds.y > 340.0
-                        && item.bounds.width >= 2.0
-                        && item.bounds.width <= 4.5
+                        && item.bounds.width >= 1.0
+                        && item.bounds.width <= 3.5
                         && item.bounds.height >= 18.0
                 })
                 .collect::<Vec<_>>();
@@ -42654,6 +42654,7 @@ mod tests {
             cursor_x
         };
 
+        let before_wave_click_summary = live_runtime.lock().unwrap().document_state_summary();
         let waveform_layout = shared_render_state.lock().unwrap().layout_proof.clone();
         let (wave_x, wave_y, wave_node) = source_hit_center_for_target(
             &waveform_layout,
@@ -42698,46 +42699,46 @@ mod tests {
         );
         assert_eq!(
             clicked_summary.pointer("/store/marker_visibility"),
-            Some(&json!("Visible")),
-            "waveform click should make the marker row visible"
+            before_wave_click_summary.pointer("/store/marker_visibility"),
+            "waveform click should not change marker visibility"
         );
         assert_eq!(
             clicked_summary.pointer("/store/marker_to_add"),
-            Some(&json!("150 s")),
-            "waveform click should use the clicked bucket as the marker insertion time"
+            before_wave_click_summary.pointer("/store/marker_to_add"),
+            "waveform click should not prepare marker insertion"
         );
         assert_eq!(
             clicked_summary.pointer("/store/marker_label"),
-            Some(&json!("M 150 s")),
-            "waveform click should update the active marker chip label"
+            before_wave_click_summary.pointer("/store/marker_label"),
+            "waveform click should not update the active marker chip label"
         );
         assert_eq!(
             clicked_summary.pointer("/store/marker_count_label"),
-            Some(&json!("2 markers")),
-            "waveform click should append a marker rather than only moving the cursor"
+            before_wave_click_summary.pointer("/store/marker_count_label"),
+            "waveform click should not append a marker"
         );
         assert_eq!(
             clicked_summary.pointer("/store/markers/0/label"),
-            Some(&json!("50 s")),
-            "NovyWave should keep the default marker as an actual marker list row"
+            before_wave_click_summary.pointer("/store/markers/0/label"),
+            "waveform click should keep the default marker row unchanged"
         );
         assert_eq!(
             clicked_summary.pointer("/store/markers/1/label"),
-            Some(&json!("150 s")),
-            "waveform click should append the clicked 150 s marker to store.markers"
+            before_wave_click_summary.pointer("/store/markers/1/label"),
+            "waveform click should not append the clicked 150 s marker to store.markers"
         );
         assert_eq!(
             clicked_summary.pointer("/store/marker_focus_label"),
-            Some(&json!("added marker at 150 s")),
-            "waveform click should announce the inserted marker"
+            before_wave_click_summary.pointer("/store/marker_focus_label"),
+            "waveform click should not announce marker insertion"
         );
         let cursor48_line_x = {
             let clicked_frame = latest_preview_frame(&shared_render_state);
             let cursor48_x = assert_waveform_cursor_lines(&clicked_frame, "150 s");
             physical_frame_text_item(
                 &clicked_frame,
-                "M 150 s",
-                "NovyWave waveform click should render the inserted 150 s marker",
+                "M 50 s",
+                "NovyWave waveform click should leave the existing marker chip unchanged",
             );
             assert!(
                 cursor48_x > 320.0,
@@ -42775,28 +42776,28 @@ mod tests {
         );
         assert_eq!(
             cursor36_summary.pointer("/store/marker_to_add"),
-            Some(&json!("0 s")),
-            "second waveform click should insert a marker at the second clicked bucket"
+            before_wave_click_summary.pointer("/store/marker_to_add"),
+            "second waveform click should still not prepare marker insertion"
         );
         assert_eq!(
             cursor36_summary.pointer("/store/marker_label"),
-            Some(&json!("M 0 s")),
-            "second waveform click should update the active marker label"
+            before_wave_click_summary.pointer("/store/marker_label"),
+            "second waveform click should not update the active marker label"
         );
         assert_eq!(
             cursor36_summary.pointer("/store/marker_count_label"),
-            Some(&json!("3 markers")),
-            "waveform marker creation should keep the marker summary populated"
+            before_wave_click_summary.pointer("/store/marker_count_label"),
+            "second waveform click should not create markers"
         );
         assert_eq!(
             cursor36_summary.pointer("/store/markers/2/label"),
-            Some(&json!("0 s")),
-            "second waveform click should append the clicked 0 s marker to store.markers"
+            before_wave_click_summary.pointer("/store/markers/2/label"),
+            "second waveform click should not append the clicked 0 s marker to store.markers"
         );
         assert_eq!(
             cursor36_summary.pointer("/store/marker_focus_label"),
-            Some(&json!("added marker at 0 s")),
-            "second waveform click should announce the new marker"
+            before_wave_click_summary.pointer("/store/marker_focus_label"),
+            "second waveform click should not announce marker insertion"
         );
         {
             let cursor36_frame = latest_preview_frame(&shared_render_state);
@@ -42804,8 +42805,8 @@ mod tests {
             physical_frame_text_item(&cursor36_frame, "0xa", "NovyWave 0 s value column A value");
             physical_frame_text_item(
                 &cursor36_frame,
-                "M 0 s",
-                "NovyWave waveform click should render the inserted 0 s marker",
+                "M 50 s",
+                "NovyWave waveform click should leave marker chip unchanged after second click",
             );
             assert!(
                 cursor36_line_x < cursor48_line_x - 20.0,
@@ -43862,29 +43863,41 @@ mod tests {
                 timeline_glass.bounds
             );
 
-            let cursor_glow = dark_layout
+            let cursor_chip = dark_layout
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_text_from_map(&item.style, "glow_color") == Some("#ffe768aa")
+                    display_item_paint_color(item) == Some("#101a2b")
                         && dark_layout.display_list.iter().any(|text| {
                             text.text.as_deref() == Some("50 s")
                                 && rect_contains_bounds(item.bounds, text.bounds)
                         })
                 })
-                .expect("NovyWave cursor chip should lower CursorGlow");
-            let marker_glow = dark_layout
+                .expect("NovyWave cursor chip should lower a quiet readable status surface");
+            let marker_chip = dark_layout
                 .display_list
                 .iter()
                 .find(|item| {
-                    style_text_from_map(&item.style, "glow_color") == Some("#8f75ff55")
-                        && item.bounds.width >= 100.0
-                        && item.bounds.height >= 14.0
+                    display_item_paint_color(item) == Some("#101a2b")
+                        && dark_layout.display_list.iter().any(|text| {
+                            text.text.as_deref() == Some("M 50 s")
+                                && rect_contains_bounds(item.bounds, text.bounds)
+                        })
                 })
-                .expect("NovyWave marker chip should lower MarkerChip glow");
+                .expect("NovyWave marker chip should lower a quiet readable status surface");
             for (label, role, bounds, min_luma_range) in [
-                ("cursor glow crop", "cursor_glow", cursor_glow.bounds, 18.0),
-                ("marker glow crop", "marker_glow", marker_glow.bounds, 18.0),
+                (
+                    "cursor chip contrast crop",
+                    "cursor_chip_contrast",
+                    cursor_chip.bounds,
+                    24.0,
+                ),
+                (
+                    "marker chip contrast crop",
+                    "marker_chip_contrast",
+                    marker_chip.bounds,
+                    24.0,
+                ),
             ] {
                 let luma_range = image_luma_range(&dark_image, bounds);
                 let crop = save_visual_crop_artifact_with_padding(
@@ -43905,7 +43918,7 @@ mod tests {
                 }));
                 assert!(
                     luma_range >= min_luma_range,
-                    "{label} should contain visible glow/text contrast, bounds={bounds:?}"
+                    "{label} should contain readable text/background contrast, bounds={bounds:?}"
                 );
             }
 

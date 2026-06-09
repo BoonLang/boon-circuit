@@ -7465,6 +7465,31 @@ impl GenericScheduledRuntime {
                     !value.as_text().unwrap_or_default().is_empty(),
                 ))
             }
+            "Number/interpolate" => {
+                let start = self
+                    .named_or_positional_arg_value(args, "start", 0, frame)?
+                    .number()?;
+                let end = self
+                    .named_or_positional_arg_value(args, "end", 1, frame)?
+                    .number()?;
+                let numerator = self
+                    .named_or_positional_arg_value(args, "numerator", 2, frame)?
+                    .number()?;
+                let denominator = self
+                    .named_or_positional_arg_value(args, "denominator", 3, frame)?
+                    .number()?;
+                let fallback = self
+                    .named_or_positional_arg_value(args, "fallback", 4, frame)
+                    .map(|value| value.number().unwrap_or(start))
+                    .unwrap_or(start);
+                if denominator == 0 {
+                    Ok(BoonValue::Number(fallback))
+                } else {
+                    Ok(BoonValue::Number(
+                        start + ((end - start) * numerator) / denominator,
+                    ))
+                }
+            }
             "Number/project_width" => {
                 let start = self
                     .named_or_positional_arg_value(args, "start_time", 0, frame)?

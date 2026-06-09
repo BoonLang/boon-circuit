@@ -565,10 +565,10 @@ store: [
 
     waveform_file_metadata:
         LIST {
-            [file: "simple.vcd", format: "VCD", digest: "sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de", waveform_ref: "wave:vcd:simple:0-250s", full_range: "0 s - 250 s", initial_window: "0 s - 250 s", range_start: 0, range_end: 250, initial_start: 0, initial_end: 250, canvas_width: 360, cursor_left: 0, cursor_default: 50, cursor_right: 150, tick_0: 0, tick_1: 50, tick_2: 100, tick_3: 150, tick_4: 250, stats: "VCD 2 signals, 0-250s, bounded pages", large_file_contract: "simple.vcd 311B -> bounded page requests only", hierarchy_page: "HIER:simple_tb/s", hierarchy_cursor: "hierarchy cursor simple_tb.s:0..64 next=none", materialization_bound: "visible rows 2/2, waveform segments 6/256 max", time_unit: "s", timescale: "1 s/native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "wave_27.fst", format: "FST", digest: "sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172", waveform_ref: "wave:fst:wave-27:0-240ns", full_range: "0 ns - 240 ns", initial_window: "0 ns - 120 ns", range_start: 0, range_end: 240, initial_start: 0, initial_end: 120, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, tick_0: 0, tick_1: 40, tick_2: 80, tick_3: 120, tick_4: 160, stats: "FST 5 signals, 0-240ns, bounded pages", large_file_contract: "wave_27.fst 28860652B -> bounded compare page only", hierarchy_page: "HIER:top.uart compare page", hierarchy_cursor: "hierarchy cursor top.uart:0..64 next=none", materialization_bound: "visible rows 4/5, waveform segments 28/256 max", time_unit: "ns", timescale: "inferred FST native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "simple_test.ghw", format: "GHW", digest: "sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491", waveform_ref: "wave:ghw:simple-test:0-100ns", full_range: "0 ns - 100 ns", initial_window: "0 ns - 100 ns", range_start: 0, range_end: 100, initial_start: 0, initial_end: 100, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, tick_0: 0, tick_1: 25, tick_2: 50, tick_3: 75, tick_4: 100, stats: "GHW 4 signals, 0-100ns, bounded pages", large_file_contract: "simple_test.ghw 833B -> bounded page requests only", hierarchy_page: "HIER:ghw.simple/counter", hierarchy_cursor: "hierarchy cursor ghw.simple:0..64 next=none", materialization_bound: "visible rows 3/4, waveform segments 20/256 max", time_unit: "ns", timescale: "GHW native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, tick_0: 0, tick_1: 0, tick_2: 0, tick_3: 0, tick_4: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
+            [file: "simple.vcd", format: "VCD", digest: "sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de", waveform_ref: "wave:vcd:simple:0-250s", full_range: "0 s - 250 s", initial_window: "0 s - 250 s", range_start: 0, range_end: 250, initial_start: 0, initial_end: 250, canvas_width: 360, cursor_left: 0, cursor_default: 50, cursor_right: 150, stats: "VCD 2 signals, 0-250s, bounded pages", large_file_contract: "simple.vcd 311B -> bounded page requests only", hierarchy_page: "HIER:simple_tb/s", hierarchy_cursor: "hierarchy cursor simple_tb.s:0..64 next=none", materialization_bound: "visible rows 2/2, waveform segments 6/256 max", time_unit: "s", timescale: "1 s/native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "wave_27.fst", format: "FST", digest: "sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172", waveform_ref: "wave:fst:wave-27:0-240ns", full_range: "0 ns - 240 ns", initial_window: "0 ns - 120 ns", range_start: 0, range_end: 240, initial_start: 0, initial_end: 120, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, stats: "FST 5 signals, 0-240ns, bounded pages", large_file_contract: "wave_27.fst 28860652B -> bounded compare page only", hierarchy_page: "HIER:top.uart compare page", hierarchy_cursor: "hierarchy cursor top.uart:0..64 next=none", materialization_bound: "visible rows 4/5, waveform segments 28/256 max", time_unit: "ns", timescale: "inferred FST native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "simple_test.ghw", format: "GHW", digest: "sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491", waveform_ref: "wave:ghw:simple-test:0-100ns", full_range: "0 ns - 100 ns", initial_window: "0 ns - 100 ns", range_start: 0, range_end: 100, initial_start: 0, initial_end: 100, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, stats: "GHW 4 signals, 0-100ns, bounded pages", large_file_contract: "simple_test.ghw 833B -> bounded page requests only", hierarchy_page: "HIER:ghw.simple/counter", hierarchy_cursor: "hierarchy cursor ghw.simple:0..64 next=none", materialization_bound: "visible rows 3/4, waveform segments 20/256 max", time_unit: "ns", timescale: "GHW native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
         }
 
     viewport_window_records:
@@ -1377,24 +1377,19 @@ store: [
         |> Text/to_number()
 
     selected_timeline_tick_0:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_0", fallback: selected_timeline_range_start)
-        |> Text/to_number()
+        viewport_label_start
 
     selected_timeline_tick_1:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_1", fallback: selected_timeline_range_start)
-        |> Text/to_number()
+        Number/interpolate(start: viewport_label_start, end: viewport_label_end, numerator: 1, denominator: 4, fallback: viewport_label_start)
 
     selected_timeline_tick_2:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_2", fallback: selected_timeline_range_start)
-        |> Text/to_number()
+        Number/interpolate(start: viewport_label_start, end: viewport_label_end, numerator: 2, denominator: 4, fallback: viewport_label_start)
 
     selected_timeline_tick_3:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_3", fallback: selected_timeline_range_end)
-        |> Text/to_number()
+        Number/interpolate(start: viewport_label_start, end: viewport_label_end, numerator: 3, denominator: 4, fallback: viewport_label_end)
 
     selected_timeline_tick_4:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "tick_4", fallback: selected_timeline_range_end)
-        |> Text/to_number()
+        viewport_label_end
 
     selected_timeline_cursor_value:
         NovyModel/cursor_time_value(cursor: cursor_position, left_value: selected_timeline_cursor_left, default_value: selected_timeline_cursor_default, right_value: selected_timeline_cursor_right)
@@ -1781,7 +1776,6 @@ store: [
             LATEST {
             elements.marker_remove.event.press |> THEN { Hidden }
             elements.marker_toggle.event.press |> THEN { Visible }
-            elements.waveform_click.text |> THEN { Visible }
             elements.load_default_file.event.press |> THEN { Visible }
             elements.show_empty.event.press |> THEN { Hidden }
             }
@@ -1793,7 +1787,6 @@ store: [
             elements.marker_rename.event.press |> THEN { TEXT { data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
-            elements.waveform_click.text
             elements.load_default_file.event.press |> THEN { TEXT { 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
@@ -1805,7 +1798,6 @@ store: [
             elements.marker_rename.event.press |> THEN { Renamed }
             elements.marker_remove.event.press |> THEN { Empty }
             elements.marker_toggle.event.press |> THEN { Added }
-            elements.waveform_click.text |> THEN { Added }
             elements.load_default_file.event.press |> THEN { Default }
             elements.show_empty.event.press |> THEN { Empty }
             }
@@ -1818,9 +1810,6 @@ store: [
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_jump.event.press |> THEN { marker_label }
             elements.marker_toggle.event.press |> THEN { TEXT { M 0 s } }
-            elements.waveform_click.text |> THEN {
-                TEXT { M } |> Text/concat(with: elements.waveform_click.text, separator: " ")
-            }
             elements.load_default_file.event.press |> THEN { TEXT { M 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { No markers } }
             }
@@ -1840,9 +1829,6 @@ store: [
             }
             elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
             elements.marker_toggle.event.press |> THEN { TEXT { added marker at 0 s } }
-            elements.waveform_click.text |> THEN {
-                TEXT { added marker at } |> Text/concat(with: elements.waveform_click.text, separator: " ")
-            }
             elements.load_default_file.event.press |> THEN { TEXT { marker at 50 s } }
             elements.show_empty.event.press |> THEN { TEXT { no marker selected } }
             }
@@ -1854,18 +1840,12 @@ store: [
     marker_to_add:
         LATEST {
             elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
-            elements.waveform_click.text
             elements.load_default_file.event.press |> THEN { TEXT { 50 s } }
         }
 
     marker_add_from_toggle:
         LATEST {
             elements.marker_toggle.event.press |> THEN { TEXT { 0 s } }
-        }
-
-    marker_add_from_waveform:
-        LATEST {
-            elements.waveform_click.text |> THEN { elements.waveform_click.text }
         }
 
     marker_add_from_load:
@@ -1879,9 +1859,6 @@ store: [
         }
         |> List/append(item: marker_add_from_toggle |> THEN {
             [label: TEXT { 0 s }]
-        })
-        |> List/append(item: marker_add_from_waveform |> THEN {
-            [label: marker_add_from_waveform]
         })
         |> List/append(item: marker_add_from_load |> THEN {
             [label: TEXT { 50 s }]
@@ -2044,9 +2021,6 @@ store: [
 
     waveform_cursor_offset:
         Number/project_offset(time: selected_timeline_cursor_value, viewport_start: selected_timeline_window_start, viewport_end: selected_timeline_window_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: zoom_level)
-
-    waveform_marker_offset:
-        Number/project_offset(time: selected_timeline_cursor_default, viewport_start: selected_timeline_window_start, viewport_end: selected_timeline_window_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: zoom_level)
 
     active_signal_label:
         TEXT { simple_tb.s.A[3:0] } |> HOLD active_signal_label {

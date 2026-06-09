@@ -576,8 +576,8 @@ expected_source_event = { source = "store.elements.marker_jump", target_text = "
 expect_root_text = { "mode" = "Dark", "marker_visibility" = "Visible", "marker_label" = "M 50 s", "marker_focus_label" = "jumped to 50 s", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "50 s" }
 
 [[step]]
-id = "waveform-click-adds-marker"
+id = "waveform-click-moves-cursor"
 user_action = { kind = "click", target = "waveform", target_text = "150 s" }
 expected_source_event = { source = "store.elements.waveform_click", text = "150 s" }
-expect_root_text = { "mode" = "Dark", "cursor_position" = "Cursor48", "keyboard_cursor_label" = "150 s", "marker_visibility" = "Visible", "marker_label" = "M 150 s", "marker_count_label" = "2 markers", "marker_focus_label" = "added marker at 150 s", "marker_to_add" = "150 s" }
-expect_semantic_delta_contains = ["ListInsert"]
+expect_root_text = { "mode" = "Dark", "cursor_position" = "Cursor48", "keyboard_cursor_label" = "150 s", "marker_visibility" = "Visible", "marker_label" = "M 50 s", "marker_count_label" = "1 marker", "marker_focus_label" = "jumped to 50 s", "marker_to_add" = "50 s" }
+expect_semantic_delta_contains = ["FieldSet:store.cursor_position"]

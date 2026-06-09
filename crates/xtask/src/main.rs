@@ -10294,8 +10294,9 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "tx_data[7:0]",
         "0x55",
         "0 ns",
-        "40 ns",
-        "80 ns",
+        "30 ns",
+        "60 ns",
+        "90 ns",
         "120 ns",
         "M 50 s",
     ];
@@ -10510,7 +10511,7 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
         "native-gpu-novywave-visual:runtime-timeline-projection-source",
         source_policy_pass,
         format!(
-            "segment_width_fields={}, runtime_projection={:?}, legacy_width_hack={:?}",
+            "segment_width_fields={}, runtime_projection={:?}, dynamic_ticks={:?}, legacy_width_hack={:?}, marker_strip={:?}",
             source_policy
                 .get("segment_width_fields")
                 .and_then(serde_json::Value::as_array)
@@ -10519,11 +10520,17 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
                 .get("runtime_projection")
                 .and_then(serde_json::Value::as_bool),
             source_policy
+                .get("dynamic_tick_projection")
+                .and_then(serde_json::Value::as_bool),
+            source_policy
                 .get("legacy_width_hack_present")
+                .and_then(serde_json::Value::as_bool),
+            source_policy
+                .get("marker_strip_present")
                 .and_then(serde_json::Value::as_bool)
         ),
         (!source_policy_pass).then(|| {
-            "NovyWave waveform records must not carry preprojected widths; widths must derive from runtime timeline metadata".to_owned()
+            "NovyWave waveform records must not carry preprojected widths or fixed tick fields; timeline widths/ticks must derive from runtime metadata and marker strips must not render under waveform rows".to_owned()
         }),
     );
 
@@ -10877,8 +10884,8 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         "boon_pressed_fmt",
         "boon_search_focused",
         "novywave-timeline-glass-crop",
-        "novywave-cursor_glow-crop",
-        "novywave-marker_glow-crop",
+        "novywave-cursor_chip_contrast-crop",
+        "novywave-marker_chip_contrast-crop",
         "novywave-trace-glow-crop",
     ];
     let missing_artifact_labels = required_artifact_labels
@@ -10932,7 +10939,12 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         })
         .filter_map(|metric| metric.get("role").and_then(serde_json::Value::as_str))
         .collect::<BTreeSet<_>>();
-    let required_material_roles = ["timeline_glass", "cursor_glow", "marker_glow", "trace_glow"];
+    let required_material_roles = [
+        "timeline_glass",
+        "cursor_chip_contrast",
+        "marker_chip_contrast",
+        "trace_glow",
+    ];
     let missing_material_roles = required_material_roles
         .iter()
         .filter(|role| !material_roles.contains(**role))
@@ -11038,29 +11050,70 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
     let legacy_width_hack_present = source.contains("simple_vcd_long_segment_width")
         || source.contains("simple_vcd_segment_width")
         || source.contains("width_source:");
+    let hardcoded_tick_fields_present = source.lines().any(|line| {
+        [
+            ", tick_0:",
+            ", tick_1:",
+            ", tick_2:",
+            ", tick_3:",
+            ", tick_4:",
+        ]
+        .iter()
+        .any(|field| line.contains(field))
+    });
     let runtime_projection = source.contains("Number/project_width")
         && source.contains("Number/project_offset")
         && source.contains("selected_timeline_window_start")
         && source.contains("selected_timeline_window_end")
         && source.contains("selected_waveform_canvas_width")
         && source.contains("RuntimeTimelineMetadata");
-    let pass = segment_width_fields.is_empty() && !legacy_width_hack_present && runtime_projection;
+    let dynamic_tick_projection = source.contains("Number/interpolate")
+        && source.contains("viewport_label_start")
+        && source.contains("viewport_label_end")
+        && source.contains("selected_timeline_tick_0")
+        && source.contains("selected_timeline_tick_4");
+    let view_path = Path::new("examples/novywave/View/NovyView.bn");
+    let view_source = fs::read_to_string(view_path).unwrap_or_default();
+    let marker_strip_present = view_source.contains("FUNCTION waveform_marker_lane")
+        || view_source.contains("FUNCTION waveform_marker_list_line");
+    let pass = segment_width_fields.is_empty()
+        && !legacy_width_hack_present
+        && !hardcoded_tick_fields_present
+        && runtime_projection
+        && dynamic_tick_projection
+        && !marker_strip_present;
     json!({
         "status": if pass { "pass" } else { "fail" },
         "source_path": source_path,
+        "view_path": view_path,
         "waveform_segment_record_line_count": segment_record_lines.len(),
         "segment_width_fields": segment_width_fields,
         "legacy_width_hack_present": legacy_width_hack_present,
+        "hardcoded_tick_fields_present": hardcoded_tick_fields_present,
         "runtime_projection": runtime_projection,
+        "dynamic_tick_projection": dynamic_tick_projection,
+        "marker_strip_present": marker_strip_present,
         "required_runtime_projection_terms": [
             "Number/project_width",
             "Number/project_offset",
+            "Number/interpolate",
+            "viewport_label_start",
+            "viewport_label_end",
             "selected_timeline_window_start",
             "selected_timeline_window_end",
             "selected_waveform_canvas_width",
             "RuntimeTimelineMetadata"
         ],
-        "contract": "NovyWave waveform segment records store source-domain times; visible widths are projected at runtime from selected file timeline/window/canvas metadata"
+        "forbidden_source_terms": [
+            "tick_0:",
+            "tick_1:",
+            "tick_2:",
+            "tick_3:",
+            "tick_4:",
+            "waveform_marker_lane",
+            "waveform_marker_list_line"
+        ],
+        "contract": "NovyWave waveform segment records store source-domain times; visible widths and timeline ticks are projected at runtime from selected file timeline/window/canvas metadata, and marker state must not render as an extra rectangle strip under waveform rows"
     })
 }
 

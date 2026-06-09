@@ -1076,16 +1076,14 @@ FUNCTION column_divider_style() {
         rounded_corners: 0
         cursor: TEXT { col-resize }
         background: [color: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #3b82f6 }
-            Light => TEXT { #60a5fa }
+            Dark => TEXT { #25344f }
+            Light => TEXT { #c9d7ea }
         }]
         __hover_background: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #93c5fd }
-            Light => TEXT { #2563eb }
+            Dark => TEXT { #4b607c }
+            Light => TEXT { #8fa8c9 }
         }
-        glow: [color: TEXT { #60a5fa66 }, intensity: 0.08]
-        material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
-        __hover_gloss: 0.12
+        __hover_gloss: 0.02
     ]
 }
 
@@ -1096,16 +1094,14 @@ FUNCTION row_divider_style() {
         rounded_corners: 0
         cursor: TEXT { row-resize }
         background: [color: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #3b82f6 }
-            Light => TEXT { #60a5fa }
+            Dark => TEXT { #25344f }
+            Light => TEXT { #c9d7ea }
         }]
         __hover_background: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #93c5fd }
-            Light => TEXT { #2563eb }
+            Dark => TEXT { #4b607c }
+            Light => TEXT { #8fa8c9 }
         }
-        glow: [color: TEXT { #60a5fa66 }, intensity: 0.08]
-        material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
-        __hover_gloss: 0.12
+        __hover_gloss: 0.02
     ]
 }
 
@@ -1116,15 +1112,14 @@ FUNCTION signal_row_divider_style() {
         rounded_corners: 0
         cursor: TEXT { row-resize }
         background: [color: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #1d4ed8 }
-            Light => TEXT { #60a5fa }
+            Dark => TEXT { #162033 }
+            Light => TEXT { #d7dde8 }
         }]
         __hover_background: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #93c5fd }
-            Light => TEXT { #2563eb }
+            Dark => TEXT { #334761 }
+            Light => TEXT { #9fb3cf }
         }
-        material: NovyTheme/material(mode: PASSED.store.mode, of: TraceEdge)
-        __hover_gloss: 0.10
+        __hover_gloss: 0.02
     ]
 }
 
@@ -2076,7 +2071,6 @@ FUNCTION waveform_full_height_overlays() {
         ]
         items: LIST {
             waveform_full_height_cursor_overlay()
-            waveform_full_height_marker_overlay()
         }
     )
 }
@@ -2087,7 +2081,7 @@ FUNCTION waveform_full_height_cursor_overlay() {
         direction: Row
         gap: 0
         style: [
-            width: PASSED.store.waveform_cursor_offset + 3
+            width: PASSED.store.waveform_cursor_offset + 2
             height: Fill
             paint: False
         ]
@@ -2096,26 +2090,6 @@ FUNCTION waveform_full_height_cursor_overlay() {
             waveform_cursor_line_core()
         }
     )
-}
-
-FUNCTION waveform_full_height_marker_overlay() {
-    PASSED.store.marker_visibility == Visible |> WHEN {
-        True => Scene/Element/stripe(
-            element: [target: PASSED.store.marker_label]
-            direction: Row
-            gap: 0
-            style: [
-                width: PASSED.store.waveform_marker_offset + 1
-                height: Fill
-                paint: False
-            ]
-            items: LIST {
-                waveform_cursor_spacer(width_value: PASSED.store.waveform_marker_offset)
-                waveform_marker_full_height_line()
-            }
-        )
-        __ => NoElement
-    }
 }
 
 FUNCTION selected_name_column_row(row) {
@@ -2424,7 +2398,7 @@ FUNCTION waveform_axis_header() {
         style: [
             width: Fill
             height: Fill
-            padding: [left: 8, right: 8]
+            padding: [left: 0, right: 0]
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #0a1322 }
@@ -2437,11 +2411,11 @@ FUNCTION waveform_axis_header() {
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
-            axis_tick(label: PASSED.store.timeline_axis_tick_0)
+            axis_tick_left(label: PASSED.store.timeline_axis_tick_0)
             axis_tick(label: PASSED.store.timeline_axis_tick_1)
             axis_tick(label: PASSED.store.timeline_axis_tick_2)
             axis_tick(label: PASSED.store.timeline_axis_tick_3)
-            axis_tick(label: PASSED.store.timeline_axis_tick_4)
+            axis_tick_right(label: PASSED.store.timeline_axis_tick_4)
         }
     )
 }
@@ -2742,14 +2716,14 @@ FUNCTION marker_row(marker) {
             height: 24
             rounded_corners: 6
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #211F4A }
-                Light => TEXT { #EEE7FF }
+                Dark => TEXT { #111827 }
+                Light => TEXT { #f2f5fb }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #7C6FF6 }
-                Light => TEXT { #B5A6FF }
+                Dark => TEXT { #334761 }
+                Light => TEXT { #c9d7ea }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
@@ -2861,7 +2835,7 @@ FUNCTION timeline_axis() {
         style: [
             width: Fill
             height: 38
-            padding: 5
+            padding: [top: 5, bottom: 5, left: 0, right: 0]
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #0a1322 }
@@ -2880,11 +2854,11 @@ FUNCTION timeline_axis() {
                 gap: 0
                 style: [width: Fill, height: 20, paint: False]
                 items: LIST {
-                    axis_tick(label: PASSED.store.timeline_axis_tick_0)
+                    axis_tick_left(label: PASSED.store.timeline_axis_tick_0)
                     axis_tick(label: PASSED.store.timeline_axis_tick_1)
                     axis_tick(label: PASSED.store.timeline_axis_tick_2)
                     axis_tick(label: PASSED.store.timeline_axis_tick_3)
-                    axis_tick(label: PASSED.store.timeline_axis_tick_4)
+                    axis_tick_right(label: PASSED.store.timeline_axis_tick_4)
                 }
             )
             Scene/Element/stripe(
@@ -2909,9 +2883,44 @@ FUNCTION axis_tick(label) {
         element: []
         style: [
             ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
-            width: 120
+            width: Fill
             height: 18
             center: True
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
+        ]
+        text: label
+    )
+}
+
+FUNCTION axis_tick_left(label) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+            width: Fill
+            height: 18
+            padding: [left: 0, right: 4]
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
+        ]
+        text: label
+    )
+}
+
+FUNCTION axis_tick_right(label) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+            width: Fill
+            height: 18
+            padding: [left: 4, right: 0]
+            align_x: TEXT { right }
             color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #90a4bf }
                 Light => TEXT { #60748b }
@@ -2929,10 +2938,14 @@ FUNCTION cursor_chip() {
             height: 18
             rounded_corners: 8
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1D4ED8 }
-                Light => TEXT { #FDE68A }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #f6f0c8 }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #334761 }
+                Light => TEXT { #d0c47a }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
@@ -2942,6 +2955,10 @@ FUNCTION cursor_chip() {
                 height: Fill
                 center: True
                 vertical_align: Center
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #f8fafc }
+                    Light => TEXT { #1f2937 }
+                }
             ]
             text: PASSED.store.keyboard_cursor_label
         )
@@ -2956,10 +2973,14 @@ FUNCTION marker_chip() {
             height: 18
             rounded_corners: 8
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #4F46E5 }
-                Light => TEXT { #E7DDFF }
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #f2f5fb }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #334761 }
+                Light => TEXT { #c9d7ea }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
@@ -2969,6 +2990,10 @@ FUNCTION marker_chip() {
                 height: Fill
                 center: True
                 vertical_align: Center
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #f8fafc }
+                    Light => TEXT { #1f2937 }
+                }
             ]
             text: PASSED.store.marker_label
         )
@@ -3091,33 +3116,13 @@ FUNCTION waveform_cursor_line_core() {
     Scene/Element/block(
         element: [target: PASSED.store.keyboard_cursor_label]
         style: [
-            width: 3
+            width: 2
             height: Fill
-            rounded_corners: 1
+            rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #FDE68A }
-                Light => TEXT { #B45309 }
+                Dark => TEXT { #D6B73F }
+                Light => TEXT { #92400E }
             }]
-            border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #FEF3C7 }
-                Light => TEXT { #FDE68A }
-            }]
-            glow: [color: TEXT { #FDE68A99 }, intensity: 0.22]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
-        ]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
-    )
-}
-
-FUNCTION waveform_marker_full_height_line() {
-    Scene/Element/block(
-        element: [target: PASSED.store.marker_label]
-        style: [
-            width: 1
-            height: Fill
-            rounded_corners: 1
-            background: [color: TEXT { #A78BFA }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
@@ -3744,7 +3749,6 @@ FUNCTION wave_area(signal) {
             ]
             items: LIST {
                 waveform_segment_lane(signal: signal)
-                waveform_marker_lane()
             }
         )
     )
@@ -3760,38 +3764,6 @@ FUNCTION waveform_segment_lane(signal) {
             PASSED.store.selected_waveform_segments
             |> List/filter_field_equal(field: "signal_id", value: signal.id)
             |> List/map(segment, new: waveform_segment(segment: segment))
-    )
-}
-
-FUNCTION waveform_marker_lane() {
-    PASSED.store.marker_visibility == Visible |> WHEN {
-        True => Scene/Element/stripe(
-            element: []
-            direction: Row
-            gap: 18
-            style: [width: Fill, height: 8, paint: False]
-            items:
-                PASSED.store.markers |> List/map(marker, new: waveform_marker_list_line(marker: marker))
-        )
-        False => Scene/Element/label(
-            element: []
-            style: [width: Fill, height: 0, paint: False]
-            label: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
-        )
-    }
-}
-
-FUNCTION waveform_marker_list_line(marker) {
-    Scene/Element/block(
-        element: [target: marker.label]
-        style: [
-            width: 18
-            height: Fill
-            rounded_corners: 1
-            background: [color: TEXT { #A78BFA }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
-        ]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
 

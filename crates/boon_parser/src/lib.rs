@@ -2349,6 +2349,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/to_number"
             | "Text/is_empty"
             | "Text/is_not_empty"
+            | "Number/interpolate"
             | "Number/project_width"
             | "Number/project_offset"
             | "Bool/not"

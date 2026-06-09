@@ -15,7 +15,7 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #162033 }
                 Light => TEXT { #f8fafc }
             }
-            gloss: 0.07
+            gloss: 0.035
             metal: 0.0
             transparency: PASSED.mode |> WHEN {
                 Dark => 0.06
@@ -23,10 +23,10 @@ FUNCTION material(mode, of) {
             }
             frosted_blur: 10
             frosted_saturate: 1.06
-            glass_highlight: 0.18
+            glass_highlight: 0.08
             glass_highlight_color: PASSED.mode |> WHEN {
-                Dark => TEXT { #dce8ff24 }
-                Light => TEXT { #ffffff8f }
+                Dark => TEXT { #dce8ff12 }
+                Light => TEXT { #ffffff66 }
             }
             border: PASSED.mode |> WHEN {
                 Dark => TEXT { #304057 }
@@ -34,8 +34,8 @@ FUNCTION material(mode, of) {
             }
             border_width: 1
             shadows: LIST {
-                [y: 1, blur: 2, color: TEXT { #ffffff22 }]
-                [y: 12, blur: 24, color: TEXT { #0b122024 }]
+                [y: 1, blur: 1, color: TEXT { #ffffff10 }]
+                [y: 10, blur: 20, color: TEXT { #0b122020 }]
             }
         ]
 
@@ -44,16 +44,16 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #0b1220 }
                 Light => TEXT { #ffffff }
             }
-            gloss: 0.05
+            gloss: 0.025
             transparency: PASSED.mode |> WHEN {
                 Dark => 0.04
                 Light => 0.06
             }
             frosted_blur: 6
-            glass_highlight: 0.18
+            glass_highlight: 0.07
             glass_highlight_color: PASSED.mode |> WHEN {
-                Dark => TEXT { #dce8ff22 }
-                Light => TEXT { #ffffff9c }
+                Dark => TEXT { #dce8ff12 }
+                Light => TEXT { #ffffff66 }
             }
             border: PASSED.mode |> WHEN {
                 Dark => TEXT { #25344f }
@@ -121,18 +121,18 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #020817d8 }
                 Light => TEXT { #f8fbffb8 }
             }
-            refraction: 1.5
-            gloss: 0.08
+            refraction: 1.1
+            gloss: 0.035
             transparency: PASSED.mode |> WHEN {
                 Dark => 0.16
                 Light => 0.18
             }
-            frosted_blur: 14
-            frosted_saturate: 1.22
-            glass_highlight: 0.58
+            frosted_blur: 8
+            frosted_saturate: 1.08
+            glass_highlight: 0.18
             glass_highlight_color: PASSED.mode |> WHEN {
-                Dark => TEXT { #dce8ff4d }
-                Light => TEXT { #ffffffb8 }
+                Dark => TEXT { #dce8ff18 }
+                Light => TEXT { #ffffff70 }
             }
         ]
 
@@ -141,9 +141,9 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #020817e6 }
                 Light => TEXT { #050b18f5 }
             }
-            refraction: 1.5
+            refraction: 1.1
             gloss: PASSED.mode |> WHEN {
-                Dark => 0.07
+                Dark => 0.035
                 Light => 0.03
             }
             transparency: PASSED.mode |> WHEN {
@@ -151,19 +151,19 @@ FUNCTION material(mode, of) {
                 Light => 0.03
             }
             frosted_blur: PASSED.mode |> WHEN {
-                Dark => 10
+                Dark => 6
                 Light => 3
             }
             frosted_saturate: PASSED.mode |> WHEN {
-                Dark => 1.16
+                Dark => 1.06
                 Light => 1.04
             }
             glass_highlight: PASSED.mode |> WHEN {
-                Dark => 0.40
+                Dark => 0.14
                 Light => 0.08
             }
             glass_highlight_color: PASSED.mode |> WHEN {
-                Dark => TEXT { #dce8ff38 }
+                Dark => TEXT { #dce8ff14 }
                 Light => TEXT { #c8e6ff14 }
             }
         ]
@@ -225,8 +225,8 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #ffef8a }
                 Light => TEXT { #9a7600 }
             }
-            gloss: 0.18
-            glow: [color: TEXT { #ffe768aa }, intensity: 0.38]
+            gloss: 0.04
+            glow: [color: TEXT { #ffe76844 }, intensity: 0.10]
         ]
 
         MarkerChip => [
@@ -234,9 +234,9 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #6147d9 }
                 Light => TEXT { #e7ddff }
             }
-            gloss: 0.12
-            glass_highlight: 0.18
-            glow: [color: TEXT { #8f75ff55 }, intensity: 0.10]
+            gloss: 0.04
+            glass_highlight: 0.06
+            glow: [color: TEXT { #8f75ff22 }, intensity: 0.04]
         ]
 
         SelectedRow => [
@@ -287,8 +287,8 @@ FUNCTION material(mode, of) {
                 Dark => TEXT { #11243b }
                 Light => TEXT { #e9f3ff }
             }
-            gloss: 0.11
-            glow: [color: TEXT { #65b8ff66 }, intensity: 0.16]
+            gloss: 0.05
+            glow: [color: TEXT { #65b8ff33 }, intensity: 0.06]
             border: PASSED.mode |> WHEN {
                 Dark => TEXT { #65b8ff }
                 Light => TEXT { #2474bb }

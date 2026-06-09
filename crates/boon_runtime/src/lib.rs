@@ -8117,7 +8117,9 @@ impl GenericScheduledRuntime {
             }
             "List/count" => {
                 let list = self.call_input_or_first(input, args, frame)?;
-                Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
+                Ok(BoonValue::Number(
+                    self.list_values_for_iteration(list, frame)?.len() as i64,
+                ))
             }
             "List/length" => {
                 let list = self.call_input_or_first(input, args, frame)?;
@@ -8189,7 +8191,7 @@ impl GenericScheduledRuntime {
             }
             "List/sum" => {
                 let list = self.call_input_or_first(input, args, frame)?;
-                self.list_sum(list)
+                self.list_sum(list, frame)
             }
             _ => self.eval_user_function(function, args, input, frame),
         }
@@ -8397,14 +8399,9 @@ impl GenericScheduledRuntime {
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
         let expected = expected.as_text().unwrap_or_default();
-        let BoonValue::ListRef(list) = list else {
-            return Ok(BoonValue::Error("type_error".to_owned()));
-        };
-        let len = self.storage.list_len(&list)?;
-        for index in 0..len {
-            let value = self.read_list_field(&list, index, field, frame)?;
-            if value.as_text().unwrap_or_default() == expected {
-                return Ok(BoonValue::RowRef { list, index });
+        for value in self.list_values_for_iteration(list, frame)? {
+            if self.list_value_field_text(&value, field, frame)? == expected {
+                return self.list_value_for_pipeline(value, frame);
             }
         }
         Ok(BoonValue::Empty)
@@ -8421,6 +8418,7 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<BoonValue> {
         match self.list_find(list, field, expected, frame)? {
             BoonValue::RowRef { list, index } => self.read_list_field(&list, index, target, frame),
+            BoonValue::Record(record) => Ok(record.get(target).cloned().unwrap_or(fallback)),
             BoonValue::Empty => Ok(fallback),
             other => Ok(other),
         }
@@ -8572,12 +8570,42 @@ impl GenericScheduledRuntime {
                     .collect())
             }
             BoonValue::Text(path) => {
-                match self.root_derived_boon_value(&path, frame)?.or_else(|| {
-                    let store_path = format!("store.{path}");
-                    self.root_derived_boon_value(&store_path, frame)
-                        .ok()
-                        .flatten()
-                }) {
+                let mut candidates = vec![path.clone()];
+                if let Some(local) = path.strip_prefix("store.") {
+                    candidates.push(local.to_owned());
+                } else {
+                    candidates.push(format!("store.{path}"));
+                }
+                for candidate in &candidates {
+                    if let Some(list_name) = candidate
+                        .strip_prefix("store.")
+                        .filter(|local| self.storage.lists.memory(local).is_some())
+                        .or_else(|| {
+                            self.storage
+                                .lists
+                                .memory(candidate)
+                                .is_some()
+                                .then_some(candidate.as_str())
+                        })
+                    {
+                        let list = list_name.to_owned();
+                        let len = self.storage.list_len(&list)?;
+                        return Ok((0..len)
+                            .map(|index| BoonValue::RowRef {
+                                list: list.clone(),
+                                index,
+                            })
+                            .collect());
+                    }
+                }
+                let mut resolved = None;
+                for candidate in candidates {
+                    if let Some(value) = self.root_derived_boon_value(&candidate, frame)? {
+                        resolved = Some(value);
+                        break;
+                    }
+                }
+                match resolved {
                     Some(BoonValue::List(values)) => Ok(values),
                     Some(BoonValue::ListRef(list)) => {
                         let len = self.storage.list_len(&list)?;
@@ -8701,27 +8729,13 @@ impl GenericScheduledRuntime {
         &mut self,
         list: BoonValue,
         index: i64,
-        _frame: &mut GenericEvalFrame,
+        frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
         let index = usize::try_from(index).map_err(|_| "List/get index is negative")?;
-        match list {
-            BoonValue::List(values) => Ok(values.get(index).cloned().unwrap_or(BoonValue::Empty)),
-            BoonValue::ListRef(list) => {
-                if index >= self.storage.list_len(&list)? {
-                    Ok(BoonValue::Empty)
-                } else {
-                    Ok(BoonValue::RowRef { list, index })
-                }
-            }
-            _ => Ok(BoonValue::Error("type_error".to_owned())),
-        }
-    }
-
-    fn list_len_for_value(&self, list: BoonValue) -> RuntimeResult<usize> {
-        match list {
-            BoonValue::List(values) => Ok(values.len()),
-            BoonValue::ListRef(list) => self.storage.list_len(&list),
-            _ => Ok(0),
+        let values = self.list_values_for_iteration(list, frame)?;
+        match values.get(index).cloned() {
+            Some(value) => self.list_value_for_pipeline(value, frame),
+            None => Ok(BoonValue::Empty),
         }
     }
 
@@ -8754,19 +8768,7 @@ impl GenericScheduledRuntime {
         predicate_expr: usize,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = match list {
-            BoonValue::List(values) => values,
-            BoonValue::ListRef(list) => {
-                let len = self.storage.list_len(&list)?;
-                (0..len)
-                    .map(|index| BoonValue::RowRef {
-                        list: list.clone(),
-                        index,
-                    })
-                    .collect()
-            }
-            _ => return Ok(BoonValue::Error("type_error".to_owned())),
-        };
+        let values = self.list_values_for_iteration(list, frame)?;
         let mut output = Vec::new();
         let previous = frame.env.get(binding).cloned();
         for value in values {
@@ -8776,7 +8778,7 @@ impl GenericScheduledRuntime {
                 .bool_value()
                 .unwrap_or(false)
             {
-                output.push(value);
+                output.push(self.list_value_for_pipeline(value, frame)?);
             }
         }
         if let Some(previous) = previous {
@@ -8794,19 +8796,7 @@ impl GenericScheduledRuntime {
         predicate_expr: usize,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = match list {
-            BoonValue::List(values) => values,
-            BoonValue::ListRef(list) => {
-                let len = self.storage.list_len(&list)?;
-                (0..len)
-                    .map(|index| BoonValue::RowRef {
-                        list: list.clone(),
-                        index,
-                    })
-                    .collect()
-            }
-            _ => return Ok(BoonValue::Error("type_error".to_owned())),
-        };
+        let values = self.list_values_for_iteration(list, frame)?;
         let previous = frame.env.get(binding).cloned();
         for value in values {
             frame.env.insert(binding.to_owned(), value);
@@ -8838,19 +8828,7 @@ impl GenericScheduledRuntime {
         predicate_expr: usize,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = match list {
-            BoonValue::List(values) => values,
-            BoonValue::ListRef(list) => {
-                let len = self.storage.list_len(&list)?;
-                (0..len)
-                    .map(|index| BoonValue::RowRef {
-                        list: list.clone(),
-                        index,
-                    })
-                    .collect()
-            }
-            _ => return Ok(BoonValue::Error("type_error".to_owned())),
-        };
+        let values = self.list_values_for_iteration(list, frame)?;
         let previous = frame.env.get(binding).cloned();
         for value in values {
             frame.env.insert(binding.to_owned(), value);
@@ -8878,36 +8856,24 @@ impl GenericScheduledRuntime {
     fn list_latest(
         &mut self,
         list: BoonValue,
-        _frame: &mut GenericEvalFrame,
+        frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = match list {
-            BoonValue::List(values) => values,
-            BoonValue::ListRef(list) => {
-                let len = self.storage.list_len(&list)?;
-                let mut values = Vec::new();
-                for index in 0..len {
-                    values.push(BoonValue::RowRef {
-                        list: list.clone(),
-                        index,
-                    });
-                }
-                values
-            }
-            _ => return Ok(BoonValue::Error("type_error".to_owned())),
-        };
+        let values = self.list_values_for_iteration(list, frame)?;
         let mut latest = BoonValue::Empty;
         for value in values {
             if !matches!(value, BoonValue::Empty) {
                 latest = value;
             }
         }
-        Ok(latest)
+        self.list_value_for_pipeline(latest, frame)
     }
 
-    fn list_sum(&self, list: BoonValue) -> RuntimeResult<BoonValue> {
-        let BoonValue::List(values) = list else {
-            return Ok(BoonValue::Error("type_error".to_owned()));
-        };
+    fn list_sum(
+        &mut self,
+        list: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
         let mut sum = 0i64;
         for value in values {
             match value {
@@ -9281,6 +9247,15 @@ impl GenericScheduledRuntime {
         let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
             return Ok(None);
         };
+        if plan.kind == DerivedValueKind::SourceEventTransform
+            && plan.has_sources
+            && let Some(value) = self.runtime_scalar_boon_value(&plan.path)
+        {
+            frame.reads.insert(GenericReadKey::Root {
+                field: plan.path.clone(),
+            });
+            return Ok(Some(value));
+        }
         if let Some(value) = self.generic_derived_state.root_value_cache.get(&plan.path) {
             if let Some(reads) = self
                 .generic_derived_state
@@ -9693,6 +9668,9 @@ impl GenericScheduledRuntime {
             root.insert(row_field_name(&path).to_owned(), value);
         }
         for (list, target) in self.list_equations.retain_targets() {
+            if contains_nested_json(&root, target) {
+                continue;
+            }
             let Some(summary) = self
                 .list_summary_fields
                 .iter()
@@ -9765,6 +9743,9 @@ impl GenericScheduledRuntime {
             return;
         };
         for projection in &self.list_projections.projections {
+            if contains_nested_json(root, &projection.target) {
+                continue;
+            }
             match &projection.kind {
                 RuntimeListProjectionKind::Chunk {
                     item_field,
@@ -11866,6 +11847,24 @@ fn insert_nested_json(root: &mut serde_json::Map<String, JsonValue>, path: &str,
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     insert_parts(root, &parts, value);
+}
+
+fn contains_nested_json(root: &serde_json::Map<String, JsonValue>, path: &str) -> bool {
+    let mut object = root;
+    let mut parts = path.split('.').filter(|part| !part.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        let Some(value) = object.get(part) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return true;
+        }
+        let Some(next) = value.as_object() else {
+            return false;
+        };
+        object = next;
+    }
+    false
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -22047,6 +22046,144 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
     }
 
     #[test]
+    fn root_list_view_predicate_reads_store_prefixed_derived_number() {
+        let source = r#"
+store: [
+    elements: [
+        click: SOURCE
+    ]
+    cursor_driver:
+        Cursor50 |> HOLD cursor_driver {
+            LATEST {
+                elements.click.event.press |> THEN { Cursor150 }
+            }
+        }
+    cursor:
+        cursor_driver |> WHEN {
+            Cursor150 => 150
+            __ => 50
+        }
+    segments:
+        LIST {
+            [start: 0, end: 50, label: TEXT { old }]
+            [start: 50, end: 150, label: TEXT { middle }]
+            [start: 150, end: 250, label: TEXT { new }]
+        }
+    selected_label:
+        segments
+        |> List/retain(segment, if: segment.start <= store.cursor)
+        |> List/retain(segment, if: segment.end > store.cursor)
+        |> List/join_field(field: "label", separator: "", empty: TEXT { empty })
+]
+
+document: Document/new(root: Element/label(element: [], label: store.selected_label))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-predicate-store-derived-number", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["selected_label"], "middle");
+
+        let clicked = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.click".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("click should update cursor")
+            .state_summary;
+        assert_eq!(clicked["store"]["cursor"], json!(150));
+        assert_eq!(clicked["store"]["selected_label"], "new");
+    }
+
+    #[test]
+    fn mapped_root_list_function_filters_segments_with_store_cursor() {
+        let source = r#"
+store: [
+    elements: [
+        click: SOURCE
+    ]
+    cursor_driver:
+        Cursor50 |> HOLD cursor_driver {
+            LATEST {
+                elements.click.event.press |> THEN { Cursor150 }
+            }
+        }
+    cursor:
+        cursor_driver |> WHEN {
+            Cursor150 => 150
+            __ => 50
+        }
+    signals:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }, current: TEXT { middle }]
+        }
+    segments:
+        LIST {
+            [signal_id: TEXT { a }, start: 0, end: 50, label: TEXT { old }]
+            [signal_id: TEXT { a }, start: 50, end: 150, label: TEXT { middle }]
+            [signal_id: TEXT { a }, start: 150, end: 250, label: TEXT { new }]
+        }
+    direct_store_label:
+        store.segments
+        |> List/filter_field_equal(field: "signal_id", value: TEXT { a })
+        |> List/retain(segment, if: segment.start <= store.cursor)
+        |> List/retain(segment, if: segment.end > store.cursor)
+        |> List/join_field(field: "label", separator: "", empty: TEXT { empty })
+    direct_plain_label:
+        segments
+        |> List/filter_field_equal(field: "signal_id", value: TEXT { a })
+        |> List/retain(segment, if: segment.start <= store.cursor)
+        |> List/retain(segment, if: segment.end > store.cursor)
+        |> List/join_field(field: "label", separator: "", empty: TEXT { empty })
+    rows:
+        signals |> List/map(signal, new: cursor_row(signal: signal))
+    cursor_rows:
+        signals |> List/map(signal, new: cursor_probe_row(signal: signal))
+    cursor_labels:
+        cursor_rows |> List/join_field(field: "label", separator: " ", empty: TEXT { empty })
+    row_labels:
+        rows |> List/join_field(field: "label", separator: " ", empty: TEXT { empty })
+]
+
+FUNCTION cursor_value(signal) {
+    store.segments
+    |> List/filter_field_equal(field: "signal_id", value: signal.id)
+    |> List/retain(segment, if: segment.start <= store.cursor)
+    |> List/retain(segment, if: segment.end > store.cursor)
+    |> List/join_field(field: "label", separator: "", empty: signal.current)
+}
+
+FUNCTION cursor_row(signal) {
+    [
+        label: signal.name |> Text/concat(with: cursor_value(signal: signal), separator: "=")
+    ]
+}
+
+FUNCTION cursor_probe_row(signal) {
+    [
+        label: store.cursor
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: store.row_labels))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("mapped-root-list-function-store-cursor", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["row_labels"], "A=middle");
+
+        let clicked = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.click".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("click should update cursor")
+            .state_summary;
+        assert_eq!(clicked["store"]["cursor"], json!(150));
+        assert_eq!(clicked["store"]["cursor_labels"], "150");
+        assert_eq!(clicked["store"]["direct_plain_label"], "new");
+        assert_eq!(clicked["store"]["direct_store_label"], "new");
+        assert_eq!(clicked["store"]["row_labels"], "A=new");
+    }
+
+    #[test]
     fn root_derived_list_literal_when_matches_runtime_values() {
         let source = r#"
 store: [
@@ -22441,6 +22578,21 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
                 ..LiveSourceEvent::default()
             })
             .expect("zoom reset should apply");
+
+        let clicked = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.waveform_click".to_owned(),
+                pointer_x: Some("216".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform click should update the cursor value")
+            .state_summary;
+        assert_eq!(clicked["store"]["keyboard_cursor_label"], "150 s");
+        assert_eq!(
+            clicked["store"]["bridge_cursor_values_label"],
+            "A[3:0]=0x0 B[3:0]=0x0 at 150 s"
+        );
 
         runtime
             .apply_source_event(LiveSourceEvent {

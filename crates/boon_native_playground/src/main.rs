@@ -45172,8 +45172,9 @@ mod tests {
         );
         input_state = PreviewNativeInputState::default();
 
-        let assert_waveform_cursor_lines = |frame: &boon_document::LayoutFrame,
-                                            label: &str|
+        let assert_waveform_guide_lines = |frame: &boon_document::LayoutFrame,
+                                           label: &str,
+                                           color: &str|
          -> f32 {
             let visible_row_labels = frame
                 .display_list
@@ -45188,7 +45189,7 @@ mod tests {
                 .display_list
                 .iter()
                 .filter(|item| {
-                    display_item_paint_color(item) == Some("#D6B73F")
+                    display_item_paint_color(item) == Some(color)
                         && item.text.is_none()
                         && item.bounds.x > 250.0
                         && item.bounds.y > 340.0
@@ -45211,7 +45212,7 @@ mod tests {
                     item.bounds.y <= visible_top + 1.0
                         && item.bounds.y + item.bounds.height >= visible_bottom - 1.0
                 }),
-                "waveform cursor `{label}` should render a full-height overlay line crossing the visible waveform rows; visible_rows={:?}, lines={:?}",
+                "waveform guide `{label}` should render a full-height overlay line crossing the visible waveform rows; color={color}, visible_rows={:?}, lines={:?}",
                 visible_row_labels
                     .iter()
                     .map(|item| (item.text.as_deref(), item.bounds))
@@ -45223,7 +45224,7 @@ mod tests {
                 lines
                     .iter()
                     .all(|item| (item.bounds.x - cursor_x).abs() <= 1.0),
-                "waveform cursor `{label}` line segments should align vertically: {:?}",
+                "waveform guide `{label}` line segments should align vertically: color={color}, {:?}",
                 lines.iter().map(|item| item.bounds).collect::<Vec<_>>()
             );
             let top = lines
@@ -45236,7 +45237,7 @@ mod tests {
                 .fold(0.0_f32, f32::max);
             assert!(
                 bottom - top >= (visible_bottom - visible_top),
-                "waveform cursor `{label}` should cross all visible waveform rows: top={top}, bottom={bottom}, visible_rows={:?}, lines={:?}",
+                "waveform guide `{label}` should cross all visible waveform rows: color={color}, top={top}, bottom={bottom}, visible_rows={:?}, lines={:?}",
                 visible_row_labels
                     .iter()
                     .map(|item| (item.text.as_deref(), item.bounds))
@@ -45326,7 +45327,7 @@ mod tests {
         );
         let cursor48_line_x = {
             let clicked_frame = latest_preview_frame(&shared_render_state);
-            let cursor48_x = assert_waveform_cursor_lines(&clicked_frame, "150 s");
+            let cursor48_x = assert_waveform_guide_lines(&clicked_frame, "150 s", "#D6B73F");
             physical_frame_text_item(
                 &clicked_frame,
                 "M 50 s",
@@ -45370,12 +45371,14 @@ mod tests {
         );
         {
             let hover_frame = latest_preview_frame(&shared_render_state);
-            let cursor_after_hover_x = assert_waveform_cursor_lines(&hover_frame, "150 s");
+            let cursor_after_hover_x =
+                assert_waveform_guide_lines(&hover_frame, "150 s", "#D6B73F");
             assert!(
                 (cursor_after_hover_x - cursor48_line_x).abs() <= 1.0,
                 "waveform pointer motion should not visually move the cursor line: before={cursor48_line_x}, after={cursor_after_hover_x}"
             );
-            let zoom_center_after_hover_x = assert_waveform_cursor_lines(&hover_frame, "200 s");
+            let zoom_center_after_hover_x =
+                assert_waveform_guide_lines(&hover_frame, "200 s", "#43D97388");
             assert!(
                 (zoom_center_after_hover_x - hover_x as f32).abs() <= 2.0,
                 "zoom-center guide should render under the hover x position: line={zoom_center_after_hover_x}, hover={hover_x}"
@@ -45435,7 +45438,8 @@ mod tests {
         );
         {
             let cursor36_frame = latest_preview_frame(&shared_render_state);
-            let cursor36_line_x = assert_waveform_cursor_lines(&cursor36_frame, "0 s");
+            let cursor36_line_x =
+                assert_waveform_guide_lines(&cursor36_frame, "0 s", "#D6B73F");
             physical_frame_text_item(&cursor36_frame, "0xa", "NovyWave 0 s value column A value");
             physical_frame_text_item(
                 &cursor36_frame,
@@ -45521,13 +45525,17 @@ mod tests {
             waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xa");
         let repeated_zoom_released_width =
             waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xc");
+        let repeated_zoom_canvas_width =
+            summary_number(&repeated_zoom_summary, "/store/selected_waveform_canvas_width");
+        let expected_repeated_zoom_leading_width = repeated_zoom_canvas_width * (10.0 / 40.0);
         assert!(
-            (repeated_zoom_leading_width - 90.0).abs() <= 1.0,
-            "held W should clip the leading 0xa segment to the 40 s - 80 s viewport: width={repeated_zoom_leading_width}"
+            (repeated_zoom_leading_width - expected_repeated_zoom_leading_width).abs() <= 1.0,
+            "held W should clip the leading 0xa segment to the 40 s - 80 s viewport using the measured canvas width: width={repeated_zoom_leading_width}, expected={expected_repeated_zoom_leading_width}, canvas={repeated_zoom_canvas_width}"
         );
+        let expected_repeated_zoom_released_width = repeated_zoom_canvas_width * (30.0 / 40.0);
         assert!(
-            repeated_zoom_released_width > zoomed_released_width * 1.2,
-            "held W should visibly continue zooming in: first={zoomed_released_width}, repeated={repeated_zoom_released_width}"
+            (repeated_zoom_released_width - expected_repeated_zoom_released_width).abs() <= 1.0,
+            "held W should clip the 0xc segment to the 40 s - 80 s viewport using the measured canvas width: width={repeated_zoom_released_width}, expected={expected_repeated_zoom_released_width}, first={zoomed_released_width}, canvas={repeated_zoom_canvas_width}"
         );
 
         let zoom_out_key = test_keyboard_input(vec![test_key_press(8, "S")], vec!["S"]);
@@ -45557,10 +45565,12 @@ mod tests {
         );
         let zoomed_out_released_width =
             waveform_value_segment_width(&zoom_out_summary, "clk", "0xc");
+        let zoomed_out_canvas_width =
+            summary_number(&zoom_out_summary, "/store/selected_waveform_canvas_width");
+        let expected_zoomed_out_released_width = zoomed_out_canvas_width * (100.0 / 150.0);
         assert!(
-            zoomed_out_released_width < repeated_zoom_released_width * 0.85
-                && zoomed_out_released_width > initial_released_width * 1.5,
-            "zoom-out should step smoothly from Closer back to Close: initial={initial_released_width}, repeated={repeated_zoom_released_width}, zoomed_out={zoomed_out_released_width}"
+            (zoomed_out_released_width - expected_zoomed_out_released_width).abs() <= 1.0,
+            "zoom-out should restore the Close viewport width from measured canvas and selected-file metadata: width={zoomed_out_released_width}, expected={expected_zoomed_out_released_width}, initial={initial_released_width}, repeated={repeated_zoom_released_width}, canvas={zoomed_out_canvas_width}"
         );
 
         input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(1));
@@ -47669,7 +47679,11 @@ mod tests {
     fn summary_number(summary: &serde_json::Value, path: &str) -> f64 {
         summary
             .pointer(path)
-            .and_then(serde_json::Value::as_f64)
+            .and_then(|value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+            })
             .unwrap_or_else(|| panic!("state summary should expose numeric `{path}`"))
     }
 

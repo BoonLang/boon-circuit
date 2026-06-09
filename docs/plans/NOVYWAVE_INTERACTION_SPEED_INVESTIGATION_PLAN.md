@@ -107,6 +107,36 @@ nodes or compact layout snapshot. Full document lowering, full layout proof JSON
 and full state summaries must remain verifier/debug/report behavior, not normal
 preview interaction behavior.
 
+## Active Implementation Checkpoint On 2026-06-09
+
+The latest local implementation checkpoint has moved the bottleneck again. The
+release verifier still fails, but steady hover is now within the 60fps budget
+and runtime apply is no longer the dominant p95 cost:
+
+- `hover_to_overlay_ms_p50_p95_max.p95`: 15.055 ms, passing the 16.7 ms target
+- `click_to_cursor_ms_p50_p95_max.p95`: 20.765 ms, still over target
+- `divider_drag_to_layout_ms_p50_p95_max.p95`: 413.139 ms, still over target
+- `resize_to_present_ms_p50_p95_max.p95`: 602.482 ms, still over target
+- `runtime_apply_ms_p50_p95_max.p95`: 4.334 ms
+- `runtime_step_apply_ms_p50_p95_max.p95`: 3.860 ms
+- `runtime_state_summary_ms_p50_p95_max.p95`: 0.478 ms
+- `layout_rebuild_ms_p50_p95_max.p95`: 5.756 ms, with a large max outlier
+- `document_eval_lower_ms_p50_p95_max.p95`: 383.727 ms
+
+The next fixes should therefore focus on the remaining generic sparse render
+and layout routes instead of adding NovyWave-specific shortcuts. In particular:
+
+- Rerun the verifier after widening the recorded interaction profile sample cap
+  so divider samples are visible in the report.
+- Inspect divider events for fallback to `document_eval_lower`; if width/style
+  bindings or list origins are missing, fix the generic binding/origin model.
+- Replace fake resize proof rebuilding with the real preview viewport relayout
+  route, and then optimize that route to relayout cached document frames without
+  full document evaluation/lowering.
+- Keep the active-file waveform-segment width dependency as a source-level
+  correctness fix, but do not use source fixtures, hardcoded timeline values, or
+  verifier exclusions to make the gate pass.
+
 ## Follow-Up Review Findings On 2026-06-09
 
 The next review narrowed the remaining work into three generic problem areas.

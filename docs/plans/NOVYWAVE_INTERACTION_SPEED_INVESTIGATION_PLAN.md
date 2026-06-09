@@ -107,6 +107,55 @@ nodes or compact layout snapshot. Full document lowering, full layout proof JSON
 and full state summaries must remain verifier/debug/report behavior, not normal
 preview interaction behavior.
 
+## Follow-Up Review Findings On 2026-06-09
+
+The next review narrowed the remaining work into three generic problem areas.
+
+### Measurement Contract Problems
+
+- The speed harness includes the first measured hover and click samples. It does
+  not define a warmup/drop policy, so one first full-layout interaction can
+  dominate p95 even when later steady hover samples are already near budget.
+- Interaction profiles are phase-mixed: hover, click, divider, and resize
+  profiles are drained together, so aggregate runtime/layout p95s are not
+  attributable to one interaction class.
+- Divider samples currently send synthetic `Grow`/`Shrink` live events, not the
+  actual press/move/release divider drag route.
+- Resize samples measure layout proof rebuild time, not input-to-present or
+  app-owned readback evidence. Rename or fix the metric before accepting it as
+  `resize_to_present`.
+- Xtask budget checks consume summary p95s but do not enforce sample counts,
+  phase isolation, or proof that each metric measured the intended route.
+
+### Runtime/List-View Problems
+
+- NovyWave click starts as a root source event, but derived cursor state fans out
+  into keyed `waveform_segment_records.width` list field commits. The renderer
+  then sees list deltas and falls back to full document rebuild.
+- The runtime has row-level derived list field commits but no first-class
+  derived root `ListView` materialization boundary for paths such as
+  `store.selected_waveform_segments`, `store.selected_cursor_pair_rows`, and
+  `store.selected_visible_items`.
+- Add generic list-view patch semantics: diff root `ListView` outputs by stable
+  list keys and emit list-view patches, not only underlying list row field
+  deltas.
+- Canonicalize root dirty keys internally so aliases such as `store.foo` and
+  `foo` do not widen fanout.
+- Compile `List/map`, `List/filter`, `List/retain`, and `List/join_field` into
+  derived operators with explicit read sets and patch semantics.
+
+### Document Binding/Layout Patch Problems
+
+- The cached-frame patch path is the right direction, but it must prove concrete
+  patched node/attr samples in the app-owned report.
+- Style records must register concrete target attrs like `width`, `height`,
+  `border`, and `border_radius`; a generic synthetic `style` target is too
+  coarse for sparse patches.
+- `ForEach`/list item lowering needs origin metadata so row-derived view nodes
+  can be patched from keyed list deltas.
+- Root-only patches should stay conservative, but list-row and list-view patches
+  are required before cursor clicks and first hover can avoid full relayout.
+
 ## Implementation Phases
 
 ### Phase 0: Baseline Verifier And Instrumentation

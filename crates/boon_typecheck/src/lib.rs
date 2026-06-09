@@ -1330,7 +1330,7 @@ impl<'a> Checker<'a> {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         expr_id,
                         format!(
-                            "unknown source payload field `{field}`\nknown fields here: text: TEXT, key: TEXT, address: TEXT, event.press, event.click, event.double_click, event.blur, event.key_down.key"
+                            "unsupported nested source payload path `{field}`\nsource payload fields are open text payloads; event.press, event.click, event.double_click, event.blur, event.change, and event.key_down are event objects"
                         ),
                     ));
                     return self.expr_type_var(expr_id);
@@ -3335,6 +3335,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Number/interpolate",
                 "Number/project_width",
                 "Number/project_offset",
+                "Number/project_time",
                 "List/count",
                 "List/length",
                 "List/sum",
@@ -4565,6 +4566,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                 function.as_str(),
                 "Number/project_width"
                     | "Number/project_offset"
+                    | "Number/project_time"
                     | "Number/interpolate"
                     | "List/count"
                     | "List/sum"
@@ -5947,12 +5949,12 @@ fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
 
 fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
     match suffix {
-        "text" | "key" | "address" => SourcePayloadAccess::Field(suffix.to_owned()),
         "change.text" => SourcePayloadAccess::Field("text".to_owned()),
         "key_down.key" => SourcePayloadAccess::Field("key".to_owned()),
         "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
             SourcePayloadAccess::Field(suffix.to_owned())
         }
+        field if !field.contains('.') => SourcePayloadAccess::Field(field.to_owned()),
         _ => SourcePayloadAccess::UnknownField(suffix.to_owned()),
     }
 }
@@ -5982,11 +5984,10 @@ fn simple_record_shape(fields: &[AstRecordField], expressions: &[AstExpr]) -> Ob
 
 fn source_payload_field_type(field: &str) -> Type {
     match field {
-        "text" | "key" | "address" => Type::Text,
         "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
             exact_empty_object_type()
         }
-        _ => unresolved_shape(format!("unknown source payload field `{field}`")),
+        _ => Type::Text,
     }
 }
 
@@ -6023,12 +6024,13 @@ fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShape
         let AstExprKind::Path(parts) = &expr.kind else {
             continue;
         };
-        let Some(field) = source_payload_field_name(parts) else {
+        let Some(SourcePayloadAccess::Field(field)) = source_payload_access(&source_paths, parts)
+        else {
             continue;
         };
         for source_path in source_lookup.source_paths_for_parts(parts) {
             if let Some(fields) = fields_by_source.get_mut(&source_path) {
-                fields.insert(field.to_owned(), source_payload_field_type(field));
+                fields.insert(field.clone(), source_payload_field_type(&field));
             }
         }
     }
@@ -6780,7 +6782,7 @@ fn collect_payload_pattern_fields(
                         }) = child.expr.and_then(|expr_id| expressions.get(expr_id))
                         {
                             for field in source_payload_fields_from_pattern(pattern) {
-                                fields.insert(field.to_owned(), source_payload_field_type(field));
+                                fields.insert(field.to_owned(), source_payload_field_type(&field));
                             }
                         }
                     }
@@ -6891,41 +6893,19 @@ fn expr_source_paths(
 
 fn parts_without_payload(parts: &[String]) -> &[String] {
     match parts.last().map(String::as_str) {
-        Some("text" | "key" | "address" | "press" | "click" | "double_click" | "blur") => {
+        Some("press" | "click" | "double_click" | "blur" | "change" | "key_down") => {
             &parts[..parts.len().saturating_sub(1)]
         }
+        Some(_) => &parts[..parts.len().saturating_sub(1)],
         _ => parts,
     }
 }
 
-fn source_payload_field_name(parts: &[String]) -> Option<&str> {
-    match parts.last().map(String::as_str) {
-        Some(field @ ("text" | "key" | "address")) => Some(field),
-        Some(field @ ("press" | "click" | "double_click" | "blur")) => Some(field),
-        Some("change") => Some("change"),
-        Some("key_down") => Some("key_down"),
-        _ => None,
-    }
-}
-
-fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<&'static str> {
+fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<String> {
     let mut fields = Vec::new();
     for window in pattern.windows(2) {
-        if matches!(
-            window[0].as_str(),
-            "text" | "key" | "address" | "press" | "click" | "double_click" | "blur"
-        ) && window[1].as_str() == ":"
-        {
-            fields.push(match window[0].as_str() {
-                "text" => "text",
-                "key" => "key",
-                "address" => "address",
-                "press" => "press",
-                "click" => "click",
-                "double_click" => "double_click",
-                "blur" => "blur",
-                _ => unreachable!(),
-            });
+        if window[1].as_str() == ":" && !matches!(window[0].as_str(), "__" | "SKIP") {
+            fields.push(window[0].clone());
         }
     }
     fields
@@ -8575,25 +8555,46 @@ document: []
     }
 
     #[test]
-    fn rejects_unknown_source_payload_field() {
+    fn rejects_nested_source_payload_field_path() {
         let source = r#"
 source: SOURCE
 value:
     Text/empty() |> HOLD value {
         LATEST {
-            source.foo
+            source.foo.bar
         }
     }
 document: []
 "#;
-        let parsed = boon_parser::parse_source("bad-source-payload-field.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("bad-source-payload-path.bn", source).unwrap();
         let report = check(&parsed);
         assert!(report.has_errors());
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("unknown source payload field `foo`")
+                .contains("unsupported nested source payload path `foo.bar`")
         }));
+    }
+
+    #[test]
+    fn accepts_open_source_payload_field_names() {
+        let source = r#"
+source: SOURCE
+value:
+    Text/empty() |> HOLD value {
+        LATEST {
+            source.platform_specific_payload
+        }
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("open-source-payload-field.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
     }
 
     #[test]

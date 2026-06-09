@@ -34,7 +34,6 @@ store: [
         select_counter_file: SOURCE
         select_uart_compare_file: SOURCE
         select_ghw_file: SOURCE
-        diagnostic_probe: SOURCE
         signal_search_focus_probe: SOURCE
         mode_to_light: SOURCE
         mode_to_dark: SOURCE
@@ -88,6 +87,7 @@ store: [
         format_ascii: SOURCE
         keyboard_capture: SOURCE
         waveform_click: SOURCE
+        waveform_hover: SOURCE
         signal_search_input: SOURCE
         scope_cpu: SOURCE
         scope_cpu_expand: SOURCE
@@ -98,12 +98,9 @@ store: [
         select_reset: SOURCE
         select_data: SOURCE
         select_temperature: SOURCE
-        panels_files_wider: SOURCE
-        panels_variables_wider: SOURCE
-        panels_reset: SOURCE
         panels_toggle_arrangement: SOURCE
-        files_main_resize_drag: SOURCE
-        files_secondary_resize_drag: SOURCE
+        files_variables_resize_drag: SOURCE
+        browser_selected_resize_drag: SOURCE
         variables_name_resize_drag: SOURCE
         variables_value_resize_drag: SOURCE
         signal_row_resize_drag: SOURCE
@@ -199,11 +196,27 @@ store: [
     panel_layout:
         Balanced |> HOLD panel_layout {
             LATEST {
-                elements.panels_files_wider.event.press |> THEN { FilesWide }
-                elements.panels_variables_wider.event.press |> THEN { VariablesWide }
-                elements.panels_reset.event.press |> THEN { Balanced }
-                elements.files_main_resize_drag.text |> THEN {
-                    elements.files_main_resize_drag.text |> WHEN {
+                elements.files_variables_resize_drag.text |> THEN {
+                    elements.files_variables_resize_drag.text |> WHEN {
+                        TEXT { Grow } => panel_layout |> WHEN {
+                            VariablesWidest => VariablesWide
+                            VariablesWide => Balanced
+                            Balanced => FilesWide
+                            FilesWide => FilesWidest
+                            __ => FilesWidest
+                        }
+                        TEXT { Shrink } => panel_layout |> WHEN {
+                            FilesWidest => FilesWide
+                            FilesWide => Balanced
+                            Balanced => VariablesWide
+                            VariablesWide => VariablesWidest
+                            __ => VariablesWidest
+                        }
+                        __ => panel_layout
+                    }
+                }
+                elements.browser_selected_resize_drag.text |> THEN {
+                    elements.browser_selected_resize_drag.text |> WHEN {
                         TEXT { Grow } => panel_layout |> WHEN {
                             VariablesWidest => VariablesWide
                             VariablesWide => Balanced
@@ -291,9 +304,25 @@ store: [
     files_panel_height_key:
         Balanced |> HOLD files_panel_height_key {
             LATEST {
-                elements.panels_reset.event.press |> THEN { Balanced }
-                elements.files_secondary_resize_drag.text |> THEN {
-                    elements.files_secondary_resize_drag.text |> WHEN {
+                elements.files_variables_resize_drag.text |> THEN {
+                    elements.files_variables_resize_drag.text |> WHEN {
+                        TEXT { Grow } => files_panel_height_key |> WHEN {
+                            Short => Balanced
+                            Balanced => Tall
+                            Tall => Tallest
+                            __ => Tallest
+                        }
+                        TEXT { Shrink } => files_panel_height_key |> WHEN {
+                            Tallest => Tall
+                            Tall => Balanced
+                            Balanced => Short
+                            __ => Short
+                        }
+                        __ => files_panel_height_key
+                    }
+                }
+                elements.browser_selected_resize_drag.text |> THEN {
+                    elements.browser_selected_resize_drag.text |> WHEN {
                         TEXT { Grow } => files_panel_height_key |> WHEN {
                             Short => Balanced
                             Balanced => Tall
@@ -342,7 +371,6 @@ store: [
                         __ => selected_name_column_width_key
                     }
                 }
-                elements.panels_reset.event.press |> THEN { Normal }
             }
         }
 
@@ -374,7 +402,6 @@ store: [
                         __ => selected_value_column_width_key
                     }
                 }
-                elements.panels_reset.event.press |> THEN { Normal }
             }
         }
 
@@ -565,10 +592,10 @@ store: [
 
     waveform_file_metadata:
         LIST {
-            [file: "simple.vcd", format: "VCD", digest: "sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de", waveform_ref: "wave:vcd:simple:0-250s", full_range: "0 s - 250 s", initial_window: "0 s - 250 s", range_start: 0, range_end: 250, initial_start: 0, initial_end: 250, canvas_width: 360, cursor_left: 0, cursor_default: 50, cursor_right: 150, stats: "VCD 2 signals, 0-250s, bounded pages", large_file_contract: "simple.vcd 311B -> bounded page requests only", hierarchy_page: "HIER:simple_tb/s", hierarchy_cursor: "hierarchy cursor simple_tb.s:0..64 next=none", materialization_bound: "visible rows 2/2, waveform segments 6/256 max", time_unit: "s", timescale: "1 s/native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "wave_27.fst", format: "FST", digest: "sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172", waveform_ref: "wave:fst:wave-27:0-240ns", full_range: "0 ns - 240 ns", initial_window: "0 ns - 120 ns", range_start: 0, range_end: 240, initial_start: 0, initial_end: 120, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, stats: "FST 5 signals, 0-240ns, bounded pages", large_file_contract: "wave_27.fst 28860652B -> bounded compare page only", hierarchy_page: "HIER:top.uart compare page", hierarchy_cursor: "hierarchy cursor top.uart:0..64 next=none", materialization_bound: "visible rows 4/5, waveform segments 28/256 max", time_unit: "ns", timescale: "inferred FST native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "simple_test.ghw", format: "GHW", digest: "sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491", waveform_ref: "wave:ghw:simple-test:0-100ns", full_range: "0 ns - 100 ns", initial_window: "0 ns - 100 ns", range_start: 0, range_end: 100, initial_start: 0, initial_end: 100, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, stats: "GHW 4 signals, 0-100ns, bounded pages", large_file_contract: "simple_test.ghw 833B -> bounded page requests only", hierarchy_page: "HIER:ghw.simple/counter", hierarchy_cursor: "hierarchy cursor ghw.simple:0..64 next=none", materialization_bound: "visible rows 3/4, waveform segments 20/256 max", time_unit: "ns", timescale: "GHW native tick", range_source: FileHeader, metadata_source: WellenHeader]
-            [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
+            [file: "simple.vcd", format: "VCD", digest: "sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de", waveform_ref: "wave:vcd:simple:0-250s", full_range: "0 s - 250 s", initial_window: "0 s - 250 s", range_start: 0, range_end: 250, initial_start: 0, initial_end: 250, canvas_width: 360, cursor_left: 0, cursor_default: 50, cursor_right: 150, zoom_center_default: 50, stats: "VCD 2 signals, 0-250s, bounded pages", large_file_contract: "simple.vcd 311B -> bounded page requests only", hierarchy_page: "HIER:simple_tb/s", hierarchy_cursor: "hierarchy cursor simple_tb.s:0..64 next=none", materialization_bound: "visible rows 2/2, waveform segments 6/256 max", time_unit: "s", timescale: "1 s/native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "wave_27.fst", format: "FST", digest: "sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172", waveform_ref: "wave:fst:wave-27:0-240ns", full_range: "0 ns - 240 ns", initial_window: "0 ns - 120 ns", range_start: 0, range_end: 240, initial_start: 0, initial_end: 120, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, zoom_center_default: 42, stats: "FST 5 signals, 0-240ns, bounded pages", large_file_contract: "wave_27.fst 28860652B -> bounded compare page only", hierarchy_page: "HIER:top.uart compare page", hierarchy_cursor: "hierarchy cursor top.uart:0..64 next=none", materialization_bound: "visible rows 4/5, waveform segments 28/256 max", time_unit: "ns", timescale: "inferred FST native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "simple_test.ghw", format: "GHW", digest: "sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491", waveform_ref: "wave:ghw:simple-test:0-100ns", full_range: "0 ns - 100 ns", initial_window: "0 ns - 100 ns", range_start: 0, range_end: 100, initial_start: 0, initial_end: 100, canvas_width: 360, cursor_left: 36, cursor_default: 42, cursor_right: 48, zoom_center_default: 42, stats: "GHW 4 signals, 0-100ns, bounded pages", large_file_contract: "simple_test.ghw 833B -> bounded page requests only", hierarchy_page: "HIER:ghw.simple/counter", hierarchy_cursor: "hierarchy cursor ghw.simple:0..64 next=none", materialization_bound: "visible rows 3/4, waveform segments 20/256 max", time_unit: "ns", timescale: "GHW native tick", range_source: FileHeader, metadata_source: WellenHeader]
+            [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, zoom_center_default: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
         }
 
     viewport_window_records:
@@ -804,7 +831,6 @@ store: [
             elements.select_counter_file.event.press |> THEN { TEXT { FILE_READY } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FILE_READY } }
             elements.select_ghw_file.event.press |> THEN { TEXT { FILE_READY } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { DIAGNOSTIC } }
             elements.begin_default_file_load.event.press |> THEN { TEXT { OPENING } }
             elements.load_default_file.event.press |> THEN { TEXT { FILE_READY } }
             elements.external_file_loaded_name.text |> THEN { TEXT { FILE_READY } }
@@ -934,7 +960,6 @@ store: [
     diagnostic_state:
         LATEST {
             OK
-            elements.diagnostic_probe.event.press |> THEN { Unsupported }
             elements.select_counter_file.event.press |> THEN { OK }
             elements.select_uart_compare_file.event.press |> THEN { OK }
             elements.select_ghw_file.event.press |> THEN { OK }
@@ -948,7 +973,6 @@ store: [
     diagnostic_label:
         LATEST {
             TEXT { bridge diagnostics OK }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported waveform file: corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_ghw_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
@@ -962,7 +986,6 @@ store: [
     diagnostic_file:
         LATEST {
             TEXT { none }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { none } }
@@ -1314,6 +1337,10 @@ store: [
         |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
 
+    selected_cursor_pair_rows:
+        selected_signal_rows
+        |> List/map(signal, new: selected_cursor_pair_row(signal: signal))
+
     selected_variable_file:
         active_signal == TEXT { none } |> WHEN {
             True => active_file
@@ -1348,9 +1375,19 @@ store: [
         List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "initial_end", fallback: active_metadata_initial_end)
         |> Text/to_number()
 
-    selected_waveform_canvas_width:
+    selected_waveform_metadata_canvas_width:
         List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "canvas_width", fallback: active_metadata_canvas_width)
         |> Text/to_number()
+
+    selected_waveform_canvas_width:
+        selected_waveform_metadata_canvas_width |> HOLD selected_waveform_canvas_width {
+            LATEST {
+                elements.waveform_click.pointer_width |> THEN { elements.waveform_click.pointer_width |> Text/to_number() }
+                elements.waveform_hover.pointer_width |> THEN { elements.waveform_hover.pointer_width |> Text/to_number() }
+                elements.load_default_file.event.press |> THEN { selected_waveform_metadata_canvas_width }
+                elements.show_empty.event.press |> THEN { selected_waveform_metadata_canvas_width }
+            }
+        }
 
     selected_timeline_time_unit:
         List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "time_unit", fallback: active_metadata_time_unit)
@@ -1376,6 +1413,76 @@ store: [
         List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "cursor_right", fallback: 0)
         |> Text/to_number()
 
+    selected_timeline_zoom_center_default:
+        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "zoom_center_default", fallback: selected_timeline_cursor_default)
+        |> Text/to_number()
+
+    waveform_click_pointer_x_text:
+        TEXT { 0 } |> HOLD waveform_click_pointer_x_text {
+            LATEST {
+                elements.waveform_click.pointer_x
+                elements.load_default_file.event.press |> THEN { TEXT { 0 } }
+                elements.show_empty.event.press |> THEN { TEXT { 0 } }
+            }
+        }
+
+    waveform_click_pointer_width_text:
+        selected_waveform_metadata_canvas_width |> HOLD waveform_click_pointer_width_text {
+            LATEST {
+                elements.waveform_click.pointer_width
+                elements.load_default_file.event.press |> THEN { selected_waveform_metadata_canvas_width }
+                elements.show_empty.event.press |> THEN { selected_waveform_metadata_canvas_width }
+            }
+        }
+
+    waveform_hover_pointer_x_text:
+        TEXT { 0 } |> HOLD waveform_hover_pointer_x_text {
+            LATEST {
+                elements.waveform_hover.pointer_x
+                elements.load_default_file.event.press |> THEN { TEXT { 0 } }
+                elements.show_empty.event.press |> THEN { TEXT { 0 } }
+            }
+        }
+
+    waveform_hover_pointer_width_text:
+        selected_waveform_metadata_canvas_width |> HOLD waveform_hover_pointer_width_text {
+            LATEST {
+                elements.waveform_hover.pointer_width
+                elements.load_default_file.event.press |> THEN { selected_waveform_metadata_canvas_width }
+                elements.show_empty.event.press |> THEN { selected_waveform_metadata_canvas_width }
+            }
+        }
+
+    cursor_time_driver:
+        CursorDefault |> HOLD cursor_time_driver {
+            LATEST {
+                elements.waveform_click.pointer_x |> THEN { PointerCursor }
+                elements.cursor_left.event.press |> THEN { CursorLeft }
+                elements.cursor_right.event.press |> THEN { CursorRight }
+                elements.marker_jump.event.press |> THEN { CursorDefault }
+                elements.zoom_reset.event.press |> THEN { CursorDefault }
+                elements.keyboard_capture.key |> WHEN {
+                    D => CursorDefault
+                    Q => CursorLeft
+                    R => CursorDefault
+                    E => CursorRight
+                    __ => SKIP
+                }
+                elements.load_default_file.event.press |> THEN { CursorDefault }
+                elements.show_empty.event.press |> THEN { CursorDefault }
+            }
+        }
+
+    zoom_center_driver:
+        CursorDefault |> HOLD zoom_center_driver {
+            LATEST {
+                elements.waveform_hover.pointer_x |> THEN { PointerCursor }
+                elements.zoom_reset.event.press |> THEN { CursorDefault }
+                elements.load_default_file.event.press |> THEN { CursorDefault }
+                elements.show_empty.event.press |> THEN { CursorDefault }
+            }
+        }
+
     selected_timeline_tick_0:
         viewport_label_start
 
@@ -1392,7 +1499,18 @@ store: [
         viewport_label_end
 
     selected_timeline_cursor_value:
-        NovyModel/cursor_time_value(cursor: cursor_position, left_value: selected_timeline_cursor_left, default_value: selected_timeline_cursor_default, right_value: selected_timeline_cursor_right)
+        cursor_time_driver |> WHEN {
+            PointerCursor => Number/project_time(pointer_x: waveform_click_pointer_x_text |> Text/to_number(), pointer_width: waveform_click_pointer_width_text |> Text/to_number(), viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_cursor_default)
+            CursorLeft => selected_timeline_cursor_left
+            CursorRight => selected_timeline_cursor_right
+            __ => selected_timeline_cursor_default
+        }
+
+    selected_timeline_zoom_center_value:
+        zoom_center_driver |> WHEN {
+            PointerCursor => Number/project_time(pointer_x: waveform_hover_pointer_x_text |> Text/to_number(), pointer_width: waveform_hover_pointer_width_text |> Text/to_number(), viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_zoom_center_default)
+            __ => selected_timeline_zoom_center_default
+        }
 
     selected_waveform_segments:
         waveform_segment_records
@@ -1478,7 +1596,6 @@ store: [
     pressed_control_label:
         TEXT { none } |> HOLD pressed_control_label {
             LATEST {
-                elements.diagnostic_probe.event.press |> THEN { TEXT { Probe } }
                 elements.format_cycle.event.press |> THEN { TEXT { Fmt } }
                 elements.format_dropdown_toggle.event.press |> THEN { TEXT { none } }
                 elements.format_binary.event.press |> THEN { TEXT { none } }
@@ -1955,6 +2072,13 @@ store: [
     zoom_level:
         NovyModel/zoom_level_from_step(step: zoom_step)
 
+    waveform_projection_zoom_level:
+        zoom_level |> WHEN {
+            Wide => Wide
+            Widest => Widest
+            __ => Fit
+        }
+
     pan_window:
         Center |> HOLD pan_window {
             LATEST {
@@ -1975,22 +2099,12 @@ store: [
         }
 
     cursor_position:
-        LATEST {
-            Cursor42
-            elements.waveform_click.text |> THEN { NovyModel/cursor_from_label(label: elements.waveform_click.text) }
-            elements.cursor_left.event.press |> THEN { Cursor36 }
-            elements.cursor_right.event.press |> THEN { Cursor48 }
-            elements.marker_jump.event.press |> THEN { Cursor42 }
-            elements.zoom_reset.event.press |> THEN { Cursor42 }
-            elements.keyboard_capture.key |> WHEN {
-                D => Cursor42
-                Q => Cursor36
-                R => Cursor42
-                E => Cursor48
-                __ => SKIP
+        selected_timeline_cursor_value <= selected_timeline_cursor_left |> WHEN {
+            True => Cursor36
+            False => selected_timeline_cursor_value >= selected_timeline_cursor_right |> WHEN {
+                True => Cursor48
+                False => Cursor42
             }
-            elements.load_default_file.event.press |> THEN { Cursor42 }
-            elements.show_empty.event.press |> THEN { Cursor42 }
         }
 
     viewport_window_key:
@@ -2019,8 +2133,14 @@ store: [
     keyboard_cursor_label:
         selected_timeline_cursor_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
+    zoom_center_label:
+        selected_timeline_zoom_center_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+
     waveform_cursor_offset:
-        Number/project_offset(time: selected_timeline_cursor_value, viewport_start: selected_timeline_window_start, viewport_end: selected_timeline_window_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: zoom_level)
+        Number/project_offset(time: selected_timeline_cursor_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
+
+    waveform_zoom_center_offset:
+        Number/project_offset(time: selected_timeline_zoom_center_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
 
     active_signal_label:
         TEXT { simple_tb.s.A[3:0] } |> HOLD active_signal_label {
@@ -2379,7 +2499,7 @@ store: [
         bridge_response_compact_label
 
     bridge_request_descriptor_label:
-        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: value_format)
+        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_label, format: value_format)
 
     bridge_response_descriptor_label:
         TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
@@ -2414,7 +2534,7 @@ store: [
                 signal: active_signal_key
                 zoom: zoom_level
                 pan: pan_window
-                cursor: cursor_position
+                cursor: cursor_label
                 format: value_format
                 window: bridge_request_window_label
             ]
@@ -2463,25 +2583,9 @@ store: [
         }
 
     bridge_cursor_values_label:
-        LATEST {
-            TEXT { A=0xc B=0x5 at 50 s }
-            elements.select_counter_file.event.press |> THEN { TEXT { A=0xc B=0x5 at 50 s } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data=0x55 busy=0 at 42 ns } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
-            elements.diagnostic_probe.event.press |> THEN { TEXT { unavailable } }
-            elements.show_empty.event.press |> THEN { TEXT { unavailable } }
-            elements.load_default_file.event.press |> THEN { TEXT { A=0xc B=0x5 at 50 s } }
-            elements.cursor_left.event.press |> THEN { TEXT { A=0xa B=0x3 at 0 s } }
-            elements.cursor_right.event.press |> THEN { TEXT { A=0x0 B=0x0 at 150 s } }
-            elements.waveform_click.text |> THEN {
-                elements.waveform_click.text |> WHEN {
-                    TEXT { 0 s } => TEXT { A=0xa B=0x3 at 0 s }
-                    TEXT { 50 s } => TEXT { A=0xc B=0x5 at 50 s }
-                    TEXT { 150 s } => TEXT { A=0x0 B=0x0 at 150 s }
-                    __ => bridge_cursor_values_label
-                }
-            }
-        }
+        selected_cursor_pair_rows
+        |> List/join_field(field: "label", separator: " ", empty: "unavailable")
+        |> Text/concat(with: keyboard_cursor_label, separator: " at ")
 
     bridge_open_descriptor:
         [
@@ -2711,6 +2815,23 @@ FUNCTION new_signal(signal) {
     ]
 }
 
+FUNCTION selected_cursor_value_for_signal(signal) {
+    store.waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: signal.file)
+        |> List/filter_field_equal(field: "signal_id", value: signal.id)
+        |> List/filter_field_not_equal(field: "state", value: CursorLine)
+        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
+        |> List/retain(segment, if: segment.start_time_value <= store.selected_timeline_cursor_value)
+        |> List/retain(segment, if: segment.end_time_value > store.selected_timeline_cursor_value)
+        |> List/join_field(field: "label", separator: "", empty: signal.current_value)
+}
+
+FUNCTION selected_cursor_pair_row(signal) {
+    [
+        label: signal.name |> Text/concat(with: selected_cursor_value_for_signal(signal: signal), separator: "=")
+    ]
+}
+
 FUNCTION new_waveform_segment(segment) {
     [
         file: segment.file
@@ -2719,9 +2840,9 @@ FUNCTION new_waveform_segment(segment) {
         end_time_value: segment.end_time_value
         projection_source: RuntimeTimelineMetadata
         width: segment.state |> WHEN {
-            CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.selected_timeline_window_start, viewport_end: store.selected_timeline_window_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.zoom_level)
+            CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
             MarkerLine => 0
-            __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.selected_timeline_window_start, viewport_end: store.selected_timeline_window_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.zoom_level)
+            __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
         }
         state: segment.state
         label: segment.label

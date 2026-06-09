@@ -128,13 +128,18 @@ pub struct ScenarioStep {
     pub expect_root_text: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericSourceEvent<'a> {
     source: &'a str,
     text: Option<&'a str>,
     key: Option<&'a str>,
     target_text: Option<&'a str>,
     address: Option<&'a str>,
+    payload: BTreeMap<String, &'a str>,
+    pointer_x: Option<&'a str>,
+    pointer_y: Option<&'a str>,
+    pointer_width: Option<&'a str>,
+    pointer_height: Option<&'a str>,
 }
 
 impl<'a> GenericSourceEvent<'a> {
@@ -144,12 +149,38 @@ impl<'a> GenericSourceEvent<'a> {
         };
         let source = toml_string_ref(expected, "source")
             .ok_or_else(|| format!("{} expected_source_event missing source", step.id))?;
+        let mut payload = BTreeMap::new();
+        for (key, value) in expected {
+            if matches!(
+                key.as_str(),
+                "source"
+                    | "text"
+                    | "key"
+                    | "target_text"
+                    | "address"
+                    | "target_occurrence"
+                    | "target_key"
+                    | "target_generation"
+                    | "bind_epoch"
+                    | "source_id"
+            ) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                payload.insert(key.clone(), value);
+            }
+        }
         Ok(Some(Self {
             source,
             text: toml_string_ref(expected, "text"),
             key: toml_string_ref(expected, "key"),
             target_text: toml_string_ref(expected, "target_text"),
             address: toml_string_ref(expected, "address"),
+            payload,
+            pointer_x: toml_string_ref(expected, "pointer_x"),
+            pointer_y: toml_string_ref(expected, "pointer_y"),
+            pointer_width: toml_string_ref(expected, "pointer_width"),
+            pointer_height: toml_string_ref(expected, "pointer_height"),
         }))
     }
 
@@ -164,18 +195,18 @@ impl<'a> GenericSourceEvent<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericRoutedSourceEvent<'a> {
     event: GenericSourceEvent<'a>,
     route_kind: SourceActionKind,
 }
 
 impl<'a> GenericRoutedSourceEvent<'a> {
-    fn source(self) -> &'a str {
+    fn source(&self) -> &'a str {
         self.event.source
     }
 
-    fn require_text(self, step_id: &str) -> RuntimeResult<&'a str> {
+    fn require_text(&self, step_id: &str) -> RuntimeResult<&'a str> {
         self.event.text.ok_or_else(|| {
             format!(
                 "{step_id} source `{}` route `{}` requires text",
@@ -260,6 +291,11 @@ pub struct LiveSourceEvent {
     pub text: Option<String>,
     pub key: Option<String>,
     pub address: Option<String>,
+    pub payload: BTreeMap<String, String>,
+    pub pointer_x: Option<String>,
+    pub pointer_y: Option<String>,
+    pub pointer_width: Option<String>,
+    pub pointer_height: Option<String>,
     pub target_text: Option<String>,
     pub target_occurrence: Option<usize>,
     pub target_key: Option<u64>,
@@ -1409,6 +1445,29 @@ impl LiveSourceEvent {
         if let Some(address) = self.address {
             expected_source_event.insert("address".to_owned(), toml::Value::String(address));
         }
+        for (key, value) in self.payload {
+            expected_source_event
+                .entry(key)
+                .or_insert_with(|| toml::Value::String(value));
+        }
+        if let Some(pointer_x) = self.pointer_x {
+            expected_source_event.insert("pointer_x".to_owned(), toml::Value::String(pointer_x));
+        }
+        if let Some(pointer_y) = self.pointer_y {
+            expected_source_event.insert("pointer_y".to_owned(), toml::Value::String(pointer_y));
+        }
+        if let Some(pointer_width) = self.pointer_width {
+            expected_source_event.insert(
+                "pointer_width".to_owned(),
+                toml::Value::String(pointer_width),
+            );
+        }
+        if let Some(pointer_height) = self.pointer_height {
+            expected_source_event.insert(
+                "pointer_height".to_owned(),
+                toml::Value::String(pointer_height),
+            );
+        }
         if let Some(target_text) = self.target_text {
             expected_source_event
                 .insert("target_text".to_owned(), toml::Value::String(target_text));
@@ -2226,7 +2285,7 @@ impl LoadedRuntime {
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
         let input = generic.source_action_input_for_event(
             &step.id,
-            source_event,
+            source_event.clone(),
             TickSeq(0),
             |list, event| generic.resolve_generic_step_index(list, step, event),
         )?;
@@ -2308,7 +2367,7 @@ impl LoadedRuntime {
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
         let input = generic.source_action_input_for_event(
             &step.id,
-            source_event,
+            source_event.clone(),
             TickSeq(0),
             |list, event| generic.resolve_generic_step_index(list, step, event),
         )?;
@@ -2365,7 +2424,7 @@ impl LoadedRuntime {
         let delta_start = deltas.len();
         let input = generic.source_action_input_for_event(
             &step.id,
-            source_event,
+            source_event.clone(),
             TickSeq(0),
             |list, event| generic.resolve_generic_step_index(list, step, event),
         )?;
@@ -2448,6 +2507,7 @@ struct CompiledProgram {
     source_payload_text_field_count: usize,
     source_payload_key_field_count: usize,
     source_payload_address_field_count: usize,
+    source_payload_pointer_field_count: usize,
     root_text_slot_count: usize,
     root_bool_slot_count: usize,
     root_enum_slot_count: usize,
@@ -2792,6 +2852,7 @@ impl CompiledProgram {
             source_payload_text_field_count: source_payload_counts.text_field_count,
             source_payload_key_field_count: source_payload_counts.key_field_count,
             source_payload_address_field_count: source_payload_counts.address_field_count,
+            source_payload_pointer_field_count: source_payload_counts.pointer_field_count,
             root_text_slot_count: storage_layout_counts.root_text_slot_count,
             root_bool_slot_count: storage_layout_counts.root_bool_slot_count,
             root_enum_slot_count: storage_layout_counts.root_enum_slot_count,
@@ -2830,6 +2891,7 @@ impl CompiledProgram {
             "source_payload_text_field_count": self.source_payload_text_field_count,
             "source_payload_key_field_count": self.source_payload_key_field_count,
             "source_payload_address_field_count": self.source_payload_address_field_count,
+            "source_payload_pointer_field_count": self.source_payload_pointer_field_count,
             "typed_storage_layout": {
                 "computed_from": "typed_ir_state_and_list_tables",
                 "root_text_slot_count": self.root_text_slot_count,
@@ -2944,6 +3006,7 @@ struct SourcePayloadCounts {
     text_field_count: usize,
     key_field_count: usize,
     address_field_count: usize,
+    pointer_field_count: usize,
 }
 
 impl SourcePayloadCounts {
@@ -2959,6 +3022,7 @@ impl SourcePayloadCounts {
                     SourcePayloadField::Text => counts.text_field_count += 1,
                     SourcePayloadField::Key => counts.key_field_count += 1,
                     SourcePayloadField::Address => counts.address_field_count += 1,
+                    SourcePayloadField::Named(_) => counts.pointer_field_count += 1,
                 }
             }
         }
@@ -3782,6 +3846,7 @@ fn generic_runtime_slice_evidence_report(
         "source_payload_text_field_count": source_payload_counts.text_field_count,
         "source_payload_key_field_count": source_payload_counts.key_field_count,
         "source_payload_address_field_count": source_payload_counts.address_field_count,
+        "source_payload_pointer_field_count": source_payload_counts.pointer_field_count,
         "typed_storage_layout": {
             "computed_from": "typed_ir_state_and_list_tables",
             "root_text_slot_count": compiled.root_text_slot_count,
@@ -5618,7 +5683,7 @@ impl GenericScheduledRuntime {
         &self,
         primary_list: &str,
         indexed_commit_field: &str,
-        source_event: GenericSourceEvent<'_>,
+        source_event: &GenericSourceEvent<'_>,
     ) -> RuntimeResult<SourceActionKind> {
         let source = source_event.source;
         let source_id = self.source_routes.require_source_id(source)?;
@@ -5749,7 +5814,7 @@ impl GenericScheduledRuntime {
         source_event: GenericSourceEvent<'a>,
     ) -> RuntimeResult<GenericRoutedSourceEvent<'a>> {
         let route_kind =
-            self.classify_source_event(primary_list, indexed_commit_field, source_event)?;
+            self.classify_source_event(primary_list, indexed_commit_field, &source_event)?;
         Ok(GenericRoutedSourceEvent {
             event: source_event,
             route_kind,
@@ -5763,9 +5828,9 @@ impl GenericScheduledRuntime {
         seq: TickSeq,
         mut resolve_index: impl FnMut(&str, GenericSourceEvent<'a>) -> RuntimeResult<Option<usize>>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
-        let list = self.source_action_list_for_top_level_event(step_id, source_event)?;
+        let list = self.source_action_list_for_top_level_event(step_id, &source_event)?;
         let index = match list.as_deref() {
-            Some(list) => resolve_index(list, source_event)?,
+            Some(list) => resolve_index(list, source_event.clone())?,
             None => None,
         };
         let source_id = self.source_routes.require_source_id(source_event.source)?;
@@ -5777,6 +5842,11 @@ impl GenericScheduledRuntime {
             key: source_event.key,
             text: source_event.text,
             address: source_event.address,
+            payload: source_event.payload.clone(),
+            pointer_x: source_event.pointer_x,
+            pointer_y: source_event.pointer_y,
+            pointer_width: source_event.pointer_width,
+            pointer_height: source_event.pointer_height,
             seq,
         })
     }
@@ -5820,6 +5890,11 @@ impl GenericScheduledRuntime {
             key: source_event.key,
             text: source_event.text,
             address: source_event.address,
+            payload: source_event.payload.clone(),
+            pointer_x: source_event.pointer_x,
+            pointer_y: source_event.pointer_y,
+            pointer_width: source_event.pointer_width,
+            pointer_height: source_event.pointer_height,
             seq,
         })
     }
@@ -5849,6 +5924,11 @@ impl GenericScheduledRuntime {
             key: source_event.key,
             text: source_event.text,
             address: source_event.address,
+            payload: source_event.payload.clone(),
+            pointer_x: source_event.pointer_x,
+            pointer_y: source_event.pointer_y,
+            pointer_width: source_event.pointer_width,
+            pointer_height: source_event.pointer_height,
             seq,
         })
     }
@@ -5856,7 +5936,7 @@ impl GenericScheduledRuntime {
     fn source_action_list_for_top_level_event(
         &self,
         step_id: &str,
-        source_event: GenericSourceEvent<'_>,
+        source_event: &GenericSourceEvent<'_>,
     ) -> RuntimeResult<Option<String>> {
         if source_event.address.is_some() {
             return self.source_action_list_for_event(step_id, source_event.source);
@@ -6237,6 +6317,11 @@ impl GenericScheduledRuntime {
             input.key,
             input.text,
             input.address,
+            &input.payload,
+            input.pointer_x,
+            input.pointer_y,
+            input.pointer_width,
+            input.pointer_height,
             |path| self.textlike_with_row_context(path, input.list.as_deref(), input.index),
         )?
         else {
@@ -6459,7 +6544,7 @@ impl GenericScheduledRuntime {
         match self.resolve_bound_source_index(
             list,
             step.user_action.as_ref(),
-            Some(source_event),
+            Some(source_event.clone()),
         )? {
             GenericBoundSourceIndex::Bound(index) => return Ok(Some(index)),
             GenericBoundSourceIndex::Stale => {
@@ -7558,6 +7643,33 @@ impl GenericScheduledRuntime {
                     width,
                     zoom.as_deref(),
                 )))
+            }
+            "Number/project_time" => {
+                let pointer_x = self
+                    .named_or_positional_arg_value(args, "pointer_x", 0, frame)?
+                    .number()?;
+                let pointer_width = self
+                    .named_or_positional_arg_value(args, "pointer_width", 1, frame)?
+                    .number()?;
+                let viewport_start = self
+                    .named_or_positional_arg_value(args, "viewport_start", 2, frame)?
+                    .number()?;
+                let viewport_end = self
+                    .named_or_positional_arg_value(args, "viewport_end", 3, frame)?
+                    .number()?;
+                let fallback = self
+                    .named_or_positional_arg_value(args, "fallback", 4, frame)
+                    .map(|value| value.number().unwrap_or(viewport_start))
+                    .unwrap_or(viewport_start);
+                let viewport_span = viewport_end - viewport_start;
+                if pointer_width <= 0 || viewport_span <= 0 {
+                    Ok(BoonValue::Number(fallback))
+                } else {
+                    let clamped_x = pointer_x.clamp(0, pointer_width);
+                    Ok(BoonValue::Number(
+                        viewport_start + (viewport_span * clamped_x) / pointer_width,
+                    ))
+                }
             }
             "Bool/not" => {
                 let value = self.call_input_or_first(input, args, frame)?;
@@ -9925,12 +10037,18 @@ impl GenericCircuitRuntime {
         payload_address: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
+        let empty_payload = BTreeMap::new();
         let Some(value) = equations.eval_text(
             target,
             source,
             payload_key,
             payload_text,
             payload_address,
+            &empty_payload,
+            None,
+            None,
+            None,
+            None,
             |path| self.root_textlike(path).ok(),
         )?
         else {
@@ -10017,9 +10135,15 @@ impl GenericCircuitRuntime {
         text: Option<&'a str>,
         address: Option<&'a str>,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        equations.eval_text_transform(target, source, key, text, address, |path| {
-            self.root_textlike(path).ok()
-        })
+        equations.eval_text_transform(
+            target,
+            source,
+            key,
+            text,
+            address,
+            &BTreeMap::new(),
+            |path| self.root_textlike(path).ok(),
+        )
     }
 
     fn commit_root_text_candidate<'a>(
@@ -10548,6 +10672,10 @@ impl GenericCircuitRuntime {
                 "indexed text update `{target}` from `{source}` cannot use address payload directly"
             )
             .into()),
+            ScalarUpdateExpression::SourcePayload(field) => Err(format!(
+                "indexed text update `{target}` from `{source}` cannot use payload `{field}` directly"
+            )
+            .into()),
             ScalarUpdateExpression::Const(value) => {
                 Ok(IndexedTextCandidate::SourceText(Cow::Owned(value.clone())))
             }
@@ -10610,8 +10738,15 @@ impl GenericCircuitRuntime {
                 payload_path,
                 separator,
             } => {
-                let Some(payload) =
-                    source_payload_match_input(payload_path, source, None, payload_text, None)
+                let empty_payload = BTreeMap::new();
+                let Some(payload) = source_payload_match_input(
+                    payload_path,
+                    source,
+                    None,
+                    payload_text,
+                    None,
+                    &empty_payload,
+                )
                 else {
                     return Err(format!(
                         "indexed text update `{target}` from `{source}` requires text payload `{payload_path}`"
@@ -11984,6 +12119,7 @@ enum ScalarUpdateExpression {
     SourceText,
     SourceKey,
     SourceAddress,
+    SourcePayload(String),
     Const(String),
     NumberInfix {
         left: String,
@@ -12026,6 +12162,7 @@ impl ScalarUpdateExpression {
             Self::SourceText
                 | Self::SourceKey
                 | Self::SourceAddress
+                | Self::SourcePayload(_)
                 | Self::Const(_)
                 | Self::NumberInfix { .. }
                 | Self::MatchNumberInfixConst { .. }
@@ -12042,6 +12179,7 @@ impl ScalarUpdateExpression {
             self,
             Self::SourceText
                 | Self::SourceKey
+                | Self::SourcePayload(_)
                 | Self::PreviousValue(_)
                 | Self::ReadPath(_)
                 | Self::TextTrimOrPrevious { .. }
@@ -12407,6 +12545,11 @@ struct GenericSourceActionInput<'a> {
     key: Option<&'a str>,
     text: Option<&'a str>,
     address: Option<&'a str>,
+    payload: BTreeMap<String, &'a str>,
+    pointer_x: Option<&'a str>,
+    pointer_y: Option<&'a str>,
+    pointer_width: Option<&'a str>,
+    pointer_height: Option<&'a str>,
     seq: TickSeq,
 }
 
@@ -13074,9 +13217,7 @@ fn source_payload_when_match_const_expression(
             return None;
         };
         let input = ast_argument_value_in_exprs(exprs, input)?;
-        if source_payload_match_input(&input, source, Some("key"), Some("text"), Some("address"))
-            .is_none()
-        {
+        if source_payload_field_from_input(&input, source).is_none() {
             return None;
         }
         let arms = runtime_match_const_arms_after_when(exprs, expr.line);
@@ -13141,7 +13282,7 @@ fn source_then_prefix_payload_concat_expression(
 fn source_direct_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
     exprs.iter().find_map(|expr| {
         let path = ast_argument_value_in_exprs(exprs, expr.id)?;
-        source_payload_match_input(&path, source, Some("key"), Some("text"), Some("address"))?;
+        source_payload_field_from_input(&path, source)?;
         Some(path)
     })
 }
@@ -13187,13 +13328,7 @@ fn prefix_payload_concat_expression(
         .find(|arg| arg.name.as_deref() == Some("with"))
         .or_else(|| args.iter().find(|arg| arg.name.is_none()))
         .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    source_payload_match_input(
-        &payload_path,
-        source,
-        Some("key"),
-        Some("text"),
-        Some("address"),
-    )?;
+    source_payload_field_from_input(&payload_path, source)?;
     let separator = args
         .iter()
         .find(|arg| arg.name.as_deref() == Some("separator"))
@@ -13669,6 +13804,9 @@ impl ScalarEquationPlan {
                     UpdateExpression::SourcePayload { path } if path == "address" => {
                         ScalarUpdateExpression::SourceAddress
                     }
+                    UpdateExpression::SourcePayload { path } => {
+                        ScalarUpdateExpression::SourcePayload(path.clone())
+                    }
                     UpdateExpression::Const { value } => {
                         ScalarUpdateExpression::Const(value.clone())
                     }
@@ -13691,61 +13829,59 @@ impl ScalarEquationPlan {
                         arms: arms.clone(),
                     },
                     UpdateExpression::PreviousValue { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".text", ".event.change.text", ".change.text"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("text") =>
                     {
                         ScalarUpdateExpression::SourceText
                     }
                     UpdateExpression::PreviousValue { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".key", ".event.key_down.key", ".key_down.key"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("key") =>
                     {
                         ScalarUpdateExpression::SourceKey
                     }
                     UpdateExpression::PreviousValue { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".address", ".event.address"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("address") =>
                     {
                         ScalarUpdateExpression::SourceAddress
+                    }
+                    UpdateExpression::PreviousValue { path }
+                        if source_payload_field_from_input(path, &branch.source).is_some() =>
+                    {
+                        ScalarUpdateExpression::SourcePayload(
+                            source_payload_field_from_input(path, &branch.source)
+                                .unwrap_or_default(),
+                        )
                     }
                     UpdateExpression::PreviousValue { path } => {
                         ScalarUpdateExpression::PreviousValue(path.clone())
                     }
                     UpdateExpression::ReadPath { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".text", ".event.change.text", ".change.text"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("text") =>
                     {
                         ScalarUpdateExpression::SourceText
                     }
                     UpdateExpression::ReadPath { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".key", ".event.key_down.key", ".key_down.key"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("key") =>
                     {
                         ScalarUpdateExpression::SourceKey
                     }
                     UpdateExpression::ReadPath { path }
-                        if source_payload_input_matches(
-                            path,
-                            &branch.source,
-                            &[".address", ".event.address"],
-                        ) =>
+                        if source_payload_field_from_input(path, &branch.source).as_deref()
+                            == Some("address") =>
                     {
                         ScalarUpdateExpression::SourceAddress
+                    }
+                    UpdateExpression::ReadPath { path }
+                        if source_payload_field_from_input(path, &branch.source).is_some() =>
+                    {
+                        ScalarUpdateExpression::SourcePayload(
+                            source_payload_field_from_input(path, &branch.source)
+                                .unwrap_or_default(),
+                        )
                     }
                     UpdateExpression::ReadPath { path } => {
                         ScalarUpdateExpression::ReadPath(path.clone())
@@ -13802,6 +13938,11 @@ impl ScalarEquationPlan {
         payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
+        payload: &BTreeMap<String, &'a str>,
+        payload_pointer_x: Option<&'a str>,
+        payload_pointer_y: Option<&'a str>,
+        payload_pointer_width: Option<&'a str>,
+        payload_pointer_height: Option<&'a str>,
         read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) = self.eval_text_value(
@@ -13810,6 +13951,11 @@ impl ScalarEquationPlan {
             payload_key,
             payload_text,
             payload_address,
+            payload,
+            payload_pointer_x,
+            payload_pointer_y,
+            payload_pointer_width,
+            payload_pointer_height,
             read_textlike,
         )?
         else {
@@ -13828,6 +13974,11 @@ impl ScalarEquationPlan {
         payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
+        payload: &BTreeMap<String, &'a str>,
+        payload_pointer_x: Option<&'a str>,
+        payload_pointer_y: Option<&'a str>,
+        payload_pointer_width: Option<&'a str>,
+        payload_pointer_height: Option<&'a str>,
         read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<ScalarTextValue<'a>>> {
         let Some(branch) = self
@@ -13855,6 +14006,22 @@ impl ScalarEquationPlan {
                     return Ok(None);
                 };
                 Ok(Some(ScalarTextValue::Text(Cow::Borrowed(address))))
+            }
+            ScalarUpdateExpression::SourcePayload(field) => {
+                let Some(value) = source_payload_value(
+                    field,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                    payload,
+                    payload_pointer_x,
+                    payload_pointer_y,
+                    payload_pointer_width,
+                    payload_pointer_height,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(Some(ScalarTextValue::Text(Cow::Borrowed(value))))
             }
             ScalarUpdateExpression::Const(value) => {
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.clone()))))
@@ -13900,6 +14067,7 @@ impl ScalarEquationPlan {
                     payload_key,
                     payload_text,
                     payload_address,
+                    payload,
                 ) {
                     Some(value) => Cow::Borrowed(value),
                     None => Cow::Owned(read_textlike(input).ok_or_else(|| {
@@ -13924,6 +14092,7 @@ impl ScalarEquationPlan {
                     payload_key,
                     payload_text,
                     payload_address,
+                    payload,
                 ) {
                     Some(value) => Cow::Borrowed(value),
                     None => Cow::Owned(read_textlike(input).ok_or_else(|| {
@@ -13968,6 +14137,7 @@ impl ScalarEquationPlan {
                     payload_key,
                     payload_text,
                     payload_address,
+                    payload,
                 )
                 .ok_or_else(|| {
                     format!("source `{source}` for `{target}` requires payload `{payload_path}`")
@@ -14162,6 +14332,7 @@ impl DerivedEquationPlan {
         key: Option<&'a str>,
         text: Option<&'a str>,
         address: Option<&'a str>,
+        payload: &BTreeMap<String, &'a str>,
         read_root_text: impl Fn(&str) -> Option<String>,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(transform) = self
@@ -14174,7 +14345,7 @@ impl DerivedEquationPlan {
         match &transform.expression {
             RuntimeDerivedTextExpression::Const { value } => Ok(Some(Cow::Owned(value.clone()))),
             RuntimeDerivedTextExpression::MatchConst { input, arms } => {
-                let current = match source_payload_match_input(input, source, key, text, address) {
+                let current = match source_payload_match_input(input, source, key, text, address, payload) {
                     Some(value) => Cow::Borrowed(value),
                     None => Cow::Owned(read_root_text(input).ok_or_else(|| {
                         format!(
@@ -14209,7 +14380,8 @@ impl DerivedEquationPlan {
                 Ok((!trimmed.is_empty()).then_some(Cow::Owned(trimmed)))
             }
             RuntimeDerivedTextExpression::SourceRootText { path } => {
-                if let Some(payload) = source_payload_match_input(path, source, key, text, address)
+                if let Some(payload) =
+                    source_payload_match_input(path, source, key, text, address, payload)
                 {
                     return Ok(Some(Cow::Borrowed(payload)));
                 }
@@ -14227,7 +14399,7 @@ impl DerivedEquationPlan {
                 separator,
             } => {
                 let payload =
-                    source_payload_match_input(payload_path, source, key, text, address)
+                    source_payload_match_input(payload_path, source, key, text, address, payload)
                         .ok_or_else(|| {
                             format!(
                                 "derived text transform `{target}` from `{source}` requires payload `{payload_path}`"
@@ -14591,35 +14763,63 @@ fn source_payload_match_input<'a>(
     payload_key: Option<&'a str>,
     payload_text: Option<&'a str>,
     payload_address: Option<&'a str>,
+    payload: &BTreeMap<String, &'a str>,
 ) -> Option<&'a str> {
-    if source_payload_input_matches(
-        input,
-        source,
-        &[".key", ".event.key_down.key", ".key_down.key"],
-    ) {
-        return payload_key;
+    match source_payload_field_from_input(input, source)?.as_str() {
+        field => source_payload_value(
+            field,
+            payload_key,
+            payload_text,
+            payload_address,
+            payload,
+            None,
+            None,
+            None,
+            None,
+        ),
     }
-    if source_payload_input_matches(
-        input,
-        source,
-        &[".text", ".event.change.text", ".change.text"],
-    ) {
-        return payload_text;
-    }
-    if source_payload_input_matches(input, source, &[".address", ".event.address"]) {
-        return payload_address;
-    }
-    None
 }
 
-fn source_payload_input_matches(input: &str, source: &str, suffixes: &[&str]) -> bool {
-    input
-        .strip_prefix(source)
-        .is_some_and(|suffix| suffixes.contains(&suffix))
-        || source
-            .strip_prefix("store.")
-            .and_then(|local| input.strip_prefix(local))
-            .is_some_and(|suffix| suffixes.contains(&suffix))
+fn source_payload_value<'a>(
+    field: &str,
+    payload_key: Option<&'a str>,
+    payload_text: Option<&'a str>,
+    payload_address: Option<&'a str>,
+    payload: &BTreeMap<String, &'a str>,
+    payload_pointer_x: Option<&'a str>,
+    payload_pointer_y: Option<&'a str>,
+    payload_pointer_width: Option<&'a str>,
+    payload_pointer_height: Option<&'a str>,
+) -> Option<&'a str> {
+    match field {
+        "key" => payload_key,
+        "text" => payload_text,
+        "address" => payload_address,
+        "pointer_x" => payload_pointer_x.or_else(|| payload.get(field).copied()),
+        "pointer_y" => payload_pointer_y.or_else(|| payload.get(field).copied()),
+        "pointer_width" => payload_pointer_width.or_else(|| payload.get(field).copied()),
+        "pointer_height" => payload_pointer_height.or_else(|| payload.get(field).copied()),
+        _ => payload.get(field).copied(),
+    }
+}
+
+fn source_payload_field_from_input(input: &str, source: &str) -> Option<String> {
+    [source.to_owned()]
+        .into_iter()
+        .chain(source.strip_prefix("store.").map(str::to_owned))
+        .find_map(|variant| {
+            let suffix = input.strip_prefix(&variant)?.strip_prefix('.')?;
+            Some(match suffix {
+                "change.text" | "event.change.text" => "text".to_owned(),
+                "key_down.key" | "event.key_down.key" => "key".to_owned(),
+                "event.address" => "address".to_owned(),
+                _ if !suffix.contains('.') => suffix.to_owned(),
+                _ if suffix.starts_with("event.") && !suffix["event.".len()..].contains('.') => {
+                    suffix["event.".len()..].to_owned()
+                }
+                _ => return None,
+            })
+        })
 }
 
 impl SourceRoutePlan {
@@ -15272,7 +15472,8 @@ impl SourceRoute {
             .extend(self.indexed_text_targets.iter().filter_map(|target| {
                 let kind = match &target.expression {
                     ScalarUpdateExpression::Const(_) => SourceRouteTextAction::Const,
-                    ScalarUpdateExpression::SourceText => SourceRouteTextAction::SourceText,
+                    ScalarUpdateExpression::SourceText
+                    | ScalarUpdateExpression::SourcePayload(_) => SourceRouteTextAction::SourceText,
                     ScalarUpdateExpression::PreviousValue(_) => {
                         SourceRouteTextAction::PreviousValue
                     }
@@ -15308,6 +15509,7 @@ impl SourceRoute {
                         SourceRouteBoolAction::ConstFalse
                     }
                     ScalarUpdateExpression::SourceText
+                    | ScalarUpdateExpression::SourcePayload(_)
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::Const(_)
@@ -15843,10 +16045,10 @@ impl ListScenarioHarness {
         };
         match &event {
             ListScenarioEvent::Source(routed) => {
-                assert_routed_source_event_matches(step, routed.event)?
+                assert_routed_source_event_matches(step, &routed.event)?
             }
             ListScenarioEvent::RowSource { routed, .. } => {
-                assert_routed_source_event_matches(step, routed.event)?
+                assert_routed_source_event_matches(step, &routed.event)?
             }
             ListScenarioEvent::HoverDelete { .. } => {}
         }
@@ -15981,6 +16183,7 @@ impl ListScenarioHarness {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 close_other_list_editors(&mut self.generic, index, deltas, patches)?;
                 let all_completed = self.all_completed();
+                let source = routed.source();
                 let source_event = GenericSourceEvent {
                     text: Some(target_text),
                     ..routed.event
@@ -16000,9 +16203,8 @@ impl ListScenarioHarness {
                     },
                     |_| Ok(()),
                 )?;
-                let edit_text =
-                    batch.require_text(routed.source(), "previous-text update", "edit_text")?;
-                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
+                let edit_text = batch.require_text(source, "previous-text update", "edit_text")?;
+                let editing = batch.require_bool(source, "editing update", "editing")?;
                 deltas.push(editing.semantic_delta());
                 deltas.push(edit_text.semantic_delta());
                 emit_generic_render_patch_for_mutation(
@@ -16047,6 +16249,7 @@ impl ListScenarioHarness {
                 target_text,
                 ..
             } if routed.route_kind == SourceActionKind::IndexedTextKey => {
+                let source = routed.source();
                 let key = routed.event.key.unwrap_or_default();
                 if matches!(key, "Enter" | "Escape") {
                     let index = self
@@ -16091,8 +16294,7 @@ impl ListScenarioHarness {
                     } else if let Some(edit_text) = batch.text("edit_text") {
                         deltas.push(edit_text.semantic_delta());
                     }
-                    let editing =
-                        batch.require_bool(routed.source(), "editing update", "editing")?;
+                    let editing = batch.require_bool(source, "editing update", "editing")?;
                     emit_list_default_protocol_mutation(
                         GenericSourceMutation::BoolField(editing),
                         deltas,
@@ -16109,6 +16311,7 @@ impl ListScenarioHarness {
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 let all_completed = self.all_completed();
+                let source = routed.source();
                 let source_event = GenericSourceEvent {
                     text: routed.event.text,
                     ..routed.event
@@ -16138,7 +16341,7 @@ impl ListScenarioHarness {
                         patches,
                     )?;
                 }
-                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
+                let editing = batch.require_bool(source, "editing update", "editing")?;
                 emit_list_default_protocol_mutation(
                     GenericSourceMutation::BoolField(editing),
                     deltas,
@@ -16247,7 +16450,7 @@ impl ListScenarioHarness {
         let source = source_event.source;
         let route_kind = self
             .generic
-            .classify_source_event("todos", "title", source_event)
+            .classify_source_event("todos", "title", &source_event)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
             match route_kind {
@@ -16385,6 +16588,11 @@ impl ListScenarioHarness {
             key: None,
             target_text,
             address: None,
+            payload: BTreeMap::new(),
+            pointer_x: None,
+            pointer_y: None,
+            pointer_width: None,
+            pointer_height: None,
         };
         let input = self.generic.source_action_input_for_list_index(
             step_id,
@@ -16421,6 +16629,11 @@ impl ListScenarioHarness {
             key: None,
             target_text: None,
             address: None,
+            payload: BTreeMap::new(),
+            pointer_x: None,
+            pointer_y: None,
+            pointer_width: None,
+            pointer_height: None,
         };
         let input = self.generic.source_action_input_for_list_index(
             step_id,
@@ -16456,6 +16669,11 @@ impl ListScenarioHarness {
             key: None,
             target_text,
             address: None,
+            payload: BTreeMap::new(),
+            pointer_x: None,
+            pointer_y: None,
+            pointer_width: None,
+            pointer_height: None,
         };
         let input = self.generic.source_action_input_for_list_index(
             step_id,
@@ -16765,7 +16983,7 @@ fn toml_u64_ref(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<u64>
 
 fn assert_routed_source_event_matches(
     step: &ScenarioStep,
-    event: GenericSourceEvent<'_>,
+    event: &GenericSourceEvent<'_>,
 ) -> RuntimeResult<()> {
     let expected = GenericSourceEvent::require(step)?;
     assert_source_event_field(&step.id, Some(expected.source), "source", event.source)?;
@@ -18196,6 +18414,11 @@ FUNCTION icon_code(item) {
                     key: Some("Enter"),
                     target_text: None,
                     address: None,
+                    payload: BTreeMap::new(),
+                    pointer_x: None,
+                    pointer_y: None,
+                    pointer_width: None,
+                    pointer_height: None,
                 },
                 TickSeq(7),
                 |_, _| Ok(None),
@@ -18228,6 +18451,11 @@ FUNCTION icon_code(item) {
             key: Some("Enter"),
             target_text: None,
             address: Some("A0"),
+            payload: BTreeMap::new(),
+            pointer_x: None,
+            pointer_y: None,
+            pointer_width: None,
+            pointer_height: None,
         };
         let default_step = ScenarioStep::default();
         let cells_input = cells_runtime
@@ -21566,7 +21794,7 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.show_empty".to_owned(),
-                target_text: Some("Empty".to_owned()),
+                target_text: Some("Clear All".to_owned()),
                 ..LiveSourceEvent::default()
             })
             .expect("empty state should apply");
@@ -22435,6 +22663,11 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
                 None,
                 None,
                 None,
+                &BTreeMap::new(),
+                None,
+                None,
+                None,
+                None,
                 |path| (path == "store.active_signal").then(|| "temperature".to_owned()),
             )
             .unwrap();
@@ -22473,6 +22706,11 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
                 "store.zoom_step",
                 "store.elements.keyboard_capture",
                 Some("W"),
+                None,
+                None,
+                &BTreeMap::new(),
+                None,
+                None,
                 None,
                 None,
                 |path| (path == "store.zoom_step").then(|| "1".to_owned()),

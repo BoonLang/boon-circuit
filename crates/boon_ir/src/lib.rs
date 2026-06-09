@@ -254,11 +254,23 @@ pub struct SourcePayloadSchema {
     pub address_lookup_field: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum SourcePayloadField {
     Address,
     Key,
+    Named(String),
     Text,
+}
+
+impl SourcePayloadField {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "address" => Self::Address,
+            "key" => Self::Key,
+            "text" => Self::Text,
+            _ => Self::Named(name.to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1132,21 +1144,7 @@ fn source_payload_schema(
             continue;
         }
         for variant in &variants {
-            if field.references_payload_path(variant, "text")
-                || field.match_arm_destructures_payload("text")
-            {
-                payload_fields.insert(SourcePayloadField::Text);
-            }
-            if field.references_payload_path(variant, "key")
-                || field.match_arm_destructures_payload("key")
-            {
-                payload_fields.insert(SourcePayloadField::Key);
-            }
-            if field.references_payload_path(variant, "address")
-                || field.match_arm_destructures_payload("address")
-            {
-                payload_fields.insert(SourcePayloadField::Address);
-            }
+            payload_fields.extend(field.referenced_payload_fields(variant));
         }
     }
     let address_lookup_field = source_address_lookup_field(program, fields, source);
@@ -3170,21 +3168,7 @@ fn require_supported_numeric_update_op(op: &str, context: &str) -> Result<(), St
 }
 
 fn source_payload_input_matches(input: &str, source: &str) -> bool {
-    source_ref_variants(source).iter().any(|variant| {
-        input.strip_prefix(variant).is_some_and(|suffix| {
-            matches!(
-                suffix,
-                ".key"
-                    | ".event.key_down.key"
-                    | ".key_down.key"
-                    | ".text"
-                    | ".event.change.text"
-                    | ".change.text"
-                    | ".address"
-                    | ".event.address"
-            )
-        })
-    })
+    source_payload_field_from_path(input, &source_ref_variants(source)).is_some()
 }
 
 fn verify_scheduled_list_operation(
@@ -5234,7 +5218,6 @@ fn dotted_path_parts(path: &str) -> Vec<&str> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PathMatch {
-    Exact,
     Prefix,
 }
 
@@ -5245,7 +5228,6 @@ fn path_parts_match(candidate: &[String], expected: &[&str], path_match: PathMat
         .map(String::as_str)
         .collect::<Vec<_>>();
     (match path_match {
-        PathMatch::Exact => candidate.len() == expected.len(),
         PathMatch::Prefix => candidate.len() >= expected.len(),
     }) && candidate
         .iter()
@@ -5376,28 +5358,12 @@ fn update_expression_for_source(
     {
         return expression;
     }
-    if variants
+    if let Some(payload_field) = variants
         .iter()
-        .any(|variant| field.references_payload_path(variant, "text"))
+        .find_map(|variant| field.first_referenced_payload_field(variant))
     {
         return UpdateExpression::SourcePayload {
-            path: "text".to_owned(),
-        };
-    }
-    if variants
-        .iter()
-        .any(|variant| field.references_payload_path(variant, "key"))
-    {
-        return UpdateExpression::SourcePayload {
-            path: "key".to_owned(),
-        };
-    }
-    if variants
-        .iter()
-        .any(|variant| field.references_payload_path(variant, "address"))
-    {
-        return UpdateExpression::SourcePayload {
-            path: "address".to_owned(),
+            path: payload_field,
         };
     }
     if !branch.is_empty() {
@@ -6643,10 +6609,7 @@ fn prefix_payload_concat_update_expression_from_items(
             .unwrap_or_default()
             .trim()
             .to_owned();
-        if !source_payload_path_matches(&payload_path, source_variants, "text")
-            && !source_payload_path_matches(&payload_path, source_variants, "key")
-            && !source_payload_path_matches(&payload_path, source_variants, "address")
-        {
+        if source_payload_field_from_path(&payload_path, source_variants).is_none() {
             return None;
         }
         let separator = summary
@@ -6710,10 +6673,7 @@ fn prefix_payload_concat_update_expression(
         .find(|arg| arg.name.as_deref() == Some("with"))
         .or_else(|| args.iter().find(|arg| arg.name.is_none()))
         .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    if !source_payload_path_matches(&payload_path, source_variants, "text")
-        && !source_payload_path_matches(&payload_path, source_variants, "key")
-        && !source_payload_path_matches(&payload_path, source_variants, "address")
-    {
+    if source_payload_field_from_path(&payload_path, source_variants).is_none() {
         return None;
     }
     let separator = args
@@ -6732,20 +6692,19 @@ fn prefix_payload_concat_update_expression(
     })
 }
 
-fn source_payload_path_matches(
-    path: &str,
-    source_variants: &[String],
-    payload_field: &str,
-) -> bool {
-    source_variants.iter().any(|variant| {
-        path == format!("{variant}.{payload_field}")
-            || path == format!("{variant}.event.{payload_field}")
-            || (payload_field == "text"
-                && (path == format!("{variant}.event.change.text")
-                    || path == format!("{variant}.change.text")))
-            || (payload_field == "key"
-                && (path == format!("{variant}.event.key_down.key")
-                    || path == format!("{variant}.key_down.key")))
+fn source_payload_field_from_path(path: &str, source_variants: &[String]) -> Option<String> {
+    source_variants.iter().find_map(|variant| {
+        let suffix = path.strip_prefix(variant)?.strip_prefix('.')?;
+        Some(match suffix {
+            "change.text" | "event.change.text" => "text".to_owned(),
+            "key_down.key" | "event.key_down.key" => "key".to_owned(),
+            "event.address" => "address".to_owned(),
+            _ if !suffix.contains('.') => suffix.to_owned(),
+            _ if suffix.starts_with("event.") && !suffix["event.".len()..].contains('.') => {
+                suffix["event.".len()..].to_owned()
+            }
+            _ => return None,
+        })
     })
 }
 
@@ -6815,35 +6774,37 @@ impl FieldDef {
         self.references_path_expr(source_variant, PathMatch::Prefix)
     }
 
-    fn references_payload_path(&self, source_variant: &str, payload_field: &str) -> bool {
-        let mut payload_paths = vec![format!("{source_variant}.{payload_field}")];
-        match payload_field {
-            "text" => {
-                payload_paths.push(format!("{source_variant}.event.change.text"));
-                payload_paths.push(format!("{source_variant}.change.text"));
-            }
-            "key" => {
-                payload_paths.push(format!("{source_variant}.event.key_down.key"));
-                payload_paths.push(format!("{source_variant}.key_down.key"));
-            }
-            "address" => {
-                payload_paths.push(format!("{source_variant}.event.address"));
-                payload_paths.push(format!("{source_variant}.address"));
-            }
-            _ => {}
-        }
-        payload_paths
-            .iter()
-            .any(|payload_path| self.references_path_expr(payload_path, PathMatch::Exact))
+    fn first_referenced_payload_field(&self, source_variant: &str) -> Option<String> {
+        self.referenced_payload_fields(source_variant)
+            .into_iter()
+            .next()
+            .map(|field| match field {
+                SourcePayloadField::Address => "address".to_owned(),
+                SourcePayloadField::Key => "key".to_owned(),
+                SourcePayloadField::Named(name) => name,
+                SourcePayloadField::Text => "text".to_owned(),
+            })
     }
 
-    fn match_arm_destructures_payload(&self, payload_field: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::MatchArm { pattern, .. } => {
-                pattern.iter().any(|part| part == payload_field)
-            }
-            _ => false,
-        })
+    fn referenced_payload_fields(&self, source_variant: &str) -> BTreeSet<SourcePayloadField> {
+        let variants = vec![source_variant.to_owned()];
+        self.ast_exprs
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::Path(parts) => {
+                    source_payload_field_from_path(&parts.join("."), &variants)
+                }
+                _ => None,
+            })
+            .chain(self.ast_exprs.iter().filter_map(|expr| match &expr.kind {
+                AstExprKind::MatchArm { pattern, .. } if pattern.len() == 1 => {
+                    Some(pattern[0].clone())
+                }
+                _ => None,
+            }))
+            .filter(|name| name != "__" && name != "SKIP")
+            .map(|name| SourcePayloadField::from_name(&name))
+            .collect()
     }
 
     fn references_path_expr(&self, path: &str, path_match: PathMatch) -> bool {

@@ -138,22 +138,8 @@ FUNCTION header() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
-                    width: 42
-                    height: Fill
-                    vertical_align: Center
-                    color: PASSED.store.mode |> WHEN {
-                        Dark => TEXT { #90a4bf }
-                        Light => TEXT { #475569 }
-                    }
-                ]
-                text: TEXT { ● ● ● }
-            )
-            Scene/Element/text(
-                element: []
-                style: [
                     ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
-                    width: 132
+                    width: 104
                     height: Fill
                     vertical_align: Center
                     size: 18
@@ -162,15 +148,10 @@ FUNCTION header() {
                         Light => TEXT { #475569 }
                     }
                 ]
-                text: TEXT { NovyWave.io }
+                text: TEXT { NovyWave }
             )
             header_workspace_button()
             header_workspace_path()
-            header_load_button()
-            header_empty_button()
-            header_files_wider_button()
-            header_variables_wider_button()
-            header_panels_reset_button()
             header_panel_arrangement_button()
             header_mode_button()
         }
@@ -932,7 +913,7 @@ FUNCTION loaded_app_stacked() {
         ]
         items: LIST {
             browser_band()
-            files_panel_secondary_divider()
+            browser_selected_row_divider()
             selected_waveform_band()
         }
     )
@@ -950,7 +931,7 @@ FUNCTION loaded_app_docked() {
         ]
         items: LIST {
             browser_band_docked()
-            files_panel_main_divider()
+            browser_selected_column_divider()
             selected_waveform_band()
         }
     )
@@ -968,7 +949,7 @@ FUNCTION browser_band() {
         ]
         items: LIST {
             left_panel()
-            files_panel_main_divider()
+            files_variables_column_divider()
             variables_panel()
         }
     )
@@ -986,7 +967,7 @@ FUNCTION browser_band_docked() {
         ]
         items: LIST {
             left_panel_docked()
-            files_panel_secondary_divider()
+            files_variables_row_divider()
             variables_panel_docked()
         }
     )
@@ -1009,24 +990,48 @@ FUNCTION selected_waveform_band() {
     )
 }
 
-FUNCTION files_panel_main_divider() {
+FUNCTION files_variables_column_divider() {
     Scene/Element/block(
         element: [
-            event: [drag: PASSED.store.elements.files_main_resize_drag]
-            hovered: PASSED.store.elements.files_main_resize_drag
-            target: TEXT { files panel main divider }
+            event: [drag: PASSED.store.elements.files_variables_resize_drag]
+            hovered: PASSED.store.elements.files_variables_resize_drag
+            target: TEXT { files variables divider }
         ]
         style: column_divider_style()
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
 
-FUNCTION files_panel_secondary_divider() {
+FUNCTION files_variables_row_divider() {
     Scene/Element/block(
         element: [
-            event: [drag: PASSED.store.elements.files_secondary_resize_drag]
-            hovered: PASSED.store.elements.files_secondary_resize_drag
-            target: TEXT { files panel secondary divider }
+            event: [drag: PASSED.store.elements.files_variables_resize_drag]
+            hovered: PASSED.store.elements.files_variables_resize_drag
+            target: TEXT { files variables divider }
+        ]
+        style: row_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION browser_selected_column_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.browser_selected_resize_drag]
+            hovered: PASSED.store.elements.browser_selected_resize_drag
+            target: TEXT { browser selected divider }
+        ]
+        style: column_divider_style()
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION browser_selected_row_divider() {
+    Scene/Element/block(
+        element: [
+            event: [drag: PASSED.store.elements.browser_selected_resize_drag]
+            hovered: PASSED.store.elements.browser_selected_resize_drag
+            target: TEXT { browser selected divider }
         ]
         style: row_divider_style()
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
@@ -1311,23 +1316,23 @@ FUNCTION left_panel_base(panel_width, panel_height) {
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelSurface)
         ]
         items: LIST {
-            panel_title(title_text: TEXT { Files and scopes })
-            file_toolbar()
+            files_panel_header()
             file_status_card()
             files_list()
         }
     )
 }
 
-FUNCTION file_toolbar() {
+FUNCTION files_panel_header() {
     Scene/Element/stripe(
         element: []
         direction: Row
         gap: 8
         style: [width: Fill, height: 28, paint: False]
         items: LIST {
+            panel_title(title_text: TEXT { Files & Scopes })
             file_load_button()
-            file_diagnostic_button()
+            file_clear_all_button()
         }
     )
 }
@@ -1424,37 +1429,19 @@ FUNCTION file_load_button() {
             event: [press: PASSED.store.elements.open_load_files_dialog]
             hovered: PASSED.store.elements.open_load_files_dialog
         ]
-        style: compact_button_style(button_width: 76, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Load })
+        style: compact_button_style(button_width: 92, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Load Files })
     )
 }
 
-FUNCTION file_diagnostic_button() {
-    PASSED.store.pressed_control_label == TEXT { Probe } |> WHEN {
-        True => file_diagnostic_button_pressed()
-        False => file_diagnostic_button_resting()
-    }
-}
-
-FUNCTION file_diagnostic_button_resting() {
+FUNCTION file_clear_all_button() {
     Scene/Element/button(
         element: [
-            event: [press: PASSED.store.elements.diagnostic_probe]
-            hovered: PASSED.store.elements.diagnostic_probe
+            event: [press: PASSED.store.elements.show_empty]
+            hovered: PASSED.store.elements.show_empty
         ]
         style: compact_button_style(button_width: 76, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Probe })
-    )
-}
-
-FUNCTION file_diagnostic_button_pressed() {
-    Scene/Element/button(
-        element: [
-            event: [press: PASSED.store.elements.diagnostic_probe]
-            hovered: PASSED.store.elements.diagnostic_probe
-        ]
-        style: probe_button_pressed_style()
-        label: button_label(button_text: TEXT { Probe })
+        label: button_label(button_text: TEXT { Clear All })
     )
 }
 
@@ -2039,8 +2026,30 @@ FUNCTION selected_wave_column_body() {
         ]
         items: LIST {
             selected_wave_rows_column()
-            waveform_full_height_overlays()
+            waveform_interaction_surface()
+            waveform_full_height_zoom_center_overlay()
+            waveform_full_height_cursor_overlay()
         }
+    )
+}
+
+FUNCTION waveform_interaction_surface() {
+    Scene/Element/block(
+        element: [
+            event: [
+                press: PASSED.store.elements.waveform_click
+                pointer_move: PASSED.store.elements.waveform_hover
+                key_down: PASSED.store.elements.keyboard_capture
+            ]
+            hovered: PASSED.store.elements.waveform_hover
+            target: TEXT { waveform canvas }
+        ]
+        style: [
+            width: Fill
+            height: Fill
+            paint: False
+        ]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
 
@@ -2059,18 +2068,19 @@ FUNCTION selected_wave_rows_column() {
     )
 }
 
-FUNCTION waveform_full_height_overlays() {
+FUNCTION waveform_full_height_zoom_center_overlay() {
     Scene/Element/stripe(
-        element: []
+        element: [target: PASSED.store.zoom_center_label]
         direction: Row
         gap: 0
         style: [
-            width: Fill
+            width: PASSED.store.waveform_zoom_center_offset + 2
             height: Fill
             paint: False
         ]
         items: LIST {
-            waveform_full_height_cursor_overlay()
+            waveform_cursor_spacer(width_value: PASSED.store.waveform_zoom_center_offset)
+            waveform_zoom_center_line_core()
         }
     )
 }
@@ -2427,7 +2437,7 @@ FUNCTION selected_variables_footer() {
         gap: 5
         style: [
             width: Fill
-            height: 67
+            height: 98
             padding: [top: 3, bottom: 3, left: 6, right: 6]
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
@@ -2443,6 +2453,7 @@ FUNCTION selected_variables_footer() {
         items: LIST {
             selected_variables_footer_primary()
             selected_variables_footer_secondary()
+            inspector_strip()
         }
     )
 }
@@ -3128,6 +3139,27 @@ FUNCTION waveform_cursor_line_core() {
     )
 }
 
+FUNCTION waveform_zoom_center_line_core() {
+    Scene/Element/block(
+        element: [target: PASSED.store.zoom_center_label]
+        style: [
+            width: 2
+            height: Fill
+            rounded_corners: 0
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #43D97388 }
+                Light => TEXT { #15803D88 }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #43D97355 }
+                Light => TEXT { #15803D55 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
 FUNCTION waveform_row(signal) {
     BLOCK {
         active: signal.id == PASSED.store.active_signal
@@ -3151,19 +3183,7 @@ FUNCTION waveform_row(signal) {
             items: LIST {
                 signal_select_button(signal: signal)
                 variables_name_divider()
-                signal.id == TEXT { clk } |> WHEN {
-                    True => value_cell(signal: signal, value_text: NovyModel/selected_clk_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
-                    False => signal.id == TEXT { reset_n } |> WHEN {
-                        True => value_cell(signal: signal, value_text: NovyModel/selected_reset_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
-                        False => signal.id == TEXT { data_bus } |> WHEN {
-                            True => value_cell(signal: signal, value_text: PASSED.store.data_bus_rendered_value)
-                            False => signal.id == TEXT { temperature } |> WHEN {
-                                True => value_cell(signal: signal, value_text: PASSED.store.temperature_rendered_value)
-                                False => value_cell(signal: signal, value_text: NovyModel/cursor_signal_value(signal_id: signal.id, cursor: PASSED.store.cursor_position, format: PASSED.store.value_format, fallback: signal.current_value))
-                            }
-                        }
-                    }
-                }
+                value_cell(signal: signal, value_text: selected_cursor_value_for_signal(signal: signal))
                 variables_value_divider()
                 wave_area(signal: signal)
             }
@@ -3176,19 +3196,18 @@ FUNCTION selected_name_cell(signal) {
 }
 
 FUNCTION selected_value_cell(signal) {
-    signal.id == TEXT { clk } |> WHEN {
-        True => value_cell(signal: signal, value_text: NovyModel/selected_clk_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
-        False => signal.id == TEXT { reset_n } |> WHEN {
-            True => value_cell(signal: signal, value_text: NovyModel/selected_reset_value_at_cursor(format: PASSED.store.value_format, cursor: PASSED.store.cursor_position))
-            False => signal.id == TEXT { data_bus } |> WHEN {
-                True => value_cell(signal: signal, value_text: PASSED.store.data_bus_rendered_value)
-                False => signal.id == TEXT { temperature } |> WHEN {
-                    True => value_cell(signal: signal, value_text: PASSED.store.temperature_rendered_value)
-                    False => value_cell(signal: signal, value_text: NovyModel/cursor_signal_value(signal_id: signal.id, cursor: PASSED.store.cursor_position, format: PASSED.store.value_format, fallback: signal.current_value))
-                }
-            }
-        }
-    }
+    value_cell(signal: signal, value_text: selected_cursor_value_for_signal(signal: signal))
+}
+
+FUNCTION selected_cursor_value_for_signal(signal) {
+    PASSED.store.waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: signal.file)
+        |> List/filter_field_equal(field: "signal_id", value: signal.id)
+        |> List/filter_field_not_equal(field: "state", value: CursorLine)
+        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
+        |> List/retain(segment, if: segment.start_time_value <= PASSED.store.selected_timeline_cursor_value)
+        |> List/retain(segment, if: segment.end_time_value > PASSED.store.selected_timeline_cursor_value)
+        |> List/join_field(field: "label", separator: "", empty: signal.current_value)
 }
 
 FUNCTION selected_wave_cell(signal) {
@@ -3727,7 +3746,7 @@ FUNCTION wave_area(signal) {
             event: [
                 key_down: PASSED.store.elements.keyboard_capture
             ]
-            hovered: PASSED.store.elements.waveform_click
+            hovered: PASSED.store.elements.waveform_hover
         ]
         style: [
             width: Fill
@@ -3783,7 +3802,7 @@ FUNCTION waveform_segment(segment) {
 
 FUNCTION waveform_segment_blue(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [
@@ -3800,7 +3819,7 @@ FUNCTION waveform_segment_blue(segment) {
 
 FUNCTION waveform_segment_dark(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [width: segment.width, height: Fill, paint: False]
@@ -3813,7 +3832,7 @@ FUNCTION waveform_segment_dark(segment) {
 
 FUNCTION waveform_segment_sky(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [width: segment.width, height: Fill, paint: False]
@@ -3826,7 +3845,7 @@ FUNCTION waveform_segment_sky(segment) {
 
 FUNCTION waveform_segment_indigo(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [width: segment.width, height: Fill, paint: False]
@@ -3839,7 +3858,7 @@ FUNCTION waveform_segment_indigo(segment) {
 
 FUNCTION waveform_segment_cyan(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [width: segment.width, height: Fill, paint: False]
@@ -3852,7 +3871,7 @@ FUNCTION waveform_segment_cyan(segment) {
 
 FUNCTION waveform_segment_pale(segment) {
     Scene/Element/stripe(
-        element: [event: [press: PASSED.store.elements.waveform_click, key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click, target: segment.click_time]
+        element: []
         direction: Row
         gap: 0
         style: [width: segment.width, height: Fill, paint: False]
@@ -3922,7 +3941,7 @@ FUNCTION waveform_trace_cell_blue(segment) {
 
 FUNCTION waveform_trace_cell_blue_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [
             width: Fill
             height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size)
@@ -3953,7 +3972,7 @@ FUNCTION waveform_trace_cell_dark(segment) {
 
 FUNCTION waveform_trace_cell_dark_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [width: Fill, height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceLow)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Dark), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
@@ -3965,7 +3984,7 @@ FUNCTION waveform_trace_cell_sky(segment) {
 
 FUNCTION waveform_trace_cell_sky_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [width: Fill, height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Sky), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
@@ -3977,7 +3996,7 @@ FUNCTION waveform_trace_cell_indigo(segment) {
 
 FUNCTION waveform_trace_cell_indigo_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [width: Fill, height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Indigo), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
@@ -3989,7 +4008,7 @@ FUNCTION waveform_trace_cell_cyan(segment) {
 
 FUNCTION waveform_trace_cell_cyan_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [width: Fill, height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Cyan), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
@@ -4001,7 +4020,7 @@ FUNCTION waveform_trace_cell_pale(segment) {
 
 FUNCTION waveform_trace_cell_pale_base(segment) {
     Scene/Element/label(
-        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_click]
+        element: [event: [key_down: PASSED.store.elements.keyboard_capture], hovered: PASSED.store.elements.waveform_hover]
         style: [width: Fill, height: NovyTheme/trace_height_for_row(state: segment.state, row_size: PASSED.store.row_size), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/material(mode: PASSED.store.mode, of: AnalogTrace)]
         label: Scene/Element/text(element: [], style: [...NovyTheme/trace_label_font(mode: PASSED.store.mode, tone: Pale), width: Fill, height: Fill, center: True, vertical_align: Center], text: segment.label)
     )
@@ -4049,8 +4068,6 @@ FUNCTION variables_panel_base(panel_width, panel_height) {
             )
             variables_list()
             search_result_line()
-            inspector_strip()
-            format_palette()
         }
     )
 }
@@ -5024,34 +5041,6 @@ FUNCTION compact_button_style(button_width, hovered) {
     ]
 }
 
-FUNCTION probe_button_pressed_style() {
-    [
-        width: 76
-        height: 28
-        rounded_corners: 8
-        spring_range: 3
-        center: True
-        background: [color: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #28466d }
-            Light => TEXT { #cce4ff }
-        }]
-        __hover_background: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #1a2b44 }
-            Light => TEXT { #e9f3ff }
-        }
-        border: [color: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #65b8ff }
-            Light => TEXT { #2474bb }
-        }]
-        __hover_border: PASSED.store.mode |> WHEN {
-            Dark => TEXT { #49617f }
-            Light => TEXT { #bad0e8 }
-        }
-        material: NovyTheme/material(mode: PASSED.store.mode, of: PressedControl)
-        __hover_gloss: 0.08
-    ]
-}
-
 FUNCTION format_button_pressed_style() {
     [
         width: 112
@@ -5086,8 +5075,8 @@ FUNCTION header_load_button() {
             event: [press: PASSED.store.elements.open_load_files_dialog]
             hovered: PASSED.store.elements.open_load_files_dialog
         ]
-        style: compact_button_style(button_width: 54, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Load })
+        style: compact_button_style(button_width: 92, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Load Files })
     )
 }
 
@@ -5138,71 +5127,12 @@ FUNCTION header_workspace_path() {
     )
 }
 
-FUNCTION header_empty_button() {
-    Scene/Element/button(
-        element: [
-            event: [press: PASSED.store.elements.show_empty]
-            hovered: PASSED.store.elements.show_empty
-        ]
-        style: compact_button_style(button_width: 62, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Empty })
-    )
-}
-
 FUNCTION header_mode_button() {
     PASSED.store.mode |> WHEN {
         Dark => header_mode_to_light_button()
         Light => header_mode_to_dark_button()
         __ => header_mode_to_light_button()
     }
-}
-
-FUNCTION header_panel_resize_controls() {
-    Scene/Element/stripe(
-        element: []
-        direction: Row
-        gap: 4
-        style: [width: 214, height: Fill, paint: False]
-        items: LIST {
-            header_files_wider_button()
-            header_variables_wider_button()
-            header_panels_reset_button()
-            header_panel_arrangement_button()
-        }
-    )
-}
-
-FUNCTION header_files_wider_button() {
-    Scene/Element/button(
-        element: [
-            event: [press: PASSED.store.elements.panels_files_wider]
-            hovered: PASSED.store.elements.panels_files_wider
-        ]
-        style: compact_button_style(button_width: 52, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Files+ })
-    )
-}
-
-FUNCTION header_variables_wider_button() {
-    Scene/Element/button(
-        element: [
-            event: [press: PASSED.store.elements.panels_variables_wider]
-            hovered: PASSED.store.elements.panels_variables_wider
-        ]
-        style: compact_button_style(button_width: 52, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Vars+ })
-    )
-}
-
-FUNCTION header_panels_reset_button() {
-    Scene/Element/button(
-        element: [
-            event: [press: PASSED.store.elements.panels_reset]
-            hovered: PASSED.store.elements.panels_reset
-        ]
-        style: compact_button_style(button_width: 50, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Reset })
-    )
 }
 
 FUNCTION header_panel_arrangement_button() {

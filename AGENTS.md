@@ -7,6 +7,11 @@ truth for the native two-window GPU playground.
 
 Do not commit or push unless the user explicitly asks.
 
+When Boon source exposes a real compiler, typechecker, runtime, or engine
+limitation, fix the engine instead of writing a Boon-level workaround. A
+workaround is acceptable only as a temporary diagnostic step while proving the
+engine bug, and it must not be left as the final implementation.
+
 Do not fabricate human-observation reports. Human testing is a separate
 follow-up after the native GPU gates pass, and it must not be used as a shortcut
 for native GPU verifier evidence.

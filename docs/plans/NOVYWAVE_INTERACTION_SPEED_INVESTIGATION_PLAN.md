@@ -83,6 +83,30 @@ the full `native_document_layout_proof_with_project_state_embedded_for_viewport`
 path for small cursor/hover/divider updates by introducing bounded render
 patches or compact layout snapshots.
 
+## Current Investigation State On 2026-06-09
+
+Additional engine/runtime work has reduced part of the hot path, but the latest
+release verifier still fails the 60fps target. The important split from
+`target/reports/native-gpu/novywave-interaction-speed.json` is:
+
+- `hover_to_overlay_ms_p50_p95_max.p95`: 462.148 ms
+- `click_to_cursor_ms_p50_p95_max.p95`: 528.296 ms
+- `divider_drag_to_layout_ms_p50_p95_max.p95`: 415.958 ms
+- `resize_to_present_ms_p50_p95_max.p95`: 586.385 ms
+- `runtime_apply_ms_p50_p95_max.p95`: 99.544 ms
+- `runtime_step_apply_ms_p50_p95_max.p95`: 64.653 ms
+- `runtime_state_summary_ms_p50_p95_max.p95`: 34.234 ms, with p50
+  0.438 ms after cached/patched summaries
+- `layout_rebuild_ms_p50_p95_max.p95`: 417.177 ms
+- `document_eval_lower_ms_p50_p95_max.p95`: 387.476 ms
+
+The next implementation priority is therefore a generic dirty-layout/render
+patch route. Small root `FieldSet` turns must map changed runtime fields to
+concrete document nodes and attributes, then update only the affected text/style
+nodes or compact layout snapshot. Full document lowering, full layout proof JSON,
+and full state summaries must remain verifier/debug/report behavior, not normal
+preview interaction behavior.
+
 ## Implementation Phases
 
 ### Phase 0: Baseline Verifier And Instrumentation

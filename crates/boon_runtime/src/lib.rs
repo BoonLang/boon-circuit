@@ -309,6 +309,20 @@ pub struct LiveStepOutput {
     pub semantic_deltas: Vec<SemanticDelta<'static>>,
     pub render_patches: Vec<RenderPatch<'static>>,
     pub state_summary: JsonValue,
+    pub apply_step_ms: f64,
+    pub state_summary_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveTurnOutput {
+    pub semantic_deltas: Vec<SemanticDelta<'static>>,
+    pub render_patches: Vec<RenderPatch<'static>>,
+    pub apply_step_ms: f64,
+    pub dirty_key_count: usize,
+    pub recomputed_field_count: usize,
+    pub recompute_candidate_count: usize,
+    pub recompute_candidate_samples: Vec<String>,
+    pub recomputed_field_samples: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1162,6 +1176,15 @@ impl LiveRuntime {
         )
     }
 
+    pub fn apply_source_event_turn(
+        &mut self,
+        event: LiveSourceEvent,
+    ) -> RuntimeResult<LiveTurnOutput> {
+        let step = event.into_step(self.next_step);
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step_turn(&step)
+    }
+
     pub fn apply_source_event_for_step(
         &mut self,
         step: &ScenarioStep,
@@ -1245,6 +1268,31 @@ impl LiveRuntime {
         self.apply_checked_step_with_summary_mode(step, true)
     }
 
+    fn apply_checked_step_turn(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveTurnOutput> {
+        let mut semantic_deltas = Vec::new();
+        let mut render_patches = Vec::new();
+        let apply_started = Instant::now();
+        let metrics = self
+            .runtime
+            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        let apply_step_ms = runtime_elapsed_ms(apply_started);
+        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+        self.runtime.assert_step_after_measurement(step)?;
+        Ok(LiveTurnOutput {
+            semantic_deltas: semantic_deltas
+                .iter()
+                .map(SemanticDelta::to_static)
+                .collect(),
+            render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
+            apply_step_ms,
+            dirty_key_count: metrics.dirty_key_count,
+            recomputed_field_count: metrics.recomputed_field_count(),
+            recompute_candidate_count: metrics.recompute_candidate_count(),
+            recompute_candidate_samples: metrics.recompute_candidate_samples(),
+            recomputed_field_samples: metrics.recomputed_field_samples(),
+        })
+    }
+
     fn apply_checked_step_with_document_window(
         &mut self,
         step: &ScenarioStep,
@@ -1255,16 +1303,20 @@ impl LiveRuntime {
     ) -> RuntimeResult<LiveStepOutput> {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
+        let apply_started = Instant::now();
         self.runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        let apply_step_ms = runtime_elapsed_ms(apply_started);
         assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
         self.runtime.assert_step_after_measurement(step)?;
+        let summary_started = Instant::now();
         let state_summary = self.runtime.document_state_summary_for_window(
             row_start,
             row_count,
             column_start,
             column_count,
         );
+        let state_summary_ms = runtime_elapsed_ms(summary_started);
         Ok(LiveStepOutput {
             semantic_deltas: semantic_deltas
                 .iter()
@@ -1272,6 +1324,8 @@ impl LiveRuntime {
                 .collect(),
             render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
             state_summary,
+            apply_step_ms,
+            state_summary_ms,
         })
     }
 
@@ -1282,15 +1336,19 @@ impl LiveRuntime {
     ) -> RuntimeResult<LiveStepOutput> {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
+        let apply_started = Instant::now();
         self.runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        let apply_step_ms = runtime_elapsed_ms(apply_started);
         assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
         self.runtime.assert_step_after_measurement(step)?;
+        let summary_started = Instant::now();
         let state_summary = if document_summary {
             self.runtime.document_state_summary()
         } else {
             self.runtime.state_summary()
         };
+        let state_summary_ms = runtime_elapsed_ms(summary_started);
         Ok(LiveStepOutput {
             semantic_deltas: semantic_deltas
                 .iter()
@@ -1298,6 +1356,8 @@ impl LiveRuntime {
                 .collect(),
             render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
             state_summary,
+            apply_step_ms,
+            state_summary_ms,
         })
     }
 
@@ -2335,10 +2395,25 @@ impl LoadedRuntime {
             }
         }
         let changed_reads = generic.read_keys_from_delta_parts(&delta_parts)?;
+        let mut root_changed_reads = changed_reads.clone();
         let (derived_commits, _recompute_metrics) =
             generic.recompute_generic_derived_after_changes(changed_reads)?;
         semantic_delta_count = semantic_delta_count.saturating_add(derived_commits.len());
-        let root_commits = generic.materialize_root_derived_field_commits()?;
+        for commit in &derived_commits {
+            if let Some(index) =
+                generic
+                    .storage
+                    .bound_index(&commit.list, commit.key, commit.generation)?
+            {
+                root_changed_reads.insert(GenericReadKey::ListField {
+                    list: commit.list.clone(),
+                    index,
+                    field: commit.field.clone(),
+                });
+            }
+        }
+        let root_commits =
+            generic.materialize_root_derived_field_commits_for_changed_reads(root_changed_reads)?;
         semantic_delta_count = semantic_delta_count.saturating_add(
             root_commits
                 .iter()
@@ -2414,6 +2489,8 @@ impl LoadedRuntime {
                 extra: StepExecutionExtra::Generic {
                     recomputed_field_count: 0,
                     recompute_candidate_count: 0,
+                    recompute_candidate_samples: Vec::new(),
+                    recomputed_field_samples: Vec::new(),
                 },
             });
         };
@@ -2440,7 +2517,11 @@ impl LoadedRuntime {
                     if let Some(delta) = mutation.semantic_delta() {
                         deltas.push(delta);
                     }
-                    patches.push(generic_document_invalidation_patch(&mutation));
+                    if let Some(patch) = GenericRenderLoweringPlan::generic()
+                        .lower_mutation_patch(&mutation, GenericRenderContext::default())?
+                    {
+                        patches.push(patch);
+                    }
                     Ok(())
                 },
             )
@@ -2453,29 +2534,57 @@ impl LoadedRuntime {
             if let Some(delta) = mutation.semantic_delta() {
                 deltas.push(delta);
             }
-            patches.push(generic_document_invalidation_patch(&mutation));
+            if let Some(patch) = GenericRenderLoweringPlan::generic()
+                .lower_mutation_patch(&mutation, GenericRenderContext::default())?
+            {
+                patches.push(patch);
+            }
         }
         let changed_reads = generic.read_keys_from_deltas(&deltas[delta_start..])?;
+        let mut root_changed_reads = changed_reads.clone();
         let (derived_commits, recompute_metrics) =
             generic.recompute_generic_derived_after_changes(changed_reads)?;
         for commit in derived_commits {
+            if let Some(index) =
+                generic
+                    .storage
+                    .bound_index(&commit.list, commit.key, commit.generation)?
+            {
+                root_changed_reads.insert(GenericReadKey::ListField {
+                    list: commit.list.clone(),
+                    index,
+                    field: commit.field.clone(),
+                });
+            }
             let mutation = GenericSourceMutation::ValueField(commit);
             if let Some(delta) = mutation.semantic_delta() {
                 deltas.push(delta);
             }
-            patches.push(generic_document_invalidation_patch(&mutation));
+            if let Some(patch) = GenericRenderLoweringPlan::generic()
+                .lower_mutation_patch(&mutation, GenericRenderContext::default())?
+            {
+                patches.push(patch);
+            }
         }
-        for mutation in generic.materialize_root_derived_field_commits()? {
+        for mutation in
+            generic.materialize_root_derived_field_commits_for_changed_reads(root_changed_reads)?
+        {
             if let Some(delta) = mutation.semantic_delta() {
                 deltas.push(delta);
             }
-            patches.push(generic_document_invalidation_patch(&mutation));
+            if let Some(patch) = GenericRenderLoweringPlan::generic()
+                .lower_mutation_patch(&mutation, GenericRenderContext::default())?
+            {
+                patches.push(patch);
+            }
         }
         Ok(StepExecutionMetrics {
             dirty_key_count: deltas.len(),
             extra: StepExecutionExtra::Generic {
                 recomputed_field_count: recompute_metrics.recomputed_field_count,
                 recompute_candidate_count: recompute_metrics.recompute_candidate_count,
+                recompute_candidate_samples: recompute_metrics.recompute_candidate_samples,
+                recomputed_field_samples: recompute_metrics.recomputed_field_samples,
             },
         })
     }
@@ -3081,6 +3190,44 @@ struct StepExecutionMetrics {
     extra: StepExecutionExtra,
 }
 
+impl StepExecutionMetrics {
+    fn recomputed_field_count(&self) -> usize {
+        match self.extra {
+            StepExecutionExtra::Generic {
+                recomputed_field_count,
+                ..
+            } => recomputed_field_count,
+        }
+    }
+
+    fn recompute_candidate_count(&self) -> usize {
+        match self.extra {
+            StepExecutionExtra::Generic {
+                recompute_candidate_count,
+                ..
+            } => recompute_candidate_count,
+        }
+    }
+
+    fn recompute_candidate_samples(&self) -> Vec<String> {
+        match &self.extra {
+            StepExecutionExtra::Generic {
+                recompute_candidate_samples,
+                ..
+            } => recompute_candidate_samples.clone(),
+        }
+    }
+
+    fn recomputed_field_samples(&self) -> Vec<String> {
+        match &self.extra {
+            StepExecutionExtra::Generic {
+                recomputed_field_samples,
+                ..
+            } => recomputed_field_samples.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirtyKeyEntry {
     list_id: String,
@@ -3162,6 +3309,8 @@ enum StepExecutionExtra {
     Generic {
         recomputed_field_count: usize,
         recompute_candidate_count: usize,
+        recompute_candidate_samples: Vec<String>,
+        recomputed_field_samples: Vec<String>,
     },
 }
 
@@ -3258,6 +3407,8 @@ fn run_generic_scenario<R: ScenarioExecutor>(
             StepExecutionExtra::Generic {
                 recomputed_field_count,
                 recompute_candidate_count,
+                recompute_candidate_samples,
+                recomputed_field_samples,
             } => {
                 object.insert("generic_runtime_step".to_owned(), json!(true));
                 object.insert(
@@ -3267,6 +3418,14 @@ fn run_generic_scenario<R: ScenarioExecutor>(
                 object.insert(
                     "recompute_candidate_count".to_owned(),
                     json!(recompute_candidate_count),
+                );
+                object.insert(
+                    "recompute_candidate_samples".to_owned(),
+                    json!(recompute_candidate_samples),
+                );
+                object.insert(
+                    "recomputed_field_samples".to_owned(),
+                    json!(recomputed_field_samples),
                 );
             }
         }
@@ -6021,6 +6180,8 @@ impl GenericScheduledRuntime {
             .source_routes
             .actions_for_source_id(input.source_id)?
             .to_vec();
+        let mut materialize_root_derived_after_actions = false;
+        let mut root_derived_changed_reads = BTreeSet::new();
         for action in &actions {
             match action {
                 SourceAction::RootScalar => {
@@ -6038,24 +6199,23 @@ impl GenericScheduledRuntime {
                                 input.source,
                                 input.seq,
                             )? {
+                                root_derived_changed_reads
+                                    .extend(root_read_keys_for_path(&commit.target));
                                 observe(GenericSourceMutation::RootBool(commit))?;
                                 if mode.materializes_derived() {
-                                    for mutation in self.materialize_root_derived_field_commits()? {
-                                        observe(mutation)?;
-                                    }
+                                    materialize_root_derived_after_actions = true;
                                 }
                             }
                         } else if let Some(commit) =
                             self.apply_root_text_source_with_row_context(&target, &input)?
                         {
+                            root_derived_changed_reads.extend(root_read_keys_for_path(&target));
                             observe(GenericSourceMutation::RootText(GenericRootTextCommit {
                                 target,
                                 value: commit,
                             }))?;
                             if mode.materializes_derived() {
-                                for mutation in self.materialize_root_derived_field_commits()? {
-                                    observe(mutation)?;
-                                }
+                                materialize_root_derived_after_actions = true;
                             }
                         }
                     }
@@ -6074,14 +6234,13 @@ impl GenericScheduledRuntime {
                             self.storage
                                 .root
                                 .insert_value(target.clone(), FieldValue::Text(value.to_string()));
+                            root_derived_changed_reads.extend(root_read_keys_for_path(target));
                             observe(GenericSourceMutation::RootText(GenericRootTextCommit {
                                 target: target.clone(),
                                 value,
                             }))?;
                             if mode.materializes_derived() {
-                                for mutation in self.materialize_root_derived_field_commits()? {
-                                    observe(mutation)?;
-                                }
+                                materialize_root_derived_after_actions = true;
                             }
                         }
                     }
@@ -6092,6 +6251,7 @@ impl GenericScheduledRuntime {
                         self.storage
                             .root
                             .insert_value(target.clone(), value.clone());
+                        root_derived_changed_reads.extend(root_read_keys_for_path(target));
                         match value {
                             FieldValue::Bool(value) => {
                                 observe(GenericSourceMutation::RootBool(GenericRootBoolCommit {
@@ -6107,9 +6267,7 @@ impl GenericScheduledRuntime {
                             }
                         }
                         if mode.materializes_derived() {
-                            for mutation in self.materialize_root_derived_field_commits()? {
-                                observe(mutation)?;
-                            }
+                            materialize_root_derived_after_actions = true;
                         }
                     }
                 }
@@ -6117,9 +6275,7 @@ impl GenericScheduledRuntime {
                     if self.router_route != *path {
                         self.router_route.clone_from(path);
                         if mode.materializes_derived() {
-                            for mutation in self.materialize_root_derived_field_commits()? {
-                                observe(mutation)?;
-                            }
+                            materialize_root_derived_after_actions = true;
                         }
                     }
                 }
@@ -6301,6 +6457,13 @@ impl GenericScheduledRuntime {
                         )?;
                     }
                 }
+            }
+        }
+        if materialize_root_derived_after_actions {
+            for mutation in self.materialize_root_derived_field_commits_for_changed_reads(
+                root_derived_changed_reads,
+            )? {
+                observe(mutation)?;
             }
         }
         Ok(())
@@ -6648,53 +6811,111 @@ impl GenericScheduledRuntime {
         let fields = self.generic_derived.root_fields.clone();
         let mut commits = Vec::new();
         for field in fields {
-            if matches!(field.kind, DerivedValueKind::ListView) {
-                continue;
-            }
-            if field.kind == DerivedValueKind::SourceEventTransform
-                && field.has_sources
-                && self.storage.root.owned_value(&field.path).is_some()
-            {
-                continue;
-            }
-            let mut frame = GenericEvalFrame::root();
-            let value = self.eval_root_derived_initial_value(&field.statement, &mut frame)?;
-            if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
-                continue;
-            }
-            let field_value = boon_value_field_value(&value);
-            let current = self.storage.root.owned_value(&field.path);
-            if current.as_ref() == Some(&field_value) {
-                continue;
-            }
-            self.storage
-                .root
-                .insert_value(field.path.clone(), field_value);
-            match boon_value_protocol_value(&value) {
-                ProtocolValue::Bool(value) => {
-                    commits.push(GenericSourceMutation::RootBool(GenericRootBoolCommit {
-                        target: field.path,
-                        value,
-                    }));
-                }
-                ProtocolValue::Text(value) => {
-                    commits.push(GenericSourceMutation::RootText(GenericRootTextCommit {
-                        target: field.path,
-                        value,
-                    }));
-                }
-                ProtocolValue::NumberText(value) => {
-                    commits.push(GenericSourceMutation::RootText(GenericRootTextCommit {
-                        target: field.path,
-                        value: Cow::Owned(value.to_string()),
-                    }));
-                }
-                ProtocolValue::Null
-                | ProtocolValue::SourceBinding { .. }
-                | ProtocolValue::CheckedProperty(_) => {}
+            if let Some(commit) = self.materialize_root_derived_field_commit(&field)? {
+                commits.push(commit);
             }
         }
         Ok(commits)
+    }
+
+    fn materialize_root_derived_field_commits_for_changed_reads(
+        &mut self,
+        changed_reads: BTreeSet<GenericReadKey>,
+    ) -> RuntimeResult<Vec<GenericSourceMutation<'static>>> {
+        let mut dirty = self
+            .generic_derived_state
+            .root_dependents_for_reads(changed_reads)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut processed = BTreeSet::new();
+        let mut commits = Vec::new();
+        let mut guard = 0usize;
+        while let Some(path) = dirty.iter().next().cloned() {
+            dirty.remove(&path);
+            if !processed.insert(path.clone()) {
+                continue;
+            }
+            guard += 1;
+            if guard > 20_000 {
+                return Err("generic root derived recompute budget exhausted".into());
+            }
+            let Some(field) = self.generic_derived.root_field_plan(&path).cloned() else {
+                continue;
+            };
+            let Some(commit) = self.materialize_root_derived_field_commit(&field)? else {
+                continue;
+            };
+            let changed_field = GenericReadKey::Root {
+                field: root_mutation_target(&commit).to_owned(),
+            };
+            for dependent in self
+                .generic_derived_state
+                .root_dependents_for_reads([changed_field])
+            {
+                if !processed.contains(&dependent) {
+                    dirty.insert(dependent);
+                }
+            }
+            commits.push(commit);
+        }
+        Ok(commits)
+    }
+
+    fn materialize_root_derived_field_commit(
+        &mut self,
+        field: &GenericDerivedRootField,
+    ) -> RuntimeResult<Option<GenericSourceMutation<'static>>> {
+        if matches!(field.kind, DerivedValueKind::ListView) {
+            return Ok(None);
+        }
+        if field.kind == DerivedValueKind::SourceEventTransform
+            && field.has_sources
+            && self.storage.root.owned_value(&field.path).is_some()
+        {
+            return Ok(None);
+        }
+        let mut frame = GenericEvalFrame::root();
+        let value = self.eval_root_derived_initial_value(&field.statement, &mut frame)?;
+        self.generic_derived_state
+            .replace_root_reads(field.path.clone(), frame.reads);
+        self.generic_derived_state
+            .root_value_cache
+            .insert(field.path.clone(), value.clone());
+        if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+            return Ok(None);
+        }
+        let field_value = boon_value_field_value(&value);
+        let current = self.storage.root.owned_value(&field.path);
+        if current.as_ref() == Some(&field_value) {
+            return Ok(None);
+        }
+        self.storage
+            .root
+            .insert_value(field.path.clone(), field_value);
+        let mutation = match boon_value_protocol_value(&value) {
+            ProtocolValue::Bool(value) => {
+                Some(GenericSourceMutation::RootBool(GenericRootBoolCommit {
+                    target: field.path.clone(),
+                    value,
+                }))
+            }
+            ProtocolValue::Text(value) => {
+                Some(GenericSourceMutation::RootText(GenericRootTextCommit {
+                    target: field.path.clone(),
+                    value,
+                }))
+            }
+            ProtocolValue::NumberText(value) => {
+                Some(GenericSourceMutation::RootText(GenericRootTextCommit {
+                    target: field.path.clone(),
+                    value: Cow::Owned(value.to_string()),
+                }))
+            }
+            ProtocolValue::Null
+            | ProtocolValue::SourceBinding { .. }
+            | ProtocolValue::CheckedProperty(_) => None,
+        };
+        Ok(mutation)
     }
 
     fn eval_root_derived_initial_value(
@@ -6836,6 +7057,11 @@ impl GenericScheduledRuntime {
                 return Err("generic derived recompute budget exhausted".into());
             }
             metrics.recompute_candidate_count += 1;
+            if metrics.recompute_candidate_samples.len() < 32 {
+                metrics
+                    .recompute_candidate_samples
+                    .push(format_generic_derived_key(&key));
+            }
             let (commit, _) = self.recompute_generic_derived_key_value(&key, &[])?;
             metrics.recomputed_field_count = self.generic_derived_state.last_recomputed.len();
             if let Some(commit) = commit {
@@ -6858,6 +7084,13 @@ impl GenericScheduledRuntime {
                 commits.push(commit);
             }
         }
+        metrics.recomputed_field_samples = self
+            .generic_derived_state
+            .last_recomputed
+            .iter()
+            .take(32)
+            .map(format_generic_derived_key)
+            .collect();
         self.generic_derived_state.last_candidate_count = metrics.recompute_candidate_count;
         Ok((commits, metrics))
     }
@@ -7306,6 +7539,14 @@ impl GenericScheduledRuntime {
         {
             return self.read_list_field(&row.list, row.index, name, frame);
         }
+        if frame.row.is_some()
+            && let Some(value) = self.runtime_scalar_boon_value(name)
+        {
+            frame.reads.insert(GenericReadKey::Root {
+                field: name.to_owned(),
+            });
+            return Ok(value);
+        }
         if let Some(value) = self.root_pure_derived_boon_value(name, frame)? {
             return Ok(value);
         }
@@ -7339,6 +7580,14 @@ impl GenericScheduledRuntime {
             return self.read_list_field(&row.list, row.index, &parts[1], frame);
         }
         let full_path = parts.join(".");
+        if frame.row.is_some()
+            && let Some(value) = self.runtime_scalar_boon_value(&full_path)
+        {
+            frame
+                .reads
+                .insert(GenericReadKey::Root { field: full_path });
+            return Ok(value);
+        }
         if let Some(value) = self.root_pure_derived_boon_value(&full_path, frame)? {
             return Ok(value);
         }
@@ -8165,7 +8414,7 @@ impl GenericScheduledRuntime {
                     frame,
                 )?) == needle
                 {
-                    matches.push(self.list_value_record(value.clone(), frame)?);
+                    matches.push(self.list_value_for_pipeline(value.clone(), frame)?);
                 }
             }
             matches
@@ -8190,7 +8439,7 @@ impl GenericScheduledRuntime {
                     .contains(&needle)
             };
             if keep {
-                output.push(self.list_value_record(value, frame)?);
+                output.push(self.list_value_for_pipeline(value, frame)?);
             }
         }
         Ok(BoonValue::List(output))
@@ -8209,7 +8458,7 @@ impl GenericScheduledRuntime {
         let mut output = Vec::new();
         for value in values {
             if (self.list_value_field_text(&value, field, frame)? == expected) == equal {
-                output.push(self.list_value_record(value, frame)?);
+                output.push(self.list_value_for_pipeline(value, frame)?);
             }
         }
         Ok(BoonValue::List(output))
@@ -8228,11 +8477,10 @@ impl GenericScheduledRuntime {
         let mut matched = Vec::new();
         let mut rest = Vec::new();
         for value in values {
-            let record = self.list_value_record(value, frame)?;
-            if self.list_value_field_text(&record, field, frame)? == expected {
-                matched.push(record);
+            if self.list_value_field_text(&value, field, frame)? == expected {
+                matched.push(self.list_value_for_pipeline(value, frame)?);
             } else {
-                rest.push(record);
+                rest.push(self.list_value_for_pipeline(value, frame)?);
             }
         }
         let mut output = Vec::with_capacity(matched.len() + rest.len());
@@ -8370,6 +8618,21 @@ impl GenericScheduledRuntime {
             );
         }
         Ok(BoonValue::Record(record))
+    }
+
+    fn list_value_for_pipeline(
+        &mut self,
+        value: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match value {
+            BoonValue::RowRef { ref list, index }
+                if self.storage.row_identity(list, index).is_ok() =>
+            {
+                Ok(value)
+            }
+            other => self.list_value_record(other, frame),
+        }
     }
 
     fn list_get(
@@ -8823,8 +9086,9 @@ impl GenericScheduledRuntime {
         }
         let mut frame = GenericEvalFrame::root();
         if let Ok(Some(value)) = self.root_pure_derived_boon_value(path, &mut frame) {
+            let value = self.boon_value_json_for_summary(&value);
             return Some(runtime_json_value_summary(
-                &boon_value_json(&value),
+                &value,
                 depth,
                 max_depth,
                 max_fields,
@@ -8835,8 +9099,9 @@ impl GenericScheduledRuntime {
             let store_path = format!("store.{path}");
             let mut frame = GenericEvalFrame::root();
             if let Ok(Some(value)) = self.root_pure_derived_boon_value(&store_path, &mut frame) {
+                let value = self.boon_value_json_for_summary(&value);
                 return Some(runtime_json_value_summary(
-                    &boon_value_json(&value),
+                    &value,
                     depth,
                     max_depth,
                     max_fields,
@@ -8966,6 +9231,19 @@ impl GenericScheduledRuntime {
         let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
             return Ok(None);
         };
+        if let Some(value) = self.generic_derived_state.root_value_cache.get(&plan.path) {
+            if let Some(reads) = self
+                .generic_derived_state
+                .root_reads_by_field
+                .get(&plan.path)
+            {
+                frame.reads.extend(reads.iter().cloned());
+            }
+            frame.reads.insert(GenericReadKey::Root {
+                field: plan.path.clone(),
+            });
+            return Ok(Some(value.clone()));
+        }
         if frame.root_stack.contains(&plan.path) {
             return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
         }
@@ -8976,6 +9254,9 @@ impl GenericScheduledRuntime {
         frame.reads.insert(GenericReadKey::Root {
             field: plan.path.clone(),
         });
+        self.generic_derived_state
+            .root_value_cache
+            .insert(plan.path.clone(), value.clone());
         Ok(Some(value))
     }
 
@@ -9260,9 +9541,35 @@ impl GenericScheduledRuntime {
             if matches!(value, BoonValue::Error(_) | BoonValue::Empty) {
                 continue;
             }
-            values.push((field.path, boon_value_json(&value)));
+            let value = self.boon_value_json_for_summary(&value);
+            values.push((field.path, value));
         }
         values
+    }
+
+    fn boon_value_json_for_summary(&mut self, value: &BoonValue) -> JsonValue {
+        match value {
+            BoonValue::Record(fields) => JsonValue::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), self.boon_value_json_for_summary(value)))
+                    .collect(),
+            ),
+            BoonValue::List(values) => JsonValue::Array(
+                values
+                    .iter()
+                    .map(|value| self.boon_value_json_for_summary(value))
+                    .collect(),
+            ),
+            BoonValue::RowRef { .. } => {
+                let mut frame = GenericEvalFrame::root();
+                match self.list_value_record(value.clone(), &mut frame) {
+                    Ok(record) if &record != value => self.boon_value_json_for_summary(&record),
+                    _ => boon_value_json(value),
+                }
+            }
+            _ => boon_value_json(value),
+        }
     }
 
     fn document_summary(&mut self) -> JsonValue {
@@ -10087,6 +10394,9 @@ impl GenericCircuitRuntime {
         let Some(value) = latest_value(target, &[candidate])? else {
             return Ok(None);
         };
+        if self.root_bool_opt(target) == Some(value) {
+            return Ok(None);
+        }
         self.set_root_bool(target, value)?;
         Ok(Some(GenericRootBoolCommit {
             target: target.to_owned(),
@@ -10154,6 +10464,9 @@ impl GenericCircuitRuntime {
         let Some(value) = latest_value(target, &[candidate])? else {
             return Ok(None);
         };
+        if self.root.textlike(target) == Some(value.as_ref()) {
+            return Ok(None);
+        }
         self.set_root_textlike(target, &value)?;
         Ok(Some(value))
     }
@@ -12418,7 +12731,56 @@ impl GenericRenderLoweringPlan {
         mutation: &GenericSourceMutation<'a>,
         _context: GenericRenderContext<'a>,
     ) -> RuntimeResult<Option<RenderPatch<'a>>> {
-        Ok(Some(generic_document_invalidation_patch(mutation)))
+        Ok(Some(match mutation {
+            GenericSourceMutation::RootText(commit) => patch(
+                "PatchRootField",
+                RenderTarget::Static(Cow::Owned(commit.target.clone())),
+                ProtocolValue::Text(commit.value.clone()),
+            ),
+            GenericSourceMutation::RootBool(commit) => patch(
+                "PatchRootField",
+                RenderTarget::Static(Cow::Owned(commit.target.clone())),
+                ProtocolValue::Bool(commit.value),
+            ),
+            GenericSourceMutation::TextField(commit) => list_row_field_patch(
+                "PatchListRowField",
+                &commit.list,
+                commit.key,
+                commit.generation,
+                &commit.field,
+                ProtocolValue::Text(commit.value.clone()),
+            ),
+            GenericSourceMutation::TextFieldIdentity(commit) => list_row_field_patch(
+                "PatchListRowField",
+                &commit.list,
+                commit.key,
+                commit.generation,
+                &commit.field,
+                ProtocolValue::Text(Cow::Owned(commit.value.clone())),
+            ),
+            GenericSourceMutation::ValueField(commit) => list_row_field_patch(
+                "PatchListRowField",
+                &commit.list,
+                commit.key,
+                commit.generation,
+                &commit.field,
+                commit.value.clone(),
+            ),
+            GenericSourceMutation::BoolField(commit) => list_row_field_patch(
+                "PatchListRowField",
+                &commit.list,
+                commit.key,
+                commit.generation,
+                &commit.field,
+                ProtocolValue::Bool(commit.value),
+            ),
+            GenericSourceMutation::ListAppend(_)
+            | GenericSourceMutation::ListRemove { .. }
+            | GenericSourceMutation::SourceBind(_)
+            | GenericSourceMutation::SourceUnbind(_) => {
+                generic_document_invalidation_patch(mutation)
+            }
+        }))
     }
 
     fn lower_row_affordance_patch<'a>(
@@ -12491,6 +12853,21 @@ impl<'a> GenericSourceMutation<'a> {
     }
 }
 
+fn root_mutation_target<'a>(mutation: &'a GenericSourceMutation<'_>) -> &'a str {
+    match mutation {
+        GenericSourceMutation::RootText(commit) => &commit.target,
+        GenericSourceMutation::RootBool(commit) => &commit.target,
+        GenericSourceMutation::TextField(_)
+        | GenericSourceMutation::TextFieldIdentity(_)
+        | GenericSourceMutation::ValueField(_)
+        | GenericSourceMutation::BoolField(_)
+        | GenericSourceMutation::ListAppend(_)
+        | GenericSourceMutation::ListRemove { .. }
+        | GenericSourceMutation::SourceBind(_)
+        | GenericSourceMutation::SourceUnbind(_) => "",
+    }
+}
+
 fn generic_document_invalidation_patch<'a>(
     mutation: &GenericSourceMutation<'a>,
 ) -> RenderPatch<'a> {
@@ -12529,6 +12906,25 @@ fn generic_document_invalidation_patch<'a>(
         RenderTarget::Static(Cow::Borrowed("document")),
         value,
     )
+}
+
+fn list_row_field_patch<'a>(
+    kind: &'static str,
+    list: &str,
+    key: u64,
+    generation: u64,
+    field: &str,
+    value: ProtocolValue<'a>,
+) -> RenderPatch<'a> {
+    let mut patch = patch(
+        kind,
+        RenderTarget::Static(Cow::Owned(field.to_owned())),
+        value,
+    );
+    patch.list_id = Some(Cow::Owned(list.to_owned()));
+    patch.key = Some(key);
+    patch.generation = Some(generation);
+    patch
 }
 
 enum GenericListRemoveObservation<'a> {
@@ -12955,6 +13351,9 @@ struct GenericDerivedIndexedField {
 struct GenericDerivedState {
     reads_by_field: BTreeMap<GenericDerivedKey, BTreeSet<GenericReadKey>>,
     dependents_by_read: BTreeMap<GenericReadKey, BTreeSet<GenericDerivedKey>>,
+    root_reads_by_field: BTreeMap<String, BTreeSet<GenericReadKey>>,
+    root_dependents_by_read: BTreeMap<GenericReadKey, BTreeSet<String>>,
+    root_value_cache: BTreeMap<String, BoonValue>,
     last_recomputed: Vec<GenericDerivedKey>,
     last_candidate_count: usize,
 }
@@ -12964,6 +13363,10 @@ struct GenericDerivedKey {
     list: String,
     index: usize,
     field: String,
+}
+
+fn format_generic_derived_key(key: &GenericDerivedKey) -> String {
+    format!("{}[{}].{}", key.list, key.index, key.field)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -12976,6 +13379,19 @@ enum GenericReadKey {
         index: usize,
         field: String,
     },
+}
+
+fn root_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
+    let mut keys = vec![GenericReadKey::Root {
+        field: path.to_owned(),
+    }];
+    let leaf = row_field_name(path);
+    if leaf != path {
+        keys.push(GenericReadKey::Root {
+            field: leaf.to_owned(),
+        });
+    }
+    keys
 }
 
 struct GenericDeltaPart {
@@ -13001,6 +13417,8 @@ impl SourceActionApplyMode {
 struct GenericRecomputeMetrics {
     recomputed_field_count: usize,
     recompute_candidate_count: usize,
+    recompute_candidate_samples: Vec<String>,
+    recomputed_field_samples: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14573,6 +14991,7 @@ impl GenericDerivedState {
     fn clear_last_step(&mut self) {
         self.last_recomputed.clear();
         self.last_candidate_count = 0;
+        self.root_value_cache.clear();
     }
 
     fn replace_reads(&mut self, key: GenericDerivedKey, reads: BTreeSet<GenericReadKey>) {
@@ -14595,6 +15014,26 @@ impl GenericDerivedState {
         self.reads_by_field.insert(key, reads);
     }
 
+    fn replace_root_reads(&mut self, field: String, reads: BTreeSet<GenericReadKey>) {
+        if let Some(previous) = self.root_reads_by_field.remove(&field) {
+            for read in previous {
+                if let Some(dependents) = self.root_dependents_by_read.get_mut(&read) {
+                    dependents.remove(&field);
+                    if dependents.is_empty() {
+                        self.root_dependents_by_read.remove(&read);
+                    }
+                }
+            }
+        }
+        for read in &reads {
+            self.root_dependents_by_read
+                .entry(read.clone())
+                .or_default()
+                .insert(field.clone());
+        }
+        self.root_reads_by_field.insert(field, reads);
+    }
+
     fn dependents_for_reads(
         &self,
         reads: impl IntoIterator<Item = GenericReadKey>,
@@ -14603,6 +15042,19 @@ impl GenericDerivedState {
         for read in reads {
             if let Some(keys) = self.dependents_by_read.get(&read) {
                 dependents.extend(keys.iter().cloned());
+            }
+        }
+        dependents
+    }
+
+    fn root_dependents_for_reads(
+        &self,
+        reads: impl IntoIterator<Item = GenericReadKey>,
+    ) -> BTreeSet<String> {
+        let mut dependents = BTreeSet::new();
+        for read in reads {
+            if let Some(fields) = self.root_dependents_by_read.get(&read) {
+                dependents.extend(fields.iter().cloned());
             }
         }
         dependents
@@ -18561,6 +19013,61 @@ document: Document/new(root: Element/label(element: [], label: store.path))
     }
 
     #[test]
+    fn root_derived_materialization_uses_changed_dependencies() {
+        let source = r#"
+store: [
+    elements: [
+        path_input: SOURCE
+    ]
+    path:
+        TEXT { default-path } |> HOLD path {
+            LATEST {
+                elements.path_input.text |> THEN { elements.path_input.text }
+            }
+        }
+    label:
+        TEXT { Path: } |> Text/concat(with: path, separator: " ")
+    unrelated:
+        TEXT { Static: } |> Text/concat(with: TEXT { stable }, separator: " ")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.label))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-derived-dependencies", source).unwrap();
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/label"),
+            Some(&json!("Path: default-path"))
+        );
+        assert_eq!(
+            runtime.document_state_summary().pointer("/store/unrelated"),
+            Some(&json!("Static: stable"))
+        );
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.path_input".to_owned(),
+                text: Some("/tmp/wave.vcd".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.path")
+        }));
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.label")
+        }));
+        assert!(
+            output.semantic_deltas.iter().all(|delta| {
+                !(delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.unrelated"))
+            }),
+            "unrelated root derived field should not be materialized on path input: {:#?}",
+            output.semantic_deltas
+        );
+    }
+
+    #[test]
     fn live_runtime_applies_observed_todomvc_source_events() {
         let source = include_str!("../../../examples/todomvc.bn");
         let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
@@ -22270,8 +22777,15 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             output
                 .render_patches
                 .iter()
-                .all(|patch| patch.kind == "InvalidateDocument"),
-            "Cells edits must use generic document invalidation patches"
+                .any(|patch| matches!(patch.kind, "PatchRootField" | "PatchListRowField")),
+            "Cells scalar edits must expose generic sparse render patches"
+        );
+        assert!(
+            output
+                .render_patches
+                .iter()
+                .all(|patch| patch.kind != "InvalidateDocument"),
+            "Cells scalar edits must not force generic document invalidation"
         );
     }
 

@@ -10,12 +10,16 @@ use boon_typecheck::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
@@ -276,6 +280,18 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     report_value["final_count"] = json!(observed_count);
     report_value["expected_count"] = json!(expected_count);
     report_value["layout_frame_hash"] = layout_hash;
+    report_value["initial_data_binding_target_paths"] = layout_proof
+        .get("data_binding_target_paths")
+        .cloned()
+        .unwrap_or(Value::Null);
+    report_value["initial_data_binding_index_count"] = layout_proof
+        .get("data_binding_index_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    report_value["initial_data_binding_target_samples"] = layout_proof
+        .get("data_binding_target_samples")
+        .cloned()
+        .unwrap_or(Value::Null);
     report_value["preview_last_error"] = json!(last_error);
     report_value["per_step_pass_fail"] = json!([
         {
@@ -555,6 +571,8 @@ fn run_novywave_interaction_speed(
         status_overlay: None,
         last_dirty_reason: None,
     }));
+    let _ = take_preview_interaction_profiles();
+    let _ = take_preview_native_input_profiles();
     let mut input_state = PreviewNativeInputState::default();
     let mut hover_ms = Vec::new();
     let mut click_ms = Vec::new();
@@ -684,23 +702,40 @@ fn run_novywave_interaction_speed(
         divider_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
 
+    let mut resize_layout_proof = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "interaction-speed render state mutex poisoned")?;
+        shared.layout_proof.clone()
+    };
     for index in 0..event_count.min(8) {
         let resized_viewport = if index % 2 == 0 {
             (1180.0, 720.0)
         } else {
             (960.0, 680.0)
         };
-        let state_summary = live_runtime
-            .lock()
-            .map_err(|_| "interaction-speed runtime mutex poisoned")?
-            .document_state_summary();
         let started = Instant::now();
-        let _ = native_document_layout_proof_with_project_state_embedded_for_viewport(
-            &source_path,
-            &source_units,
-            Some(&state_summary),
-            Some(resized_viewport),
-        )?;
+        if let Some((next_layout_proof, _layout_frame)) =
+            preview_try_relayout_cached_document_frame_for_viewport(
+                &resize_layout_proof,
+                resized_viewport,
+            )?
+        {
+            resize_layout_proof = next_layout_proof;
+        } else {
+            let state_summary = live_runtime
+                .lock()
+                .map_err(|_| "interaction-speed runtime mutex poisoned")?
+                .document_state_summary();
+            let (next_layout_proof, _layout_frame) =
+                native_document_layout_proof_with_project_state_embedded_for_viewport(
+                    &source_path,
+                    &source_units,
+                    Some(&state_summary),
+                    Some(resized_viewport),
+                )?;
+            resize_layout_proof = next_layout_proof;
+        }
         resize_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
 
@@ -736,6 +771,30 @@ fn run_novywave_interaction_speed(
     let click_summary_ms = latency_summary_ms(&click_ms);
     let divider_summary_ms = latency_summary_ms(&divider_ms);
     let resize_summary_ms = latency_summary_ms(&resize_ms);
+    let interaction_profiles = take_preview_interaction_profiles();
+    let native_input_profiles = take_preview_native_input_profiles();
+    let runtime_apply_summary_ms =
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_apply_ms");
+    let runtime_lock_wait_summary_ms =
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_lock_wait_ms");
+    let layout_rebuild_summary_ms =
+        profile_latency_summary_ms(&interaction_profiles, "/layout_rebuild_ms");
+    let document_eval_lower_summary_ms = profile_latency_summary_ms(
+        &interaction_profiles,
+        "/layout_profile/document_eval_lower_ms",
+    );
+    let text_measure_and_layout_summary_ms = profile_latency_summary_ms(
+        &interaction_profiles,
+        "/layout_profile/text_measure_and_layout_ms",
+    );
+    let function_registry_summary_ms = profile_latency_summary_ms(
+        &interaction_profiles,
+        "/layout_profile/function_registry_ms",
+    );
+    let runtime_step_apply_summary_ms =
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_step_apply_ms");
+    let runtime_state_summary_summary_ms =
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_state_summary_ms");
     let hover_p95 = latency_p95(&hover_ms);
     let click_p95 = latency_p95(&click_ms);
     let divider_p95 = latency_p95(&divider_ms);
@@ -802,7 +861,29 @@ fn run_novywave_interaction_speed(
     report_value["hover_to_overlay_ms_p50_p95_max"] = hover_summary_ms;
     report_value["divider_drag_to_layout_ms_p50_p95_max"] = divider_summary_ms;
     report_value["resize_to_present_ms_p50_p95_max"] = resize_summary_ms;
-    report_value["runtime_apply_ms_p50_p95_max"] = latency_summary_ms(&click_ms);
+    report_value["runtime_apply_ms_p50_p95_max"] = runtime_apply_summary_ms;
+    report_value["runtime_step_apply_ms_p50_p95_max"] = runtime_step_apply_summary_ms;
+    report_value["runtime_state_summary_ms_p50_p95_max"] = runtime_state_summary_summary_ms;
+    report_value["runtime_lock_wait_ms_p50_p95_max"] = runtime_lock_wait_summary_ms;
+    report_value["layout_rebuild_ms_p50_p95_max"] = layout_rebuild_summary_ms;
+    report_value["document_eval_lower_ms_p50_p95_max"] = document_eval_lower_summary_ms;
+    report_value["text_measure_and_layout_ms_p50_p95_max"] = text_measure_and_layout_summary_ms;
+    report_value["function_registry_ms_p50_p95_max"] = function_registry_summary_ms;
+    report_value["interaction_profile_count"] = json!(interaction_profiles.len());
+    report_value["interaction_profile_samples"] = json!(
+        interaction_profiles
+            .iter()
+            .take(128)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    report_value["native_input_profile_samples"] = json!(
+        native_input_profiles
+            .iter()
+            .take(128)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
     report_value["interaction_latency_ms_max"] = json!(max_observed);
     report_value["preview_shared_render_update_count"] = json!(update_count);
     report_value["selected_rows_order_label"] = json!(selected_rows);
@@ -821,6 +902,18 @@ fn run_novywave_interaction_speed(
     report_value["ui_state_persistence_disabled_for_benchmark"] =
         json!(std::env::var_os("BOON_NATIVE_DISABLE_UI_STATE_PERSIST").is_some());
     report_value["layout_frame_hash"] = layout_hash;
+    report_value["initial_data_binding_target_paths"] = layout_proof
+        .get("data_binding_target_paths")
+        .cloned()
+        .unwrap_or(Value::Null);
+    report_value["initial_data_binding_index_count"] = layout_proof
+        .get("data_binding_index_count")
+        .cloned()
+        .unwrap_or(Value::Null);
+    report_value["initial_data_binding_target_samples"] = layout_proof
+        .get("data_binding_target_samples")
+        .cloned()
+        .unwrap_or(Value::Null);
     report_value["preview_last_error"] = json!(last_error);
     report_value["per_step_pass_fail"] = json!(step_reports);
     boon_runtime::write_json(Path::new(report), &report_value)?;
@@ -849,6 +942,14 @@ fn latency_p95(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     percentile_sorted_ms(&sorted, 95.0)
+}
+
+fn profile_latency_summary_ms(profiles: &[serde_json::Value], pointer: &str) -> serde_json::Value {
+    let values = profiles
+        .iter()
+        .filter_map(|profile| profile.pointer(pointer).and_then(serde_json::Value::as_f64))
+        .collect::<Vec<_>>();
+    latency_summary_ms(&values)
 }
 
 fn percentile_sorted_ms(sorted: &[f64], percentile: f64) -> f64 {
@@ -2954,12 +3055,104 @@ impl DocumentLayoutProfile {
 struct DocumentLayoutCacheEntry {
     proof: serde_json::Value,
     layout_frame: boon_document::LayoutFrame,
+    document_frame: boon_document_model::DocumentFrame,
+    data_binding_targets: DocumentDataBindingIndex,
+}
+
+const PREVIEW_INTERACTION_PROFILE_LIMIT: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DocumentDataBindingTarget {
+    node: boon_document_model::DocumentNodeId,
+    attr: String,
+}
+
+type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>;
+
+#[derive(Clone, Debug)]
+struct DocumentRenderSnapshot {
+    document_frame: boon_document_model::DocumentFrame,
+    data_binding_targets: DocumentDataBindingIndex,
+}
+
+fn preview_interaction_profiles() -> &'static Mutex<VecDeque<serde_json::Value>> {
+    static PROFILES: OnceLock<Mutex<VecDeque<serde_json::Value>>> = OnceLock::new();
+    PROFILES.get_or_init(|| Mutex::new(VecDeque::with_capacity(PREVIEW_INTERACTION_PROFILE_LIMIT)))
+}
+
+fn preview_profiling_enabled() -> bool {
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    if std::env::var_os("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH").is_some() {
+        return true;
+    }
+    ENABLED.load(Ordering::Relaxed)
+}
+
+fn record_preview_interaction_profile(profile: serde_json::Value) {
+    let Ok(mut profiles) = preview_interaction_profiles().lock() else {
+        return;
+    };
+    while profiles.len() >= PREVIEW_INTERACTION_PROFILE_LIMIT {
+        profiles.pop_front();
+    }
+    profiles.push_back(profile);
+}
+
+fn take_preview_interaction_profiles() -> Vec<serde_json::Value> {
+    preview_interaction_profiles()
+        .lock()
+        .map(|mut profiles| profiles.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn preview_native_input_profiles() -> &'static Mutex<VecDeque<serde_json::Value>> {
+    static PROFILES: OnceLock<Mutex<VecDeque<serde_json::Value>>> = OnceLock::new();
+    PROFILES.get_or_init(|| Mutex::new(VecDeque::with_capacity(PREVIEW_INTERACTION_PROFILE_LIMIT)))
+}
+
+fn record_preview_native_input_profile(profile: serde_json::Value) {
+    let Ok(mut profiles) = preview_native_input_profiles().lock() else {
+        return;
+    };
+    while profiles.len() >= PREVIEW_INTERACTION_PROFILE_LIMIT {
+        profiles.pop_front();
+    }
+    profiles.push_back(profile);
+}
+
+fn take_preview_native_input_profiles() -> Vec<serde_json::Value> {
+    preview_native_input_profiles()
+        .lock()
+        .map(|mut profiles| profiles.drain(..).collect())
+        .unwrap_or_default()
 }
 
 fn document_layout_cache() -> &'static Mutex<BTreeMap<String, Arc<DocumentLayoutCacheEntry>>> {
     static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<DocumentLayoutCacheEntry>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn document_render_snapshot_cache() -> &'static Mutex<BTreeMap<String, Arc<DocumentRenderSnapshot>>>
+{
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<DocumentRenderSnapshot>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn cache_document_render_snapshot(hash: String, snapshot: DocumentRenderSnapshot) {
+    if let Ok(mut cache) = document_render_snapshot_cache().lock() {
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(hash, Arc::new(snapshot));
+    }
+}
+
+fn cached_document_render_snapshot(hash: &str) -> Option<Arc<DocumentRenderSnapshot>> {
+    document_render_snapshot_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(hash).cloned())
 }
 
 fn native_document_layout_proof_with_project_state_mode(
@@ -3015,6 +3208,19 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         {
             profile.insert("layout_cache_hit".to_owned(), json!(true));
         }
+        if let Some(hash) = proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        {
+            cache_document_render_snapshot(
+                hash,
+                DocumentRenderSnapshot {
+                    document_frame: entry.document_frame.clone(),
+                    data_binding_targets: entry.data_binding_targets.clone(),
+                },
+            );
+        }
         return Ok((proof, Some(entry.layout_frame.clone())));
     }
 
@@ -3039,6 +3245,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     let static_analysis = cached_document_static_analysis(source_path, units)?;
     let typecheck_report = Arc::clone(&static_analysis.typecheck_report);
     let source_binding_index = Arc::clone(&static_analysis.source_binding_index);
+    let data_binding_index = Arc::clone(&static_analysis.data_binding_index);
     profile.typecheck_ms = elapsed_ms(typecheck_started);
     profile.render_slot_count = typecheck_report.render_slot_count;
     profile.source_payload_shape_count = typecheck_report.source_payload_shape_table.len();
@@ -3064,9 +3271,13 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: initial_locals,
+        local_origins: BTreeMap::new(),
         render_args: BTreeMap::new(),
         passed: None,
         source_binding_index,
+        data_binding_index,
+        data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+        data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
         source_override: None,
         functions: Some(&document_functions),
         eval_depth: 0,
@@ -3125,22 +3336,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     profile.document_eval_lower_ms = elapsed_ms(document_eval_lower_started);
 
     let text_measure_and_layout_started = Instant::now();
-    static TEXT_MEASURER: OnceLock<Mutex<boon_native_gpu::GlyphonTextMeasurer>> = OnceLock::new();
-    let mut measurer = TEXT_MEASURER
-        .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
-        .lock()
-        .map_err(|_| "document text measurer mutex poisoned")?;
-    let layout = boon_document::layout(boon_document::LayoutInput {
-        document: &frame,
-        viewport: boon_host::Viewport {
-            surface: 1,
-            width: viewport_width,
-            height: viewport_height,
-            scale: 1.0,
-        },
-        text: &mut *measurer,
-        capabilities: boon_document::RenderCapabilities::fake_portable(),
-    });
+    let layout = layout_frame_for_document_frame(&frame, (viewport_width, viewport_height))?;
     profile.text_measure_and_layout_ms = elapsed_ms(text_measure_and_layout_started);
 
     let runtime_state_hash = runtime_state
@@ -3216,6 +3412,32 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let data_binding_targets = eval_context
+        .data_binding_targets
+        .lock()
+        .map(|targets| targets.clone())
+        .unwrap_or_default();
+    let data_binding_target_samples = data_binding_targets
+        .iter()
+        .take(256)
+        .map(|(path, targets)| {
+            let target_samples = targets
+                .iter()
+                .take(8)
+                .map(|target| {
+                    json!({
+                        "node": target.node.0,
+                        "attr": target.attr,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "path": path,
+                "target_count": targets.len(),
+                "targets": target_samples
+            })
+        })
+        .collect::<Vec<_>>();
     let hit_target_samples = hit_target_assertion_total
         .iter()
         .take(256)
@@ -3225,6 +3447,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let (source_intent_index, source_intent_value_index) =
+        source_intent_indexes(&source_intent_assertions);
     let source_intent_total = source_intent_assertions.len();
     let source_intent_samples = source_intent_assertions
         .iter()
@@ -3259,7 +3483,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     let scroll_regions = serde_json::to_value(&layout.scroll_regions)?;
     let physical_theme_evidence = document_physical_theme_evidence(&eval_context);
 
-    let proof = json!({
+    let mut proof = json!({
         "status": "pass",
         "lowering": "boon_typecheck_render_slots_to_boon_document_model",
         "render_root_kind": render_root_kind,
@@ -3290,6 +3514,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         "source_intent_sample_count": source_intent_samples.len(),
         "source_intent_sample_limit": 256,
         "source_binding_index_count": source_binding_index_count,
+        "data_binding_index_count": data_binding_targets.values().map(Vec::len).sum::<usize>(),
+        "data_binding_target_paths": data_binding_targets.len(),
         "layout_profile": profile.to_json(),
         "hit_target_assertions": hit_target_assertion_total,
         "hit_target_samples": hit_target_samples,
@@ -3303,6 +3529,10 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         "layout_cache_hit": false,
         "layout_cache_key": cache_key.clone().unwrap_or_else(|| "uncached-runtime-state-fallback".to_owned()),
     });
+    proof["source_intent_index"] = source_intent_index;
+    proof["source_intent_value_index"] = source_intent_value_index;
+    proof["data_binding_target_sample_count"] = json!(data_binding_target_samples.len());
+    proof["data_binding_target_samples"] = Value::Array(data_binding_target_samples);
     if let Some(cache_key) = cache_key {
         if let Ok(mut cache) = document_layout_cache().lock() {
             if cache.len() > 32 {
@@ -3313,10 +3543,19 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
                 Arc::new(DocumentLayoutCacheEntry {
                     proof: proof.clone(),
                     layout_frame: layout.clone(),
+                    document_frame: frame.clone(),
+                    data_binding_targets: data_binding_targets.clone(),
                 }),
             );
         }
     }
+    cache_document_render_snapshot(
+        layout_frame_hash.clone(),
+        DocumentRenderSnapshot {
+            document_frame: frame,
+            data_binding_targets,
+        },
+    );
     Ok((proof, Some(layout)))
 }
 
@@ -3395,6 +3634,7 @@ fn cached_document_project_program(
 struct DocumentStaticAnalysis {
     typecheck_report: Arc<boon_typecheck::TypeCheckReport>,
     source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
+    data_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
 }
 
 fn cached_document_static_analysis(
@@ -3416,6 +3656,9 @@ fn cached_document_static_analysis(
     )?;
     let analysis = Arc::new(DocumentStaticAnalysis {
         source_binding_index: Arc::new(source_binding_index_from_view_bindings(
+            &runtime_analysis.view_bindings,
+        )),
+        data_binding_index: Arc::new(data_binding_index_from_view_bindings(
             &runtime_analysis.view_bindings,
         )),
         typecheck_report: Arc::new(runtime_analysis.typecheck_report),
@@ -15666,9 +15909,13 @@ fn document_block_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16032,9 +16279,13 @@ fn document_function_call_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16054,9 +16305,13 @@ fn document_function_args_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16089,15 +16344,21 @@ fn document_function_args_context<'a>(
             if let Some(render_statement) = render_statement {
                 scoped.render_args.insert(name.clone(), render_statement);
             }
+            document_context_clear_data_reads(context);
             let value = document_eval_expr_value(expr, expressions, context)
                 .or_else(|| {
                     document_text_value_for_expr(expr, expressions, context).map(Value::String)
                 })
                 .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+            let mut origins = document_context_take_data_reads(context);
+            origins.extend(document_expr_origin_paths(arg.value, expressions, context));
             if let Some(value) = value {
                 if name == "PASS" {
                     scoped.passed = Some(value);
                     continue;
+                }
+                if !origins.is_empty() {
+                    scoped.local_origins.insert(name.clone(), origins);
                 }
                 scoped.locals.insert(name, value);
             }
@@ -16116,13 +16377,21 @@ fn document_function_args_context<'a>(
         let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id)) else {
             continue;
         };
+        document_context_clear_data_reads(context);
         let value = document_eval_expr_value(expr, expressions, context)
             .or_else(|| document_text_value_for_expr(expr, expressions, context).map(Value::String))
             .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+        let mut origins = document_context_take_data_reads(context);
+        if let Some(expr_id) = child.expr {
+            origins.extend(document_expr_origin_paths(expr_id, expressions, context));
+        }
         if let Some(value) = value {
             if name == "PASS" {
                 scoped.passed = Some(value);
             } else {
+                if !origins.is_empty() {
+                    scoped.local_origins.insert(name.clone(), origins);
+                }
                 scoped.locals.insert(name, value);
             }
         }
@@ -16168,9 +16437,13 @@ fn document_function_item_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16182,6 +16455,14 @@ fn document_function_item_context<'a>(
     };
     if let Some(name) = first_formal {
         scoped.locals.insert(name.to_owned(), item_value.clone());
+        if let Some(AstExpr {
+            kind: AstExprKind::Identifier(item_name),
+            ..
+        }) = expressions.get(item_expr_id)
+            && let Some(origins) = context.local_origins.get(item_name).cloned()
+        {
+            scoped.local_origins.insert(name.to_owned(), origins);
+        }
     }
     if let Some(AstExpr {
         kind: AstExprKind::Identifier(name),
@@ -16192,6 +16473,9 @@ fn document_function_item_context<'a>(
             .locals
             .entry(name.clone())
             .or_insert_with(|| item_value.clone());
+        if let Some(origins) = context.local_origins.get(name).cloned() {
+            scoped.local_origins.insert(name.clone(), origins);
+        }
     }
     document_apply_function_namespace(&mut scoped, function);
     scoped
@@ -16683,9 +16967,13 @@ fn lower_mapped_document_children(
         let mut item_context = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -16694,6 +16982,16 @@ fn lower_mapped_document_children(
         item_context
             .locals
             .insert(mapped.item_binding_name.clone(), item.clone());
+        if let Some(list_path) = expressions
+            .get(list_expr_id)
+            .and_then(|expr| document_expr_value(expr, expressions))
+            .and_then(|path| document_list_origin_for_item(&path, item))
+        {
+            item_context.local_origins.insert(
+                mapped.item_binding_name.clone(),
+                BTreeSet::from([list_path]),
+            );
+        }
         let scoped = if !mapped.template_args.is_empty() {
             document_function_args_context(
                 function,
@@ -17173,15 +17471,28 @@ fn lower_canonical_list_map_children(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
             eval_cache: Arc::clone(&context.eval_cache),
         };
         scoped.locals.insert(item_name.to_owned(), item.clone());
+        if let Some(list_path) = expressions
+            .get(input_expr_id)
+            .and_then(|expr| document_expr_value(expr, expressions))
+            .and_then(|path| document_list_origin_for_item(&path, item))
+        {
+            scoped
+                .local_origins
+                .insert(item_name.to_owned(), BTreeSet::from([list_path]));
+        }
         let child_scope = if scope_key.is_empty() {
             format!("{item_name}-{index}")
         } else {
@@ -17628,14 +17939,20 @@ fn lower_canonical_element_style(
         let Some(field) = document_field_name(child) else {
             continue;
         };
+        document_context_clear_data_reads(context);
         match field.as_str() {
             "style" => lower_canonical_style_block(child, expressions, context, node),
             "width" | "height" | "size" => {
+                let explicit_reads = child
+                    .expr
+                    .map(|expr_id| document_expr_origin_paths(expr_id, expressions, context))
+                    .unwrap_or_default();
                 lower_dimension_statement(&field, child, expressions, context, node);
+                document_context_record_target_reads(context, node, &field, explicit_reads);
             }
             "gap" | "padding" | "scroll" | "scroll_x" | "scroll_y" | "scrollbars" | "center" => {
                 if let Some(value) = document_style_value(child, expressions, context) {
-                    node.style.insert(field, value);
+                    node.style.insert(field.clone(), value);
                 }
             }
             "checked" | "selected" | "visible" | "focus" => {
@@ -17645,10 +17962,14 @@ fn lower_canonical_element_style(
                         boon_document_model::StyleValue::Bool(true),
                     );
                 } else if let Some(value) = document_style_value(child, expressions, context) {
-                    node.style.insert(field, value);
+                    node.style.insert(field.clone(), value);
                 }
             }
             _ => {}
+        }
+        let reads = document_context_take_data_reads(context);
+        if field != "style" {
+            document_context_record_target_reads(context, node, &field, reads);
         }
     }
 }
@@ -17680,6 +18001,7 @@ fn lower_canonical_style_block(
             }
             continue;
         };
+        document_context_clear_data_reads(context);
         match field.as_str() {
             "background" => {
                 lower_background_style(child, expressions, context, node);
@@ -17786,7 +18108,12 @@ fn lower_canonical_style_block(
             }
             "borders" => lower_borders_style(child, expressions, context, node),
             "width" | "height" | "size" => {
+                let explicit_reads = child
+                    .expr
+                    .map(|expr_id| document_expr_origin_paths(expr_id, expressions, context))
+                    .unwrap_or_default();
                 lower_dimension_statement(&field, child, expressions, context, node);
+                document_context_record_target_reads(context, node, &field, explicit_reads);
             }
             _ => {
                 if let Some(value) = document_style_value(child, expressions, context) {
@@ -17839,6 +18166,8 @@ fn lower_font_line_style(
             }
             _ => {}
         }
+        let reads = document_context_take_data_reads(context);
+        document_context_record_target_reads(context, node, &field, reads);
     }
 }
 
@@ -18612,6 +18941,7 @@ fn lower_canonical_style_record(
     node: &mut boon_document_model::DocumentNode,
 ) {
     for field in fields {
+        document_context_clear_data_reads(context);
         if field.spread {
             if let Some(Value::Object(object)) = expressions
                 .get(field.value)
@@ -18619,6 +18949,7 @@ fn lower_canonical_style_record(
             {
                 lower_json_style_object(&object, node);
             }
+            let _ = document_context_take_data_reads(context);
             continue;
         }
         match field.name.as_str() {
@@ -18701,7 +19032,14 @@ fn lower_canonical_style_record(
             }
             "borders" => lower_borders_style_field(field, expressions, context, node),
             "width" | "height" | "size" => {
+                let explicit_reads = document_expr_origin_paths(field.value, expressions, context);
                 lower_dimension_field(field, expressions, context, node);
+                document_context_record_target_reads(
+                    context,
+                    node,
+                    field.name.as_str(),
+                    explicit_reads,
+                );
             }
             _ => {
                 if let Some(value) =
@@ -18711,6 +19049,17 @@ fn lower_canonical_style_record(
                 }
             }
         }
+        let reads = document_context_take_data_reads(context);
+        let target_attr = canonical_style_record_target_attr(&field.name);
+        document_context_record_target_reads(context, node, target_attr, reads);
+    }
+}
+
+fn canonical_style_record_target_attr(field: &str) -> &str {
+    match field {
+        "rounded_corners" => "border_radius",
+        "outline" | "border" => "border",
+        other => other,
     }
 }
 
@@ -18928,6 +19277,9 @@ fn lower_dimension_statement(
             .get(expr_id)
             .and_then(|expr| document_eval_expr_value(expr, expressions, context))
     {
+        for origin in document_expr_origin_paths(expr_id, expressions, context) {
+            document_context_record_data_read(context, origin);
+        }
         lower_json_dimension_style(key, &value, node);
         return;
     }
@@ -18946,6 +19298,9 @@ fn lower_dimension_field(
         .get(field.value)
         .and_then(|expr| document_eval_expr_value(expr, expressions, context))
     {
+        for origin in document_expr_origin_paths(field.value, expressions, context) {
+            document_context_record_data_read(context, origin);
+        }
         lower_json_dimension_style(&field.name, &value, node);
         return;
     }
@@ -19425,6 +19780,8 @@ fn lower_canonical_element_text(
         let Some(field) = document_field_name(child) else {
             continue;
         };
+        document_context_clear_data_reads(context);
+        let mut recorded_text = false;
         match field.as_str() {
             "label"
                 if !matches!(
@@ -19439,6 +19796,7 @@ fn lower_canonical_element_text(
                     && !text.is_empty()
                 {
                     node.text = Some(boon_document_model::TextValue { text });
+                    recorded_text = true;
                 }
             }
             "text" | "value" | "display_value" => {
@@ -19449,6 +19807,7 @@ fn lower_canonical_element_text(
                         && text.contains(".event."))
                 {
                     node.text = Some(boon_document_model::TextValue { text });
+                    recorded_text = true;
                 }
             }
             "placeholder" => {
@@ -19472,9 +19831,14 @@ fn lower_canonical_element_text(
                     && !text.is_empty()
                 {
                     node.text = Some(boon_document_model::TextValue { text });
+                    recorded_text = true;
                 }
             }
             _ => {}
+        }
+        let reads = document_context_take_data_reads(context);
+        if recorded_text {
+            document_context_record_target_reads(context, node, "text", reads);
         }
     }
 }
@@ -20137,6 +20501,7 @@ fn lower_document_element(
         let Some(value) = document_statement_value(child, expressions) else {
             continue;
         };
+        document_context_clear_data_reads(context);
         if matches!(
             field.as_str(),
             "text" | "value" | "display_value" | "placeholder" | "template"
@@ -20145,6 +20510,10 @@ fn lower_document_element(
             let text = document_text_value(child, expressions, context, field == "template")
                 .unwrap_or_else(|| value.clone());
             node.text = Some(boon_document_model::TextValue { text });
+            let reads = document_context_take_data_reads(context);
+            document_context_record_target_reads(context, &node, "text", reads);
+        } else {
+            let _ = document_context_take_data_reads(context);
         }
         let source_intent_value = if field == "target" {
             document_text_value(child, expressions, context, false).unwrap_or_else(|| value.clone())
@@ -20165,7 +20534,10 @@ fn lower_document_element(
                 "source_path": source_intent_value
             }));
         } else if let Some(style_value) = document_style_value(child, expressions, context) {
+            let target_attr = canonical_style_record_target_attr(&field).to_owned();
             node.style.insert(field, style_value);
+            let reads = document_context_take_data_reads(context);
+            document_context_record_target_reads(context, &node, &target_attr, reads);
         }
     }
 
@@ -20216,13 +20588,201 @@ fn lower_document_element(
 struct DocumentEvalContext<'a> {
     root: Option<&'a Value>,
     locals: BTreeMap<String, Value>,
+    local_origins: BTreeMap<String, BTreeSet<String>>,
     render_args: BTreeMap<String, AstStatement>,
     passed: Option<Value>,
     source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
+    data_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
+    data_reads: Arc<Mutex<BTreeSet<String>>>,
+    data_binding_targets: Arc<Mutex<DocumentDataBindingIndex>>,
     source_override: Option<String>,
     functions: Option<&'a DocumentFunctionRegistry<'a>>,
     eval_depth: usize,
     eval_cache: Arc<Mutex<BTreeMap<String, Value>>>,
+}
+
+fn document_context_clear_data_reads(context: &DocumentEvalContext<'_>) {
+    if let Ok(mut reads) = context.data_reads.lock() {
+        reads.clear();
+    }
+}
+
+fn document_context_take_data_reads(context: &DocumentEvalContext<'_>) -> BTreeSet<String> {
+    context
+        .data_reads
+        .lock()
+        .map(|mut reads| std::mem::take(&mut *reads))
+        .unwrap_or_default()
+}
+
+fn document_context_record_data_read(context: &DocumentEvalContext<'_>, path: String) {
+    if path.is_empty() || path.contains('|') {
+        return;
+    }
+    if let Ok(mut reads) = context.data_reads.lock() {
+        reads.insert(path);
+    }
+}
+
+fn normalized_document_data_path(path: &str) -> String {
+    path.strip_prefix('$')
+        .unwrap_or(path)
+        .split('.')
+        .filter(|part| !part.is_empty() && *part != "PASSED")
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn document_list_origin_for_item(list_path: &str, item: &Value) -> Option<String> {
+    let boon = item.as_object()?.get("$boon")?.as_object()?;
+    let key = boon.get("row_key")?.as_u64()?;
+    let generation = boon.get("generation")?.as_u64()?;
+    let list = normalized_document_data_path(list_path);
+    if list.is_empty() {
+        return None;
+    }
+    Some(format!("@list:{list}:{key}:{generation}"))
+}
+
+fn document_data_read_key_for_list_field(
+    list: &str,
+    key: u64,
+    generation: u64,
+    field: &str,
+) -> String {
+    format!("@list:{list}:{key}:{generation}:{field}")
+}
+
+fn document_origin_with_suffix(origin: &str, suffix_path: &str) -> Option<String> {
+    if origin.starts_with("@list:") {
+        if suffix_path.is_empty() {
+            return None;
+        }
+        return Some(format!("{origin}:{suffix_path}"));
+    }
+    Some(if suffix_path.is_empty() {
+        origin.to_owned()
+    } else {
+        format!("{origin}.{suffix_path}")
+    })
+}
+
+fn document_expr_origin_paths(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> BTreeSet<String> {
+    let Some(expr) = expressions.get(expr_id) else {
+        return BTreeSet::new();
+    };
+    match &expr.kind {
+        AstExprKind::Identifier(path) => document_raw_origin_paths(path, context),
+        AstExprKind::Path(parts) => document_raw_origin_paths(&parts.join("."), context),
+        AstExprKind::StringLiteral(value) if value.starts_with('$') => {
+            document_raw_origin_paths(value, context)
+        }
+        AstExprKind::Pipe { input, args, .. } => {
+            let mut origins = document_expr_origin_paths(*input, expressions, context);
+            for arg in args {
+                origins.extend(document_expr_origin_paths(arg.value, expressions, context));
+            }
+            origins
+        }
+        AstExprKind::Call { args, .. } => {
+            let mut origins = BTreeSet::new();
+            for arg in args {
+                origins.extend(document_expr_origin_paths(arg.value, expressions, context));
+            }
+            origins
+        }
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+            let mut origins = BTreeSet::new();
+            for field in fields {
+                origins.extend(document_expr_origin_paths(
+                    field.value,
+                    expressions,
+                    context,
+                ));
+            }
+            origins
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            let mut origins = BTreeSet::new();
+            for item in items {
+                origins.extend(document_expr_origin_paths(*item, expressions, context));
+            }
+            origins
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            let mut origins = document_expr_origin_paths(*left, expressions, context);
+            origins.extend(document_expr_origin_paths(*right, expressions, context));
+            origins
+        }
+        AstExprKind::When { input } => document_expr_origin_paths(*input, expressions, context),
+        AstExprKind::TaggedObject { fields, .. } => {
+            let mut origins = BTreeSet::new();
+            for field in fields {
+                origins.extend(document_expr_origin_paths(
+                    field.value,
+                    expressions,
+                    context,
+                ));
+            }
+            origins
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
+fn document_raw_origin_paths(raw: &str, context: &DocumentEvalContext<'_>) -> BTreeSet<String> {
+    let path = raw.strip_prefix('$').unwrap_or(raw);
+    if path.is_empty() || path.contains('|') {
+        return BTreeSet::new();
+    }
+    let parts = path.split('.').collect::<Vec<_>>();
+    let Some(first) = parts.first().copied() else {
+        return BTreeSet::new();
+    };
+    let suffix_path = parts.get(1..).unwrap_or_default().join(".");
+    if first == "PASSED" {
+        return (!suffix_path.is_empty())
+            .then(|| BTreeSet::from([suffix_path]))
+            .unwrap_or_default();
+    }
+    if let Some(origins) = context.local_origins.get(first) {
+        return origins
+            .iter()
+            .filter_map(|origin| document_origin_with_suffix(origin, &suffix_path))
+            .collect();
+    }
+    if context.locals.contains_key(first) {
+        return BTreeSet::new();
+    }
+    BTreeSet::from([path.to_owned()])
+}
+
+fn document_context_record_target_reads(
+    context: &DocumentEvalContext<'_>,
+    node: &boon_document_model::DocumentNode,
+    attr: &str,
+    reads: BTreeSet<String>,
+) {
+    if reads.is_empty() {
+        return;
+    }
+    let Ok(mut targets_by_path) = context.data_binding_targets.lock() else {
+        return;
+    };
+    for path in reads {
+        let target = DocumentDataBindingTarget {
+            node: node.id.clone(),
+            attr: attr.to_owned(),
+        };
+        let targets = targets_by_path.entry(path).or_default();
+        if !targets.iter().any(|existing| existing == &target) {
+            targets.push(target);
+        }
+    }
 }
 
 fn source_binding_index_from_view_bindings(
@@ -20231,6 +20791,29 @@ fn source_binding_index_from_view_bindings(
     let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for binding in bindings {
         if !matches!(binding.kind, boon_ir::ViewBindingKind::Source) {
+            continue;
+        }
+        let key = (
+            native_binding_node_kind(&binding.node_kind).to_owned(),
+            binding.attr.clone(),
+        );
+        let paths = index.entry(key).or_default();
+        if !paths.iter().any(|path| path == &binding.path) {
+            paths.push(binding.path.clone());
+        }
+    }
+    index
+}
+
+fn data_binding_index_from_view_bindings(
+    bindings: &[boon_ir::ViewBinding],
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for binding in bindings {
+        if !matches!(
+            binding.kind,
+            boon_ir::ViewBindingKind::Data | boon_ir::ViewBindingKind::Target
+        ) {
             continue;
         }
         let key = (
@@ -20288,15 +20871,24 @@ fn lower_document_for_each(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
             eval_cache: Arc::clone(&context.eval_cache),
         };
         scoped.locals.insert(item_name.clone(), item.clone());
+        if let Some(origin) = document_list_origin_for_item(&list_path, item) {
+            scoped
+                .local_origins
+                .insert(item_name.clone(), BTreeSet::from([origin]));
+        }
         let child_scope = if scope_key.is_empty() {
             format!("{item_name}-{index}")
         } else {
@@ -20795,9 +21387,13 @@ fn document_eval_while_selector_value(
         let scoped = DocumentEvalContext {
             root: context.root,
             locals,
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -20823,9 +21419,13 @@ fn document_eval_while_selector_value(
             branch_context = DocumentEvalContext {
                 root: context.root,
                 locals,
+                local_origins: context.local_origins.clone(),
                 render_args: context.render_args.clone(),
                 passed: context.passed.clone(),
                 source_binding_index: Arc::clone(&context.source_binding_index),
+                data_binding_index: Arc::clone(&context.data_binding_index),
+                data_reads: Arc::clone(&context.data_reads),
+                data_binding_targets: Arc::clone(&context.data_binding_targets),
                 source_override: context.source_override.clone(),
                 functions: context.functions,
                 eval_depth: context.eval_depth,
@@ -22876,9 +23476,13 @@ fn document_eval_pipe_function_call(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth + 1,
@@ -23116,9 +23720,13 @@ fn document_eval_statement_sequence(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -23162,9 +23770,13 @@ fn document_eval_block_statement_sequence(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        local_origins: context.local_origins.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
+        data_binding_index: Arc::clone(&context.data_binding_index),
+        data_reads: Arc::clone(&context.data_reads),
+        data_binding_targets: Arc::clone(&context.data_binding_targets),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -23327,9 +23939,13 @@ fn document_eval_list_retain_with_statement_children(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -23395,9 +24011,13 @@ fn document_eval_list_map(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -23433,9 +24053,13 @@ fn document_eval_list_quantifier(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            local_origins: context.local_origins.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
+            data_binding_index: Arc::clone(&context.data_binding_index),
+            data_reads: Arc::clone(&context.data_reads),
+            data_binding_targets: Arc::clone(&context.data_binding_targets),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -23591,8 +24215,10 @@ fn document_resolved_value<'a>(
     if path.is_empty() || path.contains('|') {
         return None;
     }
-    let mut parts = path.split('.');
-    let first = parts.next()?;
+    let parts = path.split('.').collect::<Vec<_>>();
+    let first = *parts.first()?;
+    let suffix = parts.get(1..).unwrap_or_default();
+    let local_origins = context.local_origins.get(first).cloned();
     let mut current = if first == "PASSED" {
         context.passed.as_ref().or(context.root)?
     } else {
@@ -23603,8 +24229,20 @@ fn document_resolved_value<'a>(
                 .and_then(|object| object.get(first))
         })?
     };
-    for part in parts {
-        current = current.as_object()?.get(part)?;
+    for part in suffix {
+        current = current.as_object()?.get(*part)?;
+    }
+    if first == "PASSED" {
+        document_context_record_data_read(context, suffix.join("."));
+    } else if let Some(origins) = local_origins {
+        let suffix_path = suffix.join(".");
+        for origin in origins {
+            if let Some(path) = document_origin_with_suffix(&origin, &suffix_path) {
+                document_context_record_data_read(context, path);
+            }
+        }
+    } else if !context.locals.contains_key(first) {
+        document_context_record_data_read(context, path.to_owned());
     }
     Some(current)
 }
@@ -24423,6 +25061,166 @@ fn preview_apply_real_window_input(
     )
 }
 
+fn preview_try_apply_simple_source_click_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let input_total_started = Instant::now();
+    let reject = |reason: &str| {
+        if preview_profiling_enabled() && !input.mouse_button_events.is_empty() {
+            record_preview_native_input_profile(json!({
+                "source_path": source_path,
+                "capture_scope": input.capture_scope,
+                "fast_path": "simple_source_click_reject",
+                "reject_reason": reason,
+                "mouse_motion_event_count": input.mouse_motion_event_count,
+                "last_mouse_motion_event_count": input_state.last_mouse_motion_event_count,
+                "mouse_button_event_count": input.mouse_button_event_count,
+                "last_mouse_button_event_count": input_state.last_mouse_button_event_count,
+                "last_mouse_press_event_count": input_state.last_mouse_press_event_count,
+                "mouse_button_events": input.mouse_button_events.len(),
+                "keyboard_events": input.keyboard_events.len(),
+                "focused_node": input_state.focused_node,
+                "active_drag": input_state.active_drag.is_some(),
+                "pending_live_events": input_state.pending_live_events.len(),
+                "total_ms": elapsed_ms(input_total_started)
+            }));
+        }
+        Ok(false)
+    };
+    if input.synthetic_input_probe
+        || input.scroll_delta_x.abs() > f64::EPSILON
+        || input.scroll_delta_y.abs() > f64::EPSILON
+        || input_state.active_drag.is_some()
+        || !input_state.pending_live_events.is_empty()
+        || !input.keyboard_events.is_empty()
+        || !input.pressed_keys.is_empty()
+        || input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
+    {
+        return reject("precondition");
+    }
+    let presses = unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count);
+    let releases =
+        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
+    if releases.len() != 1
+        || presses.len() > 1
+        || input
+            .mouse_buttons_down
+            .iter()
+            .any(|button| button == "left")
+    {
+        return reject("button_shape");
+    }
+    let Some(position) = input.mouse_window_pos else {
+        return reject("missing_position");
+    };
+    let resolve_started = Instant::now();
+    let (events, node, target_text, preserve_focus) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        let layout = &shared.layout_proof;
+        let Some(hit_region) = document_hit_region_at(layout, position.x, position.y) else {
+            return reject("missing_hit_region");
+        };
+        let Some(node) = hit_region
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return reject("missing_hit_node");
+        };
+        if live_source_for_node_intent(layout, &node, "change").is_some()
+            && document_node_wants_text_cursor(layout, &node)
+        {
+            return reject("text_change");
+        }
+        let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
+            && preview_node_accepts_key_focus(layout, &node);
+        if preview_node_accepts_key_focus(layout, &node) && !preserve_focus {
+            return reject("key_focus");
+        }
+        if document_link_url_for_hit_region(layout, &hit_region).is_some() {
+            return reject("link");
+        }
+        let Some(event) = live_source_event_for_hit_region(layout, &hit_region, position, false)
+        else {
+            return reject("missing_live_event");
+        };
+        let target_text = focused_target_text(layout, &node);
+        let mut events = Vec::new();
+        if !preserve_focus
+            && let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime)
+        {
+            events.push(blur);
+        }
+        events.push(event);
+        (events, node, target_text, preserve_focus)
+    };
+    let resolve_ms = elapsed_ms(resolve_started);
+    for press in presses {
+        input_state.last_mouse_press_event_count =
+            input_state.last_mouse_press_event_count.max(press.sequence);
+    }
+    let release = &releases[0];
+    input_state.last_mouse_button_event_count = input_state
+        .last_mouse_button_event_count
+        .max(release.sequence);
+    if !preserve_focus {
+        preview_clear_focused_input_state(input_state);
+    }
+    input_state.last_click_node = Some(node.clone());
+    input_state.last_click_sequence = release.sequence;
+    input_state.last_hover_window_position = preview_mouse_position_key(input.mouse_window_pos);
+    input_state.hovered_node = Some(node);
+    input_state.hovered_target_text = target_text;
+    let apply_started = Instant::now();
+    preview_apply_live_events(
+        source_path,
+        source_text,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        events,
+    )?;
+    let apply_ms = elapsed_ms(apply_started);
+    let hover_overlay_started = Instant::now();
+    preview_apply_hover_overlay(shared_render_state, input_state)?;
+    let hover_overlay_ms = elapsed_ms(hover_overlay_started);
+    let focus_overlay_started = Instant::now();
+    preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    if preview_profiling_enabled() {
+        record_preview_native_input_profile(json!({
+            "source_path": source_path,
+            "capture_scope": input.capture_scope,
+            "fast_path": "simple_source_click",
+            "mouse_motion_event_count": input.mouse_motion_event_count,
+            "mouse_button_event_count": input.mouse_button_event_count,
+            "mouse_button_events": input.mouse_button_events.len(),
+            "keyboard_events": input.keyboard_events.len(),
+            "motion_changed": false,
+            "layout_clone_ms": 0.0,
+            "hover_update_ms": 0.0,
+            "pending_live_events_ms": 0.0,
+            "drag_events_ms": 0.0,
+            "pointer_move_ms": 0.0,
+            "mouse_release_ms": apply_ms,
+            "simple_click_resolve_ms": resolve_ms,
+            "keyboard_ms": 0.0,
+            "hover_overlay_ms": hover_overlay_ms,
+            "focus_overlay_ms": focus_overlay_ms,
+            "total_ms": elapsed_ms(input_total_started)
+        }));
+    }
+    Ok(true)
+}
+
 fn preview_apply_real_window_input_with_units(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
@@ -24441,14 +25239,38 @@ fn preview_apply_real_window_input_with_units(
     if input.scroll_delta_x.abs() > f64::EPSILON || input.scroll_delta_y.abs() > f64::EPSILON {
         return Ok(());
     }
+    if preview_try_apply_simple_source_click_input(
+        input,
+        source_path,
+        source_text,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        input_state,
+    )? {
+        return Ok(());
+    }
+    let input_total_started = Instant::now();
+    let mut pending_live_events_ms = 0.0_f64;
+    let mut drag_events_ms = 0.0_f64;
+    let mut pointer_move_ms = 0.0_f64;
+    let mut mouse_release_ms = 0.0_f64;
+    let mut keyboard_ms = 0.0_f64;
+    let mut hover_overlay_ms = 0.0_f64;
+    let mut focus_overlay_ms = 0.0_f64;
+    let layout_clone_started = Instant::now();
     let layout_proof = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?
         .layout_proof
         .clone();
+    let layout_clone_ms = elapsed_ms(layout_clone_started);
     let motion_changed = input.mouse_motion_event_count > input_state.last_mouse_motion_event_count;
-    preview_update_hover_from_input(&layout_proof, input, shared_render_state, input_state)?;
+    let hover_update_started = Instant::now();
+    preview_update_hover_from_input(&layout_proof, input, input_state)?;
+    let hover_update_ms = elapsed_ms(hover_update_started);
 
+    let pending_live_events_started = Instant::now();
     let mut latest_layout = if input_state.pending_live_events.is_empty() {
         None
     } else {
@@ -24462,7 +25284,9 @@ fn preview_apply_real_window_input_with_units(
             pending,
         )?)
     };
+    pending_live_events_ms += elapsed_ms(pending_live_events_started);
     let drag_layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+    let drag_events_started = Instant::now();
     let pending_drag_events =
         preview_take_drag_events_from_input(drag_layout, input, live_runtime, input_state);
     if !pending_drag_events.is_empty() {
@@ -24475,7 +25299,9 @@ fn preview_apply_real_window_input_with_units(
             pending_drag_events,
         )?);
     }
+    drag_events_ms += elapsed_ms(drag_events_started);
     if motion_changed {
+        let pointer_move_started = Instant::now();
         let hover_layout = latest_layout.as_ref().unwrap_or(&layout_proof);
         if let Some((position, hit_region)) = input.mouse_window_pos.and_then(|position| {
             document_hit_region_at(hover_layout, position.x, position.y)
@@ -24492,7 +25318,9 @@ fn preview_apply_real_window_input_with_units(
                 vec![event],
             )?);
         }
+        pointer_move_ms += elapsed_ms(pointer_move_started);
     }
+    let mouse_release_started = Instant::now();
     let mut pending_mouse_events = Vec::new();
     let mut defer_focusable_mouse_events = false;
     let mouse_releases =
@@ -24522,7 +25350,9 @@ fn preview_apply_real_window_input_with_units(
             })
         });
         if let Some((position, node, hit_region)) = hit_region {
-            if live_source_for_node_intent(layout, &node, "change").is_some() {
+            if live_source_for_node_intent(layout, &node, "change").is_some()
+                && document_node_wants_text_cursor(layout, &node)
+            {
                 let was_already_focused =
                     input_state.focused_node.as_deref() == Some(node.as_str());
                 if !was_already_focused
@@ -24671,7 +25501,9 @@ fn preview_apply_real_window_input_with_units(
             pending_mouse_events,
         )?);
     }
+    mouse_release_ms += elapsed_ms(mouse_release_started);
 
+    let keyboard_started = Instant::now();
     let shift_pressed = input
         .pressed_keys
         .iter()
@@ -24971,8 +25803,35 @@ fn preview_apply_real_window_input_with_units(
     } else {
         preview_clear_key_repeat(input_state);
     }
+    keyboard_ms += elapsed_ms(keyboard_started);
+    let hover_overlay_started = Instant::now();
     preview_apply_hover_overlay(shared_render_state, input_state)?;
+    hover_overlay_ms += elapsed_ms(hover_overlay_started);
+    let focus_overlay_started = Instant::now();
     preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    focus_overlay_ms += elapsed_ms(focus_overlay_started);
+    if preview_profiling_enabled() {
+        record_preview_native_input_profile(json!({
+            "source_path": source_path,
+            "capture_scope": input.capture_scope,
+            "mouse_motion_event_count": input.mouse_motion_event_count,
+            "mouse_button_event_count": input.mouse_button_event_count,
+            "mouse_button_events": input.mouse_button_events.len(),
+            "keyboard_events": input.keyboard_events.len(),
+            "motion_changed": motion_changed,
+            "position_changed": preview_mouse_position_key(input.mouse_window_pos) != input_state.last_hover_window_position,
+            "layout_clone_ms": layout_clone_ms,
+            "hover_update_ms": hover_update_ms,
+            "pending_live_events_ms": pending_live_events_ms,
+            "drag_events_ms": drag_events_ms,
+            "pointer_move_ms": pointer_move_ms,
+            "mouse_release_ms": mouse_release_ms,
+            "keyboard_ms": keyboard_ms,
+            "hover_overlay_ms": hover_overlay_ms,
+            "focus_overlay_ms": focus_overlay_ms,
+            "total_ms": elapsed_ms(input_total_started)
+        }));
+    }
     Ok(())
 }
 
@@ -24997,6 +25856,16 @@ fn preview_apply_focus_overlay(
         }
         shared.layout_frame_override = Some(frame);
         changed = true;
+    }
+    if input_state.focused_node.is_none()
+        && shared.layout_frame_override.as_ref().is_none_or(|frame| {
+            !frame
+                .display_list
+                .iter()
+                .any(display_item_has_focus_overlay_state)
+        })
+    {
+        return Ok(changed);
     }
     let runtime_resolved_focused_node =
         preview_resolved_focused_node(&shared.layout_proof, input_state);
@@ -25074,6 +25943,14 @@ fn display_item_declares_text_input_focus(item: &boon_document::DisplayItem) -> 
         )
 }
 
+fn display_item_has_focus_overlay_state(item: &boon_document::DisplayItem) -> bool {
+    item.focused
+        || item.style.contains_key("__focused")
+        || item.style.contains_key("caret_column")
+        || item.style.contains_key("caret_visible")
+        || display_item_declares_text_input_focus(item)
+}
+
 fn preview_frame_has_active_text_input_caret(
     frame: Option<&boon_document::LayoutFrame>,
     input_state: &PreviewNativeInputState,
@@ -25085,7 +25962,6 @@ fn preview_frame_has_active_text_input_caret(
 fn preview_update_hover_from_input(
     layout_proof: &Value,
     input: &boon_native_app_window::NativeInputAdapterProof,
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if input.synthetic_input_probe {
@@ -25119,7 +25995,7 @@ fn preview_update_hover_from_input(
     }
     input_state.hovered_node = next_node;
     input_state.hovered_target_text = next_target;
-    preview_apply_hover_overlay(shared_render_state, input_state)
+    Ok(true)
 }
 
 fn preview_apply_hover_overlay(
@@ -25132,12 +26008,9 @@ fn preview_apply_hover_overlay(
     if shared.layout_frame_override.is_none() {
         shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
     }
-    let layout_proof = shared.layout_proof.clone();
-    let Some(frame) = shared.layout_frame_override.as_mut() else {
-        return Ok(false);
-    };
     let hovered_scope = input_state.hovered_node.as_deref().and_then(|hovered| {
-        layout_proof
+        shared
+            .layout_proof
             .pointer("/display_item_samples")
             .and_then(serde_json::Value::as_array)
             .and_then(|items| {
@@ -25153,6 +26026,16 @@ fn preview_apply_hover_overlay(
                 })
             })
     });
+    let target_reveal_nodes = input_state
+        .hovered_target_text
+        .as_deref()
+        .map(|target| {
+            source_intent_nodes_for_value(&shared.layout_proof, &["target", "address"], target)
+        })
+        .unwrap_or_default();
+    let Some(frame) = shared.layout_frame_override.as_mut() else {
+        return Ok(false);
+    };
     let hovered_button = input_state.hovered_node.as_deref().and_then(|hovered| {
         let hovered_item = frame
             .display_list
@@ -25175,7 +26058,6 @@ fn preview_apply_hover_overlay(
     });
     let mut changed = false;
     for item in &mut frame.display_list {
-        let item_target = focused_target_text(&layout_proof, &item.node.0);
         let item_scope = display_style_text(&item.style, "__scope_key");
         let direct_hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
         let button_hover = hovered_button
@@ -25188,8 +26070,7 @@ fn preview_apply_hover_overlay(
         let hover_active = direct_hover || button_hover || button_text_hover;
         let reveal_active = hover_active
             || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
-            || (item_target.is_some()
-                && item_target.as_deref() == input_state.hovered_target_text.as_deref());
+            || target_reveal_nodes.contains(item.node.0.as_str());
         changed |= set_display_style_value(
             &mut item.style,
             "__hover",
@@ -26046,7 +26927,14 @@ fn preview_apply_live_events(
             .map_err(|_| "preview render state mutex poisoned")?;
         return Ok(shared.layout_proof.clone());
     }
-    let (scroll_x_px, scroll_y_px, viewport) = {
+    let total_started = Instant::now();
+    let source_count = events.len();
+    let source_samples = events
+        .iter()
+        .take(8)
+        .map(|event| event.source.clone())
+        .collect::<Vec<_>>();
+    let (scroll_x_px, scroll_y_px, viewport, previous_state_summary, previous_layout_proof) = {
         let shared = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
@@ -26054,21 +26942,41 @@ fn preview_apply_live_events(
             shared.scroll_x_px,
             shared.scroll_y_px,
             layout_proof_viewport(&shared.layout_proof),
+            layout_proof_runtime_state_snapshot(&shared.layout_proof),
+            shared.layout_proof.clone(),
         )
     };
     let novywave_hover_only = source_path_is_novywave(source_path)
         && events
             .iter()
             .all(|event| event.source == "store.elements.waveform_hover");
+    let runtime_lock_wait_ms: f64;
+    let runtime_apply_ms: f64;
+    let mut semantic_delta_count = 0_u64;
+    let mut render_patch_count = 0_u64;
+    let mut runtime_step_apply_ms = 0.0_f64;
+    let mut runtime_state_summary_ms = 0.0_f64;
+    let mut runtime_dirty_key_count = 0_u64;
+    let mut runtime_recomputed_field_count = 0_u64;
+    let mut runtime_recompute_candidate_count = 0_u64;
+    let mut runtime_recompute_candidate_samples = Vec::new();
+    let mut runtime_recomputed_field_samples = Vec::new();
+    let mut summary_source = "none";
+    let mut semantic_delta_samples = Vec::new();
+    let mut render_patch_samples = Vec::new();
+    let mut semantic_deltas_for_summary = Vec::new();
+    let mut render_patches_for_layout = Vec::new();
     let (state_summary, event_count, changed) = {
+        let runtime_lock_started = Instant::now();
         let mut runtime = live_runtime
             .lock()
             .map_err(|_| "preview live runtime mutex poisoned")?;
+        runtime_lock_wait_ms = elapsed_ms(runtime_lock_started);
+        let runtime_apply_started = Instant::now();
         let mut event_count = 0u64;
         let (row_start, row_count, column_start, column_count) =
             preview_scroll_window(scroll_x_px, scroll_y_px);
         let mut changed = false;
-        let mut state_summary = None;
         for event in events {
             let expanded_events = if source_path_is_novywave(source_path)
                 && event.source == "store.elements.load_external_file"
@@ -26079,30 +26987,88 @@ fn preview_apply_live_events(
             };
             event_count = event_count.saturating_add(expanded_events.len() as u64);
             for expanded_event in expanded_events {
-                let output = runtime.apply_source_event_for_document_window(
-                    expanded_event,
-                    row_start,
-                    row_count,
-                    column_start,
-                    column_count,
-                )?;
+                let output = runtime.apply_source_event_turn(expanded_event)?;
                 changed |= !output.semantic_deltas.is_empty() || !output.render_patches.is_empty();
-                state_summary = Some(output.state_summary);
+                runtime_step_apply_ms += output.apply_step_ms;
+                runtime_dirty_key_count =
+                    runtime_dirty_key_count.saturating_add(output.dirty_key_count as u64);
+                runtime_recomputed_field_count = runtime_recomputed_field_count
+                    .saturating_add(output.recomputed_field_count as u64);
+                runtime_recompute_candidate_count = runtime_recompute_candidate_count
+                    .saturating_add(output.recompute_candidate_count as u64);
+                for sample in output.recompute_candidate_samples {
+                    if runtime_recompute_candidate_samples.len() >= 32 {
+                        break;
+                    }
+                    runtime_recompute_candidate_samples.push(sample);
+                }
+                for sample in output.recomputed_field_samples {
+                    if runtime_recomputed_field_samples.len() >= 32 {
+                        break;
+                    }
+                    runtime_recomputed_field_samples.push(sample);
+                }
+                semantic_delta_count =
+                    semantic_delta_count.saturating_add(output.semantic_deltas.len() as u64);
+                render_patch_count =
+                    render_patch_count.saturating_add(output.render_patches.len() as u64);
+                semantic_deltas_for_summary.extend(output.semantic_deltas.iter().cloned());
+                render_patches_for_layout.extend(output.render_patches.iter().cloned());
+                for delta in output.semantic_deltas.iter().take(24) {
+                    if semantic_delta_samples.len() >= 24 {
+                        break;
+                    }
+                    semantic_delta_samples.push(json!({
+                        "kind": delta.kind,
+                        "list_id": delta.list_id,
+                        "field_path": delta.field_path,
+                        "key": delta.key
+                    }));
+                }
+                for patch in output.render_patches.iter().take(24) {
+                    if render_patch_samples.len() >= 24 {
+                        break;
+                    }
+                    render_patch_samples.push(json!({
+                        "kind": patch.kind,
+                        "target": patch.target,
+                        "list_id": patch.list_id,
+                        "key": patch.key
+                    }));
+                }
             }
         }
-        let state_summary = state_summary.unwrap_or_else(|| {
-            runtime.document_state_summary_for_window(
+        let state_summary = changed.then(|| {
+            let patch_started = Instant::now();
+            if let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
+                patched_window_state_summary_for_render_patches(summary, &render_patches_for_layout)
+            }) {
+                summary_source = "patched_previous_window";
+                runtime_state_summary_ms += elapsed_ms(patch_started);
+                return patched;
+            }
+            summary_source = "post_turn_window";
+            let summary_started = Instant::now();
+            let summary = runtime.document_state_summary_for_window(
                 row_start,
                 row_count,
                 column_start,
                 column_count,
-            )
+            );
+            runtime_state_summary_ms += elapsed_ms(summary_started);
+            summary
         });
+        runtime_apply_ms = elapsed_ms(runtime_apply_started);
         (state_summary, event_count, changed)
     };
-    if changed && !novywave_hover_only {
+    let persist_started = Instant::now();
+    if changed
+        && !novywave_hover_only
+        && let Some(state_summary) = state_summary.as_ref()
+    {
         persist_novywave_ui_state_for_summary(source_path, &state_summary);
     }
+    let persist_ui_state_ms = elapsed_ms(persist_started);
     if !changed {
         let mut shared = shared_render_state
             .lock()
@@ -26112,18 +27078,115 @@ fn preview_apply_live_events(
         shared.update_count = shared.update_count.saturating_add(event_count);
         shared.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+        if preview_profiling_enabled() {
+            record_preview_interaction_profile(json!({
+                "source_path": source_path,
+                "source_count": source_count,
+                "source_samples": source_samples,
+                "expanded_event_count": event_count,
+                "semantic_delta_count": semantic_delta_count,
+                "render_patch_count": render_patch_count,
+                "semantic_delta_samples": semantic_delta_samples,
+                "render_patch_samples": render_patch_samples,
+                "changed": false,
+                "summary_source": summary_source,
+                "runtime_lock_wait_ms": runtime_lock_wait_ms,
+                "runtime_apply_ms": runtime_apply_ms,
+                "runtime_step_apply_ms": runtime_step_apply_ms,
+                "runtime_state_summary_ms": runtime_state_summary_ms,
+                "runtime_dirty_key_count": runtime_dirty_key_count,
+                "runtime_recomputed_field_count": runtime_recomputed_field_count,
+                "runtime_recompute_candidate_count": runtime_recompute_candidate_count,
+                "runtime_recompute_candidate_samples": runtime_recompute_candidate_samples,
+                "runtime_recomputed_field_samples": runtime_recomputed_field_samples,
+                "persist_ui_state_ms": persist_ui_state_ms,
+                "layout_rebuild_ms": 0.0,
+                "layout_profile": null,
+                "total_ms": elapsed_ms(total_started)
+            }));
+        }
         return Ok(shared.layout_proof.clone());
+    }
+    let layout_started = Instant::now();
+    let Some(state_summary) = state_summary.as_ref() else {
+        return Err("changed preview turn did not produce a state summary".into());
+    };
+    if let Some((patched_layout, patched_frame, patched_target_count)) =
+        preview_try_patch_document_layout_for_root_deltas(
+            &previous_layout_proof,
+            state_summary,
+            &render_patches_for_layout,
+            viewport,
+            scroll_x_px,
+            scroll_y_px,
+        )?
+    {
+        let layout_rebuild_ms = elapsed_ms(layout_started);
+        let shared_update_started = Instant::now();
+        {
+            let mut shared_render_state = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared_render_state.layout_proof = patched_layout.clone();
+            shared_render_state.layout_frame_override = Some(patched_frame);
+            shared_render_state.last_error = None;
+            shared_render_state.status_overlay = None;
+            shared_render_state.update_count =
+                shared_render_state.update_count.saturating_add(event_count);
+            shared_render_state.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+        }
+        let shared_update_ms = elapsed_ms(shared_update_started);
+        if preview_profiling_enabled() {
+            record_preview_interaction_profile(json!({
+                "source_path": source_path,
+                "source_count": source_count,
+                "source_samples": source_samples,
+                "expanded_event_count": event_count,
+                "semantic_delta_count": semantic_delta_count,
+                "render_patch_count": render_patch_count,
+                "semantic_delta_samples": semantic_delta_samples,
+                "render_patch_samples": render_patch_samples,
+                "changed": true,
+                "summary_source": summary_source,
+                "layout_source": "patched_document_frame",
+                "patched_target_count": patched_target_count,
+                "runtime_lock_wait_ms": runtime_lock_wait_ms,
+                "runtime_apply_ms": runtime_apply_ms,
+                "runtime_step_apply_ms": runtime_step_apply_ms,
+                "runtime_state_summary_ms": runtime_state_summary_ms,
+                "runtime_dirty_key_count": runtime_dirty_key_count,
+                "runtime_recomputed_field_count": runtime_recomputed_field_count,
+                "runtime_recompute_candidate_count": runtime_recompute_candidate_count,
+                "runtime_recompute_candidate_samples": runtime_recompute_candidate_samples,
+                "runtime_recomputed_field_samples": runtime_recomputed_field_samples,
+                "persist_ui_state_ms": persist_ui_state_ms,
+                "layout_rebuild_ms": layout_rebuild_ms,
+                "scroll_adjust_ms": 0.0,
+                "shared_update_ms": shared_update_ms,
+                "layout_profile": patched_layout.get("layout_profile").cloned().unwrap_or_else(|| json!(null)),
+                "total_ms": elapsed_ms(total_started)
+            }));
+        }
+        return Ok(patched_layout);
     }
     let (mut post_input_layout, mut post_input_frame) =
         native_document_layout_proof_with_project_state_embedded_for_viewport(
             source_path,
             runtime_units,
-            Some(&state_summary),
+            Some(state_summary),
             viewport,
         )?;
+    post_input_layout["runtime_document_state_snapshot"] = state_summary.clone();
+    let layout_rebuild_ms = elapsed_ms(layout_started);
+    let layout_profile = post_input_layout
+        .get("layout_profile")
+        .cloned()
+        .unwrap_or_else(|| json!(null));
     let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
     let residual_y = scroll_y_px % PREVIEW_TABLE_ROW_HEIGHT_PX;
     let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
+    let scroll_adjust_started = Instant::now();
     if scroll_x_px.abs() > f64::EPSILON
         || residual_x.abs() > f64::EPSILON
         || residual_y.abs() > f64::EPSILON
@@ -26138,6 +27201,8 @@ fn preview_apply_live_events(
         post_input_layout = scrolled_layout;
         post_input_frame = scrolled_frame;
     }
+    let scroll_adjust_ms = elapsed_ms(scroll_adjust_started);
+    let shared_update_started = Instant::now();
     if post_input_layout
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -26154,6 +27219,36 @@ fn preview_apply_live_events(
             shared_render_state.update_count.saturating_add(event_count);
         shared_render_state.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+    }
+    let shared_update_ms = elapsed_ms(shared_update_started);
+    if preview_profiling_enabled() {
+        record_preview_interaction_profile(json!({
+            "source_path": source_path,
+            "source_count": source_count,
+            "source_samples": source_samples,
+            "expanded_event_count": event_count,
+            "semantic_delta_count": semantic_delta_count,
+            "render_patch_count": render_patch_count,
+            "semantic_delta_samples": semantic_delta_samples,
+            "render_patch_samples": render_patch_samples,
+            "changed": true,
+            "summary_source": summary_source,
+            "runtime_lock_wait_ms": runtime_lock_wait_ms,
+            "runtime_apply_ms": runtime_apply_ms,
+            "runtime_step_apply_ms": runtime_step_apply_ms,
+            "runtime_state_summary_ms": runtime_state_summary_ms,
+            "runtime_dirty_key_count": runtime_dirty_key_count,
+            "runtime_recomputed_field_count": runtime_recomputed_field_count,
+            "runtime_recompute_candidate_count": runtime_recompute_candidate_count,
+            "runtime_recompute_candidate_samples": runtime_recompute_candidate_samples,
+            "runtime_recomputed_field_samples": runtime_recomputed_field_samples,
+            "persist_ui_state_ms": persist_ui_state_ms,
+            "layout_rebuild_ms": layout_rebuild_ms,
+            "scroll_adjust_ms": scroll_adjust_ms,
+            "shared_update_ms": shared_update_ms,
+            "layout_profile": layout_profile,
+            "total_ms": elapsed_ms(total_started)
+        }));
     }
     Ok(post_input_layout)
 }
@@ -26585,7 +27680,51 @@ fn preview_focused_blur_event(
     })
 }
 
+fn source_intent_indexes(assertions: &[Value]) -> (Value, Value) {
+    let mut by_node: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut by_value: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for intent in assertions {
+        let Some(node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(intent_kind) = intent.get("intent").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(source_path) = intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        by_node
+            .entry(node.to_owned())
+            .or_default()
+            .entry(intent_kind.to_owned())
+            .or_insert_with(|| source_path.to_owned());
+        let nodes = by_value
+            .entry(intent_kind.to_owned())
+            .or_default()
+            .entry(source_path.to_owned())
+            .or_default();
+        if !nodes.iter().any(|existing| existing == node) {
+            nodes.push(node.to_owned());
+        }
+    }
+    (
+        serde_json::to_value(by_node).unwrap_or_else(|_| json!({})),
+        serde_json::to_value(by_value).unwrap_or_else(|_| json!({})),
+    )
+}
+
 fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
+    if let Some(value) = layout_proof
+        .get("source_intent_index")
+        .and_then(|index| index.get(node))
+        .and_then(|node_index| node_index.get(expected))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(value.to_owned());
+    }
     layout_proof
         .get("source_intent_assertions")
         .and_then(serde_json::Value::as_array)?
@@ -26607,6 +27746,46 @@ fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str)
 fn focused_target_text(layout_proof: &Value, node: &str) -> Option<String> {
     focused_source_intent_value(layout_proof, node, "target")
         .or_else(|| focused_source_intent_value(layout_proof, node, "address"))
+}
+
+fn source_intent_nodes_for_value(
+    layout_proof: &Value,
+    intent_kinds: &[&str],
+    source_path: &str,
+) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    if let Some(value_index) = layout_proof.get("source_intent_value_index") {
+        for intent_kind in intent_kinds {
+            if let Some(indexed_nodes) = value_index
+                .get(*intent_kind)
+                .and_then(|intent_index| intent_index.get(source_path))
+                .and_then(serde_json::Value::as_array)
+            {
+                nodes.extend(
+                    indexed_nodes
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        return nodes;
+    }
+    layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|intent| {
+            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+            let intent_source_path = intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)?;
+            let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
+                .then(|| node.to_owned())
+        })
+        .collect()
 }
 
 fn focused_target_occurrence(layout_proof: &Value, node: &str) -> Option<usize> {
@@ -26640,6 +27819,14 @@ fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
 }
 
 fn focused_source_intent_value(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
+    if let Some(value) = layout_proof
+        .get("source_intent_index")
+        .and_then(|index| index.get(node))
+        .and_then(|node_index| node_index.get(expected))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(value.to_owned());
+    }
     layout_proof
         .get("source_intent_assertions")
         .and_then(serde_json::Value::as_array)?
@@ -27311,6 +28498,43 @@ fn preview_relayout_for_viewport(
     if already_matches {
         return Ok(false);
     }
+    if scroll_x_px.abs() <= f64::EPSILON && scroll_y_px.abs() <= f64::EPSILON {
+        let previous_layout_proof = {
+            let shared = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.layout_proof.clone()
+        };
+        if let Some((mut layout_proof, layout_frame)) =
+            preview_try_relayout_cached_document_frame_for_viewport(
+                &previous_layout_proof,
+                (width as f32, height as f32),
+            )?
+        {
+            layout_proof["dynamic_viewport_relayout"] = json!({
+                "status": "applied",
+                "width": width,
+                "height": height,
+                "scroll_x_px": scroll_x_px,
+                "scroll_y_px": scroll_y_px,
+                "source": "cached_document_frame"
+            });
+            let mut shared = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            if layout_proof_viewport_matches(&shared.layout_proof, width, height) {
+                return Ok(false);
+            }
+            shared.layout_proof = layout_proof;
+            shared.layout_frame_override = Some(layout_frame);
+            shared.last_error = None;
+            shared.status_overlay = None;
+            shared.update_count = shared.update_count.saturating_add(1);
+            shared.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
+            return Ok(true);
+        }
+    }
     let (mut layout_proof, layout_frame) =
         preview_layout_for_scroll_window_with_units_for_viewport(
             &source_path,
@@ -27360,6 +28584,392 @@ fn layout_proof_viewport(layout_proof: &Value) -> Option<(f32, f32)> {
     } else {
         None
     }
+}
+
+fn layout_proof_runtime_state_snapshot(layout_proof: &Value) -> Option<Value> {
+    layout_proof.get("runtime_document_state_snapshot").cloned()
+}
+
+fn patched_window_state_summary_for_render_patches(
+    previous: &Value,
+    patches: &[boon_runtime::RenderPatch<'static>],
+) -> Option<Value> {
+    let mut next = previous.clone();
+    let root = next.as_object_mut()?;
+    for patch in patches {
+        let value = semantic_delta_json_value(&patch.value)?;
+        match patch.kind {
+            "PatchRootField" => {
+                let field = render_target_path(&patch.target);
+                insert_nested_json_value(root, &field, value.clone());
+                root.insert(field_leaf_name(&field).to_owned(), value);
+            }
+            "PatchListRowField" => {
+                let list = patch.list_id.as_deref()?;
+                let key = patch.key?;
+                let generation = patch.generation.unwrap_or(1);
+                let field = render_target_path(&patch.target);
+                if let Some(rows) = root.get_mut(list).and_then(Value::as_array_mut) {
+                    patch_summary_row_array_field(rows, key, generation, &field, &value);
+                }
+                if let Some(rows) = root
+                    .get_mut("store")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|store| store.get_mut(list))
+                    .and_then(Value::as_array_mut)
+                {
+                    patch_summary_row_array_field(rows, key, generation, &field, &value);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(next)
+}
+
+fn patch_summary_row_array_field(
+    rows: &mut [Value],
+    key: u64,
+    generation: u64,
+    field: &str,
+    value: &Value,
+) -> bool {
+    let mut patched = false;
+    for row in rows.iter_mut() {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let row_key = object
+            .get("$boon")
+            .and_then(|boon| boon.get("row_key"))
+            .and_then(Value::as_u64);
+        let row_generation = object
+            .get("$boon")
+            .and_then(|boon| boon.get("generation"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        if row_key == Some(key) && row_generation == generation {
+            insert_nested_json_value(object, field, value.clone());
+            object.insert(field_leaf_name(field).to_owned(), value.clone());
+            patched = true;
+        }
+    }
+    patched
+}
+
+fn semantic_delta_json_value(value: &boon_runtime::ProtocolValue<'_>) -> Option<Value> {
+    match value {
+        boon_runtime::ProtocolValue::Null => Some(Value::Null),
+        boon_runtime::ProtocolValue::Bool(value) => Some(json!(value)),
+        boon_runtime::ProtocolValue::Text(value) => Some(json!(value.as_ref())),
+        boon_runtime::ProtocolValue::NumberText(value) => Some(json!(value)),
+        boon_runtime::ProtocolValue::SourceBinding { .. }
+        | boon_runtime::ProtocolValue::CheckedProperty(_) => None,
+    }
+}
+
+fn insert_nested_json_value(root: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+    fn insert_parts(object: &mut serde_json::Map<String, Value>, parts: &[&str], value: Value) {
+        match parts {
+            [] => {}
+            [leaf] => {
+                object.insert((*leaf).to_owned(), value);
+            }
+            [head, tail @ ..] => {
+                let entry = object
+                    .entry((*head).to_owned())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !entry.is_object() {
+                    *entry = Value::Object(serde_json::Map::new());
+                }
+                if let Some(child) = entry.as_object_mut() {
+                    insert_parts(child, tail, value);
+                }
+            }
+        }
+    }
+    let parts = path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    insert_parts(root, &parts, value);
+}
+
+fn field_leaf_name(path: &str) -> &str {
+    path.rsplit_once('.').map(|(_, leaf)| leaf).unwrap_or(path)
+}
+
+fn render_target_path(target: &boon_runtime::RenderTarget<'_>) -> String {
+    match target {
+        boon_runtime::RenderTarget::Static(path) | boon_runtime::RenderTarget::Borrowed(path) => {
+            path.to_string()
+        }
+    }
+}
+
+fn document_data_patch_value(
+    patch: &boon_runtime::RenderPatch<'static>,
+) -> Option<(String, Value)> {
+    let value = semantic_delta_json_value(&patch.value)?;
+    match patch.kind {
+        "PatchRootField" => Some((render_target_path(&patch.target), value)),
+        "PatchListRowField" => {
+            let list = patch.list_id.as_deref()?;
+            let key = patch.key?;
+            let generation = patch.generation.unwrap_or(1);
+            let field = render_target_path(&patch.target);
+            Some((
+                document_data_read_key_for_list_field(list, key, generation, &field),
+                value,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn document_style_value_from_state_value(value: &Value) -> boon_document_model::StyleValue {
+    match value {
+        Value::Bool(value) => boon_document_model::StyleValue::Bool(*value),
+        Value::Number(value) => {
+            boon_document_model::StyleValue::Number(value.as_f64().unwrap_or(0.0))
+        }
+        Value::String(value) => value
+            .parse::<f64>()
+            .ok()
+            .map(boon_document_model::StyleValue::Number)
+            .unwrap_or_else(|| boon_document_model::StyleValue::Text(value.clone())),
+        Value::Null | Value::Array(_) | Value::Object(_) => {
+            boon_document_model::StyleValue::Text(json_value_to_document_text(value))
+        }
+    }
+}
+
+fn layout_frame_for_document_frame(
+    frame: &boon_document_model::DocumentFrame,
+    viewport: (f32, f32),
+) -> Result<boon_document::LayoutFrame, Box<dyn std::error::Error>> {
+    static TEXT_MEASURER: OnceLock<Mutex<boon_native_gpu::GlyphonTextMeasurer>> = OnceLock::new();
+    let mut measurer = TEXT_MEASURER
+        .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
+        .lock()
+        .map_err(|_| "document text measurer mutex poisoned")?;
+    Ok(boon_document::layout(boon_document::LayoutInput {
+        document: frame,
+        viewport: boon_host::Viewport {
+            surface: 1,
+            width: viewport.0,
+            height: viewport.1,
+            scale: 1.0,
+        },
+        text: &mut *measurer,
+        capabilities: boon_document::RenderCapabilities::fake_portable(),
+    }))
+}
+
+fn preview_try_relayout_cached_document_frame_for_viewport(
+    previous_layout_proof: &Value,
+    viewport: (f32, f32),
+) -> Result<Option<(Value, boon_document::LayoutFrame)>, Box<dyn std::error::Error>> {
+    let Some(layout_hash) = previous_layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return Ok(None);
+    };
+    let layout = layout_frame_for_document_frame(&snapshot.document_frame, viewport)?;
+    let layout_bytes = serde_json::to_vec(&layout)?;
+    let layout_frame_hash = boon_runtime::sha256_bytes(&layout_bytes);
+    let mut proof = previous_layout_proof.clone();
+    proof["layout_frame_hash"] = json!(layout_frame_hash.clone());
+    proof["layout_cache_hit"] = json!(false);
+    proof["layout_cache_key"] = json!("cached-document-frame-viewport-relayout");
+    proof["viewport"] = json!({
+        "width": viewport.0,
+        "height": viewport.1,
+        "scale": 1.0
+    });
+    proof["display_item_count"] = json!(layout.display_list.len());
+    proof["display_item_samples"] = serde_json::to_value(
+        layout
+            .display_list
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let hit_target_assertions = serde_json::to_value(&layout.hit_regions)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let hit_target_samples = hit_target_assertions
+        .iter()
+        .take(256)
+        .cloned()
+        .collect::<Vec<_>>();
+    proof["hit_target_count"] = json!(hit_target_assertions.len());
+    proof["hit_target_sample_count"] = json!(hit_target_samples.len());
+    proof["hit_target_assertions"] = Value::Array(hit_target_assertions);
+    proof["hit_target_samples"] = Value::Array(hit_target_samples);
+    proof["layout_metrics"] = serde_json::to_value(&layout.metrics)?;
+    proof["scroll_regions"] = serde_json::to_value(&layout.scroll_regions)?;
+    proof["data_binding_index_count"] = json!(
+        snapshot
+            .data_binding_targets
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+    proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
+    proof["layout_profile"] = json!({
+        "layout_cache_hit": false,
+        "cached_document_frame_viewport_relayout": true,
+        "document_eval_lower_ms": 0.0,
+        "artifact_serialize_ms": 0.0,
+        "artifact_write_ms": 0.0
+    });
+    cache_document_render_snapshot(
+        layout_frame_hash,
+        DocumentRenderSnapshot {
+            document_frame: snapshot.document_frame.clone(),
+            data_binding_targets: snapshot.data_binding_targets.clone(),
+        },
+    );
+    Ok(Some((proof, layout)))
+}
+
+fn preview_try_patch_document_layout_for_root_deltas(
+    previous_layout_proof: &Value,
+    state_summary: &Value,
+    patches: &[boon_runtime::RenderPatch<'static>],
+    viewport: Option<(f32, f32)>,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+) -> Result<Option<(Value, boon_document::LayoutFrame, usize)>, Box<dyn std::error::Error>> {
+    if scroll_x_px.abs() > f64::EPSILON || scroll_y_px.abs() > f64::EPSILON {
+        return Ok(None);
+    }
+    let patch_values = patches
+        .iter()
+        .map(document_data_patch_value)
+        .collect::<Option<Vec<_>>>();
+    let Some(patch_values) = patch_values else {
+        return Ok(None);
+    };
+    let Some(layout_hash) = previous_layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return Ok(None);
+    };
+    let mut frame = snapshot.document_frame.clone();
+    let mut patched_targets = 0usize;
+    let mut patched_target_samples = Vec::new();
+    for (path, value) in patch_values {
+        let Some(targets) = snapshot.data_binding_targets.get(&path) else {
+            continue;
+        };
+        for target in targets {
+            let Some(node) = frame.nodes.get_mut(&target.node) else {
+                return Ok(None);
+            };
+            if target.attr == "text"
+                || matches!(target.attr.as_str(), "label" | "value" | "display_value")
+            {
+                node.text = Some(boon_document_model::TextValue {
+                    text: json_value_to_document_text(&value),
+                });
+            } else if matches!(target.attr.as_str(), "width" | "height" | "size") {
+                insert_dimension_style(
+                    node,
+                    &target.attr,
+                    document_style_value_from_state_value(&value),
+                );
+            } else {
+                node.style.insert(
+                    target.attr.clone(),
+                    document_style_value_from_state_value(&value),
+                );
+            }
+            patched_targets = patched_targets.saturating_add(1);
+            if patched_target_samples.len() < 32 {
+                patched_target_samples.push(json!({
+                    "path": path,
+                    "node": target.node.0,
+                    "attr": target.attr,
+                    "value": json_value_to_document_text(&value),
+                }));
+            }
+        }
+    }
+    if patched_targets == 0 {
+        return Ok(None);
+    }
+    let viewport = viewport
+        .or_else(|| layout_proof_viewport(previous_layout_proof))
+        .ok_or("patched layout proof has no viewport")?;
+    let layout = layout_frame_for_document_frame(&frame, viewport)?;
+    let layout_bytes = serde_json::to_vec(&layout)?;
+    let layout_frame_hash = boon_runtime::sha256_bytes(&layout_bytes);
+    let mut proof = previous_layout_proof.clone();
+    proof["layout_frame_hash"] = json!(layout_frame_hash.clone());
+    proof["layout_cache_hit"] = json!(false);
+    proof["layout_cache_key"] = json!("patched-document-frame");
+    proof["runtime_document_state_snapshot"] = state_summary.clone();
+    proof["display_item_count"] = json!(layout.display_list.len());
+    proof["display_item_samples"] = serde_json::to_value(
+        layout
+            .display_list
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let hit_target_assertions = serde_json::to_value(&layout.hit_regions)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let hit_target_samples = hit_target_assertions
+        .iter()
+        .take(256)
+        .cloned()
+        .collect::<Vec<_>>();
+    proof["hit_target_count"] = json!(hit_target_assertions.len());
+    proof["hit_target_sample_count"] = json!(hit_target_samples.len());
+    proof["hit_target_assertions"] = Value::Array(hit_target_assertions);
+    proof["hit_target_samples"] = Value::Array(hit_target_samples);
+    proof["layout_metrics"] = serde_json::to_value(&layout.metrics)?;
+    proof["scroll_regions"] = serde_json::to_value(&layout.scroll_regions)?;
+    proof["data_binding_index_count"] = json!(
+        snapshot
+            .data_binding_targets
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+    proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
+    proof["layout_profile"] = json!({
+        "layout_cache_hit": false,
+        "patched_document_frame": true,
+        "patched_target_count": patched_targets,
+        "patched_target_samples": patched_target_samples,
+        "document_eval_lower_ms": 0.0,
+        "artifact_serialize_ms": 0.0,
+        "artifact_write_ms": 0.0
+    });
+    cache_document_render_snapshot(
+        layout_frame_hash,
+        DocumentRenderSnapshot {
+            document_frame: frame,
+            data_binding_targets: snapshot.data_binding_targets.clone(),
+        },
+    );
+    Ok(Some((proof, layout, patched_targets)))
 }
 
 fn preview_note_render_error(
@@ -31183,6 +32793,7 @@ mod tests {
         let context = DocumentEvalContext {
             root: None,
             locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
             render_args: BTreeMap::new(),
             passed: Some(json!({
                 "theme_options": {
@@ -31191,6 +32802,9 @@ mod tests {
                 }
             })),
             source_binding_index: Arc::new(BTreeMap::new()),
+            data_binding_index: Arc::new(BTreeMap::new()),
+            data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+            data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -31221,6 +32835,7 @@ mod tests {
         let context = DocumentEvalContext {
             root: None,
             locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
             render_args: BTreeMap::new(),
             passed: Some(json!({
                 "theme_options": {
@@ -31229,6 +32844,9 @@ mod tests {
                 }
             })),
             source_binding_index: Arc::new(BTreeMap::new()),
+            data_binding_index: Arc::new(BTreeMap::new()),
+            data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+            data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -31300,6 +32918,7 @@ mod tests {
             DocumentEvalContext {
                 root: None,
                 locals,
+                local_origins: BTreeMap::new(),
                 render_args: BTreeMap::new(),
                 passed: Some(json!({
                     "theme_options": {
@@ -31308,6 +32927,9 @@ mod tests {
                     }
                 })),
                 source_binding_index: Arc::new(BTreeMap::new()),
+                data_binding_index: Arc::new(BTreeMap::new()),
+                data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+                data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
                 source_override: None,
                 functions: Some(&functions),
                 eval_depth: 0,
@@ -31572,9 +33194,13 @@ mod tests {
         let context = DocumentEvalContext {
             root: Some(&state),
             locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
             render_args: BTreeMap::new(),
             passed: Some(state.clone()),
             source_binding_index: Arc::new(BTreeMap::new()),
+            data_binding_index: Arc::new(BTreeMap::new()),
+            data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+            data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -41625,6 +43251,152 @@ mod tests {
         let source_path = repo_path("examples/novywave/RUN.bn");
         let units = boon_runtime::source_units_for_path(&source_path)
             .expect("NovyWave manifest source units should load");
+        let parsed = boon_parser::parse_project(
+            source_path.display().to_string(),
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+        .expect("NovyWave project should parse");
+        let functions =
+            DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
+        fn find_call_to<'a>(
+            statement: &'a AstStatement,
+            expressions: &'a [AstExpr],
+            name: &str,
+        ) -> Option<&'a AstStatement> {
+            if document_call_function(statement, expressions)
+                .is_some_and(|function| function == name || function.ends_with(&format!("/{name}")))
+            {
+                return Some(statement);
+            }
+            statement
+                .children
+                .iter()
+                .find_map(|child| find_call_to(child, expressions, name))
+        }
+        let left_panel_base_call = parsed
+            .ast
+            .statements
+            .iter()
+            .find_map(|statement| {
+                find_call_to(statement, &parsed.ast.expressions, "left_panel_base")
+            })
+            .expect("NovyWave should call left_panel_base");
+        let left_panel_base_function = functions
+            .get("left_panel_base")
+            .or_else(|| {
+                functions.functions.iter().find_map(|(name, function)| {
+                    name.ends_with("/left_panel_base").then_some(*function)
+                })
+            })
+            .expect("NovyWave should define left_panel_base");
+        let argument_context = DocumentEvalContext {
+            root: None,
+            locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
+            render_args: BTreeMap::new(),
+            passed: Some(json!({"store": {"files_panel_width": 430}})),
+            source_binding_index: Arc::new(BTreeMap::new()),
+            data_binding_index: Arc::new(BTreeMap::new()),
+            data_reads: Arc::new(Mutex::new(BTreeSet::new())),
+            data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            source_override: None,
+            functions: Some(&functions),
+            eval_depth: 0,
+            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let left_panel_base_context = document_function_call_context(
+            left_panel_base_function,
+            left_panel_base_call,
+            &parsed.ast.expressions,
+            &argument_context,
+        );
+        assert!(
+            left_panel_base_context
+                .local_origins
+                .get("panel_width")
+                .is_some_and(|origins| origins.contains("store.files_panel_width")),
+            "left_panel_base panel_width argument should retain store.files_panel_width origin; origins={:?}",
+            left_panel_base_context.local_origins.get("panel_width")
+        );
+        let width_statement = left_panel_base_function
+            .children
+            .iter()
+            .flat_map(|child| child.children.iter())
+            .find(|child| document_field_name(child).as_deref() == Some("style"))
+            .and_then(|style| {
+                style
+                    .children
+                    .iter()
+                    .find(|child| document_field_name(child).as_deref() == Some("width"))
+            })
+            .expect("left_panel_base should expose a style width field");
+        let width_expr = width_statement
+            .expr
+            .expect("left_panel_base width should have an expression");
+        assert_eq!(
+            document_eval_expr_value(
+                &parsed.ast.expressions[width_expr],
+                &parsed.ast.expressions,
+                &left_panel_base_context
+            ),
+            Some(json!(430)),
+            "left_panel_base width expression should resolve from panel_width local"
+        );
+        assert!(
+            document_expr_origin_paths(
+                width_expr,
+                &parsed.ast.expressions,
+                &left_panel_base_context
+            )
+            .contains("store.files_panel_width"),
+            "left_panel_base width expression should retain store.files_panel_width origin"
+        );
+        let mut isolated_frame = boon_document_model::DocumentFrame::empty("root");
+        let mut isolated_source_intents = Vec::new();
+        let mut isolated_seen_ids = BTreeSet::new();
+        let isolated_root = isolated_frame.root.clone();
+        let isolated_typecheck = boon_typecheck::check(&parsed);
+        for child in &left_panel_base_function.children {
+            lower_canonical_document_entry(
+                child,
+                &parsed.ast.expressions,
+                &functions,
+                &isolated_root,
+                &mut isolated_frame,
+                &mut isolated_source_intents,
+                &mut isolated_seen_ids,
+                &left_panel_base_context,
+                &isolated_typecheck,
+                "",
+                false,
+            );
+        }
+        let isolated_binding_targets = left_panel_base_context
+            .data_binding_targets
+            .lock()
+            .expect("isolated binding targets should lock")
+            .clone();
+        let isolated_width_nodes = isolated_frame
+            .nodes
+            .values()
+            .filter_map(|node| {
+                node.style
+                    .get("width")
+                    .map(|width| (node.id.0.clone(), format!("{width:?}")))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            isolated_width_nodes
+                .iter()
+                .any(|(_, width)| width.contains("430")),
+            "isolated left_panel_base lowering should apply panel_width to some node width; widths={isolated_width_nodes:?}"
+        );
+        assert!(
+            isolated_binding_targets.contains_key("store.files_panel_width"),
+            "isolated left_panel_base lowering should bind store.files_panel_width; targets={isolated_binding_targets:?}"
+        );
         let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-hover", &units)
             .expect("NovyWave runtime should initialize from manifest units");
         let initial_summary = runtime.document_state_summary();
@@ -41641,6 +43413,24 @@ mod tests {
                 .iter()
                 .any(|item| item.text.as_deref() == Some("- simple.vcd")),
             "NovyWave should boot into the loaded file view"
+        );
+        let binding_samples = initial_proof
+            .get("data_binding_target_samples")
+            .and_then(Value::as_array)
+            .expect("NovyWave layout proof should expose data binding samples");
+        assert!(
+            binding_samples.iter().any(|sample| {
+                sample.get("path").and_then(Value::as_str) == Some("store.files_panel_width")
+                    && sample
+                        .get("targets")
+                        .and_then(Value::as_array)
+                        .is_some_and(|targets| {
+                            targets.iter().any(|target| {
+                                target.get("attr").and_then(Value::as_str) == Some("width")
+                            })
+                        })
+            }),
+            "NovyWave initial layout should bind store.files_panel_width to a concrete width target for sparse divider patches; samples={binding_samples:?}"
         );
         physical_frame_text_item(
             &initial_layout,

@@ -2839,10 +2839,13 @@ FUNCTION new_waveform_segment(segment) {
         start_time_value: segment.start_time_value
         end_time_value: segment.end_time_value
         projection_source: RuntimeTimelineMetadata
-        width: segment.state |> WHEN {
-            CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
-            MarkerLine => 0
-            __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
+        width: segment.file == store.active_file |> WHEN {
+            True => segment.state |> WHEN {
+                CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
+                MarkerLine => 0
+                __ => Number/project_width(start_time: segment.start_time_value, end_time: segment.end_time_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
+            }
+            __ => 0
         }
         state: segment.state
         label: segment.label

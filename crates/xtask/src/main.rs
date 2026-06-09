@@ -17564,6 +17564,46 @@ fn verify_native_gpu_novywave_interaction_speed(
                 .and_then(|report| report.get("runtime_apply_ms_p50_p95_max"))
                 .cloned()
                 .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "runtime_step_apply_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_step_apply_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "runtime_state_summary_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_state_summary_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "runtime_lock_wait_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_lock_wait_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "layout_rebuild_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("layout_rebuild_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "document_eval_lower_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("document_eval_lower_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "text_measure_and_layout_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("text_measure_and_layout_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "function_registry_ms_p50_p95_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("function_registry_ms_p50_p95_max"))
+                .cloned()
+                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "interaction_profile_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("interaction_profile_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
             "preview_blocked_on_ipc_count": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("preview_blocked_on_ipc_count"))

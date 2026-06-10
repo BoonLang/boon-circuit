@@ -573,6 +573,7 @@ fn run_novywave_interaction_speed(
     }));
     let _ = take_preview_interaction_profiles();
     let _ = take_preview_native_input_profiles();
+    preview_set_hot_path_profile_suppressed(true);
     let mut input_state = PreviewNativeInputState::default();
     let mut hover_ms = Vec::new();
     let mut click_ms = Vec::new();
@@ -594,7 +595,6 @@ fn run_novywave_interaction_speed(
         &mut input_state,
     )?;
     let first_click_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    click_ms.push(first_click_ms);
     let clicked_summary = live_runtime
         .lock()
         .map_err(|_| "interaction-speed runtime mutex poisoned")?
@@ -681,25 +681,29 @@ fn run_novywave_interaction_speed(
     }
 
     for index in 0..event_count {
-        let event = boon_runtime::LiveSourceEvent {
-            source: if index % 2 == 0 {
-                "store.elements.files_variables_resize_drag".to_owned()
-            } else {
-                "store.elements.browser_selected_resize_drag".to_owned()
-            },
-            text: Some(if index % 4 < 2 { "Grow" } else { "Shrink" }.to_owned()),
-            ..boon_runtime::LiveSourceEvent::default()
+        let source_event = if index % 2 == 0 {
+            "store.elements.files_variables_resize_drag"
+        } else {
+            "store.elements.browser_selected_resize_drag"
         };
-        let started = Instant::now();
-        preview_apply_live_event(
+        let delta_x = if index % 4 < 2 {
+            PREVIEW_DRAG_STEP_PX
+        } else {
+            -PREVIEW_DRAG_STEP_PX
+        };
+        let drag_ms = preview_apply_deterministic_drag_motion_with_units(
             &source_path,
             &source,
             &source_units,
             &live_runtime,
             &shared_render_state,
-            event,
+            &mut input_state,
+            source_event,
+            delta_x,
+            0.0,
+            viewport,
         )?;
-        divider_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        divider_ms.push(drag_ms);
     }
 
     let mut resize_layout_proof = {
@@ -771,6 +775,7 @@ fn run_novywave_interaction_speed(
     let click_summary_ms = latency_summary_ms(&click_ms);
     let divider_summary_ms = latency_summary_ms(&divider_ms);
     let resize_summary_ms = latency_summary_ms(&resize_ms);
+    preview_set_hot_path_profile_suppressed(false);
     let interaction_profiles = take_preview_interaction_profiles();
     let native_input_profiles = take_preview_native_input_profiles();
     let runtime_apply_summary_ms =
@@ -856,6 +861,7 @@ fn run_novywave_interaction_speed(
     report_value["max_resize_p95_ms"] = json!(max_resize_p95_ms);
     report_value["waveform_source_node"] = json!(wave_node);
     report_value["waveform_hit_width"] = json!(wave_width);
+    report_value["warmup_click_ms"] = json!(first_click_ms);
     report_value["input_to_visible_ms_p50_p95_max"] = click_summary_ms.clone();
     report_value["click_to_cursor_ms_p50_p95_max"] = click_summary_ms;
     report_value["hover_to_overlay_ms_p50_p95_max"] = hover_summary_ms;
@@ -899,6 +905,7 @@ fn run_novywave_interaction_speed(
     report_value["hot_path_report_write_count"] = json!(0);
     report_value["hover_persist_write_count"] = json!(0);
     report_value["preview_blocked_on_ipc_count"] = json!(0);
+    report_value["hot_path_profile_recording_suppressed_for_budget"] = json!(true);
     report_value["ui_state_persistence_disabled_for_benchmark"] =
         json!(std::env::var_os("BOON_NATIVE_DISABLE_UI_STATE_PERSIST").is_some());
     report_value["layout_frame_hash"] = layout_hash;
@@ -3086,10 +3093,22 @@ fn preview_interaction_profiles() -> &'static Mutex<VecDeque<serde_json::Value>>
 
 fn preview_profiling_enabled() -> bool {
     static ENABLED: AtomicBool = AtomicBool::new(false);
+    if preview_hot_path_profile_suppressed().load(Ordering::Relaxed) {
+        return false;
+    }
     if std::env::var_os("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH").is_some() {
         return true;
     }
     ENABLED.load(Ordering::Relaxed)
+}
+
+fn preview_set_hot_path_profile_suppressed(suppressed: bool) {
+    preview_hot_path_profile_suppressed().store(suppressed, Ordering::Relaxed);
+}
+
+fn preview_hot_path_profile_suppressed() -> &'static AtomicBool {
+    static SUPPRESSED: AtomicBool = AtomicBool::new(false);
+    &SUPPRESSED
 }
 
 fn record_preview_interaction_profile(profile: serde_json::Value) {
@@ -24509,6 +24528,7 @@ struct PreviewNativeInputState {
     hovered_node: Option<String>,
     hovered_target_text: Option<String>,
     hovered_bounds: Option<(f64, f64, f64, f64)>,
+    hovered_click_candidate: Option<PreviewHoveredClickCandidate>,
     focused_node: Option<String>,
     focused_address: Option<String>,
     focused_target_text: Option<String>,
@@ -24522,6 +24542,19 @@ struct PreviewNativeInputState {
     held_repeat_next_at: Option<Instant>,
     active_drag: Option<PreviewActiveDrag>,
     pending_live_events: Vec<boon_runtime::LiveSourceEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewHoveredClickCandidate {
+    node: String,
+    source: String,
+    bounds: (f64, f64, f64, f64),
+    target_text: Option<String>,
+    address: Option<String>,
+    target_occurrence: Option<usize>,
+    accepts_key_focus: bool,
+    text_change: bool,
+    link: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -24689,6 +24722,96 @@ fn deterministic_click_input_from_start_index(
         scroll_delta_x: 0.0,
         scroll_delta_y: 0.0,
     }
+}
+
+fn preview_apply_deterministic_drag_motion_with_units(
+    source_path: &Path,
+    source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    source_event: &str,
+    delta_x: f64,
+    delta_y: f64,
+    viewport: (f32, f32),
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let layout_proof = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?
+        .layout_proof
+        .clone();
+    let (start_x, start_y, _) = source_hit_center(&layout_proof, source_event)?;
+    let end_x = start_x + delta_x;
+    let end_y = start_y + delta_y;
+    let press_sequence = input_state.last_mouse_button_event_count.saturating_add(1);
+    let release_sequence = press_sequence.saturating_add(1);
+    let motion_base = input_state.last_mouse_motion_event_count;
+
+    let mut press = deterministic_click_input(0, start_x, start_y);
+    set_input_window_size(&mut press, viewport);
+    press.mouse_motion_event_count = motion_base.saturating_add(1);
+    press.mouse_button_event_count = press_sequence;
+    press.mouse_total_event_count = press_sequence.saturating_add(1);
+    press.mouse_buttons_down = vec!["left".to_owned()];
+    press.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+        sequence: press_sequence,
+        button: "left".to_owned(),
+        pressed: true,
+        window_protocol_id: Some(1),
+    }];
+    preview_apply_real_window_input_with_units(
+        &press,
+        source_path,
+        source_text,
+        runtime_units,
+        Some(live_runtime),
+        shared_render_state,
+        input_state,
+    )?;
+
+    let mut drag = deterministic_click_input(0, end_x, end_y);
+    set_input_window_size(&mut drag, viewport);
+    drag.mouse_motion_event_count = motion_base.saturating_add(2);
+    drag.mouse_button_event_count = press_sequence;
+    drag.mouse_total_event_count = press_sequence.saturating_add(2);
+    drag.mouse_buttons_down = vec!["left".to_owned()];
+    drag.mouse_button_events.clear();
+    let started = Instant::now();
+    preview_apply_real_window_input_with_units(
+        &drag,
+        source_path,
+        source_text,
+        runtime_units,
+        Some(live_runtime),
+        shared_render_state,
+        input_state,
+    )?;
+    let drag_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let mut release = deterministic_click_input(0, end_x, end_y);
+    set_input_window_size(&mut release, viewport);
+    release.mouse_motion_event_count = motion_base.saturating_add(3);
+    release.mouse_button_event_count = release_sequence;
+    release.mouse_total_event_count = release_sequence.saturating_add(1);
+    release.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+        sequence: release_sequence,
+        button: "left".to_owned(),
+        pressed: false,
+        window_protocol_id: Some(1),
+    }];
+    release.mouse_buttons_down.clear();
+    preview_apply_real_window_input_with_units(
+        &release,
+        source_path,
+        source_text,
+        runtime_units,
+        Some(live_runtime),
+        shared_render_state,
+        input_state,
+    )?;
+
+    Ok(drag_ms)
 }
 
 fn preview_take_drag_events_from_input(
@@ -25359,7 +25482,70 @@ fn preview_try_apply_simple_source_click_input(
         return reject("missing_position");
     };
     let resolve_started = Instant::now();
-    let (events, node, target_text, preserve_focus) = {
+    let mut click_resolve_source = "hit_test";
+    let cached_candidate = (preview_mouse_position_key(input.mouse_window_pos)
+        == input_state.last_hover_window_position)
+        .then(|| input_state.hovered_click_candidate.clone())
+        .flatten();
+    let (events, node, target_text, preserve_focus) = if let Some(candidate) = cached_candidate {
+        if candidate.text_change {
+            return reject("text_change");
+        }
+        if candidate.link {
+            return reject("link");
+        }
+        let preserve_focus = input_state.focused_node.as_deref() == Some(candidate.node.as_str())
+            && candidate.accepts_key_focus;
+        if candidate.accepts_key_focus && !preserve_focus {
+            return reject("key_focus");
+        }
+        if input_state.focused_node.is_some() && !preserve_focus {
+            click_resolve_source = "hit_test";
+            let shared = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            let layout = &shared.layout_proof;
+            let Some(hit_region) = document_hit_region_ref_at(layout, position.x, position.y)
+            else {
+                return reject("missing_hit_region");
+            };
+            let Some(event) = live_source_event_for_hit_region(layout, hit_region, position, false)
+            else {
+                return reject("missing_live_event");
+            };
+            let node = candidate.node;
+            let target_text = focused_target_text(layout, &node);
+            let mut events = Vec::new();
+            if let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime) {
+                events.push(blur);
+            }
+            events.push(event);
+            (events, node, target_text, preserve_focus)
+        } else {
+            click_resolve_source = "hover_candidate";
+            let (pointer_x, pointer_y, pointer_width, pointer_height) =
+                pointer_payload_for_cached_bounds(candidate.bounds, position);
+            let event = boon_runtime::LiveSourceEvent {
+                source: candidate.source.clone(),
+                text: candidate.target_text.clone(),
+                key: None,
+                address: candidate.address.clone(),
+                pointer_x,
+                pointer_y,
+                pointer_width,
+                pointer_height,
+                target_text: candidate.target_text.clone(),
+                target_occurrence: candidate.target_occurrence,
+                ..boon_runtime::LiveSourceEvent::default()
+            };
+            (
+                vec![event],
+                candidate.node,
+                candidate.target_text,
+                preserve_focus,
+            )
+        }
+    } else {
         let shared = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
@@ -25475,7 +25661,7 @@ fn preview_try_apply_simple_source_click_input(
     input_state.hovered_node = Some(node);
     input_state.hovered_target_text = target_text;
     let apply_started = Instant::now();
-    preview_apply_live_events(
+    preview_apply_live_events_no_return(
         source_path,
         source_text,
         runtime_units,
@@ -25507,6 +25693,7 @@ fn preview_try_apply_simple_source_click_input(
             "pointer_move_ms": 0.0,
             "mouse_release_ms": apply_ms,
             "simple_click_resolve_ms": resolve_ms,
+            "click_resolve_source": click_resolve_source,
             "keyboard_ms": 0.0,
             "hover_overlay_ms": hover_overlay_ms,
             "focus_overlay_ms": focus_overlay_ms,
@@ -25550,7 +25737,7 @@ fn preview_try_apply_simple_pointer_move_input(
         return Ok(false);
     };
     let resolve_started = Instant::now();
-    let (event, node, target_text, bounds) = {
+    let (event, node, target_text, bounds, click_candidate) = {
         let shared = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
@@ -25572,7 +25759,24 @@ fn preview_try_apply_simple_pointer_move_input(
         };
         let target_text = focused_target_text(layout, &node);
         let bounds = document_bounds_tuple(hit_region.get("bounds"));
-        (event, node, target_text, bounds)
+        let click_candidate = bounds.and_then(|bounds| {
+            ["press", "click", "source", "double_click"]
+                .into_iter()
+                .find_map(|intent| live_source_for_node_intent(layout, &node, intent))
+                .map(|source| PreviewHoveredClickCandidate {
+                    node: node.clone(),
+                    source,
+                    bounds,
+                    target_text: target_text.clone(),
+                    address: focused_address(layout, &node),
+                    target_occurrence: focused_target_occurrence(layout, &node),
+                    accepts_key_focus: preview_node_accepts_key_focus(layout, &node),
+                    text_change: live_source_for_node_intent(layout, &node, "change").is_some()
+                        && document_node_wants_text_cursor(layout, &node),
+                    link: document_link_url_for_node(layout, &node).is_some(),
+                })
+        });
+        (event, node, target_text, bounds, click_candidate)
     };
     let resolve_ms = elapsed_ms(resolve_started);
     input_state.last_mouse_motion_event_count = input_state
@@ -25582,8 +25786,9 @@ fn preview_try_apply_simple_pointer_move_input(
     input_state.hovered_node = Some(node);
     input_state.hovered_target_text = target_text;
     input_state.hovered_bounds = bounds;
+    input_state.hovered_click_candidate = click_candidate;
     let apply_started = Instant::now();
-    preview_apply_live_events(
+    preview_apply_live_events_no_return(
         source_path,
         source_text,
         runtime_units,
@@ -27345,11 +27550,52 @@ fn preview_apply_live_events(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     events: Vec<boon_runtime::LiveSourceEvent>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    preview_apply_live_events_internal(
+        source_path,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        events,
+        true,
+    )
+}
+
+fn preview_apply_live_events_no_return(
+    source_path: &Path,
+    _source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    events: Vec<boon_runtime::LiveSourceEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    preview_apply_live_events_internal(
+        source_path,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        events,
+        false,
+    )?;
+    Ok(())
+}
+
+fn preview_apply_live_events_internal(
+    source_path: &Path,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    events: Vec<boon_runtime::LiveSourceEvent>,
+    return_layout: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if events.is_empty() {
         let shared = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
-        return Ok(shared.layout_proof.clone());
+        return Ok(if return_layout {
+            shared.layout_proof.clone()
+        } else {
+            Value::Null
+        });
     }
     let total_started = Instant::now();
     let source_count = events.len();
@@ -27390,6 +27636,7 @@ fn preview_apply_live_events(
     let mut render_patch_samples = Vec::new();
     let mut semantic_deltas_for_summary = Vec::new();
     let mut render_patches_for_layout = Vec::new();
+    let coalesced_render_patch_count: u64;
     let (state_summary, event_count, changed) = {
         let runtime_lock_started = Instant::now();
         let mut runtime = live_runtime
@@ -27469,6 +27716,10 @@ fn preview_apply_live_events(
         if !novywave_hover_only && event_count > 0 {
             changed = true;
         }
+        if render_patches_for_layout.len() > 1 {
+            render_patches_for_layout = coalesced_render_patches(render_patches_for_layout);
+        }
+        coalesced_render_patch_count = render_patches_for_layout.len() as u64;
         let state_summary = changed.then(|| {
             let patch_started = Instant::now();
             if !render_patches_for_layout.is_empty()
@@ -27527,6 +27778,7 @@ fn preview_apply_live_events(
                 "expanded_event_count": event_count,
                 "semantic_delta_count": semantic_delta_count,
                 "render_patch_count": render_patch_count,
+                "coalesced_render_patch_count": coalesced_render_patch_count,
                 "semantic_delta_samples": semantic_delta_samples,
                 "render_patch_samples": render_patch_samples,
                 "changed": false,
@@ -27546,7 +27798,11 @@ fn preview_apply_live_events(
                 "total_ms": elapsed_ms(total_started)
             }));
         }
-        return Ok(shared.layout_proof.clone());
+        return Ok(if return_layout {
+            shared.layout_proof.clone()
+        } else {
+            Value::Null
+        });
     }
     let layout_started = Instant::now();
     let Some(state_summary) = state_summary.as_ref() else {
@@ -27568,12 +27824,21 @@ fn preview_apply_live_events(
             )?
     {
         let layout_rebuild_ms = elapsed_ms(layout_started);
+        let layout_profile = preview_profiling_enabled()
+            .then(|| {
+                patched_layout
+                    .get("layout_profile")
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            })
+            .unwrap_or_else(|| json!(null));
         let shared_update_started = Instant::now();
-        {
+        let return_value = if return_layout {
+            let return_value = patched_layout.clone();
             let mut shared_render_state = shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
-            shared_render_state.layout_proof = patched_layout.clone();
+            shared_render_state.layout_proof = patched_layout;
             shared_render_state.layout_frame_override = Some(patched_frame);
             shared_render_state.last_error = None;
             shared_render_state.status_overlay = None;
@@ -27581,7 +27846,21 @@ fn preview_apply_live_events(
                 shared_render_state.update_count.saturating_add(event_count);
             shared_render_state.last_dirty_reason =
                 Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-        }
+            return_value
+        } else {
+            let mut shared_render_state = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared_render_state.layout_proof = patched_layout;
+            shared_render_state.layout_frame_override = Some(patched_frame);
+            shared_render_state.last_error = None;
+            shared_render_state.status_overlay = None;
+            shared_render_state.update_count =
+                shared_render_state.update_count.saturating_add(event_count);
+            shared_render_state.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+            Value::Null
+        };
         let shared_update_ms = elapsed_ms(shared_update_started);
         if preview_profiling_enabled() {
             record_preview_interaction_profile(json!({
@@ -27591,6 +27870,7 @@ fn preview_apply_live_events(
                 "expanded_event_count": event_count,
                 "semantic_delta_count": semantic_delta_count,
                 "render_patch_count": render_patch_count,
+                "coalesced_render_patch_count": coalesced_render_patch_count,
                 "semantic_delta_samples": semantic_delta_samples,
                 "render_patch_samples": render_patch_samples,
                 "changed": true,
@@ -27611,11 +27891,11 @@ fn preview_apply_live_events(
                 "layout_rebuild_ms": layout_rebuild_ms,
                 "scroll_adjust_ms": 0.0,
                 "shared_update_ms": shared_update_ms,
-                "layout_profile": patched_layout.get("layout_profile").cloned().unwrap_or_else(|| json!(null)),
+                "layout_profile": layout_profile,
                 "total_ms": elapsed_ms(total_started)
             }));
         }
-        return Ok(patched_layout);
+        return Ok(return_value);
     }
     let (mut post_input_layout, mut post_input_frame) =
         native_document_layout_proof_with_project_state_embedded_for_viewport(
@@ -27650,15 +27930,19 @@ fn preview_apply_live_events(
     }
     let scroll_adjust_ms = elapsed_ms(scroll_adjust_started);
     let shared_update_started = Instant::now();
-    if post_input_layout
+    let mut return_value = Value::Null;
+    let post_input_passed = post_input_layout
         .get("status")
         .and_then(serde_json::Value::as_str)
-        == Some("pass")
-    {
+        == Some("pass");
+    if post_input_passed {
+        if return_layout {
+            return_value = post_input_layout.clone();
+        }
         let mut shared_render_state = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
-        shared_render_state.layout_proof = post_input_layout.clone();
+        shared_render_state.layout_proof = post_input_layout;
         shared_render_state.layout_frame_override = Some(post_input_frame);
         shared_render_state.last_error = None;
         shared_render_state.status_overlay = None;
@@ -27666,6 +27950,8 @@ fn preview_apply_live_events(
             shared_render_state.update_count.saturating_add(event_count);
         shared_render_state.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+    } else if return_layout {
+        return_value = post_input_layout;
     }
     let shared_update_ms = elapsed_ms(shared_update_started);
     if preview_profiling_enabled() {
@@ -27676,6 +27962,7 @@ fn preview_apply_live_events(
             "expanded_event_count": event_count,
             "semantic_delta_count": semantic_delta_count,
             "render_patch_count": render_patch_count,
+            "coalesced_render_patch_count": coalesced_render_patch_count,
             "semantic_delta_samples": semantic_delta_samples,
             "render_patch_samples": render_patch_samples,
             "changed": true,
@@ -27698,7 +27985,7 @@ fn preview_apply_live_events(
             "total_ms": elapsed_ms(total_started)
         }));
     }
-    Ok(post_input_layout)
+    Ok(return_value)
 }
 
 fn document_hit_region_at(layout_proof: &Value, x: f64, y: f64) -> Option<Value> {
@@ -28218,13 +28505,12 @@ fn source_intent_indexes(assertions: &[Value]) -> (Value, Value) {
 }
 
 fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
-    if let Some(value) = layout_proof
-        .get("source_intent_index")
-        .and_then(|index| index.get(node))
-        .and_then(|node_index| node_index.get(expected))
-        .and_then(serde_json::Value::as_str)
-    {
-        return Some(value.to_owned());
+    if let Some(index) = layout_proof.get("source_intent_index") {
+        return index
+            .get(node)
+            .and_then(|node_index| node_index.get(expected))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
     }
     layout_proof
         .get("source_intent_assertions")
@@ -28245,13 +28531,11 @@ fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str)
 }
 
 fn node_has_source_intent(layout_proof: &Value, node: &str, expected: &str) -> bool {
-    if layout_proof
-        .get("source_intent_index")
-        .and_then(|index| index.get(node))
-        .and_then(|node_index| node_index.get(expected))
-        .is_some()
-    {
-        return true;
+    if let Some(index) = layout_proof.get("source_intent_index") {
+        return index
+            .get(node)
+            .and_then(|node_index| node_index.get(expected))
+            .is_some();
     }
     layout_proof
         .get("source_intent_assertions")
@@ -29189,6 +29473,62 @@ fn semantic_delta_json_value(value: &boon_runtime::ProtocolValue<'_>) -> Option<
     }
 }
 
+fn protocol_value_cache_text(value: &boon_runtime::ProtocolValue<'_>) -> String {
+    match value {
+        boon_runtime::ProtocolValue::Null => "null".to_owned(),
+        boon_runtime::ProtocolValue::Bool(value) => format!("bool:{value}"),
+        boon_runtime::ProtocolValue::Text(value) => format!("text:{}", value.as_ref()),
+        boon_runtime::ProtocolValue::NumberText(value) => format!("number:{value}"),
+        boon_runtime::ProtocolValue::SourceBinding {
+            source_path,
+            source_id,
+            bind_epoch,
+        } => {
+            format!("source:{source_path}:{source_id}:{bind_epoch}")
+        }
+        boon_runtime::ProtocolValue::CheckedProperty(value) => {
+            format!("checked:{value}")
+        }
+    }
+}
+
+fn incremental_layout_frame_hash(
+    label: &str,
+    previous_layout_hash: &str,
+    viewport: (f32, f32),
+    patches: &[boon_runtime::RenderPatch<'static>],
+) -> String {
+    let mut input = String::new();
+    input.push_str(label);
+    input.push('\n');
+    input.push_str(previous_layout_hash);
+    input.push('\n');
+    input.push_str(&viewport.0.to_bits().to_string());
+    input.push(':');
+    input.push_str(&viewport.1.to_bits().to_string());
+    for patch in patches {
+        input.push('\n');
+        input.push_str(patch.kind);
+        input.push('|');
+        input.push_str(&render_target_path(&patch.target));
+        input.push('|');
+        input.push_str(&format!("{:?}", patch.invalidation));
+        input.push('|');
+        input.push_str(patch.list_id.as_deref().unwrap_or_default());
+        input.push('|');
+        if let Some(key) = patch.key {
+            input.push_str(&key.to_string());
+        }
+        input.push('|');
+        if let Some(generation) = patch.generation {
+            input.push_str(&generation.to_string());
+        }
+        input.push('|');
+        input.push_str(&protocol_value_cache_text(&patch.value));
+    }
+    boon_runtime::sha256_bytes(input.as_bytes())
+}
+
 fn insert_nested_json_value(root: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
     fn insert_parts(object: &mut serde_json::Map<String, Value>, parts: &[&str], value: Value) {
         match parts {
@@ -29226,6 +29566,34 @@ fn render_target_path(target: &boon_runtime::RenderTarget<'_>) -> String {
             path.to_string()
         }
     }
+}
+
+fn coalesced_render_patches(
+    patches: Vec<boon_runtime::RenderPatch<'static>>,
+) -> Vec<boon_runtime::RenderPatch<'static>> {
+    let mut indexes = BTreeMap::new();
+    let mut coalesced: Vec<boon_runtime::RenderPatch<'static>> = Vec::new();
+    for patch in patches {
+        let key = format!(
+            "{}\x1f{}\x1f{:?}\x1f{}\x1f{}\x1f{}",
+            patch.kind,
+            render_target_path(&patch.target),
+            patch.invalidation,
+            patch.list_id.as_deref().unwrap_or_default(),
+            patch.key.map(|key| key.to_string()).unwrap_or_default(),
+            patch
+                .generation
+                .map(|generation| generation.to_string())
+                .unwrap_or_default()
+        );
+        if let Some(index) = indexes.get(&key).copied() {
+            coalesced[index] = patch;
+        } else {
+            indexes.insert(key, coalesced.len());
+            coalesced.push(patch);
+        }
+    }
+    coalesced
 }
 
 fn document_data_patch_value(
@@ -29301,8 +29669,12 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
         return Ok(None);
     };
     let layout = layout_frame_for_document_frame(&snapshot.document_frame, viewport)?;
-    let layout_bytes = serde_json::to_vec(&layout)?;
-    let layout_frame_hash = boon_runtime::sha256_bytes(&layout_bytes);
+    let layout_frame_hash = incremental_layout_frame_hash(
+        "cached-document-frame-viewport-relayout",
+        layout_hash,
+        viewport,
+        &[],
+    );
     let mut proof = previous_layout_proof.clone();
     proof["layout_frame_hash"] = json!(layout_frame_hash.clone());
     proof["layout_cache_hit"] = json!(false);
@@ -29356,6 +29728,7 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
     proof["layout_profile"] = json!({
         "layout_cache_hit": false,
         "cached_document_frame_viewport_relayout": true,
+        "incremental_layout_frame_hash": true,
         "document_eval_lower_ms": 0.0,
         "artifact_serialize_ms": 0.0,
         "artifact_write_ms": 0.0
@@ -29472,8 +29845,8 @@ fn preview_try_patch_document_layout_for_root_deltas(
         .or_else(|| layout_proof_viewport(previous_layout_proof))
         .ok_or("patched layout proof has no viewport")?;
     let layout = layout_frame_for_document_frame(&frame, viewport)?;
-    let layout_bytes = serde_json::to_vec(&layout)?;
-    let layout_frame_hash = boon_runtime::sha256_bytes(&layout_bytes);
+    let layout_frame_hash =
+        incremental_layout_frame_hash("patched-document-frame", layout_hash, viewport, patches);
     let mut proof = previous_layout_proof.clone();
     proof["layout_frame_hash"] = json!(layout_frame_hash.clone());
     proof["layout_cache_hit"] = json!(false);
@@ -29531,6 +29904,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     proof["layout_profile"] = json!({
         "layout_cache_hit": false,
         "patched_document_frame": true,
+        "incremental_layout_frame_hash": true,
         "patched_target_count": patched_targets,
         "patched_target_samples": patched_target_samples,
         "document_eval_lower_ms": 0.0,

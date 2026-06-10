@@ -18,7 +18,6 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::{Deref, DerefMut};

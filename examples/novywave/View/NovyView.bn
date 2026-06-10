@@ -3211,7 +3211,40 @@ FUNCTION selected_cursor_value_for_signal(signal) {
 }
 
 FUNCTION selected_wave_cell(signal) {
-    wave_area(signal: signal)
+    selected_wave_area(signal: signal)
+}
+
+FUNCTION selected_wave_area(signal) {
+    Scene/Element/block(
+        element: [
+            event: [
+                key_down: PASSED.store.elements.keyboard_capture
+            ]
+            hovered: PASSED.store.elements.waveform_hover
+        ]
+        style: [
+            width: Fill
+            height: Fill
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1f2a3c }]
+            glow: [color: TEXT { #3b82f62a }, intensity: 0.03]
+        ]
+        child: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 2
+            style: [
+                width: Fill
+                height: Fill
+                padding: [left: 8, right: 8]
+                paint: False
+            ]
+            items: LIST {
+                waveform_segment_lane(signal: signal)
+            }
+        )
+    )
 }
 
 FUNCTION signal_select_button(signal) {

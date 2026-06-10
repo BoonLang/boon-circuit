@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -573,6 +573,8 @@ fn run_novywave_interaction_speed(
     }));
     let _ = take_preview_interaction_profiles();
     let _ = take_preview_native_input_profiles();
+    let _ = take_preview_interaction_timings();
+    let _ = take_preview_native_input_timings();
     preview_set_hot_path_profile_suppressed(true);
     let mut input_state = PreviewNativeInputState::default();
     let mut hover_ms = Vec::new();
@@ -582,6 +584,7 @@ fn run_novywave_interaction_speed(
     let mut step_reports = Vec::new();
 
     let click_x = wave_left + (wave_width * 150.0 / 250.0);
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_WARMUP_CLICK);
     let mut first_click = deterministic_click_input_from_index(1, click_x, wave_y);
     set_input_window_size(&mut first_click, viewport);
     let started = Instant::now();
@@ -609,6 +612,7 @@ fn run_novywave_interaction_speed(
     }));
 
     let hover_x = wave_left + (wave_width * 200.0 / 250.0);
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_HOVER);
     for index in 0..event_count {
         let x = if index == 0 {
             hover_x
@@ -657,6 +661,7 @@ fn run_novywave_interaction_speed(
         "detail": format!("zoom_center_label={zoom_after_hover}, cursor_label={cursor_after_hover}")
     }));
 
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
     for index in 0..event_count {
         let target_time = match index % 4 {
             0 => 50.0,
@@ -680,6 +685,7 @@ fn run_novywave_interaction_speed(
         click_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
 
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_DIVIDER);
     for index in 0..event_count {
         let source_event = if index % 2 == 0 {
             "store.elements.files_variables_resize_drag"
@@ -742,6 +748,7 @@ fn run_novywave_interaction_speed(
         }
         resize_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_UNSPECIFIED);
 
     let (state_summary, update_count, layout_hash, last_error) = {
         let mut runtime = live_runtime
@@ -778,16 +785,37 @@ fn run_novywave_interaction_speed(
     preview_set_hot_path_profile_suppressed(false);
     let interaction_profiles = take_preview_interaction_profiles();
     let native_input_profiles = take_preview_native_input_profiles();
-    let runtime_apply_summary_ms =
-        profile_latency_summary_ms(&interaction_profiles, "/runtime_apply_ms");
-    let runtime_lock_wait_summary_ms =
-        profile_latency_summary_ms(&interaction_profiles, "/runtime_lock_wait_ms");
-    let layout_rebuild_summary_ms =
-        profile_latency_summary_ms(&interaction_profiles, "/layout_rebuild_ms");
-    let document_eval_lower_summary_ms = profile_latency_summary_ms(
-        &interaction_profiles,
-        "/layout_profile/document_eval_lower_ms",
-    );
+    let interaction_timings = take_preview_interaction_timings();
+    let native_input_timings = take_preview_native_input_timings();
+    let runtime_apply_summary_ms = if interaction_profiles.is_empty() {
+        interaction_timing_latency_summary_ms(&interaction_timings, |sample| {
+            sample.runtime_apply_ms
+        })
+    } else {
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_apply_ms")
+    };
+    let runtime_lock_wait_summary_ms = if interaction_profiles.is_empty() {
+        interaction_timing_latency_summary_ms(&interaction_timings, |sample| {
+            sample.runtime_lock_wait_ms
+        })
+    } else {
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_lock_wait_ms")
+    };
+    let layout_rebuild_summary_ms = if interaction_profiles.is_empty() {
+        interaction_timing_latency_summary_ms(&interaction_timings, |sample| {
+            sample.layout_rebuild_ms
+        })
+    } else {
+        profile_latency_summary_ms(&interaction_profiles, "/layout_rebuild_ms")
+    };
+    let document_eval_lower_summary_ms = if interaction_profiles.is_empty() {
+        json!({"p50": null, "p95": null, "max": null, "sample_count": 0})
+    } else {
+        profile_latency_summary_ms(
+            &interaction_profiles,
+            "/layout_profile/document_eval_lower_ms",
+        )
+    };
     let text_measure_and_layout_summary_ms = profile_latency_summary_ms(
         &interaction_profiles,
         "/layout_profile/text_measure_and_layout_ms",
@@ -796,10 +824,20 @@ fn run_novywave_interaction_speed(
         &interaction_profiles,
         "/layout_profile/function_registry_ms",
     );
-    let runtime_step_apply_summary_ms =
-        profile_latency_summary_ms(&interaction_profiles, "/runtime_step_apply_ms");
-    let runtime_state_summary_summary_ms =
-        profile_latency_summary_ms(&interaction_profiles, "/runtime_state_summary_ms");
+    let runtime_step_apply_summary_ms = if interaction_profiles.is_empty() {
+        interaction_timing_latency_summary_ms(&interaction_timings, |sample| {
+            sample.runtime_step_apply_ms
+        })
+    } else {
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_step_apply_ms")
+    };
+    let runtime_state_summary_summary_ms = if interaction_profiles.is_empty() {
+        interaction_timing_latency_summary_ms(&interaction_timings, |sample| {
+            sample.runtime_state_summary_ms
+        })
+    } else {
+        profile_latency_summary_ms(&interaction_profiles, "/runtime_state_summary_ms")
+    };
     let hover_p95 = latency_p95(&hover_ms);
     let click_p95 = latency_p95(&click_ms);
     let divider_p95 = latency_p95(&divider_ms);
@@ -876,6 +914,81 @@ fn run_novywave_interaction_speed(
     report_value["text_measure_and_layout_ms_p50_p95_max"] = text_measure_and_layout_summary_ms;
     report_value["function_registry_ms_p50_p95_max"] = function_registry_summary_ms;
     report_value["interaction_profile_count"] = json!(interaction_profiles.len());
+    report_value["interaction_timing_count"] = json!(interaction_timings.len());
+    report_value["interaction_timing_samples"] = json!(
+        interaction_timings
+            .iter()
+            .take(128)
+            .map(preview_interaction_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["native_input_timing_count"] = json!(native_input_timings.len());
+    report_value["native_input_timing_samples"] = json!(
+        native_input_timings
+            .iter()
+            .take(128)
+            .map(preview_native_input_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["click_interaction_timing_ms"] = json!({
+        "runtime_apply": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.runtime_apply_ms
+        ),
+        "runtime_step_apply": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.runtime_step_apply_ms
+        ),
+        "runtime_state_summary": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.runtime_state_summary_ms
+        ),
+        "layout_rebuild": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.layout_rebuild_ms
+        ),
+        "shared_update": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.shared_update_ms
+        ),
+        "total_apply": interaction_timing_scope_latency_summary_ms(
+            &interaction_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.total_ms
+        )
+    });
+    report_value["click_native_input_timing_ms"] = json!({
+        "resolve": native_input_timing_scope_latency_summary_ms(
+            &native_input_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.resolve_ms
+        ),
+        "apply": native_input_timing_scope_latency_summary_ms(
+            &native_input_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.apply_ms
+        ),
+        "hover_overlay": native_input_timing_scope_latency_summary_ms(
+            &native_input_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.hover_overlay_ms
+        ),
+        "focus_overlay": native_input_timing_scope_latency_summary_ms(
+            &native_input_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.focus_overlay_ms
+        ),
+        "total_input": native_input_timing_scope_latency_summary_ms(
+            &native_input_timings,
+            PREVIEW_TIMING_SCOPE_CLICK,
+            |sample| sample.total_ms
+        )
+    });
     report_value["interaction_profile_samples"] = json!(
         interaction_profiles
             .iter()
@@ -955,6 +1068,49 @@ fn profile_latency_summary_ms(profiles: &[serde_json::Value], pointer: &str) -> 
     let values = profiles
         .iter()
         .filter_map(|profile| profile.pointer(pointer).and_then(serde_json::Value::as_f64))
+        .collect::<Vec<_>>();
+    latency_summary_ms(&values)
+}
+
+fn interaction_timing_latency_summary_ms<F>(
+    samples: &[PreviewInteractionTimingSample],
+    value: F,
+) -> serde_json::Value
+where
+    F: Fn(&PreviewInteractionTimingSample) -> f64,
+{
+    let values = samples.iter().map(value).collect::<Vec<_>>();
+    latency_summary_ms(&values)
+}
+
+fn interaction_timing_scope_latency_summary_ms<F>(
+    samples: &[PreviewInteractionTimingSample],
+    scope: u8,
+    value: F,
+) -> serde_json::Value
+where
+    F: Fn(&PreviewInteractionTimingSample) -> f64,
+{
+    let values = samples
+        .iter()
+        .filter(|sample| sample.scope == scope)
+        .map(value)
+        .collect::<Vec<_>>();
+    latency_summary_ms(&values)
+}
+
+fn native_input_timing_scope_latency_summary_ms<F>(
+    samples: &[PreviewNativeInputTimingSample],
+    scope: u8,
+    value: F,
+) -> serde_json::Value
+where
+    F: Fn(&PreviewNativeInputTimingSample) -> f64,
+{
+    let values = samples
+        .iter()
+        .filter(|sample| sample.scope == scope)
+        .map(value)
         .collect::<Vec<_>>();
     latency_summary_ms(&values)
 }
@@ -3069,6 +3225,11 @@ struct DocumentLayoutCacheEntry {
 }
 
 const PREVIEW_INTERACTION_PROFILE_LIMIT: usize = 256;
+const PREVIEW_TIMING_SCOPE_UNSPECIFIED: u8 = 0;
+const PREVIEW_TIMING_SCOPE_WARMUP_CLICK: u8 = 1;
+const PREVIEW_TIMING_SCOPE_HOVER: u8 = 2;
+const PREVIEW_TIMING_SCOPE_CLICK: u8 = 3;
+const PREVIEW_TIMING_SCOPE_DIVIDER: u8 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct DocumentDataBindingTarget {
@@ -3084,6 +3245,154 @@ struct DocumentRenderSnapshot {
     data_binding_targets: DocumentDataBindingIndex,
     structural_data_reads: BTreeSet<String>,
     source_intents: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewInteractionTimingSample {
+    scope: u8,
+    source_count: usize,
+    expanded_event_count: u64,
+    semantic_delta_count: u64,
+    render_patch_count: u64,
+    coalesced_render_patch_count: u64,
+    changed: bool,
+    layout_source: &'static str,
+    summary_source: &'static str,
+    document_patch_fast_path_rejected: bool,
+    runtime_lock_wait_ms: f64,
+    runtime_apply_ms: f64,
+    runtime_step_apply_ms: f64,
+    runtime_state_summary_ms: f64,
+    persist_ui_state_ms: f64,
+    layout_rebuild_ms: f64,
+    scroll_adjust_ms: f64,
+    shared_update_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewNativeInputTimingSample {
+    scope: u8,
+    fast_path: &'static str,
+    resolve_ms: f64,
+    apply_ms: f64,
+    hover_overlay_ms: f64,
+    focus_overlay_ms: f64,
+    total_ms: f64,
+}
+
+fn preview_interaction_timing_scope() -> &'static AtomicU8 {
+    static SCOPE: AtomicU8 = AtomicU8::new(PREVIEW_TIMING_SCOPE_UNSPECIFIED);
+    &SCOPE
+}
+
+fn preview_set_interaction_timing_scope(scope: u8) {
+    preview_interaction_timing_scope().store(scope, Ordering::Relaxed);
+}
+
+fn preview_current_interaction_timing_scope() -> u8 {
+    preview_interaction_timing_scope().load(Ordering::Relaxed)
+}
+
+fn preview_interaction_timing_scope_name(scope: u8) -> &'static str {
+    match scope {
+        PREVIEW_TIMING_SCOPE_WARMUP_CLICK => "warmup_click",
+        PREVIEW_TIMING_SCOPE_HOVER => "hover",
+        PREVIEW_TIMING_SCOPE_CLICK => "click",
+        PREVIEW_TIMING_SCOPE_DIVIDER => "divider",
+        _ => "unspecified",
+    }
+}
+
+fn preview_interaction_timings() -> &'static Mutex<VecDeque<PreviewInteractionTimingSample>> {
+    static TIMINGS: OnceLock<Mutex<VecDeque<PreviewInteractionTimingSample>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(VecDeque::with_capacity(PREVIEW_INTERACTION_PROFILE_LIMIT)))
+}
+
+fn record_preview_interaction_timing(sample: PreviewInteractionTimingSample) {
+    if !preview_compact_timing_enabled() {
+        return;
+    }
+    let Ok(mut timings) = preview_interaction_timings().lock() else {
+        return;
+    };
+    while timings.len() >= PREVIEW_INTERACTION_PROFILE_LIMIT {
+        timings.pop_front();
+    }
+    timings.push_back(sample);
+}
+
+fn take_preview_interaction_timings() -> Vec<PreviewInteractionTimingSample> {
+    preview_interaction_timings()
+        .lock()
+        .map(|mut timings| timings.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn preview_native_input_timings() -> &'static Mutex<VecDeque<PreviewNativeInputTimingSample>> {
+    static TIMINGS: OnceLock<Mutex<VecDeque<PreviewNativeInputTimingSample>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(VecDeque::with_capacity(PREVIEW_INTERACTION_PROFILE_LIMIT)))
+}
+
+fn record_preview_native_input_timing(sample: PreviewNativeInputTimingSample) {
+    if !preview_compact_timing_enabled() {
+        return;
+    }
+    let Ok(mut timings) = preview_native_input_timings().lock() else {
+        return;
+    };
+    while timings.len() >= PREVIEW_INTERACTION_PROFILE_LIMIT {
+        timings.pop_front();
+    }
+    timings.push_back(sample);
+}
+
+fn take_preview_native_input_timings() -> Vec<PreviewNativeInputTimingSample> {
+    preview_native_input_timings()
+        .lock()
+        .map(|mut timings| timings.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn preview_interaction_timing_sample_json(sample: &PreviewInteractionTimingSample) -> Value {
+    json!({
+        "interaction": preview_interaction_timing_scope_name(sample.scope),
+        "source_count": sample.source_count,
+        "expanded_event_count": sample.expanded_event_count,
+        "semantic_delta_count": sample.semantic_delta_count,
+        "render_patch_count": sample.render_patch_count,
+        "coalesced_render_patch_count": sample.coalesced_render_patch_count,
+        "changed": sample.changed,
+        "layout_source": sample.layout_source,
+        "summary_source": sample.summary_source,
+        "document_patch_fast_path_rejected": sample.document_patch_fast_path_rejected,
+        "runtime_lock_wait_ms": sample.runtime_lock_wait_ms,
+        "runtime_apply_ms": sample.runtime_apply_ms,
+        "runtime_step_apply_ms": sample.runtime_step_apply_ms,
+        "runtime_state_summary_ms": sample.runtime_state_summary_ms,
+        "persist_ui_state_ms": sample.persist_ui_state_ms,
+        "layout_rebuild_ms": sample.layout_rebuild_ms,
+        "scroll_adjust_ms": sample.scroll_adjust_ms,
+        "shared_update_ms": sample.shared_update_ms,
+        "total_ms": sample.total_ms
+    })
+}
+
+fn preview_native_input_timing_sample_json(sample: &PreviewNativeInputTimingSample) -> Value {
+    json!({
+        "interaction": preview_interaction_timing_scope_name(sample.scope),
+        "fast_path": sample.fast_path,
+        "resolve_ms": sample.resolve_ms,
+        "apply_ms": sample.apply_ms,
+        "hover_overlay_ms": sample.hover_overlay_ms,
+        "focus_overlay_ms": sample.focus_overlay_ms,
+        "total_ms": sample.total_ms
+    })
+}
+
+fn preview_compact_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BOON_NATIVE_PREVIEW_COMPACT_TIMING").is_some())
 }
 
 fn preview_interaction_profiles() -> &'static Mutex<VecDeque<serde_json::Value>> {
@@ -24529,6 +24838,7 @@ struct PreviewNativeInputState {
     hovered_target_text: Option<String>,
     hovered_bounds: Option<(f64, f64, f64, f64)>,
     hovered_click_candidate: Option<PreviewHoveredClickCandidate>,
+    hover_overlay_nodes: BTreeSet<String>,
     focused_node: Option<String>,
     focused_address: Option<String>,
     focused_target_text: Option<String>,
@@ -25641,6 +25951,7 @@ fn preview_try_apply_simple_source_click_input(
         }
     };
     let resolve_ms = elapsed_ms(resolve_started);
+    let focus_overlay_needed = preserve_focus || input_state.focused_node.is_some();
     for press in presses {
         input_state.last_mouse_press_event_count =
             input_state.last_mouse_press_event_count.max(press.sequence);
@@ -25674,8 +25985,19 @@ fn preview_try_apply_simple_source_click_input(
     preview_apply_hover_overlay(shared_render_state, input_state)?;
     let hover_overlay_ms = elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
-    preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    if focus_overlay_needed {
+        preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    record_preview_native_input_timing(PreviewNativeInputTimingSample {
+        scope: preview_current_interaction_timing_scope(),
+        fast_path: "simple_source_click",
+        resolve_ms,
+        apply_ms,
+        hover_overlay_ms,
+        focus_overlay_ms,
+        total_ms: elapsed_ms(input_total_started),
+    });
     if preview_profiling_enabled() {
         record_preview_native_input_profile(json!({
             "source_path": source_path,
@@ -25801,8 +26123,19 @@ fn preview_try_apply_simple_pointer_move_input(
     preview_apply_hover_overlay(shared_render_state, input_state)?;
     let hover_overlay_ms = elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
-    preview_apply_focus_overlay(shared_render_state, input_state, false)?;
+    if input_state.focused_node.is_some() {
+        preview_apply_focus_overlay(shared_render_state, input_state, false)?;
+    }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    record_preview_native_input_timing(PreviewNativeInputTimingSample {
+        scope: preview_current_interaction_timing_scope(),
+        fast_path: "simple_pointer_move",
+        resolve_ms,
+        apply_ms: pointer_move_ms,
+        hover_overlay_ms,
+        focus_overlay_ms,
+        total_ms: elapsed_ms(input_total_started),
+    });
     if preview_profiling_enabled() {
         record_preview_native_input_profile(json!({
             "source_path": source_path,
@@ -26629,7 +26962,7 @@ fn preview_update_hover_from_input(
 
 fn preview_apply_hover_overlay(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    input_state: &PreviewNativeInputState,
+    input_state: &mut PreviewNativeInputState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut shared = shared_render_state
         .lock()
@@ -26637,24 +26970,6 @@ fn preview_apply_hover_overlay(
     if shared.layout_frame_override.is_none() {
         shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
     }
-    let hovered_scope = input_state.hovered_node.as_deref().and_then(|hovered| {
-        shared
-            .layout_proof
-            .pointer("/display_item_samples")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|items| {
-                items.iter().find_map(|sample| {
-                    (sample.get("node").and_then(serde_json::Value::as_str) == Some(hovered))
-                        .then(|| {
-                            sample
-                                .pointer("/style/__scope_key")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .flatten()
-                })
-            })
-    });
     let target_reveal_nodes = input_state
         .hovered_target_text
         .as_deref()
@@ -26665,11 +26980,16 @@ fn preview_apply_hover_overlay(
     let Some(frame) = shared.layout_frame_override.as_mut() else {
         return Ok(false);
     };
-    let hovered_button = input_state.hovered_node.as_deref().and_then(|hovered| {
-        let hovered_item = frame
+    let hovered_item = input_state.hovered_node.as_deref().and_then(|hovered| {
+        frame
             .display_list
             .iter()
-            .find(|item| item.node.0 == hovered)?;
+            .find(|item| item.node.0 == hovered)
+    });
+    let hovered_scope = hovered_item
+        .and_then(|item| display_style_text(&item.style, "__scope_key"))
+        .map(str::to_owned);
+    let hovered_button = hovered_item.and_then(|hovered_item| {
         if matches!(
             hovered_item.kind,
             boon_document_model::DocumentNodeKind::Button
@@ -26685,8 +27005,10 @@ fn preview_apply_hover_overlay(
             })
             .map(|item| (item.node.0.clone(), item.bounds))
     });
-    let mut changed = false;
-    for item in &mut frame.display_list {
+    let mut next_overlay_nodes = BTreeSet::new();
+    let mut hover_active_nodes = BTreeSet::new();
+    let mut reveal_active_nodes = BTreeSet::new();
+    for item in &frame.display_list {
         let item_scope = display_style_text(&item.style, "__scope_key");
         let direct_hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
         let button_hover = hovered_button
@@ -26700,6 +27022,31 @@ fn preview_apply_hover_overlay(
         let reveal_active = hover_active
             || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
             || target_reveal_nodes.contains(item.node.0.as_str());
+        if hover_active {
+            hover_active_nodes.insert(item.node.0.clone());
+            next_overlay_nodes.insert(item.node.0.clone());
+        }
+        if reveal_active
+            && item.style.get("__hover_visible")
+                == Some(&boon_document_model::StyleValue::Bool(true))
+        {
+            reveal_active_nodes.insert(item.node.0.clone());
+            next_overlay_nodes.insert(item.node.0.clone());
+        }
+    }
+    let nodes_to_update = input_state
+        .hover_overlay_nodes
+        .iter()
+        .chain(next_overlay_nodes.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+    for item in &mut frame.display_list {
+        if !nodes_to_update.contains(item.node.0.as_str()) {
+            continue;
+        }
+        let hover_active = hover_active_nodes.contains(item.node.0.as_str());
+        let reveal_active = reveal_active_nodes.contains(item.node.0.as_str());
         changed |= set_display_style_value(
             &mut item.style,
             "__hover",
@@ -26715,6 +27062,7 @@ fn preview_apply_hover_overlay(
             boon_document_model::StyleValue::Bool(reveal_active),
         );
     }
+    input_state.hover_overlay_nodes = next_overlay_nodes;
     if changed {
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_dirty_reason =
@@ -27598,12 +27946,18 @@ fn preview_apply_live_events_internal(
         });
     }
     let total_started = Instant::now();
+    let timing_scope = preview_current_interaction_timing_scope();
+    let json_profiling_enabled = preview_profiling_enabled();
     let source_count = events.len();
-    let source_samples = events
-        .iter()
-        .take(8)
-        .map(|event| event.source.clone())
-        .collect::<Vec<_>>();
+    let source_samples = if json_profiling_enabled {
+        events
+            .iter()
+            .take(8)
+            .map(|event| event.source.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let (scroll_x_px, scroll_y_px, viewport, previous_state_summary, previous_layout_proof) = {
         let shared = shared_render_state
             .lock()
@@ -27762,15 +28116,45 @@ fn preview_apply_live_events_internal(
     }
     let persist_ui_state_ms = elapsed_ms(persist_started);
     if !changed {
-        let mut shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        shared.last_error = None;
-        shared.status_overlay = None;
-        shared.update_count = shared.update_count.saturating_add(event_count);
-        shared.last_dirty_reason =
-            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-        if preview_profiling_enabled() {
+        let shared_update_started = Instant::now();
+        let return_value = {
+            let mut shared = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.last_error = None;
+            shared.status_overlay = None;
+            shared.update_count = shared.update_count.saturating_add(event_count);
+            shared.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
+            if return_layout {
+                shared.layout_proof.clone()
+            } else {
+                Value::Null
+            }
+        };
+        let shared_update_ms = elapsed_ms(shared_update_started);
+        record_preview_interaction_timing(PreviewInteractionTimingSample {
+            scope: timing_scope,
+            source_count,
+            expanded_event_count: event_count,
+            semantic_delta_count,
+            render_patch_count,
+            coalesced_render_patch_count,
+            changed: false,
+            layout_source: "unchanged",
+            summary_source,
+            document_patch_fast_path_rejected: false,
+            runtime_lock_wait_ms,
+            runtime_apply_ms,
+            runtime_step_apply_ms,
+            runtime_state_summary_ms,
+            persist_ui_state_ms,
+            layout_rebuild_ms: 0.0,
+            scroll_adjust_ms: 0.0,
+            shared_update_ms,
+            total_ms: elapsed_ms(total_started),
+        });
+        if json_profiling_enabled {
             record_preview_interaction_profile(json!({
                 "source_path": source_path,
                 "source_count": source_count,
@@ -27794,15 +28178,12 @@ fn preview_apply_live_events_internal(
                 "runtime_recomputed_field_samples": runtime_recomputed_field_samples,
                 "persist_ui_state_ms": persist_ui_state_ms,
                 "layout_rebuild_ms": 0.0,
+                "shared_update_ms": shared_update_ms,
                 "layout_profile": null,
                 "total_ms": elapsed_ms(total_started)
             }));
         }
-        return Ok(if return_layout {
-            shared.layout_proof.clone()
-        } else {
-            Value::Null
-        });
+        return Ok(return_value);
     }
     let layout_started = Instant::now();
     let Some(state_summary) = state_summary.as_ref() else {
@@ -27824,7 +28205,7 @@ fn preview_apply_live_events_internal(
             )?
     {
         let layout_rebuild_ms = elapsed_ms(layout_started);
-        let layout_profile = preview_profiling_enabled()
+        let layout_profile = json_profiling_enabled
             .then(|| {
                 patched_layout
                     .get("layout_profile")
@@ -27862,7 +28243,28 @@ fn preview_apply_live_events_internal(
             Value::Null
         };
         let shared_update_ms = elapsed_ms(shared_update_started);
-        if preview_profiling_enabled() {
+        record_preview_interaction_timing(PreviewInteractionTimingSample {
+            scope: timing_scope,
+            source_count,
+            expanded_event_count: event_count,
+            semantic_delta_count,
+            render_patch_count,
+            coalesced_render_patch_count,
+            changed: true,
+            layout_source: "patched_document_frame",
+            summary_source,
+            document_patch_fast_path_rejected: false,
+            runtime_lock_wait_ms,
+            runtime_apply_ms,
+            runtime_step_apply_ms,
+            runtime_state_summary_ms,
+            persist_ui_state_ms,
+            layout_rebuild_ms,
+            scroll_adjust_ms: 0.0,
+            shared_update_ms,
+            total_ms: elapsed_ms(total_started),
+        });
+        if json_profiling_enabled {
             record_preview_interaction_profile(json!({
                 "source_path": source_path,
                 "source_count": source_count,
@@ -27954,7 +28356,28 @@ fn preview_apply_live_events_internal(
         return_value = post_input_layout;
     }
     let shared_update_ms = elapsed_ms(shared_update_started);
-    if preview_profiling_enabled() {
+    record_preview_interaction_timing(PreviewInteractionTimingSample {
+        scope: timing_scope,
+        source_count,
+        expanded_event_count: event_count,
+        semantic_delta_count,
+        render_patch_count,
+        coalesced_render_patch_count,
+        changed: true,
+        layout_source: "full_document_lower",
+        summary_source,
+        document_patch_fast_path_rejected: document_patch_fast_path_rejection.is_some(),
+        runtime_lock_wait_ms,
+        runtime_apply_ms,
+        runtime_step_apply_ms,
+        runtime_state_summary_ms,
+        persist_ui_state_ms,
+        layout_rebuild_ms,
+        scroll_adjust_ms,
+        shared_update_ms,
+        total_ms: elapsed_ms(total_started),
+    });
+    if json_profiling_enabled {
         record_preview_interaction_profile(json!({
             "source_path": source_path,
             "source_count": source_count,
@@ -45761,20 +46184,23 @@ mod tests {
             "2 grouped signals",
             "NovyWave selected group wave header",
         );
+        let selected_group_row_min_y = group_header.bounds.y + group_header.bounds.height;
         let clk_name = layout_frame
             .display_list
             .iter()
             .find(|item| {
-                item.text.as_deref() == Some("A[3:0]") && item.bounds.y > selected_panel_min_y
+                item.text.as_deref() == Some("A[3:0]") && item.bounds.y >= selected_group_row_min_y
             })
             .unwrap_or_else(|| panic!("selected-variable name column should render A[3:0] row"));
         let clk_value = layout_frame
             .display_list
             .iter()
             .find(|item| {
-                item.text.as_deref() == Some("0xc")
-                    && item.bounds.y > selected_panel_min_y
+                item.text.is_some()
+                    && item.bounds.y >= selected_group_row_min_y
                     && item.bounds.x > clk_name.bounds.x + clk_name.bounds.width
+                    && item.bounds.x < group_wave_header.bounds.x
+                    && item.text.as_deref() != Some("Hex")
             })
             .unwrap_or_else(|| panic!("selected-variable value column should render A value"));
         let wave_cell = layout_frame
@@ -45784,7 +46210,7 @@ mod tests {
                 matches!(
                     display_item_paint_color(item),
                     Some("#020817" | "#020817e6")
-                ) && item.bounds.x > clk_value.bounds.x + clk_value.bounds.width
+                ) && item.bounds.x >= group_wave_header.bounds.x - 1.0
                     && (item.bounds.y - clk_name.bounds.y).abs() <= 2.0
                     && item.bounds.height >= clk_name.bounds.height - 2.0
             })
@@ -47706,7 +48132,7 @@ mod tests {
                 )
                 .expect("NovyWave hover overlay should update for readback")
             );
-            preview_apply_hover_overlay(&shared_render_state, &input_state)
+            preview_apply_hover_overlay(&shared_render_state, &mut input_state)
                 .expect("NovyWave hover overlay should apply for readback");
             let hover_frame = latest_preview_frame(&shared_render_state);
             let hover_render = render_novywave_frame_artifact(
@@ -47717,7 +48143,7 @@ mod tests {
             );
             let hover_image = hover_render.image.clone();
             let hover_metadata = visual_image_artifact_metadata(
-                "boon_hover_load_files",
+                "boon_hover_probe",
                 &hover_render,
                 "Load Files hover",
             );
@@ -47775,7 +48201,7 @@ mod tests {
                 )
                 .expect("NovyWave light hover overlay should update for readback")
             );
-            preview_apply_hover_overlay(&light_shared_render_state, &light_input_state)
+            preview_apply_hover_overlay(&light_shared_render_state, &mut light_input_state)
                 .expect("NovyWave light hover overlay should apply for readback");
             let light_hover_frame = latest_preview_frame(&light_shared_render_state);
             let light_hover_render = render_novywave_frame_artifact(

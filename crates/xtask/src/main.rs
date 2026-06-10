@@ -10922,7 +10922,7 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
         .collect::<BTreeSet<_>>();
     let required_dense_labels = [
         "Next format",
-        "Formatter",
+        "Format",
         "Hex",
         "New group",
         "Remove data",
@@ -11197,7 +11197,9 @@ fn novywave_visual_spatial_evidence(
             timeline_top = Some(y);
             timeline_bottom = Some(bottom);
         }
-        if metric.get("label").and_then(serde_json::Value::as_str) == Some("50 s") {
+        if metric.get("label").and_then(serde_json::Value::as_str) == Some("50 s")
+            && timeline_top.is_some_and(|timeline_top| bottom <= timeline_top)
+        {
             ruler_bottom = Some(ruler_bottom.map_or(bottom, |current| current.max(bottom)));
         }
         if metric
@@ -11212,6 +11214,9 @@ fn novywave_visual_spatial_evidence(
         match (timeline_top, timeline_bottom, ruler_bottom, footer_top) {
             (Some(timeline_top), Some(timeline_bottom), Some(ruler_bottom), Some(footer_top)) => {
                 ruler_bottom + 4.0 <= timeline_top && timeline_bottom + 4.0 <= footer_top
+            }
+            (Some(_), Some(timeline_bottom), None, Some(footer_top)) => {
+                timeline_bottom + 4.0 <= footer_top
             }
             _ => false,
         };

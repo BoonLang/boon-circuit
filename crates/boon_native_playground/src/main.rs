@@ -3057,6 +3057,8 @@ struct DocumentLayoutCacheEntry {
     layout_frame: boon_document::LayoutFrame,
     document_frame: boon_document_model::DocumentFrame,
     data_binding_targets: DocumentDataBindingIndex,
+    structural_data_reads: BTreeSet<String>,
+    source_intents: Vec<Value>,
 }
 
 const PREVIEW_INTERACTION_PROFILE_LIMIT: usize = 256;
@@ -3073,6 +3075,8 @@ type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>
 struct DocumentRenderSnapshot {
     document_frame: boon_document_model::DocumentFrame,
     data_binding_targets: DocumentDataBindingIndex,
+    structural_data_reads: BTreeSet<String>,
+    source_intents: Vec<Value>,
 }
 
 fn preview_interaction_profiles() -> &'static Mutex<VecDeque<serde_json::Value>> {
@@ -3218,6 +3222,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
                 DocumentRenderSnapshot {
                     document_frame: entry.document_frame.clone(),
                     data_binding_targets: entry.data_binding_targets.clone(),
+                    structural_data_reads: entry.structural_data_reads.clone(),
+                    source_intents: entry.source_intents.clone(),
                 },
             );
         }
@@ -3278,6 +3284,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         data_binding_index,
         data_reads: Arc::new(Mutex::new(BTreeSet::new())),
         data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+        structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
         source_override: None,
         functions: Some(&document_functions),
         eval_depth: 0,
@@ -3417,6 +3424,11 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         .lock()
         .map(|targets| targets.clone())
         .unwrap_or_default();
+    let structural_data_reads = eval_context
+        .structural_data_reads
+        .lock()
+        .map(|reads| reads.clone())
+        .unwrap_or_default();
     let data_binding_target_samples = data_binding_targets
         .iter()
         .take(256)
@@ -3482,6 +3494,11 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     let layout_metrics = serde_json::to_value(&layout.metrics)?;
     let scroll_regions = serde_json::to_value(&layout.scroll_regions)?;
     let physical_theme_evidence = document_physical_theme_evidence(&eval_context);
+    let structural_data_read_samples = structural_data_reads
+        .iter()
+        .take(256)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let mut proof = json!({
         "status": "pass",
@@ -3533,6 +3550,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     proof["source_intent_value_index"] = source_intent_value_index;
     proof["data_binding_target_sample_count"] = json!(data_binding_target_samples.len());
     proof["data_binding_target_samples"] = Value::Array(data_binding_target_samples);
+    proof["structural_data_read_count"] = json!(structural_data_reads.len());
+    proof["structural_data_read_samples"] = json!(structural_data_read_samples);
     if let Some(cache_key) = cache_key {
         if let Ok(mut cache) = document_layout_cache().lock() {
             if cache.len() > 32 {
@@ -3545,6 +3564,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
                     layout_frame: layout.clone(),
                     document_frame: frame.clone(),
                     data_binding_targets: data_binding_targets.clone(),
+                    structural_data_reads: structural_data_reads.clone(),
+                    source_intents: source_intent_assertions.clone(),
                 }),
             );
         }
@@ -3554,6 +3575,8 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         DocumentRenderSnapshot {
             document_frame: frame,
             data_binding_targets,
+            structural_data_reads,
+            source_intents: source_intent_assertions,
         },
     );
     Ok((proof, Some(layout)))
@@ -15832,10 +15855,12 @@ fn lower_canonical_document_entry(
         document_pipe_render_function(statement, expressions, functions, context)
     {
         if let Some((_, function)) = document_resolve_function(functions, &function_name, context) {
+            document_context_clear_data_reads(context);
             let input_value = expressions
                 .get(input_expr_id)
                 .and_then(|expr| document_eval_expr_value(expr, expressions, context))
                 .unwrap_or(Value::Null);
+            document_context_take_structural_eval_reads(context, Some(input_expr_id), expressions);
             let mut scoped = document_function_item_context(
                 function,
                 input_expr_id,
@@ -15916,6 +15941,7 @@ fn document_block_context<'a>(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16174,14 +16200,18 @@ fn lower_canonical_conditional_render_entry_with_input(
         return false;
     };
     let selector = if let Some(selector) = selector_override {
+        document_context_record_structural_expr(context, input, expressions);
         selector
     } else {
         let Some(input_expr) = expressions.get(input) else {
             return true;
         };
+        document_context_clear_data_reads(context);
         let Some(selector) = document_eval_expr_value(input_expr, expressions, context) else {
+            document_context_take_structural_eval_reads(context, Some(input), expressions);
             return true;
         };
+        document_context_take_structural_eval_reads(context, Some(input), expressions);
         selector
     };
     for arm in &statement.children {
@@ -16286,6 +16316,7 @@ fn document_function_call_context<'a>(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16312,6 +16343,7 @@ fn document_function_args_context<'a>(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16444,6 +16476,7 @@ fn document_function_item_context<'a>(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -16510,8 +16543,19 @@ fn lower_canonical_document_element(
         );
         return;
     };
-    if document_child_bool(statement, "visible", expressions, context) == Some(false) {
+    let visible_expr = document_child_expr_id(statement, "visible");
+    if visible_expr.is_some() {
+        document_context_clear_data_reads(context);
+    }
+    let visible = document_child_bool(statement, "visible", expressions, context);
+    if visible_expr.is_some() {
+        document_context_take_structural_eval_reads(context, visible_expr, expressions);
+    }
+    if visible == Some(false) {
         return;
+    }
+    if let Some(expr_id) = document_child_expr_id(statement, "direction") {
+        document_context_record_structural_expr(context, expr_id, expressions);
     }
 
     let base_node_id = format!("doc-node-{}", statement.id);
@@ -16949,11 +16993,14 @@ fn lower_mapped_document_children(
             _ => None,
         })
         .unwrap_or(mapped.list_expr_id);
+    document_context_clear_data_reads(context);
     let Some(items_value) =
         document_eval_mapped_list_items(statement, list_expr_id, expressions, context)
     else {
+        document_context_take_structural_eval_reads(context, Some(list_expr_id), expressions);
         return false;
     };
+    document_context_take_structural_eval_reads(context, Some(list_expr_id), expressions);
     let Some(items) = items_value.as_array() else {
         return false;
     };
@@ -16974,6 +17021,7 @@ fn lower_mapped_document_children(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -17478,6 +17526,7 @@ fn lower_canonical_list_map_children(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -20026,6 +20075,7 @@ fn lower_canonical_element_sources(
                                 record_fields_for_statement(event, expressions)
                             {
                                 for source_field in event_fields {
+                                    document_context_clear_data_reads(context);
                                     if let Some(source_path) = document_source_value_for_expr(
                                         source_field.value,
                                         expressions,
@@ -20042,6 +20092,13 @@ fn lower_canonical_element_sources(
                                             &source_path,
                                         );
                                     }
+                                    document_context_take_source_intent_eval_reads(
+                                        context,
+                                        node_id,
+                                        &source_field.name,
+                                        Some(source_field.value),
+                                        expressions,
+                                    );
                                 }
                                 continue;
                             }
@@ -20049,6 +20106,7 @@ fn lower_canonical_element_sources(
                                 let Some(intent) = document_field_name(source) else {
                                     continue;
                                 };
+                                document_context_clear_data_reads(context);
                                 if let Some(source_path) =
                                     document_source_value(source, expressions, context)
                                         .or_else(|| context.source_override.clone())
@@ -20061,8 +20119,22 @@ fn lower_canonical_element_sources(
                                         &intent,
                                         &source_path,
                                     );
+                                    document_context_take_source_intent_eval_reads(
+                                        context,
+                                        node_id,
+                                        &intent,
+                                        source.expr,
+                                        expressions,
+                                    );
                                     continue;
                                 }
+                                document_context_take_source_intent_eval_reads(
+                                    context,
+                                    node_id,
+                                    &intent,
+                                    source.expr,
+                                    expressions,
+                                );
                                 for source_path in source_paths_for_native_node_attr(
                                     context,
                                     document_node_binding_kind(&node.kind),
@@ -20084,6 +20156,13 @@ fn lower_canonical_element_sources(
                                 .and_then(|expr_id| expressions.get(expr_id))
                                 .and_then(|expr| document_source_group_prefix(expr, expressions))
                             {
+                                if let Some(expr_id) = event.expr {
+                                    document_context_record_structural_expr(
+                                        context,
+                                        expr_id,
+                                        expressions,
+                                    );
+                                }
                                 for source_path in
                                     source_paths_for_event_group(typecheck_report, &group_path)
                                 {
@@ -20109,8 +20188,16 @@ fn lower_canonical_element_sources(
                     document_field_name(child),
                     document_statement_value(child, expressions),
                 ) {
+                    document_context_clear_data_reads(context);
                     let value =
                         document_text_value(child, expressions, context, false).unwrap_or(value);
+                    document_context_take_source_intent_eval_reads(
+                        context,
+                        node_id,
+                        &intent,
+                        child.expr,
+                        expressions,
+                    );
                     source_intents.push(json!({
                         "node": node_id,
                         "intent": intent,
@@ -20143,11 +20230,19 @@ fn lower_canonical_element_source_statement(
             true
         }
         (Some("event"), Some(intent)) => {
+            document_context_clear_data_reads(context);
             if let Some(source_path) = document_source_value(statement, expressions, context)
                 .or_else(|| context.source_override.clone())
             {
                 push_canonical_source_intent(node_id, node, source_intents, intent, &source_path);
             }
+            document_context_take_source_intent_eval_reads(
+                context,
+                node_id,
+                intent,
+                statement.expr,
+                expressions,
+            );
             true
         }
         _ => false,
@@ -20170,6 +20265,7 @@ fn lower_canonical_element_source_record(
                 boon_document_model::StyleValue::Bool(true),
             );
         } else if matches!(field.name.as_str(), "target" | "address") {
+            document_context_clear_data_reads(context);
             if let Some(value) = expressions
                 .get(field.value)
                 .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
@@ -20186,9 +20282,17 @@ fn lower_canonical_element_source_record(
                     "source_path": value
                 }));
             }
+            document_context_take_source_intent_eval_reads(
+                context,
+                node_id,
+                &field.name,
+                Some(field.value),
+                expressions,
+            );
         } else if field.name == "event" {
             if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
                 for source_field in event_fields {
+                    document_context_clear_data_reads(context);
                     if let Some(source_path) =
                         document_source_value_for_expr(source_field.value, expressions, context)
                             .or_else(|| context.source_override.clone())
@@ -20201,8 +20305,22 @@ fn lower_canonical_element_source_record(
                             &source_field.name,
                             &source_path,
                         );
+                        document_context_take_source_intent_eval_reads(
+                            context,
+                            node_id,
+                            &source_field.name,
+                            Some(source_field.value),
+                            expressions,
+                        );
                         continue;
                     }
+                    document_context_take_source_intent_eval_reads(
+                        context,
+                        node_id,
+                        &source_field.name,
+                        Some(source_field.value),
+                        expressions,
+                    );
                     for source_path in source_paths_for_native_node_attr(
                         context,
                         document_node_binding_kind(&node.kind),
@@ -20223,6 +20341,7 @@ fn lower_canonical_element_source_record(
                 .get(field.value)
                 .and_then(|expr| document_source_group_prefix(expr, expressions))
         {
+            document_context_record_structural_expr(context, field.value, expressions);
             for source_path in source_paths_for_event_group(typecheck_report, &group_path) {
                 let Some(intent) = source_path.rsplit('.').next() else {
                     continue;
@@ -20455,6 +20574,9 @@ fn lower_document_element(
     context: &DocumentEvalContext<'_>,
     scope_key: &str,
 ) {
+    if let Some(expr_id) = document_child_expr_id(statement, "kind") {
+        document_context_record_structural_expr(context, expr_id, expressions);
+    }
     let kind_name =
         document_child_value(statement, "kind", expressions).unwrap_or_else(|| "Stack".to_owned());
     if kind_name == "ForEach" {
@@ -20470,8 +20592,19 @@ fn lower_document_element(
         );
         return;
     }
-    if document_child_bool(statement, "visible", expressions, context) == Some(false) {
+    let visible_expr = document_child_expr_id(statement, "visible");
+    if visible_expr.is_some() {
+        document_context_clear_data_reads(context);
+    }
+    let visible = document_child_bool(statement, "visible", expressions, context);
+    if visible_expr.is_some() {
+        document_context_take_structural_eval_reads(context, visible_expr, expressions);
+    }
+    if visible == Some(false) {
         return;
+    }
+    if let Some(expr_id) = document_child_expr_id(statement, "id") {
+        document_context_record_structural_expr(context, expr_id, expressions);
     }
     let base_node_id = document_child_value(statement, "id", expressions)
         .unwrap_or_else(|| format!("doc-node-{}", statement.id));
@@ -20516,10 +20649,18 @@ fn lower_document_element(
             let _ = document_context_take_data_reads(context);
         }
         let source_intent_value = if field == "target" {
+            document_context_clear_data_reads(context);
             document_text_value(child, expressions, context, false).unwrap_or_else(|| value.clone())
         } else {
             value.clone()
         };
+        if is_source_intent_field(&field) {
+            let mut reads = document_context_take_data_reads(context);
+            if let Some(expr_id) = child.expr {
+                reads.extend(document_expr_origin_paths(expr_id, expressions, context));
+            }
+            document_context_record_source_intent_reads(context, &id, &field, reads);
+        }
         if is_source_binding_field(&field) && node.source_binding.is_none() {
             node.source_binding = Some(boon_document_model::SourceBinding {
                 id: boon_document_model::SourceBindingId(format!("source:{}:{}", id.0, field)),
@@ -20595,6 +20736,7 @@ struct DocumentEvalContext<'a> {
     data_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
     data_reads: Arc<Mutex<BTreeSet<String>>>,
     data_binding_targets: Arc<Mutex<DocumentDataBindingIndex>>,
+    structural_data_reads: Arc<Mutex<BTreeSet<String>>>,
     source_override: Option<String>,
     functions: Option<&'a DocumentFunctionRegistry<'a>>,
     eval_depth: usize,
@@ -20622,6 +20764,57 @@ fn document_context_record_data_read(context: &DocumentEvalContext<'_>, path: St
     if let Ok(mut reads) = context.data_reads.lock() {
         reads.insert(path);
     }
+}
+
+fn document_context_record_structural_reads(
+    context: &DocumentEvalContext<'_>,
+    reads: BTreeSet<String>,
+) {
+    if reads.is_empty() {
+        return;
+    }
+    if let Ok(mut structural_reads) = context.structural_data_reads.lock() {
+        structural_reads.extend(
+            reads
+                .into_iter()
+                .filter(|path| !path.is_empty() && !path.contains('|')),
+        );
+    }
+}
+
+fn document_context_record_structural_expr(
+    context: &DocumentEvalContext<'_>,
+    expr_id: usize,
+    expressions: &[AstExpr],
+) {
+    let reads = document_expr_origin_paths(expr_id, expressions, context);
+    document_context_record_structural_reads(context, reads);
+}
+
+fn document_context_take_structural_eval_reads(
+    context: &DocumentEvalContext<'_>,
+    expr_id: Option<usize>,
+    expressions: &[AstExpr],
+) {
+    let mut reads = document_context_take_data_reads(context);
+    if let Some(expr_id) = expr_id {
+        reads.extend(document_expr_origin_paths(expr_id, expressions, context));
+    }
+    document_context_record_structural_reads(context, reads);
+}
+
+fn document_context_take_source_intent_eval_reads(
+    context: &DocumentEvalContext<'_>,
+    node_id: &boon_document_model::DocumentNodeId,
+    intent: &str,
+    expr_id: Option<usize>,
+    expressions: &[AstExpr],
+) {
+    let mut reads = document_context_take_data_reads(context);
+    if let Some(expr_id) = expr_id {
+        reads.extend(document_expr_origin_paths(expr_id, expressions, context));
+    }
+    document_context_record_source_intent_reads(context, node_id, intent, reads);
 }
 
 fn normalized_document_data_path(path: &str) -> String {
@@ -20785,6 +20978,28 @@ fn document_context_record_target_reads(
     }
 }
 
+fn document_source_intent_binding_attr(intent: &str) -> String {
+    format!("__source_intent:{intent}")
+}
+
+fn document_context_record_source_intent_reads(
+    context: &DocumentEvalContext<'_>,
+    node_id: &boon_document_model::DocumentNodeId,
+    intent: &str,
+    reads: BTreeSet<String>,
+) {
+    let node = boon_document_model::DocumentNode::new(
+        node_id.0.clone(),
+        boon_document_model::DocumentNodeKind::Stack,
+    );
+    document_context_record_target_reads(
+        context,
+        &node,
+        &document_source_intent_binding_attr(intent),
+        reads,
+    );
+}
+
 fn source_binding_index_from_view_bindings(
     bindings: &[boon_ir::ViewBinding],
 ) -> BTreeMap<(String, String), Vec<String>> {
@@ -20859,9 +21074,16 @@ fn lower_document_for_each(
     context: &DocumentEvalContext<'_>,
     scope_key: &str,
 ) {
+    if let Some(expr_id) = document_child_expr_id(statement, "list") {
+        document_context_record_structural_expr(context, expr_id, expressions);
+    }
     let Some(list_path) = document_child_value(statement, "list", expressions) else {
         return;
     };
+    let normalized_list_path = normalized_document_data_path(&list_path);
+    if !normalized_list_path.is_empty() {
+        document_context_record_structural_reads(context, BTreeSet::from([normalized_list_path]));
+    }
     let item_name =
         document_child_value(statement, "item", expressions).unwrap_or_else(|| "item".to_owned());
     let Some(items) = document_resolved_value(&list_path, context).and_then(Value::as_array) else {
@@ -20878,6 +21100,7 @@ fn lower_document_for_each(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -21000,6 +21223,14 @@ fn document_child_bool(
         .iter()
         .find(|child| document_field_name(child).as_deref() == Some(field))?;
     document_bool_value(child, expressions, context)
+}
+
+fn document_child_expr_id(statement: &AstStatement, field: &str) -> Option<usize> {
+    statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some(field))
+        .and_then(|child| child.expr)
 }
 
 fn document_statement_value(statement: &AstStatement, expressions: &[AstExpr]) -> Option<String> {
@@ -21394,6 +21625,7 @@ fn document_eval_while_selector_value(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -21426,6 +21658,7 @@ fn document_eval_while_selector_value(
                 data_binding_index: Arc::clone(&context.data_binding_index),
                 data_reads: Arc::clone(&context.data_reads),
                 data_binding_targets: Arc::clone(&context.data_binding_targets),
+                structural_data_reads: Arc::clone(&context.structural_data_reads),
                 source_override: context.source_override.clone(),
                 functions: context.functions,
                 eval_depth: context.eval_depth,
@@ -23483,6 +23716,7 @@ fn document_eval_pipe_function_call(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth + 1,
@@ -23727,6 +23961,7 @@ fn document_eval_statement_sequence(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -23777,6 +24012,7 @@ fn document_eval_block_statement_sequence(
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
         data_binding_targets: Arc::clone(&context.data_binding_targets),
+        structural_data_reads: Arc::clone(&context.structural_data_reads),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -23946,6 +24182,7 @@ fn document_eval_list_retain_with_statement_children(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -24018,6 +24255,7 @@ fn document_eval_list_map(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -24060,6 +24298,7 @@ fn document_eval_list_quantifier(
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
             data_binding_targets: Arc::clone(&context.data_binding_targets),
+            structural_data_reads: Arc::clone(&context.structural_data_reads),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -24269,6 +24508,7 @@ struct PreviewNativeInputState {
     last_click_sequence: u64,
     hovered_node: Option<String>,
     hovered_target_text: Option<String>,
+    hovered_bounds: Option<(f64, f64, f64, f64)>,
     focused_node: Option<String>,
     focused_address: Option<String>,
     focused_target_text: Option<String>,
@@ -25124,42 +25364,95 @@ fn preview_try_apply_simple_source_click_input(
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
         let layout = &shared.layout_proof;
-        let Some(hit_region) = document_hit_region_at(layout, position.x, position.y) else {
-            return reject("missing_hit_region");
-        };
-        let Some(node) = hit_region
-            .get("node")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-        else {
-            return reject("missing_hit_node");
-        };
-        if live_source_for_node_intent(layout, &node, "change").is_some()
-            && document_node_wants_text_cursor(layout, &node)
+        if preview_mouse_position_key(input.mouse_window_pos)
+            == input_state.last_hover_window_position
+            && let (Some(node), Some(bounds)) = (
+                input_state.hovered_node.as_deref(),
+                input_state.hovered_bounds,
+            )
+            && let Some(source) = ["press", "click", "source", "double_click"]
+                .into_iter()
+                .find_map(|intent| live_source_for_node_intent(layout, node, intent))
         {
-            return reject("text_change");
+            if live_source_for_node_intent(layout, node, "change").is_some()
+                && document_node_wants_text_cursor(layout, node)
+            {
+                return reject("text_change");
+            }
+            let preserve_focus = input_state.focused_node.as_deref() == Some(node)
+                && preview_node_accepts_key_focus(layout, node);
+            if preview_node_accepts_key_focus(layout, node) && !preserve_focus {
+                return reject("key_focus");
+            }
+            if document_link_url_for_node(layout, node).is_some() {
+                return reject("link");
+            }
+            let target_text = input_state
+                .hovered_target_text
+                .clone()
+                .or_else(|| focused_target_text(layout, node));
+            let (pointer_x, pointer_y, pointer_width, pointer_height) =
+                pointer_payload_for_cached_bounds(bounds, position);
+            let event = boon_runtime::LiveSourceEvent {
+                source,
+                text: target_text.clone(),
+                key: None,
+                address: focused_address(layout, node),
+                pointer_x,
+                pointer_y,
+                pointer_width,
+                pointer_height,
+                target_text: target_text.clone(),
+                target_occurrence: focused_target_occurrence(layout, node),
+                ..boon_runtime::LiveSourceEvent::default()
+            };
+            let mut events = Vec::new();
+            if !preserve_focus
+                && let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime)
+            {
+                events.push(blur);
+            }
+            events.push(event);
+            (events, node.to_owned(), target_text, preserve_focus)
+        } else {
+            let Some(hit_region) = document_hit_region_ref_at(layout, position.x, position.y)
+            else {
+                return reject("missing_hit_region");
+            };
+            let Some(node) = hit_region
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+            else {
+                return reject("missing_hit_node");
+            };
+            if live_source_for_node_intent(layout, &node, "change").is_some()
+                && document_node_wants_text_cursor(layout, &node)
+            {
+                return reject("text_change");
+            }
+            let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
+                && preview_node_accepts_key_focus(layout, &node);
+            if preview_node_accepts_key_focus(layout, &node) && !preserve_focus {
+                return reject("key_focus");
+            }
+            if document_link_url_for_hit_region(layout, hit_region).is_some() {
+                return reject("link");
+            }
+            let Some(event) = live_source_event_for_hit_region(layout, hit_region, position, false)
+            else {
+                return reject("missing_live_event");
+            };
+            let target_text = focused_target_text(layout, &node);
+            let mut events = Vec::new();
+            if !preserve_focus
+                && let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime)
+            {
+                events.push(blur);
+            }
+            events.push(event);
+            (events, node, target_text, preserve_focus)
         }
-        let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
-            && preview_node_accepts_key_focus(layout, &node);
-        if preview_node_accepts_key_focus(layout, &node) && !preserve_focus {
-            return reject("key_focus");
-        }
-        if document_link_url_for_hit_region(layout, &hit_region).is_some() {
-            return reject("link");
-        }
-        let Some(event) = live_source_event_for_hit_region(layout, &hit_region, position, false)
-        else {
-            return reject("missing_live_event");
-        };
-        let target_text = focused_target_text(layout, &node);
-        let mut events = Vec::new();
-        if !preserve_focus
-            && let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime)
-        {
-            events.push(blur);
-        }
-        events.push(event);
-        (events, node, target_text, preserve_focus)
     };
     let resolve_ms = elapsed_ms(resolve_started);
     for press in presses {
@@ -25223,6 +25516,114 @@ fn preview_try_apply_simple_source_click_input(
     Ok(true)
 }
 
+fn preview_try_apply_simple_pointer_move_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let input_total_started = Instant::now();
+    if input.synthetic_input_probe
+        || input.scroll_delta_x.abs() > f64::EPSILON
+        || input.scroll_delta_y.abs() > f64::EPSILON
+        || input_state.active_drag.is_some()
+        || !input_state.pending_live_events.is_empty()
+        || !input.mouse_button_events.is_empty()
+        || !input.mouse_buttons_down.is_empty()
+        || !input.keyboard_events.is_empty()
+        || !input.pressed_keys.is_empty()
+        || input.mouse_motion_event_count <= input_state.last_mouse_motion_event_count
+    {
+        return Ok(false);
+    }
+    let next_position_key = preview_mouse_position_key(input.mouse_window_pos);
+    if next_position_key == input_state.last_hover_window_position {
+        input_state.last_mouse_motion_event_count = input_state
+            .last_mouse_motion_event_count
+            .max(input.mouse_motion_event_count);
+        return Ok(true);
+    }
+    let Some(position) = input.mouse_window_pos else {
+        return Ok(false);
+    };
+    let resolve_started = Instant::now();
+    let (event, node, target_text, bounds) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        let layout = &shared.layout_proof;
+        let Some(hit_region) = document_hit_region_ref_at(layout, position.x, position.y) else {
+            return Ok(false);
+        };
+        let Some(node) = hit_region
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(false);
+        };
+        let Some(event) =
+            pointer_move_live_source_event_for_hit_region(layout, hit_region, position)
+        else {
+            return Ok(false);
+        };
+        let target_text = focused_target_text(layout, &node);
+        let bounds = document_bounds_tuple(hit_region.get("bounds"));
+        (event, node, target_text, bounds)
+    };
+    let resolve_ms = elapsed_ms(resolve_started);
+    input_state.last_mouse_motion_event_count = input_state
+        .last_mouse_motion_event_count
+        .max(input.mouse_motion_event_count);
+    input_state.last_hover_window_position = next_position_key;
+    input_state.hovered_node = Some(node);
+    input_state.hovered_target_text = target_text;
+    input_state.hovered_bounds = bounds;
+    let apply_started = Instant::now();
+    preview_apply_live_events(
+        source_path,
+        source_text,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        vec![event],
+    )?;
+    let pointer_move_ms = elapsed_ms(apply_started);
+    let hover_overlay_started = Instant::now();
+    preview_apply_hover_overlay(shared_render_state, input_state)?;
+    let hover_overlay_ms = elapsed_ms(hover_overlay_started);
+    let focus_overlay_started = Instant::now();
+    preview_apply_focus_overlay(shared_render_state, input_state, false)?;
+    let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    if preview_profiling_enabled() {
+        record_preview_native_input_profile(json!({
+            "source_path": source_path,
+            "capture_scope": input.capture_scope,
+            "fast_path": "simple_pointer_move",
+            "mouse_motion_event_count": input.mouse_motion_event_count,
+            "mouse_button_event_count": input.mouse_button_event_count,
+            "mouse_button_events": input.mouse_button_events.len(),
+            "keyboard_events": input.keyboard_events.len(),
+            "motion_changed": true,
+            "layout_clone_ms": 0.0,
+            "hover_update_ms": 0.0,
+            "pending_live_events_ms": 0.0,
+            "drag_events_ms": 0.0,
+            "pointer_move_ms": pointer_move_ms,
+            "pointer_move_resolve_ms": resolve_ms,
+            "mouse_release_ms": 0.0,
+            "keyboard_ms": 0.0,
+            "hover_overlay_ms": hover_overlay_ms,
+            "focus_overlay_ms": focus_overlay_ms,
+            "total_ms": elapsed_ms(input_total_started)
+        }));
+    }
+    Ok(true)
+}
+
 fn preview_apply_real_window_input_with_units(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
@@ -25239,6 +25640,17 @@ fn preview_apply_real_window_input_with_units(
         return Ok(());
     };
     if input.scroll_delta_x.abs() > f64::EPSILON || input.scroll_delta_y.abs() > f64::EPSILON {
+        return Ok(());
+    }
+    if preview_try_apply_simple_pointer_move_input(
+        input,
+        source_path,
+        source_text,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        input_state,
+    )? {
         return Ok(());
     }
     if preview_try_apply_simple_source_click_input(
@@ -25310,11 +25722,11 @@ fn preview_apply_real_window_input_with_units(
     if motion_changed && !has_pending_primary_button_event {
         let pointer_move_started = Instant::now();
         let hover_layout = latest_layout.as_ref().unwrap_or(&layout_proof);
-        if let Some((position, hit_region)) = input.mouse_window_pos.and_then(|position| {
-            document_hit_region_at(hover_layout, position.x, position.y)
-                .map(|hit_region| (position, hit_region))
-        }) && let Some(event) =
-            pointer_move_live_source_event_for_hit_region(hover_layout, &hit_region, position)
+        if let Some(position) = input.mouse_window_pos
+            && let Some(hit_region) =
+                document_hit_region_ref_at(hover_layout, position.x, position.y)
+            && let Some(event) =
+                pointer_move_live_source_event_for_hit_region(hover_layout, hit_region, position)
         {
             latest_layout = Some(preview_apply_live_events(
                 source_path,
@@ -25344,7 +25756,7 @@ fn preview_apply_real_window_input_with_units(
         }
         let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
         let hit_region = input.mouse_window_pos.and_then(|position| {
-            document_hit_region_at(layout, position.x, position.y).map(|hit_region| {
+            document_hit_region_ref_at(layout, position.x, position.y).map(|hit_region| {
                 (
                     position,
                     hit_region
@@ -25986,22 +26398,27 @@ fn preview_update_hover_from_input(
     input_state.last_hover_window_position = next_position_key;
     let next = input
         .mouse_window_pos
-        .and_then(|position| document_hit_region_at(layout_proof, position.x, position.y))
+        .and_then(|position| document_hit_region_ref_at(layout_proof, position.x, position.y))
         .and_then(|hit_region| {
             let node = hit_region
                 .get("node")
                 .and_then(serde_json::Value::as_str)?
                 .to_owned();
             let target = focused_target_text(layout_proof, &node);
-            Some((node, target))
+            let bounds = document_bounds_tuple(hit_region.get("bounds"));
+            Some((node, target, bounds))
         });
-    let (next_node, next_target) = next.unwrap_or((String::new(), None));
+    let (next_node, next_target, next_bounds) = next.unwrap_or((String::new(), None, None));
     let next_node = (!next_node.is_empty()).then_some(next_node);
-    if input_state.hovered_node == next_node && input_state.hovered_target_text == next_target {
+    if input_state.hovered_node == next_node
+        && input_state.hovered_target_text == next_target
+        && input_state.hovered_bounds == next_bounds
+    {
         return Ok(false);
     }
     input_state.hovered_node = next_node;
     input_state.hovered_target_text = next_target;
+    input_state.hovered_bounds = next_bounds;
     Ok(true)
 }
 
@@ -27041,6 +27458,7 @@ fn preview_apply_live_events(
                     }
                     render_patch_samples.push(json!({
                         "kind": patch.kind,
+                        "invalidation": format!("{:?}", patch.invalidation),
                         "target": patch.target,
                         "list_id": patch.list_id,
                         "key": patch.key
@@ -27134,7 +27552,11 @@ fn preview_apply_live_events(
     let Some(state_summary) = state_summary.as_ref() else {
         return Err("changed preview turn did not produce a state summary".into());
     };
-    if preview_document_patch_fast_path_allowed(&render_patches_for_layout)
+    let document_patch_fast_path_rejection = preview_document_patch_fast_path_rejection(
+        &previous_layout_proof,
+        &render_patches_for_layout,
+    );
+    if document_patch_fast_path_rejection.is_none()
         && let Some((patched_layout, patched_frame, patched_target_count)) =
             preview_try_patch_document_layout_for_root_deltas(
                 &previous_layout_proof,
@@ -27174,6 +27596,7 @@ fn preview_apply_live_events(
                 "changed": true,
                 "summary_source": summary_source,
                 "layout_source": "patched_document_frame",
+                "document_patch_fast_path_rejection": null,
                 "patched_target_count": patched_target_count,
                 "runtime_lock_wait_ms": runtime_lock_wait_ms,
                 "runtime_apply_ms": runtime_apply_ms,
@@ -27268,6 +27691,7 @@ fn preview_apply_live_events(
             "runtime_recomputed_field_samples": runtime_recomputed_field_samples,
             "persist_ui_state_ms": persist_ui_state_ms,
             "layout_rebuild_ms": layout_rebuild_ms,
+            "document_patch_fast_path_rejection": document_patch_fast_path_rejection,
             "scroll_adjust_ms": scroll_adjust_ms,
             "shared_update_ms": shared_update_ms,
             "layout_profile": layout_profile,
@@ -27278,31 +27702,42 @@ fn preview_apply_live_events(
 }
 
 fn document_hit_region_at(layout_proof: &Value, x: f64, y: f64) -> Option<Value> {
+    document_hit_region_ref_at(layout_proof, x, y).cloned()
+}
+
+fn document_hit_region_ref_at<'a>(layout_proof: &'a Value, x: f64, y: f64) -> Option<&'a Value> {
     let regions = layout_proof
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)?
-        .iter()
-        .enumerate()
-        .filter(|region| {
-            region
-                .1
-                .get("bounds")
-                .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
-        })
-        .collect::<Vec<_>>();
-    regions
-        .iter()
-        .copied()
-        .filter(|(_, region)| {
-            region
-                .get("node")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|node| hit_region_node_has_live_source(layout_proof, node))
-        })
-        .min_by(|left, right| compare_hit_region_priority(left, right))
-        .or_else(|| regions.iter().copied().min_by(compare_hit_region_priority))
-        .map(|(_, region)| region)
-        .cloned()
+        .as_slice();
+    let mut best_live: Option<(usize, &Value)> = None;
+    let mut best_fallback: Option<(usize, &Value)> = None;
+    for (index, region) in regions.iter().enumerate() {
+        if !region
+            .get("bounds")
+            .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
+        {
+            continue;
+        }
+        let candidate = (index, region);
+        if best_fallback
+            .as_ref()
+            .is_none_or(|best| compare_hit_region_priority(&candidate, best).is_lt())
+        {
+            best_fallback = Some(candidate);
+        }
+        if region
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|node| hit_region_node_has_live_source(layout_proof, node))
+            && best_live
+                .as_ref()
+                .is_none_or(|best| compare_hit_region_priority(&candidate, best).is_lt())
+        {
+            best_live = Some(candidate);
+        }
+    }
+    best_live.or(best_fallback).map(|(_, region)| region)
 }
 
 fn compare_hit_region_priority(
@@ -27328,7 +27763,7 @@ fn hit_region_node_has_live_source(layout_proof: &Value, node: &str) -> bool {
         "focus",
     ]
     .into_iter()
-    .any(|intent| live_source_for_node_intent(layout_proof, node, intent).is_some())
+    .any(|intent| node_has_source_intent(layout_proof, node, intent))
 }
 
 fn document_hit_region_for_node(layout_proof: &Value, node: &str) -> Option<Value> {
@@ -27428,6 +27863,16 @@ fn document_bounds_contains(bounds: &Value, x: f64, y: f64) -> bool {
     x >= left && x <= left + width && y >= top && y <= top + height
 }
 
+fn document_bounds_tuple(bounds: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
+    let bounds = bounds?;
+    Some((
+        bounds.get("x")?.as_f64()?,
+        bounds.get("y")?.as_f64()?,
+        bounds.get("width")?.as_f64()?,
+        bounds.get("height")?.as_f64()?,
+    ))
+}
+
 fn document_bounds_area(bounds: Option<&Value>) -> Option<f64> {
     let bounds = bounds?;
     let width = bounds.get("width")?.as_f64()?;
@@ -27512,7 +27957,19 @@ fn pointer_payload_for_hit_region(
     Option<String>,
     Option<String>,
 ) {
-    let Some(bounds) = hit_region.get("bounds") else {
+    pointer_payload_for_bounds(hit_region.get("bounds"), position)
+}
+
+fn pointer_payload_for_bounds(
+    bounds: Option<&Value>,
+    position: boon_native_app_window::NativeMouseWindowPosition,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let Some(bounds) = bounds else {
         return (None, None, None, None);
     };
     let left = bounds
@@ -27543,6 +28000,28 @@ fn pointer_payload_for_hit_region(
     )
 }
 
+fn pointer_payload_for_cached_bounds(
+    bounds: (f64, f64, f64, f64),
+    position: boon_native_app_window::NativeMouseWindowPosition,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let (left, top, width, height) = bounds;
+    let width = width.max(0.0);
+    let height = height.max(0.0);
+    let x = (position.x - left).clamp(0.0, width).round() as i64;
+    let y = (position.y - top).clamp(0.0, height).round() as i64;
+    (
+        Some(x.to_string()),
+        Some(y.to_string()),
+        Some((width.round() as i64).to_string()),
+        Some((height.round() as i64).to_string()),
+    )
+}
+
 fn pointer_payload_for_source_node(
     layout_proof: &Value,
     hit_region: &Value,
@@ -27554,6 +28033,9 @@ fn pointer_payload_for_source_node(
     Option<String>,
     Option<String>,
 ) {
+    if hit_region.get("node").and_then(serde_json::Value::as_str) == Some(source_node) {
+        return pointer_payload_for_hit_region(hit_region, position);
+    }
     document_hit_region_for_node(layout_proof, source_node)
         .as_ref()
         .map(|source_hit_region| pointer_payload_for_hit_region(source_hit_region, position))
@@ -27581,7 +28063,7 @@ fn live_source_node_for_hit_region_with_intents(
     let node = hit_region.get("node")?.as_str()?;
     if source_intents
         .iter()
-        .any(|intent| live_source_for_node_intent(layout_proof, node, intent).is_some())
+        .any(|intent| node_has_source_intent(layout_proof, node, intent))
     {
         return Some(node.to_owned());
     }
@@ -27598,9 +28080,7 @@ fn live_source_node_for_hit_region_with_intents(
             let candidate_node = candidate.get("node")?.as_str()?;
             source_intents
                 .iter()
-                .any(|intent| {
-                    live_source_for_node_intent(layout_proof, candidate_node, intent).is_some()
-                })
+                .any(|intent| node_has_source_intent(layout_proof, candidate_node, intent))
                 .then(|| {
                     (
                         candidate_node.to_owned(),
@@ -27626,10 +28106,7 @@ fn live_source_node_for_hit_region_with_intents(
                     let candidate_node = candidate.get("node")?.as_str()?;
                     source_intents
                         .iter()
-                        .any(|intent| {
-                            live_source_for_node_intent(layout_proof, candidate_node, intent)
-                                .is_some()
-                        })
+                        .any(|intent| node_has_source_intent(layout_proof, candidate_node, intent))
                         .then(|| {
                             (
                                 candidate_node.to_owned(),
@@ -27764,6 +28241,26 @@ fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str)
             } else {
                 None
             }
+        })
+}
+
+fn node_has_source_intent(layout_proof: &Value, node: &str, expected: &str) -> bool {
+    if layout_proof
+        .get("source_intent_index")
+        .and_then(|index| index.get(node))
+        .and_then(|node_index| node_index.get(expected))
+        .is_some()
+    {
+        return true;
+    }
+    layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|assertions| {
+            assertions.iter().any(|intent| {
+                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    && intent.get("intent").and_then(serde_json::Value::as_str) == Some(expected)
+            })
         })
 }
 
@@ -28847,6 +29344,15 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
             .sum::<usize>()
     );
     proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
+    proof["structural_data_read_count"] = json!(snapshot.structural_data_reads.len());
+    proof["structural_data_read_samples"] = json!(
+        snapshot
+            .structural_data_reads
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
     proof["layout_profile"] = json!({
         "layout_cache_hit": false,
         "cached_document_frame_viewport_relayout": true,
@@ -28859,6 +29365,8 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
         DocumentRenderSnapshot {
             document_frame: snapshot.document_frame.clone(),
             data_binding_targets: snapshot.data_binding_targets.clone(),
+            structural_data_reads: snapshot.structural_data_reads.clone(),
+            source_intents: snapshot.source_intents.clone(),
         },
     );
     Ok(Some((proof, layout)))
@@ -28892,6 +29400,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
         return Ok(None);
     };
     let mut frame = snapshot.document_frame.clone();
+    let mut source_intents = snapshot.source_intents.clone();
     let mut patched_targets = 0usize;
     let mut patched_target_samples = Vec::new();
     for (path, value) in patch_values {
@@ -28904,7 +29413,30 @@ fn preview_try_patch_document_layout_for_root_deltas(
             let Some(node) = frame.nodes.get_mut(&target.node) else {
                 return Ok(None);
             };
-            if target.attr == "text"
+            if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
+                let source_path = json_value_to_document_text(&value);
+                if let Some(binding) = node.source_binding.as_mut()
+                    && binding.intent == intent
+                {
+                    binding.source_path = source_path.clone();
+                }
+                for source_intent in &mut source_intents {
+                    let Some(object) = source_intent.as_object_mut() else {
+                        continue;
+                    };
+                    let node_matches = object
+                        .get("node")
+                        .and_then(Value::as_str)
+                        .is_some_and(|node| node == target.node.0);
+                    let intent_matches = object
+                        .get("intent")
+                        .and_then(Value::as_str)
+                        .is_some_and(|actual| actual == intent);
+                    if node_matches && intent_matches {
+                        object.insert("source_path".to_owned(), json!(source_path.clone()));
+                    }
+                }
+            } else if target.attr == "text"
                 || matches!(target.attr.as_str(), "label" | "value" | "display_value")
             {
                 node.text = Some(boon_document_model::TextValue {
@@ -28971,6 +29503,14 @@ fn preview_try_patch_document_layout_for_root_deltas(
     proof["hit_target_samples"] = Value::Array(hit_target_samples);
     proof["layout_metrics"] = serde_json::to_value(&layout.metrics)?;
     proof["scroll_regions"] = serde_json::to_value(&layout.scroll_regions)?;
+    let (source_intent_index, source_intent_value_index) = source_intent_indexes(&source_intents);
+    proof["source_intent_count"] = json!(source_intents.len());
+    proof["source_intent_sample_count"] = json!(source_intents.len().min(256));
+    proof["source_intent_assertions"] = Value::Array(source_intents.clone());
+    proof["source_intent_samples"] =
+        Value::Array(source_intents.iter().take(256).cloned().collect::<Vec<_>>());
+    proof["source_intent_index"] = source_intent_index;
+    proof["source_intent_value_index"] = source_intent_value_index;
     proof["data_binding_index_count"] = json!(
         snapshot
             .data_binding_targets
@@ -28979,6 +29519,15 @@ fn preview_try_patch_document_layout_for_root_deltas(
             .sum::<usize>()
     );
     proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
+    proof["structural_data_read_count"] = json!(snapshot.structural_data_reads.len());
+    proof["structural_data_read_samples"] = json!(
+        snapshot
+            .structural_data_reads
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
     proof["layout_profile"] = json!({
         "layout_cache_hit": false,
         "patched_document_frame": true,
@@ -28993,20 +29542,75 @@ fn preview_try_patch_document_layout_for_root_deltas(
         DocumentRenderSnapshot {
             document_frame: frame,
             data_binding_targets: snapshot.data_binding_targets.clone(),
+            structural_data_reads: snapshot.structural_data_reads.clone(),
+            source_intents,
         },
     );
     Ok(Some((proof, layout, patched_targets)))
 }
 
+#[cfg(test)]
 fn preview_document_patch_fast_path_allowed(
-    _patches: &[boon_runtime::RenderPatch<'static>],
+    previous_layout_proof: &Value,
+    patches: &[boon_runtime::RenderPatch<'static>],
 ) -> bool {
-    // TODO: Enable this only after the engine emits generic structural
-    // invalidation metadata for every render patch. Source-name allowlists are
-    // not acceptable here: the renderer must know whether a patch can affect
-    // conditional nodes, hit regions, list membership, source bindings, or
-    // layout structure independently of which example produced the event.
-    false
+    preview_document_patch_fast_path_rejection(previous_layout_proof, patches).is_none()
+}
+
+fn preview_document_patch_fast_path_rejection(
+    previous_layout_proof: &Value,
+    patches: &[boon_runtime::RenderPatch<'static>],
+) -> Option<String> {
+    if patches.is_empty() {
+        return Some("empty_patch_set".to_owned());
+    }
+    let Some(layout_hash) = previous_layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+    else {
+        return Some("missing_layout_hash".to_owned());
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return Some("missing_document_snapshot".to_owned());
+    };
+    for patch in patches {
+        if !render_invalidation_allows_sparse_document_patch(patch.invalidation) {
+            return Some(format!(
+                "structural_invalidation:{:?}:{}",
+                patch.invalidation, patch.kind
+            ));
+        }
+        let Some((path, _)) = document_data_patch_value(patch) else {
+            return Some(format!("unsupported_patch_kind:{}", patch.kind));
+        };
+        if let Some(structural_path) = snapshot
+            .structural_data_reads
+            .iter()
+            .find(|structural_path| document_data_paths_overlap(&path, structural_path))
+        {
+            return Some(format!("structural_data_overlap:{path}:{structural_path}"));
+        }
+    }
+    None
+}
+
+fn render_invalidation_allows_sparse_document_patch(
+    invalidation: boon_runtime::RenderInvalidation,
+) -> bool {
+    matches!(
+        invalidation,
+        boon_runtime::RenderInvalidation::Paint | boon_runtime::RenderInvalidation::Layout
+    )
+}
+
+fn document_data_paths_overlap(changed_path: &str, structural_path: &str) -> bool {
+    changed_path == structural_path
+        || changed_path
+            .strip_prefix(structural_path)
+            .is_some_and(|suffix| matches!(suffix.as_bytes().first(), Some(b'.' | b':')))
+        || structural_path
+            .strip_prefix(changed_path)
+            .is_some_and(|suffix| matches!(suffix.as_bytes().first(), Some(b'.' | b':')))
 }
 
 fn preview_note_render_error(
@@ -31920,6 +32524,7 @@ fn read_json(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     #[derive(Default)]
     struct TestClipboard {
@@ -31941,6 +32546,54 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    fn test_root_field_patch(path: &str) -> boon_runtime::RenderPatch<'static> {
+        boon_runtime::RenderPatch {
+            kind: "PatchRootField",
+            invalidation: boon_runtime::RenderInvalidation::Layout,
+            target: boon_runtime::RenderTarget::Static(Cow::Owned(path.to_owned())),
+            value: boon_runtime::ProtocolValue::Text(Cow::Borrowed("patched")),
+            list_id: None,
+            key: None,
+            generation: None,
+            source_id: None,
+            bind_epoch: None,
+        }
+    }
+
+    fn cache_test_document_snapshot(hash: &str, structural_reads: &[&str]) -> Value {
+        cache_document_render_snapshot(
+            hash.to_owned(),
+            DocumentRenderSnapshot {
+                document_frame: boon_document_model::DocumentFrame::empty("root"),
+                data_binding_targets: BTreeMap::new(),
+                structural_data_reads: structural_reads
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect(),
+                source_intents: Vec::new(),
+            },
+        );
+        json!({ "layout_frame_hash": hash })
+    }
+
+    #[test]
+    fn sparse_document_patch_gate_allows_nonstructural_data_patch() {
+        let proof =
+            cache_test_document_snapshot("test-sparse-patch-nonstructural", &["store.dialog_open"]);
+        let patch = test_root_field_patch("store.title");
+
+        assert!(preview_document_patch_fast_path_allowed(&proof, &[patch]));
+    }
+
+    #[test]
+    fn sparse_document_patch_gate_rejects_structural_data_patch() {
+        let proof =
+            cache_test_document_snapshot("test-sparse-patch-structural", &["store.dialog_open"]);
+        let patch = test_root_field_patch("store.dialog_open");
+
+        assert!(!preview_document_patch_fast_path_allowed(&proof, &[patch]));
     }
 
     fn physical_todomvc_body_font_family(theme: &str) -> &'static str {
@@ -32842,6 +33495,7 @@ mod tests {
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -32884,6 +33538,7 @@ mod tests {
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -32967,6 +33622,7 @@ mod tests {
                 data_binding_index: Arc::new(BTreeMap::new()),
                 data_reads: Arc::new(Mutex::new(BTreeSet::new())),
                 data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+                structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
                 source_override: None,
                 functions: Some(&functions),
                 eval_depth: 0,
@@ -33238,6 +33894,7 @@ mod tests {
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,
@@ -43294,6 +43951,7 @@ mod tests {
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             data_binding_targets: Arc::new(Mutex::new(BTreeMap::new())),
+            structural_data_reads: Arc::new(Mutex::new(BTreeSet::new())),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,

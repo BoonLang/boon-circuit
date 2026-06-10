@@ -347,6 +347,7 @@ pub struct SemanticDelta<'a> {
 #[derive(Clone, Debug)]
 pub struct RenderPatch<'a> {
     pub kind: &'static str,
+    pub invalidation: RenderInvalidation,
     pub target: RenderTarget<'a>,
     pub value: ProtocolValue<'a>,
     pub list_id: Option<Cow<'a, str>>,
@@ -354,6 +355,17 @@ pub struct RenderPatch<'a> {
     pub generation: Option<u64>,
     pub source_id: Option<u64>,
     pub bind_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RenderInvalidation {
+    Paint,
+    Layout,
+    HitRegion,
+    SourceBinding,
+    ListStructure,
+    ConditionalStructure,
+    DocumentStructure,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +413,7 @@ impl<'a> RenderPatch<'a> {
     fn to_static(&self) -> RenderPatch<'static> {
         RenderPatch {
             kind: self.kind,
+            invalidation: self.invalidation,
             target: self.target.to_static(),
             value: self.value.to_static(),
             list_id: self
@@ -468,8 +481,9 @@ impl Serialize for RenderPatch<'_> {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("RenderPatch", 8)?;
+        let mut state = serializer.serialize_struct("RenderPatch", 9)?;
         state.serialize_field("kind", self.kind)?;
+        state.serialize_field("invalidation", &self.invalidation)?;
         state.serialize_field("target", &self.target)?;
         state.serialize_field("value", &self.value)?;
         state.serialize_field("list_id", &self.list_id)?;
@@ -1276,8 +1290,10 @@ impl LiveRuntime {
             .runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         let apply_step_ms = runtime_elapsed_ms(apply_started);
-        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-        self.runtime.assert_step_after_measurement(step)?;
+        if scenario_step_has_expectations(step) {
+            assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+            self.runtime.assert_step_after_measurement(step)?;
+        }
         Ok(LiveTurnOutput {
             semantic_deltas: semantic_deltas
                 .iter()
@@ -1307,8 +1323,10 @@ impl LiveRuntime {
         self.runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         let apply_step_ms = runtime_elapsed_ms(apply_started);
-        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-        self.runtime.assert_step_after_measurement(step)?;
+        if scenario_step_has_expectations(step) {
+            assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+            self.runtime.assert_step_after_measurement(step)?;
+        }
         let summary_started = Instant::now();
         let state_summary = self.runtime.document_state_summary_for_window(
             row_start,
@@ -1340,8 +1358,10 @@ impl LiveRuntime {
         self.runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         let apply_step_ms = runtime_elapsed_ms(apply_started);
-        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-        self.runtime.assert_step_after_measurement(step)?;
+        if scenario_step_has_expectations(step) {
+            assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+            self.runtime.assert_step_after_measurement(step)?;
+        }
         let summary_started = Instant::now();
         let state_summary = if document_summary {
             self.runtime.document_state_summary()
@@ -1370,7 +1390,9 @@ impl LiveRuntime {
             && step.expect_render_delta_contains.is_empty()
         {
             let counts = self.runtime.apply_counted_step(step)?;
-            self.runtime.assert_step_after_measurement(step)?;
+            if scenario_step_has_expectations(step) {
+                self.runtime.assert_step_after_measurement(step)?;
+            }
             let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
             return Ok(LiveSparseStepOutput {
                 semantic_delta_count: counts.semantic_delta_count,
@@ -12857,8 +12879,9 @@ impl GenericRenderLoweringPlan {
         affordance: &'static str,
         _visible: bool,
     ) -> RuntimeResult<RenderPatch<'a>> {
-        Ok(patch(
+        Ok(invalidated_patch(
             "InvalidateDocument",
+            RenderInvalidation::DocumentStructure,
             RenderTarget::Static(Cow::Borrowed("document")),
             ProtocolValue::Text(Cow::Owned(format!("{list}.{affordance}"))),
         ))
@@ -12869,8 +12892,9 @@ impl GenericRenderLoweringPlan {
         commit: &GenericListRowCommit,
         to: usize,
     ) -> RuntimeResult<RenderPatch<'a>> {
-        Ok(patch(
+        Ok(invalidated_patch(
             "InvalidateDocument",
+            RenderInvalidation::ListStructure,
             RenderTarget::Static(Cow::Borrowed("document")),
             ProtocolValue::Text(Cow::Owned(format!("{}.position:{to}", commit.list))),
         ))
@@ -12967,8 +12991,23 @@ fn generic_document_invalidation_patch<'a>(
             ProtocolValue::Text(Cow::Owned(binding.source_path.clone()))
         }
     };
-    patch(
+    let invalidation = match mutation {
+        GenericSourceMutation::ListAppend(_) | GenericSourceMutation::ListRemove { .. } => {
+            RenderInvalidation::ListStructure
+        }
+        GenericSourceMutation::SourceBind(_) | GenericSourceMutation::SourceUnbind(_) => {
+            RenderInvalidation::SourceBinding
+        }
+        GenericSourceMutation::RootText(_)
+        | GenericSourceMutation::RootBool(_)
+        | GenericSourceMutation::TextField(_)
+        | GenericSourceMutation::TextFieldIdentity(_)
+        | GenericSourceMutation::ValueField(_)
+        | GenericSourceMutation::BoolField(_) => RenderInvalidation::DocumentStructure,
+    };
+    invalidated_patch(
         "InvalidateDocument",
+        invalidation,
         RenderTarget::Static(Cow::Borrowed("document")),
         value,
     )
@@ -17659,8 +17698,18 @@ fn patch<'a>(
     target: RenderTarget<'a>,
     value: ProtocolValue<'a>,
 ) -> RenderPatch<'a> {
+    invalidated_patch(kind, RenderInvalidation::Layout, target, value)
+}
+
+fn invalidated_patch<'a>(
+    kind: &'static str,
+    invalidation: RenderInvalidation,
+    target: RenderTarget<'a>,
+    value: ProtocolValue<'a>,
+) -> RenderPatch<'a> {
     RenderPatch {
         kind,
+        invalidation,
         target,
         value,
         list_id: None,
@@ -17728,6 +17777,25 @@ fn assert_delta_expectations(
         }
     }
     Ok(())
+}
+
+fn scenario_step_has_expectations(step: &ScenarioStep) -> bool {
+    step.expect_titles.is_some()
+        || step.expect_visible_titles.is_some()
+        || step.expect_completed_titles.is_some()
+        || step.expect_active_count.is_some()
+        || step.expect_completed_count.is_some()
+        || step.expect_filter.is_some()
+        || step.expect_new_text.is_some()
+        || step.expect_editing_title.is_some()
+        || step.expect_edit_text.is_some()
+        || step.expect_no_editing.is_some()
+        || step.expect_cell.is_some()
+        || step.expect_error.is_some()
+        || step.expect_recomputed.is_some()
+        || !step.expect_semantic_delta_contains.is_empty()
+        || !step.expect_render_delta_contains.is_empty()
+        || !step.expect_root_text.is_empty()
 }
 
 fn semantic_delta_matches(delta: &SemanticDelta<'_>, expected: &str) -> bool {

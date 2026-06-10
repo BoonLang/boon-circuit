@@ -1557,6 +1557,8 @@ store: [
     selected_waveform_segments:
         waveform_segment_records
         |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/filter_field_not_equal(field: "state", value: CursorLine)
+        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
         |> List/retain(segment, if: waveform_segment_is_visible(segment: segment))
         |> List/map(segment, new: new_waveform_segment(segment: segment))
 
@@ -2886,7 +2888,7 @@ FUNCTION new_waveform_segment(segment) {
         projection_source: RuntimeTimelineMetadata
         width: segment.file == store.active_file |> WHEN {
             True => segment.state |> WHEN {
-                CursorLine => Number/project_offset(time: store.selected_timeline_cursor_value, viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
+                CursorLine => 0
                 MarkerLine => 0
                 __ => Number/project_width(start_time: Number/max(left: segment.start_time_value, right: store.viewport_label_start), end_time: Number/min(left: segment.end_time_value, right: store.viewport_label_end), viewport_start: store.viewport_label_start, viewport_end: store.viewport_label_end, canvas_width: store.selected_waveform_canvas_width, fallback: 0, zoom: store.waveform_projection_zoom_level)
             }
@@ -2900,8 +2902,8 @@ FUNCTION new_waveform_segment(segment) {
 
 FUNCTION waveform_segment_is_visible(segment) {
     segment.state |> WHEN {
-        CursorLine => True
-        MarkerLine => True
+        CursorLine => False
+        MarkerLine => False
         __ => segment.end_time_value > store.viewport_label_start |> WHEN {
             True => segment.start_time_value < store.viewport_label_end
             False => False

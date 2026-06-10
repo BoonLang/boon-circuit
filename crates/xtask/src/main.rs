@@ -10222,8 +10222,8 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .map(layout_display_texts)
         .unwrap_or_default();
     let required_initial_loaded_labels = [
-        "NovyWave.io",
-        "Files and scopes",
+        "NovyWave",
+        "Files & Scopes",
         "Variables",
         "Selected Variables",
         "single file: simple.vcd",
@@ -10253,7 +10253,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .unwrap_or_default();
 
     let required_empty_labels = [
-        "NovyWave.io",
+        "NovyWave",
         "No waveform loaded",
         "Drop or load a VCD, FST, or GHW waveform to inspect signals.",
         "Bridge state: no request scheduled; pure descriptor is wave:none",
@@ -10286,7 +10286,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
     }
 
     let required_loaded_labels = [
-        "Files and scopes",
+        "Files & Scopes",
         "Variables",
         "Selected Variables",
         "comparing simple.vcd to wave_27.fst",

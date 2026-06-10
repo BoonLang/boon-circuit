@@ -2544,7 +2544,7 @@ store: [
         bridge_response_compact_label
 
     bridge_request_descriptor_label:
-        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_label, format: value_format)
+        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: value_format)
 
     bridge_response_descriptor_label:
         TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {

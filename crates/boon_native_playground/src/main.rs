@@ -2656,6 +2656,9 @@ fn persist_novywave_ui_state_for_summary(source_path: &Path, summary: &Value) {
     let Some(state) = novywave_ui_state_from_summary(summary) else {
         return;
     };
+    if matches!(load_novywave_ui_state_from_path(&path), Ok(Some(existing)) if existing == state) {
+        return;
+    }
     if let Err(error) = save_novywave_ui_state_to_path(&path, &state) {
         eprintln!(
             "boon_native_playground: failed to persist NovyWave UI state at {}: {error}",
@@ -27999,10 +28002,6 @@ fn preview_apply_live_events_internal(
             shared.layout_proof.clone(),
         )
     };
-    let novywave_hover_only = source_path_is_novywave(source_path)
-        && events
-            .iter()
-            .all(|event| event.source == "store.elements.waveform_hover");
     let runtime_lock_wait_ms: f64;
     let runtime_apply_ms: f64;
     let mut semantic_delta_count = 0_u64;
@@ -28096,9 +28095,6 @@ fn preview_apply_live_events_internal(
                 }
             }
         }
-        if !novywave_hover_only && event_count > 0 {
-            changed = true;
-        }
         if render_patches_for_layout.len() > 1 {
             render_patches_for_layout = coalesced_render_patches(render_patches_for_layout);
         }
@@ -28137,10 +28133,7 @@ fn preview_apply_live_events_internal(
         (state_summary, event_count, changed)
     };
     let persist_started = Instant::now();
-    if changed
-        && !novywave_hover_only
-        && let Some(state_summary) = state_summary.as_ref()
-    {
+    if changed && let Some(state_summary) = state_summary.as_ref() {
         persist_novywave_ui_state_for_summary(source_path, &state_summary);
     }
     let persist_ui_state_ms = elapsed_ms(persist_started);
@@ -32007,13 +32000,18 @@ fn preview_operator_host_input_response(
                         .get("address")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|address| !address.is_empty())
-                    || later_event
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|source| source == "store.elements.remove_completed_button")
             });
+        let input_needs_materialized_frame_evidence = later_input_needs_materialized_target
+            || event
+                .target_text
+                .as_deref()
+                .is_some_and(|target| !target.is_empty())
+            || event
+                .address
+                .as_deref()
+                .is_some_and(|address| !address.is_empty());
         if (!output.render_patches.is_empty() || !output.semantic_deltas.is_empty())
-            && later_input_needs_materialized_target
+            && input_needs_materialized_frame_evidence
         {
             let focus_only_updated =
                 if event.address.is_some() && event.text.is_none() && event.key.is_none() {
@@ -32585,9 +32583,62 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
     let mut preview_shared_render_update_count = 0_u64;
     let mut status = "pass";
     let mut first = serde_json::Value::Null;
+    let mut operator_host_input = false;
+    let mut real_os_input = false;
+    let mut private_runtime_dispatch_used = false;
+    let mut source_event_only_ipc_shortcut = false;
+    let mut preview_received_scenario_data = false;
+    let mut route_contract = serde_json::Value::Null;
+    let mut public_runtime_api = serde_json::Value::Null;
+    let mut runtime_origin = serde_json::Value::Null;
+    let mut input_injection_method = serde_json::Value::Null;
     for response in responses {
         if first.is_null() {
             first = response.clone();
+        }
+        operator_host_input |= response
+            .get("operator_host_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        real_os_input |= response
+            .get("real_os_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        private_runtime_dispatch_used |= response
+            .get("private_runtime_dispatch_used")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        source_event_only_ipc_shortcut |= response
+            .get("source_event_only_ipc_shortcut")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        preview_received_scenario_data |= response
+            .get("preview_received_scenario_data")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if route_contract.is_null() {
+            route_contract = response
+                .get("route_contract")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if public_runtime_api.is_null() {
+            public_runtime_api = response
+                .get("public_runtime_api")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if runtime_origin.is_null() {
+            runtime_origin = response
+                .get("runtime_origin")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        if input_injection_method.is_null() {
+            input_injection_method = response
+                .get("input_injection_method")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
         }
         if response.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
             status = "fail";
@@ -32623,6 +32674,15 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
     first["status"] = json!(status);
     first["scenario_batch_count"] = json!(response_count);
     first["batched_operator_host_input"] = json!(true);
+    first["operator_host_input"] = json!(operator_host_input);
+    first["real_os_input"] = json!(real_os_input);
+    first["private_runtime_dispatch_used"] = json!(private_runtime_dispatch_used);
+    first["source_event_only_ipc_shortcut"] = json!(source_event_only_ipc_shortcut);
+    first["preview_received_scenario_data"] = json!(preview_received_scenario_data);
+    first["route_contract"] = route_contract;
+    first["public_runtime_api"] = public_runtime_api;
+    first["runtime_origin"] = runtime_origin;
+    first["input_injection_method"] = input_injection_method;
     first["assertions"] = json!(assertions);
     first["host_route_assertions"] = json!(host_route_assertions);
     first["outputs"] = json!(outputs);

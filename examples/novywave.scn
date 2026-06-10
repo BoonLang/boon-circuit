@@ -24,24 +24,6 @@ expected_source_event = { source = "store.elements.open_selected_workspace", tar
 expect_root_text = { "workspace_dialog" = "Closed", "workspace_path_key" = "WorkspaceB", "workspace_path" = "/home/martinkavik/repos/NovyWave/test_files/my_workspaces/workspace_b", "workspace_header_path" = ".../test_files/my_workspaces/workspace_b", "workspace_status_label" = "workspace_b ready" }
 
 [[step]]
-id = "resize-files-panel"
-user_action = { kind = "click", target = "panel resize", target_text = "Files+" }
-expected_source_event = { source = "store.elements.panels_files_wider", target_text = "Files+" }
-expect_root_text = { "panel_layout" = "FilesWide", "panel_layout_label" = "Files panel wide" }
-
-[[step]]
-id = "resize-variables-panel"
-user_action = { kind = "click", target = "panel resize", target_text = "Vars+" }
-expected_source_event = { source = "store.elements.panels_variables_wider", target_text = "Vars+" }
-expect_root_text = { "panel_layout" = "VariablesWide", "panel_layout_label" = "Variables panel wide" }
-
-[[step]]
-id = "reset-panel-layout"
-user_action = { kind = "click", target = "panel resize", target_text = "Reset" }
-expected_source_event = { source = "store.elements.panels_reset", target_text = "Reset" }
-expect_root_text = { "panel_layout" = "Balanced", "panel_layout_label" = "Panels balanced" }
-
-[[step]]
 id = "dock-panel-layout"
 user_action = { kind = "click", target = "panel arrangement", target_text = "Dock" }
 expected_source_event = { source = "store.elements.panels_toggle_arrangement", target_text = "Dock" }

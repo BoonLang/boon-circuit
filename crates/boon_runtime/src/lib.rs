@@ -19413,7 +19413,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         assert_eq!(output.state_summary["cursor_position"], "Cursor36");
         assert_eq!(
             output.state_summary["store"]["bridge_request_descriptor_label"],
-            "TOP_CPU/DATA_BUS/Fit/RightWindow/Cursor36/Hexadecimal"
+            "SIMPLE_TB_S/DATA_BUS/Fit/RightWindow/Cursor36/Hexadecimal"
         );
 
         let output = runtime
@@ -19426,7 +19426,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         assert_eq!(output.state_summary["store"]["cursor_position"], "Cursor36");
         assert_eq!(
             output.state_summary["store"]["bridge_request_descriptor_label"],
-            "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
+            "SIMPLE_TB_S/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
         );
     }
 

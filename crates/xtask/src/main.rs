@@ -17287,6 +17287,7 @@ fn verify_native_gpu_novywave_interaction_speed(
         Some(
             Command::new(&binary_path)
                 .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+                .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
                 .args([
                     "--role",
                     "interaction-speed",

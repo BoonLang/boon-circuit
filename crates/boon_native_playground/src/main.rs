@@ -25100,7 +25100,6 @@ fn preview_try_apply_simple_source_click_input(
         || !input_state.pending_live_events.is_empty()
         || !input.keyboard_events.is_empty()
         || !input.pressed_keys.is_empty()
-        || input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
     {
         return reject("precondition");
     }
@@ -25171,6 +25170,9 @@ fn preview_try_apply_simple_source_click_input(
     input_state.last_mouse_button_event_count = input_state
         .last_mouse_button_event_count
         .max(release.sequence);
+    input_state.last_mouse_motion_event_count = input_state
+        .last_mouse_motion_event_count
+        .max(input.mouse_motion_event_count);
     if !preserve_focus {
         preview_clear_focused_input_state(input_state);
     }
@@ -25300,7 +25302,12 @@ fn preview_apply_real_window_input_with_units(
         )?);
     }
     drag_events_ms += elapsed_ms(drag_events_started);
-    if motion_changed {
+    let has_pending_primary_button_event =
+        !unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count)
+            .is_empty()
+            || !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
+                .is_empty();
+    if motion_changed && !has_pending_primary_button_event {
         let pointer_move_started = Instant::now();
         let hover_layout = latest_layout.as_ref().unwrap_or(&layout_proof);
         if let Some((position, hit_region)) = input.mouse_window_pos.and_then(|position| {
@@ -28888,9 +28895,11 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let mut patched_targets = 0usize;
     let mut patched_target_samples = Vec::new();
     for (path, value) in patch_values {
-        let Some(targets) = snapshot.data_binding_targets.get(&path) else {
-            continue;
-        };
+        let targets = snapshot
+            .data_binding_targets
+            .get(&path)
+            .into_iter()
+            .flatten();
         for target in targets {
             let Some(node) = frame.nodes.get_mut(&target.node) else {
                 return Ok(None);
@@ -28992,8 +29001,11 @@ fn preview_try_patch_document_layout_for_root_deltas(
 fn preview_document_patch_fast_path_allowed(
     _patches: &[boon_runtime::RenderPatch<'static>],
 ) -> bool {
-    // Data-binding patches do not yet carry structural invalidation metadata.
-    // Rebuild the document tree so conditional nodes and hit regions cannot stay stale.
+    // TODO: Enable this only after the engine emits generic structural
+    // invalidation metadata for every render patch. Source-name allowlists are
+    // not acceptable here: the renderer must know whether a patch can affect
+    // conditional nodes, hit regions, list membership, source bindings, or
+    // layout structure independently of which example produced the event.
     false
 }
 
@@ -45438,8 +45450,7 @@ mod tests {
         );
         {
             let cursor36_frame = latest_preview_frame(&shared_render_state);
-            let cursor36_line_x =
-                assert_waveform_guide_lines(&cursor36_frame, "0 s", "#D6B73F");
+            let cursor36_line_x = assert_waveform_guide_lines(&cursor36_frame, "0 s", "#D6B73F");
             physical_frame_text_item(&cursor36_frame, "0xa", "NovyWave 0 s value column A value");
             physical_frame_text_item(
                 &cursor36_frame,
@@ -45525,8 +45536,10 @@ mod tests {
             waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xa");
         let repeated_zoom_released_width =
             waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xc");
-        let repeated_zoom_canvas_width =
-            summary_number(&repeated_zoom_summary, "/store/selected_waveform_canvas_width");
+        let repeated_zoom_canvas_width = summary_number(
+            &repeated_zoom_summary,
+            "/store/selected_waveform_canvas_width",
+        );
         let expected_repeated_zoom_leading_width = repeated_zoom_canvas_width * (10.0 / 40.0);
         assert!(
             (repeated_zoom_leading_width - expected_repeated_zoom_leading_width).abs() <= 1.0,

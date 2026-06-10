@@ -6710,18 +6710,43 @@ fn prefix_payload_concat_update_expression(
 
 fn source_payload_field_from_path(path: &str, source_variants: &[String]) -> Option<String> {
     source_variants.iter().find_map(|variant| {
-        let suffix = path.strip_prefix(variant)?.strip_prefix('.')?;
+        let suffix = source_payload_suffix_from_variant(path, variant)?;
         Some(match suffix {
-            "change.text" | "event.change.text" => "text".to_owned(),
-            "key_down.key" | "event.key_down.key" => "key".to_owned(),
-            "event.address" => "address".to_owned(),
+            "change.text" | "event.change.text" | "events.change.text" => "text".to_owned(),
+            "key_down.key" | "event.key_down.key" | "events.key_down.key" => "key".to_owned(),
+            "event.address" | "events.address" => "address".to_owned(),
             _ if !suffix.contains('.') => suffix.to_owned(),
             _ if suffix.starts_with("event.") && !suffix["event.".len()..].contains('.') => {
                 suffix["event.".len()..].to_owned()
             }
+            _ if suffix.starts_with("events.") && !suffix["events.".len()..].contains('.') => {
+                suffix["events.".len()..].to_owned()
+            }
             _ => return None,
         })
     })
+}
+
+fn source_payload_suffix_from_variant<'a>(path: &'a str, variant: &str) -> Option<&'a str> {
+    if let Some(suffix) = path
+        .strip_prefix(variant)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+    {
+        return Some(suffix);
+    }
+    let (base, event) = variant.rsplit_once('.')?;
+    for event_prefix in [
+        format!("{base}.event.{event}"),
+        format!("{base}.events.{event}"),
+    ] {
+        if let Some(suffix) = path
+            .strip_prefix(&event_prefix)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+        {
+            return Some(suffix);
+        }
+    }
+    None
 }
 
 impl FieldDef {
@@ -6812,12 +6837,6 @@ impl FieldDef {
                 }
                 _ => None,
             })
-            .chain(self.ast_exprs.iter().filter_map(|expr| match &expr.kind {
-                AstExprKind::MatchArm { pattern, .. } if pattern.len() == 1 => {
-                    Some(pattern[0].clone())
-                }
-                _ => None,
-            }))
             .filter(|name| name != "__" && name != "SKIP")
             .map(|name| SourcePayloadField::from_name(&name))
             .collect()

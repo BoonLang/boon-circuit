@@ -186,6 +186,38 @@ The next review narrowed the remaining work into three generic problem areas.
 - Root-only patches should stay conservative, but list-row and list-view patches
   are required before cursor clicks and first hover can avoid full relayout.
 
+### Generic Structural Patch TODOs
+
+- Do not use event source names, example ids, Boon file paths, target labels, or
+  scenario step ids to decide whether a preview turn can skip full document
+  lowering. Any such allowlist is a benchmark shortcut, not an engine fix.
+- Extend IR lowering so every view node records the exact runtime dependencies
+  that can affect its existence, parent/child membership, source bindings, hit
+  region, layout-affecting style, paint-only style, text, and accessibility
+  metadata.
+- Extend runtime render patches with a generic invalidation class:
+  `PaintOnly`, `LayoutOnly`, `HitRegion`, `SourceBinding`, `ListStructure`,
+  `ConditionalStructure`, and `FullDocument`. The class must be derived from
+  typed dependencies, not from current examples.
+- Split the document patcher into generic stages:
+  update the runtime-state snapshot for all patches, update bound text/paint
+  attrs for paint-only patches, relayout cached document frames for layout-only
+  patches, and fall back to full document lowering only for structural patches.
+- Add generic list-view patch semantics for root projections and `ForEach`
+  output: stable row identity, keyed inserts/removes/moves, row-field updates,
+  and view-origin metadata that maps runtime deltas to document nodes.
+- Make the sparse patch verifier fail if a patch is applied because of a
+  source-name/example-name allowlist. The report should instead show dependency
+  classes, patched node/attr samples, skipped unbound non-visual patches, and
+  the reason for any full-lowering fallback.
+- Keep a negative fixture where a dialog or conditional branch opens from a root
+  field change; it must prove the patcher chooses structural invalidation rather
+  than leaving stale hidden nodes or stale hit regions.
+- Keep a positive fixture where unrelated internal bookkeeping fields change
+  alongside visible paint/layout fields; it must prove the patcher can update
+  state snapshots without forcing full document lowering when dependency
+  metadata says the bookkeeping fields are non-visual.
+
 ## Implementation Phases
 
 ### Phase 0: Baseline Verifier And Instrumentation

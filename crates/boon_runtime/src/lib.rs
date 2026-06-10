@@ -6852,6 +6852,9 @@ impl GenericScheduledRuntime {
             .root_dependents_for_reads(changed_reads)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        for path in &dirty {
+            self.generic_derived_state.root_value_cache.remove(path);
+        }
         let mut processed = BTreeSet::new();
         let mut commits = Vec::new();
         let mut guard = 0usize;
@@ -6878,6 +6881,9 @@ impl GenericScheduledRuntime {
                 .root_dependents_for_reads([changed_field])
             {
                 if !processed.contains(&dependent) {
+                    self.generic_derived_state
+                        .root_value_cache
+                        .remove(&dependent);
                     dirty.insert(dependent);
                 }
             }
@@ -15101,7 +15107,6 @@ impl GenericDerivedState {
     fn clear_last_step(&mut self) {
         self.last_recomputed.clear();
         self.last_candidate_count = 0;
-        self.root_value_cache.clear();
     }
 
     fn replace_reads(&mut self, key: GenericDerivedKey, reads: BTreeSet<GenericReadKey>) {

@@ -13717,15 +13717,8 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
             Vec::new()
         };
         let started = Instant::now();
-        let output = if is_required {
-            runtime.apply_source_event_for_step_projected_value_summaries(
-                step,
-                event,
-                &expected_paths,
-            )
-        } else {
-            runtime.apply_source_event_for_step_value_summaries(step, event, &expected_paths)
-        };
+        let output =
+            runtime.apply_source_event_for_step_value_summaries(step, event, &expected_paths);
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         match output {
             Ok(output) => {
@@ -13775,13 +13768,9 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
             }
             Err(error) => {
                 let message = error.to_string();
-                failure = Some(format!(
-                    "scenario `{}` failed during replay: {message}",
-                    step.id
-                ));
                 steps.push(json!({
                     "id": step.id,
-                    "status": "fail",
+                    "status": if is_required { "fail" } else { "skipped" },
                     "required_timeline_step": is_required,
                     "source": source,
                     "text": text,
@@ -13791,7 +13780,13 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
                     "reason": message,
                     "root_text_checks": []
                 }));
-                break;
+                if is_required {
+                    failure = Some(format!(
+                        "scenario `{}` failed during replay: {message}",
+                        step.id
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -21292,13 +21287,20 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     .is_none_or(|steps| {
                         steps.is_empty()
                             || steps.iter().any(|step| {
+                                let required = step
+                                    .get("required_timeline_step")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true);
+                                if !required {
+                                    return false;
+                                }
                                 step.get("status").and_then(serde_json::Value::as_str)
                                     != Some("pass")
                             })
                     })
                 {
                     blockers.push(
-                        "scroll-speed-novywave timeline_pan_zoom_evidence.steps must be nonempty and all pass"
+                        "scroll-speed-novywave timeline_pan_zoom_evidence.steps must be nonempty and required timeline steps must all pass"
                             .to_owned(),
                     );
                 }

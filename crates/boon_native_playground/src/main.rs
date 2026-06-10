@@ -3242,6 +3242,7 @@ type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>
 #[derive(Clone, Debug)]
 struct DocumentRenderSnapshot {
     document_frame: boon_document_model::DocumentFrame,
+    layout_frame: boon_document::LayoutFrame,
     data_binding_targets: DocumentDataBindingIndex,
     structural_data_reads: BTreeSet<String>,
     source_intents: Vec<Value>,
@@ -3473,8 +3474,11 @@ fn document_render_snapshot_cache() -> &'static Mutex<BTreeMap<String, Arc<Docum
 
 fn cache_document_render_snapshot(hash: String, snapshot: DocumentRenderSnapshot) {
     if let Ok(mut cache) = document_render_snapshot_cache().lock() {
-        if cache.len() > 64 {
-            cache.clear();
+        while cache.len() >= 256 && !cache.contains_key(&hash) {
+            let Some(oldest_key) = cache.keys().next().cloned() else {
+                break;
+            };
+            cache.remove(&oldest_key);
         }
         cache.insert(hash, Arc::new(snapshot));
     }
@@ -3549,6 +3553,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
                 hash,
                 DocumentRenderSnapshot {
                     document_frame: entry.document_frame.clone(),
+                    layout_frame: entry.layout_frame.clone(),
                     data_binding_targets: entry.data_binding_targets.clone(),
                     structural_data_reads: entry.structural_data_reads.clone(),
                     source_intents: entry.source_intents.clone(),
@@ -3882,8 +3887,11 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
     proof["structural_data_read_samples"] = json!(structural_data_read_samples);
     if let Some(cache_key) = cache_key {
         if let Ok(mut cache) = document_layout_cache().lock() {
-            if cache.len() > 32 {
-                cache.clear();
+            while cache.len() >= 128 && !cache.contains_key(&cache_key) {
+                let Some(oldest_key) = cache.keys().next().cloned() else {
+                    break;
+                };
+                cache.remove(&oldest_key);
             }
             cache.insert(
                 cache_key,
@@ -3902,6 +3910,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport(
         layout_frame_hash.clone(),
         DocumentRenderSnapshot {
             document_frame: frame,
+            layout_frame: layout.clone(),
             data_binding_targets,
             structural_data_reads,
             source_intents: source_intent_assertions,
@@ -25793,10 +25802,13 @@ fn preview_try_apply_simple_source_click_input(
     };
     let resolve_started = Instant::now();
     let mut click_resolve_source = "hit_test";
-    let cached_candidate = (preview_mouse_position_key(input.mouse_window_pos)
-        == input_state.last_hover_window_position)
-        .then(|| input_state.hovered_click_candidate.clone())
-        .flatten();
+    let cached_candidate = input_state
+        .hovered_click_candidate
+        .as_ref()
+        .filter(|candidate| {
+            preview_cached_bounds_contains(candidate.bounds, position.x, position.y)
+        })
+        .cloned();
     let (events, node, target_text, preserve_focus) = if let Some(candidate) = cached_candidate {
         if candidate.text_change {
             return reject("text_change");
@@ -25951,7 +25963,15 @@ fn preview_try_apply_simple_source_click_input(
         }
     };
     let resolve_ms = elapsed_ms(resolve_started);
-    let focus_overlay_needed = preserve_focus || input_state.focused_node.is_some();
+    let focus_overlay_needed = input_state
+        .focused_node
+        .as_deref()
+        .is_some_and(|focused_node| {
+            let shared = shared_render_state.lock().ok();
+            shared.as_ref().is_some_and(|shared| {
+                live_source_for_node_intent(&shared.layout_proof, focused_node, "change").is_some()
+            })
+        });
     for press in presses {
         input_state.last_mouse_press_event_count =
             input_state.last_mouse_press_event_count.max(press.sequence);
@@ -27082,6 +27102,15 @@ fn rect_contains_bounds_with_epsilon(
         && outer.y + outer.height >= inner.y + inner.height - epsilon
 }
 
+fn preview_cached_bounds_contains(
+    bounds: (f64, f64, f64, f64),
+    position_x: f64,
+    position_y: f64,
+) -> bool {
+    let (x, y, width, height) = bounds;
+    position_x >= x && position_y >= y && position_x <= x + width && position_y <= y + height
+}
+
 fn display_style_text<'a>(
     style: &'a BTreeMap<String, boon_document_model::StyleValue>,
     key: &str,
@@ -28202,6 +28231,7 @@ fn preview_apply_live_events_internal(
                 viewport,
                 scroll_x_px,
                 scroll_y_px,
+                return_layout,
             )?
     {
         let layout_rebuild_ms = elapsed_ms(layout_started);
@@ -30160,6 +30190,7 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
         layout_frame_hash,
         DocumentRenderSnapshot {
             document_frame: snapshot.document_frame.clone(),
+            layout_frame: layout.clone(),
             data_binding_targets: snapshot.data_binding_targets.clone(),
             structural_data_reads: snapshot.structural_data_reads.clone(),
             source_intents: snapshot.source_intents.clone(),
@@ -30175,6 +30206,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     viewport: Option<(f32, f32)>,
     scroll_x_px: f64,
     scroll_y_px: f64,
+    full_proof: bool,
 ) -> Result<Option<(Value, boon_document::LayoutFrame, usize)>, Box<dyn std::error::Error>> {
     if scroll_x_px.abs() > f64::EPSILON || scroll_y_px.abs() > f64::EPSILON {
         return Ok(None);
@@ -30267,23 +30299,30 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let viewport = viewport
         .or_else(|| layout_proof_viewport(previous_layout_proof))
         .ok_or("patched layout proof has no viewport")?;
-    let layout = layout_frame_for_document_frame(&frame, viewport)?;
     let layout_frame_hash =
         incremental_layout_frame_hash("patched-document-frame", layout_hash, viewport, patches);
+    let (layout, cached_patched_layout) =
+        if let Some(cached) = cached_document_render_snapshot(&layout_frame_hash) {
+            (cached.layout_frame.clone(), true)
+        } else {
+            (layout_frame_for_document_frame(&frame, viewport)?, false)
+        };
     let mut proof = previous_layout_proof.clone();
     proof["layout_frame_hash"] = json!(layout_frame_hash.clone());
-    proof["layout_cache_hit"] = json!(false);
+    proof["layout_cache_hit"] = json!(cached_patched_layout);
     proof["layout_cache_key"] = json!("patched-document-frame");
     proof["runtime_document_state_snapshot"] = state_summary.clone();
     proof["display_item_count"] = json!(layout.display_list.len());
-    proof["display_item_samples"] = serde_json::to_value(
-        layout
-            .display_list
-            .iter()
-            .take(256)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )?;
+    if full_proof {
+        proof["display_item_samples"] = serde_json::to_value(
+            layout
+                .display_list
+                .iter()
+                .take(256)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
+    }
     let hit_target_assertions = serde_json::to_value(&layout.hit_regions)?
         .as_array()
         .cloned()
@@ -30307,25 +30346,27 @@ fn preview_try_patch_document_layout_for_root_deltas(
         Value::Array(source_intents.iter().take(256).cloned().collect::<Vec<_>>());
     proof["source_intent_index"] = source_intent_index;
     proof["source_intent_value_index"] = source_intent_value_index;
-    proof["data_binding_index_count"] = json!(
-        snapshot
-            .data_binding_targets
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
-    );
-    proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
-    proof["structural_data_read_count"] = json!(snapshot.structural_data_reads.len());
-    proof["structural_data_read_samples"] = json!(
-        snapshot
-            .structural_data_reads
-            .iter()
-            .take(256)
-            .cloned()
-            .collect::<Vec<_>>()
-    );
+    if full_proof {
+        proof["data_binding_index_count"] = json!(
+            snapshot
+                .data_binding_targets
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+        );
+        proof["data_binding_target_paths"] = json!(snapshot.data_binding_targets.len());
+        proof["structural_data_read_count"] = json!(snapshot.structural_data_reads.len());
+        proof["structural_data_read_samples"] = json!(
+            snapshot
+                .structural_data_reads
+                .iter()
+                .take(256)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
     proof["layout_profile"] = json!({
-        "layout_cache_hit": false,
+        "layout_cache_hit": cached_patched_layout,
         "patched_document_frame": true,
         "incremental_layout_frame_hash": true,
         "patched_target_count": patched_targets,
@@ -30338,6 +30379,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
         layout_frame_hash,
         DocumentRenderSnapshot {
             document_frame: frame,
+            layout_frame: layout.clone(),
             data_binding_targets: snapshot.data_binding_targets.clone(),
             structural_data_reads: snapshot.structural_data_reads.clone(),
             source_intents,
@@ -33364,6 +33406,14 @@ mod tests {
             hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: boon_document_model::DocumentFrame::empty("root"),
+                layout_frame: boon_document::LayoutFrame {
+                    display_list: Vec::new(),
+                    hit_regions: Vec::new(),
+                    scroll_regions: Vec::new(),
+                    accessibility: boon_document::AccessibilityTree { node_count: 0 },
+                    demands: Vec::new(),
+                    metrics: boon_document::LayoutMetrics::default(),
+                },
                 data_binding_targets: BTreeMap::new(),
                 structural_data_reads: structural_reads
                     .iter()

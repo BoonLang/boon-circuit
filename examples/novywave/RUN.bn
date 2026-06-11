@@ -70,6 +70,7 @@ store: [
         selected_remove_ghw_counter: SOURCE
         selected_remove_ghw_enable: SOURCE
         selected_remove_ghw_state: SOURCE
+        selected_clear_all: SOURCE
         selected_restore_data: SOURCE
         selected_data_up: SOURCE
         selected_data_down: SOURCE
@@ -1052,19 +1053,19 @@ store: [
 
     signal_catalog:
         LIST {
-            [key: TEXT { clk }, scope: TEXT { simple_tb.s }, name: TEXT { A[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }]
-            [key: TEXT { reset_n }, scope: TEXT { simple_tb.s }, name: TEXT { B[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }]
-            [key: TEXT { tx_data }, scope: TEXT { top.uart }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { uart }]
-            [key: TEXT { rx_data }, scope: TEXT { top.uart }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }, family: TEXT { uart }]
-            [key: TEXT { baud_tick }, scope: TEXT { top.uart }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { uart }]
-            [key: TEXT { uart_busy }, scope: TEXT { top.uart }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }, family: TEXT { uart }]
-            [key: TEXT { framing_error }, scope: TEXT { top.uart }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }, family: TEXT { uart }]
-            [key: TEXT { temperature }, scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }, family: TEXT { analog }]
-            [key: TEXT { voltage }, scope: TEXT { top.analog }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }, family: TEXT { analog }]
-            [key: TEXT { ghw_counter }, scope: TEXT { ghw.simple }, name: TEXT { ghw.counter[3:0] }, kind: TEXT { Reg }, bit_width: TEXT { 4-bit }, direction: TEXT { Counter }, family: TEXT { ghw }]
-            [key: TEXT { ghw_enable }, scope: TEXT { ghw.simple }, name: TEXT { ghw.enable }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { ghw }]
-            [key: TEXT { ghw_state }, scope: TEXT { ghw.simple }, name: TEXT { ghw.state }, kind: TEXT { Reg }, bit_width: TEXT { 2-bit }, direction: TEXT { State }, family: TEXT { ghw }]
-            [key: TEXT { ghw_clk }, scope: TEXT { ghw.simple }, name: TEXT { ghw.clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { ghw }]
+            [key: TEXT { clk }, scope: TEXT { simple_tb.s }, name: TEXT { A[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }, selected_initial: True]
+            [key: TEXT { reset_n }, scope: TEXT { simple_tb.s }, name: TEXT { B[3:0] }, kind: TEXT { Wire }, bit_width: TEXT { 4-bit }, direction: TEXT { Signal }, family: TEXT { simple_vcd }, selected_initial: True]
+            [key: TEXT { tx_data }, scope: TEXT { top.uart }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { uart }, selected_initial: True]
+            [key: TEXT { rx_data }, scope: TEXT { top.uart }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }, family: TEXT { uart }, selected_initial: True]
+            [key: TEXT { baud_tick }, scope: TEXT { top.uart }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { uart }, selected_initial: True]
+            [key: TEXT { uart_busy }, scope: TEXT { top.uart }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }, family: TEXT { uart }, selected_initial: True]
+            [key: TEXT { framing_error }, scope: TEXT { top.uart }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }, family: TEXT { uart }, selected_initial: False]
+            [key: TEXT { temperature }, scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }, family: TEXT { analog }, selected_initial: True]
+            [key: TEXT { voltage }, scope: TEXT { top.analog }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }, family: TEXT { analog }, selected_initial: False]
+            [key: TEXT { ghw_counter }, scope: TEXT { ghw.simple }, name: TEXT { ghw.counter[3:0] }, kind: TEXT { Reg }, bit_width: TEXT { 4-bit }, direction: TEXT { Counter }, family: TEXT { ghw }, selected_initial: True]
+            [key: TEXT { ghw_enable }, scope: TEXT { ghw.simple }, name: TEXT { ghw.enable }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { ghw }, selected_initial: True]
+            [key: TEXT { ghw_state }, scope: TEXT { ghw.simple }, name: TEXT { ghw.state }, kind: TEXT { Reg }, bit_width: TEXT { 2-bit }, direction: TEXT { State }, family: TEXT { ghw }, selected_initial: True]
+            [key: TEXT { ghw_clk }, scope: TEXT { ghw.simple }, name: TEXT { ghw.clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { ghw }, selected_initial: False]
         }
         |> List/map(signal, new: new_signal(signal: signal))
 
@@ -1256,6 +1257,7 @@ store: [
             elements.selected_remove_ghw_counter.event.press |> THEN { WithoutSelection }
             elements.selected_remove_ghw_enable.event.press |> THEN { WithoutSelection }
             elements.selected_remove_ghw_state.event.press |> THEN { WithoutSelection }
+            elements.selected_clear_all.event.press |> THEN { Empty }
             elements.selected_restore_data.event.press |> THEN { DefaultOrder }
             elements.selected_data_up.event.press |> THEN { DataFirst }
             elements.selected_data_down.event.press |> THEN { DataLast }
@@ -1284,6 +1286,7 @@ store: [
             elements.selected_remove_ghw_counter.event.press |> THEN { TEXT { ghw_counter } }
             elements.selected_remove_ghw_enable.event.press |> THEN { TEXT { ghw_enable } }
             elements.selected_remove_ghw_state.event.press |> THEN { TEXT { ghw_state } }
+            elements.selected_clear_all.event.press |> THEN { TEXT { none } }
             elements.selected_restore_data.event.press |> THEN { TEXT { none } }
             elements.selected_data_up.event.press |> THEN { TEXT { none } }
             elements.selected_data_down.event.press |> THEN { TEXT { none } }
@@ -1328,6 +1331,7 @@ store: [
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
         |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+        |> List/retain(row, if: selected_row_is_visible(row: row))
         |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
         |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
 
@@ -2878,11 +2882,40 @@ FUNCTION new_signal(signal) {
         bit_width: signal.bit_width
         direction: signal.direction
         family: signal.family
+        selected_initial: signal.selected_initial
         selected_once:
-            LATEST {
-                False
+            signal.selected_initial |> HOLD selected_once {
+                LATEST {
+                    signal_elements.select_signal.event.press |> THEN { True }
+                    elements.select_clk.event.press |> THEN { signal.key == TEXT { clk } |> WHEN { True => True False => selected_once } }
+                    elements.select_reset.event.press |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => True False => selected_once } }
+                    elements.select_data.event.press |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => True False => selected_once } }
+                    elements.select_temperature.event.press |> THEN { signal.key == TEXT { temperature } |> WHEN { True => True False => selected_once } }
+                    elements.selected_remove_clk.event.press |> THEN { signal.key == TEXT { clk } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_reset.event.press |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_data.event.press |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_data_valid.event.press |> THEN { signal.key == TEXT { data_valid } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_data_ready.event.press |> THEN { signal.key == TEXT { data_ready } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_state.event.press |> THEN { signal.key == TEXT { state } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_error_count.event.press |> THEN { signal.key == TEXT { error_count } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_temperature.event.press |> THEN { signal.key == TEXT { temperature } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_tx_data.event.press |> THEN { signal.key == TEXT { tx_data } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_rx_data.event.press |> THEN { signal.key == TEXT { rx_data } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_baud_tick.event.press |> THEN { signal.key == TEXT { baud_tick } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_uart_busy.event.press |> THEN { signal.key == TEXT { uart_busy } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_ghw_counter.event.press |> THEN { signal.key == TEXT { ghw_counter } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_ghw_enable.event.press |> THEN { signal.key == TEXT { ghw_enable } |> WHEN { True => False False => selected_once } }
+                    elements.selected_remove_ghw_state.event.press |> THEN { signal.key == TEXT { ghw_state } |> WHEN { True => False False => selected_once } }
+                    elements.selected_clear_all.event.press |> THEN { False }
+                    elements.selected_restore_data.event.press |> THEN { signal.selected_initial }
+                    elements.select_counter_file.event.press |> THEN { signal.selected_initial }
+                    elements.select_uart_compare_file.event.press |> THEN { signal.selected_initial }
+                    elements.select_ghw_file.event.press |> THEN { signal.selected_initial }
+                    elements.load_default_file.event.press |> THEN { signal.selected_initial }
+                    elements.external_file_loaded_name.text |> THEN { signal.selected_initial }
+                    elements.show_empty.event.press |> THEN { False }
+                }
             }
-            |> Bool/toggle(when: signal_elements.select_signal.event.press)
         alias:
             Text/empty() |> HOLD alias {
                 LATEST {
@@ -2896,6 +2929,14 @@ FUNCTION new_selected_visible_item(row) {
     row.item_kind |> WHEN {
         VariableRow => new_selected_signal(selected_signal: row)
         __ => row
+    }
+}
+
+FUNCTION selected_row_is_visible(row) {
+    row.item_kind |> WHEN {
+        GroupHeader => store.signal_catalog |> List/any(signal, if: signal.family == row.family |> Bool/and(signal.selected_once))
+        VariableRow => store.signal_catalog |> List/any(signal, if: signal.key == row.id |> Bool/and(signal.selected_once))
+        __ => True
     }
 }
 

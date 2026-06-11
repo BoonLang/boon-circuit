@@ -2682,6 +2682,21 @@ fn source_text_event(source: &str, text: impl Into<String>) -> boon_runtime::Liv
     }
 }
 
+fn source_pointer_event(
+    source: &str,
+    pointer_x: impl Into<String>,
+    pointer_width: impl Into<String>,
+) -> boon_runtime::LiveSourceEvent {
+    boon_runtime::LiveSourceEvent {
+        source: source.to_owned(),
+        pointer_x: Some(pointer_x.into()),
+        pointer_y: Some("0".to_owned()),
+        pointer_width: Some(pointer_width.into()),
+        pointer_height: Some("1".to_owned()),
+        ..boon_runtime::LiveSourceEvent::default()
+    }
+}
+
 fn novywave_external_file_load_events(
     runtime: &mut boon_runtime::LiveRuntime,
 ) -> Vec<boon_runtime::LiveSourceEvent> {
@@ -2970,13 +2985,17 @@ fn novywave_restore_events_for_ui_state(
             ("ghw_state", "store.elements.selected_remove_ghw_state"),
         ],
     );
-    if let Some(label @ ("36 ns" | "42 ns" | "48 ns")) = state.added_marker_label.as_deref() {
-        events.push(boon_runtime::LiveSourceEvent {
-            source: "store.elements.waveform_click".to_owned(),
-            text: Some(label.to_owned()),
-            target_text: Some(label.to_owned()),
-            ..boon_runtime::LiveSourceEvent::default()
-        });
+    if let Some(pointer_x) = match state.added_marker_label.as_deref() {
+        Some("36 ns") => Some("0"),
+        Some("42 ns") => Some("72"),
+        Some("48 ns") => Some("216"),
+        _ => None,
+    } {
+        events.push(source_pointer_event(
+            "store.elements.waveform_click",
+            pointer_x,
+            "360",
+        ));
     }
     if let Some(text) = state
         .signal_search_text
@@ -16143,6 +16162,21 @@ fn lower_canonical_document_entry(
     ) {
         return;
     }
+    if lower_canonical_chained_conditional_render_entry(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    ) {
+        return;
+    }
     if lower_canonical_conditional_render_entry(
         statement,
         expressions,
@@ -16475,6 +16509,54 @@ fn document_source_path_from_children(
         document_source_value(child, expressions, context)
             .or_else(|| document_source_path_from_children(&child.children, expressions, context))
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_chained_conditional_render_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+    is_root_child: bool,
+) -> bool {
+    let Some(base_input) = statement.expr else {
+        return false;
+    };
+    for child in &statement.children {
+        if !document_conditional_input_is_delimiter(child, expressions) {
+            continue;
+        }
+        document_context_clear_data_reads(context);
+        let selector = expressions
+            .get(base_input)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+            .unwrap_or(Value::Null);
+        document_context_take_structural_eval_reads(context, Some(base_input), expressions);
+        if lower_canonical_conditional_render_entry_with_input(
+            child,
+            expressions,
+            functions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            typecheck_report,
+            scope_key,
+            is_root_child,
+            Some(base_input),
+            Some(selector),
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17671,6 +17753,7 @@ fn lower_canonical_child_elements(
                 .is_none()
             && !document_source_pipe_statement(child, expressions)
             && !document_conditional_statement(child, expressions)
+            && !document_chained_conditional_statement(child, expressions)
             && child.children.is_empty()
         {
             continue;
@@ -17681,6 +17764,7 @@ fn lower_canonical_child_elements(
                 .is_some()
             || document_source_pipe_statement(child, expressions)
             || document_conditional_statement(child, expressions)
+            || document_chained_conditional_statement(child, expressions)
         {
             lower_canonical_document_entry(
                 child,
@@ -17757,6 +17841,7 @@ fn lower_canonical_child_elements(
                     .is_some()
                 || document_source_pipe_statement(nested, expressions)
                 || document_conditional_statement(nested, expressions)
+                || document_chained_conditional_statement(nested, expressions)
                 || matches!(
                     document_field_name(nested).as_deref(),
                     Some("child" | "template" | "icon")
@@ -17791,6 +17876,7 @@ fn document_statement_can_render_entry(
             .is_some()
         || document_source_pipe_statement(statement, expressions)
         || document_conditional_statement(statement, expressions)
+        || document_chained_conditional_statement(statement, expressions)
         || matches!(
             document_field_name(statement).as_deref(),
             Some("child" | "template" | "icon")
@@ -18076,6 +18162,17 @@ fn document_conditional_statement(statement: &AstStatement, expressions: &[AstEx
         .is_some()
 }
 
+fn document_chained_conditional_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    statement.expr.is_some()
+        && statement
+            .children
+            .iter()
+            .any(|child| document_conditional_input_is_delimiter(child, expressions))
+}
+
 fn document_conditional_input_is_delimiter(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -18219,6 +18316,7 @@ fn document_statement_directly_renders(
         || document_pipe_render_function(statement, expressions, functions, context).is_some()
         || document_source_pipe_statement(statement, expressions)
         || document_conditional_statement(statement, expressions)
+        || document_chained_conditional_statement(statement, expressions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30974,9 +31072,32 @@ fn render_invalidation_allows_sparse_document_patch(
 }
 
 fn document_data_paths_overlap(changed_path: &str, structural_path: &str) -> bool {
-    if document_list_data_paths_overlap(changed_path, structural_path) {
-        return true;
+    for changed in document_data_path_aliases(changed_path) {
+        for structural in document_data_path_aliases(structural_path) {
+            if document_list_data_paths_overlap(&changed, &structural)
+                || document_data_paths_overlap_exact(&changed, &structural)
+            {
+                return true;
+            }
+        }
     }
+    false
+}
+
+fn document_data_path_aliases(path: &str) -> Vec<String> {
+    let normalized = normalized_document_data_path(path);
+    let mut aliases = vec![normalized.clone()];
+    if let Some(unscoped) = normalized.strip_prefix("store.") {
+        aliases.push(unscoped.to_owned());
+    } else if !normalized.is_empty() && !normalized.starts_with("@list:") {
+        aliases.push(format!("store.{normalized}"));
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn document_data_paths_overlap_exact(changed_path: &str, structural_path: &str) -> bool {
     changed_path == structural_path
         || changed_path
             .strip_prefix(structural_path)
@@ -34112,6 +34233,18 @@ mod tests {
     }
 
     #[test]
+    fn sparse_document_patch_gate_rejects_store_alias_structural_data_patch() {
+        let proof = cache_test_document_snapshot(
+            "test-sparse-patch-store-alias-structural",
+            &["store.waveform_status"],
+            &["waveform_status"],
+        );
+        let patch = test_root_field_patch("waveform_status");
+
+        assert!(!preview_document_patch_fast_path_allowed(&proof, &[patch]));
+    }
+
+    #[test]
     fn sparse_document_patch_gate_rejects_targetless_patch() {
         let proof = cache_test_document_snapshot(
             "test-sparse-patch-targetless",
@@ -34692,7 +34825,15 @@ mod tests {
             .display_list
             .iter()
             .find(|item| item.text.as_deref() == Some(label))
-            .unwrap_or_else(|| panic!("{context} should render text `{label}`"))
+            .unwrap_or_else(|| {
+                let rendered = frame
+                    .display_list
+                    .iter()
+                    .filter_map(|item| item.text.as_deref())
+                    .take(80)
+                    .collect::<Vec<_>>();
+                panic!("{context} should render text `{label}`; rendered={rendered:?}")
+            })
     }
 
     fn rect_contains_bounds(outer: boon_document::Rect, inner: boon_document::Rect) -> bool {
@@ -45332,13 +45473,12 @@ mod tests {
             ))
             .expect("NovyWave panel divider resize source event should apply");
         runtime
-            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
-                source: "store.elements.waveform_click".to_owned(),
-                text: Some("48 ns".to_owned()),
-                target_text: Some("48 ns".to_owned()),
-                ..boon_runtime::LiveSourceEvent::default()
-            })
-            .expect("NovyWave waveform click text payload source event should apply");
+            .apply_source_event_for_document(source_pointer_event(
+                "store.elements.waveform_click",
+                "120",
+                "360",
+            ))
+            .expect("NovyWave waveform click pointer payload source event should apply");
         runtime
             .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                 source: "store.elements.signal_search_input".to_owned(),
@@ -48531,7 +48671,9 @@ mod tests {
                 "novywave-empty-reference-comparison",
             );
             let empty_image = empty_render.image.clone();
-            physical_frame_text_item(&empty_layout, "No waveform loaded", "NovyWave empty state");
+            physical_frame_text_item(&empty_layout, "No files loaded", "NovyWave empty state");
+            physical_frame_text_item(&empty_layout, "0 selected", "NovyWave empty state");
+            physical_frame_text_item(&empty_layout, "Files & Scopes", "NovyWave empty state");
             live_runtime
                 .lock()
                 .unwrap()
@@ -48556,7 +48698,17 @@ mod tests {
             let empty_light_image = empty_light_render.image.clone();
             physical_frame_text_item(
                 &empty_light_layout,
-                "No waveform loaded",
+                "No files loaded",
+                "NovyWave light empty state",
+            );
+            physical_frame_text_item(
+                &empty_light_layout,
+                "0 selected",
+                "NovyWave light empty state",
+            );
+            physical_frame_text_item(
+                &empty_light_layout,
+                "Files & Scopes",
                 "NovyWave light empty state",
             );
             live_runtime
@@ -48798,14 +48950,14 @@ mod tests {
                     "empty_dark",
                     &empty_layout,
                     &empty_image,
-                    "No waveform loaded",
+                    "No files loaded",
                     16.0,
                 );
                 record_text_metric(
                     "empty_light",
                     &empty_light_layout,
                     &empty_light_image,
-                    "No waveform loaded",
+                    "No files loaded",
                     16.0,
                 );
                 for label in [
@@ -48813,11 +48965,12 @@ mod tests {
                     "Open Workspace...",
                     ".../test_files/my_workspaces/workspace_a",
                     "A[3:0]",
-                    "50 s",
                 ] {
                     record_text_metric("loaded_dark", &dark_layout, &dark_image, label, 14.0);
                     record_text_metric("loaded_light", &light_layout, &light_image, label, 14.0);
                 }
+                record_text_metric("loaded_dark", &dark_layout, &dark_image, "50 s", 14.0);
+                record_text_metric("loaded_light", &light_layout, &light_image, "0 s", 14.0);
                 for label in [
                     "- simple.vcd",
                     "- simple_tb.s",
@@ -50268,6 +50421,356 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn novywave_files_scopes_variables_manual_workflow_is_deterministic() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let source =
+            boon_runtime::source_text_for_path(&source_path).expect("NovyWave source should load");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let mut runtime = boon_runtime::LiveRuntime::from_project(
+            "novywave-files-scopes-variables-workflow",
+            &units,
+        )
+        .expect("NovyWave runtime should initialize from manifest units");
+        let initial_summary = runtime.document_state_summary();
+        let (layout_proof, layout_frame) =
+            native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&initial_summary),
+            )
+            .expect("NovyWave initial workflow layout should lower");
+        let initial_structural_reads = layout_proof
+            .get("structural_data_read_samples")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            initial_structural_reads
+                .iter()
+                .any(|read| read.as_str() == Some("store.waveform_status")),
+            "NovyWave initial layout should record waveform_status as a structural read for sparse patch rejection; reads={initial_structural_reads:?}"
+        );
+        let live_runtime = Arc::new(Mutex::new(runtime));
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let frame_lacks_text = |frame: &boon_document::LayoutFrame, label: &str, context: &str| {
+            let texts = physical_frame_texts(frame);
+            assert!(
+                !texts.iter().any(|text| text == label),
+                "{context} should not render `{label}`; texts={texts:?}"
+            );
+        };
+
+        let cleared_selection = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.selected_clear_all",
+            1,
+            "NovyWave Selected Variables Clear All",
+        );
+        assert_eq!(
+            cleared_selection.pointer("/store/selected_rows_count"),
+            Some(&json!(0)),
+            "Selected Variables Clear All should empty selected rows without unloading files"
+        );
+        assert_eq!(
+            cleared_selection.pointer("/store/selected_rows_order_label"),
+            Some(&json!("none"))
+        );
+        assert_eq!(
+            cleared_selection.pointer("/store/active_file"),
+            Some(&json!("simple.vcd")),
+            "clearing selected variables must not remove the loaded file"
+        );
+        let cleared_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(&cleared_frame, "0 selected", "NovyWave cleared selection");
+        physical_frame_text_item(
+            &cleared_frame,
+            "- simple.vcd",
+            "NovyWave files remain loaded",
+        );
+
+        let empty_files = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.show_empty",
+            2,
+            "NovyWave Files & Scopes Clear All",
+        );
+        assert_eq!(
+            empty_files.pointer("/store/waveform_status"),
+            Some(&json!("Empty"))
+        );
+        assert_eq!(
+            empty_files.pointer("/store/active_file"),
+            Some(&json!("none"))
+        );
+        assert_eq!(
+            empty_files.pointer("/store/selected_rows_count"),
+            Some(&json!(0))
+        );
+        let empty_frame = latest_preview_frame(&shared_render_state);
+        let empty_texts = physical_frame_texts(&empty_frame);
+        let empty_layout_proof = shared_render_state
+            .lock()
+            .expect("preview shared render state should lock after empty click")
+            .layout_proof
+            .clone();
+        assert!(
+            empty_texts.iter().any(|text| text == "No files loaded"),
+            "NovyWave empty files panel should render `No files loaded`; layout_profile={}; snapshot_status={:?}; texts={empty_texts:?}",
+            serde_json::to_string_pretty(
+                empty_layout_proof
+                    .get("layout_profile")
+                    .unwrap_or(&Value::Null)
+            )
+            .unwrap(),
+            empty_layout_proof.pointer("/runtime_document_state_snapshot/store/waveform_status")
+        );
+        frame_lacks_text(
+            &empty_frame,
+            "- simple.vcd",
+            "NovyWave empty Files & Scopes panel",
+        );
+
+        let load_dialog = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.open_load_files_dialog",
+            3,
+            "NovyWave Load Files button",
+        );
+        assert_eq!(
+            load_dialog.pointer("/store/load_files_dialog"),
+            Some(&json!("Open"))
+        );
+        let load_dialog_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(
+            &load_dialog_frame,
+            "Load files",
+            "NovyWave load files dialog",
+        );
+        physical_frame_text_item(
+            &load_dialog_frame,
+            "Path: ~/repos/NovyWave/test_files/simple.vcd",
+            "NovyWave load files dialog",
+        );
+
+        let loaded_simple = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.load_external_file",
+            4,
+            "NovyWave Load files Open button",
+        );
+        assert_eq!(
+            loaded_simple.pointer("/store/load_files_dialog"),
+            Some(&json!("Closed"))
+        );
+        assert_eq!(
+            loaded_simple.pointer("/store/waveform_status"),
+            Some(&json!("Loaded"))
+        );
+        assert_eq!(
+            loaded_simple.pointer("/store/active_file"),
+            Some(&json!("simple.vcd"))
+        );
+        assert_eq!(
+            loaded_simple.pointer("/store/bridge_file_format"),
+            Some(&json!("VCD"))
+        );
+        let loaded_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(
+            &loaded_frame,
+            "- simple.vcd",
+            "NovyWave loaded Files & Scopes",
+        );
+        frame_lacks_text(
+            &loaded_frame,
+            "- wave_27.fst",
+            "NovyWave single-file load should not render stale workspace files",
+        );
+        frame_lacks_text(
+            &loaded_frame,
+            "- simple_test.ghw",
+            "NovyWave single-file load should not render stale workspace files",
+        );
+
+        if source_hit_center(
+            &shared_render_state.lock().unwrap().layout_proof,
+            "store.elements.scope_cpu_collapse",
+        )
+        .is_ok()
+        {
+            let collapsed = apply_preview_click_source(
+                &source_path,
+                &source,
+                &units,
+                &live_runtime,
+                &shared_render_state,
+                &mut input_state,
+                "store.elements.scope_cpu_collapse",
+                5,
+                "NovyWave simple.vcd scope collapse",
+            );
+            assert_eq!(
+                collapsed.pointer("/store/scope_cpu_expansion_state"),
+                Some(&json!("Collapsed"))
+            );
+        }
+        let collapsed_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(
+            &collapsed_frame,
+            "+ simple_tb.s",
+            "NovyWave collapsed simple scope",
+        );
+        frame_lacks_text(
+            &collapsed_frame,
+            "A[3:0] B[3:0]",
+            "NovyWave collapsed simple scope children",
+        );
+
+        let expanded = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.scope_cpu_expand",
+            6,
+            "NovyWave simple.vcd scope expand",
+        );
+        assert_eq!(
+            expanded.pointer("/store/scope_cpu_expansion_state"),
+            Some(&json!("Expanded"))
+        );
+        assert_eq!(
+            expanded.pointer("/store/active_scope"),
+            Some(&json!("simple_tb_s"))
+        );
+        let expanded_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        assert!(
+            source_hit_center(&expanded_layout, "store.elements.scope_cpu_expand").is_err(),
+            "expanded simple_tb.s must not expose a second expand source when it has no visible subscopes"
+        );
+        source_hit_center(&expanded_layout, "store.elements.scope_cpu_collapse")
+            .expect("expanded simple_tb.s should expose only the collapse source");
+        let expanded_frame = latest_preview_frame(&shared_render_state);
+        let selected_scope = physical_frame_text_item(
+            &expanded_frame,
+            "- simple_tb.s",
+            "NovyWave expanded simple scope",
+        );
+        assert_display_style_text(
+            selected_scope,
+            "color",
+            "#f4fbff",
+            "NovyWave selected simple scope visual state",
+        );
+        physical_frame_text_item(
+            &expanded_frame,
+            "A[3:0] B[3:0]",
+            "NovyWave expanded simple scope children",
+        );
+        physical_frame_text_item(&expanded_frame, "A[3:0]", "NovyWave Variables panel");
+        physical_frame_text_item(&expanded_frame, "B[3:0]", "NovyWave Variables panel");
+        assert_eq!(
+            expanded.pointer("/store/search_results_count"),
+            Some(&json!(2)),
+            "Variables panel should be backed by the actual simple.vcd signal catalog"
+        );
+        assert_eq!(
+            expanded.pointer("/store/search_results_key_summary"),
+            Some(&json!("clk,reset_n"))
+        );
+
+        let selected_a = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.select_clk",
+            7,
+            "NovyWave Variables A[3:0] row",
+        );
+        assert_eq!(
+            selected_a.pointer("/store/active_signal"),
+            Some(&json!("clk"))
+        );
+        let selected_b = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.select_reset",
+            8,
+            "NovyWave Variables B[3:0] row",
+        );
+        assert_eq!(
+            selected_b.pointer("/store/active_signal"),
+            Some(&json!("reset_n"))
+        );
+        assert_eq!(
+            selected_b.pointer("/store/selected_rows_count"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            selected_b.pointer("/store/selected_rows_order_label"),
+            Some(&json!("A[3:0], B[3:0]"))
+        );
+        let final_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(
+            &final_frame,
+            "2 selected",
+            "NovyWave selected variables panel",
+        );
+        assert_waveform_value_labels(
+            &selected_b,
+            "clk",
+            &["0xa", "0xc", "0x0"],
+            "simple.vcd selected A[3:0] waveform row",
+        );
+        assert_waveform_value_labels(
+            &selected_b,
+            "reset_n",
+            &["0x3", "0x5", "0x0"],
+            "simple.vcd selected B[3:0] waveform row",
+        );
     }
 
     #[test]

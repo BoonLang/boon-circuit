@@ -5924,6 +5924,9 @@ impl GenericScheduledRuntime {
         let has_root_scalar = actions
             .iter()
             .any(|action| matches!(action, SourceAction::RootScalar));
+        let has_indexed_bool = actions
+            .iter()
+            .any(|action| matches!(action, SourceAction::IndexedBool { .. }));
         let has_bool_not = actions.iter().any(|action| {
             matches!(
                 action,
@@ -5970,7 +5973,7 @@ impl GenericScheduledRuntime {
             if has_list_remove {
                 return Ok(SourceActionKind::ListRemove);
             }
-            if has_bool_not {
+            if has_indexed_bool {
                 return Ok(SourceActionKind::IndexedBoolBulk);
             }
             if has_root_scalar {
@@ -5992,7 +5995,7 @@ impl GenericScheduledRuntime {
             if has_list_remove {
                 return Ok(SourceActionKind::ListRemove);
             }
-            if has_bool_not {
+            if has_bool_not || has_indexed_bool {
                 return Ok(SourceActionKind::IndexedBoolToggle);
             }
             if has_indexed_text_target(SourceRouteTextAction::SourceText, indexed_commit_field) {
@@ -6235,9 +6238,22 @@ impl GenericScheduledRuntime {
             .split_once('.')
             .map(|(scope, _)| scope)
             .ok_or_else(|| format!("indexed target `{target}` has no row scope"))?;
+        self.list_for_row_scope(scope)
+            .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
+    }
+
+    fn list_for_row_scope(&self, scope: &str) -> Option<&str> {
+        self.list_summary_fields
+            .iter()
+            .find_map(|summary| (summary.row_scope == scope).then_some(summary.list.as_str()))
+            .or_else(|| self.list_source_bindings.list_for_row_scope(scope))
+    }
+
+    fn row_scope_belongs_to_list(&self, scope: &str, list: &str) -> bool {
         self.list_source_bindings
             .list_for_row_scope(scope)
-            .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
+            .or_else(|| self.list_for_row_scope(scope))
+            == Some(list)
     }
 
     fn apply_source_actions<'a>(
@@ -6507,13 +6523,15 @@ impl GenericScheduledRuntime {
                     }
                 }
                 SourceAction::IndexedBool { target, .. } => {
-                    let Some(list) = input.list.as_deref() else {
+                    let target_list = self.indexed_target_list(target)?.to_owned();
+                    let list = input.list.as_deref().unwrap_or(target_list.as_str());
+                    if list != target_list {
                         return Err(format!(
-                            "source `{}` indexed bool action `{target}` needs a list context",
-                            input.source
+                            "source `{}` indexed bool action `{target}` routed to list `{list}`, expected `{target_list}`",
+                            input.source,
                         )
                         .into());
-                    };
+                    }
                     if let Some(index) = input.index {
                         if self.scalar_equations.bool_const_value(target, input.source)
                             == Some(true)
@@ -6615,7 +6633,7 @@ impl GenericScheduledRuntime {
             return None;
         };
         let (row_scope, field) = path.split_once('.')?;
-        if self.list_source_bindings.list_for_row_scope(row_scope)? != list {
+        if !self.row_scope_belongs_to_list(row_scope, list) {
             return None;
         }
         self.storage
@@ -11573,6 +11591,12 @@ impl GenericCircuitRuntime {
         equations
             .eval_bool_with_context(target, source, |path| {
                 self.list_row_bool_opt(list, index, path)
+                    .or_else(|| {
+                        let field = row_field_name(path);
+                        (field != path)
+                            .then(|| self.list_row_bool_opt(list, index, field))
+                            .flatten()
+                    })
                     .or_else(|| read_extra_bool(path))
             })?
             .ok_or_else(|| {
@@ -14666,6 +14690,8 @@ enum SourceRouteBoolAction {
     BoolNot,
     ConstTrue,
     ConstFalse,
+    ReadPath,
+    SourcePulse,
 }
 
 #[derive(Clone, Debug)]
@@ -15209,6 +15235,13 @@ impl ScalarEquationPlan {
                 })?;
                 Ok(Some(!value))
             }
+            ScalarUpdateExpression::ReadPath(path) => {
+                let value = read_bool(path).ok_or_else(|| {
+                    format!("source `{source}` for `{target}` cannot read bool path `{path}`")
+                })?;
+                Ok(Some(value))
+            }
+            ScalarUpdateExpression::SourcePayload(_) => Ok(Some(true)),
             ScalarUpdateExpression::Const(value) => Err(format!(
                 "source `{source}` for bool target `{target}` produced non-bool constant `{value}`"
             )
@@ -15909,6 +15942,90 @@ fn source_payload_suffix_from_variant<'a>(input: &'a str, variant: &str) -> Opti
     None
 }
 
+fn ir_read_path_is_bool_for_target(ir: &TypedProgram, target: &str, path: &str) -> bool {
+    if ir
+        .state_cells
+        .iter()
+        .any(|cell| cell.path == path && matches!(cell.initial_value, InitialValue::Bool { .. }))
+    {
+        return true;
+    }
+    let field = row_field_name(path);
+    let path_scope = path.split_once('.').map(|(scope, _)| scope);
+    let target_scope = target.split_once('.').map(|(scope, _)| scope);
+    let list = path_scope
+        .and_then(|scope| ir.row_scopes.iter().find(|row| row.row_scope == scope))
+        .or_else(|| {
+            target_scope.and_then(|scope| ir.row_scopes.iter().find(|row| row.row_scope == scope))
+        })
+        .map(|scope| scope.list.as_str());
+    match list {
+        Some(list) => ir_list_literal_field_is_bool(ir, list, field),
+        None => false,
+    }
+}
+
+fn ir_scalar_target_is_bool(ir: &TypedProgram, target: &str) -> bool {
+    let Some(cell) = ir.state_cells.iter().find(|cell| cell.path == target) else {
+        return ir_row_literal_field_for_path_is_bool(ir, target);
+    };
+    match &cell.initial_value {
+        InitialValue::Bool { .. } => true,
+        InitialValue::RowInitialField { path } => {
+            let Some(scope_id) = cell.scope_id else {
+                return false;
+            };
+            let Some(scope) = ir.row_scopes.get(scope_id.as_usize()) else {
+                return false;
+            };
+            ir_list_literal_field_is_bool(ir, &scope.list, row_field_name(path))
+        }
+        InitialValue::RootInitialField { path } => ir.state_cells.iter().any(|root| {
+            root.path == *path && matches!(root.initial_value, InitialValue::Bool { .. })
+        }),
+        InitialValue::Text { .. }
+        | InitialValue::Number { .. }
+        | InitialValue::Enum { .. }
+        | InitialValue::Unknown { .. } => false,
+    }
+}
+
+fn ir_row_literal_field_for_path_is_bool(ir: &TypedProgram, path: &str) -> bool {
+    let Some((scope, field)) = path.split_once('.') else {
+        return false;
+    };
+    let Some(scope) = ir
+        .row_scopes
+        .iter()
+        .find(|candidate| candidate.row_scope == scope)
+    else {
+        return false;
+    };
+    ir_list_literal_field_is_bool(ir, &scope.list, row_field_name(field))
+}
+
+fn ir_list_literal_field_is_bool(ir: &TypedProgram, list: &str, field_name: &str) -> bool {
+    let Some(list) = ir.lists.iter().find(|candidate| candidate.name == list) else {
+        return false;
+    };
+    let ListInitializer::RecordLiteral { rows } = &list.initializer else {
+        return false;
+    };
+    let mut matched = false;
+    for row in rows {
+        for field in &row.fields {
+            if field.name != field_name {
+                continue;
+            }
+            matched = true;
+            if !matches!(field.value, InitialValue::Bool { .. }) {
+                return false;
+            }
+        }
+    }
+    matched
+}
+
 impl SourceRoutePlan {
     fn from_plans(
         ir: &TypedProgram,
@@ -15925,12 +16042,22 @@ impl SourceRoutePlan {
                 target: branch.target.clone(),
                 expression: branch.expression.clone(),
             };
+            let target_is_bool = ir_scalar_target_is_bool(ir, &branch.target);
+            let bool_read_path = match &branch.expression {
+                ScalarUpdateExpression::ReadPath(path) => {
+                    ir_read_path_is_bool_for_target(ir, &branch.target, path)
+                }
+                _ => false,
+            };
+            let bool_pulse = target_is_bool
+                && matches!(branch.expression, ScalarUpdateExpression::SourcePayload(_));
             if root_targets.contains(branch.target.as_str()) {
                 route.root_scalar_targets.push(scalar_target);
+            } else if branch.expression.is_indexed_bool_expression() || bool_read_path || bool_pulse
+            {
+                route.indexed_bool_targets.push(scalar_target);
             } else if branch.expression.is_indexed_text_expression() {
                 route.indexed_text_targets.push(scalar_target);
-            } else if branch.expression.is_indexed_bool_expression() {
-                route.indexed_bool_targets.push(scalar_target);
             }
         }
         for transform in &derived.text_transforms {
@@ -16616,8 +16743,9 @@ impl SourceRoute {
                     ScalarUpdateExpression::Const(value) if value == "False" => {
                         SourceRouteBoolAction::ConstFalse
                     }
+                    ScalarUpdateExpression::ReadPath(_) => SourceRouteBoolAction::ReadPath,
+                    ScalarUpdateExpression::SourcePayload(_) => SourceRouteBoolAction::SourcePulse,
                     ScalarUpdateExpression::SourceText
-                    | ScalarUpdateExpression::SourcePayload(_)
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::Const(_)
@@ -16625,7 +16753,6 @@ impl SourceRoute {
                     | ScalarUpdateExpression::ProjectTime { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
-                    | ScalarUpdateExpression::ReadPath(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
                     | ScalarUpdateExpression::PrefixPayloadConcat { .. }
                     | ScalarUpdateExpression::MatchConst { .. }
@@ -22514,6 +22641,85 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
         assert_eq!(
             values["store.ready"],
             json!({"kind": "bool", "value": true})
+        );
+    }
+
+    #[test]
+    fn top_level_source_updates_indexed_bool_rows_with_row_context() {
+        let source = r#"
+store: [
+    elements: [
+        clear_all: SOURCE
+        restore_defaults: SOURCE
+        select_clk: SOURCE
+    ]
+]
+
+signals:
+    LIST {
+        [name: TEXT { clk }, selected_initial: True]
+        [name: TEXT { reset }, selected_initial: False]
+    }
+    |> List/map(signal, new: new_signal(signal: signal, store: store))
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Signals }))
+
+FUNCTION new_signal(signal, store) {
+    [
+        name: signal.name
+        selected_initial: signal.selected_initial
+        selected:
+            signal.selected_initial |> HOLD selected {
+                LATEST {
+                    store.elements.select_clk.event.press |> THEN { signal.name == TEXT { clk } |> WHEN { True => True False => selected } }
+                    store.elements.clear_all.event.press |> THEN { False }
+                    store.elements.restore_defaults.event.press |> THEN { signal.selected_initial }
+                }
+            }
+    ]
+}
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("top-level-indexed-bool-row-context", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["signals"][0]["selected"], true);
+        assert_eq!(summary["signals"][1]["selected"], false);
+
+        let clear_output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.clear_all".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(clear_output.state_summary["signals"][0]["selected"], false);
+        assert_eq!(clear_output.state_summary["signals"][1]["selected"], false);
+
+        let select_output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_clk".to_owned(),
+                target_text: Some("clk".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(select_output.state_summary["signals"][0]["selected"], true);
+        assert_eq!(select_output.state_summary["signals"][1]["selected"], false);
+
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.clear_all".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let restore_output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.restore_defaults".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(restore_output.state_summary["signals"][0]["selected"], true);
+        assert_eq!(
+            restore_output.state_summary["signals"][1]["selected"],
+            false
         );
     }
 

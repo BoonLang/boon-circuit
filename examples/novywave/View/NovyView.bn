@@ -62,12 +62,9 @@ FUNCTION app_shell() {
         ]
         items: LIST {
             header()
-            PASSED.store.waveform_status == Empty |> WHEN {
-                True => empty_state()
-                False => PASSED.store.waveform_status == Loading |> WHEN {
-                    True => loading_state()
-                    False => loaded_app()
-                }
+            PASSED.store.waveform_status == Loading |> WHEN {
+                True => loading_state()
+                False => loaded_app()
             }
         }
     )
@@ -1404,6 +1401,20 @@ FUNCTION file_status_text(line_text, line_height) {
 }
 
 FUNCTION files_list() {
+    PASSED.store.waveform_status |> WHEN {
+        Empty => files_list_empty()
+        __ => files_list_loaded()
+    }
+}
+
+FUNCTION files_list_loaded() {
+    PASSED.store.external_file_active == Yes |> WHEN {
+        True => files_list_external_loaded()
+        False => files_list_default_workspace()
+    }
+}
+
+FUNCTION files_list_default_workspace() {
     Scene/Element/stripe(
         element: []
         direction: Column
@@ -1420,6 +1431,62 @@ FUNCTION files_list() {
             file_tree_ghw_scope_button(row: [scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, indent_width: 18])
             tree_child_row(label_text: TEXT { ghw.counter[3:0] ghw.enable ghw.state }, indent_width: 38)
         }
+    )
+}
+
+FUNCTION files_list_external_loaded() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
+        items: LIST {
+            file_tree_counter_file_button(row: [label: PASSED.store.external_file_tree_label, indent_width: 0, selected_file: PASSED.store.active_file])
+            PASSED.store.active_file == TEXT { simple.vcd } |> WHEN {
+                True => file_tree_simple_scope_button(row: [scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18])
+                False => NoElement
+            }
+            PASSED.store.active_file == TEXT { simple.vcd } |> WHEN {
+                True => simple_scope_signal_child_row()
+                False => NoElement
+            }
+        }
+    )
+}
+
+FUNCTION files_list_empty() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 224
+            padding: 8
+            rounded_corners: 7
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0b1220 }
+                Light => TEXT { #f8fafc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #90a4bf }
+                    Light => TEXT { #60748b }
+                }
+            ]
+            text: TEXT { No files loaded }
+        )
     )
 }
 
@@ -1917,7 +1984,7 @@ FUNCTION timeline_header() {
                 ]
                 text: PASSED.store.selected_signal_count_label
             )
-            remove_all_button()
+            selected_clear_all_button()
         }
     )
 }
@@ -5354,14 +5421,14 @@ FUNCTION empty_open_button() {
     )
 }
 
-FUNCTION remove_all_button() {
+FUNCTION selected_clear_all_button() {
     Scene/Element/button(
         element: [
-            event: [press: PASSED.store.elements.show_empty]
-            hovered: PASSED.store.elements.show_empty
+            event: [press: PASSED.store.elements.selected_clear_all]
+            hovered: PASSED.store.elements.selected_clear_all
         ]
-        style: compact_button_style(button_width: 82, hovered: element.hovered)
-        label: button_label(button_text: TEXT { Remove })
+        style: compact_button_style(button_width: 76, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Clear All })
     )
 }
 

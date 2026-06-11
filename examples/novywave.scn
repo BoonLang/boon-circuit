@@ -554,6 +554,6 @@ expect_root_text = { "mode" = "Dark", "marker_visibility" = "Visible", "marker_l
 [[step]]
 id = "waveform-click-moves-cursor"
 user_action = { kind = "click", target = "waveform", target_text = "150 s" }
-expected_source_event = { source = "store.elements.waveform_click", text = "150 s" }
+expected_source_event = { source = "store.elements.waveform_click", pointer_x = "216", pointer_y = "0", pointer_width = "360", pointer_height = "1", target_text = "150 s" }
 expect_root_text = { "mode" = "Dark", "cursor_position" = "Cursor48", "keyboard_cursor_label" = "150 s", "marker_visibility" = "Visible", "marker_label" = "M 50 s", "marker_count_label" = "1 marker", "marker_focus_label" = "jumped to 50 s", "marker_to_add" = "50 s" }
 expect_semantic_delta_contains = ["FieldSet:store.cursor_position"]

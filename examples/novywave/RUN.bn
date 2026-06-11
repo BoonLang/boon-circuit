@@ -31,6 +31,7 @@ store: [
         begin_default_file_load: SOURCE
         load_default_file: SOURCE
         show_empty: SOURCE
+        file_row_select: SOURCE
         select_counter_file: SOURCE
         select_uart_compare_file: SOURCE
         select_ghw_file: SOURCE
@@ -464,13 +465,11 @@ store: [
         LIST {
             [kind: FileTreeFile, file: TEXT { simple.vcd }, label: TEXT { - simple.vcd }, indent_width: 0, selected_file: TEXT { simple.vcd }, source_key: SelectCounterFile]
             [kind: FileTreeScope, file: TEXT { simple.vcd }, scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18, source_key: SelectSimpleScope]
-            [kind: FileTreeSignals, file: TEXT { simple.vcd }, scope_key: TEXT { simple_tb_s }, label: TEXT { A[3:0] B[3:0] }, expanded_label: TEXT { A[3:0] B[3:0] }, collapsed_label: TEXT { collapsed }, indent_width: 38]
             [kind: FileTreeFile, file: TEXT { wave_27.fst }, label: TEXT { - wave_27.fst }, indent_width: 0, selected_file: TEXT { wave_27.fst }, source_key: SelectUartCompareFile]
             [kind: FileTreeScope, file: TEXT { wave_27.fst }, scope_key: TEXT { top_uart }, label: TEXT { + top.uart }, indent_width: 18, source_key: SelectUartScope]
             [kind: FileTreeScope, file: TEXT { wave_27.fst }, scope_key: TEXT { top_analog }, label: TEXT { + top.analog }, indent_width: 18, source_key: SelectAnalogScope]
             [kind: FileTreeFile, file: TEXT { simple_test.ghw }, label: TEXT { - simple_test.ghw }, indent_width: 0, selected_file: TEXT { simple_test.ghw }, source_key: SelectGhwFile]
             [kind: FileTreeScope, file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, indent_width: 18, source_key: SelectGhwFile]
-            [kind: FileTreeSignals, file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, label: TEXT { ghw.counter[3:0] ghw.enable ghw.state }, indent_width: 38]
         }
 
     file_tree_rows:
@@ -619,6 +618,7 @@ store: [
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
             elements.scope_uart.event.press |> THEN { TEXT { wave_27.fst } }
             elements.scope_analog.event.press |> THEN { TEXT { wave_27.fst } }
+            elements.file_row_select.event.press |> THEN { active_file }
             elements.begin_default_file_load.event.press |> THEN { store.startup_selected_file }
             elements.load_default_file.event.press |> THEN { store.startup_selected_file }
             elements.external_file_loaded_name.text
@@ -1013,8 +1013,6 @@ store: [
         startup_selected_scope_key |> HOLD active_scope {
             LATEST {
             elements.scope_cpu.event.press |> THEN { TEXT { simple_tb_s } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_tb_s } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_tb_s } }
             elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
             elements.scope_analog.event.press |> THEN { TEXT { top_analog } }
             elements.select_counter_file.event.press |> THEN { store.startup_selected_scope_key }
@@ -1087,8 +1085,6 @@ store: [
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw } }
             elements.scope_cpu.event.press |> THEN { TEXT { simple_vcd } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_vcd } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_vcd } }
             elements.scope_uart.event.press |> THEN { TEXT { uart } }
             elements.scope_analog.event.press |> THEN { TEXT { analog } }
             elements.load_default_file.event.press |> THEN { store.startup_selected_family }
@@ -2239,48 +2235,30 @@ store: [
         }
 
     active_scope_key:
-        LATEST {
-            TEXT { SIMPLE_TB_S }
-            elements.scope_cpu.event.press |> THEN { TEXT { SIMPLE_TB_S } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { SIMPLE_TB_S } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { SIMPLE_TB_S } }
-            elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
-            elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
-            elements.select_counter_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { TOP_UART } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { GHW_SIMPLE } }
-            elements.load_default_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
-            elements.show_empty.event.press |> THEN { TEXT { NONE } }
+        active_scope |> WHEN {
+            TEXT { simple_tb_s } => TEXT { SIMPLE_TB_S }
+            TEXT { top_uart } => TEXT { TOP_UART }
+            TEXT { top_analog } => TEXT { TOP_ANALOG }
+            TEXT { ghw_simple } => TEXT { GHW_SIMPLE }
+            __ => TEXT { NONE }
         }
 
     active_scope_label:
-        LATEST {
-            TEXT { simple_tb.s }
-            elements.scope_cpu.event.press |> THEN { TEXT { simple_tb.s } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { simple_tb.s } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { simple_tb.s } }
-            elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
-            elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
-            elements.select_counter_file.event.press |> THEN { TEXT { simple_tb.s } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { top.uart } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { ghw.simple } }
-            elements.load_default_file.event.press |> THEN { TEXT { simple_tb.s } }
-            elements.show_empty.event.press |> THEN { TEXT { none } }
+        active_scope |> WHEN {
+            TEXT { simple_tb_s } => TEXT { simple_tb.s }
+            TEXT { top_uart } => TEXT { top.uart }
+            TEXT { top_analog } => TEXT { top.analog }
+            TEXT { ghw_simple } => TEXT { ghw.simple }
+            __ => TEXT { none }
         }
 
     active_scope_signal_count:
-        LATEST {
-            TEXT { 2 signals }
-            elements.scope_cpu.event.press |> THEN { TEXT { 2 signals } }
-            elements.scope_cpu_expand.event.press |> THEN { TEXT { 2 signals } }
-            elements.scope_cpu_collapse.event.press |> THEN { TEXT { 2 signals } }
-            elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
-            elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
-            elements.select_counter_file.event.press |> THEN { TEXT { 2 signals } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { 5 signals } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { 4 signals } }
-            elements.load_default_file.event.press |> THEN { TEXT { 2 signals } }
-            elements.show_empty.event.press |> THEN { TEXT { 0 signals } }
+        active_scope |> WHEN {
+            TEXT { simple_tb_s } => TEXT { 2 signals }
+            TEXT { top_uart } => TEXT { 5 signals }
+            TEXT { top_analog } => TEXT { 2 signals }
+            TEXT { ghw_simple } => TEXT { 4 signals }
+            __ => TEXT { 0 signals }
         }
 
     scope_cpu_expansion_state:
@@ -2875,6 +2853,9 @@ FUNCTION new_signal(signal) {
             select_signal: SOURCE
             alias_input: SOURCE
         ]
+        row_elements: [
+            remove_signal: SOURCE
+        ]
         key: signal.key
         scope: signal.scope
         name: signal.name
@@ -2887,6 +2868,7 @@ FUNCTION new_signal(signal) {
             signal.selected_initial |> HOLD selected_once {
                 LATEST {
                     signal_elements.select_signal.event.press |> THEN { True }
+                    row_elements.remove_signal.event.press |> THEN { False }
                     elements.select_clk.event.press |> THEN { signal.key == TEXT { clk } |> WHEN { True => True False => selected_once } }
                     elements.select_reset.event.press |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => True False => selected_once } }
                     elements.select_data.event.press |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => True False => selected_once } }
@@ -2906,13 +2888,27 @@ FUNCTION new_signal(signal) {
                     elements.selected_remove_ghw_counter.event.press |> THEN { signal.key == TEXT { ghw_counter } |> WHEN { True => False False => selected_once } }
                     elements.selected_remove_ghw_enable.event.press |> THEN { signal.key == TEXT { ghw_enable } |> WHEN { True => False False => selected_once } }
                     elements.selected_remove_ghw_state.event.press |> THEN { signal.key == TEXT { ghw_state } |> WHEN { True => False False => selected_once } }
+                    selected_signal_defaults
+                        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
+                        |> List/map(selected_signal, new:
+                            selected_signal.row_elements.remove_signal.event.press
+                                |> THEN {
+                                    selected_signal.id == signal.key |> WHEN {
+                                        True => selected_signal.family == signal.family |> WHEN {
+                                            True => False
+                                            False => selected_once
+                                        }
+                                        False => selected_once
+                                    }
+                                }
+                        )
+                        |> List/latest()
                     elements.selected_clear_all.event.press |> THEN { False }
                     elements.selected_restore_data.event.press |> THEN { signal.selected_initial }
                     elements.select_counter_file.event.press |> THEN { signal.selected_initial }
                     elements.select_uart_compare_file.event.press |> THEN { signal.selected_initial }
                     elements.select_ghw_file.event.press |> THEN { signal.selected_initial }
                     elements.load_default_file.event.press |> THEN { signal.selected_initial }
-                    elements.external_file_loaded_name.text |> THEN { signal.selected_initial }
                     elements.show_empty.event.press |> THEN { False }
                 }
             }
@@ -2942,6 +2938,9 @@ FUNCTION selected_row_is_visible(row) {
 
 FUNCTION new_selected_signal(selected_signal) {
     [
+        row_elements: [
+            remove_signal: SOURCE
+        ]
         format_elements: [
             format_dropdown_toggle: SOURCE
             format_binary: SOURCE

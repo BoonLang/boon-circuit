@@ -1423,13 +1423,11 @@ FUNCTION files_list_default_workspace() {
         items: LIST {
             file_tree_counter_file_button(row: [label: TEXT { - simple.vcd }, indent_width: 0, selected_file: TEXT { simple.vcd }])
             file_tree_simple_scope_button(row: [scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18])
-            simple_scope_signal_child_row()
             file_tree_uart_file_button(row: [label: TEXT { - wave_27.fst }, indent_width: 0, selected_file: TEXT { wave_27.fst }])
             file_tree_uart_scope_button(row: [scope_key: TEXT { top_uart }, label: TEXT { + top.uart }, indent_width: 18])
             file_tree_analog_scope_button(row: [scope_key: TEXT { top_analog }, label: TEXT { + top.analog }, indent_width: 18])
             file_tree_ghw_file_button(row: [label: TEXT { - simple_test.ghw }, indent_width: 0, selected_file: TEXT { simple_test.ghw }])
             file_tree_ghw_scope_button(row: [scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, indent_width: 18])
-            tree_child_row(label_text: TEXT { ghw.counter[3:0] ghw.enable ghw.state }, indent_width: 38)
         }
     )
 }
@@ -1441,13 +1439,9 @@ FUNCTION files_list_external_loaded() {
         gap: 2
         style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
         items: LIST {
-            file_tree_counter_file_button(row: [label: PASSED.store.external_file_tree_label, indent_width: 0, selected_file: PASSED.store.active_file])
+            file_tree_loaded_file_button(row: [label: PASSED.store.external_file_tree_label, indent_width: 0, selected_file: PASSED.store.active_file])
             PASSED.store.active_file == TEXT { simple.vcd } |> WHEN {
                 True => file_tree_simple_scope_button(row: [scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18])
-                False => NoElement
-            }
-            PASSED.store.active_file == TEXT { simple.vcd } |> WHEN {
-                True => simple_scope_signal_child_row()
                 False => NoElement
             }
         }
@@ -1516,7 +1510,7 @@ FUNCTION file_tree_row(row) {
     row.kind |> WHEN {
         FileTreeFile => file_tree_file_button(row: row)
         FileTreeScope => file_tree_scope_button(row: row)
-        FileTreeSignals => tree_child_row(label_text: file_tree_row_label(row: row), indent_width: row.indent_width)
+        FileTreeSignals => NoElement
         __ => tree_child_row(label_text: file_tree_row_label(row: row), indent_width: row.indent_width)
     }
 }
@@ -1533,6 +1527,14 @@ FUNCTION file_tree_file_button(row) {
 FUNCTION file_tree_counter_file_button(row) {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_counter_file], hovered: PASSED.store.elements.select_counter_file]
+        style: [width: Fill, height: 22, paint: False]
+        label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
+    )
+}
+
+FUNCTION file_tree_loaded_file_button(row) {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.file_row_select], hovered: PASSED.store.elements.file_row_select]
         style: [width: Fill, height: 22, paint: False]
         label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
     )
@@ -1567,10 +1569,7 @@ FUNCTION file_tree_scope_button(row) {
 FUNCTION file_tree_simple_scope_button(row) {
     PASSED.store.scope_cpu_expansion_state |> WHEN {
         Collapsed => file_tree_simple_scope_expand_button(row: row)
-        __ => PASSED.store.active_scope == TEXT { simple_tb_s } |> WHEN {
-            True => file_tree_simple_scope_collapse_button(row: row)
-            False => file_tree_simple_scope_select_button(row: row)
-        }
+        __ => file_tree_simple_scope_expanded_row(row: row)
     }
 }
 
@@ -1596,6 +1595,51 @@ FUNCTION file_tree_simple_scope_collapse_button(row) {
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_row(label_text: simple_scope_row_label(row: row), indent_width: row.indent_width, selected: PASSED.store.active_scope == TEXT { simple_tb_s })
     )
+}
+
+FUNCTION file_tree_simple_scope_expanded_row(row) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: Fill, height: 22, paint: False]
+        items: LIST {
+            file_tree_simple_scope_collapse_control(row: row)
+            file_tree_simple_scope_select_label(row: row)
+        }
+    )
+}
+
+FUNCTION file_tree_simple_scope_collapse_control(row) {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.scope_cpu_collapse], hovered: PASSED.store.elements.scope_cpu_collapse]
+        style: [width: 6, height: 22, paint: False, spring_range: 3]
+        label: tree_scope_disclosure_row(selected: PASSED.store.active_scope == TEXT { simple_tb_s })
+    )
+}
+
+FUNCTION file_tree_simple_scope_select_label(row) {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.scope_cpu], hovered: PASSED.store.elements.scope_cpu]
+        style: [width: Fill, height: 22, paint: False, spring_range: 3]
+        label: tree_scope_label_row(label_text: row.expanded_label, selected: PASSED.store.active_scope == TEXT { simple_tb_s })
+    )
+}
+
+FUNCTION tree_scope_disclosure_row(selected) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: Fill, paint: False]
+        label: Scene/Element/text(
+            element: []
+            style: [width: Fill, height: Fill]
+            text: Text/empty()
+        )
+    )
+}
+
+FUNCTION tree_scope_label_row(label_text, selected) {
+    tree_row(label_text: label_text, indent_width: 0, selected: selected)
 }
 
 FUNCTION file_tree_uart_scope_button(row) {
@@ -1636,13 +1680,6 @@ FUNCTION simple_scope_row_label(row) {
     PASSED.store.scope_cpu_expansion_state |> WHEN {
         Expanded => row.expanded_label
         __ => row.collapsed_label
-    }
-}
-
-FUNCTION simple_scope_signal_child_row() {
-    PASSED.store.scope_cpu_expansion_state |> WHEN {
-        Expanded => tree_child_row(label_text: TEXT { A[3:0] B[3:0] }, indent_width: 38)
-        __ => tree_child_row(label_text: TEXT { collapsed }, indent_width: 38)
     }
 }
 
@@ -3348,24 +3385,16 @@ FUNCTION signal_select_button(signal) {
 }
 
 FUNCTION selected_signal_remove_x_button(signal) {
-    signal.remove_kind |> WHEN {
-        RemoveClk => selected_signal_remove_clk_x_button()
-        RemoveReset => selected_signal_remove_reset_x_button()
-        RemoveData => selected_signal_remove_data_x_button()
-        RemoveDataValid => selected_signal_remove_data_valid_x_button()
-        RemoveDataReady => selected_signal_remove_data_ready_x_button()
-        RemoveState => selected_signal_remove_state_x_button()
-        RemoveErrorCount => selected_signal_remove_error_count_x_button()
-        RemoveTemperature => selected_signal_remove_temperature_x_button()
-        RemoveTxData => selected_signal_remove_tx_data_x_button()
-        RemoveRxData => selected_signal_remove_rx_data_x_button()
-        RemoveBaudTick => selected_signal_remove_baud_tick_x_button()
-        RemoveUartBusy => selected_signal_remove_uart_busy_x_button()
-        RemoveGhwCounter => selected_signal_remove_ghw_counter_x_button()
-        RemoveGhwEnable => selected_signal_remove_ghw_enable_x_button()
-        RemoveGhwState => selected_signal_remove_ghw_state_x_button()
-        __ => selected_signal_remove_data_x_button()
-    }
+    Scene/Element/button(
+        element: [
+            event: [press: signal.row_elements.remove_signal]
+            hovered: signal.row_elements.remove_signal
+        ]
+        style: row_remove_button_style(hovered: element.hovered)
+        label: row_remove_label()
+        target: signal.name
+        address: signal.id
+    )
 }
 
 FUNCTION row_remove_button_style(hovered) {
@@ -3813,9 +3842,11 @@ FUNCTION row_format_control(signal) {
 
 FUNCTION row_format_button(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_dropdown_toggle], hovered: signal.format_elements.format_dropdown_toggle, target: signal.name]
+        element: [event: [press: signal.format_elements.format_dropdown_toggle], hovered: signal.format_elements.format_dropdown_toggle]
         style: row_value_action_style(button_width: 64, hovered: element.hovered)
         label: row_value_action_label(button_text: signal.format_label)
+        target: signal.name
+        address: signal.id
     )
 }
 
@@ -3868,57 +3899,71 @@ FUNCTION row_format_dropdown_menu(signal) {
 
 FUNCTION row_format_hex_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_hex], hovered: signal.format_elements.format_hex, target: signal.name]
+        element: [event: [press: signal.format_elements.format_hex], hovered: signal.format_elements.format_hex]
         style: format_dropdown_option_style(selected: signal.formatter == Hexadecimal)
         label: format_dropdown_option_label(option_text: TEXT { Hex }, selected: signal.formatter == Hexadecimal)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_binary_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_binary], hovered: signal.format_elements.format_binary, target: signal.name]
+        element: [event: [press: signal.format_elements.format_binary], hovered: signal.format_elements.format_binary]
         style: format_dropdown_option_style(selected: signal.formatter == Binary)
         label: format_dropdown_option_label(option_text: TEXT { Bin }, selected: signal.formatter == Binary)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_grouped_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_grouped], hovered: signal.format_elements.format_grouped, target: signal.name]
+        element: [event: [press: signal.format_elements.format_grouped], hovered: signal.format_elements.format_grouped]
         style: format_dropdown_option_style(selected: signal.formatter == GroupedBinary)
         label: format_dropdown_option_label(option_text: TEXT { Bins }, selected: signal.formatter == GroupedBinary)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_octal_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_octal], hovered: signal.format_elements.format_octal, target: signal.name]
+        element: [event: [press: signal.format_elements.format_octal], hovered: signal.format_elements.format_octal]
         style: format_dropdown_option_style(selected: signal.formatter == Octal)
         label: format_dropdown_option_label(option_text: TEXT { Oct }, selected: signal.formatter == Octal)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_signed_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_signed], hovered: signal.format_elements.format_signed, target: signal.name]
+        element: [event: [press: signal.format_elements.format_signed], hovered: signal.format_elements.format_signed]
         style: format_dropdown_option_style(selected: signal.formatter == Signed)
         label: format_dropdown_option_label(option_text: TEXT { Int }, selected: signal.formatter == Signed)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_unsigned_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_unsigned], hovered: signal.format_elements.format_unsigned, target: signal.name]
+        element: [event: [press: signal.format_elements.format_unsigned], hovered: signal.format_elements.format_unsigned]
         style: format_dropdown_option_style(selected: signal.formatter == Unsigned)
         label: format_dropdown_option_label(option_text: TEXT { UInt }, selected: signal.formatter == Unsigned)
+        target: signal.name
+        address: signal.id
     )
 }
 
 FUNCTION row_format_ascii_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_ascii], hovered: signal.format_elements.format_ascii, target: signal.name]
+        element: [event: [press: signal.format_elements.format_ascii], hovered: signal.format_elements.format_ascii]
         style: format_dropdown_option_style(selected: signal.formatter == ASCII)
         label: format_dropdown_option_label(option_text: TEXT { Text }, selected: signal.formatter == ASCII)
+        target: signal.name
+        address: signal.id
     )
 }
 
@@ -4336,19 +4381,7 @@ FUNCTION variables_virtual_row(row) {
 }
 
 FUNCTION variable_result_row(signal) {
-    signal.key == TEXT { clk } |> WHEN {
-        True => variable_clk_button()
-        False => signal.key == TEXT { reset_n } |> WHEN {
-            True => variable_reset_button()
-            False => signal.key == TEXT { data_bus } |> WHEN {
-                True => variable_data_button()
-                False => signal.key == TEXT { temperature } |> WHEN {
-                    True => variable_temperature_button()
-                    False => variable_result_static_row(signal: signal)
-                }
-            }
-        }
-    }
+    variable_signal_button(signal: signal)
 }
 
 FUNCTION variable_result_static_row(signal) {
@@ -4508,8 +4541,8 @@ FUNCTION variable_temperature_button() {
 FUNCTION variable_signal_button(signal) {
     Scene/Element/button(
         element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
+            event: [press: signal.signal_elements.select_signal]
+            hovered: signal.signal_elements.select_signal
         ]
         style: [
             width: Fill
@@ -4523,17 +4556,32 @@ FUNCTION variable_signal_button(signal) {
                 }
             }
         ]
-        label: variable_static_row(
-            name_text: signal.alias |> Text/is_empty() |> WHEN {
-                True => signal.name
-                False => signal.alias
-            }
-            chip_a: signal.kind
-            chip_b: signal.bit_width
-            chip_c: signal.direction
-        )
+        label: variable_signal_row(signal: signal)
+        target: signal.name
+        address: signal.key
     )
-    |> SOURCE { signal.signal_elements.select_signal }
+}
+
+FUNCTION variable_signal_row(signal) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 20, paint: False]
+        items: LIST {
+            variable_name_text(label_text: variable_signal_display_name(signal: signal))
+            variable_chip_literal(label_text: signal.kind)
+            variable_chip_literal(label_text: signal.bit_width)
+            variable_chip_literal(label_text: signal.direction)
+        }
+    )
+}
+
+FUNCTION variable_signal_display_name(signal) {
+    signal.alias |> Text/is_empty() |> WHEN {
+        True => signal.name
+        False => signal.alias
+    }
 }
 
 FUNCTION variable_data_valid_row() {

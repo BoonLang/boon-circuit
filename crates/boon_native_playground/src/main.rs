@@ -45793,13 +45793,39 @@ mod tests {
             physical_frame_text_item(&initial_layout, "- simple_test.ghw", "NovyWave file tree");
         let ghw_scope =
             physical_frame_text_item(&initial_layout, "- ghw.simple", "NovyWave file tree");
-        let cpu_signals =
-            physical_frame_text_item(&initial_layout, "A[3:0] B[3:0]", "NovyWave file tree");
-        for (item, expected_color) in [
-            (counter_file, "#f4fbff"),
-            (compare_file, "#eaf3ff"),
-            (cpu_signals, "#eaf3ff"),
+        let files_panel_texts = physical_frame_texts_in_panel(
+            &initial_layout,
+            "Files & Scopes",
+            "Variables",
+            "Selected Variables",
+            "NovyWave file tree",
+        );
+        for label in [
+            "- simple.vcd",
+            "- simple_tb.s",
+            "- wave_27.fst",
+            "+ top.uart",
+            "+ top.analog",
+            "- simple_test.ghw",
+            "- ghw.simple",
         ] {
+            assert!(
+                files_panel_texts.iter().any(|text| text == label),
+                "NovyWave Files & Scopes panel should render `{label}`; texts={files_panel_texts:?}"
+            );
+        }
+        for forbidden in [
+            "A[3:0]",
+            "B[3:0]",
+            "A[3:0] B[3:0]",
+            "ghw.counter[3:0] ghw.enable ghw.state",
+        ] {
+            assert!(
+                !files_panel_texts.iter().any(|text| text == forbidden),
+                "NovyWave Files & Scopes panel should not render variable label `{forbidden}`; texts={files_panel_texts:?}"
+            );
+        }
+        for (item, expected_color) in [(counter_file, "#f4fbff"), (compare_file, "#eaf3ff")] {
             assert_display_style_text(
                 item,
                 "color",
@@ -45810,16 +45836,14 @@ mod tests {
         }
         assert!(
             counter_file.bounds.y < cpu_scope.bounds.y
-                && cpu_scope.bounds.y < cpu_signals.bounds.y
-                && cpu_signals.bounds.y < compare_file.bounds.y
+                && cpu_scope.bounds.y < compare_file.bounds.y
                 && compare_file.bounds.y < uart_scope.bounds.y
                 && uart_scope.bounds.y < ghw_file.bounds.y
                 && compare_file.bounds.y < ghw_file.bounds.y
                 && ghw_file.bounds.y < ghw_scope.bounds.y,
-            "NovyWave file/scope tree should be one hierarchy with scopes nested below file roots: counter={:?} cpu={:?} signals={:?} compare={:?} uart={:?} ghw={:?} ghw_scope={:?}",
+            "NovyWave file/scope tree should be one hierarchy with scopes nested below file roots: counter={:?} cpu={:?} compare={:?} uart={:?} ghw={:?} ghw_scope={:?}",
             counter_file.bounds,
             cpu_scope.bounds,
-            cpu_signals.bounds,
             compare_file.bounds,
             uart_scope.bounds,
             ghw_file.bounds,
@@ -45828,13 +45852,11 @@ mod tests {
         assert!(
             compare_file.bounds.x >= counter_file.bounds.x
                 && cpu_scope.bounds.x > counter_file.bounds.x + 10.0
-                && cpu_signals.bounds.x > cpu_scope.bounds.x + 10.0
                 && uart_scope.bounds.x > compare_file.bounds.x + 10.0
                 && ghw_scope.bounds.x > ghw_file.bounds.x + 10.0,
-            "NovyWave file/scope tree rows should keep roots aligned and children indented: file={:?} cpu={:?} signals={:?} compare={:?} uart={:?} ghw={:?} ghw_scope={:?}",
+            "NovyWave file/scope tree rows should keep roots aligned and scopes indented: file={:?} cpu={:?} compare={:?} uart={:?} ghw={:?} ghw_scope={:?}",
             counter_file.bounds,
             cpu_scope.bounds,
-            cpu_signals.bounds,
             compare_file.bounds,
             uart_scope.bounds,
             ghw_file.bounds,
@@ -47561,9 +47583,12 @@ mod tests {
             "external file digest should come from bounded metadata, got {digest}"
         );
         let remove_reset_layout = shared_render_state.lock().unwrap().layout_proof.clone();
-        let (remove_reset_x, remove_reset_y, _) =
-            source_hit_center(&remove_reset_layout, "store.elements.selected_remove_reset")
-                .expect("NovyWave selected reset row should expose an individual remove source");
+        let (remove_reset_x, remove_reset_y, _) = source_hit_center_for_target(
+            &remove_reset_layout,
+            "signal.row_elements.remove_signal",
+            Some("B[3:0]"),
+        )
+        .expect("NovyWave selected reset row X should expose a row-bound remove source");
         preview_apply_real_window_input(
             &deterministic_click_input_from_index(20, remove_reset_x, remove_reset_y),
             &source_path,
@@ -48976,7 +49001,6 @@ mod tests {
                     "- simple_tb.s",
                     "- wave_27.fst",
                     "- simple_test.ghw",
-                    "A[3:0] B[3:0]",
                     "+ top.uart",
                     "- ghw.simple",
                 ] {
@@ -50131,6 +50155,24 @@ mod tests {
             .clone();
         let (x, y, _) = source_hit_center(&layout_proof, source_event)
             .unwrap_or_else(|error| panic!("{label} should expose a hit region: {error}"));
+        let hit_region = document_hit_region_ref_at(&layout_proof, x, y)
+            .unwrap_or_else(|| panic!("{label} source point should hit a document region"));
+        let hit_event = live_source_event_for_hit_region(
+            &layout_proof,
+            hit_region,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x,
+                y,
+                window_width: 920.0,
+                window_height: 720.0,
+            },
+            false,
+        )
+        .unwrap_or_else(|| panic!("{label} source point should resolve a live source event"));
+        assert_eq!(
+            hit_event.source, source_event,
+            "{label} source point should resolve the requested source"
+        );
         let input = deterministic_click_input_from_index(sequence, x, y);
         preview_apply_real_window_input_with_units(
             &input,
@@ -50147,6 +50189,67 @@ mod tests {
             .expect("NovyWave live runtime should lock after click")
             .document_state_summary();
         state
+    }
+
+    fn apply_preview_click_source_target(
+        source_path: &Path,
+        source_text: &str,
+        runtime_units: &[boon_runtime::RuntimeSourceUnit],
+        live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+        shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+        input_state: &mut PreviewNativeInputState,
+        source_event: &str,
+        target: &str,
+        sequence: u64,
+        label: &str,
+    ) -> serde_json::Value {
+        let layout_proof = shared_render_state
+            .lock()
+            .expect("preview shared render state should lock")
+            .layout_proof
+            .clone();
+        let (x, y, _) = source_hit_center_for_target(&layout_proof, source_event, Some(target))
+            .unwrap_or_else(|error| {
+                panic!("{label} should expose a hit region for target `{target}`: {error}")
+            });
+        let hit_region = document_hit_region_ref_at(&layout_proof, x, y)
+            .unwrap_or_else(|| panic!("{label} target point should hit a document region"));
+        let hit_event = live_source_event_for_hit_region(
+            &layout_proof,
+            hit_region,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x,
+                y,
+                window_width: 920.0,
+                window_height: 720.0,
+            },
+            false,
+        )
+        .unwrap_or_else(|| panic!("{label} target point should resolve a live source event"));
+        assert_eq!(
+            hit_event.source, source_event,
+            "{label} target point should resolve the requested source"
+        );
+        assert_eq!(
+            hit_event.target_text.as_deref(),
+            Some(target),
+            "{label} target point should resolve the requested target"
+        );
+        let input = deterministic_click_input_from_index(sequence, x, y);
+        preview_apply_real_window_input_with_units(
+            &input,
+            source_path,
+            source_text,
+            runtime_units,
+            Some(live_runtime),
+            shared_render_state,
+            input_state,
+        )
+        .unwrap_or_else(|error| panic!("clicking {label} should dispatch real input: {error}"));
+        live_runtime
+            .lock()
+            .expect("NovyWave live runtime should lock after click")
+            .document_state_summary()
     }
 
     fn apply_preview_drag_source(
@@ -50367,6 +50470,33 @@ mod tests {
             .collect()
     }
 
+    fn physical_frame_texts_in_panel(
+        frame: &boon_document::LayoutFrame,
+        panel_title: &str,
+        right_neighbor_title: &str,
+        bottom_neighbor_title: &str,
+        context: &str,
+    ) -> Vec<String> {
+        let panel = physical_frame_text_item(frame, panel_title, context);
+        let right = physical_frame_text_item(frame, right_neighbor_title, context);
+        let bottom = physical_frame_text_item(frame, bottom_neighbor_title, context);
+        let left_x = panel.bounds.x - 6.0;
+        let right_x = right.bounds.x - 6.0;
+        let top_y = panel.bounds.y - 8.0;
+        let bottom_y = bottom.bounds.y - 4.0;
+        frame
+            .display_list
+            .iter()
+            .filter(|item| {
+                item.bounds.x >= left_x
+                    && item.bounds.x < right_x
+                    && item.bounds.y >= top_y
+                    && item.bounds.y < bottom_y
+            })
+            .filter_map(|item| item.text.as_deref().map(str::to_owned))
+            .collect()
+    }
+
     fn hit_region_debug_candidates_at(layout: &serde_json::Value, x: f64, y: f64) -> Vec<Value> {
         let intents = layout
             .get("source_intent_assertions")
@@ -50474,6 +50604,60 @@ mod tests {
                 "{context} should not render `{label}`; texts={texts:?}"
             );
         };
+        let assert_files_panel_lacks =
+            |frame: &boon_document::LayoutFrame, label: &str, context: &str| {
+                let texts = physical_frame_texts_in_panel(
+                    frame,
+                    "Files & Scopes",
+                    "Variables",
+                    "Selected Variables",
+                    context,
+                );
+                assert!(
+                    !texts.iter().any(|text| text == label),
+                    "{context} should not render `{label}` in Files & Scopes; texts={texts:?}"
+                );
+            };
+        let assert_selected_variables_empty =
+            |summary: &serde_json::Value, frame: &boon_document::LayoutFrame, context: &str| {
+                assert_eq!(
+                    summary.pointer("/store/selected_rows_count"),
+                    Some(&json!(0)),
+                    "{context} should have zero selected rows"
+                );
+                assert_eq!(
+                    summary.pointer("/store/selected_rows_order_label"),
+                    Some(&json!("none")),
+                    "{context} should report no selected rows"
+                );
+                assert!(
+                    summary.pointer("/store/selected_signals/0").is_none(),
+                    "{context} should have no selected_signals rows: {:?}",
+                    summary.pointer("/store/selected_signals")
+                );
+                assert!(
+                    summary.pointer("/store/selected_visible_items/0").is_none(),
+                    "{context} should have no selected visible rows: {:?}",
+                    summary.pointer("/store/selected_visible_items")
+                );
+                physical_frame_text_item(frame, "0 selected", context);
+            };
+        let assert_loaded_file_identity_unchanged =
+            |summary: &serde_json::Value, baseline: &serde_json::Value, context: &str| {
+                for pointer in [
+                    "/store/waveform_status",
+                    "/store/active_file",
+                    "/store/bridge_file_format",
+                    "/store/bridge_file_digest",
+                    "/store/external_file_tree_label",
+                ] {
+                    assert_eq!(
+                        summary.pointer(pointer),
+                        baseline.pointer(pointer),
+                        "{context} should not change loaded-file identity at {pointer}"
+                    );
+                }
+            };
 
         let cleared_selection = apply_preview_click_source(
             &source_path,
@@ -50610,11 +50794,23 @@ mod tests {
             Some(&json!("VCD"))
         );
         let loaded_frame = latest_preview_frame(&shared_render_state);
+        assert_selected_variables_empty(
+            &loaded_simple,
+            &loaded_frame,
+            "NovyWave loaded simple.vcd should not preselect variables",
+        );
         physical_frame_text_item(
             &loaded_frame,
             "- simple.vcd",
             "NovyWave loaded Files & Scopes",
         );
+        assert_files_panel_lacks(
+            &loaded_frame,
+            "A[3:0] B[3:0]",
+            "NovyWave loaded Files & Scopes",
+        );
+        assert_files_panel_lacks(&loaded_frame, "A[3:0]", "NovyWave loaded Files & Scopes");
+        assert_files_panel_lacks(&loaded_frame, "B[3:0]", "NovyWave loaded Files & Scopes");
         frame_lacks_text(
             &loaded_frame,
             "- wave_27.fst",
@@ -50624,6 +50820,29 @@ mod tests {
             &loaded_frame,
             "- simple_test.ghw",
             "NovyWave single-file load should not render stale workspace files",
+        );
+
+        let file_row_selected = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.file_row_select",
+            5,
+            "NovyWave loaded simple.vcd file row",
+        );
+        let file_row_frame = latest_preview_frame(&shared_render_state);
+        assert_loaded_file_identity_unchanged(
+            &file_row_selected,
+            &loaded_simple,
+            "Clicking loaded file row",
+        );
+        assert_selected_variables_empty(
+            &file_row_selected,
+            &file_row_frame,
+            "Clicking loaded file row",
         );
 
         if source_hit_center(
@@ -50640,12 +50859,17 @@ mod tests {
                 &shared_render_state,
                 &mut input_state,
                 "store.elements.scope_cpu_collapse",
-                5,
+                6,
                 "NovyWave simple.vcd scope collapse",
             );
             assert_eq!(
                 collapsed.pointer("/store/scope_cpu_expansion_state"),
                 Some(&json!("Collapsed"))
+            );
+            assert_loaded_file_identity_unchanged(
+                &collapsed,
+                &loaded_simple,
+                "Normalizing simple_tb.s to collapsed",
             );
         }
         let collapsed_frame = latest_preview_frame(&shared_render_state);
@@ -50654,7 +50878,15 @@ mod tests {
             "+ simple_tb.s",
             "NovyWave collapsed simple scope",
         );
-        frame_lacks_text(
+        assert_selected_variables_empty(
+            &live_runtime
+                .lock()
+                .expect("NovyWave live runtime should lock after collapse normalization")
+                .document_state_summary(),
+            &collapsed_frame,
+            "Collapsed simple_tb.s",
+        );
+        assert_files_panel_lacks(
             &collapsed_frame,
             "A[3:0] B[3:0]",
             "NovyWave collapsed simple scope children",
@@ -50668,7 +50900,7 @@ mod tests {
             &shared_render_state,
             &mut input_state,
             "store.elements.scope_cpu_expand",
-            6,
+            7,
             "NovyWave simple.vcd scope expand",
         );
         assert_eq!(
@@ -50677,20 +50909,130 @@ mod tests {
         );
         assert_eq!(
             expanded.pointer("/store/active_scope"),
-            Some(&json!("simple_tb_s"))
+            Some(&json!("none")),
+            "Expanding a scope should not select it"
         );
+        assert_loaded_file_identity_unchanged(&expanded, &loaded_simple, "Expanding simple_tb.s");
         let expanded_layout = shared_render_state.lock().unwrap().layout_proof.clone();
         assert!(
             source_hit_center(&expanded_layout, "store.elements.scope_cpu_expand").is_err(),
             "expanded simple_tb.s must not expose a second expand source when it has no visible subscopes"
         );
         source_hit_center(&expanded_layout, "store.elements.scope_cpu_collapse")
-            .expect("expanded simple_tb.s should expose only the collapse source");
+            .expect("expanded simple_tb.s should expose a collapse source");
+        source_hit_center(&expanded_layout, "store.elements.scope_cpu")
+            .expect("expanded simple_tb.s should expose a separate scope selection source");
         let expanded_frame = latest_preview_frame(&shared_render_state);
-        let selected_scope = physical_frame_text_item(
+        physical_frame_text_item(
             &expanded_frame,
             "- simple_tb.s",
             "NovyWave expanded simple scope",
+        );
+        assert_selected_variables_empty(&expanded, &expanded_frame, "Expanding simple_tb.s");
+        assert_files_panel_lacks(
+            &expanded_frame,
+            "A[3:0] B[3:0]",
+            "NovyWave expanded simple scope children",
+        );
+        assert_files_panel_lacks(
+            &expanded_frame,
+            "A[3:0]",
+            "NovyWave expanded simple scope children",
+        );
+        assert_files_panel_lacks(
+            &expanded_frame,
+            "B[3:0]",
+            "NovyWave expanded simple scope children",
+        );
+        assert_eq!(
+            expanded.pointer("/store/search_results_count"),
+            Some(&json!(0)),
+            "Expanding a scope should not select it for the Variables panel"
+        );
+        assert_eq!(
+            expanded.pointer("/store/search_results_key_summary"),
+            Some(&json!("none"))
+        );
+
+        let collapsed_again = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.scope_cpu_collapse",
+            8,
+            "NovyWave simple.vcd scope collapse after expand",
+        );
+        assert_eq!(
+            collapsed_again.pointer("/store/scope_cpu_expansion_state"),
+            Some(&json!("Collapsed"))
+        );
+        let collapsed_again_frame = latest_preview_frame(&shared_render_state);
+        assert_loaded_file_identity_unchanged(
+            &collapsed_again,
+            &loaded_simple,
+            "Collapsing simple_tb.s",
+        );
+        assert_selected_variables_empty(
+            &collapsed_again,
+            &collapsed_again_frame,
+            "Collapsing simple_tb.s",
+        );
+
+        let expanded_again = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.scope_cpu_expand",
+            9,
+            "NovyWave simple.vcd scope expand before select",
+        );
+        assert_eq!(
+            expanded_again.pointer("/store/scope_cpu_expansion_state"),
+            Some(&json!("Expanded"))
+        );
+        let expanded_again_frame = latest_preview_frame(&shared_render_state);
+        assert_loaded_file_identity_unchanged(
+            &expanded_again,
+            &loaded_simple,
+            "Expanding simple_tb.s before selecting",
+        );
+        assert_selected_variables_empty(
+            &expanded_again,
+            &expanded_again_frame,
+            "Expanding simple_tb.s before selecting",
+        );
+
+        let selected_scope_summary = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.scope_cpu",
+            10,
+            "NovyWave simple_tb scope select",
+        );
+        assert_eq!(
+            selected_scope_summary.pointer("/store/active_scope"),
+            Some(&json!("simple_tb_s"))
+        );
+        assert_loaded_file_identity_unchanged(
+            &selected_scope_summary,
+            &loaded_simple,
+            "Selecting simple_tb.s",
+        );
+        let selected_scope_frame = latest_preview_frame(&shared_render_state);
+        let selected_scope = physical_frame_text_item(
+            &selected_scope_frame,
+            "- simple_tb.s",
+            "NovyWave selected simple scope",
         );
         assert_display_style_text(
             selected_scope,
@@ -50698,47 +51040,123 @@ mod tests {
             "#f4fbff",
             "NovyWave selected simple scope visual state",
         );
-        physical_frame_text_item(
-            &expanded_frame,
-            "A[3:0] B[3:0]",
-            "NovyWave expanded simple scope children",
+        assert_selected_variables_empty(
+            &selected_scope_summary,
+            &selected_scope_frame,
+            "Selecting simple_tb.s",
         );
-        physical_frame_text_item(&expanded_frame, "A[3:0]", "NovyWave Variables panel");
-        physical_frame_text_item(&expanded_frame, "B[3:0]", "NovyWave Variables panel");
+        physical_frame_text_item(&selected_scope_frame, "A[3:0]", "NovyWave Variables panel");
+        physical_frame_text_item(&selected_scope_frame, "B[3:0]", "NovyWave Variables panel");
         assert_eq!(
-            expanded.pointer("/store/search_results_count"),
+            selected_scope_summary.pointer("/store/search_results_count"),
             Some(&json!(2)),
-            "Variables panel should be backed by the actual simple.vcd signal catalog"
+            "Variables panel should be backed by the actual simple.vcd signal catalog after scope selection"
         );
         assert_eq!(
-            expanded.pointer("/store/search_results_key_summary"),
+            selected_scope_summary.pointer("/store/search_results_key_summary"),
             Some(&json!("clk,reset_n"))
         );
 
-        let selected_a = apply_preview_click_source(
+        let selected_a = apply_preview_click_source_target(
             &source_path,
             &source,
             &units,
             &live_runtime,
             &shared_render_state,
             &mut input_state,
-            "store.elements.select_clk",
-            7,
+            "signal.signal_elements.select_signal",
+            "A[3:0]",
+            11,
             "NovyWave Variables A[3:0] row",
         );
         assert_eq!(
             selected_a.pointer("/store/active_signal"),
             Some(&json!("clk"))
         );
-        let selected_b = apply_preview_click_source(
+        assert_eq!(
+            selected_a.pointer("/store/selected_rows_count"),
+            Some(&json!(1)),
+            "Clicking one Variables row should select only that variable"
+        );
+        assert_eq!(
+            selected_a.pointer("/store/selected_rows_order_label"),
+            Some(&json!("A[3:0]"))
+        );
+        assert_eq!(
+            selected_a.pointer("/store/selected_signals/0/id"),
+            Some(&json!("clk"))
+        );
+        assert!(
+            selected_a.pointer("/store/selected_signals/1").is_none(),
+            "Clicking A[3:0] must not also select B[3:0]: selected_signals={:?}",
+            selected_a.pointer("/store/selected_signals")
+        );
+        assert!(
+            selected_visible_row_field(&selected_a, "reset_n", "name").is_none(),
+            "B[3:0] should not be visible after only A[3:0] was clicked"
+        );
+
+        let removed_last = apply_preview_click_source_target(
             &source_path,
             &source,
             &units,
             &live_runtime,
             &shared_render_state,
             &mut input_state,
-            "store.elements.select_reset",
-            8,
+            "signal.row_elements.remove_signal",
+            "A[3:0]",
+            12,
+            "NovyWave selected A[3:0] X button",
+        );
+        assert_eq!(
+            removed_last.pointer("/store/selected_rows_count"),
+            Some(&json!(0)),
+            "Removing the only selected row should empty Selected Variables"
+        );
+        assert_eq!(
+            removed_last.pointer("/store/selected_rows_order_label"),
+            Some(&json!("none"))
+        );
+        assert!(
+            removed_last
+                .pointer("/store/selected_visible_items/0")
+                .is_none(),
+            "Selected visible rows should be empty after removing the last variable: {:?}",
+            removed_last.pointer("/store/selected_visible_items")
+        );
+        let removed_last_frame = latest_preview_frame(&shared_render_state);
+        physical_frame_text_item(
+            &removed_last_frame,
+            "0 selected",
+            "NovyWave selected variables panel after last-row remove",
+        );
+
+        let selected_a_again = apply_preview_click_source_target(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "signal.signal_elements.select_signal",
+            "A[3:0]",
+            13,
+            "NovyWave Variables A[3:0] row after remove",
+        );
+        assert_eq!(
+            selected_a_again.pointer("/store/selected_rows_count"),
+            Some(&json!(1))
+        );
+        let selected_b = apply_preview_click_source_target(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "signal.signal_elements.select_signal",
+            "B[3:0]",
+            14,
             "NovyWave Variables B[3:0] row",
         );
         assert_eq!(

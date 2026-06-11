@@ -1087,7 +1087,13 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             &branch.target,
             &branch.source,
             &known_symbols,
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "update branch `{}` from `{}` failed static schedule: {error}; expression={:?}",
+                branch.target, branch.source, branch.expression
+            )
+        })?;
     }
     for operation in &program.list_operations {
         if !list_names.contains(operation.list.as_str()) {
@@ -5328,24 +5334,24 @@ fn dotted_path_parts(path: &str) -> Vec<&str> {
     path.split('.').filter(|part| !part.is_empty()).collect()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PathMatch {
-    Prefix,
-}
-
-fn path_parts_match(candidate: &[String], expected: &[&str], path_match: PathMatch) -> bool {
+fn path_parts_match_source_ref(candidate: &[String], expected: &[&str]) -> bool {
     let candidate = candidate
         .iter()
         .filter(|part| part.as_str() != "PASSED" && part.as_str() != "events")
         .map(String::as_str)
         .collect::<Vec<_>>();
-    (match path_match {
-        PathMatch::Prefix => candidate.len() >= expected.len(),
-    }) && candidate
+    if candidate
         .iter()
         .take(expected.len())
         .copied()
         .eq(expected.iter().copied())
+    {
+        return true;
+    }
+    expected.len() > 1
+        && candidate
+            .windows(expected.len())
+            .any(|window| window.iter().copied().eq(expected.iter().copied()))
 }
 
 fn item_summary(item: &AstItem) -> String {
@@ -5361,6 +5367,12 @@ fn is_name(name: &str) -> bool {
 
 fn item_has_symbol(item: &AstItem, symbol: &str) -> bool {
     item.symbols.iter().any(|candidate| candidate == symbol)
+}
+
+fn item_starts_with_symbol(item: &AstItem, symbol: &str) -> bool {
+    item.symbols
+        .first()
+        .is_some_and(|candidate| candidate == symbol)
 }
 
 fn symbol_is_list_operator(symbol: &str) -> bool {
@@ -5451,24 +5463,17 @@ fn update_expression_for_source(
     if let Some(expression) = branch.then_prefix_payload_concat_expression(&variants) {
         return expression;
     }
-    if let Some(value) = branch.then_simple_update_value() {
-        if let SimpleThenUpdateValue::Path(_) = &value {
-            if let Some(expression) =
-                match_const_update_expression(field, target, fields, source, &branch)
-            {
-                return expression;
-            }
-        }
-        return match value {
-            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
-            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
-                path: canonical_scalar_update_path_with_fields(field, target, &path, fields),
-            },
-        };
-    }
     if let Some(expression) = match_const_update_expression(field, target, fields, source, &branch)
     {
         return expression;
+    }
+    if let Some(value) = branch.then_simple_update_value() {
+        return match value {
+            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
+            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
+                path: canonical_scalar_update_path_for_source(field, target, &path, fields, source),
+            },
+        };
     }
     if let Some(payload_field) = variants
         .iter()
@@ -5709,14 +5714,28 @@ fn match_const_update_expression(
                 return None;
             };
             expr_matches_source(field, input, source)
-                .then(|| match_const_update_expression_from_expr(field, target, fields, expr.id))
+                .then(|| {
+                    match_const_update_expression_from_expr(
+                        field,
+                        target,
+                        fields,
+                        expr.id,
+                        Some(source),
+                    )
+                })
                 .flatten()
         })
         .or_else(|| {
             branch.ast_exprs.iter().find_map(|expr| {
                 matches!(expr.kind, AstExprKind::When { .. })
                     .then(|| {
-                        match_const_update_expression_from_expr(field, target, fields, expr.id)
+                        match_const_update_expression_from_expr(
+                            field,
+                            target,
+                            fields,
+                            expr.id,
+                            Some(source),
+                        )
                     })
                     .flatten()
             })
@@ -5732,12 +5751,18 @@ fn match_const_update_expression(
                         .iter()
                         .any(|branch_expr| branch_expr.id == expr.id))
                 .then(|| {
-                    match_const_update_expression_from_then_expr(field, target, fields, expr.id)
+                    match_const_update_expression_from_then_expr(
+                        field,
+                        target,
+                        fields,
+                        expr.id,
+                        Some(source),
+                    )
                 })
                 .flatten()
             })
         })
-        .or_else(|| following_match_const_update_expression(field, target, fields, source))
+        .or_else(|| following_match_const_update_expression(field, target, fields, source, branch))
 }
 
 fn then_input_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
@@ -5779,13 +5804,14 @@ fn match_const_update_expression_from_then_expr(
     target: &str,
     fields: &[FieldDef],
     expr_id: usize,
+    source: Option<&str>,
 ) -> Option<UpdateExpression> {
     let expr = field_expr(field, expr_id)?;
     let AstExprKind::Then { output, .. } = expr.kind else {
         return None;
     };
     let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
-    match_const_update_expression_from_expr(field, target, fields, output)
+    match_const_update_expression_from_expr(field, target, fields, output, source)
 }
 
 fn following_match_const_update_expression(
@@ -5793,15 +5819,16 @@ fn following_match_const_update_expression(
     target: &str,
     fields: &[FieldDef],
     source: &str,
+    branch: &RoutedBranch,
 ) -> Option<UpdateExpression> {
-    field.ast_exprs.iter().find_map(|expr| {
+    branch.ast_exprs.iter().find_map(|expr| {
         if !expr_matches_source(field, expr.id, source) {
             return None;
         }
-        let then = field.ast_exprs.iter().find(|candidate| {
+        let then = branch.ast_exprs.iter().find(|candidate| {
             candidate.line > expr.line && matches!(candidate.kind, AstExprKind::Then { .. })
         })?;
-        match_const_update_expression_from_then_expr(field, target, fields, then.id)
+        match_const_update_expression_from_then_expr(field, target, fields, then.id, Some(source))
     })
 }
 
@@ -5820,26 +5847,30 @@ fn match_const_update_expression_from_expr(
     target: &str,
     fields: &[FieldDef],
     expr_id: usize,
+    source: Option<&str>,
 ) -> Option<UpdateExpression> {
     let expr = field_expr(field, expr_id)?;
     match &expr.kind {
         AstExprKind::When { input } => {
             if let Some(expression) = match_number_infix_const_update_expression_from_input(
-                field, target, fields, *input, expr.id,
+                field, target, fields, *input, expr.id, source,
             ) {
                 return Some(expression);
             }
-            let input = canonical_scalar_update_path_with_fields(
-                field,
-                target,
-                &ast_argument_value(field, *input)?,
-                fields,
+            let raw_input = ast_argument_value(field, *input)?;
+            let input = source.map_or_else(
+                || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
+                |source| {
+                    canonical_scalar_update_path_for_source(
+                        field, target, &raw_input, fields, source,
+                    )
+                },
             );
             let arms = match_const_arms_for_when(field, expr.id);
             if arms.is_empty() {
                 return None;
             }
-            let value_arms = match_value_arms_for_when(field, target, fields, expr.id);
+            let value_arms = match_value_arms_for_when(field, target, fields, expr.id, source);
             if match_value_arms_need_structured_update(&arms, &value_arms) {
                 Some(UpdateExpression::MatchValueConst {
                     input,
@@ -5852,7 +5883,7 @@ fn match_const_update_expression_from_expr(
         AstExprKind::Then {
             output: Some(output),
             ..
-        } => match_const_update_expression_from_expr(field, target, fields, *output),
+        } => match_const_update_expression_from_expr(field, target, fields, *output, source),
         _ => None,
     }
 }
@@ -5863,6 +5894,7 @@ fn match_number_infix_const_update_expression_from_input(
     fields: &[FieldDef],
     input: usize,
     when_expr_id: usize,
+    source: Option<&str>,
 ) -> Option<UpdateExpression> {
     let input = field_expr(field, input)?;
     let AstExprKind::Infix { left, op, right } = &input.kind else {
@@ -5870,7 +5902,7 @@ fn match_number_infix_const_update_expression_from_input(
     };
     let left = scalar_number_operand(field, *left, target)?;
     let right = scalar_number_operand(field, *right, target)?;
-    let arms = match_value_arms_for_when(field, target, fields, when_expr_id);
+    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
     (!arms.is_empty()).then_some(UpdateExpression::MatchNumberInfixConst {
         left,
         op: op.clone(),
@@ -5884,6 +5916,7 @@ fn match_value_arms_for_when(
     target: &str,
     fields: &[FieldDef],
     when_expr_id: usize,
+    source: Option<&str>,
 ) -> Vec<UpdateValueMatchArm> {
     let mut arms = Vec::new();
     collect_match_value_arms_for_when(
@@ -5893,9 +5926,10 @@ fn match_value_arms_for_when(
         &field.statement,
         when_expr_id,
         &mut arms,
+        source,
     );
     if arms.is_empty() {
-        match_value_arms_after_when_expr(field, target, fields, when_expr_id)
+        match_value_arms_after_when_expr(field, target, fields, when_expr_id, source)
     } else {
         arms
     }
@@ -5927,13 +5961,14 @@ fn collect_match_value_arms_for_when(
     statement: &AstStatement,
     when_expr_id: usize,
     arms: &mut Vec<UpdateValueMatchArm>,
+    source: Option<&str>,
 ) -> bool {
     let statement_contains_when = statement.expr.is_some_and(|expr_id| {
         expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
     });
     if statement_contains_when {
         for child in &statement.children {
-            if let Some(arm) = match_value_arm(field, target, fields, child) {
+            if let Some(arm) = match_value_arm(field, target, fields, child, source) {
                 arms.push(arm);
             }
         }
@@ -5942,7 +5977,15 @@ fn collect_match_value_arms_for_when(
         }
     }
     for child in &statement.children {
-        if collect_match_value_arms_for_when(field, target, fields, child, when_expr_id, arms) {
+        if collect_match_value_arms_for_when(
+            field,
+            target,
+            fields,
+            child,
+            when_expr_id,
+            arms,
+            source,
+        ) {
             return true;
         }
     }
@@ -5954,6 +5997,7 @@ fn match_value_arms_after_when_expr(
     target: &str,
     fields: &[FieldDef],
     when_expr_id: usize,
+    source: Option<&str>,
 ) -> Vec<UpdateValueMatchArm> {
     let Some(when_expr) = field_expr(field, when_expr_id) else {
         return Vec::new();
@@ -5975,7 +6019,7 @@ fn match_value_arms_after_when_expr(
         .ast_exprs
         .iter()
         .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| match_value_arm_expr(field, target, fields, expr))
+        .filter_map(|expr| match_value_arm_expr(field, target, fields, expr, source))
         .collect()
 }
 
@@ -6129,10 +6173,11 @@ fn match_value_arm(
     target: &str,
     fields: &[FieldDef],
     statement: &AstStatement,
+    source: Option<&str>,
 ) -> Option<UpdateValueMatchArm> {
     let expr_id = statement.expr?;
     let expr = field_expr(field, expr_id)?;
-    match_value_arm_expr(field, target, fields, expr)
+    match_value_arm_expr(field, target, fields, expr, source)
 }
 
 fn match_value_arm_expr(
@@ -6140,6 +6185,7 @@ fn match_value_arm_expr(
     target: &str,
     fields: &[FieldDef],
     expr: &AstExpr,
+    source: Option<&str>,
 ) -> Option<UpdateValueMatchArm> {
     let AstExprKind::MatchArm {
         pattern,
@@ -6148,7 +6194,7 @@ fn match_value_arm_expr(
     else {
         return None;
     };
-    let output = update_value_expression_from_expr(field, target, fields, *output)?;
+    let output = update_value_expression_from_expr(field, target, fields, *output, source)?;
     let pattern = match_const_pattern_label(pattern)?;
     (!pattern.is_empty()).then(|| UpdateValueMatchArm { pattern, output })
 }
@@ -6158,11 +6204,15 @@ fn update_value_expression_from_expr(
     target: &str,
     fields: &[FieldDef],
     expr_id: usize,
+    source: Option<&str>,
 ) -> Option<UpdateValueExpression> {
     let expr = field_expr(field, expr_id)?;
     if matches!(expr.kind, AstExprKind::Identifier(_) | AstExprKind::Path(_)) {
         let raw = ast_argument_value(field, expr_id)?;
-        let path = canonical_scalar_update_path_with_fields(field, target, &raw, fields);
+        let path = source.map_or_else(
+            || canonical_scalar_update_path_with_fields(field, target, &raw, fields),
+            |source| canonical_scalar_update_path_for_source(field, target, &raw, fields, source),
+        );
         if path == target || fields.iter().any(|candidate| candidate.path == path) {
             return Some(UpdateValueExpression::ReadPath { path });
         }
@@ -6171,18 +6221,19 @@ fn update_value_expression_from_expr(
         return Some(UpdateValueExpression::Const { value });
     }
     if let AstExprKind::When { input } = expr.kind {
-        if let Some(expression) =
-            update_value_match_number_infix_from_input(field, target, fields, input, expr.id)
-        {
+        if let Some(expression) = update_value_match_number_infix_from_input(
+            field, target, fields, input, expr.id, source,
+        ) {
             return Some(expression);
         }
-        let input = canonical_scalar_update_path_with_fields(
-            field,
-            target,
-            &ast_argument_value(field, input)?,
-            fields,
+        let raw_input = ast_argument_value(field, input)?;
+        let input = source.map_or_else(
+            || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
+            |source| {
+                canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source)
+            },
         );
-        let arms = match_value_arms_for_when(field, target, fields, expr.id);
+        let arms = match_value_arms_for_when(field, target, fields, expr.id, source);
         if !arms.is_empty() {
             return Some(UpdateValueExpression::MatchConst { input, arms });
         }
@@ -6205,6 +6256,7 @@ fn update_value_match_number_infix_from_input(
     fields: &[FieldDef],
     input: usize,
     when_expr_id: usize,
+    source: Option<&str>,
 ) -> Option<UpdateValueExpression> {
     let input = field_expr(field, input)?;
     let AstExprKind::Infix { left, op, right } = &input.kind else {
@@ -6212,7 +6264,7 @@ fn update_value_match_number_infix_from_input(
     };
     let left = scalar_number_operand(field, *left, target)?;
     let right = scalar_number_operand(field, *right, target)?;
-    let arms = match_value_arms_for_when(field, target, fields, when_expr_id);
+    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
     (!arms.is_empty()).then_some(UpdateValueExpression::MatchNumberInfixConst {
         left,
         op: op.clone(),
@@ -6392,6 +6444,34 @@ fn canonical_scalar_update_path_with_fields(
         }
     } else {
         canonical_local_path(value, &field.parent_path)
+    }
+}
+
+fn canonical_scalar_update_path_for_source(
+    field: &FieldDef,
+    target: &str,
+    value: &str,
+    fields: &[FieldDef],
+    source: &str,
+) -> String {
+    let canonical = canonical_scalar_update_path_with_fields(field, target, value, fields);
+    if fields.iter().any(|candidate| candidate.path == canonical) {
+        return canonical;
+    }
+    let Some((source_scope, _)) = source.split_once('.') else {
+        return canonical;
+    };
+    let Some((_, value_tail)) = value.split_once('.') else {
+        return canonical;
+    };
+    let source_scoped = format!("{source_scope}.{value_tail}");
+    if fields
+        .iter()
+        .any(|candidate| candidate.path == source_scoped)
+    {
+        source_scoped
+    } else {
+        canonical
     }
 }
 
@@ -6939,7 +7019,11 @@ impl FieldDef {
     }
 
     fn references_source_variant(&self, source_variant: &str) -> bool {
-        self.references_path_expr(source_variant, PathMatch::Prefix)
+        let path_parts = dotted_path_parts(source_variant);
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Path(parts) => path_parts_match_source_ref(parts, &path_parts),
+            _ => false,
+        })
     }
 
     fn first_referenced_payload_field(&self, source_variant: &str) -> Option<String> {
@@ -6969,14 +7053,6 @@ impl FieldDef {
             .collect()
     }
 
-    fn references_path_expr(&self, path: &str, path_match: PathMatch) -> bool {
-        let path_parts = dotted_path_parts(path);
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Path(parts) => path_parts_match(parts, &path_parts, path_match),
-            _ => false,
-        })
-    }
-
     fn source_branch(&self, source: &str) -> Option<RoutedBranch> {
         source_ref_variants(source)
             .iter()
@@ -6986,9 +7062,7 @@ impl FieldDef {
     fn source_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
         let source_parts = dotted_path_parts(source_variant);
         let start_line = self.ast_exprs.iter().find_map(|expr| match &expr.kind {
-            AstExprKind::Path(parts)
-                if path_parts_match(parts, &source_parts, PathMatch::Prefix) =>
-            {
+            AstExprKind::Path(parts) if path_parts_match_source_ref(parts, &source_parts) => {
                 Some(expr.line)
             }
             _ => None,
@@ -7000,8 +7074,10 @@ impl FieldDef {
         let start_indent = self.ast_items[start].indent;
         let mut depth = 0i32;
         let mut items = Vec::new();
-        for (offset, item) in self.ast_items.iter().skip(start).take(6).enumerate() {
-            if offset > 0 && item.indent <= start_indent {
+        for (offset, item) in self.ast_items.iter().skip(start).enumerate() {
+            let same_indent_pipe_continuation =
+                item.indent == start_indent && item_starts_with_symbol(item, "|>");
+            if offset > 0 && item.indent <= start_indent && !same_indent_pipe_continuation {
                 break;
             }
             items.push(item.clone());
@@ -7015,10 +7091,11 @@ impl FieldDef {
                 })
                 .sum::<i32>();
             depth += scope_delta;
-            let has_indented_continuation = self
-                .ast_items
-                .get(start + offset + 1)
-                .is_some_and(|next| next.indent > start_indent);
+            let has_indented_continuation =
+                self.ast_items.get(start + offset + 1).is_some_and(|next| {
+                    next.indent > start_indent
+                        || (next.indent == start_indent && item_starts_with_symbol(next, "|>"))
+                });
             if offset == 0 && depth == 0 && scope_delta == 0 && !has_indented_continuation {
                 break;
             }
@@ -7948,10 +8025,8 @@ FUNCTION wrapped_button(source) {
         let ir = lower(&parsed).unwrap();
 
         for expected_path in [
-            "store.elements.load_default_file",
             "store.elements.signal_search_input",
             "store.elements.keyboard_capture",
-            "store.elements.select_data",
             "store.elements.format_cycle",
         ] {
             assert!(
@@ -9029,6 +9104,169 @@ FUNCTION new_row(row) {
             UpdateExpression::ReadPath {
                 path: "row.key".to_owned()
             }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn row_source_alias_inside_list_latest_lowers_to_root_update_branch() {
+        let source = r#"
+store: [
+    signal_catalog:
+        LIST {
+            [key: TEXT { clk }, name: TEXT { A[3:0] }]
+        }
+        |> List/map(signal, new: new_signal(signal: signal))
+    active_signal:
+        TEXT { none } |> HOLD active_signal {
+            LATEST {
+                signal_catalog
+                    |> List/map(signal_catalog_item, new: LATEST {
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                            |> THEN { signal_catalog_item.key }
+                    })
+                    |> List/latest()
+            }
+        }
+]
+
+FUNCTION new_signal(signal) {
+    [
+        signal_elements: [
+            select_signal: SOURCE
+        ]
+        key: signal.key
+        name: signal.name
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("row-source-alias-latest.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.active_signal"
+                    && branch.source == "signal.signal_elements.select_signal"
+            })
+            .expect("row source alias should lower to active signal update branch");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::ReadPath {
+                path: "signal.key".to_owned()
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn row_source_alias_then_when_canonicalizes_match_input() {
+        let source = r#"
+store: [
+    signal_catalog:
+        LIST {
+            [key: TEXT { clk }, name: TEXT { A[3:0] }]
+        }
+        |> List/map(signal, new: new_signal(signal: signal))
+    active_label:
+        TEXT { none } |> HOLD active_label {
+            LATEST {
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { simple_tb.s.A[3:0] }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
+            }
+        }
+]
+
+FUNCTION new_signal(signal) {
+    [
+        signal_elements: [
+            select_signal: SOURCE
+        ]
+        key: signal.key
+        name: signal.name
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("row-source-alias-then-when.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.active_label"
+                    && branch.source == "signal.signal_elements.select_signal"
+            })
+            .expect("row source alias should lower active label update branch");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::MatchConst {
+                input: "signal.key".to_owned(),
+                arms: vec![
+                    UpdateMatchArm {
+                        pattern: "clk".to_owned(),
+                        output: "simple_tb.s.A[3:0]".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "__".to_owned(),
+                        output: "SKIP".to_owned(),
+                    },
+                ],
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn source_payload_match_with_skip_does_not_lower_to_sibling_const() {
+        let source = r#"
+store: [
+    elements: [
+        keyboard_capture: SOURCE
+        load_default_file: SOURCE
+    ]
+    zoom_step:
+        0 |> HOLD zoom_step {
+            LATEST {
+                elements.keyboard_capture.key |> WHEN {
+                    W => zoom_step >= 3 |> WHEN {
+                        True => 3
+                        False => zoom_step + 1
+                    }
+                    S => zoom_step <= -2 |> WHEN {
+                        True => -2
+                        False => zoom_step - 1
+                    }
+                    R => 0
+                    __ => SKIP
+                }
+                elements.load_default_file.event.press |> THEN { 0 }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("keyboard-skip-zoom-step.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.zoom_step"
+                    && branch.source == "store.elements.keyboard_capture"
+            })
+            .expect("keyboard capture should route to zoom_step");
+        assert!(
+            matches!(branch.expression, UpdateExpression::MatchValueConst { .. }),
+            "keyboard match should stay structured and skip unmatched keys, got {:#?}",
+            branch.expression
         );
         assert!(ir.static_schedule_verified);
     }

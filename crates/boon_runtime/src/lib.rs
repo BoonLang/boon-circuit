@@ -6256,6 +6256,35 @@ impl GenericScheduledRuntime {
             == Some(list)
     }
 
+    fn source_is_row_scoped_for_list(&self, list: &str, source: &str) -> bool {
+        self.list_source_bindings
+            .source_paths_or_empty(list)
+            .iter()
+            .any(|path| path == source)
+    }
+
+    fn source_is_row_scoped(&self, source: &str) -> bool {
+        self.list_source_bindings
+            .slots()
+            .iter()
+            .any(|slot| slot.source_paths.iter().any(|path| path == source))
+    }
+
+    fn require_row_context_for_row_scoped_source(
+        &self,
+        list: &str,
+        source: &str,
+        action: &str,
+    ) -> RuntimeResult<()> {
+        if self.source_is_row_scoped_for_list(list, source) || self.source_is_row_scoped(source) {
+            return Err(format!(
+                "source `{source}` is row-scoped for list `{list}`; indexed {action} requires row context and will not be applied to every row"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn apply_source_actions<'a>(
         &mut self,
         input: GenericSourceActionInput<'a>,
@@ -6484,7 +6513,15 @@ impl GenericScheduledRuntime {
                                 target,
                                 input.source,
                             )?;
+                            root_derived_changed_reads.insert(GenericReadKey::ListField {
+                                list: list.to_owned(),
+                                index,
+                                field: row_field_name(target).to_owned(),
+                            });
                             observe(GenericSourceMutation::TextFieldIdentity(commit))?;
+                            if mode.materializes_derived() {
+                                materialize_root_derived_after_actions = true;
+                            }
                         } else if let Some(commit) = self.storage.commit_indexed_text_source(
                             &self.scalar_equations,
                             list,
@@ -6493,10 +6530,23 @@ impl GenericScheduledRuntime {
                             input.source,
                             input.text,
                         )? {
+                            root_derived_changed_reads.insert(GenericReadKey::ListField {
+                                list: list.to_owned(),
+                                index,
+                                field: row_field_name(target).to_owned(),
+                            });
                             observe(GenericSourceMutation::TextField(commit))?;
+                            if mode.materializes_derived() {
+                                materialize_root_derived_after_actions = true;
+                            }
                         }
                     } else if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none()
                     {
+                        self.require_row_context_for_row_scoped_source(
+                            list,
+                            input.source,
+                            "text previous-value action",
+                        )?;
                         for index in 0..self.storage.list_len(list)? {
                             let commit = self.storage.commit_indexed_previous_text_target_source(
                                 &self.scalar_equations,
@@ -6505,9 +6555,22 @@ impl GenericScheduledRuntime {
                                 target,
                                 input.source,
                             )?;
+                            root_derived_changed_reads.insert(GenericReadKey::ListField {
+                                list: list.to_owned(),
+                                index,
+                                field: row_field_name(target).to_owned(),
+                            });
                             observe(GenericSourceMutation::TextFieldIdentity(commit))?;
                         }
+                        if mode.materializes_derived() {
+                            materialize_root_derived_after_actions = true;
+                        }
                     } else {
+                        self.require_row_context_for_row_scoped_source(
+                            list,
+                            input.source,
+                            "text action",
+                        )?;
                         for index in 0..self.storage.list_len(list)? {
                             if let Some(commit) = self.storage.commit_indexed_text_source(
                                 &self.scalar_equations,
@@ -6517,8 +6580,16 @@ impl GenericScheduledRuntime {
                                 input.source,
                                 input.text,
                             )? {
+                                root_derived_changed_reads.insert(GenericReadKey::ListField {
+                                    list: list.to_owned(),
+                                    index,
+                                    field: row_field_name(target).to_owned(),
+                                });
                                 observe(GenericSourceMutation::TextField(commit))?;
                             }
+                        }
+                        if mode.materializes_derived() {
+                            materialize_root_derived_after_actions = true;
                         }
                     }
                 }
@@ -6533,21 +6604,6 @@ impl GenericScheduledRuntime {
                         .into());
                     }
                     if let Some(index) = input.index {
-                        if self.scalar_equations.bool_const_value(target, input.source)
-                            == Some(true)
-                        {
-                            let field = row_field_name(target).to_owned();
-                            self.storage.commit_other_indexed_bool_fields(
-                                list,
-                                index,
-                                &field,
-                                false,
-                                |commit| {
-                                    observe(GenericSourceMutation::BoolField(commit))?;
-                                    Ok(())
-                                },
-                            )?;
-                        }
                         let commit = self.storage.commit_indexed_bool_source(
                             &self.scalar_equations,
                             list,
@@ -6556,9 +6612,22 @@ impl GenericScheduledRuntime {
                             input.source,
                             read_extra_bool,
                         )?;
+                        root_derived_changed_reads.insert(GenericReadKey::ListField {
+                            list: list.to_owned(),
+                            index,
+                            field: row_field_name(target).to_owned(),
+                        });
                         observe(GenericSourceMutation::BoolField(commit))?;
+                        if mode.materializes_derived() {
+                            materialize_root_derived_after_actions = true;
+                        }
                     } else {
-                        self.storage.commit_each_indexed_bool_source(
+                        self.require_row_context_for_row_scoped_source(
+                            list,
+                            input.source,
+                            "bool action",
+                        )?;
+                        let row_count = self.storage.commit_each_indexed_bool_source(
                             &self.scalar_equations,
                             list,
                             target,
@@ -6569,6 +6638,16 @@ impl GenericScheduledRuntime {
                                 Ok(())
                             },
                         )?;
+                        for index in 0..row_count {
+                            root_derived_changed_reads.insert(GenericReadKey::ListField {
+                                list: list.to_owned(),
+                                index,
+                                field: row_field_name(target).to_owned(),
+                            });
+                        }
+                        if mode.materializes_derived() {
+                            materialize_root_derived_after_actions = true;
+                        }
                     }
                 }
             }
@@ -6835,20 +6914,22 @@ impl GenericScheduledRuntime {
         }
         if let Some(address) = source_event.address {
             let source_id = self.source_routes.require_source_id(source_event.source)?;
-            let lookup_field = self
+            if let Some(lookup_field) = self
                 .source_routes
                 .address_lookup_field_for_source_id(source_id)
-                .ok_or_else(|| {
-                    format!(
-                        "source `{}` carries an address payload but has no typed row lookup field",
-                        source_event.source
-                    )
-                })?;
-            if let Some(index) =
-                self.storage
-                    .find_list_index_by_textlike(list, lookup_field, address)?
             {
-                return Ok(Some(index));
+                if let Some(index) =
+                    self.storage
+                        .find_list_index_by_textlike(list, lookup_field, address)?
+                {
+                    return Ok(Some(index));
+                }
+            } else if source_event.target_text.is_none() {
+                return Err(format!(
+                    "source `{}` carries an address payload but has no typed row lookup field",
+                    source_event.source
+                )
+                .into());
             }
         }
         let Some(target_text) = source_event.target_text else {
@@ -6959,7 +7040,24 @@ impl GenericScheduledRuntime {
             let Some(field) = self.generic_derived.root_field_plan(&path).cloned() else {
                 continue;
             };
+            let is_list_view = matches!(field.kind, DerivedValueKind::ListView);
             let Some(commit) = self.materialize_root_derived_field_commit(&field)? else {
+                if is_list_view {
+                    let changed_field = GenericReadKey::Root {
+                        field: path.to_owned(),
+                    };
+                    for dependent in self
+                        .generic_derived_state
+                        .root_dependents_for_reads([changed_field])
+                    {
+                        if !processed.contains(&dependent) {
+                            self.generic_derived_state
+                                .root_value_cache
+                                .remove(&dependent);
+                            dirty.insert(dependent);
+                        }
+                    }
+                }
                 continue;
             };
             let changed_field = GenericReadKey::Root {
@@ -9521,13 +9619,24 @@ impl GenericScheduledRuntime {
         if frame.root_stack.contains(&plan.path) {
             return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
         }
+        let reads_before = frame.reads.clone();
         frame.root_stack.push(plan.path.clone());
         let value = self.eval_root_derived_initial_value(&plan.statement, frame);
         frame.root_stack.pop();
         let value = value?;
+        let mut field_reads = frame
+            .reads
+            .difference(&reads_before)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         frame.reads.insert(GenericReadKey::Root {
             field: plan.path.clone(),
         });
+        field_reads.insert(GenericReadKey::Root {
+            field: plan.path.clone(),
+        });
+        self.generic_derived_state
+            .replace_root_reads(plan.path.clone(), field_reads);
         self.generic_derived_state
             .root_value_cache
             .insert(plan.path.clone(), value.clone());
@@ -11243,30 +11352,6 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<(u64, u64)> {
         self.set_list_row_bool(list, index, field, value)?;
         self.row_identity(list, index)
-    }
-
-    fn commit_other_indexed_bool_fields(
-        &mut self,
-        list: &str,
-        active_index: usize,
-        field: &str,
-        value: bool,
-        mut observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
-    ) -> RuntimeResult<()> {
-        for index in 0..self.list_len(list)? {
-            if index == active_index || self.list_row_bool_opt(list, index, field) != Some(!value) {
-                continue;
-            }
-            let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
-            observe(GenericBoolFieldCommit {
-                list: list.to_owned(),
-                key,
-                generation,
-                field: field.to_owned(),
-                value,
-            })?;
-        }
-        Ok(())
     }
 
     fn commit_indexed_text_source<'a>(
@@ -22724,6 +22809,64 @@ FUNCTION new_signal(signal, store) {
     }
 
     #[test]
+    fn row_scoped_source_without_row_context_does_not_bulk_apply_indexed_bool() {
+        let source = r#"
+signals:
+    LIST {
+        [name: TEXT { clk }]
+        [name: TEXT { reset }]
+    }
+    |> List/map(signal, new: new_signal(signal: signal))
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Signals }))
+
+FUNCTION new_signal(signal) {
+    [
+        signal_elements: [
+            select_signal: SOURCE
+        ]
+        name: signal.name
+        selected:
+            False |> HOLD selected {
+                LATEST {
+                    signal_elements.select_signal.event.press |> THEN { True }
+                }
+            }
+    ]
+}
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("row-scoped-source-needs-row-context", source).unwrap();
+        let error = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "signal.signal_elements.select_signal".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect_err("row-scoped source without row context must not bulk-select all rows");
+        let message = error.to_string();
+        assert!(
+            message.contains("row-scoped")
+                && message.contains("requires row context")
+                && message.contains("will not be applied to every row"),
+            "unexpected missing-row-context error: {message}"
+        );
+        let summary = runtime.state_summary();
+        assert_eq!(summary["signals"][0]["selected"], false);
+        assert_eq!(summary["signals"][1]["selected"], false);
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "signal.signal_elements.select_signal".to_owned(),
+                target_text: Some("clk".to_owned()),
+                address: Some("clk-key".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(output.state_summary["signals"][0]["selected"], true);
+        assert_eq!(output.state_summary["signals"][1]["selected"], false);
+    }
+
+    #[test]
     fn root_latest_numeric_infix_when_updates_and_clamps() {
         let source = r#"
 store: [
@@ -23222,6 +23365,152 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             binary["store"]["active_waveform_segment_labels"],
             "cursor,1010,marker,1100,0000"
         );
+    }
+
+    #[test]
+    fn novywave_row_signal_selection_is_row_scoped_and_updates_active_signal() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-row-signal-select-runtime", &units)
+            .expect("NovyWave runtime should initialize");
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.selected_clear_all".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("clear all should empty selected variables");
+        let empty = runtime.document_state_summary();
+        assert_eq!(empty["store"]["selected_rows_count"], 0);
+        let route = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .and_then(|generic| {
+                generic
+                    .source_routes
+                    .for_source("signal.signal_elements.select_signal")
+            })
+            .expect("signal row select source route should be compiled");
+        let active_signal_branches = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .expect("generic runtime should be present")
+            .scalar_equations
+            .branches
+            .iter()
+            .filter(|branch| branch.target == "store.active_signal")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            route
+                .root_scalar_targets
+                .iter()
+                .any(|target| target.target == "store.active_signal"),
+            "signal row select route should include active_signal root target: route_targets={:?}, active_signal_branches={:?}",
+            route.root_scalar_targets,
+            active_signal_branches
+        );
+        assert!(
+            route
+                .indexed_bool_targets
+                .iter()
+                .any(|target| target.target == "signal.selected_once"),
+            "signal row select route should include selected_once indexed bool target: {:?}",
+            route.indexed_bool_targets
+        );
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "signal.signal_elements.select_signal".to_owned(),
+                text: Some("B[3:0]".to_owned()),
+                target_text: Some("B[3:0]".to_owned()),
+                address: Some("reset_n".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("row signal source should apply");
+        assert_eq!(output.state_summary["store"]["active_signal"], "reset_n");
+        assert_eq!(
+            output.state_summary["store"]["signal_catalog"][1]["selected_once"],
+            true
+        );
+        assert_eq!(output.state_summary["store"]["selected_rows_count"], 1);
+        assert_eq!(
+            output.state_summary["store"]["selected_signals"][0]["id"],
+            "reset_n"
+        );
+        assert!(
+            output.state_summary["store"]["selected_signals"]
+                .as_array()
+                .expect("selected_signals should be a list")
+                .iter()
+                .all(|row| row["id"].as_str() != Some("clk")),
+            "clicking B[3:0] must not also select A[3:0]: {:?}",
+            output.state_summary["store"]["selected_signals"]
+        );
+    }
+
+    #[test]
+    fn novywave_external_loaded_name_payload_updates_active_file() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-external-name-payload", &units)
+            .expect("NovyWave runtime should initialize");
+        let external_name_route = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .and_then(|generic| {
+                generic
+                    .source_routes
+                    .for_source("store.elements.external_file_loaded_name")
+            })
+            .expect("external file loaded name route should exist");
+        assert!(
+            external_name_route
+                .root_scalar_targets
+                .iter()
+                .any(|target| target.target == "store.active_file"),
+            "external loaded name route should update active_file: {:?}",
+            external_name_route.root_scalar_targets
+        );
+        let active_file_target = external_name_route
+            .root_scalar_targets
+            .iter()
+            .find(|target| target.target == "store.active_file")
+            .expect("active_file target should be present");
+        assert!(
+            matches!(
+                active_file_target.expression,
+                ScalarUpdateExpression::SourceText | ScalarUpdateExpression::SourcePayload(_)
+            ),
+            "active_file should read source text payload, got {:?}; payload_fields={:?}",
+            active_file_target.expression,
+            external_name_route.payload_fields
+        );
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.show_empty".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("show empty should clear active file");
+        assert_eq!(
+            runtime.document_state_summary()["store"]["active_file"],
+            "none"
+        );
+
+        let loaded = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.external_file_loaded_name".to_owned(),
+                text: Some("simple.vcd".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("external loaded name payload should apply")
+            .state_summary;
+        assert_eq!(loaded["store"]["active_file"], "simple.vcd");
+        assert_eq!(loaded["store"]["load_files_dialog"], "Closed");
     }
 
     #[test]

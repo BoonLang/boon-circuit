@@ -633,44 +633,6 @@ store: [
             [file: "none", format: "none", digest: "sha256:none", waveform_ref: "wave:none", full_range: "no waveform range", initial_window: "no request window", range_start: 0, range_end: 0, initial_start: 0, initial_end: 0, canvas_width: 360, cursor_left: 0, cursor_default: 0, cursor_right: 0, zoom_center_default: 0, stats: "no waveform stats", large_file_contract: "no large file materialized", hierarchy_page: "HIER:none", hierarchy_cursor: "hierarchy cursor none", materialization_bound: "visible rows 0/0, waveform segments 0/256 max", time_unit: "none", timescale: "no timescale", range_source: NoFile, metadata_source: NoFile]
         }
 
-    viewport_window_records:
-        LIST {
-            [window_key: "simple.vcd|Fit|Center", start: 0, end: 250]
-            [window_key: "simple.vcd|Close|Center", start: 0, end: 150]
-            [window_key: "simple.vcd|Closer|Center", start: 40, end: 80]
-            [window_key: "simple.vcd|Closest|Center", start: 50, end: 60]
-            [window_key: "simple.vcd|Wide|Center", start: 0, end: 250]
-            [window_key: "simple.vcd|Widest|Center", start: 0, end: 250]
-            [window_key: "simple.vcd|Fit|LeftWindow", start: 0, end: 150]
-            [window_key: "simple.vcd|Fit|RightWindow", start: 50, end: 250]
-            [window_key: "simple.vcd|Close|LeftWindow", start: 0, end: 50]
-            [window_key: "simple.vcd|Close|RightWindow", start: 50, end: 150]
-            [window_key: "wave_27.fst|Fit|Center", start: 0, end: 120]
-            [window_key: "wave_27.fst|Close|Center", start: 36, end: 60]
-            [window_key: "wave_27.fst|Closer|Center", start: 40, end: 52]
-            [window_key: "wave_27.fst|Closest|Center", start: 42, end: 48]
-            [window_key: "wave_27.fst|Wide|Center", start: 0, end: 240]
-            [window_key: "wave_27.fst|Widest|Center", start: 0, end: 240]
-            [window_key: "wave_27.fst|Fit|LeftWindow", start: 0, end: 80]
-            [window_key: "wave_27.fst|Fit|RightWindow", start: 80, end: 160]
-            [window_key: "wave_27.fst|Close|LeftWindow", start: 24, end: 48]
-            [window_key: "wave_27.fst|Close|RightWindow", start: 48, end: 72]
-            [window_key: "wave_27.fst|Closer|LeftWindow", start: 30, end: 42]
-            [window_key: "wave_27.fst|Closer|RightWindow", start: 42, end: 54]
-            [window_key: "wave_27.fst|Closest|LeftWindow", start: 36, end: 42]
-            [window_key: "wave_27.fst|Closest|RightWindow", start: 44, end: 50]
-            [window_key: "wave_27.fst|Wide|LeftWindow", start: 0, end: 180]
-            [window_key: "wave_27.fst|Wide|RightWindow", start: 60, end: 240]
-            [window_key: "wave_27.fst|Widest|LeftWindow", start: 0, end: 240]
-            [window_key: "wave_27.fst|Widest|RightWindow", start: 0, end: 240]
-            [window_key: "simple_test.ghw|Fit|Center", start: 0, end: 100]
-            [window_key: "simple_test.ghw|Close|Center", start: 30, end: 60]
-            [window_key: "simple_test.ghw|Closer|Center", start: 36, end: 52]
-            [window_key: "simple_test.ghw|Closest|Center", start: 42, end: 48]
-            [window_key: "simple_test.ghw|Wide|Center", start: 0, end: 100]
-            [window_key: "simple_test.ghw|Widest|Center", start: 0, end: 100]
-        }
-
     active_metadata_file:
         active_file
 
@@ -1496,35 +1458,36 @@ store: [
             }
         }
 
-    cursor_time_driver:
-        CursorDefault |> HOLD cursor_time_driver {
+    zoom_center_keyboard_value:
+        selected_timeline_zoom_center_default |> HOLD zoom_center_keyboard_value {
             LATEST {
-                elements.waveform_click.pointer_x |> THEN { PointerCursor }
-                elements.cursor_left.event.press |> THEN { CursorLeft }
-                elements.cursor_right.event.press |> THEN { CursorRight }
-                elements.marker_jump.event.press |> THEN { CursorDefault }
-                elements.zoom_reset.event.press |> THEN { CursorDefault }
                 elements.keyboard_capture.key |> WHEN {
-                    D => CursorDefault
-                    Q => CursorLeft
-                    R => CursorDefault
-                    E => CursorRight
+                    Z => selected_timeline_range_start
+                    R => selected_timeline_zoom_center_default
                     __ => SKIP
                 }
-                elements.load_default_file.event.press |> THEN { CursorDefault }
-                elements.show_empty.event.press |> THEN { CursorDefault }
+                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
             }
         }
 
-    zoom_center_driver:
-        CursorDefault |> HOLD zoom_center_driver {
+    selected_timeline_zoom_center_value:
+        selected_timeline_zoom_center_default |> HOLD selected_timeline_zoom_center_value {
             LATEST {
-                elements.waveform_hover.pointer_x |> THEN { PointerCursor }
-                elements.zoom_reset.event.press |> THEN { CursorDefault }
-                elements.load_default_file.event.press |> THEN { CursorDefault }
-                elements.show_empty.event.press |> THEN { CursorDefault }
+                elements.waveform_hover.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_hover.pointer_x, pointer_width: elements.waveform_hover.pointer_width, viewport_start: selected_timeline_range_start, viewport_end: selected_timeline_range_end, fallback: selected_timeline_zoom_center_value) }
+                elements.keyboard_capture.key |> WHEN {
+                    Z => zoom_center_keyboard_value
+                    R => zoom_center_keyboard_value
+                    __ => SKIP
+                }
+                elements.zoom_reset.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
             }
         }
+
+    selected_timeline_zoom_center_number:
+        selected_timeline_zoom_center_value |> Text/to_number()
 
     selected_timeline_tick_0:
         viewport_label_start
@@ -1542,17 +1505,23 @@ store: [
         viewport_label_end
 
     selected_timeline_cursor_value:
-        cursor_time_driver |> WHEN {
-            PointerCursor => Number/project_time(pointer_x: waveform_click_pointer_x_text |> Text/to_number(), pointer_width: waveform_click_pointer_width_text |> Text/to_number(), viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_cursor_default)
-            CursorLeft => selected_timeline_cursor_left
-            CursorRight => selected_timeline_cursor_right
-            __ => selected_timeline_cursor_default
-        }
-
-    selected_timeline_zoom_center_value:
-        zoom_center_driver |> WHEN {
-            PointerCursor => Number/project_time(pointer_x: waveform_hover_pointer_x_text |> Text/to_number(), pointer_width: waveform_hover_pointer_width_text |> Text/to_number(), viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_zoom_center_default)
-            __ => selected_timeline_zoom_center_default
+        selected_timeline_cursor_default |> HOLD selected_timeline_cursor_value {
+            LATEST {
+                elements.waveform_click.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_click.pointer_x, pointer_width: elements.waveform_click.pointer_width, viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_cursor_value) }
+                elements.cursor_left.event.press |> THEN { selected_timeline_cursor_left }
+                elements.cursor_right.event.press |> THEN { selected_timeline_cursor_right }
+                elements.marker_jump.event.press |> THEN { selected_timeline_cursor_default }
+                elements.zoom_reset.event.press |> THEN { selected_timeline_cursor_default }
+                elements.keyboard_capture.key |> WHEN {
+                    D => selected_timeline_cursor_default
+                    Q => selected_timeline_cursor_left
+                    R => selected_timeline_cursor_default
+                    E => selected_timeline_cursor_right
+                    __ => SKIP
+                }
+                elements.load_default_file.event.press |> THEN { selected_timeline_cursor_default }
+                elements.show_empty.event.press |> THEN { selected_timeline_cursor_default }
+            }
         }
 
     selected_waveform_segments:
@@ -1749,6 +1718,8 @@ store: [
         Text/empty() |> HOLD keyboard_last_key {
             LATEST {
                 elements.keyboard_capture.key
+                elements.waveform_hover.pointer_x |> THEN { Text/empty() }
+                elements.waveform_click.pointer_x |> THEN { Text/empty() }
                 elements.load_default_file.event.press |> THEN { Text/empty() }
                 elements.show_empty.event.press |> THEN { Text/empty() }
                 elements.select_counter_file.event.press |> THEN { Text/empty() }
@@ -2168,13 +2139,44 @@ store: [
         |> Text/concat(with: zoom_level, separator: "|")
         |> Text/concat(with: pan_window, separator: "|")
 
+    viewport_initial_span_value:
+        Number/max(left: selected_timeline_window_end - selected_timeline_window_start, right: 0)
+
+    viewport_range_span_value:
+        Number/max(left: selected_timeline_range_end - selected_timeline_range_start, right: 0)
+
+    viewport_close_unit_value:
+        viewport_initial_span_value / 5
+
+    viewport_closer_unit_value:
+        viewport_initial_span_value / 25
+
+    viewport_duration_value:
+        zoom_level |> WHEN {
+            Widest => viewport_range_span_value
+            Wide => viewport_range_span_value
+            Fit => viewport_initial_span_value
+            Close => Number/max(left: viewport_close_unit_value * 3, right: 1)
+            Closer => Number/max(left: viewport_closer_unit_value * 4, right: 1)
+            Closest => Number/max(left: viewport_closer_unit_value, right: 1)
+            __ => viewport_initial_span_value
+        }
+
+    viewport_anchor_center_value:
+        pan_window |> WHEN {
+            LeftWindow => selected_timeline_zoom_center_number - viewport_duration_value / 2
+            RightWindow => selected_timeline_zoom_center_number + viewport_duration_value / 2
+            __ => selected_timeline_zoom_center_number
+        }
+
+    viewport_desired_start_value:
+        viewport_anchor_center_value - viewport_duration_value / 2
+
     viewport_label_start:
-        List/find_value(viewport_window_records, field: "window_key", value: viewport_window_key, target: "start", fallback: selected_timeline_window_start)
-        |> Text/to_number()
+        Number/max(left: selected_timeline_range_start, right: Number/min(left: viewport_desired_start_value, right: selected_timeline_range_end - viewport_duration_value))
 
     viewport_label_end:
-        List/find_value(viewport_window_records, field: "window_key", value: viewport_window_key, target: "end", fallback: selected_timeline_window_end)
-        |> Text/to_number()
+        Number/min(left: selected_timeline_range_end, right: viewport_label_start + viewport_duration_value)
 
     viewport_label:
         viewport_label_start
@@ -2453,13 +2455,32 @@ store: [
         |> Text/concat(with: bridge_response_zoom, separator: "|")
         |> Text/concat(with: bridge_response_pan, separator: "|")
 
+    bridge_response_viewport_duration:
+        bridge_response_zoom |> WHEN {
+            Widest => viewport_range_span_value
+            Wide => viewport_range_span_value
+            Fit => viewport_initial_span_value
+            Close => Number/max(left: viewport_close_unit_value * 3, right: 1)
+            Closer => Number/max(left: viewport_closer_unit_value * 4, right: 1)
+            Closest => Number/max(left: viewport_closer_unit_value, right: 1)
+            __ => viewport_initial_span_value
+        }
+
+    bridge_response_viewport_anchor_center:
+        bridge_response_pan |> WHEN {
+            LeftWindow => selected_timeline_zoom_center_number - bridge_response_viewport_duration / 2
+            RightWindow => selected_timeline_zoom_center_number + bridge_response_viewport_duration / 2
+            __ => selected_timeline_zoom_center_number
+        }
+
+    bridge_response_viewport_desired_start:
+        bridge_response_viewport_anchor_center - bridge_response_viewport_duration / 2
+
     bridge_response_window_start:
-        List/find_value(viewport_window_records, field: "window_key", value: bridge_response_window_key, target: "start", fallback: selected_timeline_window_start)
-        |> Text/to_number()
+        Number/max(left: selected_timeline_range_start, right: Number/min(left: bridge_response_viewport_desired_start, right: selected_timeline_range_end - bridge_response_viewport_duration))
 
     bridge_response_window_end:
-        List/find_value(viewport_window_records, field: "window_key", value: bridge_response_window_key, target: "end", fallback: selected_timeline_window_end)
-        |> Text/to_number()
+        Number/min(left: selected_timeline_range_end, right: bridge_response_window_start + bridge_response_viewport_duration)
 
     bridge_response_cursor:
         Cursor42 |> HOLD bridge_response_cursor {

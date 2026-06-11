@@ -271,6 +271,15 @@ impl SourcePayloadField {
             _ => Self::Named(name.to_owned()),
         }
     }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Address => "address",
+            Self::Key => "key",
+            Self::Named(name) => name.as_str(),
+            Self::Text => "text",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -444,6 +453,13 @@ pub enum UpdateExpression {
         op: String,
         right: String,
     },
+    ProjectTime {
+        pointer_x: String,
+        pointer_width: String,
+        viewport_start: String,
+        viewport_end: String,
+        fallback: String,
+    },
     PreviousValue {
         path: String,
     },
@@ -578,7 +594,7 @@ fn lower_profiled_with_typecheck(
         let messages = typecheck_report
             .diagnostics
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| format!("line {}: {}", diagnostic.line, diagnostic.message))
             .collect::<Vec<_>>()
             .join("; ");
         return Err(format!(
@@ -1005,6 +1021,23 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         .iter()
         .map(|list| format!("store.{}", list.name))
         .collect::<Vec<_>>();
+    let source_payload_paths = program
+        .sources
+        .iter()
+        .flat_map(|source| {
+            source.payload_schema.fields.iter().flat_map(move |field| {
+                let field = field.name();
+                [
+                    format!("{}.{}", source.path, field),
+                    source
+                        .path
+                        .strip_prefix("store.")
+                        .map(|path| format!("{path}.{field}"))
+                        .unwrap_or_else(|| format!("{}.{}", source.path, field)),
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
     let known_symbols = source_paths
         .iter()
         .chain(state_paths.iter())
@@ -1012,6 +1045,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         .chain(derived_paths.iter())
         .copied()
         .chain(store_list_names.iter().map(String::as_str))
+        .chain(source_payload_paths.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
     let list_projection_symbols = list_projection_view_symbols(program);
     for binding in &program.view_bindings {
@@ -3051,6 +3085,26 @@ fn verify_scheduled_update_expression(
             }
             Ok(())
         }
+        UpdateExpression::ProjectTime {
+            pointer_x,
+            pointer_width,
+            viewport_start,
+            viewport_end,
+            fallback,
+        } => {
+            for (context, path) in [
+                ("project time pointer_x", pointer_x),
+                ("project time pointer_width", pointer_width),
+                ("project time viewport_start", viewport_start),
+                ("project time viewport_end", viewport_end),
+                ("project time fallback", fallback),
+            ] {
+                if path.parse::<i64>().is_err() && !source_payload_input_matches(path, source) {
+                    require_known_symbol(context, path, known_symbols)?;
+                }
+            }
+            Ok(())
+        }
         UpdateExpression::MatchNumberInfixConst {
             left,
             op,
@@ -3442,6 +3496,19 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::NumberInfix { left, right, .. } => {
             reject_hidden_identity_identifier("number infix left", left)?;
             reject_hidden_identity_identifier("number infix right", right)
+        }
+        UpdateExpression::ProjectTime {
+            pointer_x,
+            pointer_width,
+            viewport_start,
+            viewport_end,
+            fallback,
+        } => {
+            reject_hidden_identity_identifier("project time pointer_x", pointer_x)?;
+            reject_hidden_identity_identifier("project time pointer_width", pointer_width)?;
+            reject_hidden_identity_identifier("project time viewport_start", viewport_start)?;
+            reject_hidden_identity_identifier("project time viewport_end", viewport_end)?;
+            reject_hidden_identity_identifier("project time fallback", fallback)
         }
         UpdateExpression::MatchNumberInfixConst {
             left, right, arms, ..
@@ -5368,6 +5435,9 @@ fn update_expression_for_source(
     if let Some(expression) = branch.then_number_infix_expression(field, target) {
         return expression;
     }
+    if let Some(expression) = branch.then_project_time_expression(field, target) {
+        return expression;
+    }
     if let Some(expression) =
         prefix_payload_concat_update_expression_from_items(&branch.items, &variants)
     {
@@ -6543,6 +6613,44 @@ impl RoutedBranch {
                 left,
                 op: op.clone(),
                 right,
+            })
+        })
+    }
+
+    fn then_project_time_expression(
+        &self,
+        field: &FieldDef,
+        target: &str,
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then {
+                output: Some(output),
+                ..
+            } = expr.kind
+            else {
+                return None;
+            };
+            let output = self
+                .ast_exprs
+                .iter()
+                .find(|candidate| candidate.id == output)?;
+            let AstExprKind::Call { function, args } = &output.kind else {
+                return None;
+            };
+            if function != "Number/project_time" {
+                return None;
+            }
+            let arg = |name: &str| {
+                args.iter()
+                    .find(|arg| arg.name.as_deref() == Some(name))
+                    .and_then(|arg| scalar_number_operand(field, arg.value, target))
+            };
+            Some(UpdateExpression::ProjectTime {
+                pointer_x: arg("pointer_x")?,
+                pointer_width: arg("pointer_width")?,
+                viewport_start: arg("viewport_start")?,
+                viewport_end: arg("viewport_end")?,
+                fallback: arg("fallback")?,
             })
         })
     }

@@ -2738,6 +2738,19 @@ impl RuntimeSymbols {
                     symbols.intern(left);
                     symbols.intern(right);
                 }
+                UpdateExpression::ProjectTime {
+                    pointer_x,
+                    pointer_width,
+                    viewport_start,
+                    viewport_end,
+                    fallback,
+                } => {
+                    symbols.intern(pointer_x);
+                    symbols.intern(pointer_width);
+                    symbols.intern(viewport_start);
+                    symbols.intern(viewport_end);
+                    symbols.intern(fallback);
+                }
                 UpdateExpression::MatchNumberInfixConst {
                     left, right, arms, ..
                 } => {
@@ -10769,6 +10782,10 @@ impl GenericCircuitRuntime {
         payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
+        payload_pointer_x: Option<&'a str>,
+        payload_pointer_y: Option<&'a str>,
+        payload_pointer_width: Option<&'a str>,
+        payload_pointer_height: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let empty_payload = BTreeMap::new();
@@ -10779,10 +10796,10 @@ impl GenericCircuitRuntime {
             payload_text,
             payload_address,
             &empty_payload,
-            None,
-            None,
-            None,
-            None,
+            payload_pointer_x,
+            payload_pointer_y,
+            payload_pointer_width,
+            payload_pointer_height,
             |path| self.root_textlike(path).ok(),
         )?
         else {
@@ -10840,6 +10857,10 @@ impl GenericCircuitRuntime {
         payload_key: Option<&'a str>,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
+        payload_pointer_x: Option<&'a str>,
+        payload_pointer_y: Option<&'a str>,
+        payload_pointer_width: Option<&'a str>,
+        payload_pointer_height: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
         let Some(target) = routes.single_root_scalar_target_for_source_id(source_id)? else {
@@ -10852,6 +10873,10 @@ impl GenericCircuitRuntime {
             payload_key,
             payload_text,
             payload_address,
+            payload_pointer_x,
+            payload_pointer_y,
+            payload_pointer_width,
+            payload_pointer_height,
             seq,
         )?
         else {
@@ -11526,6 +11551,7 @@ impl GenericCircuitRuntime {
                 )))
             }
             ScalarUpdateExpression::NumberInfix { .. }
+            | ScalarUpdateExpression::ProjectTime { .. }
             | ScalarUpdateExpression::MatchNumberInfixConst { .. }
             | ScalarUpdateExpression::BoolNot(_)
             | ScalarUpdateExpression::Unsupported => Err(format!(
@@ -12889,6 +12915,7 @@ fn close_other_list_editors<'a>(
 #[derive(Clone, Debug)]
 struct ScalarEquationPlan {
     branches: Vec<ScalarUpdateBranch>,
+    source_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -12909,6 +12936,13 @@ enum ScalarUpdateExpression {
         left: String,
         op: String,
         right: String,
+    },
+    ProjectTime {
+        pointer_x: String,
+        pointer_width: String,
+        viewport_start: String,
+        viewport_end: String,
+        fallback: String,
     },
     MatchNumberInfixConst {
         left: String,
@@ -12949,6 +12983,7 @@ impl ScalarUpdateExpression {
                 | Self::SourcePayload(_)
                 | Self::Const(_)
                 | Self::NumberInfix { .. }
+                | Self::ProjectTime { .. }
                 | Self::MatchNumberInfixConst { .. }
                 | Self::PreviousValue(_)
                 | Self::ReadPath(_)
@@ -14698,6 +14733,11 @@ enum RuntimeListPredicate {
 
 impl ScalarEquationPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
+        let source_paths = ir
+            .sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>();
         let branches = ir
             .update_branches
             .iter()
@@ -14727,6 +14767,19 @@ impl ScalarEquationPlan {
                             right: right.clone(),
                         }
                     }
+                    UpdateExpression::ProjectTime {
+                        pointer_x,
+                        pointer_width,
+                        viewport_start,
+                        viewport_end,
+                        fallback,
+                    } => ScalarUpdateExpression::ProjectTime {
+                        pointer_x: pointer_x.clone(),
+                        pointer_width: pointer_width.clone(),
+                        viewport_start: viewport_start.clone(),
+                        viewport_end: viewport_end.clone(),
+                        fallback: fallback.clone(),
+                    },
                     UpdateExpression::MatchNumberInfixConst {
                         left,
                         op,
@@ -14830,7 +14883,16 @@ impl ScalarEquationPlan {
                 },
             })
             .collect();
-        Self { branches }
+        Self {
+            branches,
+            source_paths,
+        }
+    }
+
+    fn input_is_declared_source_payload(&self, input: &str) -> bool {
+        self.source_paths
+            .iter()
+            .any(|source| source_payload_field_from_input(input, source).is_some())
     }
 
     fn has_root_text_branch(&self, target: &str, source: &str) -> bool {
@@ -14945,6 +15007,63 @@ impl ScalarEquationPlan {
                     })?;
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.to_string()))))
             }
+            ScalarUpdateExpression::ProjectTime {
+                pointer_x,
+                pointer_width,
+                viewport_start,
+                viewport_end,
+                fallback,
+            } => {
+                let read_number = |path: &str| {
+                    path.parse::<i64>().ok().or_else(|| {
+                        source_payload_field_from_input(path, source)
+                            .and_then(|field| {
+                                source_payload_value(
+                                    &field,
+                                    payload_key,
+                                    payload_text,
+                                    payload_address,
+                                    payload,
+                                    payload_pointer_x,
+                                    payload_pointer_y,
+                                    payload_pointer_width,
+                                    payload_pointer_height,
+                                )
+                            })
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .or_else(|| read_textlike(path)?.parse::<i64>().ok())
+                    })
+                };
+                let pointer_x = read_number(pointer_x).ok_or_else(|| {
+                    format!("source `{source}` for `{target}` cannot read project time pointer_x")
+                })?;
+                let pointer_width = read_number(pointer_width).ok_or_else(|| {
+                    format!(
+                        "source `{source}` for `{target}` cannot read project time pointer_width"
+                    )
+                })?;
+                let viewport_start = read_number(viewport_start).ok_or_else(|| {
+                    format!(
+                        "source `{source}` for `{target}` cannot read project time viewport_start"
+                    )
+                })?;
+                let viewport_end = read_number(viewport_end).ok_or_else(|| {
+                    format!(
+                        "source `{source}` for `{target}` cannot read project time viewport_end"
+                    )
+                })?;
+                let fallback = read_number(fallback).unwrap_or(viewport_start);
+                let viewport_span = viewport_end - viewport_start;
+                let projected = if pointer_width <= 0 || viewport_span <= 0 {
+                    fallback
+                } else {
+                    let clamped_x = pointer_x.clamp(0, pointer_width);
+                    viewport_start + (viewport_span * clamped_x) / pointer_width
+                };
+                Ok(Some(ScalarTextValue::Text(Cow::Owned(
+                    projected.to_string(),
+                ))))
+            }
             ScalarUpdateExpression::MatchNumberInfixConst {
                 left,
                 op,
@@ -14980,6 +15099,7 @@ impl ScalarEquationPlan {
                     payload,
                 ) {
                     Some(value) => Cow::Borrowed(value),
+                    None if self.input_is_declared_source_payload(input) => return Ok(None),
                     None => Cow::Owned(read_textlike(input).ok_or_else(|| {
                         format!(
                             "source `{source}` for `{target}` cannot read match input `{input}`"
@@ -15005,6 +15125,7 @@ impl ScalarEquationPlan {
                     payload,
                 ) {
                     Some(value) => Cow::Borrowed(value),
+                    None if self.input_is_declared_source_payload(input) => return Ok(None),
                     None => Cow::Owned(read_textlike(input).ok_or_else(|| {
                         format!(
                             "source `{source}` for `{target}` cannot read match input `{input}`"
@@ -16473,6 +16594,7 @@ impl SourceRoute {
                         SourceRouteTextAction::Computed
                     }
                     ScalarUpdateExpression::NumberInfix { .. }
+                    | ScalarUpdateExpression::ProjectTime { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
@@ -16500,6 +16622,7 @@ impl SourceRoute {
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::NumberInfix { .. }
+                    | ScalarUpdateExpression::ProjectTime { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::ReadPath(_)
@@ -23114,6 +23237,17 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
         assert_eq!(waveform_value_width(&initial, "clk", "0xa"), 72);
         assert_eq!(waveform_value_width(&initial, "clk", "0xc"), 144);
 
+        let hover_center = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.waveform_hover".to_owned(),
+                pointer_x: Some("288".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform hover should update zoom center")
+            .state_summary;
+        assert_eq!(hover_center["store"]["zoom_center_label"], "200 s");
+
         let zoomed = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.zoom_in".to_owned(),
@@ -23127,11 +23261,11 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             zoomed["store"]["viewport_window_key"],
             "simple.vcd|Close|Center"
         );
-        assert_eq!(zoomed["store"]["viewport_label"], "0 s - 150 s");
-        assert_eq!(zoomed["store"]["keyboard_viewport_label"], "0 s - 150 s");
-        assert_eq!(waveform_value_labels(&zoomed, "clk"), ["0xa", "0xc"]);
-        assert_eq!(waveform_value_width(&zoomed, "clk", "0xa"), 120);
-        assert_eq!(waveform_value_width(&zoomed, "clk", "0xc"), 240);
+        assert_eq!(zoomed["store"]["viewport_label"], "100 s - 250 s");
+        assert_eq!(zoomed["store"]["keyboard_viewport_label"], "100 s - 250 s");
+        assert_eq!(waveform_value_labels(&zoomed, "clk"), ["0xc", "0x0"]);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0xc"), 120);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0x0"), 240);
 
         let closer = runtime
             .apply_source_event(LiveSourceEvent {
@@ -23142,10 +23276,27 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             .expect("second zoom-in should apply")
             .state_summary;
         assert_eq!(closer["store"]["zoom_level"], "Closer");
-        assert_eq!(closer["store"]["viewport_label"], "40 s - 80 s");
-        assert_eq!(waveform_value_labels(&closer, "clk"), ["0xa", "0xc"]);
-        assert_eq!(waveform_value_width(&closer, "clk", "0xa"), 90);
-        assert_eq!(waveform_value_width(&closer, "clk", "0xc"), 270);
+        assert_eq!(closer["store"]["viewport_label"], "180 s - 220 s");
+        assert_eq!(waveform_value_labels(&closer, "clk"), ["0x0"]);
+        assert_eq!(waveform_value_width(&closer, "clk", "0x0"), 360);
+
+        let zoom_center_origin = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.keyboard_capture".to_owned(),
+                key: Some("Z".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("Z should reset zoom center to timeline origin")
+            .state_summary;
+        assert_eq!(
+            zoom_center_origin["store"]["selected_timeline_zoom_center_number"],
+            0
+        );
+        assert_eq!(zoom_center_origin["store"]["zoom_center_label"], "0 s");
+        assert_eq!(
+            zoom_center_origin["store"]["viewport_label"], "0 s - 40 s",
+            "Z should move the zoom center to the selected file origin without changing zoom level"
+        );
 
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -24024,6 +24175,7 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
     #[test]
     fn scalar_match_const_uses_default_arm_for_unmatched_values() {
         let equations = ScalarEquationPlan {
+            source_paths: Vec::new(),
             branches: vec![ScalarUpdateBranch {
                 target: "store.active_signal".to_owned(),
                 source: "store.elements.select_data".to_owned(),
@@ -24063,6 +24215,7 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
     #[test]
     fn scalar_match_value_reports_bad_nested_output_instead_of_skip() {
         let equations = ScalarEquationPlan {
+            source_paths: vec!["store.elements.keyboard_capture".to_owned()],
             branches: vec![ScalarUpdateBranch {
                 target: "store.zoom_step".to_owned(),
                 source: "store.elements.keyboard_capture".to_owned(),

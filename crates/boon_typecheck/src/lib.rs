@@ -741,8 +741,25 @@ impl<'a> Checker<'a> {
         {
             self.check_render_slot(statement);
         }
+        let saved_name_bindings = if let AstStatementKind::Function { name, args } = &statement.kind
+        {
+            let arg_bindings = args
+                .iter()
+                .map(|arg| (arg.clone(), self.function_arg_display_type(name, arg)))
+                .collect::<Vec<_>>();
+            let saved = self.name_bindings.clone();
+            for (arg, ty) in arg_bindings {
+                self.name_bindings.insert(arg, ty);
+            }
+            Some(saved)
+        } else {
+            None
+        };
         for child in &statement.children {
             self.check_statement(child, next_in_document);
+        }
+        if let Some(saved) = saved_name_bindings {
+            self.name_bindings = saved;
         }
     }
 
@@ -766,12 +783,6 @@ impl<'a> Checker<'a> {
                 .as_ref()
                 .map(|requirement| merge_canonical_row_type(&ty, requirement))
                 .unwrap_or(ty);
-        }
-        if let Some(ty) = self.name_bindings.get(arg) {
-            return requirement
-                .as_ref()
-                .map(|requirement| merge_canonical_row_type(ty, requirement))
-                .unwrap_or_else(|| ty.clone());
         }
         requirement.unwrap_or_else(open_object_type)
     }

@@ -47859,14 +47859,14 @@ mod tests {
         );
         assert_eq!(
             keyboard_summary.pointer("/store/keyboard_viewport_label"),
-            Some(&json!("0 s - 150 s"))
+            Some(&json!("100 s - 250 s"))
         );
         assert_eq!(
             keyboard_summary.pointer("/store/keyboard_cursor_label"),
             Some(&json!("0 s"))
         );
-        assert_waveform_value_labels(&keyboard_summary, "clk", &["0xa", "0xc"], "Close viewport");
-        let zoomed_released_width = waveform_value_segment_width(&keyboard_summary, "clk", "0xc");
+        assert_waveform_value_labels(&keyboard_summary, "clk", &["0xc", "0x0"], "Close viewport");
+        let zoomed_released_width = waveform_value_segment_width(&keyboard_summary, "clk", "0x0");
         assert!(
             zoomed_released_width > initial_released_width * 1.5,
             "zoom-in should visibly expand waveform segment width: initial={initial_released_width}, zoomed={zoomed_released_width}"
@@ -47895,32 +47895,20 @@ mod tests {
         );
         assert_eq!(
             repeated_zoom_summary.pointer("/store/keyboard_viewport_label"),
-            Some(&json!("40 s - 80 s")),
+            Some(&json!("180 s - 220 s")),
             "held W should move to the closer viewport without jumping back"
         );
-        assert_waveform_value_labels(
-            &repeated_zoom_summary,
-            "clk",
-            &["0xa", "0xc"],
-            "Closer viewport",
-        );
-        let repeated_zoom_leading_width =
-            waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xa");
+        assert_waveform_value_labels(&repeated_zoom_summary, "clk", &["0x0"], "Closer viewport");
         let repeated_zoom_released_width =
-            waveform_value_segment_width(&repeated_zoom_summary, "clk", "0xc");
+            waveform_value_segment_width(&repeated_zoom_summary, "clk", "0x0");
         let repeated_zoom_canvas_width = summary_number(
             &repeated_zoom_summary,
             "/store/selected_waveform_canvas_width",
         );
-        let expected_repeated_zoom_leading_width = repeated_zoom_canvas_width * (10.0 / 40.0);
-        assert!(
-            (repeated_zoom_leading_width - expected_repeated_zoom_leading_width).abs() <= 1.0,
-            "held W should clip the leading 0xa segment to the 40 s - 80 s viewport using the measured canvas width: width={repeated_zoom_leading_width}, expected={expected_repeated_zoom_leading_width}, canvas={repeated_zoom_canvas_width}"
-        );
-        let expected_repeated_zoom_released_width = repeated_zoom_canvas_width * (30.0 / 40.0);
+        let expected_repeated_zoom_released_width = repeated_zoom_canvas_width;
         assert!(
             (repeated_zoom_released_width - expected_repeated_zoom_released_width).abs() <= 1.0,
-            "held W should clip the 0xc segment to the 40 s - 80 s viewport using the measured canvas width: width={repeated_zoom_released_width}, expected={expected_repeated_zoom_released_width}, first={zoomed_released_width}, canvas={repeated_zoom_canvas_width}"
+            "held W should fill the 180 s - 220 s viewport with the 0x0 segment using the measured canvas width: width={repeated_zoom_released_width}, expected={expected_repeated_zoom_released_width}, first={zoomed_released_width}, canvas={repeated_zoom_canvas_width}"
         );
 
         let zoom_out_key = test_keyboard_input(vec![test_key_press(8, "S")], vec!["S"]);
@@ -47940,16 +47928,16 @@ mod tests {
         );
         assert_eq!(
             zoom_out_summary.pointer("/store/keyboard_viewport_label"),
-            Some(&json!("0 s - 150 s"))
+            Some(&json!("100 s - 250 s"))
         );
         assert_waveform_value_labels(
             &zoom_out_summary,
             "clk",
-            &["0xa", "0xc"],
+            &["0xc", "0x0"],
             "Close viewport after zoom-out",
         );
         let zoomed_out_released_width =
-            waveform_value_segment_width(&zoom_out_summary, "clk", "0xc");
+            waveform_value_segment_width(&zoom_out_summary, "clk", "0x0");
         let zoomed_out_canvas_width =
             summary_number(&zoom_out_summary, "/store/selected_waveform_canvas_width");
         let expected_zoomed_out_released_width = zoomed_out_canvas_width * (100.0 / 150.0);

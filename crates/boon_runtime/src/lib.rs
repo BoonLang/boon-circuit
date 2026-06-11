@@ -1157,6 +1157,7 @@ impl LiveRuntime {
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
+        let event = self.normalize_live_source_event(event);
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step(&step)
@@ -1166,6 +1167,7 @@ impl LiveRuntime {
         &mut self,
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveStepOutput> {
+        let event = self.normalize_live_source_event(event);
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_with_document_summary(&step)
@@ -1179,6 +1181,7 @@ impl LiveRuntime {
         column_start: usize,
         column_count: usize,
     ) -> RuntimeResult<LiveStepOutput> {
+        let event = self.normalize_live_source_event(event);
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_with_document_window(
@@ -1194,9 +1197,19 @@ impl LiveRuntime {
         &mut self,
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveTurnOutput> {
+        let event = self.normalize_live_source_event(event);
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_turn(&step)
+    }
+
+    fn normalize_live_source_event(&self, mut event: LiveSourceEvent) -> LiveSourceEvent {
+        if let Some(source) = self.runtime.canonical_source_path(&event.source)
+            && source != event.source
+        {
+            event.source = source;
+        }
+        event
     }
 
     pub fn apply_source_event_for_step(
@@ -2328,6 +2341,12 @@ impl LoadedRuntime {
         self.generic
             .as_ref()
             .is_some_and(|generic| generic.has_source_path(source))
+    }
+
+    fn canonical_source_path(&self, source: &str) -> Option<String> {
+        self.generic
+            .as_ref()
+            .and_then(|generic| generic.canonical_source_path(source))
     }
 
     fn document_state_summary_for_window(
@@ -5763,6 +5782,10 @@ impl GenericScheduledRuntime {
         self.source_routes.has_source_path(source)
     }
 
+    fn canonical_source_path(&self, source: &str) -> Option<String> {
+        self.source_routes.canonical_source_path(source)
+    }
+
     fn reset_indexed_holds_from_row_initial_fields(
         &mut self,
         ir: &TypedProgram,
@@ -5783,9 +5806,16 @@ impl GenericScheduledRuntime {
             };
             let len = self.storage.list_len(&row_scope.list)?;
             for index in 0..len {
-                if let Some(value) = self
-                    .storage
-                    .list_row_value_opt(&row_scope.list, index, path)
+                let base_path;
+                let source_path = if path == target_field {
+                    base_path = base_row_field_name(target_field);
+                    base_path.as_str()
+                } else {
+                    path
+                };
+                if let Some(value) =
+                    self.storage
+                        .list_row_value_opt(&row_scope.list, index, source_path)
                 {
                     self.storage
                         .set_list_row_value(&row_scope.list, index, target_field, value)?;
@@ -5978,6 +6008,9 @@ impl GenericScheduledRuntime {
             }
             let has_previous_text = has_indexed_text(SourceRouteTextAction::PreviousValue);
             let has_read_path_text = has_indexed_text(SourceRouteTextAction::ReadPath);
+            if has_indexed_text(SourceRouteTextAction::Computed) {
+                return Ok(SourceActionKind::IndexedTextConst);
+            }
             if has_const_true && (has_previous_text || has_read_path_text) {
                 return Ok(SourceActionKind::IndexedTextOpen);
             }
@@ -6299,6 +6332,9 @@ impl GenericScheduledRuntime {
                 SourceAction::RouterRoute { path, .. } => {
                     if self.router_route != *path {
                         self.router_route.clone_from(path);
+                        root_derived_changed_reads.insert(GenericReadKey::Root {
+                            field: "Router/route".to_owned(),
+                        });
                         if mode.materializes_derived() {
                             materialize_root_derived_after_actions = true;
                         }
@@ -6401,38 +6437,60 @@ impl GenericScheduledRuntime {
                     {
                         continue;
                     }
-                    let Some(list) = input.list.as_deref() else {
+                    let target_list = self.indexed_target_list(target)?.to_owned();
+                    let list = input.list.as_deref().unwrap_or(target_list.as_str());
+                    if list != target_list {
                         return Err(format!(
-                            "source `{}` indexed text action `{target}` needs a list context",
-                            input.source
+                            "source `{}` indexed text action `{target}` routed to list `{list}`, expected `{target_list}`",
+                            input.source,
                         )
                         .into());
                     };
-                    let Some(index) = input.index else {
-                        return Err(format!(
-                            "source `{}` indexed text action `{target}` needs a row index",
-                            input.source
-                        )
-                        .into());
-                    };
-                    if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
-                        let commit = self.storage.commit_indexed_previous_text_target_source(
+                    if let Some(index) = input.index {
+                        if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
+                            let commit = self.storage.commit_indexed_previous_text_target_source(
+                                &self.scalar_equations,
+                                list,
+                                index,
+                                target,
+                                input.source,
+                            )?;
+                            observe(GenericSourceMutation::TextFieldIdentity(commit))?;
+                        } else if let Some(commit) = self.storage.commit_indexed_text_source(
                             &self.scalar_equations,
                             list,
                             index,
                             target,
                             input.source,
-                        )?;
-                        observe(GenericSourceMutation::TextFieldIdentity(commit))?;
-                    } else if let Some(commit) = self.storage.commit_indexed_text_source(
-                        &self.scalar_equations,
-                        list,
-                        index,
-                        target,
-                        input.source,
-                        input.text,
-                    )? {
-                        observe(GenericSourceMutation::TextField(commit))?;
+                            input.text,
+                        )? {
+                            observe(GenericSourceMutation::TextField(commit))?;
+                        }
+                    } else if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none()
+                    {
+                        for index in 0..self.storage.list_len(list)? {
+                            let commit = self.storage.commit_indexed_previous_text_target_source(
+                                &self.scalar_equations,
+                                list,
+                                index,
+                                target,
+                                input.source,
+                            )?;
+                            observe(GenericSourceMutation::TextFieldIdentity(commit))?;
+                        }
+                    } else {
+                        for index in 0..self.storage.list_len(list)? {
+                            if let Some(commit) = self.storage.commit_indexed_text_source(
+                                &self.scalar_equations,
+                                list,
+                                index,
+                                target,
+                                input.source,
+                                input.text,
+                            )? {
+                                observe(GenericSourceMutation::TextField(commit))?;
+                            }
+                        }
                     }
                 }
                 SourceAction::IndexedBool { target, .. } => {
@@ -6909,12 +6967,15 @@ impl GenericScheduledRuntime {
         let value = self.eval_root_derived_initial_value(&field.statement, &mut frame)?;
         self.generic_derived_state
             .replace_root_reads(field.path.clone(), frame.reads);
+        if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+            self.generic_derived_state
+                .root_value_cache
+                .remove(&field.path);
+            return Ok(None);
+        }
         self.generic_derived_state
             .root_value_cache
             .insert(field.path.clone(), value.clone());
-        if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
-            return Ok(None);
-        }
         let field_value = boon_value_field_value(&value);
         let current = self.storage.root.owned_value(&field.path);
         if current.as_ref() == Some(&field_value) {
@@ -7146,6 +7207,13 @@ impl GenericScheduledRuntime {
         let value = self.eval_statement_value(&plan.statement, &mut frame)?;
         self.generic_derived_state
             .replace_reads(key.clone(), frame.reads);
+        if plan.kind == DerivedValueKind::SourceEventTransform && matches!(value, BoonValue::Empty)
+        {
+            let current = self
+                .storage
+                .list_row_field(&key.list, key.index, &key.field)?;
+            return Ok((None, field_ref_to_boon(current)));
+        }
         let field_value = boon_value_field_value(&value);
         let current = self
             .storage
@@ -7559,6 +7627,14 @@ impl GenericScheduledRuntime {
         if name == "NaN" {
             return Ok(BoonValue::NaN);
         }
+        if let Some(row) = frame.row.clone()
+            && name == row.row_scope
+        {
+            return Ok(BoonValue::RowRef {
+                list: row.list,
+                index: row.index,
+            });
+        }
         if self.storage.lists.memory(name).is_some() {
             return Ok(BoonValue::ListRef(name.to_owned()));
         }
@@ -7589,6 +7665,12 @@ impl GenericScheduledRuntime {
             return Ok(value);
         }
         if let Some(value) = self.root_non_list_derived_boon_value(&store_name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_list_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_list_derived_boon_value(&store_name, frame)? {
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
@@ -7692,6 +7774,9 @@ impl GenericScheduledRuntime {
             if let Ok(value) = self.storage.list_row_field(list, index, &base_field) {
                 return Ok(field_ref_to_boon(value));
             }
+            if let Ok(value) = self.storage.list_row_field(list, index, field) {
+                return Ok(field_ref_to_boon(value));
+            }
         }
         if self.generic_derived.contains_field(list, field) {
             let key = GenericDerivedKey {
@@ -7770,6 +7855,12 @@ impl GenericScheduledRuntime {
                     value.as_text().unwrap_or_default().trim().to_owned(),
                 ))
             }
+            "Text/to_uppercase" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(
+                    value.as_text().unwrap_or_default().to_ascii_uppercase(),
+                ))
+            }
             "Text/starts_with" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 let prefix = self.named_arg_value(args, "prefix", frame)?;
@@ -7822,14 +7913,38 @@ impl GenericScheduledRuntime {
                         .contains(&needle.as_text().unwrap_or_default()),
                 ))
             }
-            "Text/to_number" => {
+            "Text/all_chars_in" => {
                 let value = self.call_input_or_first(input, args, frame)?;
-                let text = value.as_text().unwrap_or_default();
-                Ok(text
-                    .trim()
-                    .parse::<i64>()
-                    .map(BoonValue::Number)
-                    .unwrap_or(BoonValue::NaN))
+                let chars = self.named_arg_value(args, "chars", frame)?;
+                Ok(BoonValue::Bool(text_all_chars_in(
+                    &value.as_text().unwrap_or_default(),
+                    &chars.as_text().unwrap_or_default(),
+                )))
+            }
+            "Text/to_number" => {
+                let piped = input.is_some();
+                let value = self.call_input_or_first(input, args, frame)?;
+                let radix_position = if piped { 0 } else { 1 };
+                let radix = self
+                    .named_or_positional_arg_value(args, "radix", radix_position, frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(10);
+                let leading = self
+                    .named_arg_value(args, "leading", frame)
+                    .ok()
+                    .and_then(|value| value.bool_value().ok())
+                    .unwrap_or(false);
+                let fallback = self
+                    .named_arg_value(args, "fallback", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok());
+                Ok(
+                    parse_text_number(&value.as_text().unwrap_or_default(), radix, leading)
+                        .or(fallback)
+                        .map(BoonValue::Number)
+                        .unwrap_or(BoonValue::NaN),
+                )
             }
             "Text/is_empty" => {
                 let value = self.call_input_or_first(input, args, frame)?;
@@ -7885,6 +8000,76 @@ impl GenericScheduledRuntime {
                     .named_or_positional_arg_value(args, "right", 1, frame)?
                     .number()?;
                 Ok(BoonValue::Number(left.max(right)))
+            }
+            "Number/bit_width" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Number(number_bit_width(value.number()?)))
+            }
+            "Number/to_text" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let radix = self
+                    .named_arg_value(args, "radix", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(10);
+                let min_width = self
+                    .named_arg_value(args, "min_width", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(0);
+                let signed_width = self
+                    .named_arg_value(args, "signed_width", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(0);
+                let prefix = self
+                    .named_arg_value(args, "prefix", frame)
+                    .ok()
+                    .and_then(|value| value.bool_value().ok())
+                    .unwrap_or(false);
+                let group_size = self
+                    .named_arg_value(args, "group_size", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(0);
+                Ok(BoonValue::Text(format_number_text(
+                    value.number()?,
+                    radix,
+                    min_width,
+                    prefix,
+                    group_size,
+                    signed_width,
+                )))
+            }
+            "Number/to_codepoint_text" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let min = self
+                    .named_arg_value(args, "min", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(0);
+                let max = self
+                    .named_arg_value(args, "max", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(i64::from(u32::MAX));
+                Ok(BoonValue::Text(number_to_codepoint_text(
+                    value.number()?,
+                    min,
+                    max,
+                )))
+            }
+            "Number/to_ascii_text" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let width = self
+                    .named_arg_value(args, "width", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(8);
+                Ok(BoonValue::Text(number_to_ascii_text(
+                    value.number()?,
+                    width,
+                )))
             }
             "Number/project_width" => {
                 let start = self
@@ -8023,7 +8208,12 @@ impl GenericScheduledRuntime {
                     _ => String::new(),
                 }))
             }
-            "Router/route" => Ok(BoonValue::Text(self.router_route.clone())),
+            "Router/route" => {
+                frame.reads.insert(GenericReadKey::Root {
+                    field: "Router/route".to_owned(),
+                });
+                Ok(BoonValue::Text(self.router_route.clone()))
+            }
             "Router/go_to" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Text(value.as_text().unwrap_or_default()))
@@ -9301,7 +9491,7 @@ impl GenericScheduledRuntime {
             return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
         }
         frame.root_stack.push(plan.path.clone());
-        let value = self.eval_statement_value(&plan.statement, frame);
+        let value = self.eval_root_derived_initial_value(&plan.statement, frame);
         frame.root_stack.pop();
         let value = value?;
         frame.reads.insert(GenericReadKey::Root {
@@ -9339,6 +9529,20 @@ impl GenericScheduledRuntime {
             return Ok(None);
         };
         if matches!(plan.kind, DerivedValueKind::ListView) {
+            return Ok(None);
+        }
+        self.root_derived_boon_value(path, frame)
+    }
+
+    fn root_list_derived_boon_value(
+        &mut self,
+        path: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        let Some(plan) = self.generic_derived.root_field_plan(path) else {
+            return Ok(None);
+        };
+        if !matches!(plan.kind, DerivedValueKind::ListView) {
             return Ok(None);
         }
         self.root_derived_boon_value(path, frame)
@@ -10152,6 +10356,174 @@ fn zoom_projected_number(width: i64, zoom: Option<&str>) -> i64 {
     }
 }
 
+pub fn parse_text_number(text: &str, radix: i64, leading: bool) -> Option<i64> {
+    let radix = radix.clamp(2, 36) as u32;
+    let mut trimmed = text.trim();
+    let negative = trimmed.starts_with('-');
+    if negative || trimmed.starts_with('+') {
+        trimmed = &trimmed[1..];
+    }
+    trimmed = match radix {
+        2 => trimmed
+            .strip_prefix("0b")
+            .or_else(|| trimmed.strip_prefix("0B"))
+            .unwrap_or(trimmed),
+        8 => trimmed
+            .strip_prefix("0o")
+            .or_else(|| trimmed.strip_prefix("0O"))
+            .unwrap_or(trimmed),
+        16 => trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed),
+        _ => trimmed,
+    };
+    let digits = if leading {
+        trimmed
+            .chars()
+            .take_while(|ch| ch.is_digit(radix))
+            .collect::<String>()
+    } else {
+        if !trimmed.chars().all(|ch| ch.is_digit(radix)) {
+            return None;
+        }
+        trimmed.to_owned()
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let value = i64::from_str_radix(&digits, radix).ok()?;
+    Some(if negative { -value } else { value })
+}
+
+fn text_all_chars_in(text: &str, chars: &str) -> bool {
+    !text.is_empty() && text.chars().all(|ch| chars.contains(ch))
+}
+
+pub fn number_bit_width(value: i64) -> i64 {
+    let magnitude = value.unsigned_abs();
+    (u64::BITS - magnitude.leading_zeros()).max(1) as i64
+}
+
+pub fn format_number_text(
+    value: i64,
+    radix: i64,
+    min_width: i64,
+    prefix: bool,
+    group_size: i64,
+    signed_width: i64,
+) -> String {
+    let radix = radix.clamp(2, 36) as u32;
+    let value = if signed_width > 0 {
+        twos_complement_signed(value, signed_width)
+    } else {
+        value
+    };
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let mut digits = format_unsigned_radix(magnitude, radix);
+    let min_width = min_width.max(0) as usize;
+    if digits.len() < min_width {
+        let mut padded = String::with_capacity(min_width);
+        padded.extend(std::iter::repeat('0').take(min_width - digits.len()));
+        padded.push_str(&digits);
+        digits = padded;
+    }
+    if group_size > 0 {
+        digits = grouped_digits(&digits, group_size as usize);
+    }
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    if prefix {
+        output.push_str(match radix {
+            2 => "0b",
+            8 => "0o",
+            16 => "0x",
+            _ => "",
+        });
+    }
+    output.push_str(&digits);
+    output
+}
+
+fn format_unsigned_radix(mut value: u64, radix: u32) -> String {
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = (value % u64::from(radix)) as u32;
+        digits.push(std::char::from_digit(digit, radix).unwrap_or('?'));
+        value /= u64::from(radix);
+    }
+    digits.iter().rev().collect()
+}
+
+fn grouped_digits(digits: &str, group_size: usize) -> String {
+    if group_size == 0 || digits.len() <= group_size {
+        return digits.to_owned();
+    }
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / group_size);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % group_size == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn twos_complement_signed(value: i64, width: i64) -> i64 {
+    let width = width.clamp(1, 63);
+    let value = value as u64;
+    let sign_bit = 1_u64 << (width - 1);
+    let mask = (1_u64 << width) - 1;
+    let masked = value & mask;
+    if masked & sign_bit == 0 {
+        masked as i64
+    } else {
+        (masked as i128 - (1_i128 << width)) as i64
+    }
+}
+
+pub fn number_to_codepoint_text(value: i64, min: i64, max: i64) -> String {
+    if value < min || value > max {
+        return ".".to_owned();
+    }
+    u32::try_from(value)
+        .ok()
+        .and_then(char::from_u32)
+        .filter(|ch| !ch.is_control())
+        .map(|ch| ch.to_string())
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+pub fn number_to_ascii_text(value: i64, width: i64) -> String {
+    if width < 8 {
+        return ".".to_owned();
+    }
+    let width = width.clamp(8, 64) as u32;
+    let byte_count = (width / 8).clamp(1, 8) as usize;
+    let value = value as u64;
+    let mut bytes = Vec::with_capacity(byte_count);
+    for index in (0..byte_count).rev() {
+        let byte = ((value >> (index * 8)) & 0xff) as u8;
+        if byte == 0 {
+            bytes.push(b'?');
+        } else if byte.is_ascii() && (byte.is_ascii_graphic() || byte == b' ') {
+            bytes.push(byte);
+        } else {
+            bytes.push(b'?');
+        }
+    }
+    while bytes.last() == Some(&b'?') && bytes.len() > 1 {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| ".".to_owned())
+}
+
 fn generic_values_equal(left: &BoonValue, right: &BoonValue) -> bool {
     match (left, right) {
         (BoonValue::Text(left), BoonValue::Text(right)) => left == right,
@@ -10264,27 +10636,6 @@ fn text_match_pattern_value(tokens: &[String]) -> String {
         return format!("/{}", tokens[1..].join(""));
     }
     tokens.join(" ")
-}
-
-fn statement_is_row_initial_passthrough(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    row_scope: &str,
-    field: &str,
-) -> bool {
-    let expr_id = statement
-        .expr
-        .or_else(|| statement.children.iter().find_map(|child| child.expr));
-    let Some(expr_id) = expr_id else {
-        return false;
-    };
-    expressions.get(expr_id).is_some_and(|expr| {
-        matches!(
-            &expr.kind,
-            AstExprKind::Path(parts) if parts.as_slice() == [row_scope, field]
-                || (parts.len() == 2 && parts.get(1).is_some_and(|part| part == field))
-        )
-    })
 }
 
 impl Deref for GenericScheduledRuntime {
@@ -11146,11 +11497,37 @@ impl GenericCircuitRuntime {
                     "{prefix}{separator}{payload}"
                 ))))
             }
+            ScalarUpdateExpression::MatchConst { .. }
+            | ScalarUpdateExpression::MatchValueConst { .. } => {
+                let empty_payload = BTreeMap::new();
+                let Some(value) = equations.eval_text(
+                    target,
+                    source,
+                    None,
+                    payload_text,
+                    None,
+                    &empty_payload,
+                    None,
+                    None,
+                    None,
+                    None,
+                    |path| {
+                        self.root_textlike(path).ok().or_else(|| {
+                            self.list_row_textlike_opt(list, index, row_field_name(path))
+                                .map(str::to_owned)
+                        })
+                    },
+                )?
+                else {
+                    return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
+                };
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
+                    value.into_owned(),
+                )))
+            }
             ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::MatchNumberInfixConst { .. }
             | ScalarUpdateExpression::BoolNot(_)
-            | ScalarUpdateExpression::MatchConst { .. }
-            | ScalarUpdateExpression::MatchValueConst { .. }
             | ScalarUpdateExpression::Unsupported => Err(format!(
                 "text branch for `{target}` from `{source}` is not a supported indexed text expression"
             )
@@ -12366,13 +12743,13 @@ fn missing_row_initial_value(cell: &boon_ir::StateCell, ir: &TypedProgram) -> Op
     let InitialValue::RowInitialField { .. } = &cell.initial_value else {
         return None;
     };
-    ir.update_branches
-        .iter()
-        .any(|branch| {
-            branch.target == cell.path
-                && matches!(branch.expression, UpdateExpression::BoolNot { .. })
-        })
-        .then_some(FieldValue::Bool(false))
+    if ir.update_branches.iter().any(|branch| {
+        branch.target == cell.path && matches!(branch.expression, UpdateExpression::BoolNot { .. })
+    }) {
+        Some(FieldValue::Bool(false))
+    } else {
+        Some(FieldValue::Text(String::new()))
+    }
 }
 
 fn initialize_indexed_derived_base_fields(
@@ -12591,6 +12968,8 @@ impl ScalarUpdateExpression {
                 | Self::ReadPath(_)
                 | Self::TextTrimOrPrevious { .. }
                 | Self::PrefixPayloadConcat { .. }
+                | Self::MatchConst { .. }
+                | Self::MatchValueConst { .. }
         ) || matches!(self, Self::Const(value) if value != "True" && value != "False")
     }
 
@@ -13455,6 +13834,7 @@ struct GenericDerivedIndexedField {
     list: String,
     row_scope: String,
     field: String,
+    kind: DerivedValueKind,
     statement: AstStatement,
 }
 
@@ -14243,6 +14623,7 @@ enum SourceRouteTextAction {
     PreviousValue,
     ReadPath,
     TextTrimOrPrevious,
+    Computed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14989,18 +15370,11 @@ impl GenericDerivedPlan {
                     .iter()
                     .find(|scope| scope.row_scope == row_scope)
                     .map(|scope| scope.list.clone())?;
-                if statement_is_row_initial_passthrough(
-                    &value.statement,
-                    &ir.expressions,
-                    row_scope,
-                    field,
-                ) {
-                    return None;
-                }
                 Some(GenericDerivedIndexedField {
                     list,
                     row_scope: row_scope.to_owned(),
                     field: field.to_owned(),
+                    kind: value.kind.clone(),
                     statement: value.statement.clone(),
                 })
             })
@@ -15533,7 +15907,14 @@ impl SourceRoutePlan {
             .find_map(|variant| {
                 self.source_id_exact(&variant)
                     .or_else(|| self.source_id_unique_event_child(&variant))
+                    .or_else(|| self.source_id_unique_suffix(&variant))
             })
+    }
+
+    fn canonical_source_path(&self, source: &str) -> Option<String> {
+        let source_id = self.source_id(source)?;
+        self.for_source_id(source_id)
+            .map(|route| route.source.clone())
     }
 
     fn source_id_exact(&self, source: &str) -> Option<SourceId> {
@@ -15555,6 +15936,17 @@ impl SourceRoutePlan {
         ]
         .iter()
         .filter_map(|suffix| self.source_id_exact(&format!("{source}{suffix}")));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    fn source_id_unique_suffix(&self, source: &str) -> Option<SourceId> {
+        let suffix = source.split_once('.')?.1;
+        let suffix = format!(".{suffix}");
+        let mut matches = self
+            .label_slots
+            .iter()
+            .filter_map(|label| label.source.ends_with(&suffix).then_some(label.source_id));
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     }
@@ -16076,13 +16468,15 @@ impl SourceRoute {
                     ScalarUpdateExpression::PrefixPayloadConcat { .. } => {
                         SourceRouteTextAction::ReadPath
                     }
+                    ScalarUpdateExpression::MatchConst { .. }
+                    | ScalarUpdateExpression::MatchValueConst { .. } => {
+                        SourceRouteTextAction::Computed
+                    }
                     ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::SourceKey
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::BoolNot(_)
-                    | ScalarUpdateExpression::MatchConst { .. }
-                    | ScalarUpdateExpression::MatchValueConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
                 Some(SourceAction::IndexedText {
@@ -22421,6 +22815,84 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
             "00101010"
         );
         assert_eq!(output.state_summary["data_bus_rendered_value"], "00101010");
+    }
+
+    #[test]
+    fn novywave_selected_row_formatter_is_row_scoped_and_rerenders_values() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-row-format-runtime", &units)
+            .expect("NovyWave runtime should initialize");
+        let visible_row_by_id = |summary: &JsonValue, id: &str| -> JsonValue {
+            summary["store"]["selected_visible_items"]
+                .as_array()
+                .expect("selected_visible_items should be a list")
+                .iter()
+                .find(|row| row["id"].as_str() == Some(id))
+                .unwrap_or_else(|| panic!("missing selected row `{id}`"))
+                .clone()
+        };
+
+        let initial = runtime.document_state_summary();
+        let clk = visible_row_by_id(&initial, "clk");
+        let reset = visible_row_by_id(&initial, "reset_n");
+        assert_eq!(clk["remove_kind"], "RemoveClk");
+        assert_eq!(reset["remove_kind"], "RemoveReset");
+        assert_eq!(clk["formatter"], "Hexadecimal");
+        assert_eq!(reset["formatter"], "Hexadecimal");
+        assert_eq!(clk["format_label"], "Hex");
+        assert_eq!(clk["current_value"], "0xc");
+        assert_eq!(reset["current_value"], "0x5");
+
+        let opened = runtime
+            .apply_source_event_for_document(LiveSourceEvent {
+                source: "selected_signal.format_elements.format_dropdown_toggle".to_owned(),
+                target_text: Some("A[3:0]".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("row formatter dropdown should open")
+            .state_summary;
+        assert_eq!(
+            visible_row_by_id(&opened, "clk")["format_dropdown_state"],
+            "Open"
+        );
+        assert_eq!(
+            visible_row_by_id(&opened, "reset_n")["format_dropdown_state"],
+            "Closed"
+        );
+
+        let binary = runtime
+            .apply_source_event_for_document(LiveSourceEvent {
+                source: "selected_signal.format_elements.format_binary".to_owned(),
+                target_text: Some("A[3:0]".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("row formatter option should apply")
+            .state_summary;
+        let clk = visible_row_by_id(&binary, "clk");
+        let reset = visible_row_by_id(&binary, "reset_n");
+        assert_eq!(clk["remove_kind"], "RemoveClk");
+        assert_eq!(reset["remove_kind"], "RemoveReset");
+        assert_eq!(clk["formatter"], "Binary");
+        assert_eq!(reset["formatter"], "Hexadecimal");
+        assert_eq!(clk["format_label"], "Bin");
+        assert_eq!(clk["format_dropdown_state"], "Closed");
+        assert_eq!(clk["current_value"], "1100");
+        assert_eq!(reset["format_label"], "Hex");
+        assert_eq!(reset["current_value"], "0x5");
+        assert_eq!(
+            binary["store"]["selected_cursor_pair_rows"][0]["label"],
+            "A[3:0]=1100"
+        );
+        assert_eq!(
+            binary["store"]["selected_cursor_pair_rows"][1]["label"],
+            "B[3:0]=0x5"
+        );
+        assert_eq!(
+            binary["store"]["active_waveform_segment_labels"],
+            "cursor,1010,marker,1100,0000"
+        );
     }
 
     #[test]

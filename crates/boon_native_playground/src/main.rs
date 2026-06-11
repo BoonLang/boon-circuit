@@ -18324,6 +18324,9 @@ fn lower_canonical_element_style(
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
+    if let Some(args) = document_call_args(statement, expressions) {
+        lower_canonical_element_call_arg_style(args, expressions, context, node);
+    }
     for child in &statement.children {
         let Some(field) = document_field_name(child) else {
             continue;
@@ -18363,21 +18366,56 @@ fn lower_canonical_element_style(
     }
 }
 
+fn lower_canonical_element_call_arg_style(
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for arg in args {
+        let Some(field) = arg.name.as_deref() else {
+            continue;
+        };
+        document_context_clear_data_reads(context);
+        match field {
+            "style" => lower_canonical_style_expr(arg.value, expressions, context, node),
+            "width" | "height" | "size" => {
+                let explicit_reads = document_expr_origin_paths(arg.value, expressions, context);
+                if let Some(value) = document_style_value_for_expr(arg.value, expressions, context)
+                {
+                    node.style.insert(field.to_owned(), value);
+                }
+                document_context_record_target_reads(context, node, field, explicit_reads);
+            }
+            "gap" | "padding" | "scroll" | "scroll_x" | "scroll_y" | "scrollbars" | "center" => {
+                if let Some(value) = document_style_value_for_expr(arg.value, expressions, context)
+                {
+                    node.style.insert(field.to_owned(), value);
+                }
+            }
+            "checked" | "selected" | "visible" | "focus" => {
+                if let Some(value) = document_style_value_for_expr(arg.value, expressions, context)
+                {
+                    node.style.insert(field.to_owned(), value);
+                }
+            }
+            _ => {}
+        }
+        let reads = document_context_take_data_reads(context);
+        if field != "style" {
+            document_context_record_target_reads(context, node, field, reads);
+        }
+    }
+}
+
 fn lower_canonical_style_block(
     statement: &AstStatement,
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
-    if let Some(expr_id) = statement.expr
-        && let Some(Value::Object(object)) = expressions
-            .get(expr_id)
-            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
-    {
-        lower_json_style_object(&object, node);
-    }
-    if let Some(fields) = record_fields_for_statement(statement, expressions) {
-        lower_canonical_style_record(fields, expressions, context, node);
+    if let Some(expr_id) = statement.expr {
+        lower_canonical_style_expr(expr_id, expressions, context, node);
     }
     for child in &statement.children {
         let Some(field) = document_field_name(child) else {
@@ -18512,6 +18550,23 @@ fn lower_canonical_style_block(
         }
     }
     synthesize_physical_style(node);
+}
+
+fn lower_canonical_style_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(Value::Object(object)) = expressions
+        .get(expr_id)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_object(&object, node);
+    }
+    if let Some(fields) = record_fields_for_expr(expr_id, expressions) {
+        lower_canonical_style_record(fields, expressions, context, node);
+    }
 }
 
 fn statement_expr_is_element_hovered(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
@@ -20165,6 +20220,7 @@ fn lower_canonical_element_text(
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
+    lower_canonical_element_call_arg_text(statement, expressions, context, node);
     for child in &statement.children {
         let Some(field) = document_field_name(child) else {
             continue;
@@ -20228,6 +20284,42 @@ fn lower_canonical_element_text(
         let reads = document_context_take_data_reads(context);
         if recorded_text {
             document_context_record_target_reads(context, node, "text", reads);
+        }
+    }
+}
+
+fn lower_canonical_element_call_arg_text(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(args) = document_call_args(statement, expressions) else {
+        return;
+    };
+    for name in ["label", "text", "value", "display_value", "child", "icon"] {
+        if node.text.is_some() {
+            return;
+        }
+        let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) else {
+            continue;
+        };
+        document_context_clear_data_reads(context);
+        if let Some(text) = expressions
+            .get(arg.value)
+            .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
+            .filter(|text| {
+                !text.is_empty()
+                    && !(matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput)
+                        && text.contains(".event."))
+            })
+        {
+            node.text = Some(boon_document_model::TextValue { text });
+            let mut reads = document_context_take_data_reads(context);
+            reads.extend(document_expr_origin_paths(arg.value, expressions, context));
+            document_context_record_target_reads(context, node, "text", reads);
+        } else {
+            let _ = document_context_take_data_reads(context);
         }
     }
 }
@@ -20342,6 +20434,11 @@ fn document_text_value_for_expr(
 ) -> Option<String> {
     match &expr.kind {
         AstExprKind::Call { function, .. } if function == "Text/empty" => Some(String::new()),
+        AstExprKind::Call { function, args }
+            if boon_typecheck::is_registered_element_constructor(function) =>
+        {
+            document_render_constructor_text_arg(args, expressions, context)
+        }
         AstExprKind::StringLiteral(value) => {
             if value.starts_with('$') {
                 Some(document_resolved_text(value, context))
@@ -20369,6 +20466,22 @@ fn document_text_value_for_expr(
     }
 }
 
+fn document_render_constructor_text_arg(
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    ["text", "label", "value", "display_value"]
+        .iter()
+        .find_map(|name| {
+            args.iter()
+                .find(|arg| arg.name.as_deref() == Some(*name))
+                .and_then(|arg| expressions.get(arg.value))
+                .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
+                .filter(|text| !text.is_empty())
+        })
+}
+
 fn lower_canonical_element_sources(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -20378,6 +20491,17 @@ fn lower_canonical_element_sources(
     node: &mut boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
 ) {
+    if let Some(args) = document_call_args(statement, expressions) {
+        lower_canonical_element_call_arg_sources(
+            args,
+            expressions,
+            context,
+            typecheck_report,
+            node_id,
+            node,
+            source_intents,
+        );
+    }
     for child in &statement.children {
         match document_field_name(child).as_deref() {
             Some("element") => {
@@ -20544,6 +20668,64 @@ fn lower_canonical_element_sources(
                         "source_path": value
                     }));
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_canonical_element_call_arg_sources(
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+) {
+    for arg in args {
+        match arg.name.as_deref() {
+            Some("element") => {
+                if let Some(fields) = record_fields_for_expr(arg.value, expressions) {
+                    lower_canonical_element_source_record(
+                        fields,
+                        expressions,
+                        context,
+                        typecheck_report,
+                        node_id,
+                        node,
+                        source_intents,
+                    );
+                }
+            }
+            Some("target" | "address") => {
+                let Some(intent) = arg.name.as_deref() else {
+                    continue;
+                };
+                document_context_clear_data_reads(context);
+                if let Some(value) = expressions
+                    .get(arg.value)
+                    .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
+                    .or_else(|| {
+                        expressions
+                            .get(arg.value)
+                            .and_then(|expr| document_expr_value(expr, expressions))
+                    })
+                    .filter(|value| !value.is_empty())
+                {
+                    source_intents.push(json!({
+                        "node": node_id,
+                        "intent": intent,
+                        "source_path": value
+                    }));
+                }
+                document_context_take_source_intent_eval_reads(
+                    context,
+                    node_id,
+                    intent,
+                    Some(arg.value),
+                    expressions,
+                );
             }
             _ => {}
         }
@@ -22011,6 +22193,13 @@ fn document_eval_while_selector_value(
         if let Some(output_id) = output
             && let Some(output) = expressions.get(*output_id)
         {
+            if let Some(input) = document_when_input_expr_id(output)
+                && !arm.children.is_empty()
+                && let Some(value) =
+                    document_eval_while_expr_value(input, &arm.children, expressions, context)
+            {
+                return Some(value);
+            }
             if let AstExprKind::ListLiteral { items, .. } = &output.kind
                 && items.is_empty()
                 && !arm.children.is_empty()
@@ -22433,6 +22622,48 @@ fn document_builtin_value_call(
         }
         "Theme/lights" => Some(document_theme_lights(context)),
         "Theme/geometry" => Some(document_theme_geometry(context)),
+        "Text/empty" => Some(Value::String(String::new())),
+        "Text/space" => Some(Value::String(" ".to_owned())),
+        "Text/to_number" => {
+            let text = document_call_arg_text(args, "value", expressions, context)?;
+            Some(document_text_to_number_value(
+                &text,
+                args,
+                expressions,
+                context,
+            ))
+        }
+        "Number/bit_width" => {
+            let value = document_call_arg_i64(args, "value", expressions, context)?;
+            Some(json!(boon_runtime::number_bit_width(value)))
+        }
+        "Number/to_text" => {
+            let value = document_call_arg_i64(args, "value", expressions, context)?;
+            Some(Value::String(document_number_to_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            )))
+        }
+        "Number/to_codepoint_text" => {
+            let value = document_call_arg_i64(args, "value", expressions, context)?;
+            Some(Value::String(document_number_to_codepoint_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            )))
+        }
+        "Number/to_ascii_text" => {
+            let value = document_call_arg_i64(args, "value", expressions, context)?;
+            Some(Value::String(document_number_to_ascii_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            )))
+        }
         _ => None,
     }
 }
@@ -22530,6 +22761,158 @@ fn document_call_arg_text(
                 .get(arg.value)
                 .and_then(|expr| document_expr_value(expr, expressions))
         })
+}
+
+fn document_call_arg_value(
+    args: &[AstCallArg],
+    name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .or_else(|| args.first())?;
+    expressions
+        .get(arg.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+        .or_else(|| {
+            expressions
+                .get(arg.value)
+                .and_then(|expr| document_expr_value(expr, expressions))
+                .map(Value::String)
+        })
+}
+
+fn document_call_arg_i64(
+    args: &[AstCallArg],
+    name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<i64> {
+    document_call_arg_value(args, name, expressions, context).and_then(json_i64)
+}
+
+fn document_optional_arg_i64(
+    args: &[AstCallArg],
+    name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<i64> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .and_then(|arg| {
+            expressions
+                .get(arg.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .or_else(|| {
+                    expressions
+                        .get(arg.value)
+                        .and_then(|expr| document_expr_value(expr, expressions))
+                        .map(Value::String)
+                })
+        })
+        .and_then(json_i64)
+}
+
+fn document_optional_arg_bool(
+    args: &[AstCallArg],
+    name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<bool> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .and_then(|arg| {
+            expressions
+                .get(arg.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .or_else(|| {
+                    expressions
+                        .get(arg.value)
+                        .and_then(|expr| document_expr_value(expr, expressions))
+                        .map(Value::String)
+                })
+        })
+        .and_then(|value| match value {
+            Value::Bool(value) => Some(value),
+            Value::String(value) if value == "True" => Some(true),
+            Value::String(value) if value == "False" => Some(false),
+            Value::Number(value) => value.as_i64().map(|value| value != 0),
+            _ => None,
+        })
+}
+
+fn json_i64(value: Value) -> Option<i64> {
+    match value {
+        Value::Number(value) => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|value| value as i64)),
+        Value::String(value) => value.trim().parse::<i64>().ok(),
+        Value::Bool(value) => Some(if value { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn document_text_to_number_value(
+    text: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Value {
+    let radix = document_optional_arg_i64(args, "radix", expressions, context).unwrap_or(10);
+    let leading =
+        document_optional_arg_bool(args, "leading", expressions, context).unwrap_or(false);
+    let fallback = document_optional_arg_i64(args, "fallback", expressions, context);
+    boon_runtime::parse_text_number(text, radix, leading)
+        .or(fallback)
+        .map(|value| json!(value))
+        .unwrap_or_else(|| Value::String("NaN".to_owned()))
+}
+
+fn document_number_to_text_value(
+    value: i64,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    boon_runtime::format_number_text(
+        value,
+        document_optional_arg_i64(args, "radix", expressions, context).unwrap_or(10),
+        document_optional_arg_i64(args, "min_width", expressions, context).unwrap_or(0),
+        document_optional_arg_bool(args, "prefix", expressions, context).unwrap_or(false),
+        document_optional_arg_i64(args, "group_size", expressions, context).unwrap_or(0),
+        document_optional_arg_i64(args, "signed_width", expressions, context).unwrap_or(0),
+    )
+}
+
+fn document_number_to_codepoint_text_value(
+    value: i64,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    boon_runtime::number_to_codepoint_text(
+        value,
+        document_optional_arg_i64(args, "min", expressions, context).unwrap_or(0),
+        document_optional_arg_i64(args, "max", expressions, context).unwrap_or(i64::from(u32::MAX)),
+    )
+}
+
+fn document_number_to_ascii_text_value(
+    value: i64,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    boon_runtime::number_to_ascii_text(
+        value,
+        document_optional_arg_i64(args, "width", expressions, context).unwrap_or(8),
+    )
+}
+
+fn document_text_all_chars_in(text: &str, chars: &str) -> bool {
+    !text.is_empty() && text.chars().all(|ch| chars.contains(ch))
 }
 
 fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
@@ -24016,10 +24399,74 @@ fn document_eval_pipe_value_from_input(
         "List/map" => document_eval_list_map(input, args, expressions, context),
         "List/any" => document_eval_list_quantifier(input, args, expressions, context, true),
         "List/every" => document_eval_list_quantifier(input, args, expressions, context, false),
+        "Text/is_empty" => input.as_str().map(|text| Value::Bool(text.is_empty())),
         "Text/is_not_empty" => input.as_str().map(|text| Value::Bool(!text.is_empty())),
         "Text/trim" => input
             .as_str()
             .map(|text| Value::String(text.trim().to_owned())),
+        "Text/to_uppercase" => input
+            .as_str()
+            .map(|text| Value::String(text.to_ascii_uppercase())),
+        "Text/starts_with" => input.as_str().map(|text| {
+            Value::Bool(
+                document_call_arg_text(args, "prefix", expressions, context)
+                    .is_some_and(|prefix| text.starts_with(&prefix)),
+            )
+        }),
+        "Text/contains" => input.as_str().map(|text| {
+            Value::Bool(
+                document_call_arg_text(args, "needle", expressions, context)
+                    .is_some_and(|needle| text.contains(&needle)),
+            )
+        }),
+        "Text/substring" => input.as_str().map(|text| {
+            let start = document_optional_arg_i64(args, "start", expressions, context)
+                .unwrap_or(0)
+                .max(0) as usize;
+            let length = document_optional_arg_i64(args, "length", expressions, context)
+                .unwrap_or(0)
+                .max(0) as usize;
+            Value::String(text.chars().skip(start).take(length).collect())
+        }),
+        "Text/length" => input
+            .as_str()
+            .map(|text| json!(text.chars().count() as i64)),
+        "Text/to_number" => input
+            .as_str()
+            .map(|text| document_text_to_number_value(text, args, expressions, context)),
+        "Text/all_chars_in" => input.as_str().map(|text| {
+            Value::Bool(
+                document_call_arg_text(args, "chars", expressions, context)
+                    .is_some_and(|chars| document_text_all_chars_in(text, &chars)),
+            )
+        }),
+        "Number/bit_width" => {
+            json_i64(input).map(|value| json!(boon_runtime::number_bit_width(value)))
+        }
+        "Number/to_text" => json_i64(input).map(|value| {
+            Value::String(document_number_to_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            ))
+        }),
+        "Number/to_codepoint_text" => json_i64(input).map(|value| {
+            Value::String(document_number_to_codepoint_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            ))
+        }),
+        "Number/to_ascii_text" => json_i64(input).map(|value| {
+            Value::String(document_number_to_ascii_text_value(
+                value,
+                args,
+                expressions,
+                context,
+            ))
+        }),
         _ => document_eval_pipe_function_call(op, input, args, expressions, context),
     }
 }
@@ -25226,7 +25673,11 @@ fn preview_drag_live_event(
         key: None,
         address: focused_address(layout_proof, &active_drag.source_node),
         target_text: focused_target_text(layout_proof, &active_drag.source_node),
-        target_occurrence: focused_target_occurrence(layout_proof, &active_drag.source_node),
+        target_occurrence: focused_target_occurrence_for_source(
+            layout_proof,
+            &active_drag.source_node,
+            &active_drag.source,
+        ),
         ..boon_runtime::LiveSourceEvent::default()
     }
 }
@@ -25904,6 +26355,7 @@ fn preview_try_apply_simple_source_click_input(
                 .or_else(|| focused_target_text(layout, node));
             let (pointer_x, pointer_y, pointer_width, pointer_height) =
                 pointer_payload_for_cached_bounds(bounds, position);
+            let target_occurrence = focused_target_occurrence_for_source(layout, node, &source);
             let event = boon_runtime::LiveSourceEvent {
                 source,
                 text: target_text.clone(),
@@ -25914,7 +26366,7 @@ fn preview_try_apply_simple_source_click_input(
                 pointer_width,
                 pointer_height,
                 target_text: target_text.clone(),
-                target_occurrence: focused_target_occurrence(layout, node),
+                target_occurrence,
                 ..boon_runtime::LiveSourceEvent::default()
             };
             let mut events = Vec::new();
@@ -26108,17 +26560,21 @@ fn preview_try_apply_simple_pointer_move_input(
             ["press", "click", "source", "double_click"]
                 .into_iter()
                 .find_map(|intent| live_source_for_node_intent(layout, &node, intent))
-                .map(|source| PreviewHoveredClickCandidate {
-                    node: node.clone(),
-                    source,
-                    bounds,
-                    target_text: target_text.clone(),
-                    address: focused_address(layout, &node),
-                    target_occurrence: focused_target_occurrence(layout, &node),
-                    accepts_key_focus: preview_node_accepts_key_focus(layout, &node),
-                    text_change: live_source_for_node_intent(layout, &node, "change").is_some()
-                        && document_node_wants_text_cursor(layout, &node),
-                    link: document_link_url_for_node(layout, &node).is_some(),
+                .map(|source| {
+                    let target_occurrence =
+                        focused_target_occurrence_for_source(layout, &node, &source);
+                    PreviewHoveredClickCandidate {
+                        node: node.clone(),
+                        source,
+                        bounds,
+                        target_text: target_text.clone(),
+                        address: focused_address(layout, &node),
+                        target_occurrence,
+                        accepts_key_focus: preview_node_accepts_key_focus(layout, &node),
+                        text_change: live_source_for_node_intent(layout, &node, "change").is_some()
+                            && document_node_wants_text_cursor(layout, &node),
+                        link: document_link_url_for_node(layout, &node).is_some(),
+                    }
                 })
         });
         (event, node, target_text, bounds, click_candidate)
@@ -28099,9 +28555,15 @@ fn preview_apply_live_events_internal(
             render_patches_for_layout = coalesced_render_patches(render_patches_for_layout);
         }
         coalesced_render_patch_count = render_patches_for_layout.len() as u64;
+        let document_patch_fast_path_rejection_for_summary =
+            preview_document_patch_fast_path_rejection(
+                &previous_layout_proof,
+                &render_patches_for_layout,
+            );
         let state_summary = changed.then(|| {
             let patch_started = Instant::now();
-            if !render_patches_for_layout.is_empty()
+            if document_patch_fast_path_rejection_for_summary.is_none()
+                && !render_patches_for_layout.is_empty()
                 && let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
                     patched_window_state_summary_for_render_patches(
                         summary,
@@ -28114,8 +28576,14 @@ fn preview_apply_live_events_internal(
                 return patched;
             }
             let summary_started = Instant::now();
-            let summary = if render_patches_for_layout.is_empty() {
-                summary_source = "post_turn_full_document";
+            let summary = if render_patches_for_layout.is_empty()
+                || document_patch_fast_path_rejection_for_summary.is_some()
+            {
+                summary_source = if render_patches_for_layout.is_empty() {
+                    "post_turn_full_document"
+                } else {
+                    "post_turn_full_document_after_patch_rejection"
+                };
                 runtime.document_state_summary()
             } else {
                 summary_source = "post_turn_window";
@@ -28455,7 +28923,7 @@ fn document_hit_region_ref_at<'a>(layout_proof: &'a Value, x: f64, y: f64) -> Op
         let candidate = (index, region);
         if best_fallback
             .as_ref()
-            .is_none_or(|best| compare_hit_region_priority(&candidate, best).is_lt())
+            .is_none_or(|best| compare_hit_region_priority_at(&candidate, best, x, y).is_lt())
         {
             best_fallback = Some(candidate);
         }
@@ -28465,7 +28933,7 @@ fn document_hit_region_ref_at<'a>(layout_proof: &'a Value, x: f64, y: f64) -> Op
             .is_some_and(|node| hit_region_node_has_live_source(layout_proof, node))
             && best_live
                 .as_ref()
-                .is_none_or(|best| compare_hit_region_priority(&candidate, best).is_lt())
+                .is_none_or(|best| compare_hit_region_priority_at(&candidate, best, x, y).is_lt())
         {
             best_live = Some(candidate);
         }
@@ -28473,14 +28941,21 @@ fn document_hit_region_ref_at<'a>(layout_proof: &'a Value, x: f64, y: f64) -> Op
     best_live.or(best_fallback).map(|(_, region)| region)
 }
 
-fn compare_hit_region_priority(
+fn compare_hit_region_priority_at(
     left: &(usize, &Value),
     right: &(usize, &Value),
+    x: f64,
+    y: f64,
 ) -> std::cmp::Ordering {
+    let left_distance =
+        document_bounds_center_distance2(left.1.get("bounds"), x, y).unwrap_or(f64::MAX);
+    let right_distance =
+        document_bounds_center_distance2(right.1.get("bounds"), x, y).unwrap_or(f64::MAX);
     let left_area = document_bounds_area(left.1.get("bounds")).unwrap_or(f64::MAX);
     let right_area = document_bounds_area(right.1.get("bounds")).unwrap_or(f64::MAX);
-    left_area
-        .total_cmp(&right_area)
+    left_distance
+        .total_cmp(&right_distance)
+        .then_with(|| left_area.total_cmp(&right_area))
         .then_with(|| right.0.cmp(&left.0))
 }
 
@@ -28613,6 +29088,13 @@ fn document_bounds_area(bounds: Option<&Value>) -> Option<f64> {
     Some(width * height)
 }
 
+fn document_bounds_center_distance2(bounds: Option<&Value>, x: f64, y: f64) -> Option<f64> {
+    let (center_x, center_y) = document_bounds_center(bounds?)?;
+    let dx = center_x - x;
+    let dy = center_y - y;
+    Some(dx * dx + dy * dy)
+}
+
 fn live_source_event_for_hit_region(
     layout_proof: &Value,
     hit_region: &Value,
@@ -28632,6 +29114,8 @@ fn live_source_event_for_hit_region(
         .into_iter()
         .find_map(|intent| live_source_for_node_intent(layout_proof, &source_node, intent))?;
     let target_text = focused_target_text(layout_proof, &source_node);
+    let target_occurrence =
+        focused_target_occurrence_for_source(layout_proof, &source_node, &source);
     let (pointer_x, pointer_y, pointer_width, pointer_height) =
         pointer_payload_for_source_node(layout_proof, hit_region, &source_node, position);
     Some(boon_runtime::LiveSourceEvent {
@@ -28648,7 +29132,7 @@ fn live_source_event_for_hit_region(
         pointer_width,
         pointer_height,
         target_text,
-        target_occurrence: focused_target_occurrence(layout_proof, &source_node),
+        target_occurrence,
         ..boon_runtime::LiveSourceEvent::default()
     })
 }
@@ -28664,6 +29148,8 @@ fn pointer_move_live_source_event_for_hit_region(
             .unwrap_or_else(|| node.to_owned());
     let source = live_source_for_node_intent(layout_proof, &source_node, "pointer_move")?;
     let target_text = focused_target_text(layout_proof, &source_node);
+    let target_occurrence =
+        focused_target_occurrence_for_source(layout_proof, &source_node, &source);
     let (pointer_x, pointer_y, pointer_width, pointer_height) =
         pointer_payload_for_source_node(layout_proof, hit_region, &source_node, position);
     Some(boon_runtime::LiveSourceEvent {
@@ -28676,7 +29162,7 @@ fn pointer_move_live_source_event_for_hit_region(
         pointer_width,
         pointer_height,
         target_text,
-        target_occurrence: focused_target_occurrence(layout_proof, &source_node),
+        target_occurrence,
         ..boon_runtime::LiveSourceEvent::default()
     })
 }
@@ -28801,54 +29287,60 @@ fn live_source_node_for_hit_region_with_intents(
         return Some(node.to_owned());
     }
     let bounds = hit_region.get("bounds")?;
-    layout_proof
+    let (hit_x, hit_y) = document_bounds_center(bounds)?;
+    let candidates = layout_proof
         .get("hit_target_assertions")
-        .and_then(serde_json::Value::as_array)?
+        .and_then(serde_json::Value::as_array)?;
+    candidates
         .iter()
-        .filter(|candidate| {
+        .enumerate()
+        .filter(|(_, candidate)| {
             candidate.get("node").and_then(serde_json::Value::as_str) != Some(node)
                 && document_bounds_contains_bounds(candidate.get("bounds"), bounds)
         })
-        .filter_map(|candidate| {
-            let candidate_node = candidate.get("node")?.as_str()?;
+        .filter(|(_, candidate)| {
+            let Some(candidate_node) = candidate.get("node").and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
             source_intents
                 .iter()
                 .any(|intent| node_has_source_intent(layout_proof, candidate_node, intent))
-                .then(|| {
-                    (
-                        candidate_node.to_owned(),
-                        document_bounds_area(candidate.get("bounds")).unwrap_or(f64::MAX),
-                    )
-                })
         })
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(node, _)| node)
+        .min_by(|left, right| compare_hit_region_priority_at(left, right, hit_x, hit_y))
+        .and_then(|(_, candidate)| {
+            candidate
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
         .or_else(|| {
-            let (x, y) = document_bounds_center(bounds)?;
-            layout_proof
-                .get("hit_target_assertions")
-                .and_then(serde_json::Value::as_array)?
+            candidates
                 .iter()
-                .filter(|candidate| {
+                .enumerate()
+                .filter(|(_, candidate)| {
                     candidate.get("node").and_then(serde_json::Value::as_str) != Some(node)
                         && candidate
                             .get("bounds")
-                            .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
+                            .is_some_and(|bounds| document_bounds_contains(bounds, hit_x, hit_y))
                 })
-                .filter_map(|candidate| {
-                    let candidate_node = candidate.get("node")?.as_str()?;
+                .filter(|(_, candidate)| {
+                    let Some(candidate_node) =
+                        candidate.get("node").and_then(serde_json::Value::as_str)
+                    else {
+                        return false;
+                    };
                     source_intents
                         .iter()
                         .any(|intent| node_has_source_intent(layout_proof, candidate_node, intent))
-                        .then(|| {
-                            (
-                                candidate_node.to_owned(),
-                                document_bounds_area(candidate.get("bounds")).unwrap_or(f64::MAX),
-                            )
-                        })
                 })
-                .min_by(|left, right| left.1.total_cmp(&right.1))
-                .map(|(node, _)| node)
+                .min_by(|left, right| compare_hit_region_priority_at(left, right, hit_x, hit_y))
+                .and_then(|(_, candidate)| {
+                    candidate
+                        .get("node")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
         })
 }
 
@@ -29039,7 +29531,11 @@ fn source_intent_nodes_for_value(
         .collect()
 }
 
-fn focused_target_occurrence(layout_proof: &Value, node: &str) -> Option<usize> {
+fn focused_target_occurrence_for_source(
+    layout_proof: &Value,
+    node: &str,
+    event_source: &str,
+) -> Option<usize> {
     let target_text = focused_target_text(layout_proof, node)?;
     let target_intent = if focused_source_intent_value(layout_proof, node, "target").is_some() {
         "target"
@@ -29047,6 +29543,7 @@ fn focused_target_occurrence(layout_proof: &Value, node: &str) -> Option<usize> 
         "address"
     };
     let mut occurrence = 0usize;
+    let mut seen_nodes = BTreeSet::new();
     for intent in layout_proof
         .get("source_intent_assertions")
         .and_then(serde_json::Value::as_array)?
@@ -29055,14 +29552,43 @@ fn focused_target_occurrence(layout_proof: &Value, node: &str) -> Option<usize> 
         let source_path = intent
             .get("source_path")
             .and_then(serde_json::Value::as_str);
-        if intent_kind == Some(target_intent) && source_path == Some(target_text.as_str()) {
-            occurrence = occurrence.saturating_add(1);
-            if intent.get("node").and_then(serde_json::Value::as_str) == Some(node) {
-                return Some(occurrence.max(1));
-            }
+        if !source_intent_kind_routes_event(intent_kind) || source_path != Some(event_source) {
+            continue;
+        }
+        let Some(candidate_node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !seen_nodes.insert(candidate_node.to_owned())
+            || focused_source_intent_value(layout_proof, candidate_node, target_intent).as_deref()
+                != Some(target_text.as_str())
+        {
+            continue;
+        }
+        occurrence = occurrence.saturating_add(1);
+        if candidate_node == node {
+            return Some(occurrence.max(1));
         }
     }
     Some(1)
+}
+
+fn source_intent_kind_routes_event(intent_kind: Option<&str>) -> bool {
+    matches!(
+        intent_kind,
+        Some(
+            "source"
+                | "click"
+                | "press"
+                | "drag"
+                | "pointer_move"
+                | "double_click"
+                | "change"
+                | "focus"
+                | "blur"
+                | "key_down"
+                | "submit"
+        )
+    )
 }
 
 fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
@@ -30230,6 +30756,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
             .get(&path)
             .into_iter()
             .flatten();
+        let mut patched_this_path = false;
         for target in targets {
             let Some(node) = frame.nodes.get_mut(&target.node) else {
                 return Ok(None);
@@ -30275,6 +30802,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
                     document_style_value_from_state_value(&value),
                 );
             }
+            patched_this_path = true;
             patched_targets = patched_targets.saturating_add(1);
             if patched_target_samples.len() < 32 {
                 patched_target_samples.push(json!({
@@ -30284,6 +30812,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
                     "value": json_value_to_document_text(&value),
                 }));
             }
+        }
+        if !patched_this_path {
+            return Ok(None);
         }
     }
     if patched_targets == 0 {
@@ -30422,6 +30953,13 @@ fn preview_document_patch_fast_path_rejection(
         {
             return Some(format!("structural_data_overlap:{path}:{structural_path}"));
         }
+        if !snapshot
+            .data_binding_targets
+            .get(&path)
+            .is_some_and(|targets| !targets.is_empty())
+        {
+            return Some(format!("missing_data_binding_target:{path}"));
+        }
     }
     None
 }
@@ -30436,6 +30974,9 @@ fn render_invalidation_allows_sparse_document_patch(
 }
 
 fn document_data_paths_overlap(changed_path: &str, structural_path: &str) -> bool {
+    if document_list_data_paths_overlap(changed_path, structural_path) {
+        return true;
+    }
     changed_path == structural_path
         || changed_path
             .strip_prefix(structural_path)
@@ -30443,6 +30984,32 @@ fn document_data_paths_overlap(changed_path: &str, structural_path: &str) -> boo
         || structural_path
             .strip_prefix(changed_path)
             .is_some_and(|suffix| matches!(suffix.as_bytes().first(), Some(b'.' | b':')))
+}
+
+fn document_list_data_paths_overlap(left: &str, right: &str) -> bool {
+    if let Some(left_list) = document_list_name_from_data_path(left) {
+        if document_path_names_same_list(left_list, right) {
+            return true;
+        }
+        if let Some(right_list) = document_list_name_from_data_path(right) {
+            return document_path_names_same_list(left_list, right_list);
+        }
+    }
+    if let Some(right_list) = document_list_name_from_data_path(right) {
+        return document_path_names_same_list(right_list, left);
+    }
+    false
+}
+
+fn document_list_name_from_data_path(path: &str) -> Option<&str> {
+    path.strip_prefix("@list:")?.split(':').next()
+}
+
+fn document_path_names_same_list(left: &str, right: &str) -> bool {
+    fn canonical(path: &str) -> &str {
+        path.strip_prefix("store.").unwrap_or(path)
+    }
+    canonical(left) == canonical(right)
 }
 
 fn preview_note_render_error(
@@ -33461,7 +34028,42 @@ mod tests {
         }
     }
 
-    fn cache_test_document_snapshot(hash: &str, structural_reads: &[&str]) -> Value {
+    fn test_list_row_field_patch(
+        list: &str,
+        key: u64,
+        generation: u64,
+        field: &str,
+    ) -> boon_runtime::RenderPatch<'static> {
+        boon_runtime::RenderPatch {
+            kind: "PatchListRowField",
+            invalidation: boon_runtime::RenderInvalidation::Layout,
+            target: boon_runtime::RenderTarget::Static(Cow::Owned(field.to_owned())),
+            value: boon_runtime::ProtocolValue::Text(Cow::Borrowed("patched")),
+            list_id: Some(Cow::Owned(list.to_owned())),
+            key: Some(key),
+            generation: Some(generation),
+            source_id: None,
+            bind_epoch: None,
+        }
+    }
+
+    fn cache_test_document_snapshot(
+        hash: &str,
+        structural_reads: &[&str],
+        target_paths: &[&str],
+    ) -> Value {
+        let data_binding_targets = target_paths
+            .iter()
+            .map(|path| {
+                (
+                    (*path).to_owned(),
+                    vec![DocumentDataBindingTarget {
+                        node: boon_document_model::DocumentNodeId("test-node".to_owned()),
+                        attr: "text".to_owned(),
+                    }],
+                )
+            })
+            .collect();
         cache_document_render_snapshot(
             hash.to_owned(),
             DocumentRenderSnapshot {
@@ -33474,12 +34076,12 @@ mod tests {
                     demands: Vec::new(),
                     metrics: boon_document::LayoutMetrics::default(),
                 },
-                data_binding_targets: BTreeMap::new(),
                 structural_data_reads: structural_reads
                     .iter()
                     .map(|path| (*path).to_owned())
                     .collect(),
                 source_intents: Vec::new(),
+                data_binding_targets,
             },
         );
         json!({ "layout_frame_hash": hash })
@@ -33487,8 +34089,11 @@ mod tests {
 
     #[test]
     fn sparse_document_patch_gate_allows_nonstructural_data_patch() {
-        let proof =
-            cache_test_document_snapshot("test-sparse-patch-nonstructural", &["store.dialog_open"]);
+        let proof = cache_test_document_snapshot(
+            "test-sparse-patch-nonstructural",
+            &["store.dialog_open"],
+            &["store.title"],
+        );
         let patch = test_root_field_patch("store.title");
 
         assert!(preview_document_patch_fast_path_allowed(&proof, &[patch]));
@@ -33496,9 +34101,43 @@ mod tests {
 
     #[test]
     fn sparse_document_patch_gate_rejects_structural_data_patch() {
-        let proof =
-            cache_test_document_snapshot("test-sparse-patch-structural", &["store.dialog_open"]);
+        let proof = cache_test_document_snapshot(
+            "test-sparse-patch-structural",
+            &["store.dialog_open"],
+            &["store.dialog_open"],
+        );
         let patch = test_root_field_patch("store.dialog_open");
+
+        assert!(!preview_document_patch_fast_path_allowed(&proof, &[patch]));
+    }
+
+    #[test]
+    fn sparse_document_patch_gate_rejects_targetless_patch() {
+        let proof = cache_test_document_snapshot(
+            "test-sparse-patch-targetless",
+            &["store.dialog_open"],
+            &[],
+        );
+        let patch = test_root_field_patch("store.title");
+
+        assert!(!preview_document_patch_fast_path_allowed(&proof, &[patch]));
+    }
+
+    #[test]
+    fn sparse_document_patch_gate_rejects_list_row_patch_when_list_structure_was_read() {
+        let row_path = document_data_read_key_for_list_field(
+            "selected_visible_items",
+            7,
+            1,
+            "format_dropdown_state",
+        );
+        let proof = cache_test_document_snapshot(
+            "test-sparse-patch-list-structural-alias",
+            &["store.selected_visible_items"],
+            &[&row_path],
+        );
+        let patch =
+            test_list_row_field_patch("selected_visible_items", 7, 1, "format_dropdown_state");
 
         assert!(!preview_document_patch_fast_path_allowed(&proof, &[patch]));
     }
@@ -45294,6 +45933,16 @@ mod tests {
                 })
                 .collect()
         };
+        let selected_visible_row_by_id = |summary: &serde_json::Value, id: &str| {
+            summary
+                .pointer("/store/selected_visible_items")
+                .and_then(serde_json::Value::as_array)
+                .expect("NovyWave selected_visible_items should be exposed as Boon data")
+                .iter()
+                .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                .unwrap_or_else(|| panic!("NovyWave missing selected visible row `{id}`"))
+                .clone()
+        };
         let remove_reset_output = runtime
             .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
                 source: "store.elements.selected_remove_reset".to_owned(),
@@ -45367,6 +46016,159 @@ mod tests {
         .expect("NovyWave layout should lower from live document state");
         physical_frame_text_item(&layout, "Format", "NovyWave selected inspector format row");
         physical_frame_text_item(&layout, "Hex", "NovyWave selected inspector format value");
+        let (row_format_x, row_format_y, _row_format_node) = source_hit_center_for_target(
+            &layout_proof,
+            "signal.format_elements.format_dropdown_toggle",
+            Some("A[3:0]"),
+        )
+        .expect("NovyWave A row formatter dropdown should expose a row-scoped source");
+        let row_format_hit = document_hit_region_at(&layout_proof, row_format_x, row_format_y)
+            .expect("NovyWave A row formatter click should resolve a hit region");
+        let row_format_event = live_source_event_for_hit_region(
+            &layout_proof,
+            &row_format_hit,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x: row_format_x,
+                y: row_format_y,
+                window_width: 1280.0,
+                window_height: 720.0,
+            },
+            false,
+        )
+        .expect("NovyWave A row formatter click should resolve a source event");
+        assert_eq!(
+            row_format_event.source,
+            "signal.format_elements.format_dropdown_toggle"
+        );
+        assert_eq!(
+            row_format_event.target_text.as_deref(),
+            Some("A[3:0]"),
+            "clicking the visible row Hex button must carry row target text"
+        );
+        let row_dropdown_state = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "signal.format_elements.format_dropdown_toggle".to_owned(),
+                target_text: Some("A[3:0]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave A row formatter dropdown should open")
+            .state_summary;
+        assert_eq!(
+            selected_visible_row_by_id(&row_dropdown_state, "clk")
+                .get("format_dropdown_state")
+                .cloned(),
+            Some(json!("Open")),
+            "A row formatter dropdown should open only on the selected A row"
+        );
+        assert_eq!(
+            selected_visible_row_by_id(&row_dropdown_state, "reset_n")
+                .get("format_dropdown_state")
+                .cloned(),
+            Some(json!("Closed")),
+            "B row formatter dropdown should stay closed when A row opens"
+        );
+        let (row_dropdown_proof, row_dropdown_layout) =
+            native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&row_dropdown_state),
+            )
+            .expect("NovyWave opened row formatter dropdown layout should lower");
+        for option in ["Bin", "Bins", "Oct", "Int", "UInt", "Text"] {
+            physical_frame_text_item(
+                &row_dropdown_layout,
+                option,
+                "NovyWave row formatter dropdown option",
+            );
+        }
+        let (row_binary_x, row_binary_y, _row_binary_node) = source_hit_center_for_target(
+            &row_dropdown_proof,
+            "signal.format_elements.format_binary",
+            Some("A[3:0]"),
+        )
+        .expect("NovyWave A row Binary formatter option should expose a row-scoped source");
+        let row_binary_hit =
+            document_hit_region_at(&row_dropdown_proof, row_binary_x, row_binary_y)
+                .expect("NovyWave A row Binary formatter click should resolve a hit region");
+        let row_binary_event = live_source_event_for_hit_region(
+            &row_dropdown_proof,
+            &row_binary_hit,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x: row_binary_x,
+                y: row_binary_y,
+                window_width: 1280.0,
+                window_height: 720.0,
+            },
+            false,
+        )
+        .expect("NovyWave A row Binary formatter click should resolve a source event");
+        assert_eq!(
+            row_binary_event.source,
+            "signal.format_elements.format_binary"
+        );
+        assert_eq!(
+            row_binary_event.target_text.as_deref(),
+            Some("A[3:0]"),
+            "clicking a visible row formatter menu option must carry row target text"
+        );
+        let row_binary_summary = runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "signal.format_elements.format_binary".to_owned(),
+                target_text: Some("A[3:0]".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave A row Binary formatter option should apply")
+            .state_summary;
+        assert_eq!(
+            selected_visible_row_by_id(&row_binary_summary, "clk")
+                .get("format_label")
+                .cloned(),
+            Some(json!("Bin")),
+            "A row should switch to Binary formatter"
+        );
+        assert_eq!(
+            selected_visible_row_by_id(&row_binary_summary, "clk")
+                .get("current_value")
+                .cloned(),
+            Some(json!("1100")),
+            "A row cursor value should rerender with its Binary formatter"
+        );
+        assert_eq!(
+            selected_visible_row_by_id(&row_binary_summary, "reset_n")
+                .get("format_label")
+                .cloned(),
+            Some(json!("Hex")),
+            "B row should keep its own Hex formatter"
+        );
+        assert_eq!(
+            selected_visible_row_by_id(&row_binary_summary, "reset_n")
+                .get("current_value")
+                .cloned(),
+            Some(json!("0x5")),
+            "B row cursor value should not change when A row format changes"
+        );
+        assert_eq!(
+            row_binary_summary.pointer("/store/active_waveform_segment_labels"),
+            Some(&json!("cursor,1010,marker,1100,0000")),
+            "active waveform labels should rerender from the selected row formatter"
+        );
+        let (_, row_binary_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&row_binary_summary),
+        )
+        .expect("NovyWave Binary row formatter layout should lower");
+        let row_binary_texts = row_binary_layout
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref())
+            .collect::<Vec<_>>();
+        for label in ["1100", "1010", "0000", "0x5"] {
+            assert!(
+                row_binary_texts.iter().any(|text| *text == label),
+                "NovyWave row-local formatter should render `{label}`; texts={row_binary_texts:?}"
+            );
+        }
         source_hit_center(&layout_proof, "store.elements.format_cycle")
             .expect("NovyWave visible format cycle button should expose a source");
         runtime
@@ -45562,6 +46364,8 @@ mod tests {
                 boon_native_app_window::NativeCursorIcon::Pointer,
                 "{context} should request the native pointer cursor while hovered"
             );
+            preview_apply_hover_overlay(&shared_render_state, &mut input_state)
+                .expect("NovyWave hover overlay should update the shared frame");
             let hover_frame = latest_preview_frame(&shared_render_state);
             let hovered_button = physical_button_for_text(&hover_frame, label, &context);
             assert_eq!(
@@ -45684,7 +46488,7 @@ mod tests {
             Some(&ghw_state),
         )
         .expect("NovyWave GHW file layout should lower");
-        assert_waveform_segment_in_row(&ghw_layout, "ghw.counter[3:0]", "3");
+        assert_waveform_segment_in_row(&ghw_layout, "ghw.counter[3:0]", "0x3");
         assert_waveform_segment_in_row(&ghw_layout, "ghw.enable", "enable");
         assert_waveform_segment_in_row(&ghw_layout, "ghw.state", "Count");
 
@@ -49038,6 +49842,62 @@ mod tests {
                 .as_deref(),
             Some("button")
         );
+
+        let duplicate_row_controls_layout = json!({
+            "source_intent_assertions": [
+                { "node": "row-1-format", "intent": "press", "source_path": "row.format.toggle" },
+                { "node": "row-1-format", "intent": "target", "source_path": "Duplicate" },
+                { "node": "row-1-delete", "intent": "press", "source_path": "row.delete" },
+                { "node": "row-1-delete", "intent": "target", "source_path": "Duplicate" },
+                { "node": "row-2-format", "intent": "press", "source_path": "row.format.toggle" },
+                { "node": "row-2-format", "intent": "target", "source_path": "Duplicate" },
+                { "node": "row-2-delete", "intent": "press", "source_path": "row.delete" },
+                { "node": "row-2-delete", "intent": "target", "source_path": "Duplicate" }
+            ],
+            "hit_target_assertions": [
+                { "node": "row-1-format", "bounds": { "x": 10.0, "y": 10.0, "width": 40.0, "height": 20.0 } },
+                { "node": "row-1-delete", "bounds": { "x": 60.0, "y": 10.0, "width": 40.0, "height": 20.0 } },
+                { "node": "row-2-format", "bounds": { "x": 10.0, "y": 40.0, "width": 40.0, "height": 20.0 } },
+                { "node": "row-2-delete", "bounds": { "x": 60.0, "y": 40.0, "width": 40.0, "height": 20.0 } }
+            ]
+        });
+        let row_2_format_hit = document_hit_region_at(&duplicate_row_controls_layout, 30.0, 50.0)
+            .expect("second duplicate format control should hit");
+        let row_2_format_event = live_source_event_for_hit_region(
+            &duplicate_row_controls_layout,
+            &row_2_format_hit,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x: 30.0,
+                y: 50.0,
+                window_width: 120.0,
+                window_height: 80.0,
+            },
+            false,
+        )
+        .expect("second duplicate format control should resolve an event");
+        assert_eq!(row_2_format_event.source, "row.format.toggle");
+        assert_eq!(row_2_format_event.target_text.as_deref(), Some("Duplicate"));
+        assert_eq!(
+            row_2_format_event.target_occurrence,
+            Some(2),
+            "target occurrence should count matching row-format controls, not all controls targeting the same row text"
+        );
+        let row_1_delete_hit = document_hit_region_at(&duplicate_row_controls_layout, 80.0, 20.0)
+            .expect("first duplicate delete control should hit");
+        let row_1_delete_event = live_source_event_for_hit_region(
+            &duplicate_row_controls_layout,
+            &row_1_delete_hit,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x: 80.0,
+                y: 20.0,
+                window_width: 120.0,
+                window_height: 80.0,
+            },
+            false,
+        )
+        .expect("first duplicate delete control should resolve an event");
+        assert_eq!(row_1_delete_event.source, "row.delete");
+        assert_eq!(row_1_delete_event.target_occurrence, Some(1));
     }
 
     fn first_scroll_region_center(layout: &serde_json::Value) -> (f64, f64) {
@@ -49342,6 +50202,265 @@ mod tests {
         assert_eq!(
             labels, expected,
             "{context}: visible waveform labels should match the current viewport"
+        );
+    }
+
+    fn selected_visible_row_field(
+        summary: &serde_json::Value,
+        row_id: &str,
+        field: &str,
+    ) -> Option<serde_json::Value> {
+        summary
+            .pointer("/store/selected_visible_items")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(row_id))
+            .and_then(|row| row.get(field).cloned())
+    }
+
+    fn physical_frame_texts(frame: &boon_document::LayoutFrame) -> Vec<String> {
+        frame
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref().map(str::to_owned))
+            .collect()
+    }
+
+    fn hit_region_debug_candidates_at(layout: &serde_json::Value, x: f64, y: f64) -> Vec<Value> {
+        let intents = layout
+            .get("source_intent_assertions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        layout
+            .get("hit_target_assertions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, region)| {
+                region
+                    .get("bounds")
+                    .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
+            })
+            .map(|(index, region)| {
+                let node = region
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let node_intents = intents
+                    .iter()
+                    .filter(|intent| {
+                        intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    })
+                    .map(|intent| {
+                        json!({
+                            "intent": intent.get("intent").cloned().unwrap_or(Value::Null),
+                            "source_path": intent.get("source_path").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let center_distance2 = region
+                    .get("bounds")
+                    .and_then(document_bounds_center)
+                    .map(|(center_x, center_y)| {
+                        let dx = center_x - x;
+                        let dy = center_y - y;
+                        dx * dx + dy * dy
+                    })
+                    .unwrap_or(f64::MAX);
+                json!({
+                    "index": index,
+                    "node": node,
+                    "bounds": region.get("bounds").cloned().unwrap_or(Value::Null),
+                    "area": document_bounds_area(region.get("bounds")).unwrap_or(f64::MAX),
+                    "center_distance2": center_distance2,
+                    "live": hit_region_node_has_live_source(layout, node),
+                    "intents": node_intents,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn novywave_row_formatter_real_click_opens_and_rerenders_preview_layout() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let source =
+            boon_runtime::source_text_for_path(&source_path).expect("NovyWave source should load");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let mut runtime =
+            boon_runtime::LiveRuntime::from_project("novywave-real-row-format", &units)
+                .expect("NovyWave runtime should initialize");
+        let initial_summary = runtime.document_state_summary();
+        let viewport = (1280.0, 720.0);
+        let (layout_proof, layout_frame) =
+            native_document_layout_proof_with_project_state_embedded_for_viewport(
+                &source_path,
+                &units,
+                Some(&initial_summary),
+                Some(viewport),
+            )
+            .expect("NovyWave initial preview layout should lower");
+        let live_runtime = Arc::new(Mutex::new(runtime));
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let (format_x, format_y, format_node) = source_hit_center_for_target(
+            &layout_proof,
+            "signal.format_elements.format_dropdown_toggle",
+            Some("A[3:0]"),
+        )
+        .expect("A row formatter trigger should be hittable");
+        let mut click_format = deterministic_click_input_from_index(1, format_x, format_y);
+        set_input_window_size(&mut click_format, viewport);
+        preview_apply_real_window_input_with_units(
+            &click_format,
+            &source_path,
+            &source,
+            &units,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("real click on A row formatter should dispatch");
+
+        let opened_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            selected_visible_row_field(&opened_summary, "clk", "format_dropdown_state"),
+            Some(json!("Open")),
+            "real click should open only the clicked row formatter dropdown"
+        );
+        assert_eq!(
+            selected_visible_row_field(&opened_summary, "reset_n", "format_dropdown_state"),
+            Some(json!("Closed")),
+            "real click on A row should not open B row dropdown"
+        );
+        let opened_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let opened_frame = latest_preview_frame(&shared_render_state);
+        let opened_texts = physical_frame_texts(&opened_frame);
+        for option in ["Hex", "Bin", "Bins", "Oct", "Int", "UInt", "Text"] {
+            assert!(
+                opened_texts.iter().any(|text| text == option),
+                "opened formatter dropdown should render `{option}`; texts={opened_texts:?}"
+            );
+        }
+
+        let (binary_x, binary_y, binary_node) = source_hit_center_for_target(
+            &opened_layout,
+            "signal.format_elements.format_binary",
+            Some("A[3:0]"),
+        )
+        .expect("A row Binary formatter option should be hittable after opening");
+        assert_ne!(
+            binary_node, format_node,
+            "Binary formatter option source must be attached to a distinct menu option node"
+        );
+        let binary_hit = document_hit_region_at(&opened_layout, binary_x, binary_y)
+            .expect("A row Binary formatter option should resolve a hit region");
+        let binary_event = live_source_event_for_hit_region(
+            &opened_layout,
+            &binary_hit,
+            boon_native_app_window::NativeMouseWindowPosition {
+                x: binary_x,
+                y: binary_y,
+                window_width: f64::from(viewport.0),
+                window_height: f64::from(viewport.1),
+            },
+            false,
+        )
+        .expect("A row Binary formatter option should resolve a source event");
+        let binary_candidates = hit_region_debug_candidates_at(&opened_layout, binary_x, binary_y);
+        assert_eq!(
+            binary_event.source,
+            "signal.format_elements.format_binary",
+            "Binary formatter click should resolve the row option source before native dispatch; candidates={}",
+            serde_json::to_string_pretty(&binary_candidates).unwrap()
+        );
+        assert_eq!(
+            binary_event.target_text.as_deref(),
+            Some("A[3:0]"),
+            "Binary formatter click should resolve the selected row target before native dispatch"
+        );
+        assert_eq!(
+            binary_event.target_occurrence,
+            Some(1),
+            "Binary formatter click should count row occurrence among Binary sources, not among every control in the row"
+        );
+        let mut click_binary = deterministic_click_input_from_index(2, binary_x, binary_y);
+        set_input_window_size(&mut click_binary, viewport);
+        preview_apply_real_window_input_with_units(
+            &click_binary,
+            &source_path,
+            &source,
+            &units,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("real click on A row Binary option should dispatch");
+
+        let binary_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            selected_visible_row_field(&binary_summary, "clk", "formatter"),
+            Some(json!("Binary")),
+            "Binary option should update only A row formatter"
+        );
+        assert_eq!(
+            selected_visible_row_field(&binary_summary, "clk", "current_value"),
+            Some(json!("1100")),
+            "A row selected value should rerender through its Binary formatter"
+        );
+        assert_eq!(
+            selected_visible_row_field(&binary_summary, "reset_n", "formatter"),
+            Some(json!("Hexadecimal")),
+            "B row formatter should remain Hexadecimal"
+        );
+        assert_eq!(
+            selected_visible_row_field(&binary_summary, "reset_n", "current_value"),
+            Some(json!("0x5")),
+            "B row selected value should not rerender from A row formatter"
+        );
+        assert_eq!(
+            binary_summary.pointer("/store/active_waveform_segment_labels"),
+            Some(&json!("cursor,1010,marker,1100,0000")),
+            "waveform labels should rerender from the same row formatter state"
+        );
+
+        let binary_frame = latest_preview_frame(&shared_render_state);
+        let binary_texts = physical_frame_texts(&binary_frame);
+        let binary_layout_profile = shared_render_state
+            .lock()
+            .unwrap()
+            .layout_proof
+            .get("layout_profile")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let opened_structural_reads = opened_layout
+            .get("structural_data_read_samples")
+            .cloned()
+            .unwrap_or(Value::Null);
+        for label in ["1100", "1010", "0000", "0x5"] {
+            assert!(
+                binary_texts.iter().any(|text| text == label),
+                "Binary formatter click should render `{label}` in the updated frame; layout_profile={}; opened_structural_reads={}; texts={binary_texts:?}",
+                serde_json::to_string_pretty(&binary_layout_profile).unwrap(),
+                serde_json::to_string_pretty(&opened_structural_reads).unwrap()
+            );
+        }
+        assert!(
+            shared_render_state.lock().unwrap().update_count >= 2,
+            "both real clicks should update shared preview render state"
         );
     }
 

@@ -3318,9 +3318,13 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/empty",
                 "Text/space",
                 "Text/trim",
+                "Text/to_uppercase",
                 "Text/concat",
                 "Text/time_range_label",
                 "Text/substring",
+                "Number/to_text",
+                "Number/to_codepoint_text",
+                "Number/to_ascii_text",
                 "List/join_field",
                 "Error/text",
                 "Router/route",
@@ -3334,6 +3338,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Number/subtract",
                 "Number/min",
                 "Number/max",
+                "Number/bit_width",
                 "Number/interpolate",
                 "Number/project_width",
                 "Number/project_offset",
@@ -3355,6 +3360,7 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/is_not_empty",
                 "Text/starts_with",
                 "Text/contains",
+                "Text/all_chars_in",
                 "List/every",
                 "List/any",
                 "List/is_not_empty",
@@ -4572,6 +4578,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Number/interpolate"
                     | "Number/min"
                     | "Number/max"
+                    | "Number/bit_width"
                     | "List/count"
                     | "List/sum"
                     | "Text/find"
@@ -4587,9 +4594,13 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                 "Text/empty"
                     | "Text/space"
                     | "Text/trim"
+                    | "Text/to_uppercase"
                     | "Text/concat"
                     | "Text/time_range_label"
                     | "Text/substring"
+                    | "Number/to_text"
+                    | "Number/to_codepoint_text"
+                    | "Number/to_ascii_text"
                     | "Error/text"
                     | "Router/route"
                     | "Router/go_to"
@@ -4614,7 +4625,11 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
             if function == "Bool/not"
                 || function == "Bool/and"
                 || function == "Bool/toggle"
+                || function == "Text/is_empty"
+                || function == "Text/all_chars_in"
                 || function == "Text/is_not_empty"
+                || function == "Text/starts_with"
+                || function == "Text/contains"
                 || function == "List/every" =>
         {
             true_false_type()
@@ -4806,7 +4821,8 @@ fn collect_param_requirements_expr(
             }
         }
         AstExprKind::Infix { left, right, op } => {
-            let expected = if matches!(op.as_str(), "-" | "*" | "/" | ">" | "<" | ">=" | "<=") {
+            let expected = if matches!(op.as_str(), "+" | "-" | "*" | "/" | ">" | "<" | ">=" | "<=")
+            {
                 Some(Type::Number)
             } else {
                 None
@@ -5450,7 +5466,8 @@ fn row_binding_requirement_for_expr(
             requirement
         }
         AstExprKind::Infix { left, right, op } => {
-            let expected = if matches!(op.as_str(), "-" | "*" | "/" | ">" | "<" | ">=" | "<=") {
+            let expected = if matches!(op.as_str(), "+" | "-" | "*" | "/" | ">" | "<" | ">=" | "<=")
+            {
                 Some(Type::Number)
             } else {
                 None

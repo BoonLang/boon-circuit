@@ -1561,7 +1561,8 @@ fn view_data_path_for_expr_inner(
             })
             .or_else(|| Some(value.clone())),
         AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == "element") => None,
-        AstExprKind::Path(parts) => Some(normalized_view_data_path(&parts.join("."))),
+        AstExprKind::Path(parts) => document_path_value(parts, expressions, context)
+            .map(|path| normalized_view_data_path(&path)),
         AstExprKind::Infix { left, .. } => {
             view_data_path_for_expr_id_inner(*left, expressions, context, seen)
         }
@@ -2871,7 +2872,7 @@ fn document_expr_value(
             .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context))
             .or_else(|| Some(value.clone())),
         AstExprKind::Bool(value) => Some(value.to_string()),
-        AstExprKind::Path(parts) => Some(parts.join(".")),
+        AstExprKind::Path(parts) => document_path_value(parts, expressions, context),
         AstExprKind::Pipe { input, op, args } => {
             let mut value = document_expr_value_by_id(*input, expressions, context)?;
             value.push_str("|>");
@@ -2897,6 +2898,34 @@ fn document_expr_value(
             Some(value)
         }
         _ => None,
+    }
+}
+
+fn document_path_value(
+    parts: &[String],
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let first = parts.first()?;
+    if parts.len() > 1
+        && let Some(expr_id) = context.arg_expr(first)
+        && !expressions
+            .get(expr_id)
+            .is_some_and(|expr| expr_is_same_identifier_path(expr, first))
+        && let Some(mut value) = document_expr_value_by_id(expr_id, expressions, context)
+    {
+        value.push('.');
+        value.push_str(&parts[1..].join("."));
+        return Some(value);
+    }
+    Some(parts.join("."))
+}
+
+fn expr_is_same_identifier_path(expr: &AstExpr, name: &str) -> bool {
+    match &expr.kind {
+        AstExprKind::Identifier(value) => value == name,
+        AstExprKind::Path(parts) => parts.as_slice() == [name],
+        _ => false,
     }
 }
 
@@ -5353,12 +5382,9 @@ fn update_expression_for_source(
         return expression;
     }
     if let Some(value) = branch.then_simple_update_value() {
-        if let SimpleThenUpdateValue::Path(path) = &value {
-            let canonical = canonical_scalar_update_path_with_fields(field, target, path, fields);
-            if scope_id_for_path(&row_scopes(program), &canonical).is_none()
-                && let Some(expression) =
-                    match_const_update_expression(field, target, fields, source, &branch)
-                        .filter(|expression| !match_const_input_is_row_scoped(program, expression))
+        if let SimpleThenUpdateValue::Path(_) = &value {
+            if let Some(expression) =
+                match_const_update_expression(field, target, fields, source, &branch)
             {
                 return expression;
             }
@@ -5596,13 +5622,6 @@ fn function_call_arg_update_path(
     named_arg
         .or(positional_arg)
         .map(|path| canonical_scalar_update_path_with_fields(field, target, &path, fields))
-}
-
-fn match_const_input_is_row_scoped(program: &ParsedProgram, expression: &UpdateExpression) -> bool {
-    let UpdateExpression::MatchConst { input, .. } = expression else {
-        return false;
-    };
-    scope_id_for_path(&row_scopes(program), input).is_some()
 }
 
 fn match_const_update_expression(
@@ -6989,14 +7008,37 @@ fn source_ref_variants(path: &str) -> Vec<String> {
 fn typed_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
     let mut fields = Vec::new();
     let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
+    let function_bodies = field_function_body_index(&program.ast.statements);
     gather_field_defs_from_statements(
         &program.ast.statements,
         &mut Vec::new(),
         program,
         &items,
+        &function_bodies,
+        &mut Vec::new(),
         &mut fields,
     );
     fields
+}
+
+fn field_function_body_index<'a>(
+    statements: &'a [AstStatement],
+) -> BTreeMap<&'a str, &'a [AstStatement]> {
+    let mut functions = BTreeMap::new();
+    collect_field_function_body_index(statements, &mut functions);
+    functions
+}
+
+fn collect_field_function_body_index<'a>(
+    statements: &'a [AstStatement],
+    functions: &mut BTreeMap<&'a str, &'a [AstStatement]>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, .. } = &statement.kind {
+            functions.insert(name.as_str(), statement.children.as_slice());
+        }
+        collect_field_function_body_index(&statement.children, functions);
+    }
 }
 
 fn gather_field_defs_from_statements(
@@ -7004,20 +7046,35 @@ fn gather_field_defs_from_statements(
     scope: &mut Vec<String>,
     program: &ParsedProgram,
     items: &[&AstItem],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
     fields: &mut Vec<FieldDef>,
 ) {
     for statement in statements {
+        gather_field_defs_from_called_functions(
+            statement,
+            scope,
+            program,
+            items,
+            function_bodies,
+            function_stack,
+            fields,
+        );
         match &statement.kind {
             AstStatementKind::Function { name, .. } => {
                 if let Some(row_scope) = function_row_scope(name, program) {
                     scope.push(row_scope.to_owned());
+                    function_stack.push(name.clone());
                     gather_field_defs_from_statements(
                         &statement.children,
                         scope,
                         program,
                         items,
+                        function_bodies,
+                        function_stack,
                         fields,
                     );
+                    function_stack.pop();
                     scope.pop();
                 }
             }
@@ -7032,6 +7089,8 @@ fn gather_field_defs_from_statements(
                         scope,
                         program,
                         items,
+                        function_bodies,
+                        function_stack,
                         fields,
                     );
                     scope.pop();
@@ -7048,6 +7107,8 @@ fn gather_field_defs_from_statements(
                     scope,
                     program,
                     items,
+                    function_bodies,
+                    function_stack,
                     fields,
                 );
             }
@@ -7062,6 +7123,8 @@ fn gather_field_defs_from_statements(
                     scope,
                     program,
                     items,
+                    function_bodies,
+                    function_stack,
                     fields,
                 );
             }
@@ -7075,10 +7138,251 @@ fn gather_field_defs_from_statements(
                     scope,
                     program,
                     items,
+                    function_bodies,
+                    function_stack,
                     fields,
                 );
             }
         }
+    }
+}
+
+fn gather_field_defs_from_called_functions(
+    statement: &AstStatement,
+    scope: &mut Vec<String>,
+    program: &ParsedProgram,
+    items: &[&AstItem],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    fields: &mut Vec<FieldDef>,
+) {
+    if !scope.iter().any(|name| {
+        program
+            .row_scope_functions
+            .iter()
+            .any(|scope| scope.row_scope == *name)
+    }) {
+        return;
+    }
+    let Some(expr_id) = statement.expr else {
+        return;
+    };
+    let mut calls = Vec::new();
+    collect_field_called_functions(expr_id, &program.ast.expressions, &mut calls);
+    for function in calls {
+        gather_field_defs_from_helper_function(
+            &function,
+            scope,
+            program,
+            items,
+            function_bodies,
+            function_stack,
+            fields,
+        );
+    }
+}
+
+fn gather_field_defs_from_helper_function(
+    function: &str,
+    scope: &mut Vec<String>,
+    program: &ParsedProgram,
+    items: &[&AstItem],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    fields: &mut Vec<FieldDef>,
+) {
+    if function_stack.iter().any(|entry| entry == function) {
+        return;
+    }
+    if function_row_scope(function, program).is_some() {
+        return;
+    }
+    let Some(children) = function_bodies.get(function) else {
+        return;
+    };
+    function_stack.push(function.to_owned());
+    if function_body_defines_record_fields(children, &program.ast.expressions, &program.ast.lines) {
+        gather_field_defs_from_statements(
+            children,
+            scope,
+            program,
+            items,
+            function_bodies,
+            function_stack,
+            fields,
+        );
+    } else {
+        gather_field_defs_from_called_functions_in_statements(
+            children,
+            scope,
+            program,
+            items,
+            function_bodies,
+            function_stack,
+            fields,
+        );
+    }
+    function_stack.pop();
+}
+
+fn gather_field_defs_from_called_functions_in_statements(
+    statements: &[AstStatement],
+    scope: &mut Vec<String>,
+    program: &ParsedProgram,
+    items: &[&AstItem],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    fields: &mut Vec<FieldDef>,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr {
+            let mut calls = Vec::new();
+            collect_field_called_functions(expr_id, &program.ast.expressions, &mut calls);
+            for function in calls {
+                gather_field_defs_from_helper_function(
+                    &function,
+                    scope,
+                    program,
+                    items,
+                    function_bodies,
+                    function_stack,
+                    fields,
+                );
+            }
+        }
+        gather_field_defs_from_called_functions_in_statements(
+            &statement.children,
+            scope,
+            program,
+            items,
+            function_bodies,
+            function_stack,
+            fields,
+        );
+    }
+}
+
+fn function_body_defines_record_fields(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    lines: &[boon_parser::ParserLine],
+) -> bool {
+    statements.iter().any(|statement| {
+        if statement_is_record_field(statement) {
+            return true;
+        }
+        if statement_is_record_constructor_block(statement, lines)
+            && statement.children.iter().any(statement_is_record_field)
+        {
+            return true;
+        }
+        if matches!(statement.kind, AstStatementKind::Expression)
+            && statement.children.iter().any(statement_is_record_field)
+        {
+            return true;
+        }
+        statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| {
+                matches!(
+                    expr.kind,
+                    AstExprKind::Object(_)
+                        | AstExprKind::Record(_)
+                        | AstExprKind::TaggedObject { .. }
+                )
+            })
+    })
+}
+
+fn statement_is_record_constructor_block(
+    statement: &AstStatement,
+    lines: &[boon_parser::ParserLine],
+) -> bool {
+    matches!(statement.kind, AstStatementKind::Block)
+        && lines
+            .iter()
+            .find(|line| line.line == statement.line)
+            .is_some_and(|line| line.symbols.iter().any(|symbol| symbol == "["))
+}
+
+fn statement_is_record_field(statement: &AstStatement) -> bool {
+    matches!(
+        statement.kind,
+        AstStatementKind::Field { .. }
+            | AstStatementKind::Source { .. }
+            | AstStatementKind::Hold { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. }
+    )
+}
+
+fn collect_field_called_functions(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    calls: &mut Vec<String>,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Call { function, args } => {
+            calls.push(function.clone());
+            for arg in args {
+                collect_field_called_functions(arg.value, expressions, calls);
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            collect_field_called_functions(*input, expressions, calls);
+            calls.push(op.clone());
+            for arg in args {
+                collect_field_called_functions(arg.value, expressions, calls);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_field_called_functions(*initial, expressions, calls);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_field_called_functions(*input, expressions, calls);
+            if let Some(output) = output {
+                collect_field_called_functions(*output, expressions, calls);
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            collect_field_called_functions(*left, expressions, calls);
+            collect_field_called_functions(*right, expressions, calls);
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_field_called_functions(*output, expressions, calls);
+            }
+        }
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+            for field in fields {
+                collect_field_called_functions(field.value, expressions, calls);
+            }
+        }
+        AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_field_called_functions(field.value, expressions, calls);
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                collect_field_called_functions(*item, expressions, calls);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
     }
 }
 
@@ -7096,6 +7400,9 @@ fn push_field_def(
     } else {
         format!("{parent_path}.{name}")
     };
+    if fields.iter().any(|field| field.path == path) {
+        return;
+    }
     fields.push(FieldDef {
         path,
         local_name: name.to_owned(),
@@ -7548,6 +7855,14 @@ FUNCTION wrapped_button(source) {
                 "missing source view binding for {expected_path}"
             );
         }
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "selected_signal.formatter"
+                && cell.indexed
+                && cell.initial_value
+                    == InitialValue::RowInitialField {
+                        path: "formatter".to_owned(),
+                    }
+        }));
     }
 
     #[test]

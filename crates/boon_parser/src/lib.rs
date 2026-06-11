@@ -1,6 +1,6 @@
 use chumsky::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2341,17 +2341,24 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/concat"
             | "Text/time_range_label"
             | "Text/trim"
+            | "Text/to_uppercase"
             | "Text/substring"
             | "Text/length"
             | "Text/find"
             | "Text/contains"
             | "Text/starts_with"
+            | "Text/all_chars_in"
             | "Text/to_number"
             | "Text/is_empty"
             | "Text/is_not_empty"
+            | "Number/bit_width"
+            | "Number/to_text"
+            | "Number/to_codepoint_text"
+            | "Number/to_ascii_text"
             | "Number/interpolate"
             | "Number/project_width"
             | "Number/project_offset"
+            | "Number/project_time"
             | "Bool/not"
             | "Bool/and"
             | "Bool/toggle"
@@ -2399,14 +2406,38 @@ fn derive_program_tables(
     row_scopes: &[ParsedRowScopeFunction],
 ) -> StructureTables {
     let mut tables = StructureTables::default();
+    let function_bodies = function_body_index(&ast.statements);
     derive_structure_from_statements(
         &ast.statements,
         &ast.expressions,
+        &ast.lines,
         row_scopes,
+        &function_bodies,
+        &mut Vec::new(),
         &mut Vec::new(),
         &mut tables,
     );
     tables
+}
+
+fn function_body_index<'a>(
+    statements: &'a [AstStatement],
+) -> BTreeMap<&'a str, &'a [AstStatement]> {
+    let mut functions = BTreeMap::new();
+    collect_function_body_index(statements, &mut functions);
+    functions
+}
+
+fn collect_function_body_index<'a>(
+    statements: &'a [AstStatement],
+    functions: &mut BTreeMap<&'a str, &'a [AstStatement]>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, .. } = &statement.kind {
+            functions.insert(name.as_str(), statement.children.as_slice());
+        }
+        collect_function_body_index(&statement.children, functions);
+    }
 }
 
 fn collect_row_scope_functions(
@@ -2476,22 +2507,40 @@ fn collect_list_memory_name_statements(
 fn derive_structure_from_statements(
     statements: &[AstStatement],
     expressions: &[AstExpr],
+    lines: &[ParserLine],
     row_scopes: &[ParsedRowScopeFunction],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
     scope: &mut Vec<String>,
     tables: &mut StructureTables,
 ) {
     for statement in statements {
+        derive_structure_from_called_functions(
+            statement,
+            expressions,
+            lines,
+            row_scopes,
+            function_bodies,
+            function_stack,
+            scope,
+            tables,
+        );
         match &statement.kind {
             AstStatementKind::Function { name, .. } => {
                 if let Some(row_scope) = row_scope_for_function(row_scopes, name) {
                     scope.push(row_scope.to_owned());
+                    function_stack.push(name.clone());
                     derive_structure_from_statements(
                         &statement.children,
                         expressions,
+                        lines,
                         row_scopes,
+                        function_bodies,
+                        function_stack,
                         scope,
                         tables,
                     );
+                    function_stack.pop();
                     scope.pop();
                 }
             }
@@ -2504,12 +2553,15 @@ fn derive_structure_from_statements(
                 {
                     let path = join_path(scope, [name.as_str()]);
                     if !tables.state_cells.iter().any(|cell| cell.path == path) {
-                        tables.state_cells.push(ParsedStateCell {
-                            indexed: true,
-                            hold_name: path.clone(),
-                            path,
-                            line: statement.line,
-                        });
+                        push_state_cell(
+                            tables,
+                            ParsedStateCell {
+                                indexed: true,
+                                hold_name: path.clone(),
+                                path,
+                                line: statement.line,
+                            },
+                        );
                     }
                 }
                 collect_source_ports_from_statement_expr(
@@ -2524,7 +2576,10 @@ fn derive_structure_from_statements(
                     derive_structure_from_statements(
                         &statement.children,
                         expressions,
+                        lines,
                         row_scopes,
+                        function_bodies,
+                        function_stack,
                         scope,
                         tables,
                     );
@@ -2545,16 +2600,22 @@ fn derive_structure_from_statements(
                         Some(event) => join_path(&source_scope, [field, event]),
                         None => join_path(&source_scope, [field]),
                     };
-                    tables.source_ports.push(ParsedSourcePort {
-                        path,
-                        line: statement.line,
-                        scoped: source_scope_is_scoped(scope, row_scopes),
-                    });
+                    push_source_port(
+                        tables,
+                        ParsedSourcePort {
+                            path,
+                            line: statement.line,
+                            scoped: source_scope_is_scoped(scope, row_scopes),
+                        },
+                    );
                 }
                 derive_structure_from_statements(
                     &statement.children,
                     expressions,
+                    lines,
                     row_scopes,
+                    function_bodies,
+                    function_stack,
                     scope,
                     tables,
                 );
@@ -2565,16 +2626,22 @@ fn derive_structure_from_statements(
                     .map(|field| join_path(scope, [field.as_str()]))
                     .or_else(|| scope_path(scope))
                     .unwrap_or_else(|| format!("hold_{}", statement.line));
-                tables.state_cells.push(ParsedStateCell {
-                    indexed: scope_is_indexed(scope, row_scopes),
-                    hold_name: name.clone().unwrap_or_else(|| path.clone()),
-                    path,
-                    line: statement.line,
-                });
+                push_state_cell(
+                    tables,
+                    ParsedStateCell {
+                        indexed: scope_is_indexed(scope, row_scopes),
+                        hold_name: name.clone().unwrap_or_else(|| path.clone()),
+                        path,
+                        line: statement.line,
+                    },
+                );
                 derive_structure_from_statements(
                     &statement.children,
                     expressions,
+                    lines,
                     row_scopes,
+                    function_bodies,
+                    function_stack,
                     scope,
                     tables,
                 );
@@ -2592,7 +2659,10 @@ fn derive_structure_from_statements(
                 derive_structure_from_statements(
                     &statement.children,
                     expressions,
+                    lines,
                     row_scopes,
+                    function_bodies,
+                    function_stack,
                     scope,
                     tables,
                 );
@@ -2601,12 +2671,270 @@ fn derive_structure_from_statements(
                 derive_structure_from_statements(
                     &statement.children,
                     expressions,
+                    lines,
                     row_scopes,
+                    function_bodies,
+                    function_stack,
                     scope,
                     tables,
                 );
             }
         }
+    }
+}
+
+fn derive_structure_from_called_functions(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    lines: &[ParserLine],
+    row_scopes: &[ParsedRowScopeFunction],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    scope: &mut Vec<String>,
+    tables: &mut StructureTables,
+) {
+    if !scope_is_indexed(scope, row_scopes) {
+        return;
+    }
+    let Some(expr_id) = statement.expr else {
+        return;
+    };
+    let mut calls = Vec::new();
+    collect_called_functions(expr_id, expressions, &mut calls);
+    for function in calls {
+        derive_structure_from_helper_function(
+            &function,
+            expressions,
+            lines,
+            row_scopes,
+            function_bodies,
+            function_stack,
+            scope,
+            tables,
+        );
+    }
+}
+
+fn derive_structure_from_helper_function(
+    function: &str,
+    expressions: &[AstExpr],
+    lines: &[ParserLine],
+    row_scopes: &[ParsedRowScopeFunction],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    scope: &mut Vec<String>,
+    tables: &mut StructureTables,
+) {
+    if function_stack.iter().any(|entry| entry == function) {
+        return;
+    }
+    let Some(children) = function_bodies.get(function) else {
+        return;
+    };
+    if row_scope_for_function(row_scopes, function).is_some() {
+        return;
+    }
+    function_stack.push(function.to_owned());
+    if function_body_defines_record_fields(children, expressions, lines) {
+        derive_structure_from_statements(
+            children,
+            expressions,
+            lines,
+            row_scopes,
+            function_bodies,
+            function_stack,
+            scope,
+            tables,
+        );
+    } else {
+        derive_structure_from_called_functions_in_statements(
+            children,
+            expressions,
+            lines,
+            row_scopes,
+            function_bodies,
+            function_stack,
+            scope,
+            tables,
+        );
+    }
+    function_stack.pop();
+}
+
+fn derive_structure_from_called_functions_in_statements(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    lines: &[ParserLine],
+    row_scopes: &[ParsedRowScopeFunction],
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    function_stack: &mut Vec<String>,
+    scope: &mut Vec<String>,
+    tables: &mut StructureTables,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr {
+            let mut calls = Vec::new();
+            collect_called_functions(expr_id, expressions, &mut calls);
+            for function in calls {
+                derive_structure_from_helper_function(
+                    &function,
+                    expressions,
+                    lines,
+                    row_scopes,
+                    function_bodies,
+                    function_stack,
+                    scope,
+                    tables,
+                );
+            }
+        }
+        derive_structure_from_called_functions_in_statements(
+            &statement.children,
+            expressions,
+            lines,
+            row_scopes,
+            function_bodies,
+            function_stack,
+            scope,
+            tables,
+        );
+    }
+}
+
+fn function_body_defines_record_fields(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    lines: &[ParserLine],
+) -> bool {
+    statements.iter().any(|statement| {
+        if statement_is_record_field(statement) {
+            return true;
+        }
+        if statement_is_record_constructor_block(statement, lines)
+            && statement.children.iter().any(statement_is_record_field)
+        {
+            return true;
+        }
+        if matches!(statement.kind, AstStatementKind::Expression)
+            && statement.children.iter().any(statement_is_record_field)
+        {
+            return true;
+        }
+        statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| {
+                matches!(
+                    expr.kind,
+                    AstExprKind::Object(_)
+                        | AstExprKind::Record(_)
+                        | AstExprKind::TaggedObject { .. }
+                )
+            })
+    })
+}
+
+fn statement_is_record_constructor_block(statement: &AstStatement, lines: &[ParserLine]) -> bool {
+    matches!(statement.kind, AstStatementKind::Block)
+        && lines
+            .iter()
+            .find(|line| line.line == statement.line)
+            .is_some_and(|line| line.symbols.iter().any(|symbol| symbol == "["))
+}
+
+fn statement_is_record_field(statement: &AstStatement) -> bool {
+    matches!(
+        statement.kind,
+        AstStatementKind::Field { .. }
+            | AstStatementKind::Source { .. }
+            | AstStatementKind::Hold { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. }
+    )
+}
+
+fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut Vec<String>) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Call { function, args } => {
+            calls.push(function.clone());
+            for arg in args {
+                collect_called_functions(arg.value, expressions, calls);
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            collect_called_functions(*input, expressions, calls);
+            calls.push(op.clone());
+            for arg in args {
+                collect_called_functions(arg.value, expressions, calls);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_called_functions(*initial, expressions, calls);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_called_functions(*input, expressions, calls);
+            if let Some(output) = output {
+                collect_called_functions(*output, expressions, calls);
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            collect_called_functions(*left, expressions, calls);
+            collect_called_functions(*right, expressions, calls);
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_called_functions(*output, expressions, calls);
+            }
+        }
+        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+            for field in fields {
+                collect_called_functions(field.value, expressions, calls);
+            }
+        }
+        AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_called_functions(field.value, expressions, calls);
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                collect_called_functions(*item, expressions, calls);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+}
+
+fn push_source_port(tables: &mut StructureTables, source: ParsedSourcePort) {
+    if !tables
+        .source_ports
+        .iter()
+        .any(|existing| existing.path == source.path)
+    {
+        tables.source_ports.push(source);
+    }
+}
+
+fn push_state_cell(tables: &mut StructureTables, cell: ParsedStateCell) {
+    if !tables
+        .state_cells
+        .iter()
+        .any(|existing| existing.path == cell.path)
+    {
+        tables.state_cells.push(cell);
     }
 }
 

@@ -1136,16 +1136,17 @@ store: [
     selected_signal_defaults:
         LIST {
             [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { group_core_bus }, name: TEXT { simple_tb.s group }, current_value: TEXT { A[3:0], B[3:0] }, kind: GroupHeader, enabled: TEXT { loaded }, item_kind: GroupHeader, grouped: False, hidden_when_group: None, member_count_label: TEXT { 2 }, row_count_label: TEXT { 2 grouped signals }, divider_height_after: 0]
-            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { clk }, remove_kind: RemoveClk, name: TEXT { A[3:0] }, current_value: TEXT { 0xc }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { reset_n }, remove_kind: RemoveReset, name: TEXT { B[3:0] }, current_value: TEXT { 0x5 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { tx_data }, remove_kind: RemoveTxData, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { rx_data }, remove_kind: RemoveRxData, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { baud_tick }, remove_kind: RemoveBaudTick, name: TEXT { baud_tick }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { uart_busy }, remove_kind: RemoveUartBusy, name: TEXT { uart_busy }, current_value: TEXT { 0 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_counter }, remove_kind: RemoveGhwCounter, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_enable }, remove_kind: RemoveGhwEnable, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
-            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_state }, remove_kind: RemoveGhwState, name: TEXT { ghw.state }, current_value: TEXT { Count }, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { clk }, remove_kind: RemoveClk, name: TEXT { A[3:0] }, current_value: TEXT { 0xc }, bit_width: TEXT { 4-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { simple_vcd }, file: TEXT { simple.vcd }, id: TEXT { reset_n }, remove_kind: RemoveReset, name: TEXT { B[3:0] }, current_value: TEXT { 0x5 }, bit_width: TEXT { 4-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: True, hidden_when_group: Collapsed, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { tx_data }, remove_kind: RemoveTxData, name: TEXT { tx_data[7:0] }, current_value: TEXT { 0x55 }, bit_width: TEXT { 8-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { rx_data }, remove_kind: RemoveRxData, name: TEXT { rx_data[7:0] }, current_value: TEXT { 0xaa }, bit_width: TEXT { 8-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { baud_tick }, remove_kind: RemoveBaudTick, name: TEXT { baud_tick }, current_value: TEXT { 1 }, bit_width: TEXT { 1-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { uart }, file: TEXT { wave_27.fst }, id: TEXT { uart_busy }, remove_kind: RemoveUartBusy, name: TEXT { uart_busy }, current_value: TEXT { 0 }, bit_width: TEXT { 1-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_counter }, remove_kind: RemoveGhwCounter, name: TEXT { ghw.counter[3:0] }, current_value: TEXT { 3 }, bit_width: TEXT { 4-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_enable }, remove_kind: RemoveGhwEnable, name: TEXT { ghw.enable }, current_value: TEXT { 1 }, bit_width: TEXT { 1-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
+            [family: TEXT { ghw }, file: TEXT { simple_test.ghw }, id: TEXT { ghw_state }, remove_kind: RemoveGhwState, name: TEXT { ghw.state }, current_value: TEXT { Count }, bit_width: TEXT { 2-bit }, formatter: Hexadecimal, kind: Digital, enabled: TEXT { loaded }, item_kind: VariableRow, grouped: False, hidden_when_group: Never, member_count_label: Text/empty(), row_count_label: Text/empty(), divider_height_after: 3]
         }
+        |> List/map(selected_signal, new: new_selected_visible_item(row: selected_signal))
 
     startup_waveform_transition_records:
         LIST {
@@ -1359,25 +1360,25 @@ store: [
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
 
-    selected_signal_rows:
-        selected_signal_defaults
-        |> List/filter_field_equal(field: "family", value: selected_signal_family)
-        |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
-        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
-        |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
-        |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
-        |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
-        |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
-
-    selected_signals:
-        selected_signal_rows
-
     selected_visible_items:
         selected_signal_defaults
         |> List/filter_field_equal(field: "family", value: selected_signal_family)
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
         |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+        |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
+        |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
+
+    selected_signal_rows:
+        selected_visible_items
+        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
+
+    selected_signals:
+        selected_signal_rows
+
+    selected_signal_format_rows:
+        selected_signal_rows
+        |> List/map(signal, new: [id: signal.id, formatter: signal.formatter, bit_width: signal.bit_width])
 
     selected_cursor_pair_rows:
         selected_signal_rows
@@ -1566,7 +1567,8 @@ store: [
         waveform_segment_records
         |> List/filter_field_equal(field: "file", value: active_file)
         |> List/filter_field_equal(field: "signal_id", value: active_signal)
-        |> List/join_field(field: "label", separator: ",", empty: "none")
+        |> List/map(segment, new: [value: NovyModel/format_signal_value(value: segment.label, bit_width: active_signal_bit_width, format: active_signal_format)])
+        |> List/join_field(field: "value", separator: ",", empty: "none")
 
     active_waveform_segment_count:
         waveform_segment_records
@@ -2081,6 +2083,15 @@ store: [
             elements.load_default_file.event.press |> THEN { Hexadecimal }
         }
 
+    active_signal_format:
+        List/find_value(selected_signal_format_rows, field: "id", value: active_signal, target: "formatter", fallback: value_format)
+
+    active_signal_bit_width:
+        List/find_value(selected_signal_format_rows, field: "id", value: active_signal, target: "bit_width", fallback: TEXT { 1-bit })
+
+    data_bus_row_format:
+        List/find_value(selected_signal_format_rows, field: "id", value: TEXT { data_bus }, target: "formatter", fallback: value_format)
+
     zoom_step:
         0 |> HOLD zoom_step {
             LATEST {
@@ -2357,13 +2368,13 @@ store: [
         }
 
     format_label:
-        NovyModel/format_label(format: value_format)
+        NovyModel/format_label(format: active_signal_format)
 
     data_bus_rendered_value:
-        NovyModel/selected_data_value_at_cursor(format: value_format, cursor: cursor_position)
+        NovyModel/selected_data_value_at_cursor(format: data_bus_row_format, cursor: cursor_position)
 
     temperature_rendered_value:
-        NovyModel/selected_temperature_value_at_cursor(format: value_format, cursor: cursor_position)
+        NovyModel/selected_temperature_value_at_cursor(format: active_signal_format, cursor: cursor_position)
 
     row_height:
         NovyModel/row_height(size: row_size)
@@ -2544,7 +2555,7 @@ store: [
         bridge_response_compact_label
 
     bridge_request_descriptor_label:
-        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: value_format)
+        NovyModel/descriptor_label(scope: active_scope_key, signal: active_signal_key, zoom: zoom_level, pan: pan_window, cursor: cursor_position, format: active_signal_format)
 
     bridge_response_descriptor_label:
         TEXT { SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
@@ -2580,7 +2591,7 @@ store: [
                 zoom: zoom_level
                 pan: pan_window
                 cursor: cursor_label
-                format: value_format
+                format: active_signal_format
                 window: bridge_request_window_label
             ]
             window: bridge_page_window_label
@@ -2714,7 +2725,7 @@ store: [
         }
 
     bridge_request_compact_label:
-        NovyModel/request_page(compact: bridge_request_compact_label_raw, format: value_format, zoom: zoom_level)
+        NovyModel/request_page(compact: bridge_request_compact_label_raw, format: active_signal_format, zoom: zoom_level)
 
     bridge_response_compact_label:
         TEXT { A_FIT } |> HOLD bridge_response_compact_label {
@@ -2860,7 +2871,81 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION selected_cursor_value_for_signal(signal) {
+FUNCTION new_selected_visible_item(row) {
+    row.item_kind |> WHEN {
+        VariableRow => new_selected_signal(selected_signal: row)
+        __ => row
+    }
+}
+
+FUNCTION new_selected_signal(selected_signal) {
+    [
+        format_elements: [
+            format_dropdown_toggle: SOURCE
+            format_binary: SOURCE
+            format_hex: SOURCE
+            format_grouped: SOURCE
+            format_octal: SOURCE
+            format_signed: SOURCE
+            format_unsigned: SOURCE
+            format_ascii: SOURCE
+        ]
+        family: selected_signal.family
+        file: selected_signal.file
+        id: selected_signal.id
+        remove_kind: selected_signal.remove_kind
+        name: selected_signal.name
+        bit_width: selected_signal.bit_width
+        kind: selected_signal.kind
+        enabled: selected_signal.enabled
+        item_kind: selected_signal.item_kind
+        grouped: selected_signal.grouped
+        hidden_when_group: selected_signal.hidden_when_group
+        member_count_label: selected_signal.member_count_label
+        row_count_label: selected_signal.row_count_label
+        divider_height_after: selected_signal.divider_height_after
+        formatter:
+            selected_signal.formatter |> HOLD formatter {
+                LATEST {
+                    format_elements.format_binary.event.press |> THEN { Binary }
+                    format_elements.format_hex.event.press |> THEN { Hexadecimal }
+                    format_elements.format_grouped.event.press |> THEN { GroupedBinary }
+                    format_elements.format_octal.event.press |> THEN { Octal }
+                    format_elements.format_signed.event.press |> THEN { Signed }
+                    format_elements.format_unsigned.event.press |> THEN { Unsigned }
+                    format_elements.format_ascii.event.press |> THEN { ASCII }
+                    elements.load_default_file.event.press |> THEN { selected_signal.formatter }
+                    elements.show_empty.event.press |> THEN { selected_signal.formatter }
+                }
+            }
+        format_label:
+            NovyModel/format_short_label(format: formatter)
+        format_dropdown_state:
+            Closed |> HOLD format_dropdown_state {
+                LATEST {
+                    format_elements.format_dropdown_toggle.event.press |> THEN {
+                        format_dropdown_state |> WHEN {
+                            Open => Closed
+                            __ => Open
+                        }
+                    }
+                    format_elements.format_binary.event.press |> THEN { Closed }
+                    format_elements.format_hex.event.press |> THEN { Closed }
+                    format_elements.format_grouped.event.press |> THEN { Closed }
+                    format_elements.format_octal.event.press |> THEN { Closed }
+                    format_elements.format_signed.event.press |> THEN { Closed }
+                    format_elements.format_unsigned.event.press |> THEN { Closed }
+                    format_elements.format_ascii.event.press |> THEN { Closed }
+                    elements.load_default_file.event.press |> THEN { Closed }
+                    elements.show_empty.event.press |> THEN { Closed }
+                }
+            }
+        current_value:
+            selected_cursor_value_for_signal(signal: selected_signal, format: formatter)
+    ]
+}
+
+FUNCTION selected_cursor_value_for_signal(signal, format) {
     store.waveform_segment_records
         |> List/filter_field_equal(field: "file", value: signal.file)
         |> List/filter_field_equal(field: "signal_id", value: signal.id)
@@ -2868,12 +2953,13 @@ FUNCTION selected_cursor_value_for_signal(signal) {
         |> List/filter_field_not_equal(field: "state", value: MarkerLine)
         |> List/retain(segment, if: segment.start_time_value <= store.selected_timeline_cursor_value)
         |> List/retain(segment, if: segment.end_time_value > store.selected_timeline_cursor_value)
-        |> List/join_field(field: "label", separator: "", empty: signal.current_value)
+        |> List/map(segment, new: [value: NovyModel/format_signal_value(value: segment.label, bit_width: signal.bit_width, format: format)])
+        |> List/join_field(field: "value", separator: "", empty: NovyModel/format_signal_value(value: signal.current_value, bit_width: signal.bit_width, format: format))
 }
 
 FUNCTION selected_cursor_pair_row(signal) {
     [
-        label: signal.name |> Text/concat(with: selected_cursor_value_for_signal(signal: signal), separator: "=")
+        label: signal.name |> Text/concat(with: signal.current_value, separator: "=")
     ]
 }
 
@@ -2895,6 +2981,7 @@ FUNCTION new_waveform_segment(segment) {
             __ => 0
         }
         state: segment.state
+        raw_label: segment.label
         label: segment.label
         click_time: segment.click_time
     ]

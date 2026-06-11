@@ -3098,7 +3098,7 @@ FUNCTION waveform_rows_expanded() {
             material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
         ]
         items:
-            PASSED.store.selected_signals |> List/map(row, new: selected_waveform_row(row: row))
+            PASSED.store.selected_signal_rows |> List/map(selected_signal, new: selected_waveform_row(row: selected_signal))
     )
 }
 
@@ -3183,7 +3183,7 @@ FUNCTION waveform_row(signal) {
             items: LIST {
                 signal_select_button(signal: signal)
                 variables_name_divider()
-                value_cell(signal: signal, value_text: selected_cursor_value_for_signal(signal: signal))
+                value_cell(signal: signal, value_text: signal.current_value)
                 variables_value_divider()
                 wave_area(signal: signal)
             }
@@ -3196,18 +3196,7 @@ FUNCTION selected_name_cell(signal) {
 }
 
 FUNCTION selected_value_cell(signal) {
-    value_cell(signal: signal, value_text: selected_cursor_value_for_signal(signal: signal))
-}
-
-FUNCTION selected_cursor_value_for_signal(signal) {
-    PASSED.store.waveform_segment_records
-        |> List/filter_field_equal(field: "file", value: signal.file)
-        |> List/filter_field_equal(field: "signal_id", value: signal.id)
-        |> List/filter_field_not_equal(field: "state", value: CursorLine)
-        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
-        |> List/retain(segment, if: segment.start_time_value <= PASSED.store.selected_timeline_cursor_value)
-        |> List/retain(segment, if: segment.end_time_value > PASSED.store.selected_timeline_cursor_value)
-        |> List/join_field(field: "label", separator: "", empty: signal.current_value)
+    value_cell(signal: signal, value_text: signal.current_value)
 }
 
 FUNCTION selected_wave_cell(signal) {
@@ -3660,6 +3649,7 @@ FUNCTION value_cell(signal, value_text) {
             height: Fill
             padding: [left: 6, right: 6]
             rounded_corners: 0
+            overlay_children: True
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #111827 }
                 Light => TEXT { #E9F0FA }
@@ -3693,7 +3683,7 @@ FUNCTION value_cell(signal, value_text) {
                 )
                 signal.kind |> WHEN {
                     Analog => row_analog_limits_button()
-                    __ => row_format_button()
+                    __ => row_format_control(signal: signal)
                 }
             }
         )
@@ -3733,11 +3723,135 @@ FUNCTION row_value_action_style(button_width, hovered) {
     ]
 }
 
-FUNCTION row_format_button() {
+FUNCTION row_format_control(signal) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: 64
+            height: signal.format_dropdown_state == Open |> WHEN {
+                True => 198
+                False => 22
+            }
+            paint: False
+            overlay_children: True
+        ]
+        items: LIST {
+            row_format_button(signal: signal)
+            row_format_dropdown_state_menu(signal: signal)
+        }
+    )
+}
+
+FUNCTION row_format_button(signal) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
-        style: row_value_action_style(button_width: 46, hovered: element.hovered)
-        label: row_value_action_label(button_text: PASSED.store.format_label)
+        element: [event: [press: signal.format_elements.format_dropdown_toggle], hovered: signal.format_elements.format_dropdown_toggle, target: signal.name]
+        style: row_value_action_style(button_width: 64, hovered: element.hovered)
+        label: row_value_action_label(button_text: signal.format_label)
+    )
+}
+
+FUNCTION row_format_dropdown_state_menu(signal) {
+    signal.format_dropdown_state == Open |> WHEN {
+        True => row_format_dropdown_menu(signal: signal)
+        False => row_format_dropdown_closed_menu()
+    }
+}
+
+FUNCTION row_format_dropdown_closed_menu() {
+    Scene/Element/label(
+        element: []
+        style: [width: 64, height: 0, paint: False]
+        label: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION row_format_dropdown_menu(signal) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: 96
+            height: 172
+            padding: 4
+            rounded_corners: 4
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0b1424 }
+                Light => TEXT { #edf4fb }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #304057 }
+                Light => TEXT { #bad0e8 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        items: LIST {
+            row_format_hex_dropdown_option(signal: signal)
+            row_format_binary_dropdown_option(signal: signal)
+            row_format_grouped_dropdown_option(signal: signal)
+            row_format_octal_dropdown_option(signal: signal)
+            row_format_signed_dropdown_option(signal: signal)
+            row_format_unsigned_dropdown_option(signal: signal)
+            row_format_ascii_dropdown_option(signal: signal)
+        }
+    )
+}
+
+FUNCTION row_format_hex_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_hex], hovered: signal.format_elements.format_hex, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == Hexadecimal)
+        label: format_dropdown_option_label(option_text: TEXT { Hex }, selected: signal.formatter == Hexadecimal)
+    )
+}
+
+FUNCTION row_format_binary_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_binary], hovered: signal.format_elements.format_binary, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == Binary)
+        label: format_dropdown_option_label(option_text: TEXT { Bin }, selected: signal.formatter == Binary)
+    )
+}
+
+FUNCTION row_format_grouped_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_grouped], hovered: signal.format_elements.format_grouped, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == GroupedBinary)
+        label: format_dropdown_option_label(option_text: TEXT { Bins }, selected: signal.formatter == GroupedBinary)
+    )
+}
+
+FUNCTION row_format_octal_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_octal], hovered: signal.format_elements.format_octal, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == Octal)
+        label: format_dropdown_option_label(option_text: TEXT { Oct }, selected: signal.formatter == Octal)
+    )
+}
+
+FUNCTION row_format_signed_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_signed], hovered: signal.format_elements.format_signed, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == Signed)
+        label: format_dropdown_option_label(option_text: TEXT { Int }, selected: signal.formatter == Signed)
+    )
+}
+
+FUNCTION row_format_unsigned_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_unsigned], hovered: signal.format_elements.format_unsigned, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == Unsigned)
+        label: format_dropdown_option_label(option_text: TEXT { UInt }, selected: signal.formatter == Unsigned)
+    )
+}
+
+FUNCTION row_format_ascii_dropdown_option(signal) {
+    Scene/Element/button(
+        element: [event: [press: signal.format_elements.format_ascii], hovered: signal.format_elements.format_ascii, target: signal.name]
+        style: format_dropdown_option_style(selected: signal.formatter == ASCII)
+        label: format_dropdown_option_label(option_text: TEXT { Text }, selected: signal.formatter == ASCII)
     )
 }
 
@@ -3815,8 +3929,25 @@ FUNCTION waveform_segment_lane(signal) {
         items:
             PASSED.store.selected_waveform_segments
             |> List/filter_field_equal(field: "signal_id", value: signal.id)
-            |> List/map(segment, new: waveform_segment(segment: segment))
+            |> List/map(segment, new: waveform_segment(segment: waveform_segment_for_signal(segment: segment, signal: signal)))
     )
+}
+
+FUNCTION waveform_segment_for_signal(segment, signal) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        start_time_value: segment.start_time_value
+        end_time_value: segment.end_time_value
+        visible_start_time_value: segment.visible_start_time_value
+        visible_end_time_value: segment.visible_end_time_value
+        projection_source: segment.projection_source
+        width: segment.width
+        state: segment.state
+        raw_label: segment.raw_label
+        label: NovyModel/format_signal_value(value: segment.raw_label, bit_width: signal.bit_width, format: signal.formatter)
+        click_time: segment.click_time
+    ]
 }
 
 FUNCTION waveform_segment(segment) {

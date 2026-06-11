@@ -114,6 +114,150 @@ FUNCTION format_label(format) {
     }
 }
 
+FUNCTION format_short_label(format) {
+    format |> WHEN {
+        Hexadecimal => TEXT { Hex }
+        Binary => TEXT { Bin }
+        GroupedBinary => TEXT { Bins }
+        Octal => TEXT { Oct }
+        Signed => TEXT { Int }
+        Unsigned => TEXT { UInt }
+        ASCII => TEXT { Text }
+        __ => TEXT { Hex }
+    }
+}
+
+FUNCTION format_signal_value(value, bit_width, format) {
+    signal_value_trimmed(value: value) |> Text/is_empty() |> WHEN {
+        True => Text/empty()
+        False => signal_value_is_special(value: value) |> WHEN {
+            True => signal_special_value_label(value: value, format: format)
+            False => signal_numeric_value_label(value: value, bit_width: bit_width, format: format)
+        }
+    }
+}
+
+FUNCTION signal_value_trimmed(value) {
+    value |> Text/trim()
+}
+
+FUNCTION signal_value_is_special(value) {
+    signal_value_trimmed(value: value) |> Text/all_chars_in(chars: TEXT { XZUz?xzu })
+}
+
+FUNCTION signal_special_symbol(value) {
+    signal_value_trimmed(value: value) |> Text/to_uppercase() |> Text/substring(start: 0, length: 1)
+}
+
+FUNCTION signal_special_value(value) {
+    signal_value_trimmed(value: value) |> Text/to_uppercase()
+}
+
+FUNCTION signal_special_value_label(value, format) {
+    format |> WHEN {
+        ASCII => TEXT { . }
+        Signed => TEXT { - }
+        Unsigned => TEXT { - }
+        Binary => signal_special_value(value: value)
+        GroupedBinary => signal_special_value(value: value)
+        __ => signal_special_symbol(value: value)
+    }
+}
+
+FUNCTION signal_value_radix(value) {
+    signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0x }) |> WHEN {
+        True => 16
+        False => signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0X }) |> WHEN {
+            True => 16
+            False => signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0b }) |> WHEN {
+                True => 2
+                False => signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0B }) |> WHEN {
+                    True => 2
+                    False => signal_value_trimmed(value: value) |> Text/all_chars_in(chars: TEXT { 01 }) |> WHEN {
+                        True => 2
+                        False => 10
+                    }
+                }
+            }
+        }
+    }
+}
+
+FUNCTION signal_value_number(value) {
+    signal_value_trimmed(value: value) |> Text/to_number(radix: signal_value_radix(value: value))
+}
+
+FUNCTION signal_trimmed_length(value) {
+    signal_value_trimmed(value: value) |> Text/length()
+}
+
+FUNCTION signal_binary_width(value) {
+    signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0b }) |> WHEN {
+        True => signal_prefixed_digit_count(value: value)
+        False => signal_value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0B }) |> WHEN {
+            True => signal_prefixed_digit_count(value: value)
+            False => signal_trimmed_length(value: value)
+        }
+    }
+}
+
+FUNCTION signal_prefixed_digit_count(value) {
+    signal_trimmed_length(value: value) - 2
+}
+
+FUNCTION signal_hex_width(value) {
+    signal_prefixed_digit_count(value: value) * 4
+}
+
+FUNCTION signal_inferred_width(value) {
+    signal_value_radix(value: value) |> WHEN {
+        16 => signal_hex_width(value: value)
+        2 => signal_binary_width(value: value)
+        __ => signal_value_number(value: value) |> Number/bit_width()
+    }
+}
+
+FUNCTION signal_bit_width(value, bit_width) {
+    bit_width |> Text/to_number(leading: True, fallback: signal_inferred_width(value: value))
+}
+
+FUNCTION signal_octal_width(width) {
+    width <= 1 |> WHEN {
+        True => 1
+        False => signal_octal_digits(width: width) < 3 |> WHEN {
+            True => 3
+            False => signal_octal_digits(width: width)
+        }
+    }
+}
+
+FUNCTION signal_octal_numerator(width) {
+    width + 2
+}
+
+FUNCTION signal_octal_digits(width) {
+    signal_octal_numerator(width: width) / 3
+}
+
+FUNCTION signal_numeric_value_label(value, bit_width, format) {
+    signal_value_number(value: value) |> WHILE {
+        NaN => signal_value_trimmed(value: value)
+        number => signal_numeric_number_label(number: number, width: signal_bit_width(value: value, bit_width: bit_width), format: format)
+    }
+}
+
+FUNCTION signal_numeric_number_label(number, width, format) {
+    format |> WHEN {
+        Binary => number |> Number/to_text(radix: 2, min_width: width)
+        GroupedBinary => number |> Number/to_text(radix: 2, min_width: width, group_size: 4)
+        Octal => number |> Number/to_text(radix: 8, min_width: signal_octal_width(width: width))
+        Signed => number |> Number/to_text(radix: 10, signed_width: width)
+        Unsigned => number |> Number/to_text(radix: 10)
+        ASCII => number |> Number/to_ascii_text(width: width)
+        __ => number |> Number/to_text(radix: 16, prefix: True)
+    }
+}
+
 FUNCTION next_format(format) {
     format |> WHEN {
         Hexadecimal => Binary

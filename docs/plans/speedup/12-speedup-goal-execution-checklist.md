@@ -2849,7 +2849,7 @@ Notes:
   three-way parity shape before trying broader expression families.
 
 ### EXP-0007 Large-List Dataflow Kernel
-Status: pending
+Status: done
 Type: experiment
 Depends on: TASK-0302, TASK-0902
 Hypothesis:
@@ -2866,6 +2866,10 @@ Verification:
 - `cargo test -p boon_runtime --lib dataflow`
 Notes:
 - Do not adopt differential-dataflow or similar wholesale before this local experiment.
+- Completed first as a local bitset-backed count dataflow proof over a 1,000
+  row TodoMVC list. It is not wired into production runtime scheduling yet:
+  the experiment proves a reusable state shape and full-recompute oracle parity
+  for one-row boolean-field count updates.
 
 ## Phase 10: Compiled Artifact, Bytecode, And Future Kernel Work
 
@@ -5302,6 +5306,31 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   not compile Rust code at runtime, and does not claim a production speed win.
   Promotion still needs a release-mode measurement that excludes compile cost
   and shows a stable runtime win.
+
+### 2026-06-16 EXP-0007 Large-List Count Dataflow Kernel Proof
+
+- Date: 2026-06-16
+- Task: EXP-0007 Large-List Dataflow Kernel
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: `cargo fmt -p boon_runtime`; `cargo test -p boon_runtime
+  --lib dataflow -- --nocapture`
+- Result: EXP-0007 is complete for its first proof slice but is not promoted.
+  The runtime now has a local `LargeListCountDataflowKernel` experiment that
+  builds a predicate-membership bitset for a count projection, applies a
+  row-identity field update by `(key, generation)`, and compares the maintained
+  count against the existing full-scan oracle.
+- Report detail: the large TodoMVC proof builds active and completed count
+  kernels over `1,000` rows. Toggling `Item 500` touches `1` dataflow row per
+  count target while the oracle scans `1,000` rows. The active count moves from
+  `500` to `499`, the completed count moves from `500` to `501`, and both
+  maintained counts match the full-scan oracle.
+- Boundary: this is a local dataflow-state proof, not a production scheduler
+  change. Inserts, removes, moves, selector predicates, and general list
+  projections still need fallback handling and report evidence before this can
+  replace normal runtime paths.
 
 ## File Maintenance Checklist
 

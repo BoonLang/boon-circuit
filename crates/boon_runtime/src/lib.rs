@@ -20,7 +20,7 @@ use serde_json::{Value as JsonValue, json};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::ops::{Bound, Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -450,6 +450,9 @@ pub struct LiveRuntimeStepProfile {
     #[serde(default)]
     pub source_action_root_dirty_frontier_samples: Vec<LiveRuntimeDirtyFrontierCauseSample>,
     #[serde(default)]
+    pub source_action_root_dirty_frontier_demand_classification_counts:
+        Vec<LiveRuntimeDirtyFrontierDemandClassificationSample>,
+    #[serde(default)]
     pub source_action_root_dirty_root_work_samples: Vec<LiveRuntimeDirtyRootWorkSample>,
     #[serde(default)]
     pub source_action_route_stats_ms: f64,
@@ -475,6 +478,19 @@ pub struct LiveRuntimeDirtyFrontierCauseSample {
     pub read_key_kind: String,
     pub dependent_root: String,
     pub dependent_kind: String,
+    #[serde(default)]
+    pub dependent_demand_classification: String,
+    pub dependency_lookup_count: usize,
+    pub dependent_visit_count: usize,
+    pub dependent_enqueue_count: usize,
+    pub already_dirty_count: usize,
+    pub skipped_self_count: usize,
+    pub structured_parent_skip_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LiveRuntimeDirtyFrontierDemandClassificationSample {
+    pub dependent_demand_classification: String,
     pub dependency_lookup_count: usize,
     pub dependent_visit_count: usize,
     pub dependent_enqueue_count: usize,
@@ -487,6 +503,8 @@ pub struct LiveRuntimeDirtyFrontierCauseSample {
 pub struct LiveRuntimeDirtyRootWorkSample {
     pub root_path: String,
     pub root_kind: String,
+    #[serde(default)]
+    pub root_demand_classification: String,
     pub pop_count: usize,
     pub skip_count: usize,
     pub scalar_materialization_count: usize,
@@ -500,9 +518,65 @@ pub struct LiveRuntimeDirtyRootWorkSample {
 const LIVE_RUNTIME_DIRTY_FRONTIER_SAMPLE_LIMIT: usize = 64;
 const LIVE_RUNTIME_DIRTY_ROOT_WORK_SAMPLE_LIMIT: usize = 64;
 
+fn runtime_profile_root_demand_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOON_PROFILE_ROOT_DEMAND")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn extend_bounded_profile_samples<T>(target: &mut Vec<T>, source: Vec<T>, limit: usize) {
     let remaining = limit.saturating_sub(target.len());
     target.extend(source.into_iter().take(remaining));
+}
+
+fn merge_dirty_frontier_demand_classification_counts(
+    target: &mut Vec<LiveRuntimeDirtyFrontierDemandClassificationSample>,
+    source: Vec<LiveRuntimeDirtyFrontierDemandClassificationSample>,
+) {
+    let mut merged = target
+        .drain(..)
+        .map(|sample| (sample.dependent_demand_classification.clone(), sample))
+        .collect::<BTreeMap<_, _>>();
+    for sample in source {
+        let entry = merged
+            .entry(sample.dependent_demand_classification.clone())
+            .or_insert_with(|| LiveRuntimeDirtyFrontierDemandClassificationSample {
+                dependent_demand_classification: sample.dependent_demand_classification.clone(),
+                ..Default::default()
+            });
+        entry.dependency_lookup_count = entry
+            .dependency_lookup_count
+            .saturating_add(sample.dependency_lookup_count);
+        entry.dependent_visit_count = entry
+            .dependent_visit_count
+            .saturating_add(sample.dependent_visit_count);
+        entry.dependent_enqueue_count = entry
+            .dependent_enqueue_count
+            .saturating_add(sample.dependent_enqueue_count);
+        entry.already_dirty_count = entry
+            .already_dirty_count
+            .saturating_add(sample.already_dirty_count);
+        entry.skipped_self_count = entry
+            .skipped_self_count
+            .saturating_add(sample.skipped_self_count);
+        entry.structured_parent_skip_count = entry
+            .structured_parent_skip_count
+            .saturating_add(sample.structured_parent_skip_count);
+    }
+    *target = merged.into_values().collect();
+    target.sort_by(|left, right| {
+        right
+            .dependent_enqueue_count
+            .cmp(&left.dependent_enqueue_count)
+            .then_with(|| right.dependent_visit_count.cmp(&left.dependent_visit_count))
+            .then_with(|| {
+                left.dependent_demand_classification
+                    .cmp(&right.dependent_demand_classification)
+            })
+    });
 }
 
 impl LiveRuntimeStepProfile {
@@ -591,6 +665,10 @@ impl LiveRuntimeStepProfile {
             other.source_action_root_dirty_frontier_samples,
             LIVE_RUNTIME_DIRTY_FRONTIER_SAMPLE_LIMIT,
         );
+        merge_dirty_frontier_demand_classification_counts(
+            &mut self.source_action_root_dirty_frontier_demand_classification_counts,
+            other.source_action_root_dirty_frontier_demand_classification_counts,
+        );
         extend_bounded_profile_samples(
             &mut self.source_action_root_dirty_root_work_samples,
             other.source_action_root_dirty_root_work_samples,
@@ -654,6 +732,7 @@ impl LiveRuntimeStepProfile {
             "source_action_root_dependent_visit_count": self.source_action_root_dependent_visit_count,
             "source_action_root_dependent_enqueue_count": self.source_action_root_dependent_enqueue_count,
             "source_action_root_dirty_frontier_samples": self.source_action_root_dirty_frontier_samples,
+            "source_action_root_dirty_frontier_demand_classification_counts": self.source_action_root_dirty_frontier_demand_classification_counts,
             "source_action_root_dirty_root_work_samples": self.source_action_root_dirty_root_work_samples,
             "source_action_route_stats_ms": self.source_action_route_stats_ms,
             "source_action_unattributed_ms": self.source_action_unattributed_ms(),
@@ -12531,6 +12610,8 @@ impl GenericScheduledRuntime {
         > = source_action_profile.as_ref().map(|_| BTreeMap::new());
         let mut dirty_root_work: Option<BTreeMap<String, RuntimeDirtyRootWorkAccumulator>> =
             source_action_profile.as_ref().map(|_| BTreeMap::new());
+        let root_demand_classification_enabled = runtime_profile_root_demand_enabled();
+        let mut root_demand_classification_cache = BTreeMap::new();
         let cache_invalidation_started = source_action_profile.as_ref().map(|_| Instant::now());
         self.invalidate_derived_value_caches_for_reads(changed_reads.iter().cloned());
         if let Some(profile) = source_action_profile.as_deref_mut()
@@ -12551,11 +12632,19 @@ impl GenericScheduledRuntime {
                 .map(|(_, dependent)| dependent.clone())
                 .collect::<BTreeSet<_>>();
             for (read, dependent) in dependent_edges {
-                let dependent_kind = self
-                    .generic_derived
-                    .root_field_plan(&dependent)
+                let dependent_field = self.generic_derived.root_field_plan(&dependent);
+                let dependent_kind = dependent_field
                     .map(|field| derived_value_kind_label(&field.kind))
                     .unwrap_or("unknown");
+                let dependent_demand_classification = if root_demand_classification_enabled {
+                    self.cached_root_demand_defer_classification(
+                        &dependent,
+                        dependent_field,
+                        &mut root_demand_classification_cache,
+                    )
+                } else {
+                    "profile_disabled".to_owned()
+                };
                 let structured_parent_skip = self
                     .structured_pending_parent_for_path(&dependent, &dirty, &pending_dependents)
                     .is_some();
@@ -12566,6 +12655,7 @@ impl GenericScheduledRuntime {
                     &read,
                     &dependent,
                     dependent_kind,
+                    &dependent_demand_classification,
                     enqueued,
                     !enqueued && !structured_parent_skip,
                     false,
@@ -12668,6 +12758,15 @@ impl GenericScheduledRuntime {
                 let entry = work.entry(path.clone()).or_insert_with(|| {
                     RuntimeDirtyRootWorkAccumulator::new(
                         derived_value_kind_label(&field.kind).to_owned(),
+                        if root_demand_classification_enabled {
+                            self.cached_root_demand_defer_classification(
+                                &path,
+                                Some(&field),
+                                &mut root_demand_classification_cache,
+                            )
+                        } else {
+                            "profile_disabled".to_owned()
+                        },
                     )
                 });
                 entry.pop_count = entry.pop_count.saturating_add(1);
@@ -12813,12 +12912,21 @@ impl GenericScheduledRuntime {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        let dependent_kind = self
-                            .generic_derived
-                            .root_field_plan(&dependent)
+                        let dependent_field = self.generic_derived.root_field_plan(&dependent);
+                        let dependent_kind = dependent_field
                             .map(|field| derived_value_kind_label(&field.kind))
                             .unwrap_or("unknown")
                             .to_owned();
+                        let dependent_demand_classification = if root_demand_classification_enabled
+                        {
+                            self.cached_root_demand_defer_classification(
+                                &dependent,
+                                dependent_field,
+                                &mut root_demand_classification_cache,
+                            )
+                        } else {
+                            "profile_disabled".to_owned()
+                        };
                         let mut enqueued = false;
                         let mut already_dirty = false;
                         let mut skipped_self = false;
@@ -12833,6 +12941,7 @@ impl GenericScheduledRuntime {
                                         read,
                                         &dependent,
                                         &dependent_kind,
+                                        &dependent_demand_classification,
                                         enqueued,
                                         already_dirty,
                                         skipped_self,
@@ -12866,6 +12975,7 @@ impl GenericScheduledRuntime {
                                         read,
                                         &dependent,
                                         &dependent_kind,
+                                        &dependent_demand_classification,
                                         enqueued,
                                         already_dirty,
                                         skipped_self,
@@ -12892,6 +13002,7 @@ impl GenericScheduledRuntime {
                                         read,
                                         &dependent,
                                         &dependent_kind,
+                                        &dependent_demand_classification,
                                         enqueued,
                                         already_dirty,
                                         skipped_self,
@@ -12931,6 +13042,7 @@ impl GenericScheduledRuntime {
                                     read,
                                     &dependent,
                                     &dependent_kind,
+                                    &dependent_demand_classification,
                                     enqueued,
                                     already_dirty,
                                     skipped_self,
@@ -13073,12 +13185,20 @@ impl GenericScheduledRuntime {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let dependent_kind = self
-                    .generic_derived
-                    .root_field_plan(&dependent)
+                let dependent_field = self.generic_derived.root_field_plan(&dependent);
+                let dependent_kind = dependent_field
                     .map(|field| derived_value_kind_label(&field.kind))
                     .unwrap_or("unknown")
                     .to_owned();
+                let dependent_demand_classification = if root_demand_classification_enabled {
+                    self.cached_root_demand_defer_classification(
+                        &dependent,
+                        dependent_field,
+                        &mut root_demand_classification_cache,
+                    )
+                } else {
+                    "profile_disabled".to_owned()
+                };
                 let mut enqueued = false;
                 let mut already_dirty = false;
                 let mut skipped_self = false;
@@ -13093,6 +13213,7 @@ impl GenericScheduledRuntime {
                                 read,
                                 &dependent,
                                 &dependent_kind,
+                                &dependent_demand_classification,
                                 enqueued,
                                 already_dirty,
                                 skipped_self,
@@ -13122,6 +13243,7 @@ impl GenericScheduledRuntime {
                                 read,
                                 &dependent,
                                 &dependent_kind,
+                                &dependent_demand_classification,
                                 enqueued,
                                 already_dirty,
                                 skipped_self,
@@ -13150,6 +13272,7 @@ impl GenericScheduledRuntime {
                                 read,
                                 &dependent,
                                 &dependent_kind,
+                                &dependent_demand_classification,
                                 enqueued,
                                 already_dirty,
                                 skipped_self,
@@ -13189,6 +13312,7 @@ impl GenericScheduledRuntime {
                             read,
                             &dependent,
                             &dependent_kind,
+                            &dependent_demand_classification,
                             enqueued,
                             already_dirty,
                             skipped_self,
@@ -13219,6 +13343,8 @@ impl GenericScheduledRuntime {
                     saturating_f64_sub(total_ms, dirty_setup_ms + materialization_ms);
             }
             if let Some(frontier) = dirty_frontier_causes.take() {
+                profile.source_action_root_dirty_frontier_demand_classification_counts =
+                    dirty_frontier_demand_classification_counts(&frontier);
                 profile.source_action_root_dirty_frontier_samples =
                     dirty_frontier_cause_samples(frontier);
             }
@@ -13441,6 +13567,89 @@ impl GenericScheduledRuntime {
                 .generic_derived
                 .root_field_is_observed(&projection.target)
         })
+    }
+
+    fn root_demand_defer_classification(
+        &self,
+        path: &str,
+        field: Option<&GenericDerivedRootField>,
+    ) -> &'static str {
+        if !self.generic_derived.has_observed_root_paths() {
+            return "blocked_no_observed_root_index";
+        }
+        let Some(field) = field.or_else(|| self.generic_derived.root_field_plan(path)) else {
+            return "blocked_unknown_root";
+        };
+        if matches!(field.kind, DerivedValueKind::ListView) {
+            return "blocked_list_view";
+        }
+        if !matches!(field.kind, DerivedValueKind::Pure) || field.has_sources {
+            return "blocked_source_or_impure";
+        }
+        if self.generic_derived.root_field_is_observed(&field.path) {
+            return "blocked_observed_root";
+        }
+        if self.root_field_drives_observed_projection(&field.path) {
+            return "blocked_observed_projection_driver";
+        }
+        if self.root_field_has_observed_downstream_closure(&field.path) {
+            return "blocked_observed_downstream";
+        }
+        "candidate_unobserved_source_free_pure"
+    }
+
+    fn cached_root_demand_defer_classification(
+        &self,
+        path: &str,
+        field: Option<&GenericDerivedRootField>,
+        cache: &mut BTreeMap<String, String>,
+    ) -> String {
+        let cache_key = field
+            .map(|field| field.path.clone())
+            .unwrap_or_else(|| path.to_owned());
+        if let Some(classification) = cache.get(&cache_key) {
+            return classification.clone();
+        }
+        let classification = self
+            .root_demand_defer_classification(path, field)
+            .to_owned();
+        cache.insert(cache_key, classification.clone());
+        classification
+    }
+
+    fn root_field_has_observed_downstream_closure(&self, path: &str) -> bool {
+        let mut read_queue = VecDeque::from(root_read_keys_for_path(path));
+        let mut visited_reads = BTreeSet::new();
+        let mut visited_roots = BTreeSet::new();
+        while let Some(read) = read_queue.pop_front() {
+            if !visited_reads.insert(read.clone()) {
+                continue;
+            }
+            let Some(dependents) = self
+                .generic_derived_state
+                .root_dependents_by_read
+                .get(&read)
+            else {
+                continue;
+            };
+            for dependent in dependents {
+                if !visited_roots.insert(dependent.clone()) {
+                    continue;
+                }
+                let Some(dependent_field) = self.generic_derived.root_field_plan(dependent) else {
+                    continue;
+                };
+                if self
+                    .generic_derived
+                    .root_field_is_observed(&dependent_field.path)
+                    || self.root_field_drives_observed_projection(&dependent_field.path)
+                {
+                    return true;
+                }
+                read_queue.extend(root_read_keys_for_path(&dependent_field.path));
+            }
+        }
+        false
     }
 
     fn root_text_source_action_mutation<'a>(
@@ -14849,24 +15058,6 @@ impl GenericScheduledRuntime {
         dirty: &BTreeSet<String>,
         pending: &BTreeSet<String>,
     ) -> Option<String> {
-        let parts = path.split('.').collect::<Vec<_>>();
-        if parts.len() <= 1 {
-            return None;
-        }
-        let pending_parent = (1..parts.len()).rev().find_map(|end| {
-            let parent = parts[..end].join(".");
-            ((dirty.contains(&parent) || pending.contains(&parent))
-                && self
-                    .generic_derived
-                    .root_fields
-                    .iter()
-                    .any(|field| field.path == parent)
-                && matches!(
-                    self.storage.root.owned_value(&parent),
-                    Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
-                ))
-            .then_some(parent)
-        })?;
         let Some(field) = self
             .generic_derived
             .root_fields
@@ -14883,7 +15074,27 @@ impl GenericScheduledRuntime {
         {
             return None;
         }
-        Some(pending_parent)
+        let parts = path.split('.').collect::<Vec<_>>();
+        if parts.len() <= 1 {
+            return None;
+        }
+        for end in (1..parts.len()).rev() {
+            let parent = parts[..end].join(".");
+            if (dirty.contains(&parent) || pending.contains(&parent))
+                && self
+                    .generic_derived
+                    .root_fields
+                    .iter()
+                    .any(|field| field.path == parent)
+                && matches!(
+                    self.storage.root.owned_value(&parent),
+                    Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
+                )
+            {
+                return Some(parent);
+            }
+        }
+        None
     }
 
     fn remove_structured_child_ready_roots(
@@ -27201,6 +27412,7 @@ struct RuntimeDirtyFrontierCauseKey {
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeDirtyFrontierCauseAccumulator {
+    dependent_demand_classification: String,
     dependency_lookup_count: usize,
     dependent_visit_count: usize,
     dependent_enqueue_count: usize,
@@ -27212,6 +27424,7 @@ struct RuntimeDirtyFrontierCauseAccumulator {
 #[derive(Clone, Debug)]
 struct RuntimeDirtyRootWorkAccumulator {
     root_kind: String,
+    root_demand_classification: String,
     pop_count: usize,
     skip_count: usize,
     scalar_materialization_count: usize,
@@ -27223,9 +27436,10 @@ struct RuntimeDirtyRootWorkAccumulator {
 }
 
 impl RuntimeDirtyRootWorkAccumulator {
-    fn new(root_kind: String) -> Self {
+    fn new(root_kind: String, root_demand_classification: String) -> Self {
         Self {
             root_kind,
+            root_demand_classification,
             pop_count: 0,
             skip_count: 0,
             scalar_materialization_count: 0,
@@ -27308,6 +27522,7 @@ fn record_dirty_frontier_cause(
     read: &GenericReadKey,
     dependent_root: &str,
     dependent_kind: &str,
+    dependent_demand_classification: &str,
     enqueued: bool,
     already_dirty: bool,
     skipped_self: bool,
@@ -27322,6 +27537,9 @@ fn record_dirty_frontier_cause(
             dependent_kind: dependent_kind.to_owned(),
         })
         .or_default();
+    if entry.dependent_demand_classification.is_empty() {
+        entry.dependent_demand_classification = dependent_demand_classification.to_owned();
+    }
     entry.dependency_lookup_count = entry.dependency_lookup_count.saturating_add(1);
     entry.dependent_visit_count = entry.dependent_visit_count.saturating_add(1);
     if enqueued {
@@ -27349,6 +27567,7 @@ fn dirty_frontier_cause_samples(
             read_key_kind: key.read_key_kind,
             dependent_root: key.dependent_root,
             dependent_kind: key.dependent_kind,
+            dependent_demand_classification: value.dependent_demand_classification,
             dependency_lookup_count: value.dependency_lookup_count,
             dependent_visit_count: value.dependent_visit_count,
             dependent_enqueue_count: value.dependent_enqueue_count,
@@ -27370,6 +27589,50 @@ fn dirty_frontier_cause_samples(
     samples
 }
 
+fn dirty_frontier_demand_classification_counts(
+    accumulators: &BTreeMap<RuntimeDirtyFrontierCauseKey, RuntimeDirtyFrontierCauseAccumulator>,
+) -> Vec<LiveRuntimeDirtyFrontierDemandClassificationSample> {
+    let mut counts = BTreeMap::<String, LiveRuntimeDirtyFrontierDemandClassificationSample>::new();
+    for value in accumulators.values() {
+        let entry = counts
+            .entry(value.dependent_demand_classification.clone())
+            .or_insert_with(|| LiveRuntimeDirtyFrontierDemandClassificationSample {
+                dependent_demand_classification: value.dependent_demand_classification.clone(),
+                ..Default::default()
+            });
+        entry.dependency_lookup_count = entry
+            .dependency_lookup_count
+            .saturating_add(value.dependency_lookup_count);
+        entry.dependent_visit_count = entry
+            .dependent_visit_count
+            .saturating_add(value.dependent_visit_count);
+        entry.dependent_enqueue_count = entry
+            .dependent_enqueue_count
+            .saturating_add(value.dependent_enqueue_count);
+        entry.already_dirty_count = entry
+            .already_dirty_count
+            .saturating_add(value.already_dirty_count);
+        entry.skipped_self_count = entry
+            .skipped_self_count
+            .saturating_add(value.skipped_self_count);
+        entry.structured_parent_skip_count = entry
+            .structured_parent_skip_count
+            .saturating_add(value.structured_parent_skip_count);
+    }
+    let mut samples = counts.into_values().collect::<Vec<_>>();
+    samples.sort_by(|left, right| {
+        right
+            .dependent_enqueue_count
+            .cmp(&left.dependent_enqueue_count)
+            .then_with(|| right.dependent_visit_count.cmp(&left.dependent_visit_count))
+            .then_with(|| {
+                left.dependent_demand_classification
+                    .cmp(&right.dependent_demand_classification)
+            })
+    });
+    samples
+}
+
 fn dirty_root_work_samples(
     accumulators: BTreeMap<String, RuntimeDirtyRootWorkAccumulator>,
 ) -> Vec<LiveRuntimeDirtyRootWorkSample> {
@@ -27378,6 +27641,7 @@ fn dirty_root_work_samples(
         .map(|(root_path, value)| LiveRuntimeDirtyRootWorkSample {
             root_path,
             root_kind: value.root_kind,
+            root_demand_classification: value.root_demand_classification,
             pop_count: value.pop_count,
             skip_count: value.skip_count,
             scalar_materialization_count: value.scalar_materialization_count,

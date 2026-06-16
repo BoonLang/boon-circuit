@@ -2048,6 +2048,7 @@ struct RuntimeDirtyFrontierCauseKey {
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeDirtyFrontierCauseCounters {
+    dependent_demand_classification: String,
     dependency_lookup_count: usize,
     dependent_visit_count: usize,
     dependent_enqueue_count: usize,
@@ -2059,6 +2060,7 @@ struct RuntimeDirtyFrontierCauseCounters {
 #[derive(Clone, Debug, Default)]
 struct RuntimeDirtyRootWorkCounters {
     root_kind: String,
+    root_demand_classification: String,
     pop_count: usize,
     skip_count: usize,
     scalar_materialization_count: usize,
@@ -2072,6 +2074,7 @@ struct RuntimeDirtyRootWorkCounters {
 #[derive(Clone, Debug, Default)]
 struct RuntimeDirtyFrontierCauseAggregate {
     interaction_sample_count: usize,
+    demand_classifications: BTreeMap<String, RuntimeDirtyFrontierCauseCounters>,
     frontier: BTreeMap<RuntimeDirtyFrontierCauseKey, RuntimeDirtyFrontierCauseCounters>,
     root_work: BTreeMap<String, RuntimeDirtyRootWorkCounters>,
 }
@@ -2093,6 +2096,14 @@ impl RuntimeDirtyFrontierCauseAggregate {
                     dependent_kind: frontier_sample.dependent_kind.clone(),
                 })
                 .or_default();
+            if counters.dependent_demand_classification.is_empty() {
+                counters.dependent_demand_classification =
+                    if frontier_sample.dependent_demand_classification.is_empty() {
+                        "unknown_legacy".to_owned()
+                    } else {
+                        frontier_sample.dependent_demand_classification.clone()
+                    };
+            }
             counters.dependency_lookup_count = counters
                 .dependency_lookup_count
                 .saturating_add(frontier_sample.dependency_lookup_count);
@@ -2112,6 +2123,43 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 .structured_parent_skip_count
                 .saturating_add(frontier_sample.structured_parent_skip_count);
         }
+        for classification_sample in &sample
+            .runtime_step_profile
+            .source_action_root_dirty_frontier_demand_classification_counts
+        {
+            let classification = if classification_sample
+                .dependent_demand_classification
+                .is_empty()
+            {
+                "unknown_legacy".to_owned()
+            } else {
+                classification_sample
+                    .dependent_demand_classification
+                    .clone()
+            };
+            let counters = self
+                .demand_classifications
+                .entry(classification)
+                .or_default();
+            counters.dependency_lookup_count = counters
+                .dependency_lookup_count
+                .saturating_add(classification_sample.dependency_lookup_count);
+            counters.dependent_visit_count = counters
+                .dependent_visit_count
+                .saturating_add(classification_sample.dependent_visit_count);
+            counters.dependent_enqueue_count = counters
+                .dependent_enqueue_count
+                .saturating_add(classification_sample.dependent_enqueue_count);
+            counters.already_dirty_count = counters
+                .already_dirty_count
+                .saturating_add(classification_sample.already_dirty_count);
+            counters.skipped_self_count = counters
+                .skipped_self_count
+                .saturating_add(classification_sample.skipped_self_count);
+            counters.structured_parent_skip_count = counters
+                .structured_parent_skip_count
+                .saturating_add(classification_sample.structured_parent_skip_count);
+        }
         for work_sample in &sample
             .runtime_step_profile
             .source_action_root_dirty_root_work_samples
@@ -2121,6 +2169,12 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 .entry(work_sample.root_path.clone())
                 .or_insert_with(|| RuntimeDirtyRootWorkCounters {
                     root_kind: work_sample.root_kind.clone(),
+                    root_demand_classification: if work_sample.root_demand_classification.is_empty()
+                    {
+                        "unknown_legacy".to_owned()
+                    } else {
+                        work_sample.root_demand_classification.clone()
+                    },
                     ..Default::default()
                 });
             counters.pop_count = counters.pop_count.saturating_add(work_sample.pop_count);
@@ -2155,6 +2209,7 @@ impl RuntimeDirtyFrontierCauseAggregate {
                     "read_key_kind": &key.read_key_kind,
                     "dependent_root": &key.dependent_root,
                     "dependent_kind": &key.dependent_kind,
+                    "dependent_demand_classification": &counters.dependent_demand_classification,
                     "dependency_lookup_count": counters.dependency_lookup_count,
                     "dependent_visit_count": counters.dependent_visit_count,
                     "dependent_enqueue_count": counters.dependent_enqueue_count,
@@ -2181,6 +2236,34 @@ impl RuntimeDirtyFrontierCauseAggregate {
         });
         frontier.truncate(32);
 
+        let mut demand_classification_counts = self
+            .demand_classifications
+            .iter()
+            .map(|(classification, counters)| {
+                json!({
+                    "dependent_demand_classification": classification,
+                    "dependency_lookup_count": counters.dependency_lookup_count,
+                    "dependent_visit_count": counters.dependent_visit_count,
+                    "dependent_enqueue_count": counters.dependent_enqueue_count,
+                    "already_dirty_count": counters.already_dirty_count,
+                    "skipped_self_count": counters.skipped_self_count,
+                    "structured_parent_skip_count": counters.structured_parent_skip_count
+                })
+            })
+            .collect::<Vec<_>>();
+        demand_classification_counts.sort_by(|left, right| {
+            json_u64_for_sort(right, "dependent_enqueue_count")
+                .cmp(&json_u64_for_sort(left, "dependent_enqueue_count"))
+                .then_with(|| {
+                    json_u64_for_sort(right, "dependent_visit_count")
+                        .cmp(&json_u64_for_sort(left, "dependent_visit_count"))
+                })
+                .then_with(|| {
+                    json_str_for_sort(left, "dependent_demand_classification")
+                        .cmp(json_str_for_sort(right, "dependent_demand_classification"))
+                })
+        });
+
         let mut root_work = self
             .root_work
             .iter()
@@ -2188,6 +2271,7 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 json!({
                     "root_path": root_path,
                     "root_kind": &counters.root_kind,
+                    "root_demand_classification": &counters.root_demand_classification,
                     "pop_count": counters.pop_count,
                     "skip_count": counters.skip_count,
                     "scalar_materialization_count": counters.scalar_materialization_count,
@@ -2219,6 +2303,8 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 "dirty_frontier_fanout_with_ranked_root_work"
             },
             "interaction_sample_count": self.interaction_sample_count,
+            "demand_classification_count_scope": "all_dirty_frontier_edges_exact",
+            "demand_classification_counts": demand_classification_counts,
             "top_frontier_edges": frontier,
             "top_root_work": root_work
         })

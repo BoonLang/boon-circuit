@@ -34039,6 +34039,194 @@ impl ScalarBytecodeOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarGeneratedNumberOp {
+    Add,
+    Subtract,
+    GreaterThan,
+    GreaterEqual,
+    LessThan,
+    LessEqual,
+    EqualText,
+    NotEqualText,
+}
+
+impl ScalarGeneratedNumberOp {
+    fn compile(op: &str) -> Option<Self> {
+        Some(match op {
+            "+" => Self::Add,
+            "-" => Self::Subtract,
+            ">" => Self::GreaterThan,
+            ">=" => Self::GreaterEqual,
+            "<" => Self::LessThan,
+            "<=" => Self::LessEqual,
+            "==" => Self::EqualText,
+            "!=" => Self::NotEqualText,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::GreaterThan => "greater_than",
+            Self::GreaterEqual => "greater_equal",
+            Self::LessThan => "less_than",
+            Self::LessEqual => "less_equal",
+            Self::EqualText => "equal_text",
+            Self::NotEqualText => "not_equal_text",
+        }
+    }
+
+    fn eval(
+        self,
+        left: &str,
+        right: &str,
+        read_textlike: impl Fn(&str) -> Option<String> + Copy,
+    ) -> Option<String> {
+        if matches!(self, Self::EqualText | Self::NotEqualText) {
+            let left = scalar_text_operand_value(left, read_textlike)?;
+            let right = scalar_text_operand_value(right, read_textlike)?;
+            return Some(match self {
+                Self::EqualText => bool_label(left == right),
+                Self::NotEqualText => bool_label(left != right),
+                _ => unreachable!(),
+            });
+        }
+        let left = scalar_number_operand_value(left, read_textlike)?;
+        let right = scalar_number_operand_value(right, read_textlike)?;
+        Some(match self {
+            Self::Add => (left + right).to_string(),
+            Self::Subtract => (left - right).to_string(),
+            Self::GreaterThan => bool_label(left > right),
+            Self::GreaterEqual => bool_label(left >= right),
+            Self::LessThan => bool_label(left < right),
+            Self::LessEqual => bool_label(left <= right),
+            Self::EqualText | Self::NotEqualText => unreachable!(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScalarGeneratedKernelProgram {
+    mode: ScalarBytecodeMode,
+    body: ScalarGeneratedKernelBody,
+}
+
+#[derive(Clone, Debug)]
+enum ScalarGeneratedKernelBody {
+    Text(ScalarGeneratedTextKernel),
+}
+
+#[derive(Clone, Debug)]
+enum ScalarGeneratedTextKernel {
+    ConstBorrow {
+        value: String,
+    },
+    NumberInfix {
+        left: String,
+        op: ScalarGeneratedNumberOp,
+        right: String,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScalarGeneratedKernelStats {
+    warm_path_allocation_count: usize,
+    static_borrow_count: usize,
+    dynamic_string_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ScalarGeneratedKernelEvalOutput<'a> {
+    value: Option<Cow<'a, str>>,
+    stats: ScalarGeneratedKernelStats,
+}
+
+impl ScalarGeneratedKernelProgram {
+    fn compile_from_bytecode(program: &ScalarBytecodeProgram) -> Result<Self, String> {
+        if program.mode != ScalarBytecodeMode::Text {
+            return Err("bool_generated_kernel_not_compiled_yet".to_owned());
+        }
+        let Some(op) = program.ops.first() else {
+            return Err("empty_bytecode_program".to_owned());
+        };
+        let body = match op {
+            ScalarBytecodeOp::ConstText(value) => {
+                ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::ConstBorrow {
+                    value: value.clone(),
+                })
+            }
+            ScalarBytecodeOp::NumberInfix { left, op, right } => {
+                let compiled_op = ScalarGeneratedNumberOp::compile(op)
+                    .ok_or_else(|| format!("unsupported_number_op_{op}"))?;
+                ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::NumberInfix {
+                    left: left.clone(),
+                    op: compiled_op,
+                    right: right.clone(),
+                })
+            }
+            _ => {
+                return Err(format!("{}_not_supported_by_generated_kernel", op.label()));
+            }
+        };
+        Ok(Self {
+            mode: program.mode,
+            body,
+        })
+    }
+
+    fn kernel_label(&self) -> &'static str {
+        match &self.body {
+            ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::ConstBorrow { .. }) => {
+                "generated_const_text_borrow"
+            }
+            ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::NumberInfix { .. }) => {
+                "generated_number_infix_enum"
+            }
+        }
+    }
+
+    fn number_op_label(&self) -> Option<&'static str> {
+        match &self.body {
+            ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::NumberInfix {
+                op, ..
+            }) => Some(op.label()),
+            _ => None,
+        }
+    }
+
+    fn eval_text<'a>(
+        &'a self,
+        context: &ScalarBytecodeSampleContext,
+    ) -> RuntimeResult<ScalarGeneratedKernelEvalOutput<'a>> {
+        if self.mode != ScalarBytecodeMode::Text {
+            return Err("attempted to evaluate non-text generated kernel as text".into());
+        }
+        let mut stats = ScalarGeneratedKernelStats::default();
+        let value = match &self.body {
+            ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::ConstBorrow { value }) => {
+                stats.static_borrow_count += 1;
+                Some(Cow::Borrowed(value.as_str()))
+            }
+            ScalarGeneratedKernelBody::Text(ScalarGeneratedTextKernel::NumberInfix {
+                left,
+                op,
+                right,
+            }) => {
+                let value = op.eval(left, right, |path| context.read_textlike(path));
+                if value.is_some() {
+                    stats.warm_path_allocation_count += 1;
+                    stats.dynamic_string_count += 1;
+                }
+                value.map(Cow::Owned)
+            }
+        };
+        Ok(ScalarGeneratedKernelEvalOutput { value, stats })
+    }
+}
+
 impl ScalarBytecodeSampleContext {
     fn for_candidate(candidate: &ScalarBytecodeCandidate) -> Self {
         let mut context = Self {
@@ -34311,6 +34499,175 @@ fn scalar_expression_bytecode_report(
         "warm_path_allocation_count": warm_path_allocation_count,
         "hot_path_ready": hot_path_ready,
         "readiness": if hot_path_ready { "hot_path_ready" } else { "proof_only_with_reported_fallbacks" },
+        "samples": samples,
+    }))
+}
+
+fn scalar_generated_kernel_report(
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+    scenario: &Scenario,
+) -> RuntimeResult<JsonValue> {
+    let candidates = scalar_bytecode_candidates(ir, compiled);
+    let mut generated_kernel_count = 0usize;
+    let mut fallback_reasons = Vec::new();
+    let mut deopt_reasons = Vec::new();
+    let mut op_histogram: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut generated_kernel_histogram: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut generated_number_op_histogram: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut parity_sample_count = 0usize;
+    let mut bytecode_warm_path_allocation_count = 0usize;
+    let mut generated_warm_path_allocation_count = 0usize;
+    let mut generated_static_borrow_count = 0usize;
+    let mut generated_dynamic_string_count = 0usize;
+    let mut samples = Vec::new();
+
+    for candidate in &candidates {
+        let bytecode_program =
+            match ScalarBytecodeProgram::compile(candidate.mode, &candidate.expression) {
+                Ok(program) => program,
+                Err(reason) => {
+                    fallback_reasons.push(format!(
+                        "bytecode:{}:{}:{}:{}",
+                        candidate.mode.as_str(),
+                        candidate.source,
+                        candidate.target,
+                        reason
+                    ));
+                    continue;
+                }
+            };
+        let generated_program =
+            match ScalarGeneratedKernelProgram::compile_from_bytecode(&bytecode_program) {
+                Ok(program) => program,
+                Err(reason) => {
+                    fallback_reasons.push(format!(
+                        "generated:{}:{}:{}:{}",
+                        candidate.mode.as_str(),
+                        candidate.source,
+                        candidate.target,
+                        reason
+                    ));
+                    continue;
+                }
+            };
+
+        generated_kernel_count += 1;
+        for op in &bytecode_program.ops {
+            *op_histogram.entry(op.label()).or_default() += 1;
+        }
+        *generated_kernel_histogram
+            .entry(generated_program.kernel_label())
+            .or_default() += 1;
+        if let Some(number_op) = generated_program.number_op_label() {
+            *generated_number_op_histogram.entry(number_op).or_default() += 1;
+        }
+
+        let context = ScalarBytecodeSampleContext::for_candidate(candidate);
+        let pass = match candidate.mode {
+            ScalarBytecodeMode::Text => {
+                let payload_refs = context.payload_refs();
+                let oracle = compiled.scalar_equations.eval_text(
+                    &candidate.target,
+                    &candidate.source,
+                    context.key.as_deref(),
+                    context.text.as_deref(),
+                    context.address.as_deref(),
+                    &payload_refs,
+                    context.pointer_x.as_deref(),
+                    context.pointer_y.as_deref(),
+                    context.pointer_width.as_deref(),
+                    context.pointer_height.as_deref(),
+                    |path| context.read_textlike(path),
+                )?;
+                let bytecode = bytecode_program.eval_text(&candidate.source, &context)?;
+                let generated = generated_program.eval_text(&context)?;
+                bytecode_warm_path_allocation_count += bytecode.stats.warm_path_allocation_count;
+                generated_warm_path_allocation_count += generated.stats.warm_path_allocation_count;
+                generated_static_borrow_count += generated.stats.static_borrow_count;
+                generated_dynamic_string_count += generated.stats.dynamic_string_count;
+
+                let oracle = oracle.map(Cow::into_owned);
+                let generated_output_kind = generated.value.as_ref().map(|value| match value {
+                    Cow::Borrowed(_) => "borrowed",
+                    Cow::Owned(_) => "owned",
+                });
+                let generated_output = generated
+                    .value
+                    .as_ref()
+                    .map(|value| value.as_ref().to_owned());
+                let pass = oracle == bytecode.value && bytecode.value == generated_output;
+                if !pass {
+                    deopt_reasons.push(format!(
+                        "generated:text:{}:{} oracle={oracle:?} bytecode={:?} generated={generated_output:?}",
+                        candidate.source, candidate.target, bytecode.value
+                    ));
+                }
+                samples.push(json!({
+                    "route_id": candidate.route_id,
+                    "source_id": candidate.source_id.as_usize(),
+                    "source": candidate.source,
+                    "target": candidate.target,
+                    "target_kind": candidate.target_kind,
+                    "mode": candidate.mode.as_str(),
+                    "bytecode_ops": bytecode_program.op_labels(),
+                    "generated_kernel": generated_program.kernel_label(),
+                    "generated_number_op": generated_program.number_op_label(),
+                    "interpreter_output": oracle,
+                    "bytecode_output": bytecode.value,
+                    "generated_output": generated_output,
+                    "generated_output_kind": generated_output_kind,
+                    "pass": pass
+                }));
+                pass
+            }
+            ScalarBytecodeMode::Bool => {
+                fallback_reasons.push(format!(
+                    "generated:{}:{}:{}:bool_generated_kernel_evaluation_not_compiled_yet",
+                    candidate.mode.as_str(),
+                    candidate.source,
+                    candidate.target
+                ));
+                false
+            }
+        };
+        parity_sample_count += 1;
+        if !pass {
+            continue;
+        }
+    }
+
+    let fallback_count = fallback_reasons.len();
+    let deopt_count = deopt_reasons.len();
+    let parity_passed = generated_kernel_count > 0 && deopt_count == 0;
+    let hot_path_ready = parity_passed && fallback_count == 0;
+    Ok(json!({
+        "version": 1,
+        "execution_surface": "scalar_source_route_expressions",
+        "kernel_kind": "generated_rust_enum_kernel",
+        "interpreter_oracle": "ScalarEquationPlan",
+        "bytecode_oracle": "ScalarBytecodeProgram",
+        "scenario_name": scenario.name,
+        "scenario_step_count": scenario.step.len(),
+        "candidate_expression_count": candidates.len(),
+        "generated_kernel_count": generated_kernel_count,
+        "parity_sample_count": parity_sample_count,
+        "parity_passed": parity_passed,
+        "fallback_count": fallback_count,
+        "fallback_reasons": fallback_reasons,
+        "deopt_count": deopt_count,
+        "deopt_reasons": deopt_reasons,
+        "bytecode_op_histogram": op_histogram,
+        "generated_kernel_histogram": generated_kernel_histogram,
+        "generated_number_op_histogram": generated_number_op_histogram,
+        "bytecode_warm_path_allocation_count": bytecode_warm_path_allocation_count,
+        "generated_warm_path_allocation_count": generated_warm_path_allocation_count,
+        "generated_static_borrow_count": generated_static_borrow_count,
+        "generated_dynamic_string_count": generated_dynamic_string_count,
+        "compile_cost_included": false,
+        "compile_cost_exclusion_reason": "unit proof excludes Rust/Cranelift compile cost and validates reusable generated-kernel shape only",
+        "hot_path_ready": hot_path_ready,
+        "promotion_decision": if hot_path_ready { "not_promoted_without_release_metric" } else { "not_promoted_with_reported_fallbacks" },
         "samples": samples,
     }))
 }
@@ -44323,6 +44680,48 @@ FUNCTION icon_code(item) {
         assert_eq!(bytecode["hot_path_ready"], json!(true));
         assert_eq!(bytecode["op_histogram"]["number_infix"], json!(2));
         assert_eq!(bytecode["op_histogram"]["const_text"], json!(1));
+    }
+
+    #[test]
+    fn generated_kernel_report_proves_counter_scalar_subset_against_bytecode_and_interpreter() {
+        let parsed = parse_source(
+            "examples/counter.bn",
+            include_str!("../../../examples/counter.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
+        let report = scalar_generated_kernel_report(&ir, &compiled, &scenario).unwrap();
+
+        assert_eq!(report["kernel_kind"], json!("generated_rust_enum_kernel"));
+        assert_eq!(report["candidate_expression_count"], json!(3));
+        assert_eq!(report["generated_kernel_count"], json!(3));
+        assert_eq!(report["fallback_count"], json!(0));
+        assert_eq!(report["deopt_count"], json!(0));
+        assert_eq!(report["parity_passed"], json!(true));
+        assert_eq!(report["hot_path_ready"], json!(true));
+        assert_eq!(
+            report["promotion_decision"],
+            json!("not_promoted_without_release_metric")
+        );
+        assert_eq!(report["bytecode_op_histogram"]["number_infix"], json!(2));
+        assert_eq!(report["bytecode_op_histogram"]["const_text"], json!(1));
+        assert_eq!(
+            report["generated_kernel_histogram"]["generated_number_infix_enum"],
+            json!(2)
+        );
+        assert_eq!(
+            report["generated_kernel_histogram"]["generated_const_text_borrow"],
+            json!(1)
+        );
+        assert_eq!(report["generated_number_op_histogram"]["add"], json!(1));
+        assert_eq!(
+            report["generated_number_op_histogram"]["subtract"],
+            json!(1)
+        );
+        assert_eq!(report["generated_static_borrow_count"], json!(1));
+        assert_eq!(report["generated_dynamic_string_count"], json!(2));
     }
 
     #[test]

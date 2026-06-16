@@ -2825,7 +2825,7 @@ Notes:
   a generated WESL/WGSL-backed analytic path.
 
 ### EXP-0006 Generated Rust Or Cranelift Kernels
-Status: pending
+Status: done
 Type: experiment
 Depends on: TASK-0902
 Hypothesis:
@@ -2842,6 +2842,11 @@ Verification:
 - `cargo test -p boon_runtime --lib generated`
 Notes:
 - This is explicitly not an early optimization.
+- Completed first as a generated Rust-enum kernel proof over the Counter
+  scalar source-route subset. It is not promoted to a production hot path yet:
+  the proof excludes compile cost and does not include a release-mode p95
+  runtime win. Future Cranelift or generated-Rust work should reuse this
+  three-way parity shape before trying broader expression families.
 
 ### EXP-0007 Large-List Dataflow Kernel
 Status: pending
@@ -5269,6 +5274,34 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   replacement. Unsupported expression families still need explicit bytecode ops
   or reported fallback before generated kernels or dataflow experiments depend
   on them.
+
+### 2026-06-16 EXP-0006 Generated Rust-Enum Kernel Proof
+
+- Date: 2026-06-16
+- Task: EXP-0006 Generated Rust Or Cranelift Kernels
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: `cargo fmt -p boon_runtime`; `cargo test -p boon_runtime
+  --lib generated -- --nocapture`
+- Result: EXP-0006 is complete for its first proof slice but is not promoted.
+  The runtime now has a generated Rust-enum kernel representation for the
+  covered scalar bytecode text subset: `const_text` becomes a borrowed constant
+  output, and `number_infix` compiles the operator string once into a typed enum
+  (`add` or `subtract` for Counter). The generated kernel output is compared
+  against both `ScalarBytecodeProgram` and `ScalarEquationPlan`.
+- Report detail: the generated-kernel proof over Counter reports
+  `candidate_expression_count = 3`, `generated_kernel_count = 3`,
+  `parity_sample_count = 3`, `fallback_count = 0`, `deopt_count = 0`,
+  `generated_static_borrow_count = 1`, `generated_dynamic_string_count = 2`,
+  `generated_kernel_histogram = { generated_const_text_borrow: 1,
+  generated_number_infix_enum: 2 }`, and
+  `generated_number_op_histogram = { add: 1, subtract: 1 }`.
+- Boundary: this is intentionally proof-only. It does not add Cranelift, does
+  not compile Rust code at runtime, and does not claim a production speed win.
+  Promotion still needs a release-mode measurement that excludes compile cost
+  and shows a stable runtime win.
 
 ## File Maintenance Checklist
 

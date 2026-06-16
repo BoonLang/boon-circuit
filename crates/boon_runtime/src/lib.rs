@@ -527,6 +527,15 @@ fn runtime_profile_root_demand_enabled() -> bool {
     })
 }
 
+fn runtime_profile_dirty_frontier_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOON_PROFILE_DIRTY_FRONTIER")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn extend_bounded_profile_samples<T>(target: &mut Vec<T>, source: Vec<T>, limit: usize) {
     let remaining = limit.saturating_sub(target.len());
     target.extend(source.into_iter().take(remaining));
@@ -12605,12 +12614,16 @@ impl GenericScheduledRuntime {
         let root_materialization_ms_before = self.root_materialization_stats.total_ms;
         let dirty_setup_started = source_action_profile.as_ref().map(|_| Instant::now());
         let mut current_dirty_reads = changed_reads.clone();
+        let root_demand_classification_enabled = runtime_profile_root_demand_enabled();
+        let detailed_dirty_frontier_profile_enabled =
+            root_demand_classification_enabled || runtime_profile_dirty_frontier_enabled();
         let mut dirty_frontier_causes: Option<
             BTreeMap<RuntimeDirtyFrontierCauseKey, RuntimeDirtyFrontierCauseAccumulator>,
-        > = source_action_profile.as_ref().map(|_| BTreeMap::new());
+        > = (source_action_profile.is_some() && detailed_dirty_frontier_profile_enabled)
+            .then(BTreeMap::new);
         let mut dirty_root_work: Option<BTreeMap<String, RuntimeDirtyRootWorkAccumulator>> =
-            source_action_profile.as_ref().map(|_| BTreeMap::new());
-        let root_demand_classification_enabled = runtime_profile_root_demand_enabled();
+            (source_action_profile.is_some() && detailed_dirty_frontier_profile_enabled)
+                .then(BTreeMap::new);
         let mut root_demand_classification_cache = BTreeMap::new();
         let cache_invalidation_started = source_action_profile.as_ref().map(|_| Instant::now());
         self.invalidate_derived_value_caches_for_reads(changed_reads.iter().cloned());

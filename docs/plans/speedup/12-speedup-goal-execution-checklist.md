@@ -2891,6 +2891,9 @@ Notes:
     and `cargo xtask verify-compiled-artifact <example>` for a JSON MVP
     artifact that records the static runtime sidecar data and file hash.
   - TASK-0901B must load `.boonc` into the runtime without reparsing source.
+    A readiness inspection now proves the current artifact can be validated
+    without source access, but it cannot instantiate `LoadedRuntime` yet
+    because the artifact lacks a lossless executable `runtime_plan`.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -4478,6 +4481,43 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Follow-up: implement TASK-0901B by deserializing/loading `.boonc` into the
   runtime without reparsing source, then TASK-0901C by running a scenario from
   that loaded artifact and proving parity with the interpreter output.
+
+- Date: 2026-06-16
+- Task: TASK-0901B `.boonc` runtime-load readiness stop condition
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`;
+  `crates/boon_cli/src/main.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: artifact-load design/risk audit from subagent
+  `019ed186-3c28-7341-a5c2-9b905edbcbdc`; `cargo fmt -p
+  boon_runtime -p boon_report_schema -p boon_cli -p xtask`; `cargo test -p
+  boon_runtime --lib compiled_artifact -- --nocapture`; `cargo test -p
+  boon_report_schema --lib compiled_artifact -- --nocapture`; `cargo check
+  -p boon_cli -p xtask`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo run -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo
+  xtask verify-report-schema`; `cargo test -p boon_report_schema --lib`;
+  `cargo test -p xtask`
+- Result: TASK-0901B is not complete, and the code now prevents a false
+  artifact-load claim. The new `inspect-artifact` CLI/xtask path validates a
+  `.boonc` file and writes a schema-checked diagnostic report, but the report
+  explicitly says `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`, and
+  `scenario_execution_available = false`. A temp-source deletion test proves
+  artifact inspection does not reparse source. The current artifact is blocked
+  on these missing source-free runtime-plan sections: `runtime_plan`,
+  lossless runtime symbols, executable equation plans, runtime storage
+  initialization plan, source schema table, and document lowering runtime
+  tables.
+- Follow-up: implement a versioned executable `runtime_plan` in
+  `boonc-json-v1` from runtime-owned tables, not full `TypedProgram`, because
+  `TypedProgram` still embeds parser AST expressions. Then add an artifact
+  constructor for `LoadedRuntime`/`GenericScheduledRuntime` and only then allow
+  a report to claim runtime instantiation from `.boonc`.
 
 ## File Maintenance Checklist
 

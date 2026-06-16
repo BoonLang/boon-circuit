@@ -136,6 +136,10 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_compiled_artifact_report(&report, path)?;
         return Ok(());
     }
+    if report.get("command").and_then(JsonValue::as_str) == Some("inspect-compiled-artifact") {
+        verify_inspected_compiled_artifact_report(&report, path)?;
+        return Ok(());
+    }
     let required = [
         "report_version",
         "generated_at_utc",
@@ -296,6 +300,198 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         }
     }
     verify_artifact_hashes(report, path)?;
+    Ok(())
+}
+
+fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "status",
+        "report_version",
+        "command",
+        "command_argv",
+        "measurement_mode",
+        "exit_status",
+        "generated_at_utc",
+        "git_commit",
+        "binary_hash",
+        "artifact_path",
+        "artifact_hash",
+        "program_hash",
+        "compiled_artifact",
+        "artifact_sections",
+        "artifact_sha256s",
+        "inspection_result",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} missing inspect-compiled-artifact report field `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!(
+            "{} inspect-compiled-artifact report did not pass",
+            path.display()
+        )
+        .into());
+    }
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("diagnostic") {
+        return Err(format!(
+            "{} inspect-compiled-artifact report measurement_mode must be diagnostic",
+            path.display()
+        )
+        .into());
+    }
+    let artifact = report
+        .get("compiled_artifact")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} compiled_artifact is not an object", path.display()))?;
+    for key in [
+        "path",
+        "sha256",
+        "format",
+        "artifact_version",
+        "program_hash",
+        "report_schema_hash",
+        "source_unit_count",
+    ] {
+        if artifact.get(key).is_none() {
+            return Err(format!("{} compiled_artifact missing `{key}`", path.display()).into());
+        }
+    }
+    if artifact.get("sha256") != report.get("artifact_hash") {
+        return Err(format!(
+            "{} compiled_artifact sha256 does not match artifact_hash",
+            path.display()
+        )
+        .into());
+    }
+    if artifact.get("path") != report.get("artifact_path") {
+        return Err(format!(
+            "{} compiled_artifact path does not match artifact_path",
+            path.display()
+        )
+        .into());
+    }
+    if artifact.get("program_hash") != report.get("program_hash") {
+        return Err(format!(
+            "{} compiled_artifact program_hash does not match report",
+            path.display()
+        )
+        .into());
+    }
+    let inspection = report
+        .get("inspection_result")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} inspection_result is not an object", path.display()))?;
+    for key in [
+        "artifact_valid",
+        "loaded_runtime_from_artifact",
+        "runtime_instantiated_from_artifact",
+        "runtime_plan_present",
+        "source_free_runtime_load_available",
+        "source_reparse_required_for_current_runtime",
+        "source_reparse_attempted",
+        "source_file_access",
+        "parser_ast_required_for_execution",
+        "typed_ir_required_for_mvp_loader",
+        "scenario_execution_available",
+        "blocked_task",
+        "scenario_execution_pending_task",
+        "missing_runtime_plan_sections",
+    ] {
+        if inspection.get(key).is_none() {
+            return Err(format!("{} inspection_result missing `{key}`", path.display()).into());
+        }
+    }
+    if inspection
+        .get("artifact_valid")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+        || inspection
+            .get("loaded_runtime_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || inspection
+            .get("runtime_instantiated_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || inspection
+            .get("source_free_runtime_load_available")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || inspection
+            .get("source_reparse_required_for_current_runtime")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
+            .get("source_reparse_attempted")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || inspection
+            .get("source_file_access")
+            .and_then(JsonValue::as_str)
+            != Some("not_attempted")
+        || inspection
+            .get("scenario_execution_available")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+    {
+        return Err(format!(
+            "{} inspection_result must not claim source-free runtime load or scenario execution",
+            path.display()
+        )
+        .into());
+    }
+    if inspection
+        .get("parser_ast_required_for_execution")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+    {
+        return Err(format!(
+            "{} inspection_result must not require parser AST",
+            path.display()
+        )
+        .into());
+    }
+    if inspection
+        .get("missing_runtime_plan_sections")
+        .and_then(JsonValue::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Err(format!(
+            "{} inspection_result must list missing runtime plan sections",
+            path.display()
+        )
+        .into());
+    }
+    verify_compiled_artifact_sections(report, path)?;
+    verify_artifact_hashes(report, path)?;
+    Ok(())
+}
+
+fn verify_compiled_artifact_sections(report: &JsonValue, path: &Path) -> RuntimeResult<()> {
+    let sections = report
+        .get("artifact_sections")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} artifact_sections is not an object", path.display()))?;
+    for key in [
+        "semantic_index",
+        "symbol_table",
+        "storage_layout",
+        "source_schemas",
+        "route_op_streams",
+        "dependency_graph",
+        "document_lowering_tables",
+        "bridge_schemas",
+        "compiled_schedule",
+    ] {
+        if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
+        }
+    }
     Ok(())
 }
 
@@ -4703,6 +4899,89 @@ mod tests {
         assert!(schema_accepts(report.clone(), "compiled-artifact-valid"));
         report["artifact_sections"]["route_op_streams"] = json!(false);
         assert!(!schema_accepts(report, "compiled-artifact-missing-section"));
+        let _ = fs::remove_file(artifact_path);
+    }
+
+    #[test]
+    fn inspected_compiled_artifact_report_rejects_fake_runtime_load_claims() {
+        let artifact_path = temp_report_path("inspected-compiled-artifact-file");
+        write_json(
+            &artifact_path,
+            &json!({
+                "artifact_kind": "boonc.compiled_program",
+                "artifact_version": 1,
+                "format": "boonc-json-v1"
+            }),
+        )
+        .unwrap();
+        let artifact_hash = sha256_file(&artifact_path).unwrap();
+        let mut report = json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "inspect-compiled-artifact",
+            "command_argv": ["boon_cli", "inspect-artifact"],
+            "measurement_mode": "diagnostic",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "artifact_path": artifact_path.display().to_string(),
+            "artifact_hash": artifact_hash,
+            "program_hash": "program",
+            "compiled_artifact": {
+                "path": artifact_path.display().to_string(),
+                "sha256": sha256_file(&artifact_path).unwrap(),
+                "format": "boonc-json-v1",
+                "artifact_version": 1,
+                "program_hash": "program",
+                "report_schema_hash": report_schema_hash(),
+                "source_unit_count": 1
+            },
+            "artifact_sections": {
+                "semantic_index": true,
+                "symbol_table": true,
+                "storage_layout": true,
+                "source_schemas": true,
+                "route_op_streams": true,
+                "dependency_graph": true,
+                "document_lowering_tables": true,
+                "bridge_schemas": true,
+                "compiled_schedule": true
+            },
+            "artifact_sha256s": [{
+                "path": artifact_path.display().to_string(),
+                "sha256": sha256_file(&artifact_path).unwrap()
+            }],
+            "inspection_result": {
+                "artifact_valid": true,
+                "loaded_runtime_from_artifact": false,
+                "runtime_instantiated_from_artifact": false,
+                "runtime_plan_present": false,
+                "source_free_runtime_load_available": false,
+                "source_reparse_required_for_current_runtime": true,
+                "source_reparse_attempted": false,
+                "source_file_access": "not_attempted",
+                "parser_ast_required_for_execution": false,
+                "typed_ir_required_for_mvp_loader": true,
+                "scenario_execution_available": false,
+                "blocked_task": "TASK-0901B",
+                "scenario_execution_pending_task": "TASK-0901C",
+                "missing_runtime_plan_sections": ["runtime_plan"]
+            }
+        });
+        assert!(schema_accepts(
+            report.clone(),
+            "inspected-compiled-artifact-valid"
+        ));
+        report["inspection_result"]["runtime_instantiated_from_artifact"] = json!(true);
+        assert!(!schema_accepts(
+            report,
+            "inspected-compiled-artifact-fake-runtime-load"
+        ));
         let _ = fs::remove_file(artifact_path);
     }
 }

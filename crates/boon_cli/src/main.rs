@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 
-use boon_runtime::{VerificationLayer, emit_compiled_artifact, run_scenario, write_json};
+use boon_runtime::{
+    VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report, run_scenario,
+    write_json,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +12,7 @@ usage:
   boon_cli run <source> [--scenario <path>] [--report <path>]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli compile <source> --out <path.boonc> [--report <path>]
+  boon_cli inspect-artifact <path.boonc> [--report <path>]
   boon_cli dump-ir <source>
   boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--target <software_bounded|fpga_todomvc>] [--report <path>]
 
@@ -36,6 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "run" => run_program(&args),
         "scenario" => run_program(&args),
         "compile" => compile_program(&args),
+        "inspect-artifact" => inspect_artifact(&args),
         "dump-ir" => dump_ir(&args),
         "explain-hardware" => explain_hardware(&args),
         command => Err(format!("unknown command `{command}`").into()),
@@ -99,6 +104,24 @@ fn compile_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let out = out.ok_or("missing --out <path.boonc>")?;
     let report_value = emit_compiled_artifact(Path::new(source), &out, report.as_deref())?;
+    println!("{}", serde_json::to_string_pretty(&report_value)?);
+    Ok(())
+}
+
+fn inspect_artifact(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let artifact = args.first().ok_or("missing artifact path")?;
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => return Err(format!("unknown inspect-artifact argument `{other}`").into()),
+        }
+    }
+    let report_value = inspect_compiled_artifact_report(Path::new(artifact), report.as_deref())?;
     println!("{}", serde_json::to_string_pretty(&report_value)?);
     Ok(())
 }

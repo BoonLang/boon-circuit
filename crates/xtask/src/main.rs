@@ -2,7 +2,8 @@
 
 use boon_runtime::{
     LiveRuntime, LiveSourceEvent, VerificationLayer, emit_compiled_artifact, example_paths,
-    parse_scenario, run_scenario, run_scenario_project, verify_report_schema, write_json,
+    inspect_compiled_artifact_report, parse_scenario, run_scenario, run_scenario_project,
+    verify_report_schema, write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +26,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "bench-example",
     "verify-report-schema",
     "verify-compiled-artifact",
+    "verify-compiled-artifact-inspection",
     "check-bridge",
     "verify-novywave-bridge-scenario",
     "verify-runtime-production-hardening",
@@ -116,6 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(),
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
+        "verify-compiled-artifact-inspection" => verify_compiled_artifact_inspection(&args),
         "check-bridge" => check_bridge(&args),
         "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
@@ -1442,6 +1445,46 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
         != Some(false)
     {
         return Err("compiled artifact must not require parser AST for execution".into());
+    }
+    Ok(())
+}
+
+fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = named_arg(args, 1)?;
+    let artifact = args
+        .windows(2)
+        .find(|window| window[0] == "--artifact")
+        .map(|window| PathBuf::from(&window[1]))
+        .unwrap_or_else(|| PathBuf::from(format!("target/artifacts/boonc/{name}.boonc")));
+    if !artifact.exists() {
+        let (source, _, _) = example_paths(name)?;
+        emit_compiled_artifact(&source, &artifact, None)?;
+    }
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from(format!("target/reports/compiled-artifact-load-{name}.json"))
+    });
+    let report_value = inspect_compiled_artifact_report(&artifact, Some(&report))?;
+    verify_report_schema(&report)?;
+    if report_value
+        .pointer("/inspection_result/source_reparse_attempted")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("compiled artifact inspection attempted source reparse".into());
+    }
+    if report_value
+        .pointer("/inspection_result/scenario_execution_available")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("compiled artifact inspection report must not claim scenario execution".into());
+    }
+    if report_value
+        .pointer("/inspection_result/runtime_instantiated_from_artifact")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("compiled artifact inspection must not claim runtime instantiation".into());
     }
     Ok(())
 }

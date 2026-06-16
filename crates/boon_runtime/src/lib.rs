@@ -2327,6 +2327,62 @@ pub fn emit_compiled_artifact(
     Ok(report)
 }
 
+pub fn inspect_compiled_artifact_report(
+    artifact_path: &Path,
+    report_path: Option<&Path>,
+) -> RuntimeResult<JsonValue> {
+    let artifact = CompiledArtifact::load_from_path(artifact_path)?;
+    let artifact_hash = artifact.sha256.clone();
+    let runtime_plan_present = artifact.body.get("runtime_plan").is_some();
+    let report = json!({
+        "status": "pass",
+        "report_version": 1,
+        "command": "inspect-compiled-artifact",
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "measurement_mode": "diagnostic",
+        "exit_status": 0,
+        "generated_at_utc": now_string(),
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "artifact_path": artifact_path.display().to_string(),
+        "artifact_hash": artifact_hash.clone(),
+        "program_hash": artifact.body["program_hash"].clone(),
+        "compiled_artifact": artifact.report_with_path(artifact_path),
+        "artifact_sections": artifact.section_presence(),
+        "artifact_sha256s": [{
+            "path": artifact_path.display().to_string(),
+            "sha256": artifact_hash
+        }],
+        "inspection_result": {
+            "artifact_valid": true,
+            "loaded_runtime_from_artifact": false,
+            "runtime_instantiated_from_artifact": false,
+            "runtime_plan_present": runtime_plan_present,
+            "source_free_runtime_load_available": false,
+            "source_reparse_required_for_current_runtime": true,
+            "source_reparse_attempted": false,
+            "source_file_access": "not_attempted",
+            "parser_ast_required_for_execution": artifact.body["parser_ast_required_for_execution"].clone(),
+            "typed_ir_required_for_mvp_loader": artifact.body["typed_ir_required_for_mvp_loader"].clone(),
+            "scenario_execution_available": false,
+            "blocked_task": "TASK-0901B",
+            "scenario_execution_pending_task": "TASK-0901C",
+            "missing_runtime_plan_sections": [
+                "runtime_plan",
+                "lossless_runtime_symbols",
+                "executable_equation_plans",
+                "runtime_storage_initialization_plan",
+                "source_schema_table",
+                "document_lowering_runtime_tables"
+            ]
+        }
+    });
+    if let Some(report_path) = report_path {
+        write_json(report_path, &report)?;
+    }
+    Ok(report)
+}
+
 pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
     let text = fs::read_to_string(path)?;
     Ok(toml::from_str(&text)?)
@@ -5398,6 +5454,18 @@ struct CompiledArtifact {
 }
 
 impl CompiledArtifact {
+    const REQUIRED_SECTIONS: [&'static str; 9] = [
+        "semantic_index",
+        "symbol_table",
+        "storage_layout",
+        "source_schemas",
+        "route_op_streams",
+        "dependency_graph",
+        "document_lowering_tables",
+        "bridge_schemas",
+        "compiled_schedule",
+    ];
+
     fn from_parts(
         parsed: &ParsedProgram,
         ir: &TypedProgram,
@@ -5461,6 +5529,67 @@ impl CompiledArtifact {
         Self { body, sha256 }
     }
 
+    fn load_from_path(path: &Path) -> RuntimeResult<Self> {
+        let bytes = fs::read(path)?;
+        let sha256 = sha256_bytes(&bytes);
+        let body: JsonValue = serde_json::from_slice(&bytes)?;
+        let artifact = Self { body, sha256 };
+        artifact.validate(path)?;
+        Ok(artifact)
+    }
+
+    fn validate(&self, path: &Path) -> RuntimeResult<()> {
+        if self.body.get("artifact_kind").and_then(JsonValue::as_str)
+            != Some("boonc.compiled_program")
+        {
+            return Err(format!("{} is not a Boon compiled artifact", path.display()).into());
+        }
+        if self.body.get("format").and_then(JsonValue::as_str) != Some("boonc-json-v1") {
+            return Err(format!("{} compiled artifact has wrong format", path.display()).into());
+        }
+        if self
+            .body
+            .get("artifact_version")
+            .and_then(JsonValue::as_u64)
+            != Some(1)
+        {
+            return Err(format!("{} compiled artifact has wrong version", path.display()).into());
+        }
+        if self
+            .body
+            .get("parser_ast_required_for_execution")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        {
+            return Err(format!(
+                "{} compiled artifact must not require parser AST for execution",
+                path.display()
+            )
+            .into());
+        }
+        for key in [
+            "runtime_load_mode",
+            "program_hash",
+            "source_unit_hashes",
+            "report_schema_hash",
+            "typecheck_report_hash",
+        ] {
+            if self.body.get(key).is_none() {
+                return Err(format!("{} compiled artifact missing `{key}`", path.display()).into());
+            }
+        }
+        for key in Self::REQUIRED_SECTIONS {
+            if self.body.get(key).is_none() {
+                return Err(format!(
+                    "{} compiled artifact missing section `{key}`",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     fn report(&self) -> JsonValue {
         json!({
             "artifact_kind": "boonc.compiled_program",
@@ -5483,6 +5612,20 @@ impl CompiledArtifact {
             "storage_layout": self.body["storage_layout"].clone(),
             "bridge_schema_count": self.body["bridge_schemas"]["schema_count"].clone()
         })
+    }
+
+    fn report_with_path(&self, path: &Path) -> JsonValue {
+        let mut report = self.report();
+        report["path"] = json!(path.display().to_string());
+        report
+    }
+
+    fn section_presence(&self) -> JsonValue {
+        let mut sections = serde_json::Map::new();
+        for key in Self::REQUIRED_SECTIONS {
+            sections.insert(key.to_owned(), json!(self.body.get(key).is_some()));
+        }
+        JsonValue::Object(sections)
     }
 }
 
@@ -35093,6 +35236,52 @@ FUNCTION icon_code(item) {
         assert!(artifact_json["semantic_index"].is_object());
         assert!(artifact_json["compiled_schedule"]["source_route_op_streams"].is_object());
         assert!(artifact_json["storage_layout"].is_object());
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_plan_gap() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-load-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let source = temp_root.join("counter.bn");
+        std::fs::copy("../../examples/counter.bn", &source).unwrap();
+        let artifact = temp_root.join("counter.boonc");
+        let compile_report = temp_root.join("counter-compile-report.json");
+        emit_compiled_artifact(&source, &artifact, Some(&compile_report)).unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        let load_report = temp_root.join("counter-load-report.json");
+        let loaded = inspect_compiled_artifact_report(&artifact, Some(&load_report)).unwrap();
+        verify_report_schema(&load_report).unwrap();
+        assert_eq!(loaded["inspection_result"]["artifact_valid"], json!(true));
+        assert_eq!(
+            loaded["inspection_result"]["runtime_instantiated_from_artifact"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_present"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["source_reparse_attempted"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["source_file_access"],
+            json!("not_attempted")
+        );
+        assert_eq!(
+            loaded["inspection_result"]["scenario_execution_available"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["compiled_artifact"]["sha256"].as_str(),
+            Some(sha256_file(&artifact).unwrap().as_str())
+        );
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 

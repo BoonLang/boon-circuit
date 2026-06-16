@@ -1593,6 +1593,13 @@ fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn st
             "compiled artifact inspection must deserialize non-route runtime tables".into(),
         );
     }
+    if report_value
+        .pointer("/inspection_result/runtime_plan_source_routes_deserialized_from_artifact")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("compiled artifact inspection must deserialize source routes".into());
+    }
     Ok(())
 }
 

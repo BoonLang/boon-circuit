@@ -2340,11 +2340,13 @@ pub fn inspect_compiled_artifact_report(
     let storage_initialization_plan = artifact.runtime_storage_initialization_plan()?;
     let document_lowering_tables = artifact.runtime_document_lowering_tables()?;
     let non_route_tables = artifact.runtime_non_route_tables()?;
+    let source_routes = artifact.runtime_source_routes()?;
     let storage_initial_row_count = storage_initialization_plan
         .list_slots
         .iter()
         .map(|slot| slot.initial_rows.len())
         .sum::<usize>();
+    let source_payload_counts = SourcePayloadCounts::from_source_routes(&source_routes);
     let report = json!({
         "status": "pass",
         "report_version": 1,
@@ -2404,6 +2406,23 @@ pub fn inspect_compiled_artifact_report(
                 "list_operation_count": non_route_tables.list_equations.operations.len(),
                 "list_projection_count": non_route_tables.list_projections.projections.len(),
                 "list_source_binding_count": non_route_tables.list_source_bindings.list_slots.len()
+            },
+            "runtime_plan_source_routes_deserialized_from_artifact": true,
+            "runtime_plan_source_routes_deserialized_counts": {
+                "route_count": source_routes.len(),
+                "id_slot_count": source_routes.id_slots.len(),
+                "label_slot_count": source_routes.label_slots.len(),
+                "routes_with_ids": source_routes.routes_with_ids(),
+                "action_table_slot_count": source_routes.action_table.by_source.len(),
+                "action_op_stream_count": source_routes.op_stream_count(),
+                "total_action_op_count": source_routes.total_op_count(),
+                "max_action_op_count": source_routes.max_op_count(),
+                "source_payload_schema_count": source_payload_counts.schema_count,
+                "source_payload_field_count": source_payload_counts.field_count,
+                "source_payload_text_field_count": source_payload_counts.text_field_count,
+                "source_payload_key_field_count": source_payload_counts.key_field_count,
+                "source_payload_address_field_count": source_payload_counts.address_field_count,
+                "source_payload_pointer_field_count": source_payload_counts.pointer_field_count
             },
             "source_free_runtime_load_available": false,
             "source_reparse_required_for_current_runtime": true,
@@ -9578,6 +9597,639 @@ fn source_action_artifact(action: &SourceAction) -> JsonValue {
     }
 }
 
+impl SourceRoutePlan {
+    fn from_artifact_body(body: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan";
+        let plan = body
+            .get("runtime_plan")
+            .ok_or("compiled artifact missing runtime_plan")?;
+        let plan_object = artifact_object(plan, context)?;
+        Self::from_artifact(artifact_field(plan_object, "source_routes", context)?, body)
+    }
+
+    fn from_artifact(value: &JsonValue, body: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.source_routes";
+        let object = artifact_object(value, context)?;
+        let route_slots = artifact_array_field(object, "route_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                SourceRoute::from_artifact(value, index, &format!("{context}.route_slots[{index}]"))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let id_slots = artifact_array_field(object, "id_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if value.is_null() {
+                    return Ok(None);
+                }
+                let slot = value.as_u64().ok_or_else(|| {
+                    format!("{context}.id_slots[{index}] is not a route index or null")
+                })?;
+                Ok(Some(SourceRouteIndex(usize::try_from(slot).map_err(
+                    |_| format!("{context}.id_slots[{index}] does not fit in usize"),
+                )?)))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let label_slots = artifact_array_field(object, "label_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                SourceBoundaryLabel::from_artifact(
+                    value,
+                    &format!("{context}.label_slots[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let action_table = SourceActionTable::from_artifact(
+            artifact_field(object, "action_table", context)?,
+            &format!("{context}.action_table"),
+        )?;
+        let plan = Self {
+            route_slots,
+            id_slots,
+            label_slots,
+            action_table,
+        };
+        plan.validate_artifact_shape(context)?;
+        plan.validate_artifact_counts(body)?;
+        Ok(plan)
+    }
+
+    fn validate_artifact_shape(&self, context: &str) -> RuntimeResult<()> {
+        let mut route_sources = BTreeSet::new();
+        let mut route_source_ids = BTreeSet::new();
+        for (route_index, route) in self.route_slots.iter().enumerate() {
+            if !route_sources.insert(route.source.as_str()) {
+                return Err(
+                    format!("{context}.route_slots duplicate source `{}`", route.source).into(),
+                );
+            }
+            if !route_source_ids.insert(route.source_id.as_usize()) {
+                return Err(format!(
+                    "{context}.route_slots duplicate SourceId `{}`",
+                    route.source_id.as_usize()
+                )
+                .into());
+            }
+            if let Some(address_lookup_field) = route.address_lookup_field.as_ref() {
+                if address_lookup_field.is_empty() {
+                    return Err(format!(
+                        "{context}.route_slots[{route_index}].address_lookup_field is empty"
+                    )
+                    .into());
+                }
+                if !route
+                    .payload_fields
+                    .iter()
+                    .any(|field| matches!(field, SourcePayloadField::Address))
+                {
+                    return Err(format!(
+                        "{context}.route_slots[{route_index}] has address_lookup_field without Address payload"
+                    )
+                    .into());
+                }
+            }
+            let mut rebuilt = route.clone();
+            rebuilt.rebuild_actions();
+            if rebuilt.actions != route.actions {
+                return Err(format!(
+                    "{context}.route_slots[{route_index}] actions do not match route target arrays"
+                )
+                .into());
+            }
+            let source_id = route.source_id.as_usize();
+            let Some(Some(index)) = self.id_slots.get(source_id) else {
+                return Err(format!(
+                    "{context}.id_slots missing route index for SourceId `{source_id}`"
+                )
+                .into());
+            };
+            if index.slot() != route_index {
+                return Err(format!(
+                    "{context}.id_slots[{source_id}] points to route {}, expected {route_index}",
+                    index.slot()
+                )
+                .into());
+            }
+        }
+        for (source_id, index) in self.id_slots.iter().enumerate() {
+            let Some(index) = index else {
+                continue;
+            };
+            let Some(route) = self.route_slots.get(index.slot()) else {
+                return Err(
+                    format!("{context}.id_slots[{source_id}] points outside route_slots").into(),
+                );
+            };
+            if route.source_id.as_usize() != source_id {
+                return Err(format!(
+                    "{context}.id_slots[{source_id}] points to route SourceId `{}`",
+                    route.source_id.as_usize()
+                )
+                .into());
+            }
+        }
+
+        let mut previous_label: Option<&str> = None;
+        let mut label_sources = BTreeSet::new();
+        for label in &self.label_slots {
+            if previous_label.is_some_and(|previous| previous >= label.source.as_str()) {
+                return Err(
+                    format!("{context}.label_slots are not strictly sorted by source").into(),
+                );
+            }
+            previous_label = Some(label.source.as_str());
+            if !label_sources.insert(label.source.as_str()) {
+                return Err(
+                    format!("{context}.label_slots duplicate source `{}`", label.source).into(),
+                );
+            }
+            let Some(route) = self.for_source_id(label.source_id) else {
+                return Err(format!(
+                    "{context}.label_slots source `{}` points to missing SourceId `{}`",
+                    label.source,
+                    label.source_id.as_usize()
+                )
+                .into());
+            };
+            if route.source != label.source {
+                return Err(format!(
+                    "{context}.label_slots source `{}` points to route source `{}`",
+                    label.source, route.source
+                )
+                .into());
+            }
+        }
+        for route in &self.route_slots {
+            if self.source_id_exact(&route.source) != Some(route.source_id) {
+                return Err(format!(
+                    "{context}.label_slots missing exact label for source `{}`",
+                    route.source
+                )
+                .into());
+            }
+        }
+
+        if self.action_table.by_source.len() != self.id_slots.len() {
+            return Err(format!(
+                "{context}.action_table has {} slots, id_slots has {}",
+                self.action_table.by_source.len(),
+                self.id_slots.len()
+            )
+            .into());
+        }
+        for (source_id, actions) in self.action_table.by_source.iter().enumerate() {
+            let route = self
+                .id_slots
+                .get(source_id)
+                .copied()
+                .flatten()
+                .and_then(|index| self.route_slots.get(index.slot()));
+            match (route, actions.as_ref()) {
+                (Some(route), Some(actions)) if actions.as_ref() != route.actions.as_slice() => {
+                    return Err(format!(
+                        "{context}.action_table[{source_id}] does not match route `{}` actions",
+                        route.source
+                    )
+                    .into());
+                }
+                (Some(route), None) if !route.actions.is_empty() => {
+                    return Err(format!(
+                        "{context}.action_table[{source_id}] missing route `{}` actions",
+                        route.source
+                    )
+                    .into());
+                }
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "{context}.action_table[{source_id}] has actions without an id_slots route"
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_counts(&self, body: &JsonValue) -> RuntimeResult<()> {
+        artifact_len_matches(
+            self.route_slots.len(),
+            body,
+            "/compiled_schedule/source_route_count",
+            "runtime_plan.source_routes.route_slots",
+        )?;
+        artifact_len_matches(
+            self.id_slots.len(),
+            body,
+            "/compiled_schedule/source_route_id_slot_count",
+            "runtime_plan.source_routes.id_slots",
+        )?;
+        artifact_len_matches(
+            self.label_slots.len(),
+            body,
+            "/compiled_schedule/source_route_label_slot_count",
+            "runtime_plan.source_routes.label_slots",
+        )?;
+        artifact_len_matches(
+            self.routes_with_ids(),
+            body,
+            "/compiled_schedule/source_routes_with_ids",
+            "runtime_plan.source_routes.routes_with_ids",
+        )?;
+        artifact_len_matches(
+            self.op_stream_count(),
+            body,
+            "/compiled_schedule/source_route_op_stream_count",
+            "runtime_plan.source_routes.action_table.op_stream_count",
+        )?;
+        artifact_len_matches(
+            self.total_op_count(),
+            body,
+            "/compiled_schedule/source_route_total_action_op_count",
+            "runtime_plan.source_routes.action_table.total_op_count",
+        )?;
+        artifact_len_matches(
+            self.max_op_count(),
+            body,
+            "/compiled_schedule/source_route_max_action_op_count",
+            "runtime_plan.source_routes.action_table.max_op_count",
+        )?;
+
+        let payload_counts = SourcePayloadCounts::from_source_routes(self);
+        for (actual, pointer, context) in [
+            (
+                payload_counts.schema_count,
+                "/compiled_schedule/source_payload_schema_count",
+                "runtime_plan.source_routes.source_payload_schema_count",
+            ),
+            (
+                payload_counts.field_count,
+                "/compiled_schedule/source_payload_field_count",
+                "runtime_plan.source_routes.source_payload_field_count",
+            ),
+            (
+                payload_counts.text_field_count,
+                "/compiled_schedule/source_payload_text_field_count",
+                "runtime_plan.source_routes.source_payload_text_field_count",
+            ),
+            (
+                payload_counts.key_field_count,
+                "/compiled_schedule/source_payload_key_field_count",
+                "runtime_plan.source_routes.source_payload_key_field_count",
+            ),
+            (
+                payload_counts.address_field_count,
+                "/compiled_schedule/source_payload_address_field_count",
+                "runtime_plan.source_routes.source_payload_address_field_count",
+            ),
+            (
+                payload_counts.pointer_field_count,
+                "/compiled_schedule/source_payload_pointer_field_count",
+                "runtime_plan.source_routes.source_payload_pointer_field_count",
+            ),
+        ] {
+            artifact_len_matches(actual, body, pointer, context)?;
+        }
+
+        let expected_op_streams = body
+            .get("route_op_streams")
+            .ok_or("compiled artifact missing route_op_streams")?;
+        if self.op_stream_report() != *expected_op_streams {
+            return Err(
+                "runtime_plan.source_routes decoded route op streams do not match artifact route_op_streams"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl SourceActionTable {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let by_source = artifact_array(value, context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let entry_context = format!("{context}[{index}]");
+                let object = artifact_object(value, &entry_context)?;
+                let source_id = artifact_usize_field(object, "source_id", &entry_context)?;
+                if source_id != index {
+                    return Err(format!(
+                        "{entry_context}.source_id expected {index}, decoded {source_id}"
+                    )
+                    .into());
+                }
+                let actions = artifact_array_field(object, "actions", &entry_context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(action_index, value)| {
+                        SourceAction::from_artifact(
+                            value,
+                            &format!("{entry_context}.actions[{action_index}]"),
+                        )
+                    })
+                    .collect::<RuntimeResult<Vec<_>>>()?;
+                Ok((!actions.is_empty()).then(|| Arc::from(actions.into_boxed_slice())))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        Ok(Self { by_source })
+    }
+}
+
+impl SourceBoundaryLabel {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            source: artifact_string_field(object, "source", context)?,
+            source_id: SourceId(artifact_usize_field(object, "source_id", context)?),
+        })
+    }
+}
+
+impl SourceRoute {
+    fn from_artifact(value: &JsonValue, route_id: usize, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let decoded_route_id = artifact_usize_field(object, "route_id", context)?;
+        if decoded_route_id != route_id {
+            return Err(format!(
+                "{context}.route_id expected {route_id}, decoded {decoded_route_id}"
+            )
+            .into());
+        }
+        Ok(Self {
+            source_id: SourceId(artifact_usize_field(object, "source_id", context)?),
+            source: artifact_string_field(object, "source", context)?,
+            address_lookup_field: optional_string_field(object, "address_lookup_field", context)?,
+            payload_fields: source_payload_fields_from_artifact(
+                artifact_field(object, "payload_fields", context)?,
+                &format!("{context}.payload_fields"),
+            )?,
+            root_scalar_targets: source_route_scalar_targets_from_artifact(
+                artifact_field(object, "root_scalar_targets", context)?,
+                &format!("{context}.root_scalar_targets"),
+            )?,
+            indexed_text_targets: source_route_scalar_targets_from_artifact(
+                artifact_field(object, "indexed_text_targets", context)?,
+                &format!("{context}.indexed_text_targets"),
+            )?,
+            indexed_bool_targets: source_route_scalar_targets_from_artifact(
+                artifact_field(object, "indexed_bool_targets", context)?,
+                &format!("{context}.indexed_bool_targets"),
+            )?,
+            derived_text_targets: artifact_string_array_field(
+                object,
+                "derived_text_targets",
+                context,
+            )?,
+            router_route_targets: artifact_array_field(object, "router_route_targets", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    SourceRouteRouterRoute::from_artifact(
+                        value,
+                        &format!("{context}.router_route_targets[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+            root_text_transform_targets: artifact_array_field(
+                object,
+                "root_text_transform_targets",
+                context,
+            )?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                SourceRouteRootTextTransform::from_artifact(
+                    value,
+                    &format!("{context}.root_text_transform_targets[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?,
+            list_append_targets: artifact_array_field(object, "list_append_targets", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    SourceRouteListAppend::from_artifact(
+                        value,
+                        &format!("{context}.list_append_targets[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+            list_remove_targets: artifact_array_field(object, "list_remove_targets", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    SourceRouteListRemove::from_artifact(
+                        value,
+                        &format!("{context}.list_remove_targets[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+            actions: artifact_array_field(object, "actions", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    SourceAction::from_artifact(value, &format!("{context}.actions[{index}]"))
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
+}
+
+fn source_payload_fields_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<SourcePayloadField>> {
+    let fields = artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            source_payload_field_from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    let mut seen = BTreeSet::new();
+    for field in &fields {
+        if !seen.insert(field) {
+            return Err(format!("{context} duplicate payload field `{field:?}`").into());
+        }
+    }
+    Ok(fields)
+}
+
+fn source_payload_field_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<SourcePayloadField> {
+    if let Some(field) = value.as_str() {
+        return match field {
+            "Address" => Ok(SourcePayloadField::Address),
+            "Key" => Ok(SourcePayloadField::Key),
+            "Text" => Ok(SourcePayloadField::Text),
+            other => {
+                Err(format!("{context} has unsupported source payload field `{other}`").into())
+            }
+        };
+    }
+    let object = artifact_object(value, context)?;
+    if object.len() == 1 && object.contains_key("Named") {
+        let name = artifact_string_field(object, "Named", context)?;
+        if name.is_empty() {
+            return Err(format!("{context}.Named is empty").into());
+        }
+        return Ok(SourcePayloadField::Named(name));
+    }
+    Err(format!("{context} is not a supported source payload field").into())
+}
+
+fn source_route_scalar_targets_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<SourceRouteScalarTarget>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            SourceRouteScalarTarget::from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect()
+}
+
+impl SourceRouteScalarTarget {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            target: artifact_string_field(object, "target", context)?,
+            expression: ScalarUpdateExpression::from_artifact(
+                artifact_field(object, "expression", context)?,
+                &format!("{context}.expression"),
+            )?,
+        })
+    }
+}
+
+impl SourceRouteRouterRoute {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            source: artifact_string_field(object, "source", context)?,
+            target: artifact_string_field(object, "target", context)?,
+            path: artifact_string_field(object, "path", context)?,
+        })
+    }
+}
+
+impl SourceRouteRootTextTransform {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            source: artifact_string_field(object, "source", context)?,
+            target: artifact_string_field(object, "target", context)?,
+            value: field_value_from_artifact(artifact_field(object, "value", context)?, context)?,
+        })
+    }
+}
+
+impl SourceRouteListAppend {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            trigger: artifact_string_field(object, "trigger", context)?,
+            append_ordinal: artifact_usize_field(object, "append_ordinal", context)?,
+        })
+    }
+}
+
+impl SourceRouteListRemove {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            predicate: RuntimeListPredicate::from_artifact(
+                artifact_field(object, "predicate", context)?,
+                &format!("{context}.predicate"),
+            )?,
+        })
+    }
+}
+
+impl SourceAction {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "root_scalar" => Ok(Self::RootScalar),
+            "derived_text" => Ok(Self::DerivedText {
+                target: artifact_string_field(object, "target", context)?,
+            }),
+            "router_route" => Ok(Self::RouterRoute {
+                target: artifact_string_field(object, "target", context)?,
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "root_text_transform" => Ok(Self::RootTextTransform {
+                target: artifact_string_field(object, "target", context)?,
+                value: field_value_from_artifact(
+                    artifact_field(object, "value", context)?,
+                    &format!("{context}.value"),
+                )?,
+            }),
+            "list_remove" => Ok(Self::ListRemove {
+                list: artifact_string_field(object, "list", context)?,
+            }),
+            "list_append" => Ok(Self::ListAppend {
+                list: artifact_string_field(object, "list", context)?,
+                trigger: artifact_string_field(object, "trigger", context)?,
+                append_ordinal: artifact_usize_field(object, "append_ordinal", context)?,
+            }),
+            "indexed_text" => Ok(Self::IndexedText {
+                kind: SourceRouteTextAction::from_artifact(
+                    &artifact_string_field(object, "text_action", context)?,
+                    &format!("{context}.text_action"),
+                )?,
+                target: artifact_string_field(object, "target", context)?,
+            }),
+            "indexed_bool" => Ok(Self::IndexedBool {
+                kind: SourceRouteBoolAction::from_artifact(
+                    &artifact_string_field(object, "bool_action", context)?,
+                    &format!("{context}.bool_action"),
+                )?,
+                target: artifact_string_field(object, "target", context)?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
+impl SourceRouteTextAction {
+    fn from_artifact(value: &str, context: &str) -> RuntimeResult<Self> {
+        match value {
+            "indexed_text_const" => Ok(Self::Const),
+            "indexed_text_source_text" => Ok(Self::SourceText),
+            "indexed_text_previous_value" => Ok(Self::PreviousValue),
+            "indexed_text_read_path" => Ok(Self::ReadPath),
+            "indexed_text_trim_or_previous" => Ok(Self::TextTrimOrPrevious),
+            "indexed_text_computed" => Ok(Self::Computed),
+            other => Err(format!("{context} has unsupported value `{other}`").into()),
+        }
+    }
+}
+
+impl SourceRouteBoolAction {
+    fn from_artifact(value: &str, context: &str) -> RuntimeResult<Self> {
+        match value {
+            "indexed_bool_not" => Ok(Self::BoolNot),
+            "indexed_bool_const_true" => Ok(Self::ConstTrue),
+            "indexed_bool_const_false" => Ok(Self::ConstFalse),
+            "indexed_bool_read_path" => Ok(Self::ReadPath),
+            "indexed_bool_source_pulse" => Ok(Self::SourcePulse),
+            "indexed_bool_match" => Ok(Self::Match),
+            other => Err(format!("{context} has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn field_value_artifact(value: &FieldValue) -> JsonValue {
     match value {
         FieldValue::Text(value) => json!({ "kind": "text", "value": value }),
@@ -10079,6 +10731,10 @@ impl CompiledArtifact {
 
     fn runtime_non_route_tables(&self) -> RuntimeResult<RuntimeNonRouteTables> {
         RuntimeNonRouteTables::from_artifact_body(&self.body)
+    }
+
+    fn runtime_source_routes(&self) -> RuntimeResult<SourceRoutePlan> {
+        SourceRoutePlan::from_artifact_body(&self.body)
     }
 
     fn validate(&self, path: &Path) -> RuntimeResult<()> {
@@ -10635,6 +11291,25 @@ impl SourcePayloadCounts {
         };
         for source in &ir.sources {
             for field in &source.payload_schema.fields {
+                counts.field_count += 1;
+                match field {
+                    SourcePayloadField::Text => counts.text_field_count += 1,
+                    SourcePayloadField::Key => counts.key_field_count += 1,
+                    SourcePayloadField::Address => counts.address_field_count += 1,
+                    SourcePayloadField::Named(_) => counts.pointer_field_count += 1,
+                }
+            }
+        }
+        counts
+    }
+
+    fn from_source_routes(source_routes: &SourceRoutePlan) -> Self {
+        let mut counts = Self {
+            schema_count: source_routes.route_slots.len(),
+            ..Self::default()
+        };
+        for route in &source_routes.route_slots {
+            for field in &route.payload_fields {
                 counts.field_count += 1;
                 match field {
                     SourcePayloadField::Text => counts.text_field_count += 1,
@@ -37811,6 +38486,13 @@ impl SourceRoutePlan {
         self.route_slots.len()
     }
 
+    fn routes_with_ids(&self) -> usize {
+        self.route_slots
+            .iter()
+            .filter(|route| route.source_id.as_usize() < self.id_slots.len())
+            .count()
+    }
+
     #[cfg(test)]
     fn for_source(&self, source: &str) -> Option<&SourceRoute> {
         self.source_id(source)
@@ -41996,6 +42678,240 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn compiled_artifact_decodes_source_routes_and_action_table_without_ast() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-source-routes-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, scenario, _) = example_paths(example).unwrap();
+            let artifact_path = temp_root.join(format!("{example}.boonc"));
+            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+            let decoded = artifact.runtime_source_routes().unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+
+            assert_eq!(
+                source_route_plan_artifact(&decoded),
+                source_route_plan_artifact(&compiled.source_routes),
+                "decoded source routes differ for {example}"
+            );
+
+            let mut artifact_compiled = compiled.clone();
+            artifact_compiled.source_routes = decoded;
+            let mut runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+            assert!(
+                runtime.generic_state_summary().is_object(),
+                "decoded source routes should instantiate runtime for {example}"
+            );
+            if example == "todomvc" {
+                let scenario = parse_scenario(&scenario).unwrap();
+                let runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+                let output = run_generic_scenario(
+                    runtime,
+                    &parsed,
+                    &ir,
+                    &artifact_compiled,
+                    &scenario,
+                    VerificationLayer::Semantic,
+                )
+                .unwrap();
+                assert_eq!(
+                    output.report["status"], "pass",
+                    "decoded source routes should preserve TodoMVC scenario execution"
+                );
+            }
+        }
+
+        let artifact_path = temp_root.join("todomvc.boonc");
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let route_slots = artifact.body["runtime_plan"]["source_routes"]["route_slots"]
+            .as_array()
+            .unwrap();
+        let route_zero_source_id = route_slots[0]["source_id"].as_u64().unwrap() as usize;
+        let route_zero_next = (route_zero_source_id + 1) % route_slots.len();
+
+        let mut corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["route_id"] = json!(999);
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("route_id"),
+            "wrong route id should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["id_slots"][route_zero_source_id] =
+            json!(route_zero_next);
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("id_slots"),
+            "wrong SourceId slot should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["label_slots"][0]["source"] =
+            json!("zzzz.not.sorted");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("label_slots"),
+            "wrong label slot should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["action_table"][0]["source_id"] = json!(1);
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("action_table"),
+            "wrong action table source id should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["action_table"][route_zero_source_id]["actions"]
+            [0] = json!({"kind": "list_remove", "list": "todos"});
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("action_table"),
+            "action table mismatch should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["root_scalar_targets"] =
+            json!([]);
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("actions do not match"),
+            "route action rebuild mismatch should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["actions"][0]["kind"] =
+            json!("not_a_source_action");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_a_source_action"),
+            "bad source action kind should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["payload_fields"][0] =
+            json!("PointerWidth");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("payload field"),
+            "bad payload field should fail decoding, got {error}"
+        );
+
+        let indexed_text_route = route_slots
+            .iter()
+            .position(|route| {
+                route["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["kind"] == "indexed_text")
+            })
+            .expect("TodoMVC artifact should contain an indexed text route");
+        let indexed_text_action = route_slots[indexed_text_route]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|action| action["kind"] == "indexed_text")
+            .unwrap();
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][indexed_text_route]["actions"]
+            [indexed_text_action]["text_action"] = json!("not_an_indexed_text_action");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_an_indexed_text_action"),
+            "bad indexed text action should fail decoding, got {error}"
+        );
+
+        let indexed_bool_route = route_slots
+            .iter()
+            .position(|route| {
+                route["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["kind"] == "indexed_bool")
+            })
+            .expect("TodoMVC artifact should contain an indexed bool route");
+        let indexed_bool_action = route_slots[indexed_bool_route]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|action| action["kind"] == "indexed_bool")
+            .unwrap();
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][indexed_bool_route]["actions"]
+            [indexed_bool_action]["bool_action"] = json!("not_an_indexed_bool_action");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_an_indexed_bool_action"),
+            "bad indexed bool action should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["root_scalar_targets"][0]["expression"]
+            ["kind"] = json!("not_a_scalar_expression");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_a_scalar_expression"),
+            "bad scalar route expression should fail decoding, got {error}"
+        );
+
+        let list_remove_route = route_slots
+            .iter()
+            .position(|route| {
+                route["list_remove_targets"]
+                    .as_array()
+                    .unwrap()
+                    .first()
+                    .is_some()
+            })
+            .expect("TodoMVC artifact should contain a list-remove route");
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["source_routes"]["route_slots"][list_remove_route]["list_remove_targets"]
+            [0]["predicate"]["kind"] = json!("not_a_list_predicate");
+        let error = SourceRoutePlan::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_a_list_predicate"),
+            "bad list-remove predicate should fail decoding, got {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
         let parsed = parse_source(
             "examples/todomvc.bn",
@@ -42312,6 +43228,18 @@ FUNCTION decorate(value) {
                 .as_object()
                 .is_some_and(|counts| counts
                     .get("runtime_symbol_count")
+                    .and_then(JsonValue::as_u64)
+                    .is_some())
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_source_routes_deserialized_from_artifact"],
+            json!(true)
+        );
+        assert!(
+            loaded["inspection_result"]["runtime_plan_source_routes_deserialized_counts"]
+                .as_object()
+                .is_some_and(|counts| counts
+                    .get("route_count")
                     .and_then(JsonValue::as_u64)
                     .is_some())
         );

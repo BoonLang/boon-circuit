@@ -2901,12 +2901,13 @@ Notes:
     inspection path now decodes `runtime_plan.generic_derived`,
     `runtime_plan.storage_initialization`, `runtime_plan.document_lowering`,
     `runtime_plan.runtime_symbols`, scalar equations, derived text transforms,
-    list equations, list projections, and list source bindings into runtime-owned
-    structs. `.boonc` still cannot instantiate `LoadedRuntime` because the
-    artifact path still lacks source-route/action-table deserializers, an
-    artifact-backed runtime constructor, and scenario parity proof. The report
-    must keep `generic_derived_ast_free_plan` as missing until the full path is
-    executable without parser AST.
+    list equations, list projections, list source bindings, source routes,
+    source/action tables, source payload field metadata, and dense source/action
+    routing into runtime-owned structs. `.boonc` still cannot instantiate
+    `LoadedRuntime` because the artifact path still lacks an artifact-backed
+    runtime constructor and scenario parity proof. The report must keep
+    `generic_derived_ast_free_plan` as missing until the full path is executable
+    without parser AST.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -5058,6 +5059,65 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   payload field metadata, and dense action/source IDs from the artifact. Then
   build the artifact-backed runtime constructor and scenario parity gate before
   any report claims `loaded_runtime_from_artifact`,
+  `runtime_instantiated_from_artifact`,
+  `source_free_runtime_load_available`, or `scenario_execution_available`.
+
+- Date: 2026-06-16
+- Task: TASK-0901B source-route/action-table artifact deserialization slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only source-route decoder audit from subagent
+  `019ed234-96d1-7251-9c7b-06fa4481f0f1`; `cargo fmt -p boon_runtime -p
+  boon_report_schema -p xtask`; `cargo test -p boon_runtime --lib
+  compiled_artifact_decodes_source_routes_and_action_table_without_ast --
+  --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo test -p boon_report_schema --lib compiled_artifact --
+  --nocapture`; `cargo check -p boon_runtime -p boon_cli -p xtask`; `cargo
+  test -p xtask`; `cargo xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-report-schema`; full `cargo test -p boon_runtime --lib -- --nocapture`
+  passed with `216` tests.
+- Result: TASK-0901B remains incomplete, but source routes are no longer an
+  artifact decoding gap. `CompiledArtifact::runtime_source_routes()` now
+  reconstructs `SourceRoutePlan`, `SourceActionTable`, dense `SourceId` to route
+  slots, sorted label slots, per-route payload fields, route target arrays, and
+  per-source action streams from `.boonc`. The decoder validates route IDs,
+  dense id-slot backlinks, unused id-slot safety, sorted/unique label slots,
+  action-table source IDs, action-table equality with route actions, rebuilt
+  action streams from target arrays, address lookup payload consistency, source
+  payload field variants, scalar route expressions, list-remove predicates,
+  source route schedule counts, payload aggregate counts, and route-op-stream
+  report equality.
+- Artifact/result detail: inspection reports now include
+  `runtime_plan_source_routes_deserialized_from_artifact = true` and
+  `runtime_plan_source_routes_deserialized_counts`. The refreshed TodoMVC CLI
+  inspection report shows `route_count = 15`, `id_slot_count = 15`,
+  `label_slot_count = 15`, `routes_with_ids = 15`,
+  `action_table_slot_count = 15`, `action_op_stream_count = 15`,
+  `total_action_op_count = 21`, `max_action_op_count = 3`,
+  `source_payload_field_count = 7`, `source_payload_text_field_count = 2`,
+  `source_payload_key_field_count = 2`, and
+  `source_payload_address_field_count = 3`. Runtime and scenario readiness
+  booleans still correctly remain false, with `source_reparse_attempted = false`
+  and `source_file_access = "not_attempted"`.
+- Remaining blocker: assemble the decoded runtime-plan sections into an
+  artifact-backed `LoadedRuntime`/`GenericScheduledRuntime` constructor without
+  reparsing source or rebuilding from typed IR, then run scenario parity from the
+  artifact before any report claims `loaded_runtime_from_artifact`,
   `runtime_instantiated_from_artifact`,
   `source_free_runtime_load_available`, or `scenario_execution_available`.
 

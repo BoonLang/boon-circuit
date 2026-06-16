@@ -400,6 +400,8 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "runtime_plan_document_lowering_deserialized_counts",
         "runtime_plan_non_route_tables_deserialized_from_artifact",
         "runtime_plan_non_route_tables_deserialized_counts",
+        "runtime_plan_source_routes_deserialized_from_artifact",
+        "runtime_plan_source_routes_deserialized_counts",
         "source_free_runtime_load_available",
         "source_reparse_required_for_current_runtime",
         "source_reparse_attempted",
@@ -445,6 +447,10 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             != Some(true)
         || inspection
             .get("runtime_plan_non_route_tables_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
+            .get("runtime_plan_source_routes_deserialized_from_artifact")
             .and_then(JsonValue::as_bool)
             != Some(true)
         || inspection
@@ -581,6 +587,43 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         {
             return Err(format!(
                 "{} inspection_result runtime_plan_non_route_tables_deserialized_counts missing `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let source_route_counts = inspection
+        .get("runtime_plan_source_routes_deserialized_counts")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result runtime_plan_source_routes_deserialized_counts is not an object",
+                path.display()
+            )
+        })?;
+    for key in [
+        "route_count",
+        "id_slot_count",
+        "label_slot_count",
+        "routes_with_ids",
+        "action_table_slot_count",
+        "action_op_stream_count",
+        "total_action_op_count",
+        "max_action_op_count",
+        "source_payload_schema_count",
+        "source_payload_field_count",
+        "source_payload_text_field_count",
+        "source_payload_key_field_count",
+        "source_payload_address_field_count",
+        "source_payload_pointer_field_count",
+    ] {
+        if source_route_counts
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} inspection_result runtime_plan_source_routes_deserialized_counts missing `{key}`",
                 path.display()
             )
             .into());
@@ -5154,6 +5197,24 @@ mod tests {
                     "generic_derived_ast_free_plan"
                 ]
             }
+        });
+        report["inspection_result"]["runtime_plan_source_routes_deserialized_from_artifact"] =
+            json!(true);
+        report["inspection_result"]["runtime_plan_source_routes_deserialized_counts"] = json!({
+            "route_count": 1,
+            "id_slot_count": 1,
+            "label_slot_count": 1,
+            "routes_with_ids": 1,
+            "action_table_slot_count": 1,
+            "action_op_stream_count": 1,
+            "total_action_op_count": 1,
+            "max_action_op_count": 1,
+            "source_payload_schema_count": 1,
+            "source_payload_field_count": 1,
+            "source_payload_text_field_count": 1,
+            "source_payload_key_field_count": 0,
+            "source_payload_address_field_count": 0,
+            "source_payload_pointer_field_count": 0
         });
         assert!(schema_accepts(
             report.clone(),

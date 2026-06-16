@@ -17,10 +17,11 @@ use boon_parser::{
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
+use smallvec::SmallVec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::{Bound, Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
+type RootReadKeys = SmallVec<[GenericReadKey; 3]>;
+type DirtyKeyEntries = SmallVec<[DirtyKeyEntry; 8]>;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -5887,13 +5890,13 @@ struct DirtyKeyEntry {
 
 #[derive(Clone, Debug, Default)]
 struct DirtyKeySets {
-    entries: Vec<DirtyKeyEntry>,
+    entries: DirtyKeyEntries,
 }
 
 impl DirtyKeySets {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(capacity),
+            entries: DirtyKeyEntries::with_capacity(capacity),
         }
     }
 
@@ -13634,10 +13637,10 @@ impl GenericScheduledRuntime {
     }
 
     fn root_field_has_observed_downstream_closure(&self, path: &str) -> bool {
-        let mut read_queue = VecDeque::from(root_read_keys_for_path(path));
+        let mut read_queue = root_read_keys_for_path(path);
         let mut visited_reads = BTreeSet::new();
         let mut visited_roots = BTreeSet::new();
-        while let Some(read) = read_queue.pop_front() {
+        while let Some(read) = read_queue.pop() {
             if !visited_reads.insert(read.clone()) {
                 continue;
             }
@@ -15503,7 +15506,7 @@ impl GenericScheduledRuntime {
                         key: row_key,
                         generation,
                         field: key.field.clone(),
-                        changed_reads: Vec::new(),
+                        changed_reads: RootReadKeys::new(),
                         mutation,
                     }),
                     value,
@@ -15513,14 +15516,13 @@ impl GenericScheduledRuntime {
         }
         self.generic_derived_state
             .replace_numeric_stability_guards(key.clone(), numeric_stability_guards);
-        let changed_reads = vec![
-            list_column_read_key(&key.list, &key.field),
-            GenericReadKey::ListField {
-                list: key.list.clone(),
-                index: key.index,
-                field: key.field.clone(),
-            },
-        ];
+        let mut changed_reads = RootReadKeys::new();
+        changed_reads.push(list_column_read_key(&key.list, &key.field));
+        changed_reads.push(GenericReadKey::ListField {
+            list: key.list.clone(),
+            index: key.index,
+            field: key.field.clone(),
+        });
         if current.as_ref() != Some(&field_value) {
             self.storage.set_or_replace_list_row_value(
                 &key.list,
@@ -26086,7 +26088,7 @@ struct GenericValueFieldMaterialization<'a> {
     key: u64,
     generation: u64,
     field: String,
-    changed_reads: Vec<GenericReadKey>,
+    changed_reads: RootReadKeys,
     mutation: Option<GenericValueFieldCommit<'a>>,
 }
 
@@ -26577,7 +26579,7 @@ enum GenericSourceMutation<'a> {
 
 struct GenericRootDerivedMaterialization<'a> {
     target: String,
-    changed_reads: Vec<GenericReadKey>,
+    changed_reads: RootReadKeys,
     mutation: Option<GenericSourceMutation<'a>>,
 }
 
@@ -27893,8 +27895,8 @@ fn update_value_expression_root_read_paths<'a>(
     }
 }
 
-fn root_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
-    let mut keys = Vec::with_capacity(3);
+fn root_read_keys_for_path(path: &str) -> RootReadKeys {
+    let mut keys = RootReadKeys::new();
     push_root_read_key_for_path_aliases(path, |field| {
         keys.push(GenericReadKey::Root {
             field: field.to_owned(),
@@ -27906,10 +27908,14 @@ fn root_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
     keys
 }
 
-fn root_dependency_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
-    root_child_read_key_for_path(path)
-        .map(|key| vec![key])
-        .unwrap_or_else(|| root_read_keys_for_path(path))
+fn root_dependency_read_keys_for_path(path: &str) -> RootReadKeys {
+    if let Some(key) = root_child_read_key_for_path(path) {
+        let mut keys = RootReadKeys::new();
+        keys.push(key);
+        keys
+    } else {
+        root_read_keys_for_path(path)
+    }
 }
 
 fn push_root_read_key_for_path_aliases(path: &str, mut push: impl FnMut(&str)) {
@@ -27988,7 +27994,7 @@ fn remove_root_dirty_read_key_counts(counts: &mut BTreeMap<GenericReadKey, usize
     });
 }
 
-fn root_read_keys_for_nested_path(path: &str) -> Vec<GenericReadKey> {
+fn root_read_keys_for_nested_path(path: &str) -> RootReadKeys {
     let mut keys = BTreeSet::new();
     if let Some(child) = root_child_read_key_for_path(path) {
         keys.insert(child);
@@ -28002,7 +28008,7 @@ fn root_changed_read_keys_for_materialized_value(
     path: &str,
     value: &BoonValue,
     previous: Option<&FieldValue>,
-) -> Vec<GenericReadKey> {
+) -> RootReadKeys {
     let mut keys = root_read_keys_for_path(path)
         .into_iter()
         .collect::<BTreeSet<_>>();

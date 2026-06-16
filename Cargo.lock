@@ -690,6 +690,7 @@ dependencies = [
  "boon_typecheck",
  "serde",
  "serde_json",
+ "smallvec",
  "toml",
 ]
 

@@ -2693,7 +2693,7 @@ Notes:
   not indicate a POD/shader/layout regression.
 
 ### EXP-0002 `smallvec` Or `arrayvec` For Tiny Hot Lists
-Status: pending
+Status: done
 Type: experiment
 Depends on: TASK-0004B
 Hypothesis:
@@ -2710,6 +2710,10 @@ Verification:
 - `cargo test -p boon_runtime -p boon_document --lib`
 Notes:
 - Do not use fixed-capacity arrays where overflow would panic in production.
+- Promoted 2026-06-16 with `SmallVec`, not `ArrayVec`, for two internal
+  overflow-safe tiny-list surfaces: root read-key vectors and dirty-key entry
+  vectors. This is a narrow allocation reduction, not the remaining
+  zero-allocation budget fix.
 
 ### EXP-0003 Interner Crate Versus Custom Symbol Table
 Status: pending
@@ -4234,6 +4238,53 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Cause learned: this compatibility edge is real but not the current hot graph-shape lever by itself. Narrowing the direct alias self-read after `RootChild` does not reduce the actual cursor/request/page chain and can perturb cache/list materialization enough to regress the canonical interaction. Do not retry this exact alias narrowing as a speed slice unless paired with a broader compiled demand/currentness graph and a focused correctness proof for nested alias queryability.
 - Post-revert current-code report: the refreshed canonical `target/reports/native-gpu/novywave-interaction-speed.json` again matches the current runtime and fails only the strict latency budgets: `click_to_cursor.p95=18.691ms`, `input_to_visible.p95=18.691ms`, `runtime_apply.p95=10.922ms`, `runtime_step_apply.p95=8.618ms`, and `layout_rebuild.p95=5.176ms`. The graph-shape blocker remains unchanged at click p95 `194` visits / `32` enqueues / `38` pops and aggregate `3536` visits / `600` enqueues / `792` pops. Top lists are `selected_signal_lane_rows eval_ms=15.886 diff_ms=14.573` and `selected_cursor_pair_rows eval_ms=9.382 diff_ms=8.927`.
 - Current state: TASK-0804A remains `in_progress` and unfinished. Per user direction on 2026-06-16, pause further TASK-0804A optimization after refreshing the canonical report back on current code and move to another unfinished dependency-ready task.
+
+- Date: 2026-06-16
+- Task: EXP-0002 `smallvec` Or `arrayvec` For Tiny Hot Lists
+- Commit: uncommitted
+- Files changed in this slice: `Cargo.toml`; `Cargo.lock`;
+  `crates/boon_runtime/Cargo.toml`; `crates/boon_runtime/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only tiny-vector candidate review from subagent
+  `019ed0dd-8dcb-7090-954a-55d0538c5a1e`; baseline diagnostic
+  `cargo xtask verify-example-speed counter --report target/diagnostics/exp-0002-counter-baseline.json`
+  failed the known allocation budget; root-read-key-only diagnostic
+  `cargo xtask verify-example-speed counter --report target/diagnostics/exp-0002-counter-root-read-keys.json`
+  failed the same allocation budget; combined diagnostic
+  `cargo xtask verify-example-speed counter --report target/diagnostics/exp-0002-counter-root-read-keys-dirtysets.json`
+  failed the same allocation budget; `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_read_key_aliases_match_store_local_without_nested_leaf_collision -- --nocapture`;
+  `cargo test -p boon_runtime --lib structured_root_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_derived_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib user_function_cache_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib dirty_ -- --nocapture`;
+  `cargo check -p boon_runtime`; `cargo test -p boon_runtime -p boon_document --lib`
+  passed with `boon_document` `33` passed / `0` failed and `boon_runtime`
+  `202` passed / `0` failed.
+- Result: promoted the experiment as a small internal runtime allocation
+  cleanup. `root_read_keys_for_path`, `root_dependency_read_keys_for_path`,
+  `root_read_keys_for_nested_path`, root materialization changed-read payloads,
+  and value-field materialization changed-read payloads now use
+  `SmallVec<[GenericReadKey; 3]>`. `DirtyKeySets` now stores entries in
+  `SmallVec<[DirtyKeyEntry; 8]>`. These choices keep overflow safe by spilling
+  instead of panicking and do not change reports, schemas, Boon syntax, or public
+  runtime APIs.
+- Measurement: the counter speed diagnostic showed baseline after-warmup
+  allocations at `88` / `7558` bytes per step and total allocations at `523` /
+  `45187` bytes. The root-read-key-only slice reduced that to `86` / `7222`
+  after-warmup and `511` / `43171` total. The combined promoted slice reduced
+  it to `84` / `7110` after-warmup and `499` / `42499` total, a reduction of
+  `4` after-warmup allocations and `24` total allocations for the scenario.
+- Caveat: the speed diagnostic still fails the existing strict
+  `allocation_budget` because the budget requires zero after-warmup allocations
+  and the current runtime still has `84`. This task should not be treated as the
+  broader allocation-budget fix or as evidence that container swaps are the main
+  NovyWave latency lever.
+- Next direction: move on to the next dependency-ready unfinished task instead
+  of continuing low-level container swaps. Revisit tiny inline storage only when
+  a refreshed report identifies another specific hot allocation surface with a
+  clear before/after counter.
 
 ## File Maintenance Checklist
 

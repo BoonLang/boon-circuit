@@ -42,6 +42,7 @@ boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+smallvec = "1.15"
 toml = "0.9"
 sha2 = "0.10"
 chumsky = "0.9"

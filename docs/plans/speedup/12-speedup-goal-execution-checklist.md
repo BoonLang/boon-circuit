@@ -2899,11 +2899,13 @@ Notes:
     summary metadata from compiled-owned document-lowering runtime tables, so
     document lowering is no longer a missing runtime-plan section. `.boonc`
     still cannot instantiate `LoadedRuntime` because the artifact path still
-    lacks complete `runtime_plan` deserializers, an artifact-backed runtime
-    constructor, and scenario parity proof. The artifact inspection path now
-    decodes `runtime_plan.generic_derived` into runtime-owned structs, but the
-    report must keep `generic_derived_ast_free_plan` as missing until the full
-    path is executable without parser AST.
+    lacks remaining `runtime_plan` deserializers for symbols/equations/routes/
+    bindings, an artifact-backed runtime constructor, and scenario parity
+    proof. The artifact inspection path now decodes `runtime_plan.generic_derived`,
+    `runtime_plan.storage_initialization`, and `runtime_plan.document_lowering`
+    into runtime-owned structs, but the report must keep
+    `generic_derived_ast_free_plan` as missing until the full path is executable
+    without parser AST.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -4932,13 +4934,74 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   `source_reparse_attempted = false`, and
   `source_file_access = "not_attempted"`.
 - Remaining blocker: deserialize the rest of `runtime_plan` into runtime-owned
-  structs, especially storage initialization, document lowering, symbols,
-  scalar/list/source-route plans, list bindings, and any equation/action
-  expressions needed by `GenericScheduledRuntime`. Then replace the remaining
+  structs, especially symbols, scalar/list/source-route plans, list bindings,
+  and any equation/action expressions needed by `GenericScheduledRuntime`. Then
+  replace the remaining
   AST-backed `GenericDerivedPlan` dependencies in root list-view/fallback paths
   or encode equivalent runtime-plan metadata, add an artifact-backed runtime
   constructor, and only then run scenario parity before removing
   `generic_derived_ast_free_plan`.
+
+- Date: 2026-06-16
+- Task: TASK-0901B storage/document artifact deserialization slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only storage/document decoder audit from subagent
+  `019ed212-fdea-7a91-b324-3cc290c61bf4`; `cargo fmt -p boon_runtime -p
+  boon_report_schema -p xtask`; `cargo test -p boon_runtime --lib
+  compiled_artifact_decodes_storage_initialization_runtime_plan_without_ast --
+  --nocapture`; `cargo test -p boon_runtime --lib
+  compiled_artifact_decodes_document_lowering_runtime_tables_without_ast --
+  --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo test -p boon_report_schema --lib compiled_artifact --
+  --nocapture`; `cargo check -p boon_runtime -p boon_cli -p xtask`; `cargo
+  xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-report-schema`; `cargo test -p xtask`; full `cargo test -p
+  boon_runtime --lib -- --nocapture` passed with `214` tests.
+- Result: TASK-0901B remains incomplete, but two more runtime-plan sections now
+  have real typed read-side decoders. `CompiledArtifact` can reconstruct
+  `RuntimeStorageInitializationPlan` and `RuntimeDocumentLoweringTables` from
+  `.boonc` without touching source or parser AST. Storage decoding validates
+  declared counts, stable row field IDs, duplicate root/list identities,
+  duplicate row fields, list capacities, reset-list references, initializer
+  kinds, row snapshots, field values, and row templates. Document-lowering
+  decoding validates declared counts, unique set-like arrays, projection
+  resolution/unresolved separation, render slot metadata, materialization
+  policy names, `template_args_embedded_ast = false`, and exact generic
+  render-patch lowering constants.
+- Artifact/result detail: inspection reports now include
+  `runtime_plan_storage_deserialized_from_artifact = true`,
+  `runtime_plan_storage_deserialized_counts`,
+  `runtime_plan_document_lowering_deserialized_from_artifact = true`, and
+  `runtime_plan_document_lowering_deserialized_counts`. The refreshed TodoMVC
+  CLI inspection report shows storage counts `root_slot_count = 3`,
+  `list_slot_count = 2`, `initial_row_count = 4`, and document counts
+  `root_summary_path_count = 4`, `list_summary_field_count = 2`,
+  `render_slot_count = 13`. Runtime and scenario readiness booleans still
+  correctly remain false, with `source_reparse_attempted = false` and
+  `source_file_access = "not_attempted"`.
+- Remaining blocker: deserialize or reconstruct the remaining runtime-plan
+  inputs needed by `GenericScheduledRuntime`, especially runtime symbols,
+  scalar/list equations, source-route plans, list-source bindings, and
+  source/action expression tables. Then add an artifact-backed runtime
+  constructor and scenario parity gate before any report claims
+  `loaded_runtime_from_artifact`, `runtime_instantiated_from_artifact`,
+  `source_free_runtime_load_available`, or `scenario_execution_available`.
 
 ## File Maintenance Checklist
 

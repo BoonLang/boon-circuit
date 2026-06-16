@@ -2337,6 +2337,13 @@ pub fn inspect_compiled_artifact_report(
     let runtime_plan_present = artifact.body.get("runtime_plan").is_some();
     let missing_runtime_plan_sections = artifact.missing_runtime_plan_sections();
     let generic_derived_runtime_plan = artifact.runtime_generic_derived_plan()?;
+    let storage_initialization_plan = artifact.runtime_storage_initialization_plan()?;
+    let document_lowering_tables = artifact.runtime_document_lowering_tables()?;
+    let storage_initial_row_count = storage_initialization_plan
+        .list_slots
+        .iter()
+        .map(|slot| slot.initial_rows.len())
+        .sum::<usize>();
     let report = json!({
         "status": "pass",
         "report_version": 1,
@@ -2367,6 +2374,25 @@ pub fn inspect_compiled_artifact_report(
                 "root_supported_count": generic_derived_runtime_plan.supported_root_count(),
                 "indexed_supported_count": generic_derived_runtime_plan.supported_indexed_count(),
                 "unsupported_reason_count": generic_derived_runtime_plan.unsupported_reasons.len()
+            },
+            "runtime_plan_storage_deserialized_from_artifact": true,
+            "runtime_plan_storage_deserialized_counts": {
+                "root_slot_count": storage_initialization_plan.root_slots.len(),
+                "root_initial_field_copy_count": storage_initialization_plan.root_initial_field_copies.len(),
+                "list_slot_count": storage_initialization_plan.list_slots.len(),
+                "indexed_row_initial_reset_count": storage_initialization_plan.indexed_row_initial_resets.len(),
+                "initial_row_count": storage_initial_row_count
+            },
+            "runtime_plan_document_lowering_deserialized_from_artifact": true,
+            "runtime_plan_document_lowering_deserialized_counts": {
+                "root_summary_path_count": document_lowering_tables.root_summary_paths.len(),
+                "list_summary_field_count": document_lowering_tables.list_summary_fields.len(),
+                "dynamic_list_view_list_count": document_lowering_tables.dynamic_list_view_lists.len(),
+                "projection_storage_resolution_count": document_lowering_tables.projection_storage_resolutions.len(),
+                "unresolved_projection_storage_path_count": document_lowering_tables.unresolved_projection_storage_paths.len(),
+                "observed_root_path_count": document_lowering_tables.observed_root_paths.len(),
+                "render_slot_count": document_lowering_tables.render_slot_count,
+                "render_slot_failure_count": document_lowering_tables.render_slot_failure_count
             },
             "source_free_runtime_load_available": false,
             "source_reparse_required_for_current_runtime": true,
@@ -7130,6 +7156,275 @@ fn runtime_initial_value_artifact(value: &RuntimeInitialValue) -> JsonValue {
     }
 }
 
+impl RuntimeStorageInitializationPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.storage_initialization";
+        let object = artifact_object(value, context)?;
+        let format = artifact_string_field(object, "format", context)?;
+        if format != "boonc-runtime-storage-initialization-json-v1" {
+            return Err(format!("{context}.format has unsupported value `{format}`").into());
+        }
+        if !artifact_bool_field(object, "storage_runtime_ast_free", context)? {
+            return Err(format!("{context} must be AST-free").into());
+        }
+
+        let root_slots = artifact_array_field(object, "root_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                RuntimeStorageRootSlot::from_artifact(
+                    value,
+                    &format!("{context}.root_slots[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let root_initial_field_copies =
+            artifact_array_field(object, "root_initial_field_copies", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeStorageRootInitialCopy::from_artifact(
+                        value,
+                        &format!("{context}.root_initial_field_copies[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+        let list_slots = artifact_array_field(object, "list_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                RuntimeStorageListSlot::from_artifact(
+                    value,
+                    &format!("{context}.list_slots[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let indexed_row_initial_resets =
+            artifact_array_field(object, "indexed_row_initial_resets", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeStorageIndexedRowInitialReset::from_artifact(
+                        value,
+                        &format!("{context}.indexed_row_initial_resets[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+
+        artifact_count_matches(object, "root_slot_count", root_slots.len(), context)?;
+        artifact_count_matches(
+            object,
+            "root_initial_field_copy_count",
+            root_initial_field_copies.len(),
+            context,
+        )?;
+        artifact_count_matches(object, "list_slot_count", list_slots.len(), context)?;
+        artifact_count_matches(
+            object,
+            "indexed_row_initial_reset_count",
+            indexed_row_initial_resets.len(),
+            context,
+        )?;
+        let mut root_paths = BTreeSet::new();
+        for slot in &root_slots {
+            if !root_paths.insert(slot.path.as_str()) {
+                return Err(format!("{context}.root_slots duplicate root `{}`", slot.path).into());
+            }
+        }
+        let mut list_ids = BTreeSet::new();
+        let mut list_names = BTreeSet::new();
+        for slot in &list_slots {
+            if !list_ids.insert(slot.id.0) {
+                return Err(format!("{context}.list_slots duplicate id {}", slot.id.0).into());
+            }
+            if !list_names.insert(slot.name.as_str()) {
+                return Err(format!("{context}.list_slots duplicate list `{}`", slot.name).into());
+            }
+            if let Some(capacity) = slot.capacity
+                && slot.initial_rows.len() > capacity
+            {
+                return Err(format!(
+                    "{context}.list_slots list `{}` has {} initial rows beyond capacity {capacity}",
+                    slot.name,
+                    slot.initial_rows.len()
+                )
+                .into());
+            }
+        }
+        for reset in &indexed_row_initial_resets {
+            if !list_names.contains(reset.list.as_str()) {
+                return Err(format!(
+                    "{context}.indexed_row_initial_resets references unknown list `{}`",
+                    reset.list
+                )
+                .into());
+            }
+        }
+
+        Ok(Self {
+            root_slots,
+            root_initial_field_copies,
+            list_slots,
+            indexed_row_initial_resets,
+        })
+    }
+}
+
+impl RuntimeStorageRootSlot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            path: artifact_string_field(object, "path", context)?,
+            initializer: RuntimeInitialValue::from_artifact(
+                artifact_field(object, "initializer", context)?,
+                &format!("{context}.initializer"),
+            )?,
+            initial_value: field_value_from_artifact(
+                artifact_field(object, "initial_value", context)?,
+                &format!("{context}.initial_value"),
+            )?,
+        })
+    }
+}
+
+impl RuntimeStorageRootInitialCopy {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            target: artifact_string_field(object, "target", context)?,
+            source: artifact_string_field(object, "source", context)?,
+        })
+    }
+}
+
+impl RuntimeStorageListSlot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let initial_rows = artifact_array_field(object, "initial_rows", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                RuntimeRowSnapshot::from_artifact(
+                    value,
+                    &format!("{context}.initial_rows[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        artifact_count_matches(object, "initial_row_count", initial_rows.len(), context)?;
+        Ok(Self {
+            id: ListId(artifact_usize_field(object, "id", context)?),
+            name: artifact_string_field(object, "name", context)?,
+            capacity: optional_usize_field(object, "capacity", context)?,
+            row_scope: artifact_string_field(object, "row_scope", context)?,
+            synthetic_list_view_storage: artifact_bool_field(
+                object,
+                "synthetic_list_view_storage",
+                context,
+            )?,
+            initializer_kind: RuntimeStorageListInitializerKind::from_artifact(
+                artifact_field(object, "initializer", context)?,
+                &format!("{context}.initializer"),
+            )?,
+            row_template: RuntimeStorageRowTemplate::from_artifact(
+                artifact_field(object, "row_template", context)?,
+                &format!("{context}.row_template"),
+            )?,
+            initial_rows,
+        })
+    }
+}
+
+impl RuntimeStorageListInitializerKind {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "record_literal" => Ok(Self::RecordLiteral),
+            "range" => Ok(Self::Range {
+                from: artifact_i64_field(object, "from", context)?,
+                to: artifact_i64_field(object, "to", context)?,
+            }),
+            "empty" => Ok(Self::Empty),
+            "deferred_dynamic_list_view" => Ok(Self::DeferredDynamicListView),
+            "synthetic_list_view_storage" => Ok(Self::SyntheticListViewStorage),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
+impl RuntimeStorageRowTemplate {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let fields = artifact_array_field(object, "fields", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                RuntimeStorageRowFieldTemplate::from_artifact(
+                    value,
+                    &format!("{context}.fields[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        artifact_count_matches(object, "field_count", fields.len(), context)?;
+        Ok(Self { fields })
+    }
+}
+
+impl RuntimeStorageRowFieldTemplate {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let field_name = artifact_string_field(object, "field", context)?;
+        let field_id = artifact_usize_field(object, "field_id", context)?;
+        if field_id != stable_runtime_field_id(&field_name) {
+            return Err(
+                format!("{context}.field_id does not match stable id for `{field_name}`").into(),
+            );
+        }
+        Ok(Self {
+            field_name,
+            initial_value: RuntimeInitialValue::from_artifact(
+                artifact_field(object, "initial_value", context)?,
+                &format!("{context}.initial_value"),
+            )?,
+            missing_row_initial_value: optional_field_value_from_artifact(
+                object,
+                "missing_row_initial_value",
+                context,
+            )?,
+        })
+    }
+}
+
+impl RuntimeStorageIndexedRowInitialReset {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            target_field: artifact_string_field(object, "target_field", context)?,
+            source_field: artifact_string_field(object, "source_field", context)?,
+            original_source_path: artifact_string_field(object, "original_source_path", context)?,
+        })
+    }
+}
+
+impl RuntimeInitialValue {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "text" => Ok(Self::Text(artifact_string_field(object, "value", context)?)),
+            "number" => Ok(Self::Number(artifact_i64_field(object, "value", context)?)),
+            "bool" => Ok(Self::Bool(artifact_bool_field(object, "value", context)?)),
+            "enum" => Ok(Self::Enum(artifact_string_field(object, "value", context)?)),
+            "root_initial_field" => Ok(Self::RootInitialField {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "row_initial_field" => Ok(Self::RowInitialField {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> JsonValue {
     json!({
         "format": "boonc-runtime-generic-derived-partial-json-v1",
@@ -7747,6 +8042,18 @@ fn runtime_row_snapshot_artifact(row: &RuntimeRowSnapshot) -> JsonValue {
     })
 }
 
+impl RuntimeRowSnapshot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            columns: ValueColumns::from_artifact(
+                artifact_field(object, "fields", context)?,
+                &format!("{context}.fields"),
+            )?,
+        })
+    }
+}
+
 fn value_columns_artifact(columns: &ValueColumns) -> JsonValue {
     let mut fields = Vec::new();
     fields.extend(columns.text.iter().map(|slot| {
@@ -7798,6 +8105,31 @@ fn value_columns_artifact(columns: &ValueColumns) -> JsonValue {
     JsonValue::Array(fields)
 }
 
+impl ValueColumns {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let mut columns = Self::default();
+        let mut seen_fields = BTreeSet::new();
+        for (index, value) in artifact_array(value, context)?.iter().enumerate() {
+            let field_context = format!("{context}[{index}]");
+            let object = artifact_object(value, &field_context)?;
+            let field = artifact_string_field(object, "field", &field_context)?;
+            let field_id = artifact_usize_field(object, "field_id", &field_context)?;
+            if field_id != stable_runtime_field_id(&field) {
+                return Err(format!(
+                    "{field_context}.field_id does not match stable id for `{field}`"
+                )
+                .into());
+            }
+            if !seen_fields.insert(field.clone()) {
+                return Err(format!("{field_context} duplicates row field `{field}`").into());
+            }
+            let value = field_value_from_artifact(value, &field_context)?;
+            columns.insert_value(field, value);
+        }
+        Ok(columns)
+    }
+}
+
 fn runtime_document_lowering_tables_artifact(tables: &RuntimeDocumentLoweringTables) -> JsonValue {
     json!({
         "format": "boonc-document-lowering-runtime-tables-json-v1",
@@ -7825,6 +8157,124 @@ fn runtime_document_lowering_tables_artifact(tables: &RuntimeDocumentLoweringTab
     })
 }
 
+impl RuntimeDocumentLoweringTables {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.document_lowering";
+        let object = artifact_object(value, context)?;
+        let format = artifact_string_field(object, "format", context)?;
+        if format != "boonc-document-lowering-runtime-tables-json-v1" {
+            return Err(format!("{context}.format has unsupported value `{format}`").into());
+        }
+        if !artifact_bool_field(object, "document_lowering_runtime_ast_free", context)? {
+            return Err(format!("{context} must be AST-free").into());
+        }
+
+        let root_summary_paths =
+            artifact_string_array_field(object, "root_summary_paths", context)?;
+        ensure_unique_strings(
+            &root_summary_paths,
+            &format!("{context}.root_summary_paths"),
+        )?;
+        let list_summary_fields = artifact_array_field(object, "list_summary_fields", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                ListSummaryFields::from_artifact(
+                    value,
+                    &format!("{context}.list_summary_fields[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let dynamic_list_view_lists =
+            artifact_string_set_field(object, "dynamic_list_view_lists", context)?;
+        let projection_storage_resolutions =
+            artifact_string_map_field(object, "projection_storage_resolutions", context)?;
+        artifact_count_matches(
+            object,
+            "projection_storage_resolution_count",
+            projection_storage_resolutions.len(),
+            context,
+        )?;
+        let unresolved_projection_storage_paths =
+            artifact_string_set_field(object, "unresolved_projection_storage_paths", context)?;
+        for path in projection_storage_resolutions.keys() {
+            if unresolved_projection_storage_paths.contains(path) {
+                return Err(format!(
+                    "{context}.unresolved_projection_storage_paths overlaps resolved projection `{path}`"
+                )
+                .into());
+            }
+        }
+
+        let render_slots = artifact_array_field(object, "render_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                RuntimeDocumentRenderSlot::from_artifact(
+                    value,
+                    &format!("{context}.render_slots[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        artifact_count_matches(object, "render_slot_count", render_slots.len(), context)?;
+        let render_slot_failure_count =
+            artifact_usize_field(object, "render_slot_failure_count", context)?;
+        if render_slot_failure_count > render_slots.len() {
+            return Err(
+                format!("{context}.render_slot_failure_count exceeds render_slot_count").into(),
+            );
+        }
+
+        Ok(Self {
+            summary_limits: RuntimeDocumentSummaryLimits::from_artifact(
+                artifact_field(object, "summary_limits", context)?,
+                &format!("{context}.summary_limits"),
+            )?,
+            root_summary_paths,
+            list_summary_fields,
+            dynamic_list_view_lists,
+            projection_storage_resolutions,
+            unresolved_projection_storage_paths,
+            render_slot_table_hash: artifact_string_field(
+                object,
+                "render_slot_table_hash",
+                context,
+            )?,
+            render_slot_count: render_slots.len(),
+            render_slot_failure_count,
+            full_document_typecheck_coverage: artifact_bool_field(
+                object,
+                "full_document_typecheck_coverage",
+                context,
+            )?,
+            list_map_binding_count_render_slot_materialization: artifact_usize_field(
+                object,
+                "list_map_binding_count_render_slot_materialization",
+                context,
+            )?,
+            observed_root_paths: artifact_string_set_field(object, "observed_root_paths", context)?,
+            render_slots,
+            render_patch_lowering: RuntimeRenderPatchLoweringTables::from_artifact(
+                artifact_field(object, "render_patch_lowering", context)?,
+                &format!("{context}.render_patch_lowering"),
+            )?,
+        })
+    }
+}
+
+impl ListSummaryFields {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let fields = artifact_string_array_field(object, "fields", context)?;
+        ensure_unique_strings(&fields, &format!("{context}.fields"))?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            row_scope: artifact_string_field(object, "row_scope", context)?,
+            fields,
+        })
+    }
+}
+
 fn runtime_document_summary_limits_artifact(limits: &RuntimeDocumentSummaryLimits) -> JsonValue {
     json!({
         "preview_list_row_start": limits.preview_list_row_start,
@@ -7835,6 +8285,37 @@ fn runtime_document_summary_limits_artifact(limits: &RuntimeDocumentSummaryLimit
         "preview_chunk_columns": limits.preview_chunk_columns,
         "windowed_limits_are_request_driven": limits.windowed_limits_are_request_driven
     })
+}
+
+impl RuntimeDocumentSummaryLimits {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            preview_list_row_start: artifact_usize_field(
+                object,
+                "preview_list_row_start",
+                context,
+            )?,
+            preview_list_rows: optional_usize_field(object, "preview_list_rows", context)?,
+            preview_chunk_row_start: artifact_usize_field(
+                object,
+                "preview_chunk_row_start",
+                context,
+            )?,
+            preview_chunk_rows: optional_usize_field(object, "preview_chunk_rows", context)?,
+            preview_chunk_column_start: artifact_usize_field(
+                object,
+                "preview_chunk_column_start",
+                context,
+            )?,
+            preview_chunk_columns: optional_usize_field(object, "preview_chunk_columns", context)?,
+            windowed_limits_are_request_driven: artifact_bool_field(
+                object,
+                "windowed_limits_are_request_driven",
+                context,
+            )?,
+        })
+    }
 }
 
 fn string_map_artifact(map: &BTreeMap<String, String>) -> JsonValue {
@@ -7870,6 +8351,35 @@ fn runtime_document_render_slot_artifact(slot: &RuntimeDocumentRenderSlot) -> Js
     })
 }
 
+impl RuntimeDocumentRenderSlot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        if artifact_bool_field(object, "template_args_embedded_ast", context)? {
+            return Err(format!("{context}.template_args_embedded_ast must be false").into());
+        }
+        Ok(Self {
+            slot_statement_id: artifact_usize_field(object, "slot_statement_id", context)?,
+            slot_name: artifact_string_field(object, "slot_name", context)?,
+            expected_contract: artifact_string_field(object, "expected_contract", context)?,
+            value_expr_id: optional_usize_field(object, "value_expr_id", context)?,
+            actual_type: artifact_field(object, "actual_type", context)?.clone(),
+            diagnostic_count: artifact_usize_field(object, "diagnostic_count", context)?,
+            optional_list_map_binding_id: optional_usize_field(
+                object,
+                "optional_list_map_binding_id",
+                context,
+            )?,
+            item_scope_id: optional_usize_field(object, "item_scope_id", context)?,
+            template_function: optional_string_field(object, "template_function", context)?,
+            template_arg_count: artifact_usize_field(object, "template_arg_count", context)?,
+            materialization_policy: RuntimeDocumentMaterializationPolicy::from_artifact(
+                &artifact_string_field(object, "materialization_policy", context)?,
+                &format!("{context}.materialization_policy"),
+            )?,
+        })
+    }
+}
+
 fn runtime_render_patch_lowering_artifact(tables: &RuntimeRenderPatchLoweringTables) -> JsonValue {
     json!({
         "lowerer": "generic_render_patch_lowering",
@@ -7882,6 +8392,74 @@ fn runtime_render_patch_lowering_artifact(tables: &RuntimeRenderPatchLoweringTab
         "row_mutation_patch_kinds": ["PatchListRowField"],
         "structural_patch_kinds": ["InvalidateDocument"]
     })
+}
+
+impl RuntimeDocumentMaterializationPolicy {
+    fn from_artifact(value: &str, context: &str) -> RuntimeResult<Self> {
+        match value {
+            "runtime_value" => Ok(Self::RuntimeValue),
+            "render_slot_materialization" => Ok(Self::RenderSlotMaterialization),
+            "static_children" => Ok(Self::StaticChildren),
+            other => Err(format!("{context} has unsupported value `{other}`").into()),
+        }
+    }
+}
+
+impl RuntimeRenderPatchLoweringTables {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        expect_artifact_string_field(object, "lowerer", "generic_render_patch_lowering", context)?;
+        let tables = Self::generic();
+        expect_artifact_string_field(
+            object,
+            "root_patch_target_kind",
+            tables.root_patch_target_kind,
+            context,
+        )?;
+        expect_artifact_string_field(
+            object,
+            "row_field_patch_target_kind",
+            tables.row_field_patch_target_kind,
+            context,
+        )?;
+        expect_artifact_string_field(
+            object,
+            "structural_invalidation_target",
+            tables.structural_invalidation_target,
+            context,
+        )?;
+        expect_artifact_bool_field(
+            object,
+            "semantic_only_root_patch_suppression",
+            tables.semantic_only_root_patch_suppression,
+            context,
+        )?;
+        expect_artifact_bool_field(
+            object,
+            "observed_root_filtering",
+            tables.observed_root_filtering,
+            context,
+        )?;
+        expect_artifact_string_array_field(
+            object,
+            "root_mutation_patch_kinds",
+            &["PatchRootField"],
+            context,
+        )?;
+        expect_artifact_string_array_field(
+            object,
+            "row_mutation_patch_kinds",
+            &["PatchListRowField"],
+            context,
+        )?;
+        expect_artifact_string_array_field(
+            object,
+            "structural_patch_kinds",
+            &["InvalidateDocument"],
+            context,
+        )?;
+        Ok(tables)
+    }
 }
 
 fn scalar_equation_plan_artifact(plan: &ScalarEquationPlan) -> JsonValue {
@@ -8328,6 +8906,42 @@ fn field_value_artifact(value: &FieldValue) -> JsonValue {
     }
 }
 
+fn field_value_from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<FieldValue> {
+    let object = artifact_object(value, context)?;
+    match artifact_string_field(object, "kind", context)?.as_str() {
+        "text" => Ok(FieldValue::Text(artifact_string_field(
+            object, "value", context,
+        )?)),
+        "bool" => Ok(FieldValue::Bool(artifact_bool_field(
+            object, "value", context,
+        )?)),
+        "enum" => Ok(FieldValue::Enum(artifact_string_field(
+            object, "value", context,
+        )?)),
+        "json" => Ok(FieldValue::Json(
+            artifact_field(object, "value", context)?.clone(),
+        )),
+        other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+    }
+}
+
+fn optional_field_value_from_artifact(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<FieldValue>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(field_value_from_artifact(
+        value,
+        &format!("{context}.{key}"),
+    )?))
+}
+
 fn list_source_binding_plan_artifact(plan: &ListSourceBindingPlan) -> JsonValue {
     json!({
         "list_slots": plan.list_slots.iter().map(list_source_binding_slot_artifact).collect::<Vec<_>>()
@@ -8406,6 +9020,25 @@ fn optional_string_field(
         .ok_or_else(|| format!("{context}.{key} is not a string or null").into())
 }
 
+fn optional_usize_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<usize>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("{context}.{key} is not a non-negative integer or null"))?;
+    Ok(Some(usize::try_from(value).map_err(|_| {
+        format!("{context}.{key} does not fit in usize")
+    })?))
+}
+
 fn artifact_string_array_field(
     object: &serde_json::Map<String, JsonValue>,
     key: &str,
@@ -8421,6 +9054,47 @@ fn artifact_string_array_field(
                 .ok_or_else(|| format!("{context}.{key}[{index}] is not a string").into())
         })
         .collect()
+}
+
+fn artifact_string_map_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<BTreeMap<String, String>> {
+    let map = artifact_field(object, key, context)?
+        .as_object()
+        .ok_or_else(|| format!("{context}.{key} is not an object"))?;
+    map.iter()
+        .map(|(name, value)| {
+            Ok((
+                name.clone(),
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{context}.{key}.{name} is not a string"))?,
+            ))
+        })
+        .collect()
+}
+
+fn artifact_string_set_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<BTreeSet<String>> {
+    let values = artifact_string_array_field(object, key, context)?;
+    ensure_unique_strings(&values, &format!("{context}.{key}"))?;
+    Ok(values.into_iter().collect())
+}
+
+fn ensure_unique_strings(values: &[String], context: &str) -> RuntimeResult<()> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !seen.insert(value) {
+            return Err(format!("{context} duplicates `{value}`").into());
+        }
+    }
+    Ok(())
 }
 
 fn artifact_bool_field(
@@ -8487,6 +9161,52 @@ fn artifact_count_matches(
         Ok(())
     } else {
         Err(format!("{context}.{key} expected {expected}, decoded {actual}").into())
+    }
+}
+
+fn expect_artifact_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    expected: &str,
+    context: &str,
+) -> RuntimeResult<()> {
+    let actual = artifact_string_field(object, key, context)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context}.{key} expected `{expected}`, decoded `{actual}`").into())
+    }
+}
+
+fn expect_artifact_bool_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    expected: bool,
+    context: &str,
+) -> RuntimeResult<()> {
+    let actual = artifact_bool_field(object, key, context)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context}.{key} expected `{expected}`, decoded `{actual}`").into())
+    }
+}
+
+fn expect_artifact_string_array_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    expected: &[&str],
+    context: &str,
+) -> RuntimeResult<()> {
+    let actual = artifact_string_array_field(object, key, context)?;
+    let expected = expected
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context}.{key} expected {expected:?}, decoded {actual:?}").into())
     }
 }
 
@@ -8589,6 +9309,26 @@ impl CompiledArtifact {
                 .get("runtime_plan")
                 .and_then(|plan| plan.get("generic_derived"))
                 .ok_or("compiled artifact missing runtime_plan.generic_derived")?,
+        )
+    }
+
+    fn runtime_storage_initialization_plan(
+        &self,
+    ) -> RuntimeResult<RuntimeStorageInitializationPlan> {
+        RuntimeStorageInitializationPlan::from_artifact(
+            self.body
+                .get("runtime_plan")
+                .and_then(|plan| plan.get("storage_initialization"))
+                .ok_or("compiled artifact missing runtime_plan.storage_initialization")?,
+        )
+    }
+
+    fn runtime_document_lowering_tables(&self) -> RuntimeResult<RuntimeDocumentLoweringTables> {
+        RuntimeDocumentLoweringTables::from_artifact(
+            self.body
+                .get("runtime_plan")
+                .and_then(|plan| plan.get("document_lowering"))
+                .ok_or("compiled artifact missing runtime_plan.document_lowering")?,
         )
     }
 
@@ -40163,6 +40903,212 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn compiled_artifact_decodes_storage_initialization_runtime_plan_without_ast() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-storage-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, _, _) = example_paths(example).unwrap();
+            let artifact_path = temp_root.join(format!("{example}.boonc"));
+            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+            let decoded = artifact.runtime_storage_initialization_plan().unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+
+            assert_eq!(
+                decoded.root_slots.len(),
+                compiled.storage_initialization.root_slots.len(),
+                "decoded root slot count differs for {example}"
+            );
+            assert_eq!(
+                decoded.list_slots.len(),
+                compiled.storage_initialization.list_slots.len(),
+                "decoded list slot count differs for {example}"
+            );
+            let decoded_storage = decoded.instantiate_storage().unwrap();
+            let planned_storage = compiled
+                .storage_initialization
+                .instantiate_storage()
+                .unwrap();
+            assert_eq!(
+                decoded_storage.root, planned_storage.root,
+                "decoded root storage differs for {example}"
+            );
+            assert_eq!(
+                decoded_storage.lists.list_slots.len(),
+                planned_storage.lists.list_slots.len(),
+                "decoded list slot count differs for {example}"
+            );
+            for (decoded_slot, planned_slot) in decoded_storage
+                .lists
+                .list_slots
+                .iter()
+                .zip(planned_storage.lists.list_slots.iter())
+            {
+                assert_eq!(
+                    decoded_slot.name, planned_slot.name,
+                    "decoded list name differs for {example}"
+                );
+                assert_eq!(
+                    decoded_slot.capacity, planned_slot.capacity,
+                    "decoded capacity differs for {} in {example}",
+                    decoded_slot.name
+                );
+                assert_eq!(
+                    decoded_slot.memory.visible_snapshots(),
+                    planned_slot.memory.visible_snapshots(),
+                    "decoded initial rows differ for {} in {example}",
+                    decoded_slot.name
+                );
+            }
+        }
+
+        let artifact_path = temp_root.join("cells.boonc");
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let decoded = artifact.runtime_storage_initialization_plan().unwrap();
+        let mut corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["storage_initialization"]["list_slot_count"] =
+            json!(decoded.list_slots.len() + 1);
+        let error = RuntimeStorageInitializationPlan::from_artifact(
+            &corrupt["runtime_plan"]["storage_initialization"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("list_slot_count"),
+            "wrong storage list count should fail decoding, got {error}"
+        );
+        corrupt = artifact.body.clone();
+        let (slot_index, field_index) =
+            corrupt["runtime_plan"]["storage_initialization"]["list_slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .find_map(|(slot_index, slot)| {
+                    slot["row_template"]["fields"]
+                        .as_array()
+                        .and_then(|fields| (!fields.is_empty()).then_some((slot_index, 0)))
+                })
+                .expect("Cells artifact should have at least one row-template field");
+        corrupt["runtime_plan"]["storage_initialization"]["list_slots"][slot_index]["row_template"]
+            ["fields"][field_index]["field_id"] = json!(usize::MAX);
+        let error = RuntimeStorageInitializationPlan::from_artifact(
+            &corrupt["runtime_plan"]["storage_initialization"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("field_id"),
+            "wrong row-template field id should fail decoding, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn compiled_artifact_decodes_document_lowering_runtime_tables_without_ast() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-document-lowering-decode-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, _, _) = example_paths(example).unwrap();
+            let artifact_path = temp_root.join(format!("{example}.boonc"));
+            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+            let decoded = artifact.runtime_document_lowering_tables().unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+            let expected_root_state_paths = compiled.root_state_paths.clone();
+            let expected_list_summary_fields = compiled.list_summary_fields.clone();
+            let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
+
+            assert_eq!(
+                decoded.root_summary_paths, compiled.document_lowering.root_summary_paths,
+                "decoded root summary paths differ for {example}"
+            );
+            assert_eq!(
+                decoded.list_summary_fields, compiled.document_lowering.list_summary_fields,
+                "decoded list summary fields differ for {example}"
+            );
+            assert_eq!(
+                decoded.dynamic_list_view_lists, compiled.document_lowering.dynamic_list_view_lists,
+                "decoded dynamic list-view set differs for {example}"
+            );
+            assert_eq!(
+                decoded.projection_storage_resolutions,
+                compiled.document_lowering.projection_storage_resolutions,
+                "decoded projection storage resolutions differ for {example}"
+            );
+            assert_eq!(
+                decoded.render_slot_table_hash, compiled.document_lowering.render_slot_table_hash,
+                "decoded render slot table hash differs for {example}"
+            );
+            assert_eq!(
+                decoded.render_slot_count, compiled.document_lowering.render_slot_count,
+                "decoded render slot count differs for {example}"
+            );
+
+            compiled.document_lowering = decoded;
+            compiled.root_state_paths.clear();
+            compiled.list_summary_fields.clear();
+            compiled.dynamic_list_view_lists.clear();
+            let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+            assert_eq!(
+                runtime.root_state_paths, expected_root_state_paths,
+                "runtime did not use decoded document root paths for {example}"
+            );
+            assert_eq!(
+                runtime.list_summary_fields, expected_list_summary_fields,
+                "runtime did not use decoded document list summary fields for {example}"
+            );
+            assert_eq!(
+                runtime.dynamic_list_view_lists, expected_dynamic_list_view_lists,
+                "runtime did not use decoded document dynamic list-view set for {example}"
+            );
+        }
+
+        let artifact_path = temp_root.join("todomvc.boonc");
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let decoded = artifact.runtime_document_lowering_tables().unwrap();
+        let mut corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["document_lowering"]["render_slot_count"] =
+            json!(decoded.render_slots.len() + 1);
+        let error = RuntimeDocumentLoweringTables::from_artifact(
+            &corrupt["runtime_plan"]["document_lowering"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("render_slot_count"),
+            "wrong render slot count should fail decoding, got {error}"
+        );
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["document_lowering"]["render_patch_lowering"]["root_patch_target_kind"] =
+            json!("wrong");
+        let error = RuntimeDocumentLoweringTables::from_artifact(
+            &corrupt["runtime_plan"]["document_lowering"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("root_patch_target_kind"),
+            "wrong render patch lowering constant should fail decoding, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
         let parsed = parse_source(
             "examples/todomvc.bn",
@@ -40443,6 +41389,30 @@ FUNCTION decorate(value) {
                 .as_object()
                 .is_some_and(|counts| counts
                     .get("root_supported_count")
+                    .and_then(JsonValue::as_u64)
+                    .is_some())
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_storage_deserialized_from_artifact"],
+            json!(true)
+        );
+        assert!(
+            loaded["inspection_result"]["runtime_plan_storage_deserialized_counts"]
+                .as_object()
+                .is_some_and(|counts| counts
+                    .get("list_slot_count")
+                    .and_then(JsonValue::as_u64)
+                    .is_some())
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_document_lowering_deserialized_from_artifact"],
+            json!(true)
+        );
+        assert!(
+            loaded["inspection_result"]["runtime_plan_document_lowering_deserialized_counts"]
+                .as_object()
+                .is_some_and(|counts| counts
+                    .get("render_slot_count")
                     .and_then(JsonValue::as_u64)
                     .is_some())
         );

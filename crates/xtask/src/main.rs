@@ -1565,6 +1565,25 @@ fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn st
             "compiled artifact inspection must deserialize generic-derived runtime plan".into(),
         );
     }
+    if report_value
+        .pointer("/inspection_result/runtime_plan_storage_deserialized_from_artifact")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact inspection must deserialize storage initialization runtime plan"
+                .into(),
+        );
+    }
+    if report_value
+        .pointer("/inspection_result/runtime_plan_document_lowering_deserialized_from_artifact")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact inspection must deserialize document lowering runtime tables".into(),
+        );
+    }
     Ok(())
 }
 

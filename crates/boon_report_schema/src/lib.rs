@@ -394,6 +394,10 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "runtime_plan_present",
         "runtime_plan_generic_derived_deserialized_from_artifact",
         "runtime_plan_generic_derived_deserialized_counts",
+        "runtime_plan_storage_deserialized_from_artifact",
+        "runtime_plan_storage_deserialized_counts",
+        "runtime_plan_document_lowering_deserialized_from_artifact",
+        "runtime_plan_document_lowering_deserialized_counts",
         "source_free_runtime_load_available",
         "source_reparse_required_for_current_runtime",
         "source_reparse_attempted",
@@ -427,6 +431,14 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             != Some(false)
         || inspection
             .get("runtime_plan_generic_derived_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
+            .get("runtime_plan_storage_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
+            .get("runtime_plan_document_lowering_deserialized_from_artifact")
             .and_then(JsonValue::as_bool)
             != Some(true)
         || inspection
@@ -474,6 +486,65 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         {
             return Err(format!(
                 "{} inspection_result runtime_plan_generic_derived_deserialized_counts missing `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let storage_counts = inspection
+        .get("runtime_plan_storage_deserialized_counts")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result runtime_plan_storage_deserialized_counts is not an object",
+                path.display()
+            )
+        })?;
+    for key in [
+        "root_slot_count",
+        "root_initial_field_copy_count",
+        "list_slot_count",
+        "indexed_row_initial_reset_count",
+        "initial_row_count",
+    ] {
+        if storage_counts
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} inspection_result runtime_plan_storage_deserialized_counts missing `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let document_counts = inspection
+        .get("runtime_plan_document_lowering_deserialized_counts")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result runtime_plan_document_lowering_deserialized_counts is not an object",
+                path.display()
+            )
+        })?;
+    for key in [
+        "root_summary_path_count",
+        "list_summary_field_count",
+        "dynamic_list_view_list_count",
+        "projection_storage_resolution_count",
+        "unresolved_projection_storage_path_count",
+        "observed_root_path_count",
+        "render_slot_count",
+        "render_slot_failure_count",
+    ] {
+        if document_counts
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} inspection_result runtime_plan_document_lowering_deserialized_counts missing `{key}`",
                 path.display()
             )
             .into());
@@ -5004,6 +5075,25 @@ mod tests {
                     "root_supported_count": 1,
                     "indexed_supported_count": 0,
                     "unsupported_reason_count": 0
+                },
+                "runtime_plan_storage_deserialized_from_artifact": true,
+                "runtime_plan_storage_deserialized_counts": {
+                    "root_slot_count": 1,
+                    "root_initial_field_copy_count": 0,
+                    "list_slot_count": 1,
+                    "indexed_row_initial_reset_count": 0,
+                    "initial_row_count": 0
+                },
+                "runtime_plan_document_lowering_deserialized_from_artifact": true,
+                "runtime_plan_document_lowering_deserialized_counts": {
+                    "root_summary_path_count": 1,
+                    "list_summary_field_count": 0,
+                    "dynamic_list_view_list_count": 0,
+                    "projection_storage_resolution_count": 0,
+                    "unresolved_projection_storage_path_count": 0,
+                    "observed_root_path_count": 0,
+                    "render_slot_count": 0,
+                    "render_slot_failure_count": 0
                 },
                 "source_free_runtime_load_available": false,
                 "source_reparse_required_for_current_runtime": true,

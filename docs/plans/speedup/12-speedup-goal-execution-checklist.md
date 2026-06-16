@@ -2898,8 +2898,10 @@ Notes:
     missing runtime-plan section. The normal source runtime also reads document
     summary metadata from compiled-owned document-lowering runtime tables, so
     document lowering is no longer a missing runtime-plan section. `.boonc`
-    still cannot instantiate `LoadedRuntime` because the plan lacks AST-free
-    generic-derived execution.
+    still cannot instantiate `LoadedRuntime` because the artifact path still
+    lacks real `runtime_plan` deserializers, an artifact-backed runtime
+    constructor, and scenario parity proof; the report must keep
+    `generic_derived_ast_free_plan` as missing until that path is executable.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -4796,6 +4798,78 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   real `runtime_plan` deserializers and an artifact-backed runtime constructor
   before removing `generic_derived_ast_free_plan` or claiming source-free
   runtime load.
+
+- Date: 2026-06-16
+- Task: TASK-0901B runtime-owned Cells function/list-view generic-derived
+  slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: Cells runtime-derived audit from subagent
+  `019ed1e4-b69e-7c52-b8f2-5b0a505931eb`; artifact-load readiness audit
+  from subagent `019ed1e4-ca24-7000-bebd-651a1f13dc5b`; `cargo fmt -p
+  boon_runtime`; `cargo test -p boon_runtime --lib
+  runtime_generic_user_functions_execute_without_ast_bodies -- --nocapture`;
+  `cargo test -p boon_runtime --lib
+  cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions_without_ast
+  -- --nocapture`; `cargo test -p boon_runtime --lib
+  generic_derived_runtime_plan_executes_supported_fields_without_ast_statements
+  -- --nocapture`; regression reruns for
+  `indexed_filter_retain_map_join_pipeline_fuses_cursor_value_shape`,
+  `indexed_pipeline_reorders_text_equal_filters_by_bucket_size`,
+  `mapped_root_list_function_filters_segments_with_store_cursor`, and
+  `root_list_view_field_cache_reuses_stable_fields_across_cursor_change`;
+  full `cargo test -p boon_runtime --lib -- --nocapture` passed with `211`
+  tests; `cargo xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo
+  xtask verify-report-schema`; `jq` inspection of
+  `runtime_plan.generic_derived` and artifact inspection booleans.
+- Result: TASK-0901B remains incomplete, but Cells no longer has generic
+  runtime-derived coverage blockers. `RuntimeGenericDerivedPlan` now owns the
+  reachable user-function closure for supported root/indexed fields, serializes
+  those functions in `runtime_plan.generic_derived`, and can execute runtime
+  user functions without legacy AST statements. Runtime generic statements now
+  preserve field bindings so `BLOCK { local: ... }` locals work. Runtime
+  builtins now cover the Cells path through `List/find`, `List/find_value`,
+  `List/chunk`, `List/get`, `List/map`, `List/sum`, `List/range`, and the
+  needed text helpers.
+- Cause learned from the failed full-suite experiment: generic root `ListView`
+  execution for `List/map` bypassed the existing optimized root-list-view
+  materializer, so field-cache/row-identity/profile counters did not run and
+  eight root-list-view cache/patch tests failed. The kept fix is an explicit
+  dispatch boundary: source-backed runtime execution still uses the optimized
+  root `ListView` materializer, while the runtime-owned plan is still compiled
+  and reported for future artifact loading. This avoids replacing a proven fast
+  path with a slower generic evaluator until the artifact path can preserve the
+  same row identity, cache, and profile semantics.
+- Artifact/result detail: refreshed Cells coverage is `function_count = 11`,
+  `root_supported_count = 2`, `indexed_supported_count = 6`, and
+  `unsupported_reasons = {}`. Refreshed TodoMVC coverage is
+  `function_count = 0`, `root_supported_count = 5`,
+  `indexed_supported_count = 2`, and `unsupported_reasons = {}`. All inspected
+  artifacts still correctly report
+  `missing_runtime_plan_sections = ["generic_derived_ast_free_plan"]`,
+  `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`,
+  `scenario_execution_available = false`,
+  `source_reparse_attempted = false`, and
+  `source_file_access = "not_attempted"`.
+- Remaining blocker: add real `runtime_plan` deserializers, build
+  `LoadedRuntime`/`GenericScheduledRuntime` from `.boonc` without source or
+  parser AST, and run scenario parity from that artifact before removing
+  `generic_derived_ast_free_plan` or claiming source-free runtime load.
 
 ## File Maintenance Checklist
 

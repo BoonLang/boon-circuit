@@ -5060,9 +5060,17 @@ enum RuntimeInitialValue {
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeGenericDerivedPlan {
+    functions: BTreeMap<String, RuntimeGenericFunction>,
     root_fields: Vec<RuntimeGenericDerivedRootField>,
     indexed_fields: Vec<RuntimeGenericDerivedIndexedField>,
     unsupported_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericFunction {
+    name: String,
+    args: Vec<String>,
+    statement: RuntimeGenericStatement,
 }
 
 #[derive(Clone, Debug)]
@@ -5088,6 +5096,10 @@ struct RuntimeGenericDerivedIndexedField {
 enum RuntimeGenericStatement {
     Empty,
     Expr(RuntimeGenericExpr),
+    Binding {
+        name: String,
+        value: Box<RuntimeGenericStatement>,
+    },
     ExprWithChildren {
         expr: RuntimeGenericExpr,
         children: Vec<RuntimeGenericStatement>,
@@ -5740,6 +5752,23 @@ impl RuntimeInitialValue {
 impl RuntimeGenericDerivedPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
         let mut plan = Self::default();
+        let function_names = ir
+            .functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut compiled_functions = BTreeMap::new();
+        let mut unsupported_functions = BTreeMap::new();
+        for function in &ir.functions {
+            match RuntimeGenericFunction::from_ir(function, &ir.expressions, &function_names) {
+                Ok(compiled) => {
+                    compiled_functions.insert(function.name.clone(), compiled);
+                }
+                Err(reason) => {
+                    unsupported_functions.insert(function.name.clone(), reason);
+                }
+            }
+        }
         for value in ir.derived_values.iter().filter(|value| {
             !value.indexed
                 && value.scope_id.is_none()
@@ -5750,7 +5779,11 @@ impl RuntimeGenericDerivedPlan {
                         | DerivedValueKind::ListView
                 )
         }) {
-            let compiled = RuntimeGenericStatement::from_ast(&value.statement, &ir.expressions);
+            let compiled = RuntimeGenericStatement::from_ast(
+                &value.statement,
+                &ir.expressions,
+                &function_names,
+            );
             let (statement, unsupported_reason) = match compiled {
                 Ok(statement) => (Some(statement), None),
                 Err(reason) => {
@@ -5782,7 +5815,11 @@ impl RuntimeGenericDerivedPlan {
                 let Some(list) = list else {
                     continue;
                 };
-                let compiled = RuntimeGenericStatement::from_ast(&value.statement, &ir.expressions);
+                let compiled = RuntimeGenericStatement::from_ast(
+                    &value.statement,
+                    &ir.expressions,
+                    &function_names,
+                );
                 let (statement, unsupported_reason) = match compiled {
                     Ok(statement) => (Some(statement), None),
                     Err(reason) => {
@@ -5800,6 +5837,53 @@ impl RuntimeGenericDerivedPlan {
                 });
             }
         }
+        let reachable_functions =
+            plan.reachable_function_names(&compiled_functions, &unsupported_functions);
+        for function in &reachable_functions.missing {
+            let reason = unsupported_functions
+                .get(function)
+                .map(|reason| format!("function:{function}:{reason}"))
+                .unwrap_or_else(|| format!("function:{function}:missing"));
+            *plan.unsupported_reasons.entry(reason).or_default() += 1;
+        }
+        for field in &mut plan.root_fields {
+            if let Some(statement) = field.statement.as_ref()
+                && let Some(function) = runtime_statement_missing_function(
+                    statement,
+                    &compiled_functions,
+                    &unsupported_functions,
+                )
+            {
+                let reason = unsupported_functions
+                    .get(&function)
+                    .map(|reason| format!("function:{function}:{reason}"))
+                    .unwrap_or_else(|| format!("function:{function}:missing"));
+                field.statement = None;
+                field.unsupported_reason = Some(reason.clone());
+                *plan.unsupported_reasons.entry(reason).or_default() += 1;
+            }
+        }
+        for field in &mut plan.indexed_fields {
+            if let Some(statement) = field.statement.as_ref()
+                && let Some(function) = runtime_statement_missing_function(
+                    statement,
+                    &compiled_functions,
+                    &unsupported_functions,
+                )
+            {
+                let reason = unsupported_functions
+                    .get(&function)
+                    .map(|reason| format!("function:{function}:{reason}"))
+                    .unwrap_or_else(|| format!("function:{function}:missing"));
+                field.statement = None;
+                field.unsupported_reason = Some(reason.clone());
+                *plan.unsupported_reasons.entry(reason).or_default() += 1;
+            }
+        }
+        plan.functions = compiled_functions
+            .into_iter()
+            .filter(|(name, _)| reachable_functions.supported.contains(name))
+            .collect();
         plan
     }
 
@@ -5831,21 +5915,105 @@ impl RuntimeGenericDerivedPlan {
             .filter(|field| field.statement.is_some())
             .count()
     }
+
+    fn function(&self, function: &str) -> Option<&RuntimeGenericFunction> {
+        self.functions.get(function).or_else(|| {
+            function
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| self.functions.get(suffix))
+        })
+    }
+
+    fn reachable_function_names(
+        &self,
+        functions: &BTreeMap<String, RuntimeGenericFunction>,
+        unsupported_functions: &BTreeMap<String, String>,
+    ) -> ReachableRuntimeFunctions {
+        let mut pending = Vec::new();
+        for statement in self
+            .root_fields
+            .iter()
+            .filter_map(|field| field.statement.as_ref())
+            .chain(
+                self.indexed_fields
+                    .iter()
+                    .filter_map(|field| field.statement.as_ref()),
+            )
+        {
+            statement.collect_user_function_calls(functions, unsupported_functions, &mut pending);
+        }
+
+        let mut supported = BTreeSet::new();
+        let mut missing = BTreeSet::new();
+        while let Some(function) = pending.pop() {
+            if supported.contains(&function) || missing.contains(&function) {
+                continue;
+            }
+            if let Some(definition) = functions.get(&function) {
+                supported.insert(function.clone());
+                definition.statement.collect_user_function_calls(
+                    functions,
+                    unsupported_functions,
+                    &mut pending,
+                );
+            } else {
+                missing.insert(function);
+            }
+        }
+        ReachableRuntimeFunctions { supported, missing }
+    }
+}
+
+#[derive(Default)]
+struct ReachableRuntimeFunctions {
+    supported: BTreeSet<String>,
+    missing: BTreeSet<String>,
+}
+
+impl RuntimeGenericFunction {
+    fn from_ir(
+        function: &FunctionDefinition,
+        expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            name: function.name.clone(),
+            args: function.args.clone(),
+            statement: RuntimeGenericStatement::from_ast(
+                &function.statement,
+                expressions,
+                functions,
+            )?,
+        })
+    }
 }
 
 impl RuntimeGenericStatement {
-    fn from_ast(statement: &AstStatement, expressions: &[AstExpr]) -> Result<Self, String> {
+    fn from_ast(
+        statement: &AstStatement,
+        expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
+    ) -> Result<Self, String> {
         if statement.children.is_empty() {
-            return statement
+            let value = statement
                 .expr
-                .map(|expr| RuntimeGenericExpr::from_ast(expr, expressions).map(Self::Expr))
-                .unwrap_or(Ok(Self::Empty));
+                .map(|expr| {
+                    RuntimeGenericExpr::from_ast(expr, expressions, functions).map(Self::Expr)
+                })
+                .unwrap_or(Ok(Self::Empty))?;
+            if let AstStatementKind::Field { name } = &statement.kind {
+                return Ok(Self::Binding {
+                    name: name.clone(),
+                    value: Box::new(value),
+                });
+            }
+            return Ok(value);
         }
         if statement.expr.is_none()
             && statement.children.len() == 1
             && matches!(statement.children[0].kind, AstStatementKind::Expression)
         {
-            return Self::from_ast(&statement.children[0], expressions);
+            return Self::from_ast(&statement.children[0], expressions, functions);
         }
         if statement.expr.is_some_and(|expr| {
             expressions
@@ -5855,7 +6023,7 @@ impl RuntimeGenericStatement {
             return statement
                 .children
                 .iter()
-                .map(|child| Self::from_ast(child, expressions))
+                .map(|child| Self::from_ast(child, expressions, functions))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Self::Latest);
         }
@@ -5863,20 +6031,28 @@ impl RuntimeGenericStatement {
             && matches!(statement.kind, AstStatementKind::List { field: None, .. })
             && record_statement_children(&statement.children)
         {
-            return RuntimeGenericRecordField::from_ast_children(&statement.children, expressions)
-                .map(Self::Record);
+            return RuntimeGenericRecordField::from_ast_children(
+                &statement.children,
+                expressions,
+                functions,
+            )
+            .map(Self::Record);
         }
         if matches!(statement.kind, AstStatementKind::List { .. }) {
             return statement
                 .children
                 .iter()
-                .map(|child| Self::from_ast(child, expressions))
+                .map(|child| Self::from_ast(child, expressions, functions))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Self::List);
         }
         if statement.expr.is_none() && record_statement_children(&statement.children) {
-            return RuntimeGenericRecordField::from_ast_children(&statement.children, expressions)
-                .map(Self::Record);
+            return RuntimeGenericRecordField::from_ast_children(
+                &statement.children,
+                expressions,
+                functions,
+            )
+            .map(Self::Record);
         }
         if statement.expr.is_none()
             && statement.children.len() == 1
@@ -5886,29 +6062,85 @@ impl RuntimeGenericStatement {
             return RuntimeGenericRecordField::from_ast_children(
                 &statement.children[0].children,
                 expressions,
+                functions,
             )
             .map(Self::Record);
         }
         if let Some(expr) = statement.expr {
-            return RuntimeGenericExpr::from_ast(expr, expressions).and_then(|expr| {
-                if statement.children.is_empty() {
-                    Ok(Self::Expr(expr))
+            return RuntimeGenericExpr::from_ast(expr, expressions, functions).and_then(|expr| {
+                let value = if statement.children.is_empty() {
+                    Self::Expr(expr)
                 } else {
                     statement
                         .children
                         .iter()
-                        .map(|child| Self::from_ast(child, expressions))
+                        .map(|child| Self::from_ast(child, expressions, functions))
                         .collect::<Result<Vec<_>, _>>()
-                        .map(|children| Self::ExprWithChildren { expr, children })
+                        .map(|children| Self::ExprWithChildren { expr, children })?
+                };
+                if let AstStatementKind::Field { name } = &statement.kind {
+                    Ok(Self::Binding {
+                        name: name.clone(),
+                        value: Box::new(value),
+                    })
+                } else {
+                    Ok(value)
                 }
             });
         }
-        statement
+        let value = statement
             .children
             .iter()
-            .map(|child| Self::from_ast(child, expressions))
+            .map(|child| Self::from_ast(child, expressions, functions))
             .collect::<Result<Vec<_>, _>>()
-            .map(Self::Block)
+            .map(Self::Block)?;
+        if let AstStatementKind::Field { name } = &statement.kind {
+            Ok(Self::Binding {
+                name: name.clone(),
+                value: Box::new(value),
+            })
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn collect_user_function_calls(
+        &self,
+        functions: &BTreeMap<String, RuntimeGenericFunction>,
+        unsupported_functions: &BTreeMap<String, String>,
+        output: &mut Vec<String>,
+    ) {
+        match self {
+            RuntimeGenericStatement::Empty => {}
+            RuntimeGenericStatement::Expr(expr) => {
+                expr.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericStatement::Binding { value, .. } => {
+                value.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                expr.collect_user_function_calls(functions, unsupported_functions, output);
+                for child in children {
+                    child.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericStatement::Block(statements)
+            | RuntimeGenericStatement::List(statements)
+            | RuntimeGenericStatement::Latest(statements) => {
+                for statement in statements {
+                    statement.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericStatement::Record(fields) => {
+                for field in fields {
+                    field.value.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -5916,6 +6148,7 @@ impl RuntimeGenericRecordField {
     fn from_ast_children(
         children: &[AstStatement],
         expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
     ) -> Result<Vec<Self>, String> {
         children
             .iter()
@@ -5923,7 +6156,7 @@ impl RuntimeGenericRecordField {
                 let name = record_statement_child_name(child)
                     .ok_or_else(|| "record_child_name".to_owned())?
                     .to_owned();
-                RuntimeGenericStatement::from_ast(child, expressions)
+                RuntimeGenericStatement::from_ast(child, expressions, functions)
                     .map(|value| RuntimeGenericRecordField { name, value })
             })
             .collect()
@@ -5931,7 +6164,11 @@ impl RuntimeGenericRecordField {
 }
 
 impl RuntimeGenericExpr {
-    fn from_ast(expr_id: usize, expressions: &[AstExpr]) -> Result<Self, String> {
+    fn from_ast(
+        expr_id: usize,
+        expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
+    ) -> Result<Self, String> {
         let expr = expressions
             .get(expr_id)
             .ok_or_else(|| "missing_expr".to_owned())?;
@@ -5949,49 +6186,53 @@ impl RuntimeGenericExpr {
             AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(Self::Enum(value.clone())),
             AstExprKind::TaggedObject { tag, fields } => Ok(Self::TaggedObject {
                 tag: tag.clone(),
-                fields: RuntimeGenericRecordExprField::from_ast_fields(fields, expressions)?,
+                fields: RuntimeGenericRecordExprField::from_ast_fields(
+                    fields,
+                    expressions,
+                    functions,
+                )?,
             }),
             AstExprKind::Call { function, args } => {
-                runtime_generic_call_supported(function)?;
+                runtime_generic_call_supported(function, functions)?;
                 Ok(Self::Call {
                     function: function.clone(),
-                    args: RuntimeGenericArg::from_ast_args(args, expressions)?,
+                    args: RuntimeGenericArg::from_ast_args(args, expressions, functions)?,
                 })
             }
             AstExprKind::Pipe { input, op, args } => {
-                runtime_generic_call_supported(op)?;
+                runtime_generic_call_supported(op, functions)?;
                 Ok(Self::Pipe {
-                    input: Box::new(Self::from_ast(*input, expressions)?),
+                    input: Box::new(Self::from_ast(*input, expressions, functions)?),
                     op: op.clone(),
-                    args: RuntimeGenericArg::from_ast_args(args, expressions)?,
+                    args: RuntimeGenericArg::from_ast_args(args, expressions, functions)?,
                 })
             }
             AstExprKind::Infix { left, op, right } => Ok(Self::Infix {
-                left: Box::new(Self::from_ast(*left, expressions)?),
+                left: Box::new(Self::from_ast(*left, expressions, functions)?),
                 op: op.clone(),
-                right: Box::new(Self::from_ast(*right, expressions)?),
+                right: Box::new(Self::from_ast(*right, expressions, functions)?),
             }),
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => Ok(Self::Record(
-                RuntimeGenericRecordExprField::from_ast_fields(fields, expressions)?,
+                RuntimeGenericRecordExprField::from_ast_fields(fields, expressions, functions)?,
             )),
             AstExprKind::ListLiteral { items, .. } => items
                 .iter()
-                .map(|item| Self::from_ast(*item, expressions))
+                .map(|item| Self::from_ast(*item, expressions, functions))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Self::List),
             AstExprKind::Then { input, output } => Ok(Self::Then {
-                input: Box::new(Self::from_ast(*input, expressions)?),
+                input: Box::new(Self::from_ast(*input, expressions, functions)?),
                 output: output
-                    .map(|output| Self::from_ast(output, expressions).map(Box::new))
+                    .map(|output| Self::from_ast(output, expressions, functions).map(Box::new))
                     .transpose()?,
             }),
             AstExprKind::When { input } => Ok(Self::When {
-                input: Box::new(Self::from_ast(*input, expressions)?),
+                input: Box::new(Self::from_ast(*input, expressions, functions)?),
             }),
             AstExprKind::MatchArm { pattern, output } => Ok(Self::MatchArm {
                 pattern: pattern.clone(),
                 output: output
-                    .map(|output| Self::from_ast(output, expressions).map(Box::new))
+                    .map(|output| Self::from_ast(output, expressions, functions).map(Box::new))
                     .transpose()?,
             }),
             AstExprKind::Delimiter => Ok(Self::Delimiter),
@@ -6003,19 +6244,99 @@ impl RuntimeGenericExpr {
             }
         }
     }
+
+    fn collect_user_function_calls(
+        &self,
+        functions: &BTreeMap<String, RuntimeGenericFunction>,
+        unsupported_functions: &BTreeMap<String, String>,
+        output: &mut Vec<String>,
+    ) {
+        match self {
+            RuntimeGenericExpr::Call { function, args } => {
+                collect_runtime_user_function_call(
+                    function,
+                    functions,
+                    unsupported_functions,
+                    output,
+                );
+                for arg in args {
+                    arg.value
+                        .collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Pipe { input, op, args } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+                collect_runtime_user_function_call(op, functions, unsupported_functions, output);
+                for arg in args {
+                    arg.value
+                        .collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Infix { left, right, .. } => {
+                left.collect_user_function_calls(functions, unsupported_functions, output);
+                right.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::TaggedObject { fields, .. }
+            | RuntimeGenericExpr::Record(fields) => {
+                for field in fields {
+                    field.value.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+            RuntimeGenericExpr::List(items) => {
+                for item in items {
+                    item.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Then {
+                input,
+                output: then_output,
+            } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+                if let Some(output_expr) = then_output {
+                    output_expr.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+            RuntimeGenericExpr::When { input } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::MatchArm {
+                output: Some(output_expr),
+                ..
+            } => {
+                output_expr.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::Identifier(_)
+            | RuntimeGenericExpr::Path(_)
+            | RuntimeGenericExpr::Text(_)
+            | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::Bool(_)
+            | RuntimeGenericExpr::Enum(_)
+            | RuntimeGenericExpr::MatchArm { output: None, .. }
+            | RuntimeGenericExpr::Delimiter => {}
+        }
+    }
 }
 
 impl RuntimeGenericRecordExprField {
     fn from_ast_fields(
         fields: &[AstRecordField],
         expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
     ) -> Result<Vec<Self>, String> {
         fields
             .iter()
             .map(|field| {
                 Ok(Self {
                     name: field.name.clone(),
-                    value: RuntimeGenericExpr::from_ast(field.value, expressions)?,
+                    value: RuntimeGenericExpr::from_ast(field.value, expressions, functions)?,
                     spread: field.spread,
                 })
             })
@@ -6024,22 +6345,33 @@ impl RuntimeGenericRecordExprField {
 }
 
 impl RuntimeGenericArg {
-    fn from_ast_args(args: &[AstCallArg], expressions: &[AstExpr]) -> Result<Vec<Self>, String> {
+    fn from_ast_args(
+        args: &[AstCallArg],
+        expressions: &[AstExpr],
+        functions: &BTreeSet<String>,
+    ) -> Result<Vec<Self>, String> {
         args.iter()
             .map(|arg| {
                 Ok(Self {
                     name: arg.name.clone(),
-                    value: RuntimeGenericExpr::from_ast(arg.value, expressions)?,
+                    value: RuntimeGenericExpr::from_ast(arg.value, expressions, functions)?,
                 })
             })
             .collect()
     }
 }
 
-fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
+fn runtime_generic_call_supported(
+    function: &str,
+    functions: &BTreeSet<String>,
+) -> Result<(), String> {
     if function.strip_prefix("Field/").is_some()
         || is_generic_render_constructor(function)
         || is_light_constructor(function)
+        || functions.contains(function)
+        || function
+            .rsplit_once('/')
+            .is_some_and(|(_, suffix)| functions.contains(suffix))
     {
         return Ok(());
     }
@@ -6048,6 +6380,11 @@ fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
         | "Text/empty"
         | "Text/concat"
         | "Text/trim"
+        | "Text/to_number"
+        | "Text/starts_with"
+        | "Text/substring"
+        | "Text/length"
+        | "Text/find"
         | "Text/is_empty"
         | "Text/is_not_empty"
         | "Number/min"
@@ -6058,6 +6395,13 @@ fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
         | "Bool/and"
         | "WHEN"
         | "WHILE"
+        | "List/range"
+        | "List/find"
+        | "List/find_value"
+        | "List/chunk"
+        | "List/get"
+        | "List/map"
+        | "List/sum"
         | "List/retain"
         | "List/every"
         | "List/any"
@@ -6067,6 +6411,65 @@ fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
         | "Router/go_to" => Ok(()),
         _ => Err(format!("call:{function}")),
     }
+}
+
+fn collect_runtime_user_function_call(
+    function: &str,
+    functions: &BTreeMap<String, RuntimeGenericFunction>,
+    unsupported_functions: &BTreeMap<String, String>,
+    output: &mut Vec<String>,
+) {
+    if let Some(name) = resolve_runtime_generic_function_name(function, functions.keys()) {
+        output.push(name);
+        return;
+    }
+    if let Some(name) =
+        resolve_runtime_generic_function_name(function, unsupported_functions.keys())
+    {
+        output.push(name);
+    }
+}
+
+fn runtime_statement_missing_function(
+    statement: &RuntimeGenericStatement,
+    functions: &BTreeMap<String, RuntimeGenericFunction>,
+    unsupported_functions: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut pending = Vec::new();
+    statement.collect_user_function_calls(functions, unsupported_functions, &mut pending);
+    let mut seen = BTreeSet::new();
+    while let Some(function) = pending.pop() {
+        if !seen.insert(function.clone()) {
+            continue;
+        }
+        if unsupported_functions.contains_key(&function) {
+            return Some(function);
+        }
+        let Some(definition) = functions.get(&function) else {
+            return Some(function);
+        };
+        definition.statement.collect_user_function_calls(
+            functions,
+            unsupported_functions,
+            &mut pending,
+        );
+    }
+    None
+}
+
+fn resolve_runtime_generic_function_name<'a, I>(function: &str, names: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let names = names.into_iter().collect::<Vec<_>>();
+    if names.iter().any(|name| name.as_str() == function) {
+        return Some(function.to_owned());
+    }
+    let suffix = function.rsplit_once('/').map(|(_, suffix)| suffix)?;
+    names
+        .into_iter()
+        .find(|name| name.as_str() == suffix)
+        .cloned()
 }
 
 fn runtime_generic_expr_kind_label(kind: &AstExprKind) -> &'static str {
@@ -6724,11 +7127,13 @@ fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> Js
         "format": "boonc-runtime-generic-derived-partial-json-v1",
         "generic_derived_runtime_ast_free": true,
         "partial_coverage": true,
+        "function_count": plan.functions.len(),
         "root_field_count": plan.root_fields.len(),
         "indexed_field_count": plan.indexed_fields.len(),
         "root_supported_count": plan.supported_root_count(),
         "indexed_supported_count": plan.supported_indexed_count(),
         "unsupported_reasons": usize_map_artifact(&plan.unsupported_reasons),
+        "functions": plan.functions.values().map(runtime_generic_function_artifact).collect::<Vec<_>>(),
         "root_fields": plan.root_fields.iter().map(runtime_generic_derived_root_field_artifact).collect::<Vec<_>>(),
         "indexed_fields": plan.indexed_fields.iter().map(runtime_generic_derived_indexed_field_artifact).collect::<Vec<_>>(),
         "excluded_parser_ast_sections": [
@@ -6736,6 +7141,14 @@ fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> Js
             "AstExpr",
             "FunctionDefinition"
         ]
+    })
+}
+
+fn runtime_generic_function_artifact(function: &RuntimeGenericFunction) -> JsonValue {
+    json!({
+        "name": function.name,
+        "args": function.args,
+        "statement": runtime_generic_statement_artifact(&function.statement)
     })
 }
 
@@ -6772,6 +7185,11 @@ fn runtime_generic_statement_artifact(statement: &RuntimeGenericStatement) -> Js
         RuntimeGenericStatement::Expr(expr) => {
             json!({ "kind": "expr", "expr": runtime_generic_expr_artifact(expr) })
         }
+        RuntimeGenericStatement::Binding { name, value } => json!({
+            "kind": "binding",
+            "name": name,
+            "value": runtime_generic_statement_artifact(value)
+        }),
         RuntimeGenericStatement::ExprWithChildren { expr, children } => json!({
             "kind": "expr_with_children",
             "expr": runtime_generic_expr_artifact(expr),
@@ -17959,10 +18377,15 @@ impl GenericScheduledRuntime {
         statement: &AstStatement,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let runtime_statement = self
-            .generic_derived_runtime
-            .root_field_plan(path)
-            .and_then(|field| field.statement.clone());
+        let runtime_statement =
+            self.generic_derived_runtime
+                .root_field_plan(path)
+                .and_then(|field| {
+                    if matches!(&field.kind, DerivedValueKind::ListView) {
+                        return None;
+                    }
+                    field.statement.clone()
+                });
         if let Some(statement) = runtime_statement {
             self.eval_runtime_generic_statement(&statement, frame)
         } else {
@@ -18349,6 +18772,11 @@ impl GenericScheduledRuntime {
         match statement {
             RuntimeGenericStatement::Empty => Ok(BoonValue::Empty),
             RuntimeGenericStatement::Expr(expr) => self.eval_runtime_generic_expr(expr, frame),
+            RuntimeGenericStatement::Binding { name, value } => {
+                let value = self.eval_runtime_generic_statement(value, frame)?;
+                frame.env.insert(name.clone(), value.clone());
+                Ok(value)
+            }
             RuntimeGenericStatement::ExprWithChildren { expr, children } => {
                 self.eval_runtime_generic_expr_with_children(expr, children, frame)
             }
@@ -18424,6 +18852,9 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<BoonValue> {
         frame.consume_budget()?;
         match expr {
+            RuntimeGenericExpr::Identifier(name) if name == "BLOCK" => {
+                self.eval_runtime_generic_statement_block(children, frame)
+            }
             RuntimeGenericExpr::Pipe { input, op, .. } if op == "WHILE" || op == "WHEN" => {
                 let input = self.eval_runtime_generic_expr(input, frame)?;
                 self.eval_runtime_generic_while(input, children, frame)
@@ -18748,6 +19179,74 @@ impl GenericScheduledRuntime {
                     value.as_text().unwrap_or_default().trim().to_owned(),
                 ))
             }
+            "Text/to_number" => {
+                let piped = input.is_some();
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                let radix_position = if piped { 0 } else { 1 };
+                let radix = self
+                    .runtime_named_or_positional_arg_value(args, "radix", radix_position, frame)
+                    .ok()
+                    .and_then(|value| value.number().ok())
+                    .unwrap_or(10);
+                let leading = self
+                    .runtime_named_arg_value(args, "leading", frame)
+                    .ok()
+                    .and_then(|value| value.bool_value().ok())
+                    .unwrap_or(false);
+                let fallback = self
+                    .runtime_named_arg_value(args, "fallback", frame)
+                    .ok()
+                    .and_then(|value| value.number().ok());
+                Ok(
+                    parse_text_number(&value.as_text().unwrap_or_default(), radix, leading)
+                        .or(fallback)
+                        .map(BoonValue::Number)
+                        .unwrap_or(BoonValue::NaN),
+                )
+            }
+            "Text/starts_with" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                let prefix = self.runtime_named_arg_value(args, "prefix", frame)?;
+                Ok(BoonValue::Bool(
+                    value
+                        .as_text()
+                        .unwrap_or_default()
+                        .starts_with(&prefix.as_text().unwrap_or_default()),
+                ))
+            }
+            "Text/substring" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                let start = self
+                    .runtime_named_arg_value(args, "start", frame)?
+                    .number()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let length = self
+                    .runtime_named_arg_value(args, "length", frame)?
+                    .number()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let text = value.as_text().unwrap_or_default();
+                Ok(BoonValue::Text(
+                    text.chars().skip(start).take(length).collect::<String>(),
+                ))
+            }
+            "Text/length" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Number(
+                    value.as_text().unwrap_or_default().chars().count() as i64,
+                ))
+            }
+            "Text/find" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                let needle = self.runtime_named_arg_value(args, "needle", frame)?;
+                let text = value.as_text().unwrap_or_default();
+                let needle = needle.as_text().unwrap_or_default();
+                Ok(text
+                    .find(&needle)
+                    .map(|index| BoonValue::Number(index as i64))
+                    .unwrap_or(BoonValue::NaN))
+            }
             "Text/is_empty" => {
                 let value = self.runtime_call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Bool(
@@ -18848,6 +19347,83 @@ impl GenericScheduledRuntime {
                     left.bool_value().unwrap_or(false) && right.bool_value().unwrap_or(false),
                 ))
             }
+            "List/range" => {
+                let from = self
+                    .runtime_named_arg_value(args, "from", frame)?
+                    .number()
+                    .unwrap_or(0);
+                let to = self
+                    .runtime_named_arg_value(args, "to", frame)?
+                    .number()
+                    .unwrap_or(-1);
+                let values = if from <= to {
+                    (from..=to).map(BoonValue::Number).collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(BoonValue::List(values))
+            }
+            "List/find" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let field = self
+                    .runtime_field_name_arg(args, "field", frame)?
+                    .ok_or("List/find requires field")?;
+                let expected = self.runtime_named_arg_value(args, "value", frame)?;
+                self.list_find(list, &field, expected, frame)
+            }
+            "List/find_value" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let field = self
+                    .runtime_field_name_arg(args, "field", frame)?
+                    .ok_or("List/find_value requires field")?;
+                let expected = self.runtime_named_arg_value(args, "value", frame)?;
+                let target = self
+                    .runtime_field_name_arg(args, "target", frame)?
+                    .ok_or("List/find_value requires target")?;
+                let fallback = self
+                    .runtime_named_arg_value(args, "fallback", frame)
+                    .unwrap_or(BoonValue::Empty);
+                self.list_find_value(list, &field, expected, &target, fallback, frame)
+            }
+            "List/chunk" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let size = self
+                    .runtime_named_arg_value(args, "size", frame)?
+                    .number()
+                    .unwrap_or(0);
+                let item_field = self
+                    .runtime_field_name_arg(args, "items", frame)?
+                    .ok_or("List/chunk requires items field")?;
+                let label_field = self
+                    .runtime_field_name_arg(args, "label", frame)?
+                    .ok_or("List/chunk requires label field")?;
+                self.runtime_list_chunk(list, size, &item_field, &label_field, frame)
+            }
+            "List/get" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let index = self
+                    .runtime_named_arg_value(args, "index", frame)?
+                    .number()
+                    .unwrap_or(-1);
+                self.list_get(list, index, frame)
+            }
+            "List/map" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(runtime_generic_raw_arg_name)
+                    .ok_or("List/map requires an item binding")?;
+                let new_expr = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("new"))
+                    .ok_or("List/map requires new expression")?;
+                self.runtime_list_map(list, &binding, &new_expr.value, frame)
+            }
+            "List/sum" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                self.list_sum(list, frame)
+            }
             "List/retain" => {
                 let list = self.runtime_call_input_or_first(input, args, frame)?;
                 let binding = args
@@ -18911,9 +19487,7 @@ impl GenericScheduledRuntime {
                 let value = self.runtime_call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Text(value.as_text().unwrap_or_default()))
             }
-            _ => Ok(BoonValue::Error(
-                "unsupported_runtime_generic_call".to_owned(),
-            )),
+            _ => self.eval_runtime_user_function(function, args, input, frame),
         }
     }
 
@@ -18990,6 +19564,202 @@ impl GenericScheduledRuntime {
             .nth(position)
             .ok_or_else(|| format!("generic runtime call requires `{name}`"))?;
         self.eval_runtime_generic_expr(&arg.value, frame)
+    }
+
+    fn runtime_raw_named_arg(&self, args: &[RuntimeGenericArg], name: &str) -> Option<String> {
+        args.iter()
+            .find(|arg| arg.name.as_deref() == Some(name))
+            .and_then(runtime_generic_raw_arg_name)
+    }
+
+    fn runtime_field_name_arg(
+        &mut self,
+        args: &[RuntimeGenericArg],
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<String>> {
+        if let Some(raw) = self.runtime_raw_named_arg(args, name) {
+            if raw != "TEXT" {
+                return Ok(Some(checked_boon_field_name(&raw)?));
+            }
+        }
+        let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) else {
+            return Ok(None);
+        };
+        self.eval_runtime_generic_expr(&arg.value, frame)?
+            .as_text()
+            .map(|value| checked_boon_field_name(&value))
+            .transpose()
+    }
+
+    fn runtime_list_map(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        new_expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let previous = frame.env.get(binding).cloned();
+        let mut output = Vec::with_capacity(values.len());
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            let mapped = self.eval_runtime_generic_expr(new_expr, frame)?;
+            if !matches!(mapped, BoonValue::Empty | BoonValue::Error(_)) {
+                output.push(self.list_value_for_pipeline(mapped, frame)?);
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::List(output))
+    }
+
+    fn runtime_list_chunk(
+        &mut self,
+        list: BoonValue,
+        size: i64,
+        item_field: &str,
+        label_field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let size = usize::try_from(size).ok().filter(|size| *size > 0);
+        let Some(size) = size else {
+            return Ok(BoonValue::List(Vec::new()));
+        };
+        let values = self.list_values_for_iteration(list, frame)?;
+        let mut rows = Vec::with_capacity(values.len().div_ceil(size));
+        for (row_index, chunk) in values.chunks(size).enumerate() {
+            let mut row = BTreeMap::new();
+            row.insert(
+                label_field.to_owned(),
+                BoonValue::Text(row_index.to_string()),
+            );
+            row.insert("index".to_owned(), BoonValue::Number(row_index as i64));
+            let mut items = Vec::with_capacity(chunk.len());
+            for item in chunk {
+                items.push(self.list_value_for_pipeline(item.clone(), frame)?);
+            }
+            row.insert(item_field.to_owned(), BoonValue::List(items));
+            rows.push(BoonValue::Record(row));
+        }
+        Ok(BoonValue::List(rows))
+    }
+
+    fn eval_runtime_user_function(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let Some(definition) = self.generic_derived_runtime.function(function).cloned() else {
+            return Ok(BoonValue::Error("parse_error".to_owned()));
+        };
+        if frame.call_depth > 128 {
+            return Err(format!("generic function `{function}` call budget exhausted").into());
+        }
+        let call_started = self.function_call_profiling_enabled.then(Instant::now);
+        with_root_list_view_attribution(frame, |profile| {
+            profile.user_function_call_count = profile.user_function_call_count.saturating_add(1);
+        });
+        let mut child = frame.child();
+        child.call_depth += 1;
+        let mut resolved_args = Vec::new();
+        if let Some(input) = input.clone()
+            && let Some(first) = definition.args.first()
+        {
+            child.env.insert(first.clone(), input);
+        }
+        let arg_eval_started = Instant::now();
+        for (position, arg) in args.iter().enumerate() {
+            let value = self.eval_runtime_generic_expr(&arg.value, frame)?;
+            let name = arg
+                .name
+                .clone()
+                .or_else(|| definition.args.get(position).cloned())
+                .ok_or_else(|| format!("generic function `{function}` has too many arguments"))?;
+            if name == "PASS" {
+                child.env.insert("PASSED".to_owned(), value.clone());
+            }
+            child.env.insert(name.clone(), value.clone());
+            resolved_args.push((name, value));
+        }
+        with_root_list_view_attribution(frame, |profile| {
+            profile.user_function_arg_eval_ms += runtime_elapsed_ms(arg_eval_started);
+        });
+        let cache_key_started = Instant::now();
+        let cache_key =
+            runtime_generic_function_cache_key(&definition, frame, input.as_ref(), &resolved_args);
+        with_root_list_view_attribution(frame, |profile| {
+            profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
+        });
+        let cache_hit_started = Instant::now();
+        if let Some(entry) = self
+            .generic_derived_state
+            .function_value_cache
+            .get(&cache_key)
+            .cloned()
+        {
+            let read_key_count = entry.reads.len();
+            let numeric_guard_count = entry.numeric_stability_guards.len();
+            with_root_list_view_attribution(frame, |profile| {
+                profile.user_function_cache_hit_count =
+                    profile.user_function_cache_hit_count.saturating_add(1);
+                profile.user_function_cache_hit_read_key_count = profile
+                    .user_function_cache_hit_read_key_count
+                    .saturating_add(read_key_count);
+                profile.user_function_cache_hit_numeric_guard_count = profile
+                    .user_function_cache_hit_numeric_guard_count
+                    .saturating_add(numeric_guard_count);
+                profile.user_function_cache_hit_ms += runtime_elapsed_ms(cache_hit_started);
+            });
+            frame.reads.extend(entry.reads);
+            frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
+            if let Some(call_started) = call_started {
+                self.record_function_call_sample(
+                    &definition.name,
+                    frame,
+                    runtime_elapsed_ms(call_started),
+                    true,
+                );
+            }
+            return Ok(entry.value);
+        }
+        let body_started = Instant::now();
+        let value = self.eval_runtime_generic_statement(&definition.statement, &mut child)?;
+        with_root_list_view_attribution(frame, |profile| {
+            profile.user_function_body_ms += runtime_elapsed_ms(body_started);
+        });
+        let reads = child.reads;
+        let numeric_stability_guards = child.numeric_stability_guards;
+        let read_key_count = reads.len();
+        let numeric_guard_count = numeric_stability_guards.len();
+        frame.reads.extend(reads.iter().cloned());
+        frame.merge_numeric_stability_guards(numeric_stability_guards.clone());
+        with_root_list_view_attribution(frame, |profile| {
+            profile.user_function_body_read_key_count = profile
+                .user_function_body_read_key_count
+                .saturating_add(read_key_count);
+            profile.user_function_body_numeric_guard_count = profile
+                .user_function_body_numeric_guard_count
+                .saturating_add(numeric_guard_count);
+        });
+        self.generic_derived_state.function_value_cache.insert(
+            cache_key,
+            GenericFunctionValueCacheEntry {
+                value: value.clone(),
+                reads,
+                numeric_stability_guards,
+            },
+        );
+        if let Some(call_started) = call_started {
+            self.record_function_call_sample(
+                &definition.name,
+                frame,
+                runtime_elapsed_ms(call_started),
+                false,
+            );
+        }
+        Ok(value)
     }
 
     fn runtime_list_retain(
@@ -31972,6 +32742,34 @@ fn runtime_generic_raw_arg_name(arg: &RuntimeGenericArg) -> Option<String> {
     }
 }
 
+fn runtime_generic_function_cache_key(
+    definition: &RuntimeGenericFunction,
+    frame: &GenericEvalFrame,
+    input: Option<&BoonValue>,
+    args: &[(String, BoonValue)],
+) -> String {
+    let mut parts = Vec::with_capacity(
+        2 + usize::from(frame.row.is_some())
+            + frame.env.len()
+            + usize::from(input.is_some())
+            + args.len(),
+    );
+    parts.push(format!("rt-fn:{}", definition.name));
+    if let Some(row) = &frame.row {
+        parts.push(format!("row:{}:{}", row.list, row.index));
+    }
+    for (name, value) in &frame.env {
+        parts.push(format!("env:{name}:{}", boon_value_cache_fragment(value)));
+    }
+    if let Some(input) = input {
+        parts.push(format!("input:{}", boon_value_cache_fragment(input)));
+    }
+    for (name, value) in args {
+        parts.push(format!("arg:{name}:{}", boon_value_cache_fragment(value)));
+    }
+    parts.join("\u{1f}")
+}
+
 fn restore_runtime_generic_binding(
     frame: &mut GenericEvalFrame,
     binding: &str,
@@ -38727,7 +39525,9 @@ FUNCTION icon_code(item) {
             .collect::<BTreeSet<_>>();
         let poison = empty_ast_statement_for_test();
         for field in &mut compiled.generic_derived.root_fields {
-            if supported_roots.contains(&field.path) {
+            if supported_roots.contains(&field.path)
+                && !matches!(&field.kind, DerivedValueKind::ListView)
+            {
                 field.statement = poison.clone();
             }
         }
@@ -38767,6 +39567,158 @@ FUNCTION icon_code(item) {
             4,
             "visible_todos should materialize from the runtime-owned block plan"
         );
+    }
+
+    #[test]
+    fn runtime_generic_user_functions_execute_without_ast_bodies() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { ready } |> HOLD noop {
+            LATEST {
+                sources.noop.text
+            }
+        }
+    decorated:
+        decorate(value: TEXT { raw })
+]
+
+document: Document/new(root: Element/label(element: [], label: store.decorated))
+
+FUNCTION decorate(value) {
+    BLOCK {
+        suffix: TEXT { ok }
+        value |> Text/concat(with: suffix, separator: TEXT { - })
+    }
+}
+"#;
+        let parsed = parse_source("runtime-user-function.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        assert!(
+            compiled
+                .generic_derived_runtime
+                .functions
+                .contains_key("decorate"),
+            "runtime plan should own the reachable user function body"
+        );
+        assert!(
+            compiled
+                .generic_derived_runtime
+                .unsupported_reasons
+                .is_empty(),
+            "runtime user-function fixture should be fully AST-free supported: {:?}",
+            compiled.generic_derived_runtime.unsupported_reasons
+        );
+        let poison = empty_ast_statement_for_test();
+        for field in &mut compiled.generic_derived.root_fields {
+            if field.path == "store.decorated" {
+                field.statement = poison.clone();
+            }
+        }
+        for function in compiled.generic_derived.functions.values_mut() {
+            function.statement = poison.clone();
+        }
+
+        let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        assert_eq!(
+            runtime.storage.root_textlike("store.decorated").unwrap(),
+            "raw-ok"
+        );
+    }
+
+    #[test]
+    fn cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions_without_ast() {
+        let parsed = parse_cells_project_for_test();
+        let ir = lower(&parsed).unwrap();
+        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        assert_eq!(
+            compiled.generic_derived_runtime.supported_root_count(),
+            2,
+            "Cells should support selected_input and sheet_rows root list views"
+        );
+        assert_eq!(
+            compiled.generic_derived_runtime.supported_indexed_count(),
+            6,
+            "Cells should support all indexed derived row fields"
+        );
+        assert!(
+            compiled
+                .generic_derived_runtime
+                .unsupported_reasons
+                .is_empty(),
+            "Cells runtime generic-derived plan should have no blockers: {:?}",
+            compiled.generic_derived_runtime.unsupported_reasons
+        );
+        for function in [
+            "cell_address",
+            "default_formula_for_address",
+            "compute_value",
+        ] {
+            assert!(
+                compiled
+                    .generic_derived_runtime
+                    .functions
+                    .contains_key(function),
+                "runtime plan should include reachable Cells function `{function}`"
+            );
+        }
+
+        let runtime_executed_supported_roots = compiled
+            .generic_derived_runtime
+            .root_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .filter(|field| !matches!(&field.kind, DerivedValueKind::ListView))
+            .map(|field| field.path.clone())
+            .collect::<BTreeSet<_>>();
+        let supported_indexed = compiled
+            .generic_derived_runtime
+            .indexed_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .map(|field| (field.list.clone(), field.field.clone()))
+            .collect::<BTreeSet<_>>();
+        let reachable_functions = compiled
+            .generic_derived_runtime
+            .functions
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let poison = empty_ast_statement_for_test();
+        for field in &mut compiled.generic_derived.root_fields {
+            if runtime_executed_supported_roots.contains(&field.path) {
+                field.statement = poison.clone();
+            }
+        }
+        for field in &mut compiled.generic_derived.indexed_fields {
+            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
+                field.statement = poison.clone();
+            }
+        }
+        for (name, function) in &mut compiled.generic_derived.functions {
+            if reachable_functions.contains(name) {
+                function.statement = poison.clone();
+            }
+        }
+
+        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let summary = runtime.generic_state_summary();
+        assert_eq!(
+            summary["store"]["selected_input"]["address"], "A0",
+            "List/find root view should materialize one selected row"
+        );
+        assert_eq!(
+            summary["store"]["sheet_rows"].as_array().unwrap().len(),
+            100,
+            "List/chunk root view should materialize 100 sheet rows"
+        );
+        assert_eq!(summary["cells"][0]["address"], "A0");
+        assert_eq!(summary["cells"][0]["default_formula"], "5");
+        assert_eq!(summary["cells"][0]["value"], "5");
     }
 
     #[test]

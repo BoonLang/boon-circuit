@@ -2339,6 +2339,7 @@ pub fn inspect_compiled_artifact_report(
     let generic_derived_runtime_plan = artifact.runtime_generic_derived_plan()?;
     let storage_initialization_plan = artifact.runtime_storage_initialization_plan()?;
     let document_lowering_tables = artifact.runtime_document_lowering_tables()?;
+    let non_route_tables = artifact.runtime_non_route_tables()?;
     let storage_initial_row_count = storage_initialization_plan
         .list_slots
         .iter()
@@ -2393,6 +2394,16 @@ pub fn inspect_compiled_artifact_report(
                 "observed_root_path_count": document_lowering_tables.observed_root_paths.len(),
                 "render_slot_count": document_lowering_tables.render_slot_count,
                 "render_slot_failure_count": document_lowering_tables.render_slot_failure_count
+            },
+            "runtime_plan_non_route_tables_deserialized_from_artifact": true,
+            "runtime_plan_non_route_tables_deserialized_counts": {
+                "runtime_symbol_count": non_route_tables.symbols.len(),
+                "scalar_source_path_count": non_route_tables.scalar_equations.source_paths.len(),
+                "scalar_branch_count": non_route_tables.scalar_equations.branches.len(),
+                "derived_text_transform_count": non_route_tables.derived_equations.text_transforms.len(),
+                "list_operation_count": non_route_tables.list_equations.operations.len(),
+                "list_projection_count": non_route_tables.list_projections.projections.len(),
+                "list_source_binding_count": non_route_tables.list_source_bindings.list_slots.len()
             },
             "source_free_runtime_load_available": false,
             "source_reparse_required_for_current_runtime": true,
@@ -5223,6 +5234,16 @@ struct RuntimeDocumentLoweringTables {
     render_patch_lowering: RuntimeRenderPatchLoweringTables,
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeNonRouteTables {
+    symbols: RuntimeSymbols,
+    scalar_equations: ScalarEquationPlan,
+    derived_equations: DerivedEquationPlan,
+    list_equations: ListEquationPlan,
+    list_projections: ListProjectionPlan,
+    list_source_bindings: ListSourceBindingPlan,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RuntimeDocumentSummaryLimits {
     preview_list_row_start: usize,
@@ -5451,6 +5472,19 @@ impl RuntimeSymbols {
 
     fn len(&self) -> usize {
         self.paths.len()
+    }
+
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.runtime_symbols";
+        let object = artifact_object(value, context)?;
+        expect_artifact_string_field(object, "kind", "dense_runtime_symbol_ids", context)?;
+        let paths = artifact_string_array_field(object, "paths", context)?;
+        ensure_unique_strings(&paths, &format!("{context}.paths"))?;
+        let mut symbols = Self::default();
+        for path in paths {
+            symbols.intern(&path);
+        }
+        Ok(symbols)
     }
 }
 
@@ -8462,6 +8496,108 @@ impl RuntimeRenderPatchLoweringTables {
     }
 }
 
+impl RuntimeNonRouteTables {
+    fn from_artifact_body(body: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan";
+        let plan = body
+            .get("runtime_plan")
+            .ok_or("compiled artifact missing runtime_plan")?;
+        let plan_object = artifact_object(plan, context)?;
+
+        let symbols = RuntimeSymbols::from_artifact(artifact_field(
+            plan_object,
+            "runtime_symbols",
+            context,
+        )?)?;
+        let scalar_equations = ScalarEquationPlan::from_artifact(artifact_field(
+            plan_object,
+            "scalar_equations",
+            context,
+        )?)?;
+        let derived_equations = DerivedEquationPlan::from_artifact(artifact_field(
+            plan_object,
+            "derived_text_transforms",
+            context,
+        )?)?;
+        let list_equations = ListEquationPlan::from_artifact(artifact_field(
+            plan_object,
+            "list_equations",
+            context,
+        )?)?;
+        let list_projections = ListProjectionPlan::from_artifact(artifact_field(
+            plan_object,
+            "list_projections",
+            context,
+        )?)?;
+        let list_source_bindings = ListSourceBindingPlan::from_artifact(artifact_field(
+            plan_object,
+            "list_source_bindings",
+            context,
+        )?)?;
+
+        let runtime_symbol_count =
+            artifact_pointer_usize(body, "/runtime_symbol_count", "runtime_symbol_count")?;
+        if symbols.len() != runtime_symbol_count {
+            return Err(format!(
+                "runtime_plan.runtime_symbols decoded {} paths, expected {runtime_symbol_count}",
+                symbols.len()
+            )
+            .into());
+        }
+        let symbol_table_count = artifact_pointer_usize(
+            body,
+            "/symbol_table/symbol_count",
+            "symbol_table.symbol_count",
+        )?;
+        if symbols.len() != symbol_table_count {
+            return Err(format!(
+                "runtime_plan.runtime_symbols decoded {} paths, symbol_table expects {symbol_table_count}",
+                symbols.len()
+            )
+            .into());
+        }
+        artifact_len_matches(
+            scalar_equations.branches.len(),
+            body,
+            "/compiled_schedule/update_branch_count",
+            "runtime_plan.scalar_equations.branches",
+        )?;
+        artifact_len_matches(
+            derived_equations.text_transforms.len(),
+            body,
+            "/compiled_schedule/derived_text_transform_count",
+            "runtime_plan.derived_text_transforms.text_transforms",
+        )?;
+        artifact_len_matches(
+            list_equations.operations.len(),
+            body,
+            "/compiled_schedule/list_operation_count",
+            "runtime_plan.list_equations.operations",
+        )?;
+        artifact_len_matches(
+            list_projections.projections.len(),
+            body,
+            "/compiled_schedule/list_projection_count",
+            "runtime_plan.list_projections.projections",
+        )?;
+        artifact_len_matches(
+            list_source_bindings.list_slots.len(),
+            body,
+            "/compiled_schedule/list_source_binding_count",
+            "runtime_plan.list_source_bindings.list_slots",
+        )?;
+
+        Ok(Self {
+            symbols,
+            scalar_equations,
+            derived_equations,
+            list_equations,
+            list_projections,
+            list_source_bindings,
+        })
+    }
+}
+
 fn scalar_equation_plan_artifact(plan: &ScalarEquationPlan) -> JsonValue {
     json!({
         "source_paths": plan.source_paths,
@@ -8569,11 +8705,194 @@ fn scalar_update_expression_artifact(expression: &ScalarUpdateExpression) -> Jso
     }
 }
 
+impl ScalarEquationPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.scalar_equations";
+        let object = artifact_object(value, context)?;
+        let source_paths = artifact_string_array_field(object, "source_paths", context)?;
+        ensure_unique_strings(&source_paths, &format!("{context}.source_paths"))?;
+        let source_path_set = source_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let branches = artifact_array_field(object, "branches", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                ScalarUpdateBranch::from_artifact(value, &format!("{context}.branches[{index}]"))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        for branch in &branches {
+            if !source_path_set.contains(branch.source.as_str()) {
+                return Err(format!(
+                    "{context}.branches source `{}` is not in source_paths",
+                    branch.source
+                )
+                .into());
+            }
+        }
+        Ok(Self {
+            branches,
+            source_paths,
+        })
+    }
+}
+
+impl ScalarUpdateBranch {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            target: artifact_string_field(object, "target", context)?,
+            source: artifact_string_field(object, "source", context)?,
+            expression: ScalarUpdateExpression::from_artifact(
+                artifact_field(object, "expression", context)?,
+                &format!("{context}.expression"),
+            )?,
+        })
+    }
+}
+
+impl ScalarUpdateExpression {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "source_text" => Ok(Self::SourceText),
+            "source_key" => Ok(Self::SourceKey),
+            "source_address" => Ok(Self::SourceAddress),
+            "source_payload" => Ok(Self::SourcePayload(artifact_string_field(
+                object, "path", context,
+            )?)),
+            "const" => Ok(Self::Const(artifact_string_field(
+                object, "value", context,
+            )?)),
+            "number_infix" => Ok(Self::NumberInfix {
+                left: artifact_string_field(object, "left", context)?,
+                op: artifact_string_field(object, "op", context)?,
+                right: artifact_string_field(object, "right", context)?,
+            }),
+            "project_time" => Ok(Self::ProjectTime {
+                pointer_x: artifact_string_field(object, "pointer_x", context)?,
+                pointer_width: artifact_string_field(object, "pointer_width", context)?,
+                viewport_start: artifact_string_field(object, "viewport_start", context)?,
+                viewport_end: artifact_string_field(object, "viewport_end", context)?,
+                fallback: artifact_string_field(object, "fallback", context)?,
+            }),
+            "match_number_infix_const" => Ok(Self::MatchNumberInfixConst {
+                left: artifact_string_field(object, "left", context)?,
+                op: artifact_string_field(object, "op", context)?,
+                right: artifact_string_field(object, "right", context)?,
+                arms: update_value_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "list_find_value" => Ok(Self::ListFindValue {
+                list: artifact_string_field(object, "list", context)?,
+                field: artifact_string_field(object, "field", context)?,
+                expected: Box::new(update_value_expression_from_artifact(
+                    artifact_field(object, "expected", context)?,
+                    &format!("{context}.expected"),
+                )?),
+                target: artifact_string_field(object, "target", context)?,
+                fallback: optional_update_value_expression(object, "fallback", context)?,
+            }),
+            "previous_value" => Ok(Self::PreviousValue(artifact_string_field(
+                object, "path", context,
+            )?)),
+            "read_path" => Ok(Self::ReadPath(artifact_string_field(
+                object, "path", context,
+            )?)),
+            "text_trim_or_previous" => Ok(Self::TextTrimOrPrevious {
+                path: artifact_string_field(object, "path", context)?,
+                previous: artifact_string_field(object, "previous", context)?,
+            }),
+            "prefix_payload_concat" => Ok(Self::PrefixPayloadConcat {
+                prefix: artifact_string_field(object, "prefix", context)?,
+                payload_path: artifact_string_field(object, "payload_path", context)?,
+                separator: artifact_string_field(object, "separator", context)?,
+            }),
+            "prefix_root_concat" => Ok(Self::PrefixRootConcat {
+                prefix: artifact_string_field(object, "prefix", context)?,
+                path: artifact_string_field(object, "path", context)?,
+                separator: artifact_string_field(object, "separator", context)?,
+            }),
+            "bool_not" => Ok(Self::BoolNot(artifact_string_field(
+                object, "path", context,
+            )?)),
+            "match_const" => Ok(Self::MatchConst {
+                input: artifact_string_field(object, "input", context)?,
+                arms: update_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "match_value_const" => Ok(Self::MatchValueConst {
+                input: artifact_string_field(object, "input", context)?,
+                arms: update_value_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "unsupported" => Ok(Self::Unsupported),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn update_value_match_arm_artifact(arm: &UpdateValueMatchArm) -> JsonValue {
     json!({
         "pattern": arm.pattern,
         "output": update_value_expression_artifact(&arm.output)
     })
+}
+
+fn update_match_arm_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<UpdateMatchArm> {
+    let object = artifact_object(value, context)?;
+    Ok(UpdateMatchArm {
+        pattern: artifact_string_field(object, "pattern", context)?,
+        output: artifact_string_field(object, "output", context)?,
+    })
+}
+
+fn update_match_arms_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<UpdateMatchArm>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| update_match_arm_from_artifact(value, &format!("{context}[{index}]")))
+        .collect()
+}
+
+fn update_value_match_arm_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<UpdateValueMatchArm> {
+    let object = artifact_object(value, context)?;
+    Ok(UpdateValueMatchArm {
+        pattern: artifact_string_field(object, "pattern", context)?,
+        output: update_value_expression_from_artifact(
+            artifact_field(object, "output", context)?,
+            &format!("{context}.output"),
+        )?,
+    })
+}
+
+fn update_value_match_arms_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<UpdateValueMatchArm>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            update_value_match_arm_from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect()
 }
 
 fn update_value_expression_artifact(expression: &UpdateValueExpression) -> JsonValue {
@@ -8603,6 +8922,112 @@ fn update_value_expression_artifact(expression: &UpdateValueExpression) -> JsonV
     }
 }
 
+fn update_value_expression_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<UpdateValueExpression> {
+    let object = artifact_object(value, context)?;
+    if object.get("kind").is_some() {
+        return match artifact_string_field(object, "kind", context)?.as_str() {
+            "const" => Ok(UpdateValueExpression::Const {
+                value: artifact_string_field(object, "value", context)?,
+            }),
+            "read_path" => Ok(UpdateValueExpression::ReadPath {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "match_const" => Ok(UpdateValueExpression::MatchConst {
+                input: artifact_string_field(object, "input", context)?,
+                arms: update_value_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "number_infix" => Ok(UpdateValueExpression::NumberInfix {
+                left: artifact_string_field(object, "left", context)?,
+                op: artifact_string_field(object, "op", context)?,
+                right: artifact_string_field(object, "right", context)?,
+            }),
+            "match_number_infix_const" => Ok(UpdateValueExpression::MatchNumberInfixConst {
+                left: artifact_string_field(object, "left", context)?,
+                op: artifact_string_field(object, "op", context)?,
+                right: artifact_string_field(object, "right", context)?,
+                arms: update_value_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        };
+    }
+
+    // Older serde-shaped nested enum values can appear inside match arms.
+    if let Some(inner) = object.get("Const") {
+        let inner = artifact_object(inner, &format!("{context}.Const"))?;
+        Ok(UpdateValueExpression::Const {
+            value: artifact_string_field(inner, "value", &format!("{context}.Const"))?,
+        })
+    } else if let Some(inner) = object.get("ReadPath") {
+        let inner = artifact_object(inner, &format!("{context}.ReadPath"))?;
+        Ok(UpdateValueExpression::ReadPath {
+            path: artifact_string_field(inner, "path", &format!("{context}.ReadPath"))?,
+        })
+    } else if let Some(inner) = object.get("MatchConst") {
+        let inner = artifact_object(inner, &format!("{context}.MatchConst"))?;
+        Ok(UpdateValueExpression::MatchConst {
+            input: artifact_string_field(inner, "input", &format!("{context}.MatchConst"))?,
+            arms: update_value_match_arms_from_artifact(
+                artifact_field(inner, "arms", &format!("{context}.MatchConst"))?,
+                &format!("{context}.MatchConst.arms"),
+            )?,
+        })
+    } else if let Some(inner) = object.get("NumberInfix") {
+        let inner = artifact_object(inner, &format!("{context}.NumberInfix"))?;
+        Ok(UpdateValueExpression::NumberInfix {
+            left: artifact_string_field(inner, "left", &format!("{context}.NumberInfix"))?,
+            op: artifact_string_field(inner, "op", &format!("{context}.NumberInfix"))?,
+            right: artifact_string_field(inner, "right", &format!("{context}.NumberInfix"))?,
+        })
+    } else if let Some(inner) = object.get("MatchNumberInfixConst") {
+        let inner = artifact_object(inner, &format!("{context}.MatchNumberInfixConst"))?;
+        Ok(UpdateValueExpression::MatchNumberInfixConst {
+            left: artifact_string_field(
+                inner,
+                "left",
+                &format!("{context}.MatchNumberInfixConst"),
+            )?,
+            op: artifact_string_field(inner, "op", &format!("{context}.MatchNumberInfixConst"))?,
+            right: artifact_string_field(
+                inner,
+                "right",
+                &format!("{context}.MatchNumberInfixConst"),
+            )?,
+            arms: update_value_match_arms_from_artifact(
+                artifact_field(inner, "arms", &format!("{context}.MatchNumberInfixConst"))?,
+                &format!("{context}.MatchNumberInfixConst.arms"),
+            )?,
+        })
+    } else {
+        Err(format!("{context} has unknown update value expression shape").into())
+    }
+}
+
+fn optional_update_value_expression(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<Box<UpdateValueExpression>>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(update_value_expression_from_artifact(
+        value,
+        &format!("{context}.{key}"),
+    )?)))
+}
+
 fn derived_equation_plan_artifact(plan: &DerivedEquationPlan) -> JsonValue {
     json!({
         "text_transforms": plan.text_transforms.iter().map(runtime_derived_text_transform_artifact).collect::<Vec<_>>()
@@ -8615,6 +9040,39 @@ fn runtime_derived_text_transform_artifact(transform: &RuntimeDerivedTextTransfo
         "source": transform.source,
         "expression": runtime_derived_text_expression_artifact(&transform.expression)
     })
+}
+
+impl DerivedEquationPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.derived_text_transforms";
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            text_transforms: artifact_array_field(object, "text_transforms", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeDerivedTextTransform::from_artifact(
+                        value,
+                        &format!("{context}.text_transforms[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
+}
+
+impl RuntimeDerivedTextTransform {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            target: artifact_string_field(object, "target", context)?,
+            source: artifact_string_field(object, "source", context)?,
+            expression: RuntimeDerivedTextExpression::from_artifact(
+                artifact_field(object, "expression", context)?,
+                &format!("{context}.expression"),
+            )?,
+        })
+    }
 }
 
 fn runtime_derived_text_expression_artifact(
@@ -8672,10 +9130,76 @@ fn runtime_derived_text_expression_artifact(
     }
 }
 
+impl RuntimeDerivedTextExpression {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "const" => Ok(Self::Const {
+                value: artifact_string_field(object, "value", context)?,
+            }),
+            "match_const" => Ok(Self::MatchConst {
+                input: artifact_string_field(object, "input", context)?,
+                arms: update_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "enter_key_payload_text_trim_non_empty" => Ok(Self::EnterKeyPayloadTextTrimNonEmpty),
+            "enter_key_root_text_trim_non_empty" => Ok(Self::EnterKeyRootTextTrimNonEmpty {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "source_root_text" => Ok(Self::SourceRootText {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "list_find_value" => Ok(Self::ListFindValue {
+                list: artifact_string_field(object, "list", context)?,
+                field: artifact_string_field(object, "field", context)?,
+                expected: Box::new(update_value_expression_from_artifact(
+                    artifact_field(object, "expected", context)?,
+                    &format!("{context}.expected"),
+                )?),
+                target: artifact_string_field(object, "target", context)?,
+                fallback: optional_update_value_expression(object, "fallback", context)?,
+            }),
+            "prefix_root_concat" => Ok(Self::PrefixRootConcat {
+                prefix: artifact_string_field(object, "prefix", context)?,
+                path: artifact_string_field(object, "path", context)?,
+                separator: artifact_string_field(object, "separator", context)?,
+            }),
+            "prefix_payload_concat" => Ok(Self::PrefixPayloadConcat {
+                prefix: artifact_string_field(object, "prefix", context)?,
+                payload_path: artifact_string_field(object, "payload_path", context)?,
+                separator: artifact_string_field(object, "separator", context)?,
+            }),
+            "unsupported" => Ok(Self::Unsupported),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn list_equation_plan_artifact(plan: &ListEquationPlan) -> JsonValue {
     json!({
         "operations": plan.operations.iter().map(runtime_list_operation_artifact).collect::<Vec<_>>()
     })
+}
+
+impl ListEquationPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.list_equations";
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            operations: artifact_array_field(object, "operations", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeListOperation::from_artifact(
+                        value,
+                        &format!("{context}.operations[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
 }
 
 fn runtime_list_operation_artifact(operation: &RuntimeListOperation) -> JsonValue {
@@ -8683,6 +9207,19 @@ fn runtime_list_operation_artifact(operation: &RuntimeListOperation) -> JsonValu
         "list": operation.list,
         "kind": runtime_list_operation_kind_artifact(&operation.kind)
     })
+}
+
+impl RuntimeListOperation {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            kind: RuntimeListOperationKind::from_artifact(
+                artifact_field(object, "kind", context)?,
+                &format!("{context}.kind"),
+            )?,
+        })
+    }
 }
 
 fn runtime_list_operation_kind_artifact(kind: &RuntimeListOperationKind) -> JsonValue {
@@ -8710,11 +9247,67 @@ fn runtime_list_operation_kind_artifact(kind: &RuntimeListOperationKind) -> Json
     }
 }
 
+impl RuntimeListOperationKind {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "append" => Ok(Self::Append {
+                trigger: artifact_string_field(object, "trigger", context)?,
+                fields: artifact_array_field(object, "fields", context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        RuntimeListAppendField::from_artifact(
+                            value,
+                            &format!("{context}.fields[{index}]"),
+                        )
+                    })
+                    .collect::<RuntimeResult<Vec<_>>>()?,
+            }),
+            "remove" => Ok(Self::Remove {
+                source: artifact_string_field(object, "source", context)?,
+                predicate: RuntimeListPredicate::from_artifact(
+                    artifact_field(object, "predicate", context)?,
+                    &format!("{context}.predicate"),
+                )?,
+            }),
+            "retain" => Ok(Self::Retain {
+                target: artifact_string_field(object, "target", context)?,
+                predicate: RuntimeListPredicate::from_artifact(
+                    artifact_field(object, "predicate", context)?,
+                    &format!("{context}.predicate"),
+                )?,
+            }),
+            "count" => Ok(Self::Count {
+                target: artifact_string_field(object, "target", context)?,
+                predicate: RuntimeListPredicate::from_artifact(
+                    artifact_field(object, "predicate", context)?,
+                    &format!("{context}.predicate"),
+                )?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn runtime_list_append_field_artifact(field: &RuntimeListAppendField) -> JsonValue {
     json!({
         "name": field.name,
         "value": runtime_list_append_field_value_artifact(&field.value)
     })
+}
+
+impl RuntimeListAppendField {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            name: artifact_string_field(object, "name", context)?,
+            value: RuntimeListAppendFieldValue::from_artifact(
+                artifact_field(object, "value", context)?,
+                &format!("{context}.value"),
+            )?,
+        })
+    }
 }
 
 fn runtime_list_append_field_value_artifact(value: &RuntimeListAppendFieldValue) -> JsonValue {
@@ -8724,6 +9317,21 @@ fn runtime_list_append_field_value_artifact(value: &RuntimeListAppendFieldValue)
         }
         RuntimeListAppendFieldValue::Const { value } => {
             json!({ "kind": "const", "value": value })
+        }
+    }
+}
+
+impl RuntimeListAppendFieldValue {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "source" => Ok(Self::Source {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "const" => Ok(Self::Const {
+                value: artifact_string_field(object, "value", context)?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
         }
     }
 }
@@ -8749,10 +9357,50 @@ fn runtime_list_predicate_artifact(predicate: &RuntimeListPredicate) -> JsonValu
     }
 }
 
+impl RuntimeListPredicate {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "always_true" => Ok(Self::AlwaysTrue),
+            "field_bool" => Ok(Self::FieldBool {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "field_bool_not" => Ok(Self::FieldBoolNot {
+                path: artifact_string_field(object, "path", context)?,
+            }),
+            "selector_visibility" => Ok(Self::SelectorVisibility {
+                selector: artifact_string_field(object, "selector", context)?,
+                row_field: artifact_string_field(object, "row_field", context)?,
+            }),
+            "unsupported" => Ok(Self::Unsupported),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
+        }
+    }
+}
+
 fn list_projection_plan_artifact(plan: &ListProjectionPlan) -> JsonValue {
     json!({
         "projections": plan.projections.iter().map(runtime_list_projection_artifact).collect::<Vec<_>>()
     })
+}
+
+impl ListProjectionPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.list_projections";
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            projections: artifact_array_field(object, "projections", context)?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeListProjection::from_artifact(
+                        value,
+                        &format!("{context}.projections[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
 }
 
 fn runtime_list_projection_artifact(projection: &RuntimeListProjection) -> JsonValue {
@@ -8763,6 +9411,22 @@ fn runtime_list_projection_artifact(projection: &RuntimeListProjection) -> JsonV
         "rows": projection.rows,
         "kind": runtime_list_projection_kind_artifact(&projection.kind)
     })
+}
+
+impl RuntimeListProjection {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            target: artifact_string_field(object, "target", context)?,
+            list: artifact_string_field(object, "list", context)?,
+            columns: artifact_usize_field(object, "columns", context)?,
+            rows: artifact_usize_field(object, "rows", context)?,
+            kind: RuntimeListProjectionKind::from_artifact(
+                artifact_field(object, "kind", context)?,
+                &format!("{context}.kind"),
+            )?,
+        })
+    }
 }
 
 fn runtime_list_projection_kind_artifact(kind: &RuntimeListProjectionKind) -> JsonValue {
@@ -8777,6 +9441,23 @@ fn runtime_list_projection_kind_artifact(kind: &RuntimeListProjectionKind) -> Js
         }),
         RuntimeListProjectionKind::Find { field, value } => {
             json!({ "kind": "find", "field": field, "value": value })
+        }
+    }
+}
+
+impl RuntimeListProjectionKind {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        match artifact_string_field(object, "kind", context)?.as_str() {
+            "chunk" => Ok(Self::Chunk {
+                item_field: artifact_string_field(object, "item_field", context)?,
+                label_field: artifact_string_field(object, "label_field", context)?,
+            }),
+            "find" => Ok(Self::Find {
+                field: artifact_string_field(object, "field", context)?,
+                value: artifact_string_field(object, "value", context)?,
+            }),
+            other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
         }
     }
 }
@@ -8948,12 +9629,52 @@ fn list_source_binding_plan_artifact(plan: &ListSourceBindingPlan) -> JsonValue 
     })
 }
 
+impl ListSourceBindingPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let context = "runtime_plan.list_source_bindings";
+        let object = artifact_object(value, context)?;
+        let list_slots = artifact_array_field(object, "list_slots", context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                ListSourceBindingSlot::from_artifact(
+                    value,
+                    &format!("{context}.list_slots[{index}]"),
+                )
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let mut lists = BTreeSet::new();
+        for slot in &list_slots {
+            if !lists.insert(slot.list.as_str()) {
+                return Err(format!("{context}.list_slots duplicate list `{}`", slot.list).into());
+            }
+        }
+        Ok(Self { list_slots })
+    }
+}
+
 fn list_source_binding_slot_artifact(slot: &ListSourceBindingSlot) -> JsonValue {
     json!({
         "list": slot.list,
         "row_scope": slot.row_scope,
         "source_paths": slot.source_paths
     })
+}
+
+impl ListSourceBindingSlot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let source_paths = artifact_string_array_field(object, "source_paths", context)?;
+        if source_paths.is_empty() {
+            return Err(format!("{context}.source_paths must not be empty").into());
+        }
+        ensure_unique_strings(&source_paths, &format!("{context}.source_paths"))?;
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            row_scope: artifact_string_field(object, "row_scope", context)?,
+            source_paths,
+        })
+    }
 }
 
 fn artifact_object<'a>(
@@ -9164,6 +9885,30 @@ fn artifact_count_matches(
     }
 }
 
+fn artifact_pointer_usize(value: &JsonValue, pointer: &str, context: &str) -> RuntimeResult<usize> {
+    let value = value
+        .pointer(pointer)
+        .ok_or_else(|| format!("compiled artifact missing {context}"))?
+        .as_u64()
+        .ok_or_else(|| format!("compiled artifact {context} is not a non-negative integer"))?;
+    usize::try_from(value)
+        .map_err(|_| format!("compiled artifact {context} does not fit in usize").into())
+}
+
+fn artifact_len_matches(
+    actual: usize,
+    value: &JsonValue,
+    pointer: &str,
+    context: &str,
+) -> RuntimeResult<()> {
+    let expected = artifact_pointer_usize(value, pointer, context)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context} expected {expected}, decoded {actual}").into())
+    }
+}
+
 fn expect_artifact_string_field(
     object: &serde_json::Map<String, JsonValue>,
     key: &str,
@@ -9330,6 +10075,10 @@ impl CompiledArtifact {
                 .and_then(|plan| plan.get("document_lowering"))
                 .ok_or("compiled artifact missing runtime_plan.document_lowering")?,
         )
+    }
+
+    fn runtime_non_route_tables(&self) -> RuntimeResult<RuntimeNonRouteTables> {
+        RuntimeNonRouteTables::from_artifact_body(&self.body)
     }
 
     fn validate(&self, path: &Path) -> RuntimeResult<()> {
@@ -41109,6 +41858,144 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-non-route-tables-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, scenario, _) = example_paths(example).unwrap();
+            let artifact_path = temp_root.join(format!("{example}.boonc"));
+            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+            let decoded = artifact.runtime_non_route_tables().unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+
+            assert_eq!(
+                decoded
+                    .symbols
+                    .paths
+                    .iter()
+                    .map(|path| path.as_ref())
+                    .collect::<Vec<_>>(),
+                compiled
+                    .symbols
+                    .paths
+                    .iter()
+                    .map(|path| path.as_ref())
+                    .collect::<Vec<_>>(),
+                "decoded runtime symbols differ for {example}"
+            );
+            assert_eq!(
+                scalar_equation_plan_artifact(&decoded.scalar_equations),
+                scalar_equation_plan_artifact(&compiled.scalar_equations),
+                "decoded scalar equations differ for {example}"
+            );
+            assert_eq!(
+                derived_equation_plan_artifact(&decoded.derived_equations),
+                derived_equation_plan_artifact(&compiled.derived_equations),
+                "decoded derived text transforms differ for {example}"
+            );
+            assert_eq!(
+                list_equation_plan_artifact(&decoded.list_equations),
+                list_equation_plan_artifact(&compiled.list_equations),
+                "decoded list equations differ for {example}"
+            );
+            assert_eq!(
+                list_projection_plan_artifact(&decoded.list_projections),
+                list_projection_plan_artifact(&compiled.list_projections),
+                "decoded list projections differ for {example}"
+            );
+            assert_eq!(
+                list_source_binding_plan_artifact(&decoded.list_source_bindings),
+                list_source_binding_plan_artifact(&compiled.list_source_bindings),
+                "decoded list source bindings differ for {example}"
+            );
+
+            let mut artifact_compiled = compiled.clone();
+            artifact_compiled.symbols = decoded.symbols;
+            artifact_compiled.scalar_equations = decoded.scalar_equations;
+            artifact_compiled.derived_equations = decoded.derived_equations;
+            artifact_compiled.list_equations = decoded.list_equations;
+            artifact_compiled.list_projections = decoded.list_projections;
+            artifact_compiled.list_source_bindings = decoded.list_source_bindings;
+
+            let mut runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+            let summary = runtime.generic_state_summary();
+            assert!(
+                summary.is_object(),
+                "decoded non-route tables should instantiate runtime for {example}"
+            );
+            if example == "cells" {
+                assert_eq!(summary["store"]["selected_input"]["address"], "A0");
+                assert_eq!(
+                    summary["store"]["sheet_rows"].as_array().unwrap().len(),
+                    100,
+                    "decoded list projection tables should preserve Cells sheet rows"
+                );
+            }
+            if example == "todomvc" {
+                let scenario = parse_scenario(&scenario).unwrap();
+                let runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+                let output = run_generic_scenario(
+                    runtime,
+                    &parsed,
+                    &ir,
+                    &artifact_compiled,
+                    &scenario,
+                    VerificationLayer::Semantic,
+                )
+                .unwrap();
+                assert_eq!(
+                    output.report["status"], "pass",
+                    "decoded non-route tables should preserve TodoMVC scenario execution"
+                );
+            }
+        }
+
+        let artifact_path = temp_root.join("todomvc.boonc");
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let decoded = artifact.runtime_non_route_tables().unwrap();
+        let mut corrupt = artifact.body.clone();
+        corrupt["runtime_symbol_count"] = json!(decoded.symbols.len() + 1);
+        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime_symbols"),
+            "wrong symbol count should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["scalar_equations"]["branches"][0]["expression"]["kind"] =
+            json!("not_a_scalar_expression");
+        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_a_scalar_expression"),
+            "wrong scalar expression kind should fail decoding, got {error}"
+        );
+
+        corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["list_equations"]["operations"][0]["kind"]["kind"] =
+            json!("not_a_list_operation");
+        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not_a_list_operation"),
+            "wrong list operation kind should fail decoding, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
         let parsed = parse_source(
             "examples/todomvc.bn",
@@ -41413,6 +42300,18 @@ FUNCTION decorate(value) {
                 .as_object()
                 .is_some_and(|counts| counts
                     .get("render_slot_count")
+                    .and_then(JsonValue::as_u64)
+                    .is_some())
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_non_route_tables_deserialized_from_artifact"],
+            json!(true)
+        );
+        assert!(
+            loaded["inspection_result"]["runtime_plan_non_route_tables_deserialized_counts"]
+                .as_object()
+                .is_some_and(|counts| counts
+                    .get("runtime_symbol_count")
                     .and_then(JsonValue::as_u64)
                     .is_some())
         );

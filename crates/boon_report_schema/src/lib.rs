@@ -398,6 +398,8 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "runtime_plan_storage_deserialized_counts",
         "runtime_plan_document_lowering_deserialized_from_artifact",
         "runtime_plan_document_lowering_deserialized_counts",
+        "runtime_plan_non_route_tables_deserialized_from_artifact",
+        "runtime_plan_non_route_tables_deserialized_counts",
         "source_free_runtime_load_available",
         "source_reparse_required_for_current_runtime",
         "source_reparse_attempted",
@@ -439,6 +441,10 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             != Some(true)
         || inspection
             .get("runtime_plan_document_lowering_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
+            .get("runtime_plan_non_route_tables_deserialized_from_artifact")
             .and_then(JsonValue::as_bool)
             != Some(true)
         || inspection
@@ -545,6 +551,36 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         {
             return Err(format!(
                 "{} inspection_result runtime_plan_document_lowering_deserialized_counts missing `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let non_route_counts = inspection
+        .get("runtime_plan_non_route_tables_deserialized_counts")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result runtime_plan_non_route_tables_deserialized_counts is not an object",
+                path.display()
+            )
+        })?;
+    for key in [
+        "runtime_symbol_count",
+        "scalar_source_path_count",
+        "scalar_branch_count",
+        "derived_text_transform_count",
+        "list_operation_count",
+        "list_projection_count",
+        "list_source_binding_count",
+    ] {
+        if non_route_counts
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} inspection_result runtime_plan_non_route_tables_deserialized_counts missing `{key}`",
                 path.display()
             )
             .into());
@@ -5094,6 +5130,16 @@ mod tests {
                     "observed_root_path_count": 0,
                     "render_slot_count": 0,
                     "render_slot_failure_count": 0
+                },
+                "runtime_plan_non_route_tables_deserialized_from_artifact": true,
+                "runtime_plan_non_route_tables_deserialized_counts": {
+                    "runtime_symbol_count": 4,
+                    "scalar_source_path_count": 1,
+                    "scalar_branch_count": 1,
+                    "derived_text_transform_count": 0,
+                    "list_operation_count": 0,
+                    "list_projection_count": 0,
+                    "list_source_binding_count": 0
                 },
                 "source_free_runtime_load_available": false,
                 "source_reparse_required_for_current_runtime": true,

@@ -2897,15 +2897,16 @@ Notes:
     storage initialization plan, so storage initialization is no longer a
     missing runtime-plan section. The normal source runtime also reads document
     summary metadata from compiled-owned document-lowering runtime tables, so
-    document lowering is no longer a missing runtime-plan section. `.boonc`
-    still cannot instantiate `LoadedRuntime` because the artifact path still
-    lacks remaining `runtime_plan` deserializers for symbols/equations/routes/
-    bindings, an artifact-backed runtime constructor, and scenario parity
-    proof. The artifact inspection path now decodes `runtime_plan.generic_derived`,
-    `runtime_plan.storage_initialization`, and `runtime_plan.document_lowering`
-    into runtime-owned structs, but the report must keep
-    `generic_derived_ast_free_plan` as missing until the full path is executable
-    without parser AST.
+    document lowering is no longer a missing runtime-plan section. The artifact
+    inspection path now decodes `runtime_plan.generic_derived`,
+    `runtime_plan.storage_initialization`, `runtime_plan.document_lowering`,
+    `runtime_plan.runtime_symbols`, scalar equations, derived text transforms,
+    list equations, list projections, and list source bindings into runtime-owned
+    structs. `.boonc` still cannot instantiate `LoadedRuntime` because the
+    artifact path still lacks source-route/action-table deserializers, an
+    artifact-backed runtime constructor, and scenario parity proof. The report
+    must keep `generic_derived_ast_free_plan` as missing until the full path is
+    executable without parser AST.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -5001,6 +5002,63 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   source/action expression tables. Then add an artifact-backed runtime
   constructor and scenario parity gate before any report claims
   `loaded_runtime_from_artifact`, `runtime_instantiated_from_artifact`,
+  `source_free_runtime_load_available`, or `scenario_execution_available`.
+
+- Date: 2026-06-16
+- Task: TASK-0901B non-route runtime-table artifact deserialization slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only non-route runtime-table audit from subagent
+  `019ed221-861f-7c81-8e30-07ac29599bd9`; `cargo fmt -p boon_runtime -p
+  boon_report_schema -p xtask`; `cargo test -p boon_runtime --lib
+  compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast --
+  --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo test -p boon_report_schema --lib compiled_artifact --
+  --nocapture`; `cargo check -p boon_runtime -p boon_cli -p xtask`; `cargo
+  xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-report-schema`; `cargo test -p xtask`; full `cargo test -p
+  boon_runtime --lib -- --nocapture` passed with `215` tests.
+- Result: TASK-0901B remains incomplete, but the artifact now has typed
+  read-side decoders for the non-route runtime tables consumed by
+  `GenericScheduledRuntime`: dense runtime symbols, scalar equation branches,
+  derived text transforms, list operations, list projections, and list source
+  binding slots. The decoder validates symbol uniqueness and count agreement
+  with the top-level artifact and symbol table, scalar branch count against the
+  compiled schedule, branch source membership, derived/list/projection/binding
+  schedule counts, list operation/projection kinds, list-binding uniqueness, and
+  recursive update-value/list-predicate expression kinds. A focused test installs
+  the decoded tables into a cloned `CompiledProgram` and runs runtime summaries
+  plus a TodoMVC scenario while source routes still come from the IR-built plan.
+- Artifact/result detail: inspection reports now include
+  `runtime_plan_non_route_tables_deserialized_from_artifact = true` and
+  `runtime_plan_non_route_tables_deserialized_counts`. The refreshed TodoMVC CLI
+  inspection report shows `runtime_symbol_count = 42`,
+  `scalar_source_path_count = 15`, `scalar_branch_count = 18`,
+  `derived_text_transform_count = 1`, `list_operation_count = 6`,
+  `list_projection_count = 0`, and `list_source_binding_count = 1`. Runtime and
+  scenario readiness booleans still correctly remain false, with
+  `source_reparse_attempted = false` and
+  `source_file_access = "not_attempted"`.
+- Remaining blocker: decode typed source routes, source/action tables, source
+  payload field metadata, and dense action/source IDs from the artifact. Then
+  build the artifact-backed runtime constructor and scenario parity gate before
+  any report claims `loaded_runtime_from_artifact`,
+  `runtime_instantiated_from_artifact`,
   `source_free_runtime_load_available`, or `scenario_execution_available`.
 
 ## File Maintenance Checklist

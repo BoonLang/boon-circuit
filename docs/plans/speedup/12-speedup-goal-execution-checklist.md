@@ -4724,6 +4724,79 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   artifact-backed runtime constructor before removing
   `generic_derived_ast_free_plan`.
 
+- Date: 2026-06-16
+- Task: TASK-0901B runtime-generic child control-flow/list statement slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: unsupported-shape audit from subagent
+  `019ed1cf-15d7-75c2-9efa-45aa523ce36f`; artifact-load honesty audit from
+  subagent `019ed1cf-27d6-7450-b3ce-a05f0081d446`; `cargo fmt -p
+  boon_runtime`; `cargo test -p boon_runtime --lib
+  generic_derived_runtime_plan_executes_supported_fields_without_ast_statements
+  -- --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo check -p boon_runtime -p boon_cli -p xtask`; `cargo
+  test -p boon_runtime --lib generic_rows_preserve_nested_field_records_and_lists
+  -- --nocapture`; `cargo test -p boon_runtime --lib
+  novywave_waveform_metadata_drives_selected_file_and_timeline_window --
+  --nocapture`; full `cargo test -p boon_runtime --lib -- --nocapture` passed
+  with `209` tests; `cargo xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- compile examples/todomvc.bn --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc.json`; `cargo run -q -p boon_cli
+  -- compile examples/cells.bn --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells.json`; `cargo xtask
+  verify-report-schema`; `jq` inspection of
+  `runtime_plan.generic_derived` and
+  `inspection_result.missing_runtime_plan_sections`.
+- Result: TASK-0901B remains incomplete, but the TodoMVC generic-derived
+  runtime-plan blockers from the previous slice are removed. The runtime-owned
+  generic statement plan now represents attached expression children, statement
+  blocks, list statements, `WHEN`/`WHILE` control-flow, match arms, and
+  block-form `List/retain`/`List/every`/`List/any` predicates. Source runtime
+  evaluation can now execute TodoMVC `store.title_to_add` and
+  `store.visible_todos` without using the legacy AST statement. The regression
+  test poisons all supported TodoMVC root/indexed AST statements and proves
+  `visible_todos` materializes four rows from the runtime-owned block/list
+  plan.
+- Artifact/result detail: refreshed TodoMVC coverage is
+  `root_supported_count = 5`, `indexed_supported_count = 2`, and
+  `unsupported_reasons = {}`. Refreshed Cells coverage is still
+  `root_supported_count = 0`, `indexed_supported_count = 2`, with blockers
+  `{ call:List/chunk: 1, call:List/find: 1, call:cell_address: 1,
+  call:compute_value: 2, call:default_formula_for_address: 1 }`. All inspected
+  artifacts still correctly report
+  `missing_runtime_plan_sections = ["generic_derived_ast_free_plan"]`,
+  `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`, and
+  `scenario_execution_available = false`.
+- Correctness guard learned: do not treat multiline user-function calls with
+  attached named-argument children as record literals. This slice tightened
+  runtime-plan record detection so calls such as `NovyBridge/artifact_ref(...)`
+  remain unsupported and fall back to the AST evaluator until user-function
+  bodies and call frames are serialized. The full runtime suite caught and
+  protects this via NovyWave bridge metadata and nested row/list preservation
+  tests.
+- Remaining blocker: implement runtime-owned generic-derived coverage for Cells
+  root list views (`List/find`, `List/chunk`) and user functions
+  (`cell_address`, `default_formula_for_address`, `compute_value`), then add
+  real `runtime_plan` deserializers and an artifact-backed runtime constructor
+  before removing `generic_derived_ast_free_plan` or claiming source-free
+  runtime load.
+
 ## File Maintenance Checklist
 
 After editing this file, run:

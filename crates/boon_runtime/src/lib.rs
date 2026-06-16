@@ -5088,6 +5088,12 @@ struct RuntimeGenericDerivedIndexedField {
 enum RuntimeGenericStatement {
     Empty,
     Expr(RuntimeGenericExpr),
+    ExprWithChildren {
+        expr: RuntimeGenericExpr,
+        children: Vec<RuntimeGenericStatement>,
+    },
+    Block(Vec<RuntimeGenericStatement>),
+    List(Vec<RuntimeGenericStatement>),
     Record(Vec<RuntimeGenericRecordField>),
     Latest(Vec<RuntimeGenericStatement>),
 }
@@ -5128,6 +5134,13 @@ enum RuntimeGenericExpr {
     List(Vec<RuntimeGenericExpr>),
     Then {
         input: Box<RuntimeGenericExpr>,
+        output: Option<Box<RuntimeGenericExpr>>,
+    },
+    When {
+        input: Box<RuntimeGenericExpr>,
+    },
+    MatchArm {
+        pattern: Vec<String>,
         output: Option<Box<RuntimeGenericExpr>>,
     },
     Delimiter,
@@ -5846,11 +5859,27 @@ impl RuntimeGenericStatement {
                 .collect::<Result<Vec<_>, _>>()
                 .map(Self::Latest);
         }
-        if record_statement_children(&statement.children) {
+        if statement.expr.is_none()
+            && matches!(statement.kind, AstStatementKind::List { field: None, .. })
+            && record_statement_children(&statement.children)
+        {
             return RuntimeGenericRecordField::from_ast_children(&statement.children, expressions)
                 .map(Self::Record);
         }
-        if statement.children.len() == 1
+        if matches!(statement.kind, AstStatementKind::List { .. }) {
+            return statement
+                .children
+                .iter()
+                .map(|child| Self::from_ast(child, expressions))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List);
+        }
+        if statement.expr.is_none() && record_statement_children(&statement.children) {
+            return RuntimeGenericRecordField::from_ast_children(&statement.children, expressions)
+                .map(Self::Record);
+        }
+        if statement.expr.is_none()
+            && statement.children.len() == 1
             && matches!(statement.children[0].kind, AstStatementKind::Block)
             && record_statement_children(&statement.children[0].children)
         {
@@ -5865,11 +5894,21 @@ impl RuntimeGenericStatement {
                 if statement.children.is_empty() {
                     Ok(Self::Expr(expr))
                 } else {
-                    Err("attached_children".to_owned())
+                    statement
+                        .children
+                        .iter()
+                        .map(|child| Self::from_ast(child, expressions))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|children| Self::ExprWithChildren { expr, children })
                 }
             });
         }
-        Err("statement_children".to_owned())
+        statement
+            .children
+            .iter()
+            .map(|child| Self::from_ast(child, expressions))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self::Block)
     }
 }
 
@@ -5946,12 +5985,19 @@ impl RuntimeGenericExpr {
                     .map(|output| Self::from_ast(output, expressions).map(Box::new))
                     .transpose()?,
             }),
+            AstExprKind::When { input } => Ok(Self::When {
+                input: Box::new(Self::from_ast(*input, expressions)?),
+            }),
+            AstExprKind::MatchArm { pattern, output } => Ok(Self::MatchArm {
+                pattern: pattern.clone(),
+                output: output
+                    .map(|output| Self::from_ast(output, expressions).map(Box::new))
+                    .transpose()?,
+            }),
             AstExprKind::Delimiter => Ok(Self::Delimiter),
             AstExprKind::Source
             | AstExprKind::Hold { .. }
             | AstExprKind::Latest
-            | AstExprKind::When { .. }
-            | AstExprKind::MatchArm { .. }
             | AstExprKind::Unknown(_) => {
                 Err(runtime_generic_expr_kind_label(&expr.kind).to_owned())
             }
@@ -6010,6 +6056,11 @@ fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
         | "Number/project_time"
         | "Bool/not"
         | "Bool/and"
+        | "WHEN"
+        | "WHILE"
+        | "List/retain"
+        | "List/every"
+        | "List/any"
         | "Error/new"
         | "Error/text"
         | "Router/route"
@@ -6721,6 +6772,19 @@ fn runtime_generic_statement_artifact(statement: &RuntimeGenericStatement) -> Js
         RuntimeGenericStatement::Expr(expr) => {
             json!({ "kind": "expr", "expr": runtime_generic_expr_artifact(expr) })
         }
+        RuntimeGenericStatement::ExprWithChildren { expr, children } => json!({
+            "kind": "expr_with_children",
+            "expr": runtime_generic_expr_artifact(expr),
+            "children": children.iter().map(runtime_generic_statement_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericStatement::Block(statements) => json!({
+            "kind": "block",
+            "statements": statements.iter().map(runtime_generic_statement_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericStatement::List(statements) => json!({
+            "kind": "list_statement",
+            "items": statements.iter().map(runtime_generic_statement_artifact).collect::<Vec<_>>()
+        }),
         RuntimeGenericStatement::Record(fields) => json!({
             "kind": "record_statement",
             "fields": fields.iter().map(runtime_generic_record_field_artifact).collect::<Vec<_>>()
@@ -6780,6 +6844,15 @@ fn runtime_generic_expr_artifact(expr: &RuntimeGenericExpr) -> JsonValue {
         RuntimeGenericExpr::Then { input, output } => json!({
             "kind": "then",
             "input": runtime_generic_expr_artifact(input),
+            "output": output.as_deref().map(runtime_generic_expr_artifact)
+        }),
+        RuntimeGenericExpr::When { input } => json!({
+            "kind": "when",
+            "input": runtime_generic_expr_artifact(input)
+        }),
+        RuntimeGenericExpr::MatchArm { pattern, output } => json!({
+            "kind": "match_arm",
+            "pattern": pattern,
             "output": output.as_deref().map(runtime_generic_expr_artifact)
         }),
         RuntimeGenericExpr::Delimiter => json!({ "kind": "delimiter" }),
@@ -18276,6 +18349,16 @@ impl GenericScheduledRuntime {
         match statement {
             RuntimeGenericStatement::Empty => Ok(BoonValue::Empty),
             RuntimeGenericStatement::Expr(expr) => self.eval_runtime_generic_expr(expr, frame),
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                self.eval_runtime_generic_expr_with_children(expr, children, frame)
+            }
+            RuntimeGenericStatement::Block(statements) => {
+                self.eval_runtime_generic_statement_block(statements, frame)
+            }
+            RuntimeGenericStatement::List(statements) => {
+                let value = self.eval_runtime_generic_list_statement_children(statements, frame)?;
+                self.eval_runtime_generic_pipe_continuation_siblings(statements, value, frame)
+            }
             RuntimeGenericStatement::Record(fields) => {
                 let mut record = BTreeMap::new();
                 for field in fields {
@@ -18295,6 +18378,237 @@ impl GenericScheduledRuntime {
                 }
                 Ok(BoonValue::Empty)
             }
+        }
+    }
+
+    fn eval_runtime_generic_statement_block(
+        &mut self,
+        statements: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut last = BoonValue::Empty;
+        for statement in statements {
+            frame.consume_budget()?;
+            if self.runtime_generic_statement_is_pipe_continuation(statement) {
+                last = self.eval_runtime_generic_pipe_continuation_chain(statement, last, frame)?;
+            } else {
+                last = self.eval_runtime_generic_statement(statement, frame)?;
+            }
+        }
+        Ok(last)
+    }
+
+    fn eval_runtime_generic_list_statement_children(
+        &mut self,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut values = Vec::new();
+        for child in children {
+            if self.runtime_generic_statement_is_pipe_continuation(child) {
+                continue;
+            }
+            let value = self.eval_runtime_generic_statement(child, frame)?;
+            if !matches!(value, BoonValue::Empty) {
+                values.push(value);
+            }
+        }
+        Ok(BoonValue::List(values))
+    }
+
+    fn eval_runtime_generic_expr_with_children(
+        &mut self,
+        expr: &RuntimeGenericExpr,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        match expr {
+            RuntimeGenericExpr::Pipe { input, op, .. } if op == "WHILE" || op == "WHEN" => {
+                let input = self.eval_runtime_generic_expr(input, frame)?;
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            RuntimeGenericExpr::When { input } => {
+                let input = self.eval_runtime_generic_expr(input, frame)?;
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            RuntimeGenericExpr::Call { function, args } if function == "WHILE" => {
+                let input = self.runtime_named_or_positional_arg_value(args, "input", 0, frame)?;
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            RuntimeGenericExpr::Pipe { input, op, args }
+                if list_predicate_operator(op)
+                    && !args.iter().any(|arg| arg.name.as_deref() == Some("if"))
+                    && !children.is_empty() =>
+            {
+                let input = self.eval_runtime_generic_expr(input, frame)?;
+                let value = self.eval_runtime_generic_list_predicate_call_with_block(
+                    op, input, args, children, frame,
+                )?;
+                self.eval_runtime_generic_pipe_continuation_siblings(children, value, frame)
+            }
+            _ if self.runtime_generic_children_are_match_arms(children) => {
+                let input = self.eval_runtime_generic_expr(expr, frame)?;
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            _ => {
+                let value = self.eval_runtime_generic_expr(expr, frame)?;
+                self.eval_runtime_generic_pipe_continuation_siblings(children, value, frame)
+            }
+        }
+    }
+
+    fn eval_runtime_generic_pipe_continuation_chain(
+        &mut self,
+        statement: &RuntimeGenericStatement,
+        input: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        let value =
+            self.eval_runtime_generic_pipe_continuation_statement(statement, input, frame)?;
+        self.eval_runtime_generic_pipe_continuation_siblings(
+            self.runtime_generic_statement_children(statement),
+            value,
+            frame,
+        )
+    }
+
+    fn eval_runtime_generic_pipe_continuation_statement(
+        &mut self,
+        statement: &RuntimeGenericStatement,
+        input: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match statement {
+            RuntimeGenericStatement::Expr(expr) => {
+                self.eval_runtime_generic_pipe_continuation(expr, input, &[], frame)
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                self.eval_runtime_generic_pipe_continuation(expr, input, children, frame)
+            }
+            _ => Ok(input),
+        }
+    }
+
+    fn eval_runtime_generic_pipe_continuation(
+        &mut self,
+        expr: &RuntimeGenericExpr,
+        input: BoonValue,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match expr {
+            RuntimeGenericExpr::Pipe { op, args, .. } if op == "WHILE" || op == "WHEN" => {
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            RuntimeGenericExpr::Pipe { op, args, .. }
+                if list_predicate_operator(op)
+                    && !args.iter().any(|arg| arg.name.as_deref() == Some("if")) =>
+            {
+                self.eval_runtime_generic_list_predicate_call_with_block(
+                    op, input, args, children, frame,
+                )
+            }
+            RuntimeGenericExpr::Pipe { op, args, .. } => {
+                self.eval_runtime_generic_call(op, args, Some(input), frame)
+            }
+            RuntimeGenericExpr::When { .. } => {
+                self.eval_runtime_generic_while(input, children, frame)
+            }
+            RuntimeGenericExpr::Then { output, .. } => {
+                if matches!(input, BoonValue::Empty) {
+                    return Ok(BoonValue::Empty);
+                }
+                if let Some(output) = output {
+                    self.eval_runtime_generic_expr_with_children(output, children, frame)
+                } else {
+                    self.eval_runtime_generic_statement_block(children, frame)
+                }
+            }
+            _ => Ok(input),
+        }
+    }
+
+    fn eval_runtime_generic_pipe_continuation_siblings(
+        &mut self,
+        children: &[RuntimeGenericStatement],
+        input: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut value = input;
+        for child in children {
+            if !self.runtime_generic_statement_is_pipe_continuation(child) {
+                continue;
+            }
+            value = self.eval_runtime_generic_pipe_continuation_chain(child, value, frame)?;
+        }
+        Ok(value)
+    }
+
+    fn eval_runtime_generic_while(
+        &mut self,
+        input: BoonValue,
+        arms: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        for arm in arms {
+            let Some((pattern, output, children)) = self.runtime_generic_match_arm_parts(arm)
+            else {
+                continue;
+            };
+            let Some(binding) = generic_pattern_binding(pattern, &input) else {
+                continue;
+            };
+            let previous = binding.as_ref().and_then(|(name, value)| {
+                frame
+                    .env
+                    .insert(name.clone(), value.clone())
+                    .map(|old| (name.clone(), old))
+            });
+            let inserted_name = binding.as_ref().map(|(name, _)| name.clone());
+            let value = if let Some(output) = output {
+                if children.is_empty() {
+                    self.eval_runtime_generic_expr(output, frame)?
+                } else {
+                    self.eval_runtime_generic_expr_with_children(output, children, frame)?
+                }
+            } else {
+                self.eval_runtime_generic_statement_block(children, frame)?
+            };
+            if let Some((name, value)) = previous {
+                frame.env.insert(name, value);
+            } else if let Some(name) = inserted_name {
+                frame.env.remove(&name);
+            }
+            return Ok(value);
+        }
+        Ok(BoonValue::Empty)
+    }
+
+    fn eval_runtime_generic_list_predicate_call_with_block(
+        &mut self,
+        op: &str,
+        list: BoonValue,
+        args: &[RuntimeGenericArg],
+        predicate_children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let binding = args
+            .iter()
+            .find(|arg| arg.name.is_none())
+            .and_then(runtime_generic_raw_arg_name)
+            .ok_or_else(|| format!("{op} requires an item binding"))?;
+        match op {
+            "List/retain" => {
+                self.runtime_list_retain_block(list, &binding, predicate_children, frame)
+            }
+            "List/every" => {
+                self.runtime_list_every_block(list, &binding, predicate_children, frame)
+            }
+            "List/any" => self.runtime_list_any_block(list, &binding, predicate_children, frame),
+            _ => unreachable!("checked list predicate operator"),
         }
     }
 
@@ -18357,6 +18671,9 @@ impl GenericScheduledRuntime {
                     .as_deref()
                     .map(|output| self.eval_runtime_generic_expr(output, frame))
                     .unwrap_or(Ok(input))
+            }
+            RuntimeGenericExpr::When { .. } | RuntimeGenericExpr::MatchArm { .. } => {
+                Ok(BoonValue::Empty)
             }
             RuntimeGenericExpr::Delimiter => Ok(BoonValue::Empty),
         }
@@ -18531,6 +18848,46 @@ impl GenericScheduledRuntime {
                     left.bool_value().unwrap_or(false) && right.bool_value().unwrap_or(false),
                 ))
             }
+            "List/retain" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(runtime_generic_raw_arg_name)
+                    .ok_or("List/retain requires an item binding")?;
+                let predicate = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/retain requires if expression")?;
+                self.runtime_list_retain(list, &binding, &predicate.value, frame)
+            }
+            "List/every" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(runtime_generic_raw_arg_name)
+                    .ok_or("List/every requires an item binding")?;
+                let predicate = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/every requires if expression")?;
+                self.runtime_list_every(list, &binding, &predicate.value, frame)
+            }
+            "List/any" => {
+                let list = self.runtime_call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(runtime_generic_raw_arg_name)
+                    .ok_or("List/any requires an item binding")?;
+                let predicate = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/any requires if expression")?;
+                self.runtime_list_any(list, &binding, &predicate.value, frame)
+            }
+            "WHEN" | "WHILE" => Ok(BoonValue::Empty),
             "Error/new" => {
                 let code = self.runtime_named_arg_value(args, "code", frame)?;
                 Ok(BoonValue::Error(
@@ -18633,6 +18990,203 @@ impl GenericScheduledRuntime {
             .nth(position)
             .ok_or_else(|| format!("generic runtime call requires `{name}`"))?;
         self.eval_runtime_generic_expr(&arg.value, frame)
+    }
+
+    fn runtime_list_retain(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let mut output = Vec::new();
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value.clone());
+            if self
+                .eval_runtime_generic_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                output.push(self.list_value_for_pipeline(value, frame)?);
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::List(output))
+    }
+
+    fn runtime_list_retain_block(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let mut output = Vec::new();
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value.clone());
+            if self
+                .eval_runtime_generic_statement_block(predicate_children, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                output.push(self.list_value_for_pipeline(value, frame)?);
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::List(output))
+    }
+
+    fn runtime_list_every(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if !self
+                .eval_runtime_generic_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                restore_runtime_generic_binding(frame, binding, previous);
+                return Ok(BoonValue::Bool(false));
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::Bool(true))
+    }
+
+    fn runtime_list_every_block(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if !self
+                .eval_runtime_generic_statement_block(predicate_children, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                restore_runtime_generic_binding(frame, binding, previous);
+                return Ok(BoonValue::Bool(false));
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::Bool(true))
+    }
+
+    fn runtime_list_any(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if self
+                .eval_runtime_generic_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                restore_runtime_generic_binding(frame, binding, previous);
+                return Ok(BoonValue::Bool(true));
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::Bool(false))
+    }
+
+    fn runtime_list_any_block(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = self.list_values_for_iteration(list, frame)?;
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if self
+                .eval_runtime_generic_statement_block(predicate_children, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                restore_runtime_generic_binding(frame, binding, previous);
+                return Ok(BoonValue::Bool(true));
+            }
+        }
+        restore_runtime_generic_binding(frame, binding, previous);
+        Ok(BoonValue::Bool(false))
+    }
+
+    fn runtime_generic_statement_is_pipe_continuation(
+        &self,
+        statement: &RuntimeGenericStatement,
+    ) -> bool {
+        match statement {
+            RuntimeGenericStatement::Expr(expr)
+            | RuntimeGenericStatement::ExprWithChildren { expr, .. } => {
+                runtime_generic_expr_is_pipe_continuation(expr)
+            }
+            _ => false,
+        }
+    }
+
+    fn runtime_generic_statement_children<'a>(
+        &self,
+        statement: &'a RuntimeGenericStatement,
+    ) -> &'a [RuntimeGenericStatement] {
+        match statement {
+            RuntimeGenericStatement::ExprWithChildren { children, .. } => children,
+            RuntimeGenericStatement::Block(statements) => statements,
+            _ => &[],
+        }
+    }
+
+    fn runtime_generic_children_are_match_arms(
+        &self,
+        children: &[RuntimeGenericStatement],
+    ) -> bool {
+        children
+            .iter()
+            .any(|child| self.runtime_generic_match_arm_parts(child).is_some())
+    }
+
+    fn runtime_generic_match_arm_parts<'a>(
+        &self,
+        statement: &'a RuntimeGenericStatement,
+    ) -> Option<(
+        &'a [String],
+        Option<&'a RuntimeGenericExpr>,
+        &'a [RuntimeGenericStatement],
+    )> {
+        match statement {
+            RuntimeGenericStatement::Expr(RuntimeGenericExpr::MatchArm { pattern, output }) => {
+                Some((pattern, output.as_deref(), &[]))
+            }
+            RuntimeGenericStatement::ExprWithChildren {
+                expr: RuntimeGenericExpr::MatchArm { pattern, output },
+                children,
+            } => Some((pattern, output.as_deref(), children)),
+            _ => None,
+        }
     }
 
     fn eval_statement_block(
@@ -31409,6 +31963,49 @@ fn list_predicate_operator(op: &str) -> bool {
     matches!(op, "List/retain" | "List/every" | "List/any")
 }
 
+fn runtime_generic_raw_arg_name(arg: &RuntimeGenericArg) -> Option<String> {
+    match &arg.value {
+        RuntimeGenericExpr::Identifier(value) => Some(value.clone()),
+        RuntimeGenericExpr::Path(parts) => Some(parts.join(".")),
+        RuntimeGenericExpr::Text(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn restore_runtime_generic_binding(
+    frame: &mut GenericEvalFrame,
+    binding: &str,
+    previous: Option<BoonValue>,
+) {
+    if let Some(previous) = previous {
+        frame.env.insert(binding.to_owned(), previous);
+    } else {
+        frame.env.remove(binding);
+    }
+}
+
+fn runtime_generic_expr_is_pipe_continuation(expr: &RuntimeGenericExpr) -> bool {
+    let input = match expr {
+        RuntimeGenericExpr::Pipe { input, .. }
+        | RuntimeGenericExpr::Then { input, .. }
+        | RuntimeGenericExpr::When { input } => input.as_ref(),
+        _ => return false,
+    };
+    runtime_generic_expr_chain_starts_with_pipe_placeholder(input)
+}
+
+fn runtime_generic_expr_chain_starts_with_pipe_placeholder(expr: &RuntimeGenericExpr) -> bool {
+    match expr {
+        RuntimeGenericExpr::Delimiter => true,
+        RuntimeGenericExpr::Pipe { input, .. }
+        | RuntimeGenericExpr::Then { input, .. }
+        | RuntimeGenericExpr::When { input } => {
+            runtime_generic_expr_chain_starts_with_pipe_placeholder(input)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GenericEvalRow {
     list: String,
@@ -38098,6 +38695,14 @@ FUNCTION icon_code(item) {
             compiled.generic_derived_runtime.supported_indexed_count() > 0,
             "TodoMVC should expose at least one supported indexed generic-derived field"
         );
+        assert!(
+            compiled
+                .generic_derived_runtime
+                .unsupported_reasons
+                .is_empty(),
+            "TodoMVC generic-derived runtime plan should be fully AST-free supported: {:?}",
+            compiled.generic_derived_runtime.unsupported_reasons
+        );
         let supported_roots = compiled
             .generic_derived_runtime
             .root_fields
@@ -38105,6 +38710,14 @@ FUNCTION icon_code(item) {
             .filter(|field| field.statement.is_some())
             .map(|field| field.path.clone())
             .collect::<BTreeSet<_>>();
+        assert!(
+            supported_roots.contains("store.title_to_add"),
+            "title_to_add must compile to runtime-owned WHEN/match-arm evaluation"
+        );
+        assert!(
+            supported_roots.contains("store.visible_todos"),
+            "visible_todos must compile to runtime-owned block/list-predicate evaluation"
+        );
         let supported_indexed = compiled
             .generic_derived_runtime
             .indexed_fields
@@ -38148,6 +38761,11 @@ FUNCTION icon_code(item) {
         assert_eq!(
             runtime.storage.list_row_bool_opt("todos", 0, "not_editing"),
             Some(true)
+        );
+        assert_eq!(
+            runtime.storage.list_len("visible_todos").unwrap(),
+            4,
+            "visible_todos should materialize from the runtime-owned block plan"
         );
     }
 

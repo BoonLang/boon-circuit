@@ -1457,6 +1457,26 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
         );
     }
     if artifact_value
+        .pointer(
+            "/runtime_plan/included_runtime_owned_sections/runtime_storage_initialization_plan",
+        )
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact runtime_plan must include storage initialization plan".into(),
+        );
+    }
+    if artifact_value
+        .pointer("/runtime_plan/storage_initialization/storage_runtime_ast_free")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact runtime_plan storage initialization must be AST-free".into(),
+        );
+    }
+    if artifact_value
         .get("parser_ast_required_for_execution")
         .and_then(serde_json::Value::as_bool)
         != Some(false)

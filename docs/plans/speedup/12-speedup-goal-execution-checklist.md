@@ -2892,10 +2892,12 @@ Notes:
     artifact that records the static runtime sidecar data and file hash.
   - TASK-0901B must load `.boonc` into the runtime without reparsing source.
     A readiness inspection now proves the current artifact can be validated
-    without source access and carries a partial AST-free `runtime_plan`, but
-    it cannot instantiate `LoadedRuntime` yet because the plan still lacks
-    generic-derived, storage-initialization, and document-lowering runtime
-    sections.
+    without source access and carries a partial AST-free `runtime_plan`.
+    The normal source runtime now builds generic storage from the compiled-owned
+    storage initialization plan, so storage initialization is no longer a
+    missing runtime-plan section. `.boonc` still cannot instantiate
+    `LoadedRuntime` because the plan lacks AST-free generic-derived execution
+    and document-lowering runtime tables.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -4560,6 +4562,56 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   AST-free generic-derived execution, runtime storage initialization, and
   document-lowering runtime tables. Do not serialize full `TypedProgram` to
   close this task, because it still embeds parser AST expressions/statements.
+
+- Date: 2026-06-16
+- Task: TASK-0901B storage initialization runtime-plan slice
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: storage-plan next-slice audit from subagent
+  `019ed19e-291a-7a80-b0fd-a1bea2c095ca`; artifact/report acceptance audit
+  from subagent `019ed19e-43b3-7091-9d55-4a739da1d72f`; `cargo fmt -p
+  boon_runtime -p boon_report_schema -p xtask`; `cargo test -p
+  boon_runtime --lib compiled_artifact -- --nocapture`; `cargo test -p
+  boon_runtime --lib runtime_storage_initialization_plan_matches_ir_storage
+  -- --nocapture`; `cargo test -p boon_report_schema --lib
+  compiled_artifact -- --nocapture`; `cargo check -p boon_runtime -p
+  boon_cli -p xtask`; `cargo xtask verify-compiled-artifact todomvc
+  --report target/reports/compiled-artifact-todomvc-xtask.json`; `cargo
+  xtask verify-compiled-artifact-inspection todomvc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo run -p
+  boon_cli -- compile examples/todomvc.bn --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc.json`; `cargo run -p boon_cli --
+  inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `jq`
+  inspection of `runtime_plan.storage_initialization` and
+  `inspection_result.missing_runtime_plan_sections`; `cargo xtask
+  verify-report-schema`; `cargo test -p boon_report_schema --lib`; `cargo
+  test -p xtask`; `cargo test -p boon_runtime --lib`
+- Result: TASK-0901B remains incomplete, but storage initialization is now an
+  executable AST-free runtime-plan slice instead of only a JSON promise.
+  `CompiledProgram` owns a `RuntimeStorageInitializationPlan` with root slots,
+  root initial-field copy specs, list slots, row templates, materialized initial
+  rows, synthetic list-view storage slots, and indexed row-initial reset specs.
+  `GenericScheduledRuntime::new_profiled` now creates `GenericCircuitRuntime`
+  storage from this compiled-owned plan on the normal source path, and the
+  storage oracle verifies plan-built storage matches the old IR-built storage
+  for Counter, TodoMVC, and Cells.
+- Artifact/result detail: `.boonc` now exposes
+  `runtime_plan.storage_initialization` with
+  `storage_runtime_ast_free = true`. `inspect-artifact` reports the remaining
+  missing runtime-plan sections as only `generic_derived_ast_free_plan` and
+  `document_lowering_runtime_tables`; it still correctly keeps
+  `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`, and
+  `scenario_execution_available = false`.
+- Remaining blocker: implement AST-free generic-derived execution and
+  document-lowering runtime tables, then add a real artifact-backed runtime
+  constructor and scenario parity gate before flipping any source-free runtime
+  execution booleans.
 
 ## File Maintenance Checklist
 

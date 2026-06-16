@@ -4933,6 +4933,7 @@ struct CompiledProgram {
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
+    storage_initialization: RuntimeStorageInitializationPlan,
     root_state_paths: Vec<String>,
     list_summary_fields: Vec<ListSummaryFields>,
     dynamic_list_view_lists: BTreeSet<String>,
@@ -4981,6 +4982,78 @@ struct ListSummaryFields {
     list: String,
     row_scope: String,
     fields: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageInitializationPlan {
+    root_slots: Vec<RuntimeStorageRootSlot>,
+    root_initial_field_copies: Vec<RuntimeStorageRootInitialCopy>,
+    list_slots: Vec<RuntimeStorageListSlot>,
+    indexed_row_initial_resets: Vec<RuntimeStorageIndexedRowInitialReset>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageRootSlot {
+    path: String,
+    initializer: RuntimeInitialValue,
+    initial_value: FieldValue,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageRootInitialCopy {
+    target: String,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageListSlot {
+    id: ListId,
+    name: String,
+    capacity: Option<usize>,
+    row_scope: String,
+    synthetic_list_view_storage: bool,
+    initializer_kind: RuntimeStorageListInitializerKind,
+    row_template: RuntimeStorageRowTemplate,
+    initial_rows: Vec<RuntimeRowSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeStorageListInitializerKind {
+    RecordLiteral,
+    Range { from: i64, to: i64 },
+    Empty,
+    DeferredDynamicListView,
+    SyntheticListViewStorage,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeStorageRowTemplate {
+    fields: Vec<RuntimeStorageRowFieldTemplate>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageRowFieldTemplate {
+    field_name: String,
+    initial_value: RuntimeInitialValue,
+    missing_row_initial_value: Option<FieldValue>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStorageIndexedRowInitialReset {
+    list: String,
+    target_field: String,
+    source_field: String,
+    original_source_path: String,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeInitialValue {
+    Text(String),
+    Number(i64),
+    Bool(bool),
+    Enum(String),
+    RootInitialField { path: String },
+    RowInitialField { path: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -5207,6 +5280,300 @@ fn intern_update_value_expression_symbols(
     }
 }
 
+impl RuntimeStorageInitializationPlan {
+    fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
+        let mut root_slots = Vec::new();
+        let mut root_initial_field_copies = Vec::new();
+        let empty_initial_fields = ValueColumns::default();
+        for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
+            let initializer = RuntimeInitialValue::from_initial(&cell.initial_value)?;
+            let initial_value = initializer.to_field_value(&empty_initial_fields)?;
+            if let RuntimeInitialValue::RootInitialField { path } = &initializer {
+                root_initial_field_copies.push(RuntimeStorageRootInitialCopy {
+                    target: cell.path.clone(),
+                    source: path.clone(),
+                });
+            }
+            root_slots.push(RuntimeStorageRootSlot {
+                path: cell.path.clone(),
+                initializer,
+                initial_value,
+            });
+        }
+
+        let mut list_slots = Vec::new();
+        let mut list_names = BTreeSet::new();
+        for list in &ir.lists {
+            let row_scope = row_scope_name_for_ir_list(ir, list);
+            let indexed_cells = ir
+                .state_cells
+                .iter()
+                .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
+                .collect::<Vec<_>>();
+            let row_template =
+                RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;
+            let row_template_plan =
+                RuntimeStorageRowTemplate::from_runtime_template(&row_template)?;
+            let (initializer_kind, initial_rows) = match &list.initializer {
+                ListInitializer::RecordLiteral { rows }
+                    if ir_list_has_derived_list_view(ir, &list.name)
+                        && list_initial_records_have_dynamic_fields(rows) =>
+                {
+                    (
+                        RuntimeStorageListInitializerKind::DeferredDynamicListView,
+                        Vec::new(),
+                    )
+                }
+                ListInitializer::RecordLiteral { rows } => {
+                    let rows = rows
+                        .iter()
+                        .map(|row| {
+                            let initial_fields = list_initial_fields(row)?;
+                            let mut row = row_template.materialize(initial_fields)?;
+                            initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
+                            initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
+                            Ok(row)
+                        })
+                        .collect::<RuntimeResult<Vec<_>>>()?;
+                    (RuntimeStorageListInitializerKind::RecordLiteral, rows)
+                }
+                ListInitializer::Range { from, to } => {
+                    let count = if from <= to {
+                        usize::try_from(to.saturating_sub(*from).saturating_add(1))
+                            .map_err(|_| "List/range row count is out of range")?
+                    } else {
+                        0
+                    };
+                    let mut range_rows = Vec::with_capacity(count);
+                    for value in *from..=*to {
+                        let mut initial_fields = ValueColumns::default();
+                        let text = value.to_string();
+                        initial_fields
+                            .insert_value("index".to_owned(), FieldValue::Text(text.clone()));
+                        initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
+                        row_template.fill_missing_row_initial_fields(&mut initial_fields);
+                        let mut row = row_template.materialize(initial_fields)?;
+                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
+                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
+                        range_rows.push(row);
+                    }
+                    (
+                        RuntimeStorageListInitializerKind::Range {
+                            from: *from,
+                            to: *to,
+                        },
+                        range_rows,
+                    )
+                }
+                ListInitializer::Empty => (RuntimeStorageListInitializerKind::Empty, Vec::new()),
+                ListInitializer::Unknown { summary } => {
+                    if ir_list_has_derived_list_view(ir, &list.name) {
+                        (
+                            RuntimeStorageListInitializerKind::DeferredDynamicListView,
+                            Vec::new(),
+                        )
+                    } else {
+                        return Err(format!(
+                            "list `{}` has unsupported initializer `{summary}`",
+                            list.name
+                        )
+                        .into());
+                    }
+                }
+            };
+            if let Some(capacity) = list.capacity
+                && initial_rows.len() > capacity
+            {
+                return Err(format!(
+                    "list `{}` initializes {} rows beyond declared capacity {capacity}",
+                    list.name,
+                    initial_rows.len()
+                )
+                .into());
+            }
+            list_names.insert(list.name.clone());
+            list_slots.push(RuntimeStorageListSlot {
+                id: list.id,
+                name: list.name.clone(),
+                capacity: list.capacity,
+                row_scope,
+                synthetic_list_view_storage: false,
+                initializer_kind,
+                row_template: row_template_plan,
+                initial_rows,
+            });
+        }
+
+        let mut synthetic_list_id = ir
+            .lists
+            .iter()
+            .map(|list| list.id.0)
+            .max()
+            .map_or(0, |id| id.saturating_add(1));
+        for value in ir.derived_values.iter().filter(|value| {
+            !value.indexed
+                && value.scope_id.is_none()
+                && matches!(value.kind, DerivedValueKind::ListView)
+        }) {
+            let name = derived_root_list_storage_name(&value.path);
+            if list_names.contains(&name) {
+                continue;
+            }
+            list_names.insert(name.clone());
+            list_slots.push(RuntimeStorageListSlot {
+                id: ListId(synthetic_list_id),
+                name,
+                capacity: None,
+                row_scope: String::new(),
+                synthetic_list_view_storage: true,
+                initializer_kind: RuntimeStorageListInitializerKind::SyntheticListViewStorage,
+                row_template: RuntimeStorageRowTemplate::default(),
+                initial_rows: Vec::new(),
+            });
+            synthetic_list_id = synthetic_list_id.saturating_add(1);
+        }
+
+        let indexed_row_initial_resets = ir
+            .state_cells
+            .iter()
+            .filter(|cell| cell.indexed)
+            .filter_map(|cell| {
+                let InitialValue::RowInitialField { path } = &cell.initial_value else {
+                    return None;
+                };
+                let scope_id = cell.scope_id?;
+                let row_scope = ir.row_scopes.iter().find(|scope| scope.id == scope_id)?;
+                let target_field = cell
+                    .path
+                    .strip_prefix(&format!("{}.", row_scope.row_scope))?
+                    .to_owned();
+                let source_field = if path == &target_field {
+                    base_row_field_name(&target_field)
+                } else {
+                    path.clone()
+                };
+                Some(RuntimeStorageIndexedRowInitialReset {
+                    list: row_scope.list.clone(),
+                    target_field,
+                    source_field,
+                    original_source_path: path.clone(),
+                })
+            })
+            .collect();
+
+        Ok(Self {
+            root_slots,
+            root_initial_field_copies,
+            list_slots,
+            indexed_row_initial_resets,
+        })
+    }
+
+    fn instantiate_storage(&self) -> RuntimeResult<GenericCircuitRuntime> {
+        let mut runtime = GenericCircuitRuntime::default();
+        for slot in &self.root_slots {
+            runtime
+                .root
+                .insert_value(slot.path.clone(), slot.initial_value.clone());
+        }
+        for slot in &self.list_slots {
+            runtime.lists.insert(
+                slot.id,
+                slot.name.clone(),
+                ListMemory::from_values(slot.initial_rows.clone()),
+                slot.capacity,
+                slot.row_template.to_runtime_template(),
+            );
+        }
+        Ok(runtime)
+    }
+}
+
+impl RuntimeStorageRowTemplate {
+    fn from_runtime_template(template: &RuntimeRowSnapshotTemplate) -> RuntimeResult<Self> {
+        Ok(Self {
+            fields: template
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok(RuntimeStorageRowFieldTemplate {
+                        field_name: field.field_name.to_string(),
+                        initial_value: RuntimeInitialValue::from_initial(&field.initial_value)?,
+                        missing_row_initial_value: field.missing_row_initial_value.clone(),
+                    })
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
+
+    fn to_runtime_template(&self) -> RuntimeRowSnapshotTemplate {
+        RuntimeRowSnapshotTemplate {
+            fields: self
+                .fields
+                .iter()
+                .map(|field| RuntimeRowSnapshotFieldTemplate {
+                    field_name: field.field_name.clone().into_boxed_str(),
+                    field_id: FieldSlotId::from_path(&field.field_name),
+                    initial_value: field.initial_value.to_initial_value(),
+                    missing_row_initial_value: field.missing_row_initial_value.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RuntimeInitialValue {
+    fn from_initial(initial: &InitialValue) -> RuntimeResult<Self> {
+        match initial {
+            InitialValue::Text { value } => Ok(Self::Text(value.clone())),
+            InitialValue::Number { value } => Ok(Self::Number(*value)),
+            InitialValue::Bool { value } => Ok(Self::Bool(*value)),
+            InitialValue::Enum { value } => Ok(Self::Enum(value.clone())),
+            InitialValue::RootInitialField { path } => {
+                Ok(Self::RootInitialField { path: path.clone() })
+            }
+            InitialValue::RowInitialField { path } => {
+                Ok(Self::RowInitialField { path: path.clone() })
+            }
+            InitialValue::Unknown { summary } => {
+                Err(format!("unsupported state initializer `{summary}`").into())
+            }
+        }
+    }
+
+    fn to_initial_value(&self) -> InitialValue {
+        match self {
+            Self::Text(value) => InitialValue::Text {
+                value: value.clone(),
+            },
+            Self::Number(value) => InitialValue::Number { value: *value },
+            Self::Bool(value) => InitialValue::Bool { value: *value },
+            Self::Enum(value) => InitialValue::Enum {
+                value: value.clone(),
+            },
+            Self::RootInitialField { path } => {
+                InitialValue::RootInitialField { path: path.clone() }
+            }
+            Self::RowInitialField { path } => InitialValue::RowInitialField { path: path.clone() },
+        }
+    }
+
+    fn to_field_value(&self, initial_fields: &ValueColumns) -> RuntimeResult<FieldValue> {
+        match self {
+            Self::Text(value) => Ok(FieldValue::Text(value.clone())),
+            Self::Number(value) => Ok(FieldValue::Text(value.to_string())),
+            Self::Bool(value) => Ok(FieldValue::Bool(*value)),
+            Self::Enum(value) => Ok(FieldValue::Enum(value.clone())),
+            Self::RootInitialField { path } => Ok(initial_fields
+                .owned_value(path)
+                .unwrap_or_else(|| FieldValue::Text(String::new()))),
+            Self::RowInitialField { path } => initial_fields
+                .owned_value(path)
+                .ok_or_else(|| format!("row initial field `{path}` is missing").into()),
+        }
+    }
+}
+
 impl CompiledProgram {
     fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
         let symbols = RuntimeSymbols::from_ir(ir);
@@ -5272,6 +5639,7 @@ impl CompiledProgram {
             )
             .into());
         }
+        let storage_initialization = RuntimeStorageInitializationPlan::from_ir(ir)?;
         let scalar_equations = ScalarEquationPlan::from_ir(ir);
         let derived_equations = DerivedEquationPlan::from_ir(ir);
         let generic_derived = GenericDerivedPlan::from_ir(ir);
@@ -5327,6 +5695,7 @@ impl CompiledProgram {
             list_projections,
             source_routes,
             list_source_bindings,
+            storage_initialization,
             root_state_paths,
             list_summary_fields,
             dynamic_list_view_lists,
@@ -5449,7 +5818,6 @@ impl CompiledProgram {
             "source_free_runtime_instantiation_ready": false,
             "runtime_instantiation_blocked_by": [
                 "generic_derived_ast_free_plan",
-                "runtime_storage_initialization_plan",
                 "document_lowering_runtime_tables"
             ],
             "included_runtime_owned_sections": {
@@ -5460,6 +5828,7 @@ impl CompiledProgram {
                 "list_projections": true,
                 "source_routes": true,
                 "list_source_bindings": true,
+                "runtime_storage_initialization_plan": true,
                 "root_state_paths": true,
                 "list_summary_fields": true,
                 "dynamic_list_view_lists": true,
@@ -5483,7 +5852,8 @@ impl CompiledProgram {
             "list_equations": list_equation_plan_artifact(&self.list_equations),
             "list_projections": list_projection_plan_artifact(&self.list_projections),
             "source_routes": source_route_plan_artifact(&self.source_routes),
-            "list_source_bindings": list_source_binding_plan_artifact(&self.list_source_bindings)
+            "list_source_bindings": list_source_binding_plan_artifact(&self.list_source_bindings),
+            "storage_initialization": runtime_storage_initialization_plan_artifact(&self.storage_initialization)
         })
     }
 }
@@ -5494,6 +5864,171 @@ fn list_summary_fields_artifact(summary: &ListSummaryFields) -> JsonValue {
         "row_scope": summary.row_scope,
         "fields": summary.fields
     })
+}
+
+fn runtime_storage_initialization_plan_artifact(
+    plan: &RuntimeStorageInitializationPlan,
+) -> JsonValue {
+    json!({
+        "format": "boonc-runtime-storage-initialization-json-v1",
+        "storage_runtime_ast_free": true,
+        "root_slot_count": plan.root_slots.len(),
+        "root_initial_field_copy_count": plan.root_initial_field_copies.len(),
+        "list_slot_count": plan.list_slots.len(),
+        "indexed_row_initial_reset_count": plan.indexed_row_initial_resets.len(),
+        "root_slots": plan.root_slots.iter().map(runtime_storage_root_slot_artifact).collect::<Vec<_>>(),
+        "root_initial_field_copies": plan.root_initial_field_copies.iter().map(runtime_storage_root_initial_copy_artifact).collect::<Vec<_>>(),
+        "list_slots": plan.list_slots.iter().map(runtime_storage_list_slot_artifact).collect::<Vec<_>>(),
+        "indexed_row_initial_resets": plan.indexed_row_initial_resets.iter().map(runtime_storage_indexed_row_initial_reset_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_storage_root_slot_artifact(slot: &RuntimeStorageRootSlot) -> JsonValue {
+    json!({
+        "path": slot.path,
+        "initializer": runtime_initial_value_artifact(&slot.initializer),
+        "initial_value": field_value_artifact(&slot.initial_value)
+    })
+}
+
+fn runtime_storage_root_initial_copy_artifact(copy: &RuntimeStorageRootInitialCopy) -> JsonValue {
+    json!({
+        "target": copy.target,
+        "source": copy.source
+    })
+}
+
+fn runtime_storage_list_slot_artifact(slot: &RuntimeStorageListSlot) -> JsonValue {
+    json!({
+        "id": slot.id.0,
+        "name": slot.name,
+        "capacity": slot.capacity,
+        "row_scope": slot.row_scope,
+        "synthetic_list_view_storage": slot.synthetic_list_view_storage,
+        "initializer": runtime_storage_list_initializer_artifact(&slot.initializer_kind),
+        "row_template": runtime_storage_row_template_artifact(&slot.row_template),
+        "initial_row_count": slot.initial_rows.len(),
+        "initial_rows": slot.initial_rows.iter().map(runtime_row_snapshot_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_storage_list_initializer_artifact(
+    initializer: &RuntimeStorageListInitializerKind,
+) -> JsonValue {
+    match initializer {
+        RuntimeStorageListInitializerKind::RecordLiteral => json!({ "kind": "record_literal" }),
+        RuntimeStorageListInitializerKind::Range { from, to } => {
+            json!({ "kind": "range", "from": from, "to": to })
+        }
+        RuntimeStorageListInitializerKind::Empty => json!({ "kind": "empty" }),
+        RuntimeStorageListInitializerKind::DeferredDynamicListView => {
+            json!({ "kind": "deferred_dynamic_list_view" })
+        }
+        RuntimeStorageListInitializerKind::SyntheticListViewStorage => {
+            json!({ "kind": "synthetic_list_view_storage" })
+        }
+    }
+}
+
+fn runtime_storage_row_template_artifact(template: &RuntimeStorageRowTemplate) -> JsonValue {
+    json!({
+        "field_count": template.fields.len(),
+        "fields": template.fields.iter().map(runtime_storage_row_field_template_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_storage_row_field_template_artifact(
+    field: &RuntimeStorageRowFieldTemplate,
+) -> JsonValue {
+    json!({
+        "field": field.field_name,
+        "field_id": stable_runtime_field_id(&field.field_name),
+        "initial_value": runtime_initial_value_artifact(&field.initial_value),
+        "missing_row_initial_value": field.missing_row_initial_value.as_ref().map(field_value_artifact)
+    })
+}
+
+fn runtime_storage_indexed_row_initial_reset_artifact(
+    reset: &RuntimeStorageIndexedRowInitialReset,
+) -> JsonValue {
+    json!({
+        "list": reset.list,
+        "target_field": reset.target_field,
+        "source_field": reset.source_field,
+        "original_source_path": reset.original_source_path
+    })
+}
+
+fn runtime_initial_value_artifact(value: &RuntimeInitialValue) -> JsonValue {
+    match value {
+        RuntimeInitialValue::Text(value) => json!({ "kind": "text", "value": value }),
+        RuntimeInitialValue::Number(value) => json!({ "kind": "number", "value": value }),
+        RuntimeInitialValue::Bool(value) => json!({ "kind": "bool", "value": value }),
+        RuntimeInitialValue::Enum(value) => json!({ "kind": "enum", "value": value }),
+        RuntimeInitialValue::RootInitialField { path } => {
+            json!({ "kind": "root_initial_field", "path": path })
+        }
+        RuntimeInitialValue::RowInitialField { path } => {
+            json!({ "kind": "row_initial_field", "path": path })
+        }
+    }
+}
+
+fn runtime_row_snapshot_artifact(row: &RuntimeRowSnapshot) -> JsonValue {
+    json!({
+        "fields": value_columns_artifact(&row.columns)
+    })
+}
+
+fn value_columns_artifact(columns: &ValueColumns) -> JsonValue {
+    let mut fields = Vec::new();
+    fields.extend(columns.text.iter().map(|slot| {
+        json!({
+            "field": slot.field_id.as_str(),
+            "field_id": slot.field_id.id.0,
+            "kind": "text",
+            "value": slot.value
+        })
+    }));
+    fields.extend(columns.bools.iter().map(|slot| {
+        json!({
+            "field": slot.field_id.as_str(),
+            "field_id": slot.field_id.id.0,
+            "kind": "bool",
+            "value": slot.value
+        })
+    }));
+    fields.extend(columns.enums.iter().map(|slot| {
+        json!({
+            "field": slot.field_id.as_str(),
+            "field_id": slot.field_id.id.0,
+            "kind": "enum",
+            "value": slot.value
+        })
+    }));
+    fields.extend(columns.json.iter().map(|slot| {
+        json!({
+            "field": slot.field_id.as_str(),
+            "field_id": slot.field_id.id.0,
+            "kind": "json",
+            "value": slot.value
+        })
+    }));
+    fields.sort_by(|left, right| {
+        let left_id = left
+            .get("field_id")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let right_id = right
+            .get("field_id")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left["field"].as_str().cmp(&right["field"].as_str()))
+            .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
+    });
+    JsonValue::Array(fields)
 }
 
 fn scalar_equation_plan_artifact(plan: &ScalarEquationPlan) -> JsonValue {
@@ -6121,6 +6656,7 @@ impl CompiledArtifact {
             "list_projections",
             "source_routes",
             "list_source_bindings",
+            "storage_initialization",
         ] {
             if !plan.contains_key(key) {
                 return Err(format!("{} runtime_plan missing `{key}`", path.display()).into());
@@ -6174,6 +6710,7 @@ impl CompiledArtifact {
             "list_projections",
             "source_routes",
             "list_source_bindings",
+            "runtime_storage_initialization_plan",
             "root_state_paths",
             "list_summary_fields",
             "dynamic_list_view_lists",
@@ -6206,6 +6743,49 @@ impl CompiledArtifact {
             return Err(
                 format!("{} runtime_plan has no source route slots", path.display()).into(),
             );
+        }
+        let storage = plan
+            .get("storage_initialization")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} runtime_plan storage_initialization is not an object",
+                    path.display()
+                )
+            })?;
+        if storage.get("format").and_then(JsonValue::as_str)
+            != Some("boonc-runtime-storage-initialization-json-v1")
+        {
+            return Err(format!(
+                "{} runtime_plan storage_initialization has wrong format",
+                path.display()
+            )
+            .into());
+        }
+        if storage
+            .get("storage_runtime_ast_free")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "{} runtime_plan storage_initialization must be AST-free",
+                path.display()
+            )
+            .into());
+        }
+        for key in [
+            "root_slots",
+            "root_initial_field_copies",
+            "list_slots",
+            "indexed_row_initial_resets",
+        ] {
+            if storage.get(key).and_then(JsonValue::as_array).is_none() {
+                return Err(format!(
+                    "{} runtime_plan storage_initialization missing array `{key}`",
+                    path.display()
+                )
+                .into());
+            }
         }
         Ok(())
     }
@@ -11244,12 +11824,12 @@ impl GenericScheduledRuntime {
     }
 
     fn new_profiled(
-        ir: &TypedProgram,
+        _ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<(Self, JsonValue)> {
         let total_started = Instant::now();
         let storage_started = Instant::now();
-        let storage = GenericCircuitRuntime::new(ir)?;
+        let storage = compiled.storage_initialization.instantiate_storage()?;
         let storage_ms = runtime_elapsed_ms(storage_started);
         let clone_started = Instant::now();
         let mut runtime = Self {
@@ -11281,7 +11861,7 @@ impl GenericScheduledRuntime {
         };
         let clone_ms = runtime_elapsed_ms(clone_started);
         let root_initial_started = Instant::now();
-        runtime.initialize_root_holds_from_root_initial_fields(ir)?;
+        runtime.initialize_root_holds_from_storage_plan(&compiled.storage_initialization)?;
         let initialize_root_holds_ms = runtime_elapsed_ms(root_initial_started);
         let bind_started = Instant::now();
         runtime.bind_initial_list_sources()?;
@@ -11290,7 +11870,7 @@ impl GenericScheduledRuntime {
         let first_derived_profile = runtime.initialize_generic_derived_fields_profiled()?;
         let first_derived_ms = runtime_elapsed_ms(first_derived_started);
         let reset_started = Instant::now();
-        runtime.reset_indexed_holds_from_row_initial_fields(ir)?;
+        runtime.reset_indexed_holds_from_storage_plan(&compiled.storage_initialization)?;
         let reset_indexed_holds_ms = runtime_elapsed_ms(reset_started);
         let second_derived_started = Instant::now();
         let second_derived_profile = runtime.initialize_generic_derived_fields_profiled()?;
@@ -11322,6 +11902,17 @@ impl GenericScheduledRuntime {
             };
             let value = self.resolve_root_initial_field_value(path)?;
             self.storage.root.insert_value(cell.path.clone(), value);
+        }
+        Ok(())
+    }
+
+    fn initialize_root_holds_from_storage_plan(
+        &mut self,
+        plan: &RuntimeStorageInitializationPlan,
+    ) -> RuntimeResult<()> {
+        for copy in &plan.root_initial_field_copies {
+            let value = self.resolve_root_initial_field_value(&copy.source)?;
+            self.storage.root.insert_value(copy.target.clone(), value);
         }
         Ok(())
     }
@@ -11845,6 +12436,40 @@ impl GenericScheduledRuntime {
                     };
                 self.storage
                     .set_list_row_value(&row_scope.list, index, target_field, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_indexed_holds_from_storage_plan(
+        &mut self,
+        plan: &RuntimeStorageInitializationPlan,
+    ) -> RuntimeResult<()> {
+        for reset in &plan.indexed_row_initial_resets {
+            let len = self.storage.list_len(&reset.list)?;
+            for index in 0..len {
+                if let Some(value) =
+                    self.storage
+                        .list_row_value_opt(&reset.list, index, &reset.source_field)
+                {
+                    self.storage.set_list_row_value(
+                        &reset.list,
+                        index,
+                        &reset.target_field,
+                        value,
+                    )?;
+                    continue;
+                }
+                let value =
+                    match self
+                        .storage
+                        .list_row_value_opt(&reset.list, index, &reset.target_field)
+                    {
+                        Some(_) => continue,
+                        None => FieldValue::Text(String::new()),
+                    };
+                self.storage
+                    .set_list_row_value(&reset.list, index, &reset.target_field, value)?;
             }
         }
         Ok(())
@@ -35896,6 +36521,24 @@ FUNCTION icon_code(item) {
         assert!(artifact_json["runtime_plan"]["scalar_equations"]["branches"].is_array());
         assert!(artifact_json["runtime_plan"]["list_equations"]["operations"].is_array());
         assert!(artifact_json["runtime_plan"]["source_routes"]["route_slots"].is_array());
+        assert_eq!(
+            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["runtime_storage_initialization_plan"],
+            json!(true)
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["storage_initialization"]["storage_runtime_ast_free"],
+            json!(true)
+        );
+        assert!(
+            artifact_json["runtime_plan"]["storage_initialization"]["root_slots"]
+                .as_array()
+                .is_some_and(|slots| !slots.is_empty())
+        );
+        assert!(
+            artifact_json["runtime_plan"]["storage_initialization"]["list_slots"]
+                .as_array()
+                .is_some_and(|slots| !slots.is_empty())
+        );
         assert!(
             artifact_json["runtime_plan"]["excluded_parser_ast_sections"]
                 .as_array()
@@ -35945,6 +36588,13 @@ FUNCTION icon_code(item) {
                 .iter()
                 .any(|section| section.as_str() == Some("generic_derived_ast_free_plan"))
         );
+        assert!(
+            !loaded["inspection_result"]["missing_runtime_plan_sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|section| section.as_str() == Some("runtime_storage_initialization_plan"))
+        );
         assert_eq!(
             loaded["inspection_result"]["source_reparse_attempted"],
             json!(false)
@@ -35962,6 +36612,58 @@ FUNCTION icon_code(item) {
             Some(sha256_file(&artifact).unwrap().as_str())
         );
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn runtime_storage_initialization_plan_matches_ir_storage() {
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, _, _) = example_paths(example).unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+            let legacy = GenericCircuitRuntime::new(&ir).unwrap();
+            let planned = compiled
+                .storage_initialization
+                .instantiate_storage()
+                .unwrap();
+            assert_eq!(
+                planned.root, legacy.root,
+                "root storage differs for {example}"
+            );
+            assert_eq!(
+                planned.lists.list_slots.len(),
+                legacy.lists.list_slots.len(),
+                "list slot count differs for {example}"
+            );
+            for (planned_slot, legacy_slot) in planned
+                .lists
+                .list_slots
+                .iter()
+                .zip(legacy.lists.list_slots.iter())
+            {
+                assert_eq!(
+                    planned_slot.name, legacy_slot.name,
+                    "list name differs for {example}"
+                );
+                assert_eq!(
+                    planned_slot.capacity, legacy_slot.capacity,
+                    "list capacity differs for {} in {example}",
+                    planned_slot.name
+                );
+                assert_eq!(
+                    planned_slot.row_template.fields.len(),
+                    legacy_slot.row_template.fields.len(),
+                    "row template length differs for {} in {example}",
+                    planned_slot.name
+                );
+                assert_eq!(
+                    planned_slot.memory.visible_snapshots(),
+                    legacy_slot.memory.visible_snapshots(),
+                    "initial rows differ for {} in {example}",
+                    planned_slot.name
+                );
+            }
+        }
     }
 
     #[test]

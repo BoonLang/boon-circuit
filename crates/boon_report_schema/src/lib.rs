@@ -4976,7 +4976,6 @@ mod tests {
                 "scenario_execution_pending_task": "TASK-0901C",
                 "missing_runtime_plan_sections": [
                     "generic_derived_ast_free_plan",
-                    "runtime_storage_initialization_plan",
                     "document_lowering_runtime_tables"
                 ]
             }

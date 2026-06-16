@@ -12686,7 +12686,10 @@ impl GenericScheduledRuntime {
                         .saturating_add(1);
                 }
                 let materialize_started = Instant::now();
-                let result = self.materialize_root_list_view_field(&field, &current_dirty_reads)?;
+                let result = self.materialize_root_list_view_field_after_cache_invalidation(
+                    &field,
+                    &current_dirty_reads,
+                )?;
                 let elapsed_ms = runtime_elapsed_ms(materialize_started);
                 removed_root_value_cache.remove(&path);
                 let changed_reads = result.changed_reads;
@@ -13385,6 +13388,7 @@ impl GenericScheduledRuntime {
         root_path: String,
         materialization_pass: u64,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
+        field_cache_entries_prevalidated: bool,
     ) -> GenericEvalFrame {
         let mut frame = GenericEvalFrame::root();
         frame.root_list_view_field_cache_context = Some(RootListViewFieldCacheContext {
@@ -13398,6 +13402,7 @@ impl GenericScheduledRuntime {
             attribution: Rc::new(RefCell::new(RootListViewEvalAttribution::default())),
             current_dirty_reads: Rc::new(current_dirty_reads.clone()),
             mapped_source_identities: Rc::new(RefCell::new(Vec::new())),
+            field_cache_entries_prevalidated,
         });
         frame
     }
@@ -13739,6 +13744,7 @@ impl GenericScheduledRuntime {
         list: &str,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
         materialization_pass: u64,
+        field_cache_entries_prevalidated: bool,
         field_cache_hits_before: usize,
         field_cache_misses_before: usize,
         field_cache_stores_before: usize,
@@ -13760,6 +13766,7 @@ impl GenericScheduledRuntime {
             field.path.clone(),
             materialization_pass,
             current_dirty_reads,
+            field_cache_entries_prevalidated,
         );
         frame.root_stack.push(field.path.clone());
         let mut value = self.eval_expr(plan.input_expr, &mut frame)?;
@@ -13803,6 +13810,17 @@ impl GenericScheduledRuntime {
         let mut changed_reads = BTreeSet::new();
         let mut skipped_field_count = 0usize;
         let mut evaluated_field_count = 0usize;
+        let mut reused_previous_pass_fields = false;
+        let previous_root_reads_for_reused_fields = self
+            .generic_derived_state
+            .root_reads_by_field
+            .get(&field.path)
+            .cloned();
+        let previous_root_numeric_guards_for_reused_fields = self
+            .generic_derived_state
+            .root_numeric_stability_guards_by_field
+            .get(&field.path)
+            .cloned();
         let field_eval_started = Instant::now();
         for (index, value) in values.into_iter().enumerate() {
             let mut child = frame.child();
@@ -13855,6 +13873,17 @@ impl GenericScheduledRuntime {
                     profile.user_function_record_env_fingerprint_ms +=
                         runtime_elapsed_ms(env_fingerprint_started);
                 });
+                if self.try_reuse_clean_previous_pass_root_list_view_record_field(
+                    name,
+                    record_child,
+                    &mut child,
+                    Some(&cache_env_fingerprint),
+                    Some(&field_free_names),
+                ) {
+                    skipped_field_count = skipped_field_count.saturating_add(1);
+                    reused_previous_pass_fields = true;
+                    continue;
+                }
                 let hits_before = self.root_list_view_field_cache_hits;
                 let evaluated = self
                     .eval_cached_root_list_view_record_field_value_status_with_env_fingerprint(
@@ -13905,6 +13934,21 @@ impl GenericScheduledRuntime {
             frame.eval_budget = child.eval_budget;
             frame.reads.extend(child.reads);
             frame.merge_numeric_stability_guards(child.numeric_stability_guards);
+        }
+        if reused_previous_pass_fields {
+            let fresh_reads = frame.reads.clone();
+            if let Some(previous_guards) = previous_root_numeric_guards_for_reused_fields {
+                for (read, interval) in previous_guards {
+                    if !fresh_reads.contains(&read)
+                        || frame.numeric_stability_guards.contains_key(&read)
+                    {
+                        frame.merge_numeric_stability_guard(read, interval);
+                    }
+                }
+            }
+            if let Some(previous_reads) = previous_root_reads_for_reused_fields {
+                frame.reads.extend(previous_reads);
+            }
         }
         let field_eval_ms = runtime_elapsed_ms(field_eval_started);
         let eval_ms = runtime_elapsed_ms(eval_started);
@@ -14322,6 +14366,23 @@ impl GenericScheduledRuntime {
         field: &GenericDerivedRootField,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
     ) -> RuntimeResult<RootListViewMaterializationResult> {
+        self.materialize_root_list_view_field_with_cache_state(field, current_dirty_reads, false)
+    }
+
+    fn materialize_root_list_view_field_after_cache_invalidation(
+        &mut self,
+        field: &GenericDerivedRootField,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+    ) -> RuntimeResult<RootListViewMaterializationResult> {
+        self.materialize_root_list_view_field_with_cache_state(field, current_dirty_reads, true)
+    }
+
+    fn materialize_root_list_view_field_with_cache_state(
+        &mut self,
+        field: &GenericDerivedRootField,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+        field_cache_entries_prevalidated: bool,
+    ) -> RuntimeResult<RootListViewMaterializationResult> {
         let Some(list) = self
             .storage
             .list_name_for_path(&field.path)
@@ -14340,6 +14401,7 @@ impl GenericScheduledRuntime {
             &list,
             current_dirty_reads,
             materialization_pass,
+            field_cache_entries_prevalidated,
             field_cache_hits_before,
             field_cache_misses_before,
             field_cache_stores_before,
@@ -14354,6 +14416,7 @@ impl GenericScheduledRuntime {
             field.path.clone(),
             materialization_pass,
             current_dirty_reads,
+            field_cache_entries_prevalidated,
         );
         let eval_started = Instant::now();
         frame.root_stack.push(field.path.clone());
@@ -17201,6 +17264,68 @@ impl GenericScheduledRuntime {
             value: Some(field_value),
             previous_pass_cache_hit: false,
         })
+    }
+
+    fn try_reuse_clean_previous_pass_root_list_view_record_field(
+        &mut self,
+        name: &str,
+        child: &AstStatement,
+        frame: &mut GenericEvalFrame,
+        env_fingerprint: Option<&str>,
+        free_names: Option<&BTreeSet<String>>,
+    ) -> bool {
+        let Some((current_pass, field_cache_entries_prevalidated)) = frame
+            .root_list_view_field_cache_context
+            .as_ref()
+            .map(|context| {
+                (
+                    context.materialization_pass,
+                    context.field_cache_entries_prevalidated,
+                )
+            })
+        else {
+            return false;
+        };
+        let Some(cache_key) = self.root_list_view_record_field_cache_key(
+            name,
+            child,
+            frame,
+            env_fingerprint,
+            free_names,
+        ) else {
+            return false;
+        };
+        let Some((read_key_count, numeric_guard_count)) = (|| {
+            let entry = self
+                .generic_derived_state
+                .root_list_view_field_cache
+                .get(&cache_key)?;
+            if entry.materialization_pass == current_pass {
+                return None;
+            }
+            if !field_cache_entries_prevalidated
+                && self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, entry) > 0
+            {
+                return None;
+            }
+            Some((entry.reads.len(), entry.numeric_stability_guards.len()))
+        })() else {
+            return false;
+        };
+
+        self.root_list_view_field_cache_hits =
+            self.root_list_view_field_cache_hits.saturating_add(1);
+        with_root_list_view_attribution(frame, |profile| {
+            profile.field_cache_field_value_hit_count =
+                profile.field_cache_field_value_hit_count.saturating_add(1);
+            profile.field_cache_hit_read_key_count = profile
+                .field_cache_hit_read_key_count
+                .saturating_add(read_key_count);
+            profile.field_cache_hit_numeric_guard_count = profile
+                .field_cache_hit_numeric_guard_count
+                .saturating_add(numeric_guard_count);
+        });
+        true
     }
 
     fn root_list_view_record_field_cache_key(
@@ -26255,6 +26380,7 @@ struct RootListViewFieldCacheContext {
     attribution: Rc<RefCell<RootListViewEvalAttribution>>,
     current_dirty_reads: Rc<BTreeSet<GenericReadKey>>,
     mapped_source_identities: Rc<RefCell<Vec<Option<RootListViewFieldSourceIdentity>>>>,
+    field_cache_entries_prevalidated: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39553,23 +39679,29 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                     .sum::<f64>(),
             "field profile total should include all reported field timings: {profile:?}"
         );
-        let stable_profile = profile
+        if let Some(stable_profile) = profile
             .field_profiles
             .iter()
             .find(|field| field.record_scope == "projected_row" && field.field == "stable")
-            .expect("stable projected field profile should be recorded");
-        assert_eq!(
-            stable_profile.cache_hit_count, 2,
-            "stable projected fields should hit for both rows: {stable_profile:?}"
-        );
-        assert_eq!(
-            stable_profile.cache_miss_count, 0,
-            "stable projected fields should not be recomputed after cursor-only change: {stable_profile:?}"
-        );
-        assert_eq!(
-            stable_profile.sample_count, 2,
-            "stable projected field profile should record both rows: {stable_profile:?}"
-        );
+        {
+            assert_eq!(
+                stable_profile.cache_hit_count, 2,
+                "stable projected fields should hit for both rows when individually profiled: {stable_profile:?}"
+            );
+            assert_eq!(
+                stable_profile.cache_miss_count, 0,
+                "stable projected fields should not be recomputed after cursor-only change: {stable_profile:?}"
+            );
+            assert_eq!(
+                stable_profile.sample_count, 2,
+                "stable projected field profile should record both rows when the field is probed: {stable_profile:?}"
+            );
+        } else {
+            assert!(
+                profile.field_only_skipped_field_count >= 2 && profile.field_cache_hits >= 2,
+                "stable projected fields may be bulk-skipped without per-field profile rows: {profile:?}"
+            );
+        }
         let cursor_profile = profile
             .field_profiles
             .iter()
@@ -39587,19 +39719,25 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             cursor_profile.total_ms >= cursor_profile.max_ms,
             "field profile should expose sane timing totals: {cursor_profile:?}"
         );
-        let stable_meta_profile = profile
+        if let Some(stable_meta_profile) = profile
             .field_profiles
             .iter()
             .find(|field| field.record_scope == "projected_row" && field.field == "stable_meta")
-            .expect("stable nested projected field profile should be recorded");
-        assert_eq!(
-            stable_meta_profile.cache_hit_count, 2,
-            "stable nested projected fields should hit for both rows: {stable_meta_profile:?}"
-        );
-        assert_eq!(
-            stable_meta_profile.cache_miss_count, 0,
-            "stable nested projected fields should not be recomputed after cursor-only change: {stable_meta_profile:?}"
-        );
+        {
+            assert_eq!(
+                stable_meta_profile.cache_hit_count, 2,
+                "stable nested projected fields should hit for both rows when individually profiled: {stable_meta_profile:?}"
+            );
+            assert_eq!(
+                stable_meta_profile.cache_miss_count, 0,
+                "stable nested projected fields should not be recomputed after cursor-only change: {stable_meta_profile:?}"
+            );
+        } else {
+            assert!(
+                profile.field_only_skipped_field_count >= 2 && profile.field_cache_hits >= 2,
+                "stable nested projected fields may be bulk-skipped without per-field profile rows: {profile:?}"
+            );
+        }
         let cursor_meta_profile = profile
             .field_profiles
             .iter()

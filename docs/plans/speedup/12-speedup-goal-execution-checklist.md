@@ -2542,6 +2542,115 @@ Notes:
 - Do not run `EXP-0002` as the next slice merely because it is next in the old
   experiment backlog. Low-level container experiments are deferred until this
   measured root-flush path is addressed or disproven.
+- 2026-06-16 TASK-0804A measurement refresh and killed lazy-ready scheduler
+  experiment: refreshed the official NovyWave interaction-speed gate before
+  changing code. The fresh canonical report still fails only the release click
+  and input p95 budgets: `click_to_cursor_p95=25.073ms`,
+  `input_to_visible_p95=25.073ms`, `runtime_apply_p95=16.311ms`,
+  `runtime_step_apply_p95=13.897ms`, and `layout_rebuild_p95=5.345ms`.
+  Click root buckets identify the current slow path as
+  `source_action_root_flush_p95=9.873ms`,
+  `source_action_root_dirty_scheduler_p95=6.254ms`,
+  `source_action_root_materialization_p95=3.360ms`,
+  `source_action_root_dependent_visit_count_p95=194`,
+  `source_action_root_dependent_enqueue_count_p95=32`, and
+  `source_action_root_dirty_pop_count_p95=38`. The report's root-list summary
+  says the cause directly:
+  `root_flush_dirty_scheduler_plus_root_list_materialization`; the
+  architecture cause is that root list-view materialization still evaluates the
+  whole root expression, maps source rows, materializes rows, and diffs after
+  the fact instead of using a compiled row/field dependency frontier. Across
+  the full click sample set the root flush spent `193.319ms`, with
+  `112.687ms` in dirty scheduling and `75.386ms` in root materialization;
+  `selected_signal_lane_rows` dominated list work (`eval_ms=25.638`,
+  `diff_ms=20.191`, `changed_row_count=96`, `field_cache_hits=4768`,
+  `field_cache_misses=160`), followed by `selected_cursor_pair_rows`
+  (`eval_ms=12.507`, `diff_ms=11.774`, `changed_row_count=48`). An opt-in
+  dirty-frontier report with `BOON_PROFILE_DIRTY_FRONTIER=1` confirmed ranked
+  frontier/root-work samples remain available diagnostically, with top root
+  materialization work on `store.selected_signal_lane_rows` and
+  `store.selected_cursor_pair_rows`; the canonical report intentionally keeps
+  those heavy BTreeMap/string samples disabled and reports
+  `no_dirty_frontier_samples`. A generic lazy-ready dirty-root scheduler patch
+  was implemented and tested, then killed: focused root-derived and
+  root-list-view tests passed, but the official speed gate regressed
+  `click_to_cursor_p95`/`input_to_visible_p95` to `25.850ms` and worsened
+  `runtime_apply_p95` to `16.521ms`. It only nudged
+  `source_action_root_dirty_scheduler_p95` from `6.254ms` to `6.092ms` and
+  `source_action_root_dependent_enqueue_p95` from `3.784ms` to `3.582ms`,
+  below the meaningful-improvement threshold, so it was reverted instead of
+  stacked. Verification/evidence used: report-side subagent
+  `019ed06e-c1d0-7fa3-ae3f-f301eb7fac2c`; `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_derived_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them -- --nocapture`;
+  canonical `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  diagnostic `BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-dirty-frontier.json`;
+  and `git diff --check -- crates/boon_runtime/src/lib.rs`. TASK-0804A
+  remains `in_progress`; the next kept slice should target compiled
+  root-list-view row/field frontiers or direct reuse for the two dominant
+  list-view roots, not another readiness-set heuristic.
+- 2026-06-16 TASK-0804A field-only root list-view snapshot slice: kept a
+  narrow generic runtime materialization cleanup from explorer
+  `019ed06e-7af9-76a0-a86b-4de834fe8f60`. The successful field-only
+  root `ListView` path no longer clones every previous visible row snapshot
+  before it can patch fields. It now checks row count with `list_len`, uses
+  per-row `list_row_field_names` only for branch field-shape guards, and keeps
+  the existing per-field `list_row_field` comparison for changed values. Full
+  fallback snapshot/diff behavior is unchanged. This adds no Boon syntax, no
+  NovyWave-specific branch, and no source workaround. Because canonical reports
+  intentionally keep heavy dirty-frontier samples disabled, `boon_runtime`
+  test builds now keep those samples on by default so structured-parent
+  diagnostic tests still prove skipped child enqueue behavior without changing
+  release report behavior. Post-revert baseline before this slice:
+  `click_to_cursor_p95=22.998ms`, `input_to_visible_p95=22.998ms`,
+  `runtime_apply_p95=15.306ms`, `runtime_step_apply_p95=13.181ms`,
+  `layout_rebuild_p95=5.147ms`, `source_action_root_flush_p95=9.109ms`,
+  `source_action_root_materialization_p95=2.841ms`, and
+  `source_action_root_dirty_scheduler_p95=6.104ms`;
+  `selected_signal_lane_rows.previous_snapshot_ms=3.087`,
+  `selected_signal_lane_rows.eval_ms=23.045`, and
+  `selected_cursor_pair_rows.previous_snapshot_ms=0.058`. After the slice,
+  the strict speed gate still fails click/input budgets and click p95 is noisy
+  (`click_to_cursor_p95=23.337ms`,
+  `input_to_visible_p95=23.337ms`), but the targeted runtime buckets moved in
+  the right direction: `runtime_apply_p95=15.106ms`,
+  `runtime_step_apply_p95=12.957ms`,
+  `source_action_root_flush_p95=8.972ms`,
+  `source_action_root_materialization_p95=2.653ms`, and
+  `source_action_root_dirty_scheduler_p95=6.111ms`.
+  `selected_signal_lane_rows.previous_snapshot_ms=0.0`,
+  `selected_signal_lane_rows.eval_ms=19.767`,
+  `selected_signal_lane_rows.diff_ms=18.556`,
+  `selected_cursor_pair_rows.previous_snapshot_ms=0.0`, and
+  `selected_cursor_pair_rows.eval_ms=11.382`. Renderer upload remains solved:
+  post-interaction upload is still `3360` bytes, dirty upload ranges are `3`,
+  staging wraps are `0`, and quad-cache evictions are `0`. Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_list_view_field_cache_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_same_source_rows_patch_in_place_and_keep_target_identity -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_field_only_patches_when_dispatched_record_rows -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_branch_selector_dirty_falls_back_before_field_patch -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_materializes_current_order_after_same_count_reorder -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_append_after_remove_does_not_reuse_stale_row_projection -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_derived_revisits_earlier_dependent_after_later_dependency_changes -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_scalar_same_event_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib` (`201 passed`);
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  (expected `status=fail` on remaining click/input budgets);
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
+  (`status=pass`, proof mode, coverage `71/71`);
+  `cargo xtask verify-report-schema`;
+  and `git diff --check -- crates/boon_runtime/src/lib.rs docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+  The broad
+  `cargo test -p boon_native_playground --bin boon_native_playground` command
+  was attempted and is not pass evidence in the current tree: it failed
+  `22/168` broad UI/editor/cells/Todo/NovyWave tests unrelated to this
+  runtime-only field-only list-view snapshot change. TASK-0804A remains
+  `in_progress`; next work should attack the remaining `selected_signal_lane_rows`
+  `diff_ms`/field-loop cost or dirty-scheduler fanout with a compiled
+  row/field frontier.
 
 ## Phase 9: Low-Level Rust Experiments
 

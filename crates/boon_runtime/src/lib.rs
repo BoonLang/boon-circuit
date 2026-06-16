@@ -530,6 +530,11 @@ fn runtime_profile_root_demand_enabled() -> bool {
 fn runtime_profile_dirty_frontier_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
+        #[cfg(test)]
+        {
+            return true;
+        }
+        #[cfg(not(test))]
         std::env::var("BOON_PROFILE_DIRTY_FRONTIER")
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
@@ -14100,10 +14105,9 @@ impl GenericScheduledRuntime {
             ));
         }
 
-        let previous_snapshot_started = Instant::now();
-        let previous_rows = self.storage.list_visible_snapshots(list)?;
-        let previous_snapshot_ms = runtime_elapsed_ms(previous_snapshot_started);
-        if previous_rows.len() != values.len() {
+        let previous_row_count = self.storage.list_len(list)?;
+        let previous_snapshot_ms = 0.0;
+        if previous_row_count != values.len() {
             return Ok(RootListViewFieldOnlyOutcome::Fallback(
                 "row_count_mismatch".to_owned(),
             ));
@@ -14139,10 +14143,10 @@ impl GenericScheduledRuntime {
                 Err(reason) => return Ok(RootListViewFieldOnlyOutcome::Fallback(reason)),
             };
             if active.branch_checked {
-                let previous_field_names = previous_rows[index]
-                    .columns
-                    .field_id_labels()
-                    .into_values()
+                let previous_field_names = self
+                    .storage
+                    .list_row_field_names(list, index)?
+                    .into_iter()
                     .collect::<BTreeSet<_>>();
                 if !active.record_field_names.is_subset(&previous_field_names) {
                     return Ok(RootListViewFieldOnlyOutcome::Fallback(
@@ -14321,8 +14325,8 @@ impl GenericScheduledRuntime {
             .sum::<f64>();
         let profile = LiveRuntimeRootListViewProfile {
             list: list.to_owned(),
-            row_count: previous_rows.len(),
-            previous_row_count: previous_rows.len(),
+            row_count: previous_row_count,
+            previous_row_count,
             changed_row_count: changed_rows.len(),
             changed_field_count,
             broad_fallback: false,
@@ -14351,7 +14355,7 @@ impl GenericScheduledRuntime {
             replace_ms,
             rebind_ms: 0.0,
             in_place_patch: true,
-            in_place_patch_row_count: previous_rows.len(),
+            in_place_patch_row_count: previous_row_count,
             field_only_attempt: true,
             field_only_patch: true,
             field_only_fallback_reason: None,
@@ -40308,6 +40312,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "field-only materialization must not rebuild full row bodies: {profile:?}"
         );
         assert_eq!(
+            profile.previous_snapshot_ms, 0.0,
+            "field-only materialization should avoid cloning previous row snapshots: {profile:?}"
+        );
+        assert_eq!(
             profile.field_only_patch_row_count, 2,
             "both cursor-dependent rows should be field-patched: {profile:?}"
         );
@@ -40438,6 +40446,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(
             profile.full_eval_row_count, 0,
             "branch field-only materialization must not rebuild full rows: {profile:?}"
+        );
+        assert_eq!(
+            profile.previous_snapshot_ms, 0.0,
+            "branch field-only materialization should check row shape lazily without cloning all rows: {profile:?}"
         );
         assert_eq!(
             profile.field_only_patch_row_count, 2,

@@ -14849,6 +14849,24 @@ impl GenericScheduledRuntime {
         dirty: &BTreeSet<String>,
         pending: &BTreeSet<String>,
     ) -> Option<String> {
+        let parts = path.split('.').collect::<Vec<_>>();
+        if parts.len() <= 1 {
+            return None;
+        }
+        let pending_parent = (1..parts.len()).rev().find_map(|end| {
+            let parent = parts[..end].join(".");
+            ((dirty.contains(&parent) || pending.contains(&parent))
+                && self
+                    .generic_derived
+                    .root_fields
+                    .iter()
+                    .any(|field| field.path == parent)
+                && matches!(
+                    self.storage.root.owned_value(&parent),
+                    Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
+                ))
+            .then_some(parent)
+        })?;
         let Some(field) = self
             .generic_derived
             .root_fields
@@ -14865,27 +14883,7 @@ impl GenericScheduledRuntime {
         {
             return None;
         }
-        let parts = path.split('.').collect::<Vec<_>>();
-        if parts.len() <= 1 {
-            return None;
-        }
-        for end in (1..parts.len()).rev() {
-            let parent = parts[..end].join(".");
-            if (dirty.contains(&parent) || pending.contains(&parent))
-                && self
-                    .generic_derived
-                    .root_fields
-                    .iter()
-                    .any(|field| field.path == parent)
-                && matches!(
-                    self.storage.root.owned_value(&parent),
-                    Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
-                )
-            {
-                return Some(parent);
-            }
-        }
-        None
+        Some(pending_parent)
     }
 
     fn remove_structured_child_ready_roots(

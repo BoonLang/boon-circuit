@@ -13451,22 +13451,37 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_field_only_record_projector(
-        &self,
+        &mut self,
         function: FunctionDefinition,
         row_arg: String,
     ) -> Option<RootListViewFieldOnlyRecordProjector> {
         let record_children = Self::root_list_view_function_record_children(&function)?;
-        let record_field_names = Self::root_list_view_record_field_names(&record_children)?;
+        let fields = record_children
+            .into_iter()
+            .map(|statement| {
+                let name = record_statement_child_name(&statement)?.to_owned();
+                let free_env_names = self.statement_free_env_names(&statement);
+                Some(RootListViewFieldOnlyRecordField {
+                    name,
+                    statement,
+                    free_env_names,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let record_field_names = fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<BTreeSet<_>>();
         Some(RootListViewFieldOnlyRecordProjector {
             function,
             row_arg,
-            record_children,
+            fields,
             record_field_names,
         })
     }
 
     fn root_list_view_field_only_projector_from_call(
-        &self,
+        &mut self,
         function: &str,
         call_args: &[AstCallArg],
         forwarded_binding: &str,
@@ -13482,7 +13497,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_field_only_branch_projector(
-        &self,
+        &mut self,
         function: FunctionDefinition,
         row_arg: String,
     ) -> Option<RootListViewFieldOnlyProjector> {
@@ -13501,30 +13516,30 @@ impl GenericScheduledRuntime {
             if !arm.children.is_empty() {
                 return None;
             }
-            let arm_expr = self.generic_derived.expressions.get(arm.expr?)?;
-            let AstExprKind::MatchArm {
-                pattern,
-                output: Some(output),
-            } = &arm_expr.kind
-            else {
-                return None;
-            };
-            let output_expr = self.generic_derived.expressions.get(*output)?;
-            let AstExprKind::Call {
-                function: arm_function,
-                args: arm_args,
-            } = &output_expr.kind
-            else {
-                return None;
+            let (pattern, arm_function, arm_args) = {
+                let arm_expr = self.generic_derived.expressions.get(arm.expr?)?;
+                let AstExprKind::MatchArm {
+                    pattern,
+                    output: Some(output),
+                } = &arm_expr.kind
+                else {
+                    return None;
+                };
+                let output_expr = self.generic_derived.expressions.get(*output)?;
+                let AstExprKind::Call {
+                    function: arm_function,
+                    args: arm_args,
+                } = &output_expr.kind
+                else {
+                    return None;
+                };
+                (pattern.clone(), arm_function.clone(), arm_args.clone())
             };
             let (arm_function, arm_row_arg) =
-                self.root_list_view_field_only_call_target(arm_function, arm_args, &row_arg)?;
+                self.root_list_view_field_only_call_target(&arm_function, &arm_args, &row_arg)?;
             let projector =
                 self.root_list_view_field_only_record_projector(arm_function, arm_row_arg)?;
-            arms.push(RootListViewFieldOnlyBranchArm {
-                pattern: pattern.clone(),
-                projector,
-            });
+            arms.push(RootListViewFieldOnlyBranchArm { pattern, projector });
         }
         (!arms.is_empty()).then_some(RootListViewFieldOnlyProjector::Branch {
             function,
@@ -13535,7 +13550,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_field_only_plan(
-        &self,
+        &mut self,
         statement: &AstStatement,
     ) -> Option<RootListViewFieldOnlyPlan> {
         if statement.expr.is_none() {
@@ -13582,7 +13597,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_field_only_plan_from_continuations(
-        &self,
+        &mut self,
         input_expr: usize,
         mut continuations: Vec<AstStatement>,
     ) -> Option<RootListViewFieldOnlyPlan> {
@@ -13597,11 +13612,12 @@ impl GenericScheduledRuntime {
         if op != "List/map" {
             return None;
         }
-        self.root_list_view_field_only_plan_from_map(input_expr, continuations, args)
+        let args = args.clone();
+        self.root_list_view_field_only_plan_from_map(input_expr, continuations, &args)
     }
 
     fn root_list_view_field_only_plan_from_expr(
-        &self,
+        &mut self,
         expr_id: usize,
     ) -> Option<RootListViewFieldOnlyPlan> {
         let expr = self.generic_derived.expressions.get(expr_id)?;
@@ -13609,11 +13625,13 @@ impl GenericScheduledRuntime {
             return None;
         };
         (op == "List/map").then_some(())?;
-        self.root_list_view_field_only_plan_from_map(*input, Vec::new(), args)
+        let input = *input;
+        let args = args.clone();
+        self.root_list_view_field_only_plan_from_map(input, Vec::new(), &args)
     }
 
     fn root_list_view_field_only_plan_from_map(
-        &self,
+        &mut self,
         input_expr: usize,
         prefix_continuations: Vec<AstStatement>,
         args: &[AstCallArg],
@@ -13626,15 +13644,22 @@ impl GenericScheduledRuntime {
             .iter()
             .find(|arg| arg.name.as_deref() == Some("new"))?
             .value;
-        let AstExprKind::Call {
-            function,
-            args: call_args,
-        } = &self.generic_derived.expressions.get(new_expr)?.kind
-        else {
-            return None;
+        let (function, call_args) = {
+            let expr = self.generic_derived.expressions.get(new_expr)?;
+            let AstExprKind::Call {
+                function,
+                args: call_args,
+            } = &expr.kind
+            else {
+                return None;
+            };
+            (function.clone(), call_args.clone())
         };
-        let projector =
-            self.root_list_view_field_only_projector_from_call(function, call_args, &map_binding)?;
+        let projector = self.root_list_view_field_only_projector_from_call(
+            &function,
+            &call_args,
+            &map_binding,
+        )?;
         Some(RootListViewFieldOnlyPlan {
             input_expr,
             prefix_continuations,
@@ -13657,7 +13682,7 @@ impl GenericScheduledRuntime {
                 Ok(Ok(RootListViewActiveRecordProjector {
                     function_name: &projector.function.name,
                     row_arg: &projector.row_arg,
-                    record_children: &projector.record_children,
+                    record_fields: &projector.fields,
                     record_field_names: &projector.record_field_names,
                     function_call_count: 1,
                     branch_checked: false,
@@ -13691,7 +13716,7 @@ impl GenericScheduledRuntime {
                             return Ok(Ok(RootListViewActiveRecordProjector {
                                 function_name: &arm.projector.function.name,
                                 row_arg: &arm.projector.row_arg,
-                                record_children: &arm.projector.record_children,
+                                record_fields: &arm.projector.fields,
                                 record_field_names: &arm.projector.record_field_names,
                                 function_call_count: 2,
                                 branch_checked: true,
@@ -13816,14 +13841,11 @@ impl GenericScheduledRuntime {
             let body_started = Instant::now();
             let field_loop_started = Instant::now();
             let mut env_fingerprint_cache = BTreeMap::new();
-            for record_child in active.record_children {
-                let Some(name) = record_statement_child_name(record_child) else {
-                    return Ok(RootListViewFieldOnlyOutcome::Fallback(
-                        "unsupported_record_child".to_owned(),
-                    ));
-                };
+            for record_field in active.record_fields {
+                let name = record_field.name.as_str();
+                let record_child = &record_field.statement;
+                let field_free_names = &record_field.free_env_names;
                 let env_fingerprint_started = Instant::now();
-                let field_free_names = self.statement_free_env_names(record_child);
                 let cache_env_fingerprint = root_list_view_cached_env_fingerprint(
                     &mut env_fingerprint_cache,
                     || self.root_list_view_env_fingerprint(&child, Some(&field_free_names)),
@@ -13841,6 +13863,7 @@ impl GenericScheduledRuntime {
                         &mut child,
                         Some(&cache_env_fingerprint),
                         Some(&field_free_names),
+                        false,
                     )?;
                 if self.root_list_view_field_cache_hits > hits_before {
                     skipped_field_count = skipped_field_count.saturating_add(1);
@@ -13850,6 +13873,12 @@ impl GenericScheduledRuntime {
                 if evaluated.previous_pass_cache_hit {
                     continue;
                 }
+                let Some(evaluated_value) = evaluated.value else {
+                    return Err(format!(
+                        "missing evaluated field value for changed root list field `{name}`"
+                    )
+                    .into());
+                };
                 let current = match self.storage.list_row_field(list, index, name) {
                     Ok(value) => field_value_ref_owned(value),
                     Err(_) => {
@@ -13858,11 +13887,11 @@ impl GenericScheduledRuntime {
                         ));
                     }
                 };
-                if current != evaluated.value {
+                if current != evaluated_value {
                     patches.push(RootListViewFieldOnlyPatch {
                         row: index,
                         field: name.to_owned(),
-                        value: evaluated.value,
+                        value: evaluated_value,
                     });
                     changed_rows.insert(index);
                     insert_changed_list_field_read_keys(&mut changed_reads, list, index, name);
@@ -17014,8 +17043,13 @@ impl GenericScheduledRuntime {
             frame,
             env_fingerprint,
             free_names,
+            true,
         )
-        .map(|evaluated| evaluated.value)
+        .and_then(|evaluated| {
+            evaluated.value.ok_or_else(|| {
+                format!("missing cached root list-view field value for `{name}`").into()
+            })
+        })
     }
 
     fn eval_cached_root_list_view_record_field_value_status_with_env_fingerprint(
@@ -17025,6 +17059,7 @@ impl GenericScheduledRuntime {
         frame: &mut GenericEvalFrame,
         env_fingerprint: Option<&str>,
         free_names: Option<&BTreeSet<String>>,
+        value_for_previous_pass_hit: bool,
     ) -> RuntimeResult<RootListViewEvaluatedFieldValue> {
         let Some(cache_key) = self.root_list_view_record_field_cache_key(
             name,
@@ -17043,7 +17078,7 @@ impl GenericScheduledRuntime {
             }
             let value = value?;
             return Ok(RootListViewEvaluatedFieldValue {
-                value: boon_value_field_value(&value),
+                value: Some(boon_value_field_value(&value)),
                 previous_pass_cache_hit: false,
             });
         };
@@ -17070,14 +17105,20 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_list_view_field_cache
             .get(&cache_key)
-            .cloned()
         {
             let read_key_count = entry.reads.len();
             let numeric_guard_count = entry.numeric_stability_guards.len();
+            let previous_pass_cache_hit = frame
+                .root_list_view_field_cache_context
+                .as_ref()
+                .is_some_and(|context| entry.materialization_pass != context.materialization_pass);
+            let value = (!previous_pass_cache_hit || value_for_previous_pass_hit)
+                .then(|| entry.field_value.clone());
+            let numeric_stability_guards = entry.numeric_stability_guards.clone();
             self.root_list_view_field_cache_hits =
                 self.root_list_view_field_cache_hits.saturating_add(1);
-            frame.reads.extend(entry.reads);
-            frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
+            frame.reads.extend(entry.reads.iter().cloned());
+            frame.merge_numeric_stability_guards(numeric_stability_guards);
             with_root_list_view_attribution(frame, |profile| {
                 profile.field_cache_field_value_hit_count =
                     profile.field_cache_field_value_hit_count.saturating_add(1);
@@ -17095,12 +17136,8 @@ impl GenericScheduledRuntime {
                 true,
                 false,
             );
-            let previous_pass_cache_hit = frame
-                .root_list_view_field_cache_context
-                .as_ref()
-                .is_some_and(|context| entry.materialization_pass != context.materialization_pass);
             return Ok(RootListViewEvaluatedFieldValue {
-                value: entry.field_value.clone(),
+                value,
                 previous_pass_cache_hit,
             });
         }
@@ -17161,7 +17198,7 @@ impl GenericScheduledRuntime {
                 );
         }
         Ok(RootListViewEvaluatedFieldValue {
-            value: field_value,
+            value: Some(field_value),
             previous_pass_cache_hit: false,
         })
     }
@@ -26106,8 +26143,14 @@ struct RootListViewFieldOnlyPlan {
 struct RootListViewFieldOnlyRecordProjector {
     function: FunctionDefinition,
     row_arg: String,
-    record_children: Vec<AstStatement>,
+    fields: Vec<RootListViewFieldOnlyRecordField>,
     record_field_names: BTreeSet<String>,
+}
+
+struct RootListViewFieldOnlyRecordField {
+    name: String,
+    statement: AstStatement,
+    free_env_names: BTreeSet<String>,
 }
 
 enum RootListViewFieldOnlyProjector {
@@ -26128,7 +26171,7 @@ struct RootListViewFieldOnlyBranchArm {
 struct RootListViewActiveRecordProjector<'a> {
     function_name: &'a str,
     row_arg: &'a str,
-    record_children: &'a [AstStatement],
+    record_fields: &'a [RootListViewFieldOnlyRecordField],
     record_field_names: &'a BTreeSet<String>,
     function_call_count: usize,
     branch_checked: bool,
@@ -26176,7 +26219,7 @@ struct RootListViewFieldCacheEntry {
 
 #[derive(Clone, Debug)]
 struct RootListViewEvaluatedFieldValue {
-    value: FieldValue,
+    value: Option<FieldValue>,
     previous_pass_cache_hit: bool,
 }
 

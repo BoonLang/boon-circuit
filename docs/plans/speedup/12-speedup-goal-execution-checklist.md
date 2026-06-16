@@ -2784,7 +2784,7 @@ Notes:
   sets, or dirty-set timing above roughly `1%` of apply time.
 
 ### EXP-0005 Shader-Side Shapes
-Status: pending
+Status: done
 Type: experiment
 Depends on: TASK-0501
 Hypothesis:
@@ -2802,6 +2802,27 @@ Verification:
 - `cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json`
 Notes:
 - Keep generated WESL/WGSL/bindgen pipeline authoritative.
+- Result: do not promote a shader-side shape primitive in this slice. The
+  renderer already has chunk-level geometry upload identity, and the latest
+  available NovyWave interaction report shows post-interaction upload at
+  `3360` bytes, `3` dirty upload ranges, and `3` queue writes after retained
+  chunk reuse. That report is useful as a historical hint, but it is not fresh
+  for current `HEAD`, so it is not treated as current proof.
+- The future candidate remains real but narrower: replace CPU-rasterized
+  checkbox/circle/checkmark primitives with analytic GPU primitives only after
+  reports distinguish primitive expansion by type. Current tests show the CPU
+  paths are correctness-sensitive and already have visual expectations for
+  checkbox raster, rounded shadows, material layers, and external document
+  primitives; broad rounded/shadow/timeline/waveform shader rewrites are
+  deferred behind a dedicated measured candidate.
+- Kill criteria applied: no measured current interaction upload/frame win was
+  available, and changing the generated shader/vertex schema now would add
+  proof risk without attacking the measured runtime/frontier bottleneck.
+- Reopen when a dedicated report shows a primitive class dominating initial or
+  interaction frames, for example CPU-emitted checkbox/circle pixels,
+  rounded-border segments, or shadow/material layers. A promoted slice should
+  first add primitive-type counters and then move only one primitive family to
+  a generated WESL/WGSL-backed analytic path.
 
 ### EXP-0006 Generated Rust Or Cranelift Kernels
 Status: pending
@@ -4389,6 +4410,33 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Next direction: move to dependency-frontier, field-only list-root, or
   compiled row scheduling tasks instead of continuing generic dirty-set
   container swaps.
+
+- Date: 2026-06-16
+- Task: EXP-0005 Shader-Side Shapes
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only shader-side shape audit from subagent
+  `019ed175-4a8a-7fb1-b548-87a0a06dff7e`; local renderer/shader inspection;
+  `cargo test -p boon_native_gpu --lib`; `cargo xtask
+  verify-native-gpu-shaders --check --report
+  target/reports/native-gpu/shaders.json`; `jq` inspection of the latest
+  available NovyWave interaction renderer upload probe.
+- Result: killed/deferred shader-side shape promotion for the current roadmap
+  slice. The current generated shader remains a simple textured-quad path, and
+  CPU-expanded rounded rects, shadows, material layers, and checkbox/circle
+  rasters are real future candidates. The latest available NovyWave
+  interaction report, generated before the current `HEAD`, shows
+  post-interaction renderer upload at `3360` bytes, `3` dirty upload ranges,
+  `3` queue writes, `314` retained chunk hits, and `10` misses. Treat that as
+  historical direction only; together with current shader tests, it does not
+  justify a shader/vertex schema change before the measured
+  runtime/root-frontier work.
+- Next direction: if returning to this family, first add primitive-type
+  expansion counters and a narrow proof fixture for one analytic primitive
+  family, likely checkbox/circle/checkmark. Keep the generated
+  WESL/WGSL/bindgen pipeline authoritative and do not hand-edit the generated
+  shader path.
 
 ## File Maintenance Checklist
 

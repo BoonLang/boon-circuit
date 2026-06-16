@@ -1,9 +1,10 @@
 #![recursion_limit = "256"]
 
 use boon_runtime::{
-    LiveRuntime, LiveSourceEvent, VerificationLayer, emit_compiled_artifact, example_paths,
-    inspect_compiled_artifact_report, parse_scenario, run_scenario, run_scenario_project,
-    verify_report_schema, write_json,
+    ArtifactScenarioRunOutput, LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer,
+    emit_compiled_artifact, example_paths, inspect_compiled_artifact_report, parse_scenario,
+    run_compiled_artifact_scenario, run_scenario, run_scenario_project, verify_report_schema,
+    write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +28,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-report-schema",
     "verify-compiled-artifact",
     "verify-compiled-artifact-inspection",
+    "verify-compiled-artifact-scenario",
     "check-bridge",
     "verify-novywave-bridge-scenario",
     "verify-runtime-production-hardening",
@@ -119,6 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-report-schema" => verify_reports_schema(),
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
         "verify-compiled-artifact-inspection" => verify_compiled_artifact_inspection(&args),
+        "verify-compiled-artifact-scenario" => verify_compiled_artifact_scenario(&args),
         "check-bridge" => check_bridge(&args),
         "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
@@ -1624,6 +1627,114 @@ fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn st
         return Err("compiled artifact inspection must deserialize source routes".into());
     }
     Ok(())
+}
+
+fn verify_compiled_artifact_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = named_arg(args, 1)?;
+    let (source, scenario, _) = example_paths(name)?;
+    let artifact = args
+        .windows(2)
+        .find(|window| window[0] == "--artifact")
+        .map(|window| PathBuf::from(&window[1]))
+        .unwrap_or_else(|| PathBuf::from(format!("target/artifacts/boonc/{name}.boonc")));
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "target/reports/compiled-artifact-scenario-{name}.json"
+        ))
+    });
+
+    let compile_report = emit_compiled_artifact(&source, &artifact, None)?;
+    let source_output = run_scenario(&source, &scenario, VerificationLayer::Semantic, None)?;
+    let artifact_output = run_compiled_artifact_scenario(&artifact, &scenario)?;
+    let source_signature = source_scenario_signature(&source_output);
+    let artifact_signature = artifact_scenario_signature(&artifact_output);
+    let source_signature_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&source_signature)?);
+    let artifact_signature_hash =
+        boon_runtime::sha256_bytes(&serde_json::to_vec(&artifact_signature)?);
+    let semantic_deltas_match =
+        source_signature["semantic_deltas"] == artifact_signature["semantic_deltas"];
+    let render_patches_match =
+        source_signature["render_patches"] == artifact_signature["render_patches"];
+    let state_summary_match =
+        source_signature["state_summary"] == artifact_signature["state_summary"];
+    let parity_passed = semantic_deltas_match && render_patches_match && state_summary_match;
+    let artifact_hash = boon_runtime::sha256_file(&artifact)?;
+    let source_hash = boon_runtime::sha256_file(&source)?;
+    let scenario_hash = boon_runtime::sha256_file(&scenario)?;
+    let report_value = json!({
+        "status": if parity_passed { "pass" } else { "fail" },
+        "report_version": 1,
+        "command": "verify-compiled-artifact-scenario",
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "measurement_mode": "proof",
+        "exit_status": if parity_passed { 0 } else { 1 },
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source.display().to_string(),
+        "source_hash": source_hash.clone(),
+        "expected_source_hash": source_hash,
+        "program_hash": compile_report["program_hash"],
+        "scenario_path": scenario.display().to_string(),
+        "scenario_hash": scenario_hash,
+        "artifact_path": artifact.display().to_string(),
+        "artifact_hash": artifact_hash.clone(),
+        "compiled_artifact": compile_report["compiled_artifact"],
+        "artifact_sections": compile_report["artifact_sections"],
+        "artifact_sha256s": [{
+            "path": artifact.display().to_string(),
+            "sha256": artifact_hash
+        }],
+        "artifact_scenario": {
+            "scenario_execution_available": true,
+            "scenario_execution_from_artifact": true,
+            "runtime_instantiated_from_artifact": true,
+            "source_reparse_attempted": false,
+            "source_file_access": "not_attempted",
+            "typed_ir_required_for_artifact_execution": false,
+            "parser_ast_required_for_artifact_execution": false,
+            "source_oracle_layer": "semantic",
+            "artifact_run_step_count": artifact_output.per_step.len(),
+            "source_run_step_count": source_output.report["total_ticks"],
+            "source_total_semantic_deltas": source_output.semantic_deltas.len(),
+            "artifact_total_semantic_deltas": artifact_output.semantic_deltas.len(),
+            "source_total_render_patches": source_output.render_patches.len(),
+            "artifact_total_render_patches": artifact_output.render_patches.len(),
+            "semantic_deltas_match": semantic_deltas_match,
+            "render_patches_match": render_patches_match,
+            "state_summary_match": state_summary_match,
+            "parity_passed": parity_passed,
+            "source_signature_hash": source_signature_hash,
+            "artifact_signature_hash": artifact_signature_hash,
+            "artifact_per_step": artifact_output.per_step,
+        }
+    });
+    write_json(&report, &report_value)?;
+    if !parity_passed {
+        return Err(format!(
+            "compiled artifact scenario parity failed; see {}",
+            report.display()
+        )
+        .into());
+    }
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn source_scenario_signature(output: &RunOutput) -> serde_json::Value {
+    json!({
+        "semantic_deltas": output.semantic_deltas,
+        "render_patches": output.render_patches,
+        "state_summary": output.state_summary,
+    })
+}
+
+fn artifact_scenario_signature(output: &ArtifactScenarioRunOutput) -> serde_json::Value {
+    json!({
+        "semantic_deltas": output.semantic_deltas,
+        "render_patches": output.render_patches,
+        "state_summary": output.state_summary,
+    })
 }
 
 fn enrich_semantic_build_evidence(

@@ -308,6 +308,14 @@ pub struct RunOutput {
     pub document: Option<DocumentAst>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ArtifactScenarioRunOutput {
+    pub semantic_deltas: Vec<SemanticDelta<'static>>,
+    pub render_patches: Vec<RenderPatch<'static>>,
+    pub state_summary: JsonValue,
+    pub per_step: Vec<JsonValue>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LiveSourceEvent {
     pub source: String,
@@ -2481,6 +2489,16 @@ pub fn run_scenario(
         document: boon_parser::parsed_document(&parsed),
         ..output
     })
+}
+
+pub fn run_compiled_artifact_scenario(
+    artifact_path: &Path,
+    scenario_path: &Path,
+) -> RuntimeResult<ArtifactScenarioRunOutput> {
+    let artifact = CompiledArtifact::load_from_path(artifact_path)?;
+    let runtime = LoadedRuntime::from_compiled_artifact(&artifact)?;
+    let scenario = parse_scenario(scenario_path)?;
+    run_artifact_runtime_scenario(runtime, &scenario)
 }
 
 pub fn run_scenario_project(
@@ -12538,6 +12556,41 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         render_patches,
         state_summary,
         document: boon_parser::parsed_document(parsed),
+    })
+}
+
+fn run_artifact_runtime_scenario(
+    mut runtime: LoadedRuntime,
+    scenario: &Scenario,
+) -> RuntimeResult<ArtifactScenarioRunOutput> {
+    runtime.prepare_for_scenario(scenario)?;
+    let mut semantic_deltas = Vec::new();
+    let mut render_patches = Vec::new();
+    let mut per_step = Vec::new();
+    let mut step_deltas = Vec::with_capacity(64);
+    let mut step_patches = Vec::with_capacity(64);
+    for step in &scenario.step {
+        step_deltas.clear();
+        step_patches.clear();
+        runtime.apply_step(step, &mut step_deltas, &mut step_patches)?;
+        assert_delta_expectations(step, &step_deltas, &step_patches)?;
+        runtime.assert_step_after_measurement(step)?;
+        per_step.push(json!({
+            "id": step.id,
+            "pass": true,
+            "input_route_verified": step.user_action.is_some(),
+            "semantic_delta_count": step_deltas.len(),
+            "render_patch_count": step_patches.len(),
+        }));
+        semantic_deltas.extend(step_deltas.iter().map(SemanticDelta::to_static));
+        render_patches.extend(step_patches.iter().map(RenderPatch::to_static));
+    }
+    let state_summary = runtime.state_summary();
+    Ok(ArtifactScenarioRunOutput {
+        semantic_deltas,
+        render_patches,
+        state_summary,
+        per_step,
     })
 }
 
@@ -43429,6 +43482,44 @@ FUNCTION icon_code(item) {
             runtime.generic_state_summary().is_object(),
             "artifact runtime load must not depend on source file access"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn compiled_artifact_runs_counter_scenario_without_source_and_matches_source_runtime() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-scenario-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let source = temp_root.join("counter.bn");
+        std::fs::copy("../../examples/counter.bn", &source).unwrap();
+        let scenario = Path::new("../../examples/counter.scn");
+        let artifact_path = temp_root.join("counter.boonc");
+
+        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+        let source_output =
+            run_scenario(&source, scenario, VerificationLayer::Semantic, None).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&source_output.semantic_deltas).unwrap(),
+            serde_json::to_value(&artifact_output.semantic_deltas).unwrap(),
+            "artifact scenario semantic deltas must match source runtime"
+        );
+        assert_eq!(
+            serde_json::to_value(&source_output.render_patches).unwrap(),
+            serde_json::to_value(&artifact_output.render_patches).unwrap(),
+            "artifact scenario render patches must match source runtime"
+        );
+        assert_eq!(
+            source_output.state_summary, artifact_output.state_summary,
+            "artifact scenario final state must match source runtime"
+        );
+        assert_eq!(artifact_output.per_step.len(), 7);
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

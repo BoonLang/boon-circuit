@@ -140,6 +140,12 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_inspected_compiled_artifact_report(&report, path)?;
         return Ok(());
     }
+    if report.get("command").and_then(JsonValue::as_str)
+        == Some("verify-compiled-artifact-scenario")
+    {
+        verify_compiled_artifact_scenario_report(&report, path)?;
+        return Ok(());
+    }
     let required = [
         "report_version",
         "generated_at_utc",
@@ -660,6 +666,187 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         )
         .into());
     }
+    verify_compiled_artifact_sections(report, path)?;
+    verify_artifact_hashes(report, path)?;
+    Ok(())
+}
+
+fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "status",
+        "report_version",
+        "command",
+        "command_argv",
+        "measurement_mode",
+        "exit_status",
+        "generated_at_utc",
+        "git_commit",
+        "binary_hash",
+        "source_path",
+        "source_hash",
+        "scenario_path",
+        "scenario_hash",
+        "program_hash",
+        "artifact_path",
+        "artifact_hash",
+        "compiled_artifact",
+        "artifact_sections",
+        "artifact_sha256s",
+        "artifact_scenario",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} missing verify-compiled-artifact-scenario report field `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!(
+            "{} verify-compiled-artifact-scenario report did not pass",
+            path.display()
+        )
+        .into());
+    }
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("proof") {
+        return Err(format!(
+            "{} verify-compiled-artifact-scenario report measurement_mode must be proof",
+            path.display()
+        )
+        .into());
+    }
+    let artifact = report
+        .get("compiled_artifact")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} compiled_artifact is not an object", path.display()))?;
+    for key in [
+        "path",
+        "sha256",
+        "format",
+        "artifact_version",
+        "program_hash",
+        "report_schema_hash",
+        "source_unit_count",
+    ] {
+        if artifact.get(key).is_none() {
+            return Err(format!("{} compiled_artifact missing `{key}`", path.display()).into());
+        }
+    }
+    if artifact.get("sha256") != report.get("artifact_hash") {
+        return Err(format!(
+            "{} compiled_artifact sha256 does not match artifact_hash",
+            path.display()
+        )
+        .into());
+    }
+    if artifact.get("path") != report.get("artifact_path") {
+        return Err(format!(
+            "{} compiled_artifact path does not match artifact_path",
+            path.display()
+        )
+        .into());
+    }
+    if artifact.get("program_hash") != report.get("program_hash") {
+        return Err(format!(
+            "{} compiled_artifact program_hash does not match report",
+            path.display()
+        )
+        .into());
+    }
+    let scenario = report
+        .get("artifact_scenario")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} artifact_scenario is not an object", path.display()))?;
+    for key in [
+        "scenario_execution_available",
+        "scenario_execution_from_artifact",
+        "runtime_instantiated_from_artifact",
+        "source_reparse_attempted",
+        "source_file_access",
+        "typed_ir_required_for_artifact_execution",
+        "parser_ast_required_for_artifact_execution",
+        "semantic_deltas_match",
+        "render_patches_match",
+        "state_summary_match",
+        "parity_passed",
+        "source_signature_hash",
+        "artifact_signature_hash",
+    ] {
+        if scenario.get(key).is_none() {
+            return Err(format!("{} artifact_scenario missing `{key}`", path.display()).into());
+        }
+    }
+    if scenario
+        .get("scenario_execution_available")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+        || scenario
+            .get("scenario_execution_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || scenario
+            .get("runtime_instantiated_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || scenario
+            .get("semantic_deltas_match")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || scenario
+            .get("render_patches_match")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || scenario
+            .get("state_summary_match")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || scenario.get("parity_passed").and_then(JsonValue::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "{} artifact_scenario must prove artifact execution and source parity",
+            path.display()
+        )
+        .into());
+    }
+    if scenario
+        .get("source_reparse_attempted")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+        || scenario
+            .get("source_file_access")
+            .and_then(JsonValue::as_str)
+            != Some("not_attempted")
+        || scenario
+            .get("typed_ir_required_for_artifact_execution")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || scenario
+            .get("parser_ast_required_for_artifact_execution")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+    {
+        return Err(format!(
+            "{} artifact_scenario must be source-free and AST-free",
+            path.display()
+        )
+        .into());
+    }
+    if scenario
+        .get("source_signature_hash")
+        .and_then(JsonValue::as_str)
+        != scenario
+            .get("artifact_signature_hash")
+            .and_then(JsonValue::as_str)
+    {
+        return Err(format!(
+            "{} artifact_scenario source/artifact signature hashes differ",
+            path.display()
+        )
+        .into());
+    }
+    verify_report_file_hash(report, path, "source_path", "source_hash")?;
+    verify_report_file_hash(report, path, "scenario_path", "scenario_hash")?;
     verify_compiled_artifact_sections(report, path)?;
     verify_artifact_hashes(report, path)?;
     Ok(())
@@ -5231,6 +5418,139 @@ mod tests {
         assert!(!schema_accepts(
             report,
             "inspected-compiled-artifact-fake-scenario-execution"
+        ));
+        let _ = fs::remove_file(artifact_path);
+    }
+
+    #[test]
+    fn compiled_artifact_scenario_report_requires_source_free_parity() {
+        let artifact_path = temp_report_path("compiled-artifact-scenario-file");
+        write_json(
+            &artifact_path,
+            &json!({
+                "artifact_kind": "boonc.compiled_program",
+                "artifact_version": 1,
+                "format": "boonc-json-v1"
+            }),
+        )
+        .unwrap();
+        let artifact_hash = sha256_file(&artifact_path).unwrap();
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/counter.bn")
+            .canonicalize()
+            .unwrap();
+        let scenario_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/counter.scn")
+            .canonicalize()
+            .unwrap();
+        let source_hash = sha256_file(&source_path).unwrap();
+        let scenario_hash = sha256_file(&scenario_path).unwrap();
+        let signature_hash = sha256_bytes(b"matching-runtime-signature");
+        let compiled_artifact = json!({
+            "path": artifact_path.display().to_string(),
+            "sha256": artifact_hash.clone(),
+            "format": "boonc-json-v1",
+            "artifact_version": 1,
+            "program_hash": "program",
+            "report_schema_hash": report_schema_hash(),
+            "source_unit_count": 1
+        });
+        let artifact_sections = json!({
+            "semantic_index": true,
+            "symbol_table": true,
+            "storage_layout": true,
+            "source_schemas": true,
+            "route_op_streams": true,
+            "dependency_graph": true,
+            "document_lowering_tables": true,
+            "bridge_schemas": true,
+            "compiled_schedule": true,
+            "runtime_plan": true
+        });
+        let artifact_scenario = json!({
+            "scenario_execution_available": true,
+            "scenario_execution_from_artifact": true,
+            "runtime_instantiated_from_artifact": true,
+            "source_reparse_attempted": false,
+            "source_file_access": "not_attempted",
+            "typed_ir_required_for_artifact_execution": false,
+            "parser_ast_required_for_artifact_execution": false,
+            "source_oracle_layer": "semantic",
+            "artifact_run_step_count": 7,
+            "source_run_step_count": 7,
+            "source_total_semantic_deltas": 7,
+            "artifact_total_semantic_deltas": 7,
+            "source_total_render_patches": 7,
+            "artifact_total_render_patches": 7,
+            "semantic_deltas_match": true,
+            "render_patches_match": true,
+            "state_summary_match": true,
+            "parity_passed": true,
+            "source_signature_hash": signature_hash,
+            "artifact_signature_hash": signature_hash,
+            "artifact_per_step": []
+        });
+        let report = json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "verify-compiled-artifact-scenario",
+            "command_argv": ["cargo", "xtask", "verify-compiled-artifact-scenario", "counter"],
+            "measurement_mode": "proof",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": source_path.display().to_string(),
+            "source_hash": source_hash,
+            "program_hash": "program",
+            "scenario_path": scenario_path.display().to_string(),
+            "scenario_hash": scenario_hash,
+            "artifact_path": artifact_path.display().to_string(),
+            "artifact_hash": artifact_hash.clone(),
+            "compiled_artifact": compiled_artifact,
+            "artifact_sections": artifact_sections,
+            "artifact_sha256s": [{
+                "path": artifact_path.display().to_string(),
+                "sha256": artifact_hash
+            }],
+            "artifact_scenario": artifact_scenario
+        });
+        assert!(schema_accepts(
+            report.clone(),
+            "compiled-artifact-scenario-valid"
+        ));
+
+        let mut source_read = report.clone();
+        source_read["artifact_scenario"]["source_file_access"] = json!("source_read");
+        assert!(!schema_accepts(
+            source_read,
+            "compiled-artifact-scenario-source-read"
+        ));
+
+        let mut fake_parity = report.clone();
+        fake_parity["artifact_scenario"]["parity_passed"] = json!(false);
+        assert!(!schema_accepts(
+            fake_parity,
+            "compiled-artifact-scenario-fake-parity"
+        ));
+
+        let mut hash_mismatch = report.clone();
+        hash_mismatch["artifact_scenario"]["artifact_signature_hash"] = json!("different");
+        assert!(!schema_accepts(
+            hash_mismatch,
+            "compiled-artifact-scenario-hash-mismatch"
+        ));
+
+        let mut ast_required = report;
+        ast_required["artifact_scenario"]["parser_ast_required_for_artifact_execution"] =
+            json!(true);
+        assert!(!schema_accepts(
+            ast_required,
+            "compiled-artifact-scenario-ast-required"
         ));
         let _ = fs::remove_file(artifact_path);
     }

@@ -2865,7 +2865,7 @@ Notes:
 ## Phase 10: Compiled Artifact, Bytecode, And Future Kernel Work
 
 ### TASK-0901 `.boonc` Compiled Artifact MVP
-Status: in_progress
+Status: done
 Type: implementation
 Priority: P2
 Depends on: TASK-0101, TASK-0201, TASK-0802
@@ -2880,6 +2880,7 @@ Acceptance:
 - Artifact hash appears in reports.
 Verification:
 - `cargo test -p boon_runtime --lib compiled_artifact`
+- `cargo xtask verify-compiled-artifact-scenario counter --artifact target/artifacts/boonc/counter.boonc --report target/reports/compiled-artifact-scenario-counter.json`
 - `cargo xtask verify-report-schema`
 Rollback / stop condition:
 - Stop if artifact scope is too broad. Split into serialization, runtime load, scenario run, and report hash child tasks.
@@ -2905,9 +2906,14 @@ Notes:
     `source_reparse_required_for_current_runtime = false`, and
     `missing_runtime_plan_sections = []`.
   - TASK-0901C must run at least one scenario from the loaded artifact and
-    compare output against the interpreter path.
-- Normal source-run reports must not claim artifact-loaded execution until
-  TASK-0901B/TASK-0901C prove that path.
+    compare output against the interpreter path. This is complete for Counter:
+    `run_compiled_artifact_scenario` loads `target/artifacts/boonc/counter.boonc`,
+    instantiates `LoadedRuntime` from the artifact, executes
+    `examples/counter.scn`, and matches semantic deltas, render patches, and
+    final state against the source-runtime oracle.
+- Normal source-run reports still must not claim artifact-loaded execution. Use
+  `verify-compiled-artifact-scenario` when the report is specifically proving
+  `.boonc` scenario execution.
 
 ### TASK-0902 Expression Bytecode Or Micro-Op Interpreter
 Status: pending
@@ -5177,6 +5183,50 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Remaining blocker: implement TASK-0901C by running at least one scenario from
   the loaded artifact and comparing it against the interpreter/source path. Keep
   `scenario_execution_available = false` until that parity gate exists.
+
+### 2026-06-16 TASK-0901C Artifact-Backed Scenario Parity
+
+- Date: 2026-06-16
+- Task: TASK-0901C `.boonc` scenario execution and source-runtime parity
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`;
+  `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: `cargo fmt -p boon_runtime -p boon_report_schema -p xtask`;
+  `cargo test -p boon_runtime --lib
+  compiled_artifact_runs_counter_scenario_without_source_and_matches_source_runtime
+  -- --nocapture`; `cargo test -p boon_report_schema --lib
+  compiled_artifact -- --nocapture`; `cargo xtask
+  verify-compiled-artifact-scenario counter --artifact
+  target/artifacts/boonc/counter.boonc --report
+  target/reports/compiled-artifact-scenario-counter.json`; `cargo test -p
+  boon_runtime --lib compiled_artifact -- --nocapture`; `cargo test -p
+  boon_report_schema --lib -- --nocapture`; `cargo test -p xtask`; `cargo
+  xtask verify-report-schema`; `cargo check -p boon_runtime -p boon_cli -p
+  xtask`; `cargo test -p boon_runtime --lib -- --nocapture` passed with `218`
+  tests.
+- Result: TASK-0901C is complete and TASK-0901 is done. Counter now has a
+  durable `.boonc` scenario proof: source runtime output is used as the oracle,
+  the artifact runtime is instantiated from `counter.boonc`, the copied source
+  file is removed in the runtime regression test before the artifact run, and
+  semantic deltas, render patches, and final state match exactly.
+- Artifact/report detail:
+  `target/reports/compiled-artifact-scenario-counter.json` reports
+  `scenario_execution_available = true`,
+  `scenario_execution_from_artifact = true`,
+  `runtime_instantiated_from_artifact = true`,
+  `source_reparse_attempted = false`,
+  `source_file_access = "not_attempted"`,
+  `typed_ir_required_for_artifact_execution = false`,
+  `parser_ast_required_for_artifact_execution = false`,
+  `semantic_deltas_match = true`, `render_patches_match = true`,
+  `state_summary_match = true`, and `parity_passed = true`; the source and
+  artifact scenario signature hashes are identical.
+- Next available implementation task: TASK-0902 can start from a proven
+  artifact baseline and use `.boonc` output as one serialization/loading
+  boundary while designing bytecode or micro-op execution.
 
 ## File Maintenance Checklist
 

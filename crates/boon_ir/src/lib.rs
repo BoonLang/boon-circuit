@@ -1848,69 +1848,69 @@ fn semantic_symbols(
     fields: &[SemanticFieldEntry],
     view_bindings: &[SemanticViewBindingEntry],
 ) -> Vec<SemanticSymbolEntry> {
-    let mut table = BTreeMap::<(String, String), SemanticSymbolId>::new();
+    let mut table = SemanticSymbolTable::default();
     for file in &program.files {
-        intern_semantic_symbol(&mut table, "source_unit_path", &file.path);
+        table.intern("source_unit_path", &file.path);
         if let Some(module) = &file.module {
-            intern_semantic_symbol(&mut table, "module_path", module);
+            table.intern("module_path", module);
         }
     }
     for source in sources {
-        intern_semantic_symbol(&mut table, "source_label", &source.path);
+        table.intern("source_label", &source.path);
         for part in source.path.split('.') {
-            intern_semantic_symbol(&mut table, "source_label_segment", part);
+            table.intern("source_label_segment", part);
         }
     }
     for list in lists {
-        intern_semantic_symbol(&mut table, "list_name", &list.name);
+        table.intern("list_name", &list.name);
     }
     for scope in row_scopes {
-        intern_semantic_symbol(&mut table, "row_scope", &scope.row_scope);
-        intern_semantic_symbol(&mut table, "row_scope_function", &scope.function);
+        table.intern("row_scope", &scope.row_scope);
+        table.intern("row_scope_function", &scope.function);
     }
     for function in functions {
-        intern_semantic_symbol(&mut table, "function_name", &function.name);
+        table.intern("function_name", &function.name);
         for arg in &function.args {
-            intern_semantic_symbol(&mut table, "function_arg", arg);
+            table.intern("function_arg", arg);
         }
     }
     for field in fields {
-        intern_semantic_symbol(&mut table, "field_path", &field.path);
-        intern_semantic_symbol(&mut table, "field_name", &field.local_name);
+        table.intern("field_path", &field.path);
+        table.intern("field_name", &field.local_name);
     }
     for operator in &program.operators {
-        intern_semantic_symbol(&mut table, "operator_name", operator);
+        table.intern("operator_name", operator);
     }
     for expr in &program.expressions {
         match &expr.kind {
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-                intern_semantic_symbol(&mut table, "tag", tag);
+                table.intern("tag", tag);
             }
             AstExprKind::TaggedObject { tag, fields } => {
-                intern_semantic_symbol(&mut table, "tag", tag);
+                table.intern("tag", tag);
                 for field in fields {
-                    intern_semantic_symbol(&mut table, "document_attr", &field.name);
+                    table.intern("document_attr", &field.name);
                 }
             }
             AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
                 for field in fields {
-                    intern_semantic_symbol(&mut table, "document_attr", &field.name);
-                    intern_semantic_symbol(&mut table, "style_attr", &field.name);
+                    table.intern("document_attr", &field.name);
+                    table.intern("style_attr", &field.name);
                 }
             }
             AstExprKind::Call { function, args } => {
-                intern_semantic_symbol(&mut table, "operator_name", function);
+                table.intern("operator_name", function);
                 for arg in args {
                     if let Some(name) = &arg.name {
-                        intern_semantic_symbol(&mut table, "document_attr", name);
+                        table.intern("document_attr", name);
                     }
                 }
             }
             AstExprKind::Pipe { op, args, .. } => {
-                intern_semantic_symbol(&mut table, "operator_name", op);
+                table.intern("operator_name", op);
                 for arg in args {
                     if let Some(name) = &arg.name {
-                        intern_semantic_symbol(&mut table, "document_attr", name);
+                        table.intern("document_attr", name);
                     }
                 }
             }
@@ -1918,28 +1918,46 @@ fn semantic_symbols(
         }
     }
     for binding in view_bindings {
-        intern_semantic_symbol(&mut table, "document_attr", &binding.attr);
-        intern_semantic_symbol(&mut table, "view_node_kind", &binding.node_kind);
+        table.intern("document_attr", &binding.attr);
+        table.intern("view_node_kind", &binding.node_kind);
     }
-    let mut entries = table
-        .into_iter()
-        .map(|((category, text), id)| SemanticSymbolEntry { id, category, text })
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.id);
-    entries
+    table.into_entries()
 }
 
-fn intern_semantic_symbol(
-    table: &mut BTreeMap<(String, String), SemanticSymbolId>,
-    category: &str,
-    text: &str,
-) -> SemanticSymbolId {
-    if let Some(id) = table.get(&(category.to_owned(), text.to_owned())) {
-        return *id;
+#[derive(Default)]
+struct SemanticSymbolTable {
+    ids_by_category: BTreeMap<String, BTreeMap<String, SemanticSymbolId>>,
+    entries: Vec<SemanticSymbolEntry>,
+}
+
+impl SemanticSymbolTable {
+    fn intern(&mut self, category: &str, text: &str) -> SemanticSymbolId {
+        if let Some(id) = self
+            .ids_by_category
+            .get(category)
+            .and_then(|symbols| symbols.get(text))
+            .copied()
+        {
+            return id;
+        }
+        let id = SemanticSymbolId(self.entries.len());
+        if let Some(symbols) = self.ids_by_category.get_mut(category) {
+            symbols.insert(text.to_owned(), id);
+        } else {
+            self.ids_by_category
+                .insert(category.to_owned(), BTreeMap::from([(text.to_owned(), id)]));
+        }
+        self.entries.push(SemanticSymbolEntry {
+            id,
+            category: category.to_owned(),
+            text: text.to_owned(),
+        });
+        id
     }
-    let id = SemanticSymbolId(table.len());
-    table.insert((category.to_owned(), text.to_owned()), id);
-    id
+
+    fn into_entries(self) -> Vec<SemanticSymbolEntry> {
+        self.entries
+    }
 }
 
 fn row_scopes_from_entries(entries: &[SemanticRowScopeEntry]) -> Vec<RowScope> {
@@ -10951,6 +10969,27 @@ FUNCTION counter_button(press, label) {
         assert_eq!(index.readiness.source_payload_schemas.fallback_count, 0);
         assert_eq!(index.readiness.render_contracts.fallback_count, 0);
         assert!(index.report()["present"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn semantic_symbol_table_reuses_duplicate_category_text_pairs() {
+        let mut table = SemanticSymbolTable::default();
+
+        let first = table.intern("field_name", "count");
+        let duplicate = table.intern("field_name", "count");
+        let same_text_other_category = table.intern("source_label", "count");
+
+        assert_eq!(first, duplicate);
+        assert_ne!(first, same_text_other_category);
+
+        let entries = table.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, first);
+        assert_eq!(entries[0].category, "field_name");
+        assert_eq!(entries[0].text, "count");
+        assert_eq!(entries[1].id, same_text_other_category);
+        assert_eq!(entries[1].category, "source_label");
+        assert_eq!(entries[1].text, "count");
     }
 
     #[test]

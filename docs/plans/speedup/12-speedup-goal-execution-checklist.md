@@ -2716,7 +2716,7 @@ Notes:
   zero-allocation budget fix.
 
 ### EXP-0003 Interner Crate Versus Custom Symbol Table
-Status: pending
+Status: superseded
 Type: experiment
 Depends on: TASK-0101
 Hypothesis:
@@ -2733,6 +2733,11 @@ Verification:
 - `cargo test -p boon_parser -p boon_ir -p boon_typecheck -p boon_runtime --lib`
 Notes:
 - Candidate crates include `lasso` or `string-interner`, but a small custom table is allowed.
+- Superseded 2026-06-16 by the already-completed `TASK-0102` custom dense
+  semantic/runtime symbol tables. A narrow cleanup was still promoted for the
+  remaining semantic-symbol construction boundary: duplicate `(category, text)`
+  lookups no longer allocate owned lookup keys, and no new interner dependency
+  was added.
 
 ### EXP-0004 Dirty Set Representation
 Status: pending
@@ -4285,6 +4290,52 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   of continuing low-level container swaps. Revisit tiny inline storage only when
   a refreshed report identifies another specific hot allocation surface with a
   clear before/after counter.
+
+- Date: 2026-06-16
+- Task: EXP-0003 Interner Crate Versus Custom Symbol Table
+- Commit: uncommitted
+- Files changed in this slice: `crates/boon_ir/src/lib.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only interner/symbol-table audit from subagent
+  `019ed0ed-43c4-7700-bb72-db4d9f65aeba`; `cargo fmt -p boon_ir`;
+  `cargo test -p boon_ir --lib semantic_symbol_table_reuses_duplicate_category_text_pairs -- --nocapture`;
+  `cargo test -p boon_ir --lib semantic_index_skeleton_reuses_parser_ir_and_typecheck_facts -- --nocapture`;
+  `cargo test -p boon_ir --lib static_schedule_verifier_checks_order_and_symbol_tables -- --nocapture`;
+  `cargo check -p boon_ir`; `cargo test -p boon_typecheck --lib`;
+  `cargo test -p boon_runtime --lib`; diagnostic
+  `cargo xtask verify-example-speed counter --report target/diagnostics/exp-0003-counter-symbol-table.json`
+  failed only the known strict allocation budget and was kept under
+  `target/diagnostics` so report-schema scans do not treat it as canonical.
+- Broad-gate caveat: the original EXP-0003 command
+  `cargo test -p boon_parser -p boon_ir -p boon_typecheck -p boon_runtime --lib`
+  is not a clean acceptance gate in the current checkout. `boon_ir` failed `4`
+  existing lowering/source-wrapper tests, and
+  `inline_empty_render_slot_lists_inside_row_constructors_get_unique_names`
+  reproduced with the EXP-0003 patch reversed. `boon_parser --lib` also failed
+  `list_unknown_alias_does_not_create_list_memories` and
+  `widget_prefixed_symbols_do_not_create_list_memories` without any parser
+  changes in this slice. `boon_typecheck --lib` and `boon_runtime --lib` both
+  passed.
+- Result: no `lasso`, `string-interner`, or broader dependency swap was added.
+  The general experiment is superseded because `TASK-0102` already chose and
+  implemented custom dense semantic/runtime symbol tables while preserving
+  readable diagnostics. The kept cleanup replaces the semantic-index
+  construction map from `BTreeMap<(String, String), SemanticSymbolId>` to a
+  small `SemanticSymbolTable` with borrowed category/text lookups and stable
+  insertion-order entries, removing repeated owned lookup-key allocation for
+  duplicate symbols without changing report shape.
+- Evidence: the fresh diagnostic report shows `semantic_index.symbol_count=71`,
+  `semantic_index.reuse.parser_reused_by_ir=true`,
+  `semantic_index.reuse.typecheck_reused_by_ir=true`,
+  `semantic_index.reuse.runtime_reports_reuse_index=true`,
+  `compiled_schedule.runtime_symbol_table.kind=dense_runtime_symbol_ids`,
+  `compiled_schedule.runtime_symbol_ownership=compiled_program_owned`, and
+  `compiled_schedule.field_slot_collision_count=0`.
+- Next direction: do not revisit a general interner crate unless a refreshed
+  report or targeted counter proves a specific remaining string boundary is hot.
+  If string work is needed later, start with measured `FieldSlotId::from_path`,
+  source-route lookup, or text-lookup/cache-key clone counters rather than a
+  cross-stage dependency swap.
 
 ## File Maintenance Checklist
 

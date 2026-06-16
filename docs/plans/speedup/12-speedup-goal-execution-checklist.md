@@ -2890,24 +2890,20 @@ Notes:
     This adds `boon_cli compile <source> --out <path.boonc> [--report <path>]`
     and `cargo xtask verify-compiled-artifact <example>` for a JSON MVP
     artifact that records the static runtime sidecar data and file hash.
-  - TASK-0901B must load `.boonc` into the runtime without reparsing source.
-    A readiness inspection now proves the current artifact can be validated
-    without source access and carries a partial AST-free `runtime_plan`.
-    The normal source runtime now builds generic storage from the compiled-owned
-    storage initialization plan, so storage initialization is no longer a
-    missing runtime-plan section. The normal source runtime also reads document
-    summary metadata from compiled-owned document-lowering runtime tables, so
-    document lowering is no longer a missing runtime-plan section. The artifact
-    inspection path now decodes `runtime_plan.generic_derived`,
-    `runtime_plan.storage_initialization`, `runtime_plan.document_lowering`,
-    `runtime_plan.runtime_symbols`, scalar equations, derived text transforms,
-    list equations, list projections, list source bindings, source routes,
-    source/action tables, source payload field metadata, and dense source/action
-    routing into runtime-owned structs. `.boonc` still cannot instantiate
-    `LoadedRuntime` because the artifact path still lacks an artifact-backed
-    runtime constructor and scenario parity proof. The report must keep
-    `generic_derived_ast_free_plan` as missing until the full path is executable
-    without parser AST.
+  - TASK-0901B is complete for runtime-load readiness. `.boonc` now decodes
+    `runtime_plan.generic_derived`, `runtime_plan.storage_initialization`,
+    `runtime_plan.document_lowering`, `runtime_plan.runtime_symbols`, scalar
+    equations, derived text transforms, list equations, list projections, list
+    source bindings, source routes, source/action tables, source payload field
+    metadata, dense source/action routing, storage layout counts, and field-slot
+    diagnostics into runtime-owned structs. `CompiledProgram::from_artifact`
+    assembles those sections, `LoadedRuntime::from_compiled_artifact` can
+    instantiate Counter, TodoMVC, and Cells without source or typed IR, and
+    inspection reports now truthfully claim `loaded_runtime_from_artifact =
+    true`, `runtime_instantiated_from_artifact = true`,
+    `source_free_runtime_load_available = true`,
+    `source_reparse_required_for_current_runtime = false`, and
+    `missing_runtime_plan_sections = []`.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -5120,6 +5116,67 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   artifact before any report claims `loaded_runtime_from_artifact`,
   `runtime_instantiated_from_artifact`,
   `source_free_runtime_load_available`, or `scenario_execution_available`.
+
+- Date: 2026-06-16
+- Task: TASK-0901B `.boonc` artifact-backed runtime constructor
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: `cargo test -p boon_runtime --lib
+  compiled_artifact_instantiates_loaded_runtime_without_source_or_ir --
+  --nocapture`; `cargo test -p boon_runtime --lib
+  compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_load
+  -- --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo test -p boon_runtime --lib root_list_view_ --
+  --nocapture --test-threads=1`; `cargo test -p boon_report_schema --lib
+  compiled_artifact -- --nocapture`; `cargo check -p boon_runtime -p boon_cli
+  -p xtask`; `cargo xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact cells --out target/artifacts/boonc/cells.boonc
+  --report target/reports/compiled-artifact-cells-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo xtask
+  verify-compiled-artifact-inspection cells --artifact
+  target/artifacts/boonc/cells.boonc --report
+  target/reports/compiled-artifact-inspection-cells.json`; `cargo run -q -p
+  boon_cli -- inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-report-schema`; `cargo test -p xtask`; full `cargo test -p
+  boon_runtime --lib -- --nocapture` passed with `217` tests.
+- Result: TASK-0901B is complete. `CompiledProgram::from_artifact` now builds a
+  runtime-owned compiled program from `.boonc` by decoding non-route runtime
+  tables, generic-derived runtime plans, storage initialization, document
+  lowering, source routes/action tables, root/list summary metadata, storage
+  layout counts, and field-slot collision diagnostics. The new
+  `LoadedRuntime::from_compiled_artifact` path instantiates Counter, TodoMVC,
+  and Cells without source files or typed IR; a temp-source deletion test proves
+  the constructor still works after the source file is removed.
+- Artifact/report detail: `runtime_plan.source_free_runtime_instantiation_ready
+  = true`, `runtime_plan.runtime_instantiation_blocked_by = []`,
+  `typed_ir_required_for_mvp_loader = false`,
+  `loaded_runtime_from_artifact = true`,
+  `runtime_instantiated_from_artifact = true`,
+  `source_free_runtime_load_available = true`,
+  `source_reparse_required_for_current_runtime = false`,
+  `source_reparse_attempted = false`, `source_file_access = "not_attempted"`,
+  and `missing_runtime_plan_sections = []`. Schema and xtask verification now
+  reject stale reports that still claim typed-IR/source requirements.
+- Cause learned from the failed first full-runtime pass: switching all roots to
+  runtime-generic statements broke source-backed root list-view patch/cache
+  tests because the generic runtime evaluator does not yet reproduce the
+  optimized AST materializer's source-identity, list-map attribution, and
+  field-cache hooks. The kept fix is an explicit internal boundary:
+  source-compiled runtimes keep AST list-view materialization; artifact-compiled
+  runtimes use the source-free runtime statement path. Do not remove that
+  boundary until the runtime-generic list-view evaluator owns equivalent row
+  identity, cache, dirty-read, and profile semantics.
+- Remaining blocker: implement TASK-0901C by running at least one scenario from
+  the loaded artifact and comparing it against the interpreter/source path. Keep
+  `scenario_execution_available = false` until that parity gate exists.
 
 ## File Maintenance Checklist
 

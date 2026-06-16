@@ -1450,10 +1450,19 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
     if artifact_value
         .pointer("/runtime_plan/source_free_runtime_instantiation_ready")
         .and_then(serde_json::Value::as_bool)
-        != Some(false)
+        != Some(true)
     {
         return Err(
-            "compiled artifact runtime_plan must not claim source-free instantiation yet".into(),
+            "compiled artifact runtime_plan must claim source-free instantiation readiness".into(),
+        );
+    }
+    if artifact_value
+        .pointer("/runtime_plan/runtime_instantiation_blocked_by")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|blockers| !blockers.is_empty())
+    {
+        return Err(
+            "compiled artifact runtime_plan must not list runtime instantiation blockers".into(),
         );
     }
     if artifact_value
@@ -1516,6 +1525,13 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
     {
         return Err("compiled artifact must not require parser AST for execution".into());
     }
+    if artifact_value
+        .get("typed_ir_required_for_mvp_loader")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("compiled artifact must not require typed IR for the MVP loader".into());
+    }
     Ok(())
 }
 
@@ -1552,9 +1568,16 @@ fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn st
     if report_value
         .pointer("/inspection_result/runtime_instantiated_from_artifact")
         .and_then(serde_json::Value::as_bool)
-        != Some(false)
+        != Some(true)
     {
-        return Err("compiled artifact inspection must not claim runtime instantiation".into());
+        return Err("compiled artifact inspection must instantiate runtime from artifact".into());
+    }
+    if report_value
+        .pointer("/inspection_result/source_free_runtime_load_available")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("compiled artifact inspection must prove source-free runtime load".into());
     }
     if report_value
         .pointer("/inspection_result/runtime_plan_generic_derived_deserialized_from_artifact")

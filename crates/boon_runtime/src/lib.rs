@@ -2341,6 +2341,8 @@ pub fn inspect_compiled_artifact_report(
     let document_lowering_tables = artifact.runtime_document_lowering_tables()?;
     let non_route_tables = artifact.runtime_non_route_tables()?;
     let source_routes = artifact.runtime_source_routes()?;
+    let (_runtime, runtime_instantiation_profile) =
+        LoadedRuntime::from_compiled_artifact_profiled(&artifact)?;
     let storage_initial_row_count = storage_initialization_plan
         .list_slots
         .iter()
@@ -2368,8 +2370,9 @@ pub fn inspect_compiled_artifact_report(
         }],
         "inspection_result": {
             "artifact_valid": true,
-            "loaded_runtime_from_artifact": false,
-            "runtime_instantiated_from_artifact": false,
+            "loaded_runtime_from_artifact": true,
+            "runtime_instantiated_from_artifact": true,
+            "artifact_runtime_instantiation_profile": runtime_instantiation_profile,
             "runtime_plan_present": runtime_plan_present,
             "runtime_plan_generic_derived_deserialized_from_artifact": true,
             "runtime_plan_generic_derived_deserialized_counts": {
@@ -2424,14 +2427,14 @@ pub fn inspect_compiled_artifact_report(
                 "source_payload_address_field_count": source_payload_counts.address_field_count,
                 "source_payload_pointer_field_count": source_payload_counts.pointer_field_count
             },
-            "source_free_runtime_load_available": false,
-            "source_reparse_required_for_current_runtime": true,
+            "source_free_runtime_load_available": true,
+            "source_reparse_required_for_current_runtime": false,
             "source_reparse_attempted": false,
             "source_file_access": "not_attempted",
             "parser_ast_required_for_execution": artifact.body["parser_ast_required_for_execution"].clone(),
             "typed_ir_required_for_mvp_loader": artifact.body["typed_ir_required_for_mvp_loader"].clone(),
             "scenario_execution_available": false,
-            "blocked_task": "TASK-0901B",
+            "blocked_task": "none",
             "scenario_execution_pending_task": "TASK-0901C",
             "missing_runtime_plan_sections": missing_runtime_plan_sections
         }
@@ -4506,6 +4509,25 @@ impl LoadedRuntime {
         .with_profile(generic_profile))
     }
 
+    fn from_compiled_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
+        Ok(Self::from_compiled_artifact_profiled(artifact)?.0)
+    }
+
+    fn from_compiled_artifact_profiled(
+        artifact: &CompiledArtifact,
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        let compiled = CompiledProgram::from_artifact(artifact)?;
+        Self::from_compiled_profiled(&compiled)
+    }
+
+    fn from_compiled_profiled(compiled: &CompiledProgram) -> RuntimeResult<(Self, JsonValue)> {
+        let (generic, generic_profile) = GenericScheduledRuntime::from_compiled_profiled(compiled)?;
+        Ok(Self {
+            generic: Some(generic),
+        }
+        .with_profile(generic_profile))
+    }
+
     fn with_profile(self, generic_profile: JsonValue) -> (Self, JsonValue) {
         (
             self,
@@ -4989,6 +5011,7 @@ fn close_other_generic_bool_field<'a>(
 
 #[derive(Clone, Debug)]
 struct CompiledProgram {
+    compiled_from_typed_ir: bool,
     symbols: RuntimeSymbols,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
@@ -5504,6 +5527,25 @@ impl RuntimeSymbols {
             symbols.intern(&path);
         }
         Ok(symbols)
+    }
+}
+
+impl FieldSlotCollisionDiagnostic {
+    fn vec_from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Vec<Self>> {
+        artifact_array(value, context)?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let field_context = format!("{context}[{index}]");
+                let object = artifact_object(value, &field_context)?;
+                let labels = artifact_string_array_field(object, "labels", &field_context)?;
+                ensure_unique_strings(&labels, &format!("{field_context}.labels"))?;
+                Ok(Self {
+                    field_id: artifact_usize_field(object, "field_id", &field_context)?,
+                    labels,
+                })
+            })
+            .collect()
     }
 }
 
@@ -6917,6 +6959,7 @@ impl CompiledProgram {
         let source_payload_counts = SourcePayloadCounts::from_ir(ir);
         let storage_layout_counts = TypedStorageLayoutCounts::from_ir(ir);
         Ok(Self {
+            compiled_from_typed_ir: true,
             symbols,
             scalar_equations,
             derived_equations,
@@ -6964,9 +7007,231 @@ impl CompiledProgram {
         })
     }
 
+    fn from_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
+        Self::from_artifact_body(&artifact.body)
+    }
+
+    fn from_artifact_body(body: &JsonValue) -> RuntimeResult<Self> {
+        let context = "compiled artifact";
+        let body_object = artifact_object(body, context)?;
+        let runtime_plan = artifact_field(body_object, "runtime_plan", context)?;
+        let runtime_plan_object = artifact_object(runtime_plan, "runtime_plan")?;
+        let compiled_schedule = artifact_field(body_object, "compiled_schedule", context)?;
+        let compiled_schedule_object =
+            artifact_object(compiled_schedule, "compiled artifact compiled_schedule")?;
+        let storage_layout = artifact_field(body_object, "storage_layout", context)?;
+        let storage_layout_object =
+            artifact_object(storage_layout, "compiled artifact storage_layout")?;
+
+        let non_route_tables = RuntimeNonRouteTables::from_artifact_body(body)?;
+        let generic_derived_runtime = RuntimeGenericDerivedPlan::from_artifact(artifact_field(
+            runtime_plan_object,
+            "generic_derived",
+            "runtime_plan",
+        )?)?;
+        let storage_initialization =
+            RuntimeStorageInitializationPlan::from_artifact(artifact_field(
+                runtime_plan_object,
+                "storage_initialization",
+                "runtime_plan",
+            )?)?;
+        let document_lowering = RuntimeDocumentLoweringTables::from_artifact(artifact_field(
+            runtime_plan_object,
+            "document_lowering",
+            "runtime_plan",
+        )?)?;
+        let source_routes = SourceRoutePlan::from_artifact_body(body)?;
+
+        let root_state_paths =
+            artifact_string_array_field(runtime_plan_object, "root_state_paths", "runtime_plan")?;
+        ensure_unique_strings(&root_state_paths, "runtime_plan.root_state_paths")?;
+        let list_summary_fields =
+            artifact_array_field(runtime_plan_object, "list_summary_fields", "runtime_plan")?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    ListSummaryFields::from_artifact(
+                        value,
+                        &format!("runtime_plan.list_summary_fields[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+        let dynamic_list_view_lists = artifact_string_set_field(
+            runtime_plan_object,
+            "dynamic_list_view_lists",
+            "runtime_plan",
+        )?;
+        if document_lowering.root_summary_paths != root_state_paths {
+            return Err(
+                "runtime_plan.root_state_paths does not match document lowering root_summary_paths"
+                    .into(),
+            );
+        }
+        if document_lowering.list_summary_fields != list_summary_fields {
+            return Err("runtime_plan.list_summary_fields does not match document lowering list_summary_fields".into());
+        }
+        if document_lowering.dynamic_list_view_lists != dynamic_list_view_lists {
+            return Err("runtime_plan.dynamic_list_view_lists does not match document lowering dynamic_list_view_lists".into());
+        }
+
+        let generic_derived = GenericDerivedPlan::from_runtime_plan(
+            &generic_derived_runtime,
+            document_lowering.observed_root_paths.clone(),
+        )?;
+        let source_payload_counts = SourcePayloadCounts::from_source_routes(&source_routes);
+        let derived_text_transform_count = non_route_tables.derived_equations.text_transforms.len();
+        let list_operation_count = non_route_tables.list_equations.operations.len();
+        let list_projection_count = non_route_tables.list_projections.projections.len();
+        let storage_layout_counts = TypedStorageLayoutCounts::from_artifact(storage_layout_object)?;
+        let field_slot_collision_diagnostics = FieldSlotCollisionDiagnostic::vec_from_artifact(
+            artifact_field(
+                compiled_schedule_object,
+                "field_slot_collision_diagnostics",
+                "compiled artifact compiled_schedule",
+            )?,
+            "compiled artifact compiled_schedule.field_slot_collision_diagnostics",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "field_slot_collision_count",
+            field_slot_collision_diagnostics.len(),
+            "compiled artifact compiled_schedule",
+        )?;
+
+        let source_route_count = source_routes.len();
+        artifact_count_matches(
+            compiled_schedule_object,
+            "runtime_symbol_count",
+            non_route_tables.symbols.len(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_count",
+            source_route_count,
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_id_slot_count",
+            source_routes.id_slots.len(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_label_slot_count",
+            source_routes.label_slots.len(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_routes_with_ids",
+            source_routes.routes_with_ids(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_op_stream_count",
+            source_routes.op_stream_count(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_total_action_op_count",
+            source_routes.total_op_count(),
+            "compiled artifact compiled_schedule",
+        )?;
+        artifact_count_matches(
+            compiled_schedule_object,
+            "source_route_max_action_op_count",
+            source_routes.max_op_count(),
+            "compiled artifact compiled_schedule",
+        )?;
+
+        Ok(Self {
+            compiled_from_typed_ir: false,
+            symbols: non_route_tables.symbols,
+            scalar_equations: non_route_tables.scalar_equations,
+            derived_equations: non_route_tables.derived_equations,
+            generic_derived,
+            generic_derived_runtime,
+            list_equations: non_route_tables.list_equations,
+            list_projections: non_route_tables.list_projections,
+            source_routes,
+            list_source_bindings: non_route_tables.list_source_bindings,
+            storage_initialization,
+            document_lowering,
+            root_state_paths,
+            list_summary_fields,
+            dynamic_list_view_lists,
+            schedule_node_count: artifact_usize_field(
+                compiled_schedule_object,
+                "schedule_node_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            state_initializer_count: artifact_usize_field(
+                compiled_schedule_object,
+                "state_initializer_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            list_initializer_count: artifact_usize_field(
+                compiled_schedule_object,
+                "list_initializer_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            derived_value_count: artifact_usize_field(
+                compiled_schedule_object,
+                "derived_value_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            derived_text_transform_count,
+            update_branch_count: artifact_usize_field(
+                compiled_schedule_object,
+                "update_branch_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            list_operation_count,
+            list_projection_count,
+            view_binding_count: artifact_usize_field(
+                compiled_schedule_object,
+                "view_binding_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            source_payload_schema_count: source_payload_counts.schema_count,
+            source_payload_field_count: source_payload_counts.field_count,
+            source_payload_text_field_count: source_payload_counts.text_field_count,
+            source_payload_key_field_count: source_payload_counts.key_field_count,
+            source_payload_address_field_count: source_payload_counts.address_field_count,
+            source_payload_pointer_field_count: source_payload_counts.pointer_field_count,
+            root_text_slot_count: storage_layout_counts.root_text_slot_count,
+            root_bool_slot_count: storage_layout_counts.root_bool_slot_count,
+            root_enum_slot_count: storage_layout_counts.root_enum_slot_count,
+            list_memory_count: storage_layout_counts.list_memory_count,
+            list_row_template_field_count: storage_layout_counts.list_row_template_field_count,
+            list_row_text_slot_count: storage_layout_counts.list_row_text_slot_count,
+            list_row_bool_slot_count: storage_layout_counts.list_row_bool_slot_count,
+            list_row_enum_slot_count: storage_layout_counts.list_row_enum_slot_count,
+            list_hidden_key_slot_count: storage_layout_counts.list_hidden_key_slot_count,
+            list_hidden_generation_slot_count: storage_layout_counts
+                .list_hidden_generation_slot_count,
+            source_route_count,
+            unsupported_update_branch_count: artifact_usize_field(
+                compiled_schedule_object,
+                "unsupported_update_branch_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            unsupported_list_operation_count: artifact_usize_field(
+                compiled_schedule_object,
+                "unsupported_list_operation_count",
+                "compiled artifact compiled_schedule",
+            )?,
+            field_slot_collision_diagnostics,
+        })
+    }
+
     fn report(&self) -> JsonValue {
         json!({
-            "compiled_from_typed_ir": true,
+            "compiled_from_typed_ir": self.compiled_from_typed_ir,
             "runtime_symbol_count": self.symbols.len(),
             "runtime_symbol_table": {
                 "kind": "dense_runtime_symbol_ids",
@@ -6978,7 +7243,7 @@ impl CompiledProgram {
             "field_slot_collision_diagnostics": self.field_slot_collision_diagnostics,
             "runtime_symbol_ownership": "compiled_program_owned",
             "executable_surface": "generic",
-            "executable_surface_inferred_from_ir": true,
+            "executable_surface_inferred_from_ir": self.compiled_from_typed_ir,
             "schedule_node_count": self.schedule_node_count,
             "state_initializer_count": self.state_initializer_count,
             "list_initializer_count": self.list_initializer_count,
@@ -7047,10 +7312,8 @@ impl CompiledProgram {
             "runtime_plan_version": 1,
             "format": "boonc-runtime-plan-json-v1",
             "ast_free": true,
-            "source_free_runtime_instantiation_ready": false,
-            "runtime_instantiation_blocked_by": [
-                "generic_derived_ast_free_plan"
-            ],
+            "source_free_runtime_instantiation_ready": true,
+            "runtime_instantiation_blocked_by": [],
             "included_runtime_owned_sections": {
                 "runtime_symbols": true,
                 "scalar_equations": true,
@@ -10644,7 +10907,7 @@ impl CompiledArtifact {
             "format": "boonc-json-v1",
             "runtime_load_mode": "compiled_static_graph_sidecar",
             "parser_ast_required_for_execution": false,
-            "typed_ir_required_for_mvp_loader": true,
+            "typed_ir_required_for_mvp_loader": false,
             "program_kind": parsed.kind.as_str(),
             "program_hash": program_hash,
             "source_unit_hashes": source_units,
@@ -10766,6 +11029,18 @@ impl CompiledArtifact {
             )
             .into());
         }
+        if self
+            .body
+            .get("typed_ir_required_for_mvp_loader")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        {
+            return Err(format!(
+                "{} compiled artifact must not require typed IR for the MVP loader",
+                path.display()
+            )
+            .into());
+        }
         for key in [
             "runtime_load_mode",
             "program_hash",
@@ -10831,10 +11106,10 @@ impl CompiledArtifact {
         if plan
             .get("source_free_runtime_instantiation_ready")
             .and_then(JsonValue::as_bool)
-            != Some(false)
+            != Some(true)
         {
             return Err(format!(
-                "{} runtime_plan must not claim source-free instantiation yet",
+                "{} runtime_plan must claim source-free instantiation readiness",
                 path.display()
             )
             .into());
@@ -10842,10 +11117,10 @@ impl CompiledArtifact {
         if plan
             .get("runtime_instantiation_blocked_by")
             .and_then(JsonValue::as_array)
-            .is_none_or(Vec::is_empty)
+            .is_none_or(|blockers| !blockers.is_empty())
         {
             return Err(format!(
-                "{} runtime_plan must list runtime instantiation blockers",
+                "{} runtime_plan must not list runtime instantiation blockers",
                 path.display()
             )
             .into());
@@ -11270,6 +11545,48 @@ impl TypedStorageLayoutCounts {
             .filter(|value| value.indexed)
             .count();
         counts
+    }
+
+    fn from_artifact(
+        object: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<TypedStorageLayoutCounts> {
+        let context = "compiled artifact storage_layout";
+        Ok(Self {
+            root_text_slot_count: artifact_usize_field(object, "root_text_slot_count", context)?,
+            root_bool_slot_count: artifact_usize_field(object, "root_bool_slot_count", context)?,
+            root_enum_slot_count: artifact_usize_field(object, "root_enum_slot_count", context)?,
+            list_memory_count: artifact_usize_field(object, "list_memory_count", context)?,
+            list_row_template_field_count: artifact_usize_field(
+                object,
+                "list_row_template_field_count",
+                context,
+            )?,
+            list_row_text_slot_count: artifact_usize_field(
+                object,
+                "list_row_text_slot_count",
+                context,
+            )?,
+            list_row_bool_slot_count: artifact_usize_field(
+                object,
+                "list_row_bool_slot_count",
+                context,
+            )?,
+            list_row_enum_slot_count: artifact_usize_field(
+                object,
+                "list_row_enum_slot_count",
+                context,
+            )?,
+            list_hidden_key_slot_count: artifact_usize_field(
+                object,
+                "list_hidden_key_slot_count",
+                context,
+            )?,
+            list_hidden_generation_slot_count: artifact_usize_field(
+                object,
+                "list_hidden_generation_slot_count",
+                context,
+            )?,
+        })
     }
 }
 
@@ -15946,6 +16263,7 @@ struct GenericScheduledRuntime {
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
     generic_derived_runtime: RuntimeGenericDerivedPlan,
+    runtime_generic_list_views_from_artifact: bool,
     generic_derived_state: GenericDerivedState,
     list_equations: ListEquationPlan,
     list_projections: ListProjectionPlan,
@@ -16143,6 +16461,10 @@ impl GenericScheduledRuntime {
         _ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<(Self, JsonValue)> {
+        Self::from_compiled_profiled(compiled)
+    }
+
+    fn from_compiled_profiled(compiled: &CompiledProgram) -> RuntimeResult<(Self, JsonValue)> {
         let total_started = Instant::now();
         let storage_started = Instant::now();
         let storage = compiled.storage_initialization.instantiate_storage()?;
@@ -16155,6 +16477,7 @@ impl GenericScheduledRuntime {
             derived_equations: compiled.derived_equations.clone(),
             generic_derived: compiled.generic_derived.clone(),
             generic_derived_runtime: compiled.generic_derived_runtime.clone(),
+            runtime_generic_list_views_from_artifact: !compiled.compiled_from_typed_ir,
             generic_derived_state: GenericDerivedState::default(),
             list_equations: compiled.list_equations.clone(),
             list_projections: compiled.list_projections.clone(),
@@ -19358,8 +19681,9 @@ impl GenericScheduledRuntime {
         {
             return Ok(None);
         }
-        if let Some((referenced_path, list)) =
-            self.direct_root_list_ref_for_statement(&field.statement)
+        if let Some((referenced_path, list)) = self
+            .direct_runtime_root_list_ref_for_path(&field.path)
+            .or_else(|| self.direct_root_list_ref_for_statement(&field.statement))
         {
             let value = BoonValue::ListRef(list.clone());
             let mut field_reads = root_read_keys_for_path(&field.path)
@@ -21141,7 +21465,9 @@ impl GenericScheduledRuntime {
             self.generic_derived_runtime
                 .root_field_plan(path)
                 .and_then(|field| {
-                    if matches!(&field.kind, DerivedValueKind::ListView) {
+                    if matches!(&field.kind, DerivedValueKind::ListView)
+                        && !self.runtime_generic_list_views_from_artifact
+                    {
                         return None;
                     }
                     field.statement.clone()
@@ -28235,8 +28561,9 @@ impl GenericScheduledRuntime {
             }
             return Ok(Some(value.clone()));
         }
-        if let Some((referenced_path, list)) =
-            self.direct_root_list_ref_for_statement(&plan.statement)
+        if let Some((referenced_path, list)) = self
+            .direct_runtime_root_list_ref_for_path(&plan.path)
+            .or_else(|| self.direct_root_list_ref_for_statement(&plan.statement))
         {
             let value = BoonValue::ListRef(list);
             let mut field_reads = root_read_keys_for_path(&plan.path)
@@ -28359,6 +28686,31 @@ impl GenericScheduledRuntime {
             AstExprKind::Path(parts) if !parts.is_empty() => parts.join("."),
             _ => return None,
         };
+        let plan = self.generic_derived.root_field_plan(&referenced)?;
+        if !matches!(plan.kind, DerivedValueKind::ListView) {
+            return None;
+        }
+        let list = self.storage.list_name_for_path(&plan.path)?;
+        Some((plan.path.clone(), list.to_owned()))
+    }
+
+    fn direct_runtime_root_list_ref_for_path(&self, path: &str) -> Option<(String, String)> {
+        let statement = self
+            .generic_derived_runtime
+            .root_field_plan(path)?
+            .statement
+            .as_ref()?;
+        self.direct_runtime_root_list_ref_for_statement(statement)
+    }
+
+    fn direct_runtime_root_list_ref_for_statement(
+        &self,
+        statement: &RuntimeGenericStatement,
+    ) -> Option<(String, String)> {
+        let RuntimeGenericStatement::Expr(expr) = statement else {
+            return None;
+        };
+        let referenced = runtime_generic_expr_path(expr)?;
         let plan = self.generic_derived.root_field_plan(&referenced)?;
         if !matches!(plan.kind, DerivedValueKind::ListView) {
             return None;
@@ -32967,8 +33319,7 @@ fn close_other_list_editors<'a>(
     Ok(())
 }
 
-#[cfg(test)]
-fn empty_ast_statement_for_test() -> AstStatement {
+fn ast_free_runtime_placeholder_statement() -> AstStatement {
     AstStatement {
         id: 0,
         line: 0,
@@ -32979,6 +33330,11 @@ fn empty_ast_statement_for_test() -> AstStatement {
         expr: None,
         children: Vec::new(),
     }
+}
+
+#[cfg(test)]
+fn empty_ast_statement_for_test() -> AstStatement {
+    ast_free_runtime_placeholder_statement()
 }
 
 #[derive(Clone, Debug)]
@@ -35502,6 +35858,14 @@ fn runtime_generic_raw_arg_name(arg: &RuntimeGenericArg) -> Option<String> {
     }
 }
 
+fn runtime_generic_expr_path(expr: &RuntimeGenericExpr) -> Option<String> {
+    match expr {
+        RuntimeGenericExpr::Identifier(value) => Some(value.clone()),
+        RuntimeGenericExpr::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
 fn runtime_generic_function_cache_key(
     definition: &RuntimeGenericFunction,
     frame: &GenericEvalFrame,
@@ -37544,6 +37908,60 @@ impl GenericDerivedPlan {
             observed_root_paths: observed_root_paths_from_view_bindings(ir),
             indexed_fields,
         }
+    }
+
+    fn from_runtime_plan(
+        plan: &RuntimeGenericDerivedPlan,
+        observed_root_paths: BTreeSet<String>,
+    ) -> RuntimeResult<Self> {
+        if !plan.unsupported_reasons.is_empty() {
+            return Err(format!(
+                "runtime generic-derived artifact still has unsupported AST-free sections: {:?}",
+                plan.unsupported_reasons
+            )
+            .into());
+        }
+        let placeholder = ast_free_runtime_placeholder_statement();
+        let mut root_fields = Vec::with_capacity(plan.root_fields.len());
+        for field in &plan.root_fields {
+            if field.statement.is_none() {
+                return Err(format!(
+                    "runtime generic-derived root `{}` has no AST-free statement",
+                    field.path
+                )
+                .into());
+            }
+            root_fields.push(GenericDerivedRootField {
+                path: field.path.clone(),
+                kind: field.kind.clone(),
+                has_sources: field.has_sources,
+                statement: placeholder.clone(),
+            });
+        }
+        let mut indexed_fields = Vec::with_capacity(plan.indexed_fields.len());
+        for field in &plan.indexed_fields {
+            if field.statement.is_none() {
+                return Err(format!(
+                    "runtime generic-derived indexed field `{}.{}` has no AST-free statement",
+                    field.row_scope, field.field
+                )
+                .into());
+            }
+            indexed_fields.push(GenericDerivedIndexedField {
+                list: field.list.clone(),
+                row_scope: field.row_scope.clone(),
+                field: field.field.clone(),
+                kind: field.kind.clone(),
+                statement: placeholder.clone(),
+            });
+        }
+        Ok(Self {
+            expressions: Vec::new(),
+            functions: BTreeMap::new(),
+            root_fields,
+            observed_root_paths,
+            indexed_fields,
+        })
     }
 
     fn has_indexed_fields(&self) -> bool {
@@ -42160,7 +42578,15 @@ FUNCTION icon_code(item) {
         assert_eq!(artifact_json["runtime_plan"]["ast_free"], json!(true));
         assert_eq!(
             artifact_json["runtime_plan"]["source_free_runtime_instantiation_ready"],
+            json!(true)
+        );
+        assert_eq!(
+            artifact_json["typed_ir_required_for_mvp_loader"],
             json!(false)
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["runtime_instantiation_blocked_by"],
+            json!([])
         );
         assert!(artifact_json["runtime_plan"]["runtime_symbols"]["paths"].is_array());
         assert!(artifact_json["runtime_plan"]["scalar_equations"]["branches"].is_array());
@@ -42912,6 +43338,102 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn compiled_artifact_instantiates_loaded_runtime_without_source_or_ir() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-runtime-load-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, _, _) = example_paths(example).unwrap();
+            let artifact_path = temp_root.join(format!("{example}.boonc"));
+            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+            assert_eq!(
+                artifact.body["typed_ir_required_for_mvp_loader"],
+                json!(false),
+                "{example} artifact should not require typed IR for runtime loading"
+            );
+            assert_eq!(
+                artifact.body["runtime_plan"]["source_free_runtime_instantiation_ready"],
+                json!(true),
+                "{example} artifact should declare source-free runtime instantiation readiness"
+            );
+            let artifact_compiled = CompiledProgram::from_artifact(&artifact).unwrap();
+            assert_eq!(
+                artifact_compiled.report()["compiled_from_typed_ir"],
+                json!(false),
+                "{example} artifact-backed CompiledProgram report should be honest"
+            );
+            let source_compiled = CompiledProgram::from_ir(
+                &lower(&parse_source_path_or_manifest_project(&source).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                artifact_compiled.report()["runtime_symbol_count"],
+                source_compiled.report()["runtime_symbol_count"],
+                "{example} decoded runtime symbol count should match source compilation"
+            );
+            assert_eq!(
+                artifact_compiled.report()["source_route_op_streams"],
+                source_compiled.report()["source_route_op_streams"],
+                "{example} decoded source-route op streams should match source compilation"
+            );
+
+            let mut runtime = LoadedRuntime::from_compiled_artifact(&artifact).unwrap();
+            let summary = runtime.generic_state_summary();
+            match example {
+                "counter" => {
+                    assert!(
+                        summary.is_object(),
+                        "counter artifact runtime should produce a generic state summary"
+                    );
+                }
+                "todomvc" => {
+                    assert_eq!(
+                        summary["todos"].as_array().map(Vec::len),
+                        Some(4),
+                        "TodoMVC artifact runtime should materialize initial todos"
+                    );
+                    assert_eq!(summary["store"]["active_count"], json!(3));
+                    assert_eq!(summary["store"]["completed_count"], json!(1));
+                }
+                "cells" => {
+                    assert_eq!(
+                        summary["store"]["selected_input"]["address"], "A0",
+                        "Cells artifact runtime should materialize List/find root view"
+                    );
+                    assert_eq!(
+                        summary["store"]["sheet_rows"].as_array().unwrap().len(),
+                        100,
+                        "Cells artifact runtime should materialize List/chunk root view"
+                    );
+                    assert_eq!(summary["cells"][0]["address"], "A0");
+                    assert_eq!(summary["cells"][0]["default_formula"], "5");
+                    assert_eq!(summary["cells"][0]["value"], "5");
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let source = temp_root.join("source-deleted-counter.bn");
+        std::fs::copy("../../examples/counter.bn", &source).unwrap();
+        let artifact_path = temp_root.join("source-deleted-counter.boonc");
+        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let mut runtime = LoadedRuntime::from_compiled_artifact(&artifact).unwrap();
+        assert!(
+            runtime.generic_state_summary().is_object(),
+            "artifact runtime load must not depend on source file access"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
         let parsed = parse_source(
             "examples/todomvc.bn",
@@ -43157,7 +43679,7 @@ FUNCTION decorate(value) {
     }
 
     #[test]
-    fn compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_plan_gap() {
+    fn compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_load() {
         let temp_root = std::env::temp_dir().join(format!(
             "boon-compiled-artifact-load-test-{}",
             std::process::id()
@@ -43177,6 +43699,22 @@ FUNCTION decorate(value) {
         assert_eq!(loaded["inspection_result"]["artifact_valid"], json!(true));
         assert_eq!(
             loaded["inspection_result"]["runtime_instantiated_from_artifact"],
+            json!(true)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["loaded_runtime_from_artifact"],
+            json!(true)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["source_free_runtime_load_available"],
+            json!(true)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["source_reparse_required_for_current_runtime"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["typed_ir_required_for_mvp_loader"],
             json!(false)
         );
         assert_eq!(
@@ -43251,7 +43789,7 @@ FUNCTION decorate(value) {
                 .any(|section| section.as_str() == Some("runtime_plan"))
         );
         assert!(
-            loaded["inspection_result"]["missing_runtime_plan_sections"]
+            !loaded["inspection_result"]["missing_runtime_plan_sections"]
                 .as_array()
                 .unwrap()
                 .iter()

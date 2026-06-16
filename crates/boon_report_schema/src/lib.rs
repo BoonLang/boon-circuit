@@ -424,15 +424,15 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         || inspection
             .get("loaded_runtime_from_artifact")
             .and_then(JsonValue::as_bool)
-            != Some(false)
+            != Some(true)
         || inspection
             .get("runtime_instantiated_from_artifact")
             .and_then(JsonValue::as_bool)
-            != Some(false)
+            != Some(true)
         || inspection
             .get("source_free_runtime_load_available")
             .and_then(JsonValue::as_bool)
-            != Some(false)
+            != Some(true)
         || inspection
             .get("runtime_plan_generic_derived_deserialized_from_artifact")
             .and_then(JsonValue::as_bool)
@@ -456,7 +456,11 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         || inspection
             .get("source_reparse_required_for_current_runtime")
             .and_then(JsonValue::as_bool)
-            != Some(true)
+            != Some(false)
+        || inspection
+            .get("typed_ir_required_for_mvp_loader")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
         || inspection
             .get("source_reparse_attempted")
             .and_then(JsonValue::as_bool)
@@ -471,7 +475,7 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             != Some(false)
     {
         return Err(format!(
-            "{} inspection_result must not claim source-free runtime load or scenario execution",
+            "{} inspection_result must prove source-free runtime load and must not claim scenario execution",
             path.display()
         )
         .into());
@@ -640,13 +644,18 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         )
         .into());
     }
-    if inspection
+    let missing_runtime_plan_sections = inspection
         .get("missing_runtime_plan_sections")
         .and_then(JsonValue::as_array)
-        .is_none_or(Vec::is_empty)
-    {
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result missing_runtime_plan_sections is not an array",
+                path.display()
+            )
+        })?;
+    if !missing_runtime_plan_sections.is_empty() {
         return Err(format!(
-            "{} inspection_result must list missing runtime plan sections",
+            "{} inspection_result must not list missing runtime plan sections",
             path.display()
         )
         .into());
@@ -5145,8 +5154,8 @@ mod tests {
             }],
             "inspection_result": {
                 "artifact_valid": true,
-                "loaded_runtime_from_artifact": false,
-                "runtime_instantiated_from_artifact": false,
+                "loaded_runtime_from_artifact": true,
+                "runtime_instantiated_from_artifact": true,
                 "runtime_plan_present": true,
                 "runtime_plan_generic_derived_deserialized_from_artifact": true,
                 "runtime_plan_generic_derived_deserialized_counts": {
@@ -5184,18 +5193,16 @@ mod tests {
                     "list_projection_count": 0,
                     "list_source_binding_count": 0
                 },
-                "source_free_runtime_load_available": false,
-                "source_reparse_required_for_current_runtime": true,
+                "source_free_runtime_load_available": true,
+                "source_reparse_required_for_current_runtime": false,
                 "source_reparse_attempted": false,
                 "source_file_access": "not_attempted",
                 "parser_ast_required_for_execution": false,
-                "typed_ir_required_for_mvp_loader": true,
+                "typed_ir_required_for_mvp_loader": false,
                 "scenario_execution_available": false,
-                "blocked_task": "TASK-0901B",
+                "blocked_task": "none",
                 "scenario_execution_pending_task": "TASK-0901C",
-                "missing_runtime_plan_sections": [
-                    "generic_derived_ast_free_plan"
-                ]
+                "missing_runtime_plan_sections": []
             }
         });
         report["inspection_result"]["runtime_plan_source_routes_deserialized_from_artifact"] =
@@ -5220,10 +5227,10 @@ mod tests {
             report.clone(),
             "inspected-compiled-artifact-valid"
         ));
-        report["inspection_result"]["runtime_instantiated_from_artifact"] = json!(true);
+        report["inspection_result"]["scenario_execution_available"] = json!(true);
         assert!(!schema_accepts(
             report,
-            "inspected-compiled-artifact-fake-runtime-load"
+            "inspected-compiled-artifact-fake-scenario-execution"
         ));
         let _ = fs::remove_file(artifact_path);
     }

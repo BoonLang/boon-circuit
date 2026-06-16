@@ -13,6 +13,7 @@ pub struct TypedProgram {
     pub expression_count: usize,
     pub expressions: Vec<AstExpr>,
     pub expression_coverage: ExpressionCoverage,
+    pub semantic_index: SemanticIndex,
     pub graph_node_count: usize,
     pub nodes: Vec<IrNode>,
     pub row_scopes: Vec<RowScope>,
@@ -64,6 +65,22 @@ pub struct FieldId(pub usize);
 #[serde(transparent)]
 pub struct ViewBindingId(pub usize);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceUnitId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FunctionId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DiagnosticSpanId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SemanticSymbolId(pub usize);
+
 impl ExprId {
     pub fn as_usize(self) -> usize {
         self.0
@@ -107,6 +124,30 @@ impl FieldId {
 }
 
 impl ViewBindingId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl SourceUnitId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl FunctionId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl DiagnosticSpanId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl SemanticSymbolId {
     pub fn as_usize(self) -> usize {
         self.0
     }
@@ -158,6 +199,197 @@ impl fmt::Display for ViewBindingId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+impl fmt::Display for SourceUnitId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for FunctionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for DiagnosticSpanId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for SemanticSymbolId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticIndex {
+    pub version: u32,
+    pub computed_from: String,
+    pub parser_policy_phase: String,
+    pub reuse_key: String,
+    pub source_units: Vec<SemanticSourceUnit>,
+    pub sources: Vec<SemanticSourceEntry>,
+    pub lists: Vec<SemanticListEntry>,
+    pub row_scopes: Vec<SemanticRowScopeEntry>,
+    pub functions: Vec<SemanticFunctionEntry>,
+    pub fields: Vec<SemanticFieldEntry>,
+    pub view_bindings: Vec<SemanticViewBindingEntry>,
+    pub diagnostic_spans: Vec<SemanticDiagnosticSpan>,
+    pub symbols: Vec<SemanticSymbolEntry>,
+    pub readiness: SemanticIndexReadiness,
+    pub reuse: SemanticIndexReuse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSourceUnit {
+    pub id: SourceUnitId,
+    pub path: String,
+    pub module: Option<String>,
+    pub start_line: usize,
+    pub line_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSourceEntry {
+    pub id: SourceId,
+    pub path: String,
+    pub scoped: bool,
+    pub scope_id: Option<ScopeId>,
+    pub payload_schema_known: bool,
+    pub payload_field_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticListEntry {
+    pub id: ListId,
+    pub name: String,
+    pub row_scope_id: Option<ScopeId>,
+    pub capacity: Option<usize>,
+    pub initializer_known: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticRowScopeEntry {
+    pub id: ScopeId,
+    pub list: String,
+    pub function: String,
+    pub row_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticFunctionEntry {
+    pub id: FunctionId,
+    pub name: String,
+    pub args: Vec<String>,
+    pub statement_id: usize,
+    pub line: usize,
+    pub type_known: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticFieldEntry {
+    pub id: FieldId,
+    pub path: String,
+    pub local_name: String,
+    pub parent_path: String,
+    pub scope_id: Option<ScopeId>,
+    pub statement_id: usize,
+    pub line: usize,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticViewBindingEntry {
+    pub id: ViewBindingId,
+    pub node_kind: String,
+    pub attr: String,
+    pub path: String,
+    pub kind: ViewBindingKind,
+    pub scope_id: Option<ScopeId>,
+    pub source_id: Option<SourceId>,
+    pub render_contract_known: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticDiagnosticSpan {
+    pub id: DiagnosticSpanId,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSymbolEntry {
+    pub id: SemanticSymbolId,
+    pub category: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticIndexReadiness {
+    pub source_payload_schemas: SemanticKnowledgeStatus,
+    pub source_completions: SemanticKnowledgeStatus,
+    pub route_critical_unknowns: SemanticKnowledgeStatus,
+    pub row_scopes: SemanticKnowledgeStatus,
+    pub row_scope_ambiguity: SemanticKnowledgeStatus,
+    pub selectors: SemanticKnowledgeStatus,
+    pub selector_index_ambiguity: SemanticKnowledgeStatus,
+    pub render_contracts: SemanticKnowledgeStatus,
+    pub bridge_page_descriptors: SemanticKnowledgeStatus,
+    pub dynamic_fallback_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticKnowledgeStatus {
+    pub known_count: usize,
+    pub fallback_count: usize,
+    pub fallback_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticIndexReuse {
+    pub parser_reused_by_ir: bool,
+    pub typecheck_reused_by_ir: bool,
+    pub runtime_reports_reuse_index: bool,
+    pub shared_tables: Vec<String>,
+}
+
+impl SemanticIndex {
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "present": true,
+            "version": self.version,
+            "computed_from": self.computed_from,
+            "parser_policy_phase": self.parser_policy_phase,
+            "reuse_key": self.reuse_key,
+            "source_unit_count": self.source_units.len(),
+            "source_count": self.sources.len(),
+            "list_count": self.lists.len(),
+            "row_scope_count": self.row_scopes.len(),
+            "function_count": self.functions.len(),
+            "field_count": self.fields.len(),
+            "view_binding_count": self.view_bindings.len(),
+            "diagnostic_span_count": self.diagnostic_spans.len(),
+            "symbol_count": self.symbols.len(),
+            "symbol_categories": semantic_symbol_category_counts(&self.symbols),
+            "readiness": &self.readiness,
+            "reuse": &self.reuse,
+        })
+    }
+}
+
+fn semantic_symbol_category_counts(symbols: &[SemanticSymbolEntry]) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    for symbol in symbols {
+        *counts.entry(symbol.category.as_str()).or_insert(0) += 1;
+    }
+    counts
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -475,6 +707,11 @@ pub enum UpdateExpression {
         payload_path: String,
         separator: String,
     },
+    PrefixRootConcat {
+        prefix: String,
+        path: String,
+        separator: String,
+    },
     BoolNot {
         path: String,
     },
@@ -491,6 +728,13 @@ pub enum UpdateExpression {
         op: String,
         right: String,
         arms: Vec<UpdateValueMatchArm>,
+    },
+    ListFindValue {
+        list: String,
+        field: String,
+        expected: Box<UpdateValueExpression>,
+        target: String,
+        fallback: Option<Box<UpdateValueExpression>>,
     },
     Unknown {
         summary: String,
@@ -666,7 +910,7 @@ fn lower_profiled_with_typecheck(
             has_generation: true,
             graph_clones_per_item: 0,
             capacity: list.capacity,
-            initializer: list_initializer(program, &list.name),
+            initializer: list_initializer(program, list),
         })
         .collect::<Vec<_>>();
     let lists_ms = lower_elapsed_ms(lists_started);
@@ -677,13 +921,20 @@ fn lower_profiled_with_typecheck(
         return Err("List/map node must be indexed".to_owned());
     }
     let dependencies_started = Instant::now();
-    let dependencies = dependency_edges(program, &state_cells, &fields, &direct_sources);
+    let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources);
+    let dependencies = dependency_edges(program, &state_cells, &mut candidate_sources);
     let dependencies_ms = lower_elapsed_ms(dependencies_started);
     let possible_causes_started = Instant::now();
-    let possible_causes = possible_causes(program, &state_cells, &fields, &direct_sources);
+    let possible_causes = possible_causes(&state_cells, &mut candidate_sources);
     let possible_causes_ms = lower_elapsed_ms(possible_causes_started);
     let update_branches_started = Instant::now();
-    let update_branches = update_branches(program, &state_cells, &fields, &direct_sources);
+    let update_branches = update_branches(
+        program,
+        &state_cells,
+        &fields,
+        &direct_sources,
+        &mut candidate_sources,
+    );
     let update_branches_ms = lower_elapsed_ms(update_branches_started);
     let list_operations_started = Instant::now();
     let list_operations = list_operations(program);
@@ -712,11 +963,25 @@ fn lower_profiled_with_typecheck(
         &list_operations,
     );
     let expression_coverage_ms = lower_elapsed_ms(expression_coverage_started);
+    let semantic_index_started = Instant::now();
+    let semantic_index = semantic_index(
+        program,
+        &fields,
+        &row_scopes,
+        &sources,
+        &state_cells,
+        &lists,
+        &functions,
+        &view_bindings,
+        &typecheck_report,
+    );
+    let semantic_index_ms = lower_elapsed_ms(semantic_index_started);
     let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
         expressions: program.expressions.clone(),
         expression_coverage,
+        semantic_index,
         graph_node_count: nodes.len(),
         nodes,
         row_scopes,
@@ -741,6 +1006,9 @@ fn lower_profiled_with_typecheck(
     let verify_hidden_started = Instant::now();
     verify_hidden_identity(&typed)?;
     let verify_hidden_ms = lower_elapsed_ms(verify_hidden_started);
+    let representation_analysis_started = Instant::now();
+    let representation_analysis = representation_analysis(program, &typed);
+    let representation_analysis_ms = lower_elapsed_ms(representation_analysis_started);
     let profile = serde_json::json!({
         "typecheck_ms": typecheck_ms,
         "typecheck_profile": typecheck_profile,
@@ -761,13 +1029,1124 @@ fn lower_profiled_with_typecheck(
         "derived_values_ms": derived_values_ms,
         "view_bindings_ms": view_bindings_ms,
         "expression_coverage_ms": expression_coverage_ms,
+        "semantic_index_ms": semantic_index_ms,
         "verify_static_schedule_ms": verify_static_ms,
         "verify_hidden_identity_ms": verify_hidden_ms,
+        "representation_analysis_ms": representation_analysis_ms,
+        "representation_analysis": representation_analysis,
         "expression_count": typed.expression_count,
         "graph_node_count": typed.graph_node_count,
         "total_ms": lower_elapsed_ms(total_started)
     });
     Ok((typed, profile))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepresentationExprClass {
+    LiteralConstant,
+    StaticComposite,
+    RowDependent,
+    SourceOrHoldDynamic,
+    RuntimeDynamic,
+    UnknownDynamic,
+}
+
+impl RepresentationExprClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LiteralConstant => "literal_constant",
+            Self::StaticComposite => "static_composite",
+            Self::RowDependent => "row_dependent",
+            Self::SourceOrHoldDynamic => "source_or_hold_dynamic",
+            Self::RuntimeDynamic => "runtime_dynamic",
+            Self::UnknownDynamic => "unknown_dynamic",
+        }
+    }
+
+    fn is_static(self) -> bool {
+        matches!(self, Self::LiteralConstant | Self::StaticComposite)
+    }
+}
+
+fn representation_analysis(program: &ParsedProgram, typed: &TypedProgram) -> serde_json::Value {
+    let mut cache = vec![None; program.expressions.len()];
+    let row_scope_names = representation_row_binding_names(program);
+    let source_paths = program
+        .source_ports
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let state_paths = program
+        .state_cells
+        .iter()
+        .map(|cell| cell.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let list_names = program
+        .list_memories
+        .iter()
+        .map(|list| list.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut expression_class_counts = BTreeMap::<&'static str, usize>::new();
+    let mut static_list_literal_count = 0usize;
+    let mut dynamic_list_literal_count = 0usize;
+    let mut list_literal_item_count = 0usize;
+    for expr in &program.expressions {
+        let class = representation_expr_class(
+            expr.id,
+            program,
+            &row_scope_names,
+            &source_paths,
+            &state_paths,
+            &list_names,
+            &mut cache,
+        );
+        *expression_class_counts.entry(class.label()).or_default() += 1;
+        if let AstExprKind::ListLiteral { items, .. } = &expr.kind {
+            list_literal_item_count = list_literal_item_count.saturating_add(items.len());
+            if class.is_static() {
+                static_list_literal_count = static_list_literal_count.saturating_add(1);
+            } else {
+                dynamic_list_literal_count = dynamic_list_literal_count.saturating_add(1);
+            }
+        }
+    }
+    let list_storage_mode_candidates = representation_list_storage_mode_candidates(typed);
+    let root_derived_samples = representation_root_derived_samples(
+        program,
+        typed,
+        &row_scope_names,
+        &source_paths,
+        &state_paths,
+        &list_names,
+        &mut cache,
+    );
+    serde_json::json!({
+        "version": 1,
+        "computed_from": "parser_ast_and_typed_ir",
+        "policy": "diagnostic_only_no_folding_or_storage_rewrite",
+        "expression_class_counts": expression_class_counts,
+        "list_literal_counts": {
+            "static": static_list_literal_count,
+            "dynamic": dynamic_list_literal_count,
+            "item_count": list_literal_item_count
+        },
+        "list_storage_mode_candidates": list_storage_mode_candidates,
+        "root_derived_samples": root_derived_samples,
+    })
+}
+
+fn representation_row_binding_names(program: &ParsedProgram) -> BTreeSet<String> {
+    let mut names = program
+        .row_scope_functions
+        .iter()
+        .map(|scope| scope.row_scope.clone())
+        .collect::<BTreeSet<_>>();
+    for expr in &program.expressions {
+        match &expr.kind {
+            AstExprKind::Pipe { op, args, .. } if representation_op_binds_row(op) => {
+                if let Some(name) = representation_positional_identifier_arg(program, args) {
+                    names.insert(name);
+                }
+            }
+            AstExprKind::Call { function, args } if representation_op_binds_row(function) => {
+                if let Some(name) = representation_positional_identifier_arg(program, args) {
+                    names.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn representation_op_binds_row(op: &str) -> bool {
+    matches!(
+        op,
+        "List/map"
+            | "List/retain"
+            | "List/remove"
+            | "List/every"
+            | "List/filter_text_contains"
+            | "List/filter_field_equal"
+            | "List/filter_field_not_equal"
+            | "List/move_field_first"
+            | "List/move_field_last"
+    )
+}
+
+fn representation_positional_identifier_arg(
+    program: &ParsedProgram,
+    args: &[AstCallArg],
+) -> Option<String> {
+    let value = args.iter().find(|arg| arg.name.is_none())?.value;
+    match program.expressions.get(value).map(|expr| &expr.kind) {
+        Some(AstExprKind::Identifier(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn representation_expr_class(
+    expr_id: usize,
+    program: &ParsedProgram,
+    row_scope_names: &BTreeSet<String>,
+    source_paths: &BTreeSet<&str>,
+    state_paths: &BTreeSet<&str>,
+    list_names: &BTreeSet<&str>,
+    cache: &mut [Option<RepresentationExprClass>],
+) -> RepresentationExprClass {
+    if let Some(class) = cache.get(expr_id).copied().flatten() {
+        return class;
+    }
+    let Some(expr) = program.expressions.iter().find(|expr| expr.id == expr_id) else {
+        return RepresentationExprClass::UnknownDynamic;
+    };
+    let class = match &expr.kind {
+        AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_) => RepresentationExprClass::LiteralConstant,
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            representation_merge_child_classes(fields.iter().map(|field| {
+                representation_expr_class(
+                    field.value,
+                    program,
+                    row_scope_names,
+                    source_paths,
+                    state_paths,
+                    list_names,
+                    cache,
+                )
+            }))
+            .filter(
+                RepresentationExprClass::is_static,
+                RepresentationExprClass::StaticComposite,
+            )
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            representation_merge_child_classes(items.iter().map(|item| {
+                representation_expr_class(
+                    *item,
+                    program,
+                    row_scope_names,
+                    source_paths,
+                    state_paths,
+                    list_names,
+                    cache,
+                )
+            }))
+            .filter(
+                RepresentationExprClass::is_static,
+                RepresentationExprClass::StaticComposite,
+            )
+        }
+        AstExprKind::Identifier(name) => representation_symbol_class(
+            name,
+            row_scope_names,
+            source_paths,
+            state_paths,
+            list_names,
+        ),
+        AstExprKind::Path(parts) => representation_symbol_class(
+            &parts.join("."),
+            row_scope_names,
+            source_paths,
+            state_paths,
+            list_names,
+        ),
+        AstExprKind::Source | AstExprKind::Hold { .. } => {
+            RepresentationExprClass::SourceOrHoldDynamic
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            if op == "HOLD" {
+                RepresentationExprClass::SourceOrHoldDynamic
+            } else {
+                let input_class = representation_expr_class(
+                    *input,
+                    program,
+                    row_scope_names,
+                    source_paths,
+                    state_paths,
+                    list_names,
+                    cache,
+                );
+                let arg_class = representation_merge_child_classes(args.iter().map(|arg| {
+                    representation_expr_class(
+                        arg.value,
+                        program,
+                        row_scope_names,
+                        source_paths,
+                        state_paths,
+                        list_names,
+                        cache,
+                    )
+                }));
+                representation_merge_child_classes([input_class, arg_class])
+                    .promote_dynamic_default()
+            }
+        }
+        AstExprKind::Call { args, .. } => {
+            representation_merge_child_classes(args.iter().map(|arg| {
+                representation_expr_class(
+                    arg.value,
+                    program,
+                    row_scope_names,
+                    source_paths,
+                    state_paths,
+                    list_names,
+                    cache,
+                )
+            }))
+            .promote_dynamic_default()
+        }
+        AstExprKind::Infix { left, right, .. } => representation_merge_child_classes([
+            representation_expr_class(
+                *left,
+                program,
+                row_scope_names,
+                source_paths,
+                state_paths,
+                list_names,
+                cache,
+            ),
+            representation_expr_class(
+                *right,
+                program,
+                row_scope_names,
+                source_paths,
+                state_paths,
+                list_names,
+                cache,
+            ),
+        ])
+        .promote_dynamic_default(),
+        AstExprKind::When { .. } | AstExprKind::Then { .. } | AstExprKind::Latest => {
+            RepresentationExprClass::RuntimeDynamic
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => representation_expr_class(
+            *output,
+            program,
+            row_scope_names,
+            source_paths,
+            state_paths,
+            list_names,
+            cache,
+        )
+        .promote_dynamic_default(),
+        AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => RepresentationExprClass::UnknownDynamic,
+    };
+    if let Some(slot) = cache.get_mut(expr_id) {
+        *slot = Some(class);
+    }
+    class
+}
+
+trait RepresentationClassExt {
+    fn filter(self, predicate: impl FnOnce(Self) -> bool, replacement: Self) -> Self
+    where
+        Self: Sized;
+    fn promote_dynamic_default(self) -> Self;
+}
+
+impl RepresentationClassExt for RepresentationExprClass {
+    fn filter(self, predicate: impl FnOnce(Self) -> bool, replacement: Self) -> Self {
+        if predicate(self) { replacement } else { self }
+    }
+
+    fn promote_dynamic_default(self) -> Self {
+        if self.is_static() {
+            RepresentationExprClass::RuntimeDynamic
+        } else {
+            self
+        }
+    }
+}
+
+fn representation_merge_child_classes(
+    classes: impl IntoIterator<Item = RepresentationExprClass>,
+) -> RepresentationExprClass {
+    let mut saw_static = false;
+    let mut saw_unknown = false;
+    let mut saw_runtime = false;
+    let mut saw_row = false;
+    let mut saw_source_or_hold = false;
+    for class in classes {
+        match class {
+            RepresentationExprClass::SourceOrHoldDynamic => {
+                saw_source_or_hold = true;
+            }
+            RepresentationExprClass::RowDependent => saw_row = true,
+            RepresentationExprClass::RuntimeDynamic => saw_runtime = true,
+            RepresentationExprClass::UnknownDynamic => saw_unknown = true,
+            RepresentationExprClass::LiteralConstant | RepresentationExprClass::StaticComposite => {
+                saw_static = true;
+            }
+        }
+    }
+    if saw_source_or_hold {
+        RepresentationExprClass::SourceOrHoldDynamic
+    } else if saw_row {
+        RepresentationExprClass::RowDependent
+    } else if saw_runtime {
+        RepresentationExprClass::RuntimeDynamic
+    } else if saw_unknown {
+        RepresentationExprClass::UnknownDynamic
+    } else if saw_static {
+        RepresentationExprClass::StaticComposite
+    } else {
+        RepresentationExprClass::LiteralConstant
+    }
+}
+
+fn representation_symbol_class(
+    name: &str,
+    row_scope_names: &BTreeSet<String>,
+    source_paths: &BTreeSet<&str>,
+    state_paths: &BTreeSet<&str>,
+    list_names: &BTreeSet<&str>,
+) -> RepresentationExprClass {
+    if row_scope_names.iter().any(|scope| {
+        name == scope.as_str()
+            || name
+                .strip_prefix(scope.as_str())
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    }) {
+        return RepresentationExprClass::RowDependent;
+    }
+    if source_paths.contains(name) || state_paths.contains(name) || list_names.contains(name) {
+        return RepresentationExprClass::RuntimeDynamic;
+    }
+    if name == "SOURCE" || name == "HOLD" || name.contains(".event.") {
+        return RepresentationExprClass::SourceOrHoldDynamic;
+    }
+    RepresentationExprClass::UnknownDynamic
+}
+
+fn representation_list_storage_mode_candidates(
+    typed: &TypedProgram,
+) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::<&'static str, usize>::new();
+    for list in &typed.lists {
+        let mode = match &list.initializer {
+            ListInitializer::RecordLiteral { rows } => {
+                if list_initializer_has_dynamic_fields(rows) {
+                    "dense_vec_dynamic_initializer"
+                } else {
+                    "constant_array_literal"
+                }
+            }
+            ListInitializer::Range { .. } => "virtual_range",
+            ListInitializer::Empty => "dense_vec_empty",
+            ListInitializer::Unknown { .. } => "unknown_initializer",
+        };
+        *counts.entry(mode).or_default() += 1;
+    }
+    for value in typed
+        .derived_values
+        .iter()
+        .filter(|value| matches!(value.kind, DerivedValueKind::ListView))
+    {
+        for mode in representation_list_view_mode_hints(&value.statement, &typed.expressions) {
+            *counts.entry(mode).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn representation_root_derived_samples(
+    program: &ParsedProgram,
+    typed: &TypedProgram,
+    row_scope_names: &BTreeSet<String>,
+    source_paths: &BTreeSet<&str>,
+    state_paths: &BTreeSet<&str>,
+    list_names: &BTreeSet<&str>,
+    cache: &mut [Option<RepresentationExprClass>],
+) -> Vec<serde_json::Value> {
+    typed
+        .derived_values
+        .iter()
+        .filter(|value| !value.indexed && value.scope_id.is_none())
+        .take(64)
+        .map(|value| {
+            let class = representation_statement_class(
+                &value.statement,
+                program,
+                row_scope_names,
+                source_paths,
+                state_paths,
+                list_names,
+                cache,
+            );
+            serde_json::json!({
+                "path": value.path,
+                "line": value.statement.line,
+                "kind": derived_value_kind_label_ir(&value.kind),
+                "class": class.label(),
+                "list_storage_hints": if matches!(value.kind, DerivedValueKind::ListView) {
+                    representation_list_view_mode_hints(&value.statement, &typed.expressions)
+                } else {
+                    Vec::new()
+                }
+            })
+        })
+        .collect()
+}
+
+fn representation_statement_class(
+    statement: &AstStatement,
+    program: &ParsedProgram,
+    row_scope_names: &BTreeSet<String>,
+    source_paths: &BTreeSet<&str>,
+    state_paths: &BTreeSet<&str>,
+    list_names: &BTreeSet<&str>,
+    cache: &mut [Option<RepresentationExprClass>],
+) -> RepresentationExprClass {
+    let ids = representation_statement_expr_ids(statement, &program.expressions);
+    representation_merge_child_classes(ids.into_iter().map(|expr_id| {
+        representation_expr_class(
+            expr_id,
+            program,
+            row_scope_names,
+            source_paths,
+            state_paths,
+            list_names,
+            cache,
+        )
+    }))
+}
+
+fn representation_statement_expr_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Vec<usize> {
+    let mut ids = Vec::new();
+    representation_collect_statement_expr_ids(statement, expressions, &mut ids);
+    ids
+}
+
+fn representation_collect_statement_expr_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    ids: &mut Vec<usize>,
+) {
+    if let Some(expr_id) = statement.expr {
+        representation_push_expr_id(expr_id, expressions, ids);
+    }
+    for child in &statement.children {
+        representation_collect_statement_expr_ids(child, expressions, ids);
+    }
+}
+
+fn representation_push_expr_id(expr_id: usize, expressions: &[AstExpr], ids: &mut Vec<usize>) {
+    if !ids.contains(&expr_id) {
+        ids.push(expr_id);
+    }
+    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => {
+            for arg in args {
+                representation_push_expr_id(arg.value, expressions, ids);
+            }
+        }
+        AstExprKind::Pipe { input, args, .. } => {
+            representation_push_expr_id(*input, expressions, ids);
+            for arg in args {
+                representation_push_expr_id(arg.value, expressions, ids);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            representation_push_expr_id(*initial, expressions, ids);
+        }
+        AstExprKind::Then { input, output } => {
+            representation_push_expr_id(*input, expressions, ids);
+            if let Some(output) = output {
+                representation_push_expr_id(*output, expressions, ids);
+            }
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => representation_push_expr_id(*output, expressions, ids),
+        AstExprKind::Infix { left, right, .. } => {
+            representation_push_expr_id(*left, expressions, ids);
+            representation_push_expr_id(*right, expressions, ids);
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                representation_push_expr_id(field.value, expressions, ids);
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                representation_push_expr_id(*item, expressions, ids);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+}
+
+fn representation_list_view_mode_hints(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Vec<&'static str> {
+    let mut hints = BTreeSet::new();
+    for expr_id in representation_statement_expr_ids(statement, expressions) {
+        let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
+            continue;
+        };
+        match &expr.kind {
+            AstExprKind::Pipe { op, .. } | AstExprKind::Call { function: op, .. } => {
+                match op.as_str() {
+                    "List/map" => {
+                        hints.insert("incremental_projection");
+                    }
+                    "List/retain"
+                    | "List/filter_text_contains"
+                    | "List/filter_field_equal"
+                    | "List/filter_field_not_equal"
+                    | "List/move_field_first"
+                    | "List/move_field_last" => {
+                        hints.insert("selection_view");
+                    }
+                    "List/chunk" => {
+                        hints.insert("page_or_chunk_view");
+                    }
+                    "List/range" => {
+                        hints.insert("virtual_range");
+                    }
+                    _ => {}
+                }
+            }
+            AstExprKind::ListLiteral { .. } => {
+                hints.insert("constant_or_dense_literal");
+            }
+            _ => {}
+        }
+    }
+    if hints.is_empty() {
+        hints.insert("dense_vec_materialized");
+    }
+    hints.into_iter().collect()
+}
+
+fn derived_value_kind_label_ir(kind: &DerivedValueKind) -> &'static str {
+    match kind {
+        DerivedValueKind::SourceEventTransform => "source_event_transform",
+        DerivedValueKind::ListView => "list_view",
+        DerivedValueKind::Aggregate => "aggregate",
+        DerivedValueKind::Pure => "pure",
+        DerivedValueKind::Unknown => "unknown",
+    }
+}
+
+fn semantic_index(
+    program: &ParsedProgram,
+    fields: &[FieldDef],
+    row_scopes: &[RowScope],
+    sources: &[SourcePort],
+    state_cells: &[StateCell],
+    lists: &[ListMemory],
+    functions: &[FunctionDefinition],
+    view_bindings: &[ViewBinding],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> SemanticIndex {
+    let payload_shape_by_source = typecheck_report
+        .source_payload_shape_table
+        .iter()
+        .map(|entry| (entry.source_path.as_str(), entry.fields.len()))
+        .collect::<BTreeMap<_, _>>();
+    let function_types = typecheck_report
+        .function_type_table
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let source_units = program
+        .files
+        .iter()
+        .enumerate()
+        .map(|(id, file)| SemanticSourceUnit {
+            id: SourceUnitId(id),
+            path: file.path.clone(),
+            module: file.module.clone(),
+            start_line: file.start_line,
+            line_count: file.source.lines().count().max(1),
+        })
+        .collect::<Vec<_>>();
+    let sources = sources
+        .iter()
+        .map(|source| {
+            let payload_field_count = payload_shape_by_source
+                .get(source.path.as_str())
+                .copied()
+                .unwrap_or(source.payload_schema.fields.len());
+            SemanticSourceEntry {
+                id: source.id,
+                path: source.path.clone(),
+                scoped: source.scoped,
+                scope_id: source.scope_id,
+                payload_schema_known: payload_shape_by_source.contains_key(source.path.as_str()),
+                payload_field_count,
+            }
+        })
+        .collect::<Vec<_>>();
+    let lists = lists
+        .iter()
+        .map(|list| SemanticListEntry {
+            id: list.id,
+            name: list.name.clone(),
+            row_scope_id: list.row_scope_id,
+            capacity: list.capacity,
+            initializer_known: !matches!(list.initializer, ListInitializer::Unknown { .. }),
+        })
+        .collect::<Vec<_>>();
+    let row_scopes = row_scopes
+        .iter()
+        .map(|scope| SemanticRowScopeEntry {
+            id: scope.id,
+            list: scope.list.clone(),
+            function: scope.function.clone(),
+            row_scope: scope.row_scope.clone(),
+        })
+        .collect::<Vec<_>>();
+    let functions = functions
+        .iter()
+        .enumerate()
+        .map(|(id, function)| SemanticFunctionEntry {
+            id: FunctionId(id),
+            name: function.name.clone(),
+            args: function.args.clone(),
+            statement_id: function.statement.id,
+            line: function.statement.line,
+            type_known: function_types.contains(function.name.as_str()),
+        })
+        .collect::<Vec<_>>();
+    let fields = fields
+        .iter()
+        .enumerate()
+        .map(|(id, field)| SemanticFieldEntry {
+            id: FieldId(id),
+            path: field.path.clone(),
+            local_name: field.local_name.clone(),
+            parent_path: field.parent_path.clone(),
+            scope_id: scope_id_for_path(
+                row_scopes_from_entries(row_scopes.as_slice()).as_slice(),
+                &field.path,
+            ),
+            statement_id: field.statement.id,
+            line: field.statement.line,
+            kind: semantic_field_kind(
+                field,
+                state_cells,
+                lists_from_entries(lists.as_slice()).as_slice(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let view_bindings = view_bindings
+        .iter()
+        .map(|binding| SemanticViewBindingEntry {
+            id: binding.id,
+            node_kind: binding.node_kind.clone(),
+            attr: binding.attr.clone(),
+            path: binding.path.clone(),
+            kind: binding.kind,
+            scope_id: binding.scope_id,
+            source_id: binding.source_id,
+            render_contract_known: true,
+        })
+        .collect::<Vec<_>>();
+    let diagnostic_spans = typecheck_report
+        .diagnostics
+        .iter()
+        .enumerate()
+        .map(|(id, diagnostic)| SemanticDiagnosticSpan {
+            id: DiagnosticSpanId(id),
+            line: diagnostic.line,
+            start: diagnostic.start,
+            end: diagnostic.end,
+            severity: format!("{:?}", diagnostic.severity).to_ascii_lowercase(),
+            message: diagnostic.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let symbols = semantic_symbols(
+        program,
+        &sources,
+        &lists,
+        &row_scopes,
+        &functions,
+        &fields,
+        &view_bindings,
+    );
+    let readiness = semantic_index_readiness(
+        &sources,
+        row_scopes.len(),
+        lists.len(),
+        program,
+        typecheck_report,
+    );
+    SemanticIndex {
+        version: 1,
+        computed_from: "parser_ast_ir_typecheck_tables".to_owned(),
+        parser_policy_phase: "syntax_parse_then_semantic_index_policy_checks".to_owned(),
+        reuse_key: semantic_index_reuse_key(program, &readiness),
+        source_units,
+        sources,
+        lists,
+        row_scopes,
+        functions,
+        fields,
+        view_bindings,
+        diagnostic_spans,
+        symbols,
+        readiness,
+        reuse: SemanticIndexReuse {
+            parser_reused_by_ir: true,
+            typecheck_reused_by_ir: true,
+            runtime_reports_reuse_index: true,
+            shared_tables: vec![
+                "ParsedProgram.source_ports".to_owned(),
+                "ParsedProgram.list_memories".to_owned(),
+                "ParsedProgram.row_scope_functions".to_owned(),
+                "TypeCheckReport.source_payload_shape_table".to_owned(),
+                "TypeCheckReport.render_slot_table".to_owned(),
+                "TypedProgram.view_bindings".to_owned(),
+            ],
+        },
+    }
+}
+
+fn semantic_symbols(
+    program: &ParsedProgram,
+    sources: &[SemanticSourceEntry],
+    lists: &[SemanticListEntry],
+    row_scopes: &[SemanticRowScopeEntry],
+    functions: &[SemanticFunctionEntry],
+    fields: &[SemanticFieldEntry],
+    view_bindings: &[SemanticViewBindingEntry],
+) -> Vec<SemanticSymbolEntry> {
+    let mut table = BTreeMap::<(String, String), SemanticSymbolId>::new();
+    for file in &program.files {
+        intern_semantic_symbol(&mut table, "source_unit_path", &file.path);
+        if let Some(module) = &file.module {
+            intern_semantic_symbol(&mut table, "module_path", module);
+        }
+    }
+    for source in sources {
+        intern_semantic_symbol(&mut table, "source_label", &source.path);
+        for part in source.path.split('.') {
+            intern_semantic_symbol(&mut table, "source_label_segment", part);
+        }
+    }
+    for list in lists {
+        intern_semantic_symbol(&mut table, "list_name", &list.name);
+    }
+    for scope in row_scopes {
+        intern_semantic_symbol(&mut table, "row_scope", &scope.row_scope);
+        intern_semantic_symbol(&mut table, "row_scope_function", &scope.function);
+    }
+    for function in functions {
+        intern_semantic_symbol(&mut table, "function_name", &function.name);
+        for arg in &function.args {
+            intern_semantic_symbol(&mut table, "function_arg", arg);
+        }
+    }
+    for field in fields {
+        intern_semantic_symbol(&mut table, "field_path", &field.path);
+        intern_semantic_symbol(&mut table, "field_name", &field.local_name);
+    }
+    for operator in &program.operators {
+        intern_semantic_symbol(&mut table, "operator_name", operator);
+    }
+    for expr in &program.expressions {
+        match &expr.kind {
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
+                intern_semantic_symbol(&mut table, "tag", tag);
+            }
+            AstExprKind::TaggedObject { tag, fields } => {
+                intern_semantic_symbol(&mut table, "tag", tag);
+                for field in fields {
+                    intern_semantic_symbol(&mut table, "document_attr", &field.name);
+                }
+            }
+            AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+                for field in fields {
+                    intern_semantic_symbol(&mut table, "document_attr", &field.name);
+                    intern_semantic_symbol(&mut table, "style_attr", &field.name);
+                }
+            }
+            AstExprKind::Call { function, args } => {
+                intern_semantic_symbol(&mut table, "operator_name", function);
+                for arg in args {
+                    if let Some(name) = &arg.name {
+                        intern_semantic_symbol(&mut table, "document_attr", name);
+                    }
+                }
+            }
+            AstExprKind::Pipe { op, args, .. } => {
+                intern_semantic_symbol(&mut table, "operator_name", op);
+                for arg in args {
+                    if let Some(name) = &arg.name {
+                        intern_semantic_symbol(&mut table, "document_attr", name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for binding in view_bindings {
+        intern_semantic_symbol(&mut table, "document_attr", &binding.attr);
+        intern_semantic_symbol(&mut table, "view_node_kind", &binding.node_kind);
+    }
+    let mut entries = table
+        .into_iter()
+        .map(|((category, text), id)| SemanticSymbolEntry { id, category, text })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.id);
+    entries
+}
+
+fn intern_semantic_symbol(
+    table: &mut BTreeMap<(String, String), SemanticSymbolId>,
+    category: &str,
+    text: &str,
+) -> SemanticSymbolId {
+    if let Some(id) = table.get(&(category.to_owned(), text.to_owned())) {
+        return *id;
+    }
+    let id = SemanticSymbolId(table.len());
+    table.insert((category.to_owned(), text.to_owned()), id);
+    id
+}
+
+fn row_scopes_from_entries(entries: &[SemanticRowScopeEntry]) -> Vec<RowScope> {
+    entries
+        .iter()
+        .map(|entry| RowScope {
+            id: entry.id,
+            list: entry.list.clone(),
+            function: entry.function.clone(),
+            row_scope: entry.row_scope.clone(),
+        })
+        .collect()
+}
+
+fn lists_from_entries(entries: &[SemanticListEntry]) -> Vec<ListMemory> {
+    entries
+        .iter()
+        .map(|entry| ListMemory {
+            id: entry.id,
+            name: entry.name.clone(),
+            row_scope_id: entry.row_scope_id,
+            hidden_key_type: hidden_key_type(&entry.name),
+            has_generation: true,
+            graph_clones_per_item: 0,
+            capacity: entry.capacity,
+            initializer: if entry.initializer_known {
+                ListInitializer::Empty
+            } else {
+                ListInitializer::Unknown {
+                    summary: "semantic index entry carried fallback initializer".to_owned(),
+                }
+            },
+        })
+        .collect()
+}
+
+fn semantic_field_kind(
+    field: &FieldDef,
+    state_cells: &[StateCell],
+    lists: &[ListMemory],
+) -> String {
+    if state_cells.iter().any(|cell| cell.path == field.path) {
+        "state_cell".to_owned()
+    } else if lists
+        .iter()
+        .any(|list| field.path == list.name || field.path.ends_with(&format!(".{}", list.name)))
+    {
+        "list_memory".to_owned()
+    } else {
+        "derived_value".to_owned()
+    }
+}
+
+fn semantic_index_readiness(
+    sources: &[SemanticSourceEntry],
+    row_scope_count: usize,
+    list_count: usize,
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> SemanticIndexReadiness {
+    let source_payload_fallbacks = sources
+        .iter()
+        .filter(|source| !source.payload_schema_known)
+        .map(|source| format!("{} has no source payload shape entry", source.path))
+        .collect::<Vec<_>>();
+    let row_scope_fallbacks = if list_count > 0 && row_scope_count == 0 {
+        vec!["lists exist but no row scope function was discovered".to_owned()]
+    } else {
+        Vec::new()
+    };
+    let selector_fallbacks = selector_fallback_reasons(program);
+    let render_fallbacks = typecheck_report
+        .render_slot_table
+        .slots
+        .iter()
+        .filter(|slot| !slot.diagnostics.is_empty())
+        .map(|slot| {
+            format!(
+                "render slot `{}` at statement {} has {} diagnostic(s)",
+                slot.slot_name,
+                slot.slot_statement_id,
+                slot.diagnostics.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    let route_critical_fallbacks = route_critical_unknown_reasons(typecheck_report);
+    let row_scope_ambiguity_fallbacks = row_scope_ambiguity_reasons(program);
+    SemanticIndexReadiness {
+        source_payload_schemas: SemanticKnowledgeStatus {
+            known_count: sources.len().saturating_sub(source_payload_fallbacks.len()),
+            fallback_count: source_payload_fallbacks.len(),
+            fallback_reasons: source_payload_fallbacks,
+        },
+        source_completions: SemanticKnowledgeStatus {
+            known_count: sources.len(),
+            fallback_count: 0,
+            fallback_reasons: Vec::new(),
+        },
+        route_critical_unknowns: SemanticKnowledgeStatus {
+            known_count: typecheck_report.checked_expression_count,
+            fallback_count: route_critical_fallbacks.len(),
+            fallback_reasons: route_critical_fallbacks,
+        },
+        row_scopes: SemanticKnowledgeStatus {
+            known_count: row_scope_count,
+            fallback_count: row_scope_fallbacks.len(),
+            fallback_reasons: row_scope_fallbacks,
+        },
+        row_scope_ambiguity: SemanticKnowledgeStatus {
+            known_count: row_scope_count,
+            fallback_count: row_scope_ambiguity_fallbacks.len(),
+            fallback_reasons: row_scope_ambiguity_fallbacks,
+        },
+        selectors: SemanticKnowledgeStatus {
+            known_count: program.list_memories.len(),
+            fallback_count: selector_fallbacks.len(),
+            fallback_reasons: selector_fallbacks.clone(),
+        },
+        selector_index_ambiguity: SemanticKnowledgeStatus {
+            known_count: program.list_memories.len(),
+            fallback_count: selector_fallbacks.len(),
+            fallback_reasons: selector_fallbacks.clone(),
+        },
+        render_contracts: SemanticKnowledgeStatus {
+            known_count: typecheck_report
+                .render_slot_table
+                .slots
+                .len()
+                .saturating_sub(render_fallbacks.len()),
+            fallback_count: render_fallbacks.len(),
+            fallback_reasons: render_fallbacks,
+        },
+        bridge_page_descriptors: SemanticKnowledgeStatus {
+            known_count: 0,
+            fallback_count: 0,
+            fallback_reasons: Vec::new(),
+        },
+        dynamic_fallback_count: typecheck_report.dynamic_fallback_count,
+    }
+}
+
+fn route_critical_unknown_reasons(
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if typecheck_report.dynamic_fallback_count > 0 {
+        reasons.push(format!(
+            "typecheck dynamic_fallback_count={} in route-critical report; inspect expr_type_table and diagnostics for expression spans",
+            typecheck_report.dynamic_fallback_count
+        ));
+    }
+    for slot in &typecheck_report.render_slot_table.slots {
+        if !slot.diagnostics.is_empty() {
+            reasons.push(format!(
+                "render slot `{}` statement={} value_expr={:?} has {} fallback diagnostic(s)",
+                slot.slot_name,
+                slot.slot_statement_id,
+                slot.value_expr_id,
+                slot.diagnostics.len()
+            ));
+        }
+    }
+    reasons
+}
+
+fn row_scope_ambiguity_reasons(program: &ParsedProgram) -> Vec<String> {
+    let mut seen = BTreeMap::<&str, &str>::new();
+    let mut reasons = Vec::new();
+    for scope in &program.row_scope_functions {
+        if let Some(existing_list) = seen.insert(scope.row_scope.as_str(), scope.list.as_str()) {
+            if existing_list != scope.list {
+                reasons.push(format!(
+                    "row scope `{}` is shared by lists `{}` and `{}`",
+                    scope.row_scope, existing_list, scope.list
+                ));
+            }
+        }
+    }
+    reasons
+}
+
+fn selector_fallback_reasons(program: &ParsedProgram) -> Vec<String> {
+    program
+        .expressions
+        .iter()
+        .filter_map(|expr| match &expr.kind {
+            AstExprKind::Unknown(tokens) if tokens.iter().any(|token| token.contains("List/")) => {
+                Some(format!(
+                    "list selector expression at line {} was parsed as unknown",
+                    expr.line
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn semantic_index_reuse_key(program: &ParsedProgram, readiness: &SemanticIndexReadiness) -> String {
+    format!(
+        "semantic-index-v1:{}:{}:{}:{}:{}:{}",
+        program.path,
+        program.files.len(),
+        program.source_ports.len(),
+        program.list_memories.len(),
+        program.row_scope_functions.len(),
+        readiness.dynamic_fallback_count
+    )
 }
 
 fn lower_elapsed_ms(start: Instant) -> f64 {
@@ -1140,17 +2519,21 @@ fn verify_scope_refs(
 }
 
 fn row_scopes(program: &ParsedProgram) -> Vec<RowScope> {
-    program
-        .row_scope_functions
-        .iter()
-        .enumerate()
-        .map(|(id, scope)| RowScope {
-            id: ScopeId(id),
+    let mut scopes = Vec::new();
+    for scope in &program.row_scope_functions {
+        if scopes.iter().any(|existing: &RowScope| {
+            existing.list == scope.list && existing.row_scope == scope.row_scope
+        }) {
+            continue;
+        }
+        scopes.push(RowScope {
+            id: ScopeId(scopes.len()),
             list: scope.list.clone(),
             function: scope.function.clone(),
             row_scope: scope.row_scope.clone(),
-        })
-        .collect()
+        });
+    }
+    scopes
 }
 
 fn scope_id_for_path(row_scopes: &[RowScope], path: &str) -> Option<ScopeId> {
@@ -1205,25 +2588,111 @@ fn source_address_lookup_field(
     let Some(source_scope) = source.split('.').next() else {
         return None;
     };
-    program
+    let scope = program
         .row_scope_functions
         .iter()
-        .find(|scope| scope.row_scope == source_scope)
-        .and_then(|scope| {
-            fields.iter().find_map(|field| {
-                field
-                    .path
-                    .strip_prefix(&format!("{}.", scope.row_scope))
-                    .filter(|lookup| *lookup == "address")
-                    .or_else(|| {
-                        field
-                            .path
-                            .rsplit_once(&format!(".{}.", scope.row_scope))
-                            .and_then(|(_, lookup)| (lookup == "address").then_some(lookup))
-                    })
-                    .map(str::to_owned)
-            })
+        .find(|scope| scope.row_scope == source_scope);
+    if let Some(scope) = scope {
+        if let Some(explicit_address) = fields.iter().find_map(|field| {
+            field
+                .path
+                .strip_prefix(&format!("{}.", scope.row_scope))
+                .filter(|lookup| *lookup == "address")
+                .or_else(|| {
+                    field
+                        .path
+                        .rsplit_once(&format!(".{}.", scope.row_scope))
+                        .and_then(|(_, lookup)| (lookup == "address").then_some(lookup))
+                })
+                .map(str::to_owned)
+        }) {
+            return Some(explicit_address);
+        }
+    }
+    let mut candidates = Vec::new();
+    for field in fields {
+        let Some(branch) = field.source_branch(source) else {
+            continue;
+        };
+        let Some(SimpleThenUpdateValue::Path(path)) = branch.then_simple_update_value() else {
+            continue;
+        };
+        if let Some(scope) = scope {
+            let canonical =
+                canonical_scalar_update_path_for_source(field, &field.path, &path, fields, source);
+            if let Some(lookup) = canonical
+                .strip_prefix(&format!("{}.", scope.row_scope))
+                .filter(|lookup| !lookup.contains('.'))
+            {
+                candidates.push(lookup.to_owned());
+            }
+        } else if store_list_source_tail(source, program).is_some()
+            && let Some((row_alias, lookup)) = path.split_once('.')
+            && row_alias != "store"
+            && !lookup.contains('.')
+        {
+            candidates.push(lookup.to_owned());
+        }
+    }
+    select_source_address_lookup_field(source, candidates)
+}
+
+fn select_source_address_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
+    candidates
+        .into_iter()
+        .enumerate()
+        .max_by_key(|(index, candidate)| {
+            (
+                source_address_lookup_field_score(source, candidate),
+                std::cmp::Reverse(*index),
+            )
         })
+        .map(|(_, candidate)| candidate)
+}
+
+fn source_address_lookup_field_score(source: &str, candidate: &str) -> i32 {
+    let terms = source_address_intent_terms(source);
+    let mut score = 0;
+    if matches!(candidate, "id" | "key" | "unique_id") {
+        score += 50;
+    }
+    if candidate.ends_with("_id") || candidate.ends_with("_key") {
+        score += 45;
+    }
+    if candidate == "file" {
+        score += 25;
+    }
+    for term in terms {
+        if candidate == term {
+            score += 120;
+        }
+        if candidate == format!("{term}_key") || candidate == format!("{term}_id") {
+            score += 130;
+        }
+        if candidate.starts_with(&format!("{term}_")) {
+            score += 80;
+        }
+        if candidate.contains(&term) {
+            score += 50;
+        }
+    }
+    score
+}
+
+fn source_address_intent_terms(source: &str) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    for segment in source.split('.') {
+        for part in segment.split('_') {
+            if matches!(part, "select" | "row" | "rows" | "element" | "elements") {
+                continue;
+            }
+            if part.is_empty() {
+                continue;
+            }
+            terms.insert(part.to_owned());
+        }
+    }
+    terms.into_iter().collect()
 }
 
 fn view_bindings(
@@ -1625,6 +3094,25 @@ fn attr_can_bind_data(attr: &str) -> bool {
             | "target"
             | "key"
             | "address"
+            | "width"
+            | "height"
+            | "size"
+            | "box_size"
+            | "min_width"
+            | "max_width"
+            | "min_height"
+            | "max_height"
+            | "padding"
+            | "padding_left"
+            | "padding_right"
+            | "padding_top"
+            | "padding_bottom"
+            | "gap"
+            | "center"
+            | "align_x"
+            | "overlay_children"
+            | "materialized"
+            | "focus"
     )
 }
 
@@ -1633,6 +3121,39 @@ fn attr_can_contain_render(attr: &str) -> bool {
         attr,
         "root" | "child" | "children" | "items" | "contents" | "label" | "icon" | "placeholder"
     )
+}
+
+fn push_data_view_binding_for_expr(
+    node_kind: &str,
+    attr: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    if !attr_can_bind_data(attr) {
+        return;
+    }
+    let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context) else {
+        return;
+    };
+    if !view_data_binding_is_schedulable(&path, row_scopes, context) {
+        return;
+    }
+    bindings.push(ViewBinding {
+        id: ViewBindingId(bindings.len()),
+        node_kind: node_kind.to_owned(),
+        attr: attr.to_owned(),
+        scope_id: scope_id_for_path(row_scopes, &path),
+        source_id: None,
+        kind: if attr == "target" {
+            ViewBindingKind::Target
+        } else {
+            ViewBindingKind::Data
+        },
+        path,
+    });
 }
 
 fn view_data_binding_is_schedulable(
@@ -1715,6 +3236,50 @@ fn expr_is_source_pipe_continuation(expr_id: usize, expressions: &[AstExpr]) -> 
     })
 }
 
+fn collect_document_function_body_view_bindings(
+    function_statement: &AstStatement,
+    source_text: &str,
+    expressions: &[AstExpr],
+    functions: &DocumentViewFunctionRegistry<'_>,
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    render_slots: &RenderSlotBindingLookup<'_>,
+    bindings: &mut Vec<ViewBinding>,
+    function_stack: &mut Vec<String>,
+    visited_expr_contexts: &mut BTreeSet<(usize, String)>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(expr_id) = function_statement.expr {
+        collect_document_expr_view_bindings(
+            expr_id,
+            source_text,
+            expressions,
+            functions,
+            row_scopes,
+            source_paths,
+            render_slots,
+            bindings,
+            function_stack,
+            context,
+            visited_expr_contexts,
+            &mut Vec::new(),
+        );
+    }
+    collect_document_view_bindings(
+        &function_statement.children,
+        source_text,
+        expressions,
+        functions,
+        row_scopes,
+        source_paths,
+        render_slots,
+        bindings,
+        function_stack,
+        visited_expr_contexts,
+        context,
+    );
+}
+
 fn collect_document_view_bindings(
     statements: &[AstStatement],
     source_text: &str,
@@ -1783,8 +3348,8 @@ fn collect_document_view_bindings(
                     sibling_context
                         .with_function_item_expr(function_statement, binding.item_expr_id)
                 };
-                collect_document_view_bindings(
-                    &function_statement.children,
+                collect_document_function_body_view_bindings(
+                    function_statement,
                     source_text,
                     expressions,
                     functions,
@@ -1819,8 +3384,8 @@ fn collect_document_view_bindings(
             function_stack.push(function.to_owned());
             let scoped_context =
                 sibling_context.with_function_call(function_statement, statement, expressions);
-            collect_document_view_bindings(
-                &function_statement.children,
+            collect_document_function_body_view_bindings(
+                function_statement,
                 source_text,
                 expressions,
                 functions,
@@ -2028,8 +3593,8 @@ fn collect_document_expr_view_bindings(
             {
                 function_stack.push(function.to_owned());
                 let scoped_context = context.with_function_args(function_statement, args);
-                collect_document_view_bindings(
-                    &function_statement.children,
+                collect_document_function_body_view_bindings(
+                    function_statement,
                     source_text,
                     expressions,
                     functions,
@@ -2119,8 +3684,8 @@ fn collect_document_expr_view_bindings(
                 function_stack.push(op.to_owned());
                 let function_context =
                     scoped_context.with_pipe_function_call(function_statement, *input, args);
-                collect_document_view_bindings(
-                    &function_statement.children,
+                collect_document_function_body_view_bindings(
+                    function_statement,
                     source_text,
                     expressions,
                     functions,
@@ -2162,8 +3727,8 @@ fn collect_document_expr_view_bindings(
                         scoped_context
                             .with_function_item_expr(function_statement, binding.item_expr_id)
                     };
-                    collect_document_view_bindings(
-                        &function_statement.children,
+                    collect_document_function_body_view_bindings(
+                        function_statement,
                         source_text,
                         expressions,
                         functions,
@@ -2368,26 +3933,37 @@ fn collect_canonical_element_view_bindings(
                 bindings,
                 context,
             );
+            collect_canonical_element_data_bindings(
+                &node_kind,
+                child,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
             continue;
         }
-        if attr_can_bind_data(&attr)
-            && let Some(expr_id) = child.expr
-            && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
-            && view_data_binding_is_schedulable(&path, row_scopes, context)
-        {
-            bindings.push(ViewBinding {
-                id: ViewBindingId(bindings.len()),
-                node_kind: node_kind.clone(),
-                attr: attr.clone(),
-                scope_id: scope_id_for_path(row_scopes, &path),
-                source_id: None,
-                kind: if attr == "target" {
-                    ViewBindingKind::Target
-                } else {
-                    ViewBindingKind::Data
-                },
-                path,
-            });
+        if attr == "style" {
+            collect_style_statement_view_bindings(
+                &node_kind,
+                child,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
+            continue;
+        }
+        if let Some(expr_id) = child.expr {
+            push_data_view_binding_for_expr(
+                &node_kind,
+                &attr,
+                expr_id,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
         }
         for nested in &child.children {
             if attr_can_bind_data(&attr)
@@ -2430,6 +4006,18 @@ fn collect_canonical_call_arg_view_bindings(
         let Some(attr) = arg.name.as_deref() else {
             continue;
         };
+        if attr == "style" {
+            collect_style_expr_view_bindings(
+                node_kind,
+                arg.value,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+                &mut BTreeSet::new(),
+            );
+            continue;
+        }
         if attr == "element" {
             collect_canonical_element_source_bindings_from_expr(
                 node_kind,
@@ -2440,25 +4028,167 @@ fn collect_canonical_call_arg_view_bindings(
                 bindings,
                 context,
             );
+            collect_canonical_element_data_bindings_from_expr(
+                node_kind,
+                arg.value,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
             continue;
         }
-        if attr_can_bind_data(attr)
-            && let Some(path) = view_data_path_for_expr_id(arg.value, expressions, context)
-            && view_data_binding_is_schedulable(&path, row_scopes, context)
-        {
-            bindings.push(ViewBinding {
-                id: ViewBindingId(bindings.len()),
-                node_kind: node_kind.to_owned(),
-                attr: attr.to_owned(),
-                scope_id: scope_id_for_path(row_scopes, &path),
-                source_id: None,
-                kind: if attr == "target" {
-                    ViewBindingKind::Target
-                } else {
-                    ViewBindingKind::Data
-                },
-                path,
-            });
+        push_data_view_binding_for_expr(
+            node_kind,
+            attr,
+            arg.value,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+        );
+    }
+}
+
+fn collect_style_expr_view_bindings(
+    node_kind: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+    seen: &mut BTreeSet<usize>,
+) {
+    if !seen.insert(expr_id) {
+        return;
+    }
+    let Some(resolved_expr_id) =
+        document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())
+    else {
+        return;
+    };
+    if resolved_expr_id != expr_id {
+        collect_style_expr_view_bindings(
+            node_kind,
+            resolved_expr_id,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+            seen,
+        );
+        return;
+    }
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Identifier(name) => {
+            if let Some(arg_expr) = context.arg_expr(name) {
+                collect_style_expr_view_bindings(
+                    node_kind,
+                    arg_expr,
+                    expressions,
+                    row_scopes,
+                    bindings,
+                    context,
+                    seen,
+                );
+            }
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                push_data_view_binding_for_expr(
+                    node_kind,
+                    &field.name,
+                    field.value,
+                    expressions,
+                    row_scopes,
+                    bindings,
+                    context,
+                );
+                collect_style_expr_view_bindings(
+                    node_kind,
+                    field.value,
+                    expressions,
+                    row_scopes,
+                    bindings,
+                    context,
+                    seen,
+                );
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                collect_style_expr_view_bindings(
+                    node_kind,
+                    *item,
+                    expressions,
+                    row_scopes,
+                    bindings,
+                    context,
+                    seen,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_style_statement_view_bindings(
+    node_kind: &str,
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(expr_id) = statement.expr {
+        collect_style_expr_view_bindings(
+            node_kind,
+            expr_id,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+            &mut BTreeSet::new(),
+        );
+    }
+    for child in &statement.children {
+        let Some(attr) = document_statement_field(child) else {
+            continue;
+        };
+        if let Some(expr_id) = child.expr {
+            push_data_view_binding_for_expr(
+                node_kind,
+                &attr,
+                expr_id,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
+            collect_style_expr_view_bindings(
+                node_kind,
+                expr_id,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+                &mut BTreeSet::new(),
+            );
+        }
+        if !child.children.is_empty() {
+            collect_style_statement_view_bindings(
+                node_kind,
+                child,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
         }
     }
 }
@@ -2653,6 +4383,89 @@ fn collect_canonical_element_source_bindings_from_fields(
     }
 }
 
+fn collect_canonical_element_data_bindings(
+    node_kind: &str,
+    element_field: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(fields) = record_fields_for_statement(element_field, expressions) {
+        collect_canonical_element_data_bindings_from_fields(
+            node_kind,
+            fields,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+        );
+    }
+    for child in &element_field.children {
+        let Some(attr) = document_statement_field(child) else {
+            continue;
+        };
+        if attr != "target" {
+            continue;
+        }
+        if let Some(expr_id) = child.expr {
+            push_data_view_binding_for_expr(
+                node_kind,
+                &attr,
+                expr_id,
+                expressions,
+                row_scopes,
+                bindings,
+                context,
+            );
+        }
+    }
+}
+
+fn collect_canonical_element_data_bindings_from_expr(
+    node_kind: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(fields) = record_fields_for_expr(expr_id, expressions) {
+        collect_canonical_element_data_bindings_from_fields(
+            node_kind,
+            fields,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+        );
+    }
+}
+
+fn collect_canonical_element_data_bindings_from_fields(
+    node_kind: &str,
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    for field in fields {
+        if field.name != "target" {
+            continue;
+        }
+        push_data_view_binding_for_expr(
+            node_kind,
+            &field.name,
+            field.value,
+            expressions,
+            row_scopes,
+            bindings,
+            context,
+        );
+    }
+}
+
 fn push_canonical_view_event_group_bindings(
     node_kind: &str,
     group_path: &str,
@@ -2661,7 +4474,9 @@ fn push_canonical_view_event_group_bindings(
     bindings: &mut Vec<ViewBinding>,
 ) {
     let normalized_group = normalized_document_source_path(group_path);
-    let prefix = format!("{normalized_group}.");
+    let canonical_group = canonical_view_source_group_path(source_paths, &normalized_group)
+        .unwrap_or(normalized_group);
+    let prefix = format!("{canonical_group}.");
     for (path, source_id) in source_paths
         .iter()
         .filter(|(source_path, _)| source_path.starts_with(&prefix))
@@ -2689,6 +4504,45 @@ fn normalized_document_source_path(path: &str) -> String {
         .join(".")
 }
 
+fn canonical_view_source_path<'a>(
+    source_paths: &'a [(&'a str, SourceId)],
+    normalized_value: &str,
+) -> Option<(&'a str, SourceId)> {
+    if let Some((path, source_id)) = source_paths
+        .iter()
+        .find(|(source_path, _)| *source_path == normalized_value)
+    {
+        return Some((*path, *source_id));
+    }
+    let suffix = normalized_value.split_once('.')?.1;
+    let suffix = format!(".{suffix}");
+    let mut matches = source_paths
+        .iter()
+        .filter(|(source_path, _)| source_path.ends_with(&suffix));
+    let first = matches.next()?;
+    matches.next().is_none().then_some((first.0, first.1))
+}
+
+fn canonical_view_source_group_path(
+    source_paths: &[(&str, SourceId)],
+    normalized_group: &str,
+) -> Option<String> {
+    if source_paths
+        .iter()
+        .any(|(source_path, _)| source_path.starts_with(&format!("{normalized_group}.")))
+    {
+        return Some(normalized_group.to_owned());
+    }
+    let group_suffix = normalized_group.split_once('.')?.1;
+    let suffix = format!(".{group_suffix}.");
+    let mut prefixes = source_paths.iter().filter_map(|(source_path, _)| {
+        let prefix_end = source_path.find(&suffix)? + suffix.len() - 1;
+        Some(source_path[..prefix_end].to_owned())
+    });
+    let first = prefixes.next()?;
+    prefixes.all(|prefix| prefix == first).then_some(first)
+}
+
 fn push_canonical_view_source_binding(
     node_kind: &str,
     attr: &str,
@@ -2698,19 +4552,16 @@ fn push_canonical_view_source_binding(
     bindings: &mut Vec<ViewBinding>,
 ) {
     let normalized_value = normalized_document_source_path(value);
-    if let Some((path, source_id)) = source_paths
-        .iter()
-        .find(|(source_path, _)| *source_path == normalized_value)
-    {
+    if let Some((path, source_id)) = canonical_view_source_path(source_paths, &normalized_value) {
         let binding_attr = if attr == "key_down" { "submit" } else { attr };
         bindings.push(ViewBinding {
             id: ViewBindingId(bindings.len()),
             node_kind: node_kind.to_owned(),
             attr: binding_attr.to_owned(),
-            path: (*path).to_owned(),
+            path: path.to_owned(),
             kind: ViewBindingKind::Source,
             scope_id: scope_id_for_path(row_scopes, path),
-            source_id: Some(*source_id),
+            source_id: Some(source_id),
         });
     }
 }
@@ -2909,6 +4760,11 @@ fn document_expr_value(
         }
         AstExprKind::Identifier(value) => context
             .arg_expr(value)
+            .filter(|expr_id| {
+                !expressions
+                    .get(*expr_id)
+                    .is_some_and(|expr| expr_is_same_identifier_path(expr, value))
+            })
             .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context))
             .or_else(|| Some(value.clone())),
         AstExprKind::Bool(value) => Some(value.to_string()),
@@ -3160,6 +5016,11 @@ fn verify_scheduled_update_expression(
                 require_known_symbol("concat payload", payload_path, known_symbols)
             }
         }
+        UpdateExpression::PrefixRootConcat {
+            prefix: _,
+            path,
+            separator: _,
+        } => require_known_symbol("concat path", path, known_symbols),
         UpdateExpression::MatchConst { input, .. } => {
             if source_payload_input_matches(input, source) {
                 Ok(())
@@ -3173,6 +5034,23 @@ fn verify_scheduled_update_expression(
             }
             for arm in arms {
                 verify_update_value_expression(&arm.output, known_symbols, "match value arm")?;
+            }
+            Ok(())
+        }
+        UpdateExpression::ListFindValue {
+            list,
+            expected,
+            fallback,
+            ..
+        } => {
+            require_known_symbol("list find value list", list, known_symbols)?;
+            verify_update_value_expression(expected, known_symbols, "list find value expected")?;
+            if let Some(fallback) = fallback {
+                verify_update_value_expression(
+                    fallback,
+                    known_symbols,
+                    "list find value fallback",
+                )?;
             }
             Ok(())
         }
@@ -3326,6 +5204,64 @@ fn is_row_local_field_path(path: &str) -> bool {
     !field.is_empty() && value_starts_lowercase_identifier(row)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldCycleVisit {
+    Pending,
+    Visiting,
+    Complete,
+}
+
+fn field_symbol_dependency_graph(
+    fields: &[FieldDef],
+    excluded_paths: &BTreeSet<&str>,
+) -> (Vec<bool>, Vec<Vec<usize>>) {
+    let excluded_field = fields
+        .iter()
+        .map(|field| excluded_paths.contains(field.path.as_str()))
+        .collect::<Vec<_>>();
+    let mentioned_identifiers = fields
+        .iter()
+        .map(|field| {
+            let mut identifiers = BTreeSet::new();
+            for item in &field.ast_items {
+                for symbol in &item.symbols {
+                    identifiers.insert(symbol.as_str());
+                }
+            }
+            identifiers
+        })
+        .collect::<Vec<_>>();
+    let mut fields_by_parent = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, field) in fields.iter().enumerate() {
+        fields_by_parent
+            .entry(field.parent_path.as_str())
+            .or_default()
+            .push(index);
+    }
+    let mut dependency_edges = vec![Vec::<usize>::new(); fields.len()];
+    for (field_index, field) in fields.iter().enumerate() {
+        if excluded_field[field_index] {
+            continue;
+        }
+        let Some(siblings) = fields_by_parent.get(field.parent_path.as_str()) else {
+            continue;
+        };
+        for &dependency_index in siblings {
+            let dependency = &fields[dependency_index];
+            if dependency_index == field_index
+                || excluded_field[dependency_index]
+                || dependency.local_name == field.local_name
+            {
+                continue;
+            }
+            if mentioned_identifiers[field_index].contains(dependency.local_name.as_str()) {
+                dependency_edges[field_index].push(dependency_index);
+            }
+        }
+    }
+    (excluded_field, dependency_edges)
+}
+
 fn verify_combinational_field_cycles(
     fields: &[FieldDef],
     state_cells: &[StateCell],
@@ -3334,46 +5270,64 @@ fn verify_combinational_field_cycles(
         .iter()
         .map(|cell| cell.path.as_str())
         .collect::<BTreeSet<_>>();
-    for field in fields
-        .iter()
-        .filter(|field| !state_paths.contains(field.path.as_str()))
-    {
+    let (state_field, dependency_edges) = field_symbol_dependency_graph(fields, &state_paths);
+
+    let mut visits = vec![FieldCycleVisit::Pending; fields.len()];
+    for (field_index, is_state_field) in state_field.iter().enumerate() {
+        if *is_state_field {
+            continue;
+        }
         let mut visiting = Vec::new();
-        verify_combinational_field_cycles_from(field, fields, &state_paths, &mut visiting)?;
+        verify_combinational_field_cycles_from(
+            field_index,
+            fields,
+            &dependency_edges,
+            &mut visits,
+            &mut visiting,
+        )?;
     }
     Ok(())
 }
 
-fn verify_combinational_field_cycles_from<'a>(
-    field: &'a FieldDef,
-    fields: &'a [FieldDef],
-    state_paths: &BTreeSet<&str>,
-    visiting: &mut Vec<&'a str>,
+fn verify_combinational_field_cycles_from(
+    field_index: usize,
+    fields: &[FieldDef],
+    dependency_edges: &[Vec<usize>],
+    visits: &mut [FieldCycleVisit],
+    visiting: &mut Vec<usize>,
 ) -> Result<(), String> {
-    if let Some(position) = visiting.iter().position(|path| *path == field.path) {
-        let mut cycle = visiting[position..].to_vec();
-        cycle.push(field.path.as_str());
-        return Err(format!(
-            "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD: {}",
-            cycle.join(" -> ")
-        ));
-    }
-    if state_paths.contains(field.path.as_str()) {
-        return Ok(());
-    }
-    visiting.push(field.path.as_str());
-    for dependency in fields.iter().filter(|candidate| {
-        candidate.parent_path == field.parent_path
-            && candidate.path != field.path
-            && candidate.local_name != field.local_name
-            && field.mentions_identifier(&candidate.local_name)
-    }) {
-        if state_paths.contains(dependency.path.as_str()) {
-            continue;
+    match visits[field_index] {
+        FieldCycleVisit::Complete => return Ok(()),
+        FieldCycleVisit::Visiting => {
+            let position = visiting
+                .iter()
+                .position(|candidate| *candidate == field_index)
+                .unwrap_or(0);
+            let mut cycle = visiting[position..]
+                .iter()
+                .map(|index| fields[*index].path.as_str())
+                .collect::<Vec<_>>();
+            cycle.push(fields[field_index].path.as_str());
+            return Err(format!(
+                "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD: {}",
+                cycle.join(" -> ")
+            ));
         }
-        verify_combinational_field_cycles_from(dependency, fields, state_paths, visiting)?;
+        FieldCycleVisit::Pending => {}
+    }
+    visits[field_index] = FieldCycleVisit::Visiting;
+    visiting.push(field_index);
+    for &dependency_index in &dependency_edges[field_index] {
+        verify_combinational_field_cycles_from(
+            dependency_index,
+            fields,
+            dependency_edges,
+            visits,
+            visiting,
+        )?;
     }
     visiting.pop();
+    visits[field_index] = FieldCycleVisit::Complete;
     Ok(())
 }
 
@@ -3499,6 +5453,15 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             reject_hidden_identity_identifier("concat payload", payload_path)?;
             reject_hidden_identity_identifier("concat separator", separator)
         }
+        UpdateExpression::PrefixRootConcat {
+            prefix,
+            path,
+            separator,
+        } => {
+            reject_hidden_identity_identifier("concat prefix", prefix)?;
+            reject_hidden_identity_identifier("concat path", path)?;
+            reject_hidden_identity_identifier("concat separator", separator)
+        }
         UpdateExpression::NumberInfix { left, right, .. } => {
             reject_hidden_identity_identifier("number infix left", left)?;
             reject_hidden_identity_identifier("number infix right", right)
@@ -3540,6 +5503,22 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             for arm in arms {
                 reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
                 reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
+        }
+        UpdateExpression::ListFindValue {
+            list,
+            field,
+            expected,
+            target,
+            fallback,
+        } => {
+            reject_hidden_identity_identifier("list find value list", list)?;
+            reject_hidden_identity_identifier("list find value field", field)?;
+            reject_update_value_expression_identity(expected)?;
+            reject_hidden_identity_identifier("list find value target", target)?;
+            if let Some(fallback) = fallback {
+                reject_update_value_expression_identity(fallback)?;
             }
             Ok(())
         }
@@ -3658,7 +5637,6 @@ fn hidden_identity_token(value: &str) -> Option<&'static str> {
         "row_key",
         "hidden_key",
         "hidden_keys",
-        "generation",
         "hidden_generation",
         "target_key",
         "target_generation",
@@ -3677,6 +5655,8 @@ fn hidden_identity_token(value: &str) -> Option<&'static str> {
 
 pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
     serde_json::json!({
+        "semantic_index": program.semantic_index,
+        "semantic_index_report": program.semantic_index.report(),
         "expression_coverage": program.expression_coverage,
         "row_scopes": program.row_scopes,
         "sources": program.sources,
@@ -3966,12 +5946,11 @@ fn push_generated(nodes: &mut Vec<IrNode>, name: &str, kind: IrNodeKind, indexed
 fn dependency_edges(
     program: &ParsedProgram,
     cells: &[StateCell],
-    fields: &[FieldDef],
-    direct_sources: &BTreeMap<String, Vec<String>>,
+    candidate_sources: &mut CandidateSourceIndex<'_>,
 ) -> Vec<DependencyEdge> {
     let mut edges = Vec::new();
     for cell in cells {
-        for source in candidate_sources_cached(program, fields, direct_sources, &cell.path) {
+        for source in candidate_sources.candidate_sources(&cell.path) {
             edges.push(DependencyEdge {
                 indexed: cell.indexed || path_has_parsed_row_scope(program, &source),
                 from: source,
@@ -3983,16 +5962,14 @@ fn dependency_edges(
 }
 
 fn possible_causes(
-    program: &ParsedProgram,
     cells: &[StateCell],
-    fields: &[FieldDef],
-    direct_sources: &BTreeMap<String, Vec<String>>,
+    candidate_sources: &mut CandidateSourceIndex<'_>,
 ) -> Vec<PossibleCause> {
     cells
         .iter()
         .map(|cell| PossibleCause {
             target: cell.path.clone(),
-            sources: candidate_sources_cached(program, fields, direct_sources, &cell.path),
+            sources: candidate_sources.candidate_sources(&cell.path),
         })
         .collect()
 }
@@ -4002,7 +5979,12 @@ fn update_branches(
     cells: &[StateCell],
     fields: &[FieldDef],
     direct_sources: &BTreeMap<String, Vec<String>>,
+    candidate_sources: &mut CandidateSourceIndex<'_>,
 ) -> Vec<UpdateBranch> {
+    let state_paths = cells
+        .iter()
+        .map(|cell| cell.path.as_str())
+        .collect::<BTreeSet<_>>();
     cells
         .iter()
         .flat_map(|cell| {
@@ -4020,6 +6002,15 @@ fn update_branches(
                     source,
                 })
                 .collect::<Vec<_>>();
+            branches.extend(derived_dependency_update_branches(
+                program,
+                fields,
+                field,
+                cell,
+                &state_paths,
+                &branches,
+                candidate_sources,
+            ));
             branches.extend(derived_then_empty_update_branches(
                 &fields,
                 field,
@@ -4029,6 +6020,46 @@ fn update_branches(
             branches
         })
         .collect()
+}
+
+fn derived_dependency_update_branches(
+    program: &ParsedProgram,
+    fields: &[FieldDef],
+    field: &FieldDef,
+    cell: &StateCell,
+    state_paths: &BTreeSet<&str>,
+    existing_branches: &[UpdateBranch],
+    candidate_sources: &mut CandidateSourceIndex<'_>,
+) -> Vec<UpdateBranch> {
+    let mut branches = Vec::new();
+    for dependency in fields.iter().filter(|dependency| {
+        dependency.parent_path == field.parent_path
+            && dependency.path != field.path
+            && !state_paths.contains(dependency.path.as_str())
+            && field.mentions_identifier_expr(&dependency.local_name)
+    }) {
+        for source in candidate_sources.candidate_sources(&dependency.path) {
+            if existing_branches
+                .iter()
+                .chain(branches.iter())
+                .any(|branch: &UpdateBranch| branch.source == source)
+            {
+                continue;
+            }
+            let Some(expression) = update_expression_for_derived_dependency_source(
+                program, &cell.path, field, fields, dependency, &source,
+            ) else {
+                continue;
+            };
+            branches.push(UpdateBranch {
+                expression,
+                indexed: cell.indexed,
+                target: cell.path.clone(),
+                source,
+            });
+        }
+    }
+    branches
 }
 
 fn derived_then_empty_update_branches(
@@ -4120,7 +6151,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                     predicate: list_retain_predicate(field, row_scope.as_deref()),
                 },
             });
-        } else if field.has_operator("List/retain") {
+        } else if field.has_operator("List/retain") && !field_retains_into_materialized_map(field) {
             let Some(list) = count_or_retain_source_list(field, program) else {
                 continue;
             };
@@ -4153,6 +6184,24 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
     operations
 }
 
+fn field_retains_into_materialized_map(field: &FieldDef) -> bool {
+    let Some(first_retain_id) = field
+        .ast_exprs
+        .iter()
+        .filter_map(|expr| {
+            matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "List/retain")
+                .then_some(expr.id)
+        })
+        .min()
+    else {
+        return false;
+    };
+    field.ast_exprs.iter().any(|expr| {
+        expr.id > first_retain_id
+            && matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "List/map")
+    })
+}
+
 fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
     typed_field_defs(program)
         .into_iter()
@@ -4160,7 +6209,7 @@ fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
             if field.has_operator("List/chunk") {
                 return Some(ListProjection {
                     target: field.path.clone(),
-                    list: ast_call_argument(&field, "List/chunk")?,
+                    list: ast_list_projection_argument(program, &field, "List/chunk")?,
                     kind: ListProjectionKind::Chunk {
                         size: ast_named_call_argument(&field, "List/chunk", "size")
                             .and_then(|value| value.parse::<usize>().ok()),
@@ -4174,7 +6223,7 @@ fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
             if field.has_operator("List/find") {
                 return Some(ListProjection {
                     target: field.path.clone(),
-                    list: ast_call_argument(&field, "List/find")?,
+                    list: ast_list_projection_argument(program, &field, "List/find")?,
                     kind: ListProjectionKind::Find {
                         field: ast_named_call_argument(&field, "List/find", "field")?,
                         value: canonical_local_path(
@@ -4189,6 +6238,43 @@ fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
         .collect()
 }
 
+fn ast_list_projection_argument(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    function: &str,
+) -> Option<String> {
+    let raw = ast_call_argument(field, function)?;
+    Some(resolve_list_memory_argument(program, &raw, &field.parent_path).unwrap_or(raw))
+}
+
+fn resolve_list_memory_argument(
+    program: &ParsedProgram,
+    raw: &str,
+    parent_path: &str,
+) -> Option<String> {
+    let canonical = canonical_local_path(raw, parent_path);
+    for candidate in [raw, canonical.as_str()] {
+        if program
+            .list_memories
+            .iter()
+            .any(|list| list.name == candidate)
+        {
+            return Some(candidate.to_owned());
+        }
+    }
+    let local = raw.rsplit_once('.').map(|(_, local)| local).unwrap_or(raw);
+    let prefix = format!("{local}_list_");
+    let mut matches = program
+        .list_memories
+        .iter()
+        .filter(|list| list.name.starts_with(&prefix))
+        .map(|list| list.name.clone())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
 fn derived_values(
     program: &ParsedProgram,
     row_scopes: &[RowScope],
@@ -4199,27 +6285,97 @@ fn derived_values(
     fields
         .iter()
         .filter(|field| {
+            let indexed_field = path_has_parsed_row_scope(program, &field.path);
+            let list_memory_path = field_is_list_memory_path(field, program);
             !state_cells.iter().any(|cell| cell.path == field.path)
-                && !program.list_memories.iter().any(|list| {
-                    field.path.ends_with(&format!(".{}", list.name)) || field.path == list.name
-                })
+                && (indexed_field
+                    || !list_memory_path
+                    || field_is_derived_list_memory_view(field, program))
         })
         .enumerate()
         .map(|(id, field)| {
             let sources = direct_sources_for_field(direct_sources, field)
                 .cloned()
                 .collect::<Vec<_>>();
+            let list_memory_view = field_is_derived_list_memory_view(field, program);
             DerivedValue {
                 id: FieldId(id),
                 indexed: path_has_parsed_row_scope(program, &field.path),
                 scope_id: scope_id_for_path(row_scopes, &field.path),
-                kind: derived_value_kind(field, &sources),
+                kind: if list_memory_view {
+                    DerivedValueKind::ListView
+                } else {
+                    derived_value_kind(field, &sources)
+                },
                 path: field.path.clone(),
                 sources,
                 statement: field.statement.clone(),
             }
         })
         .collect()
+}
+
+fn field_is_list_memory_path(field: &FieldDef, program: &ParsedProgram) -> bool {
+    program
+        .list_memories
+        .iter()
+        .any(|list| field.path.ends_with(&format!(".{}", list.name)) || field.path == list.name)
+}
+
+fn field_is_derived_list_memory_view(field: &FieldDef, program: &ParsedProgram) -> bool {
+    if !field_is_list_memory_path(field, program) || field.has_operator("List/append") {
+        return false;
+    }
+    let Some(list) = field_list_memory(field, program) else {
+        return false;
+    };
+    match list_initializer(program, list) {
+        ListInitializer::RecordLiteral { rows } => list_initializer_has_dynamic_fields(&rows),
+        ListInitializer::Range { .. } => false,
+        ListInitializer::Empty => field.has_any_operator(&DERIVED_LIST_VIEW_OPERATORS),
+        ListInitializer::Unknown { .. } => {
+            field.has_any_operator(&DERIVED_LIST_VIEW_OPERATORS)
+                || field_references_list_memory(field, program)
+        }
+    }
+}
+
+const DERIVED_LIST_VIEW_OPERATORS: [&str; 8] = [
+    "List/map",
+    "List/retain",
+    "List/filter_text_contains",
+    "List/filter_field_equal",
+    "List/filter_field_not_equal",
+    "List/move_field_first",
+    "List/move_field_last",
+    "WHEN",
+];
+
+fn list_initializer_has_dynamic_fields(rows: &[ListInitialRecord]) -> bool {
+    rows.iter().any(|row| {
+        row.fields
+            .iter()
+            .any(|field| matches!(field.value, InitialValue::Unknown { .. }))
+    })
+}
+
+fn field_references_list_memory(field: &FieldDef, program: &ParsedProgram) -> bool {
+    program
+        .list_memories
+        .iter()
+        .any(|list| list.name != field.local_name && field.mentions_identifier_expr(&list.name))
+}
+
+fn field_list_memory<'a>(
+    field: &FieldDef,
+    program: &'a ParsedProgram,
+) -> Option<&'a boon_parser::ParsedListMemory> {
+    let local = field
+        .path
+        .rsplit_once('.')
+        .map(|(_, local)| local)
+        .unwrap_or(&field.path);
+    program.list_memories.iter().find(|list| list.name == local)
 }
 
 fn function_definitions(program: &ParsedProgram) -> Vec<FunctionDefinition> {
@@ -4247,6 +6403,12 @@ fn collect_function_definitions(
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
     if field.has_operator("List/count") || field.has_operator("List/every") {
         DerivedValueKind::Aggregate
+    } else if field.has_operator("List/latest") {
+        if !sources.is_empty() || field.has_then_expr() {
+            DerivedValueKind::SourceEventTransform
+        } else {
+            DerivedValueKind::Pure
+        }
     } else if field.has_any_operator(&[
         "List/retain",
         "List/map",
@@ -4361,8 +6523,20 @@ fn ast_initial_value(
     }
 }
 
-fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer {
-    let Some(items) = list_body_items(program, list_name) else {
+fn list_initializer(
+    program: &ParsedProgram,
+    list: &boon_parser::ParsedListMemory,
+) -> ListInitializer {
+    let Some(items) = (list.line > 0)
+        .then(|| {
+            list_body_items(program, &list.name)
+                .or_else(|| list_body_items_by_line(program, list.line))
+        })
+        .flatten()
+    else {
+        if list.line == 0 {
+            return ListInitializer::Empty;
+        }
         return ListInitializer::Unknown {
             summary: "list body not found".to_owned(),
         };
@@ -4384,6 +6558,14 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: items.first().map(item_summary).unwrap_or_default(),
         }
     }
+}
+
+fn list_body_items_by_line(program: &ParsedProgram, line: usize) -> Option<Vec<AstItem>> {
+    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
+    items
+        .iter()
+        .position(|item| item.line == line)
+        .map(|item_index| collect_field_ast_items(&items, item_index, items[item_index].indent))
 }
 
 fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstItem>> {
@@ -4452,6 +6634,9 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
     if let Some(value) = text_literal_value(tokens) {
         return InitialValue::Text { value };
     }
+    if let Some(value) = signed_integer_literal_value(tokens) {
+        return InitialValue::Number { value };
+    }
     let value = tokens_to_path(tokens);
     match value.as_str() {
         "True" => InitialValue::Bool { value: true },
@@ -4465,6 +6650,19 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
         value => InitialValue::Unknown {
             summary: value.to_owned(),
         },
+    }
+}
+
+fn signed_integer_literal_value(tokens: &[String]) -> Option<i64> {
+    match tokens {
+        [value] => value.parse::<i64>().ok(),
+        [sign, value] if sign == "-" && value.chars().all(|ch| ch.is_ascii_digit()) => {
+            value.parse::<i64>().ok().and_then(i64::checked_neg)
+        }
+        [sign, value] if sign == "+" && value.chars().all(|ch| ch.is_ascii_digit()) => {
+            value.parse::<i64>().ok()
+        }
+        _ => None,
     }
 }
 
@@ -5375,6 +7573,34 @@ fn item_starts_with_symbol(item: &AstItem, symbol: &str) -> bool {
         .is_some_and(|candidate| candidate == symbol)
 }
 
+fn item_symbols_start_with_path(item: &AstItem, expected: &[&str]) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let joined = expected.join(".");
+    if item
+        .symbols
+        .first()
+        .is_some_and(|candidate| candidate == &joined)
+    {
+        return true;
+    }
+    let mut index = 0usize;
+    for (part_index, part) in expected.iter().enumerate() {
+        if item.symbols.get(index).map(String::as_str) != Some(*part) {
+            return false;
+        }
+        index += 1;
+        if part_index + 1 < expected.len() {
+            if item.symbols.get(index).map(String::as_str) != Some(".") {
+                return false;
+            }
+            index += 1;
+        }
+    }
+    true
+}
+
 fn symbol_is_list_operator(symbol: &str) -> bool {
     matches!(
         symbol,
@@ -5416,6 +7642,41 @@ fn update_expression_for_source(
 ) -> UpdateExpression {
     let variants = source_ref_variants(source);
     let branch = field.source_branch(source).unwrap_or_default();
+    update_expression_for_routed_branch(program, target, field, fields, source, &variants, branch)
+}
+
+fn update_expression_for_derived_dependency_source(
+    program: &ParsedProgram,
+    target: &str,
+    field: &FieldDef,
+    fields: &[FieldDef],
+    dependency: &FieldDef,
+    source: &str,
+) -> Option<UpdateExpression> {
+    let branch = field
+        .source_trigger_branch(&dependency.path)
+        .or_else(|| field.source_trigger_branch(&dependency.local_name))?;
+    let variants = source_ref_variants(source);
+    Some(update_expression_for_routed_branch(
+        program,
+        target,
+        field,
+        fields,
+        &dependency.path,
+        &variants,
+        branch,
+    ))
+}
+
+fn update_expression_for_routed_branch(
+    program: &ParsedProgram,
+    target: &str,
+    field: &FieldDef,
+    fields: &[FieldDef],
+    branch_source: &str,
+    variants: &[String],
+    branch: RoutedBranch,
+) -> UpdateExpression {
     if branch.has_token("=>") && branch.has_token("False") && !branch.has_token("True") {
         return UpdateExpression::Const {
             value: "False".to_owned(),
@@ -5436,7 +7697,7 @@ fn update_expression_for_source(
             path: target.to_owned(),
         };
     }
-    if bool_toggle_when_matches_source(field, source) {
+    if bool_toggle_when_matches_source(field, branch_source) {
         return UpdateExpression::BoolNot {
             path: target.to_owned(),
         };
@@ -5451,19 +7712,28 @@ fn update_expression_for_source(
         return expression;
     }
     if let Some(expression) =
-        prefix_payload_concat_update_expression_from_items(&branch.items, &variants)
+        prefix_payload_concat_update_expression_from_items(&branch.items, variants)
     {
         return expression;
     }
     if let Some(expression) =
-        then_function_match_update_expression(program, field, target, fields, source)
+        then_function_match_update_expression(program, field, target, fields, branch_source)
+    {
+        return expression;
+    }
+    if let Some(expression) =
+        then_list_find_value_update_expression(field, target, fields, branch_source, &branch)
     {
         return expression;
     }
     if let Some(expression) = branch.then_prefix_payload_concat_expression(&variants) {
         return expression;
     }
-    if let Some(expression) = match_const_update_expression(field, target, fields, source, &branch)
+    if let Some(expression) = branch.then_prefix_root_concat_expression(field, target, fields) {
+        return expression;
+    }
+    if let Some(expression) =
+        match_const_update_expression(field, target, fields, branch_source, &branch)
     {
         return expression;
     }
@@ -5471,7 +7741,13 @@ fn update_expression_for_source(
         return match value {
             SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
             SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
-                path: canonical_scalar_update_path_for_source(field, target, &path, fields, source),
+                path: canonical_scalar_update_path_for_source(
+                    field,
+                    target,
+                    &path,
+                    fields,
+                    branch_source,
+                ),
             },
         };
     }
@@ -5481,6 +7757,20 @@ fn update_expression_for_source(
     {
         return UpdateExpression::SourcePayload {
             path: payload_field,
+        };
+    }
+    if let Some(value) = branch.simple_update_value() {
+        return match value {
+            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
+            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
+                path: canonical_scalar_update_path_for_source(
+                    field,
+                    target,
+                    &path,
+                    fields,
+                    branch_source,
+                ),
+            },
         };
     }
     if !branch.is_empty() {
@@ -5525,6 +7815,83 @@ fn then_function_match_update_expression(
             return None;
         };
         function_match_const_update_expression(program, field, target, fields, function, args)
+    })
+}
+
+fn then_list_find_value_update_expression(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    branch: &RoutedBranch,
+) -> Option<UpdateExpression> {
+    branch.ast_exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { output, .. } = expr.kind else {
+            return None;
+        };
+        let output = output.or_else(|| {
+            field
+                .ast_exprs
+                .iter()
+                .filter(|candidate| candidate.line > expr.line)
+                .find_map(|candidate| match candidate.kind {
+                    AstExprKind::Call { .. } => Some(candidate.id),
+                    _ => None,
+                })
+        })?;
+        list_find_value_update_expression_from_expr(field, target, fields, source, output)
+    })
+}
+
+fn list_find_value_update_expression_from_expr(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    expr_id: usize,
+) -> Option<UpdateExpression> {
+    let expr = field_expr(field, expr_id)?;
+    let AstExprKind::Call { function, args } = &expr.kind else {
+        return None;
+    };
+    if function != "List/find_value" {
+        return None;
+    }
+    let list = args
+        .iter()
+        .filter(|arg| arg.name.is_none())
+        .next()
+        .and_then(|arg| ast_argument_value(field, arg.value))
+        .map(|path| {
+            canonical_scalar_update_path_for_source(field, target, &path, fields, source)
+        })?;
+    let field_name = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("field"))
+        .and_then(|arg| ast_argument_value(field, arg.value))?;
+    let expected = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("value"))
+        .and_then(|arg| {
+            update_value_expression_from_expr(field, target, fields, arg.value, Some(source))
+        })?;
+    let target_field = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("target"))
+        .and_then(|arg| ast_argument_value(field, arg.value))?;
+    let fallback = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("fallback"))
+        .and_then(|arg| {
+            update_value_expression_from_expr(field, target, fields, arg.value, Some(source))
+        })
+        .map(Box::new);
+    Some(UpdateExpression::ListFindValue {
+        list,
+        field: field_name,
+        expected: Box::new(expected),
+        target: target_field,
+        fallback,
     })
 }
 
@@ -6289,8 +8656,8 @@ fn match_const_arm_expr_in_exprs(exprs: &[AstExpr], expr: &AstExpr) -> Option<Up
 fn match_const_pattern_label(pattern: &[String]) -> Option<String> {
     if pattern.is_empty() {
         None
-    } else if pattern.len() == 4 && pattern[0] == "TEXT" && pattern[1] == "{" && pattern[3] == "}" {
-        Some(pattern[2].clone())
+    } else if let Some(value) = text_literal_value(pattern) {
+        Some(value)
     } else if pattern.len() == 1 {
         Some(pattern[0].clone())
     } else {
@@ -6580,14 +8947,83 @@ fn bool_not_path_from_expr(exprs: &[AstExpr], expr_id: usize) -> Option<String> 
     }
 }
 
+struct CandidateSourceIndex<'a> {
+    fields: &'a [FieldDef],
+    direct_sources: &'a BTreeMap<String, Vec<String>>,
+    fields_by_path: BTreeMap<&'a str, usize>,
+    dependencies_by_field: Vec<Vec<usize>>,
+    cache: BTreeMap<String, Vec<String>>,
+}
+
+impl<'a> CandidateSourceIndex<'a> {
+    fn new(
+        fields: &'a [FieldDef],
+        direct_sources: &'a BTreeMap<String, Vec<String>>,
+    ) -> CandidateSourceIndex<'a> {
+        let empty_exclusions = BTreeSet::new();
+        let (_, dependencies_by_field) = field_symbol_dependency_graph(fields, &empty_exclusions);
+        let fields_by_path = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (field.path.as_str(), index))
+            .collect();
+        CandidateSourceIndex {
+            fields,
+            direct_sources,
+            fields_by_path,
+            dependencies_by_field,
+            cache: BTreeMap::new(),
+        }
+    }
+
+    fn candidate_sources(&mut self, target: &str) -> Vec<String> {
+        if let Some(cached) = self.cache.get(target) {
+            return cached.clone();
+        }
+        let Some(&field_index) = self.fields_by_path.get(target) else {
+            self.cache.insert(target.to_owned(), Vec::new());
+            return Vec::new();
+        };
+        let mut visiting = Vec::new();
+        self.candidate_sources_for_index(field_index, &mut visiting)
+    }
+
+    fn candidate_sources_for_index(
+        &mut self,
+        field_index: usize,
+        visiting: &mut Vec<usize>,
+    ) -> Vec<String> {
+        let path = self.fields[field_index].path.clone();
+        if visiting.contains(&field_index) {
+            return Vec::new();
+        }
+        if let Some(cached) = self.cache.get(&path) {
+            return cached.clone();
+        }
+        visiting.push(field_index);
+        let field = &self.fields[field_index];
+        let mut candidates = direct_sources_for_field(self.direct_sources, field)
+            .cloned()
+            .collect::<Vec<_>>();
+        for dependency_index in self.dependencies_by_field[field_index].clone() {
+            for source in self.candidate_sources_for_index(dependency_index, visiting) {
+                push_unique(&mut candidates, source);
+            }
+        }
+        visiting.pop();
+        self.cache.insert(path, candidates.clone());
+        candidates
+    }
+}
+
+#[cfg(test)]
 fn candidate_sources_cached(
-    program: &ParsedProgram,
+    _program: &ParsedProgram,
     fields: &[FieldDef],
     direct_sources: &BTreeMap<String, Vec<String>>,
     target: &str,
 ) -> Vec<String> {
-    let mut visited = Vec::new();
-    candidate_sources_for_path(target, fields, direct_sources, program, &mut visited)
+    CandidateSourceIndex::new(fields, direct_sources).candidate_sources(target)
 }
 
 #[derive(Clone, Debug)]
@@ -6662,6 +9098,20 @@ impl RoutedBranch {
                     ast_simple_then_update_value_in_exprs(&self.ast_exprs, candidate.id)
                 })
         })
+    }
+
+    fn simple_update_value(&self) -> Option<SimpleThenUpdateValue> {
+        if self.ast_exprs.iter().any(|expr| {
+            matches!(
+                expr.kind,
+                AstExprKind::Then { .. } | AstExprKind::When { .. }
+            )
+        }) {
+            return None;
+        }
+        self.ast_exprs
+            .iter()
+            .find_map(|expr| ast_simple_then_update_value_in_exprs(&self.ast_exprs, expr.id))
     }
 
     fn then_number_infix_expression(
@@ -6784,9 +9234,138 @@ impl RoutedBranch {
         })
     }
 
+    fn then_prefix_root_concat_expression(
+        &self,
+        field: &FieldDef,
+        target: &str,
+        fields: &[FieldDef],
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then { output, .. } = expr.kind else {
+                return None;
+            };
+            output
+                .and_then(|output| {
+                    prefix_root_concat_update_expression(
+                        &self.ast_exprs,
+                        output,
+                        field,
+                        target,
+                        fields,
+                    )
+                    .or_else(|| {
+                        prefix_root_concat_update_expression_using_input(
+                            &self.ast_exprs,
+                            output,
+                            field,
+                            target,
+                            fields,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    prefix_root_concat_update_expression_after_line(
+                        &self.ast_exprs,
+                        expr.line,
+                        field,
+                        target,
+                        fields,
+                    )
+                })
+        })
+    }
+
     fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+fn prefix_root_concat_update_expression_using_input(
+    exprs: &[AstExpr],
+    input: usize,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+) -> Option<UpdateExpression> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Pipe {
+            input: pipe_input, ..
+        } = &expr.kind
+        else {
+            return None;
+        };
+        (*pipe_input == input)
+            .then(|| prefix_root_concat_update_expression(exprs, expr.id, field, target, fields))
+            .flatten()
+    })
+}
+
+fn prefix_root_concat_update_expression_after_line(
+    exprs: &[AstExpr],
+    line: usize,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+) -> Option<UpdateExpression> {
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line && expr.line < end_line)
+        .find_map(|expr| {
+            prefix_root_concat_update_expression(exprs, expr.id, field, target, fields)
+        })
+}
+
+fn prefix_root_concat_update_expression(
+    exprs: &[AstExpr],
+    output: usize,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+) -> Option<UpdateExpression> {
+    let expr = exprs.iter().find(|expr| expr.id == output)?;
+    let AstExprKind::Pipe { op, input, args } = &expr.kind else {
+        return None;
+    };
+    if op != "Text/concat" {
+        return None;
+    }
+    let SimpleThenUpdateValue::Const(prefix) =
+        ast_simple_then_update_value_in_exprs(exprs, *input)?
+    else {
+        return None;
+    };
+    let raw_path = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("with"))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
+    let path = canonical_scalar_update_path_with_fields(field, target, &raw_path, fields);
+    let separator = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("separator"))
+        .and_then(|arg| ast_simple_then_update_value_in_exprs(exprs, arg.value))
+        .and_then(|value| match value {
+            SimpleThenUpdateValue::Const(value) => Some(value),
+            SimpleThenUpdateValue::Path(_) => None,
+        })
+        .unwrap_or_default();
+    Some(UpdateExpression::PrefixRootConcat {
+        prefix,
+        path,
+        separator,
+    })
 }
 
 fn prefix_payload_concat_update_expression_using_input(
@@ -6981,12 +9560,6 @@ impl FieldDef {
             .any(|expr| matches!(expr.kind, AstExprKind::Then { .. }))
     }
 
-    fn mentions_identifier(&self, identifier: &str) -> bool {
-        self.ast_items
-            .iter()
-            .any(|item| item.symbols.iter().any(|lexeme| lexeme == identifier))
-    }
-
     fn mentions_identifier_expr(&self, identifier: &str) -> bool {
         self.ast_exprs.iter().any(|expr| match &expr.kind {
             AstExprKind::Identifier(value) => value == identifier,
@@ -7059,10 +9632,21 @@ impl FieldDef {
             .find_map(|variant| self.source_branch_variant(variant))
     }
 
+    fn source_trigger_branch(&self, source: &str) -> Option<RoutedBranch> {
+        source_ref_variants(source)
+            .iter()
+            .find_map(|variant| self.source_trigger_branch_variant(variant))
+    }
+
     fn source_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
         let source_parts = dotted_path_parts(source_variant);
         let start_line = self.ast_exprs.iter().find_map(|expr| match &expr.kind {
             AstExprKind::Path(parts) if path_parts_match_source_ref(parts, &source_parts) => {
+                Some(expr.line)
+            }
+            AstExprKind::Identifier(value)
+                if source_parts.len() == 1 && value == source_parts[0] =>
+            {
                 Some(expr.line)
             }
             _ => None,
@@ -7112,40 +9696,83 @@ impl FieldDef {
             .collect();
         Some(RoutedBranch { items, ast_exprs })
     }
-}
 
-fn candidate_sources_for_path(
-    target: &str,
-    fields: &[FieldDef],
-    direct_sources: &BTreeMap<String, Vec<String>>,
-    program: &ParsedProgram,
-    visited: &mut Vec<String>,
-) -> Vec<String> {
-    if visited.iter().any(|path| path == target) {
-        return Vec::new();
+    fn source_trigger_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
+        let source_parts = dotted_path_parts(source_variant);
+        let start_line = self.ast_exprs.iter().find_map(|expr| {
+            let line_starts_with_source = self
+                .ast_items
+                .iter()
+                .find(|item| {
+                    item.line == expr.line
+                        && item.hold.is_none()
+                        && item_symbols_start_with_path(item, &source_parts)
+                })
+                .is_some();
+            if !line_starts_with_source {
+                return None;
+            }
+            match &expr.kind {
+                AstExprKind::Path(parts) if path_parts_match_source_ref(parts, &source_parts) => {
+                    Some(expr.line)
+                }
+                AstExprKind::Identifier(value)
+                    if source_parts.len() == 1 && value == source_parts[0] =>
+                {
+                    Some(expr.line)
+                }
+                _ => None,
+            }
+        })?;
+        self.branch_from_line(start_line)
     }
-    visited.push(target.to_owned());
-    let Some(field) = fields.iter().find(|field| field.path == target) else {
-        visited.pop();
-        return Vec::new();
-    };
-    let mut candidates = direct_sources_for_field(direct_sources, field)
-        .cloned()
-        .collect::<Vec<_>>();
-    for dependency in fields.iter().filter(|candidate| {
-        candidate.parent_path == field.parent_path
-            && candidate.path != field.path
-            && candidate.local_name != field.local_name
-            && field.mentions_identifier(&candidate.local_name)
-    }) {
-        for source in
-            candidate_sources_for_path(&dependency.path, fields, direct_sources, program, visited)
-        {
-            push_unique(&mut candidates, source);
+
+    fn branch_from_line(&self, start_line: usize) -> Option<RoutedBranch> {
+        let start = self
+            .ast_items
+            .iter()
+            .position(|item| item.line == start_line)?;
+        let start_indent = self.ast_items[start].indent;
+        let mut depth = 0i32;
+        let mut items = Vec::new();
+        for (offset, item) in self.ast_items.iter().skip(start).enumerate() {
+            let same_indent_pipe_continuation =
+                item.indent == start_indent && item_starts_with_symbol(item, "|>");
+            if offset > 0 && item.indent <= start_indent && !same_indent_pipe_continuation {
+                break;
+            }
+            items.push(item.clone());
+            let scope_delta = item
+                .symbols
+                .iter()
+                .map(|lexeme| match lexeme.as_str() {
+                    "{" => 1,
+                    "}" => -1,
+                    _ => 0,
+                })
+                .sum::<i32>();
+            depth += scope_delta;
+            let has_indented_continuation =
+                self.ast_items.get(start + offset + 1).is_some_and(|next| {
+                    next.indent > start_indent
+                        || (next.indent == start_indent && item_starts_with_symbol(next, "|>"))
+                });
+            if offset == 0 && depth == 0 && scope_delta == 0 && !has_indented_continuation {
+                break;
+            }
+            if depth <= 0 && item_has_symbol(item, "}") {
+                break;
+            }
         }
+        let lines = items.iter().map(|item| item.line).collect::<Vec<_>>();
+        let ast_exprs = self
+            .ast_exprs
+            .iter()
+            .filter(|expr| lines.contains(&expr.line))
+            .cloned()
+            .collect();
+        Some(RoutedBranch { items, ast_exprs })
     }
-    visited.pop();
-    candidates
 }
 
 fn direct_source_refs_by_path(
@@ -7171,7 +9798,7 @@ fn direct_sources_for_field<'a>(
 fn direct_source_refs(field: &FieldDef, program: &ParsedProgram) -> Vec<String> {
     let mut sources = Vec::new();
     for source in &program.source_ports {
-        if source_ref_variants(&source.path)
+        if source_ref_variants_for_program(&source.path, program)
             .iter()
             .any(|variant| field.references_source_variant(variant))
         {
@@ -7187,7 +9814,73 @@ fn source_ref_variants(path: &str) -> Vec<String> {
         variants.push(suffix.to_owned());
         variants.push(format!("item.{suffix}"));
     }
+    if let Some(tail) = store_list_source_tail_without_program(path) {
+        variants.push(tail);
+    }
     variants
+}
+
+fn source_ref_variants_for_program(path: &str, program: &ParsedProgram) -> Vec<String> {
+    let mut variants = vec![path.to_owned()];
+    let Some((_, suffix)) = path.split_once('.') else {
+        return variants;
+    };
+    if source_suffix_is_unique(suffix, program) {
+        variants.push(suffix.to_owned());
+        variants.push(format!("item.{suffix}"));
+    }
+    if let Some(list_item_tail) = unique_list_item_source_tail(path, program) {
+        variants.push(list_item_tail);
+    }
+    variants
+}
+
+fn source_suffix_is_unique(suffix: &str, program: &ParsedProgram) -> bool {
+    let suffix = format!(".{suffix}");
+    program
+        .source_ports
+        .iter()
+        .filter(|source| source.path.ends_with(&suffix))
+        .take(2)
+        .count()
+        == 1
+}
+
+fn unique_list_item_source_tail(path: &str, program: &ParsedProgram) -> Option<String> {
+    let tail = store_list_source_tail(path, program)?;
+    let tail_suffix = format!(".{tail}");
+    let unique = program
+        .source_ports
+        .iter()
+        .filter(|source| source.path.ends_with(&tail_suffix))
+        .take(2)
+        .count()
+        == 1;
+    unique.then_some(tail)
+}
+
+fn store_list_source_tail(path: &str, program: &ParsedProgram) -> Option<String> {
+    let parts = dotted_path_parts(path);
+    let ["store", list, tail @ ..] = parts.as_slice() else {
+        return None;
+    };
+    if tail.is_empty()
+        || !program
+            .list_memories
+            .iter()
+            .any(|memory| memory.name == *list)
+    {
+        return None;
+    }
+    Some(tail.join("."))
+}
+
+fn store_list_source_tail_without_program(path: &str) -> Option<String> {
+    let parts = dotted_path_parts(path);
+    let ["store", _list, tail @ ..] = parts.as_slice() else {
+        return None;
+    };
+    (!tail.is_empty()).then(|| tail.join("."))
 }
 
 fn typed_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
@@ -7247,18 +9940,37 @@ fn gather_field_defs_from_statements(
         );
         match &statement.kind {
             AstStatementKind::Function { name, .. } => {
-                if let Some(row_scope) = function_row_scope(name, program) {
-                    scope.push(row_scope.to_owned());
+                let function_row_scopes = function_row_scopes(name, program)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for row_scope in function_row_scopes {
+                    scope.push(row_scope);
                     function_stack.push(name.clone());
-                    gather_field_defs_from_statements(
+                    if function_body_defines_record_fields(
                         &statement.children,
-                        scope,
-                        program,
-                        items,
-                        function_bodies,
-                        function_stack,
-                        fields,
-                    );
+                        &program.ast.expressions,
+                        &program.ast.lines,
+                    ) {
+                        gather_field_defs_from_statements(
+                            &statement.children,
+                            scope,
+                            program,
+                            items,
+                            function_bodies,
+                            function_stack,
+                            fields,
+                        );
+                    } else {
+                        gather_field_defs_from_called_functions_in_statements(
+                            &statement.children,
+                            scope,
+                            program,
+                            items,
+                            function_bodies,
+                            function_stack,
+                            fields,
+                        );
+                    }
                     function_stack.pop();
                     scope.pop();
                 }
@@ -7303,15 +10015,6 @@ fn gather_field_defs_from_statements(
                 if should_record_field_statement(name, scope, program) {
                     push_field_def(statement, name, scope, program, items, fields);
                 }
-                gather_field_defs_from_statements(
-                    &statement.children,
-                    scope,
-                    program,
-                    items,
-                    function_bodies,
-                    function_stack,
-                    fields,
-                );
             }
             AstStatementKind::Block
             | AstStatementKind::Expression
@@ -7379,7 +10082,7 @@ fn gather_field_defs_from_helper_function(
     if function_stack.iter().any(|entry| entry == function) {
         return;
     }
-    if function_row_scope(function, program).is_some() {
+    if function_has_row_scope(function, program) {
         return;
     }
     let Some(children) = function_bodies.get(function) else {
@@ -7453,6 +10156,13 @@ fn function_body_defines_record_fields(
     lines: &[boon_parser::ParserLine],
 ) -> bool {
     statements.iter().any(|statement| {
+        if statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(expr_is_render_constructor)
+        {
+            return false;
+        }
         if statement_is_record_field(statement) {
             return true;
         }
@@ -7478,6 +10188,15 @@ fn function_body_defines_record_fields(
                 )
             })
     })
+}
+
+fn expr_is_render_constructor(expr: &AstExpr) -> bool {
+    match &expr.kind {
+        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } => {
+            boon_typecheck::is_registered_render_constructor(function)
+        }
+        _ => false,
+    }
 }
 
 fn statement_is_record_constructor_block(
@@ -7749,11 +10468,14 @@ fn collect_field_ast_items(items: &[&AstItem], start: usize, indent: usize) -> V
     body
 }
 
-fn function_row_scope<'a>(name: &str, program: &'a ParsedProgram) -> Option<&'a str> {
+fn function_row_scopes<'a>(
+    name: &str,
+    program: &'a ParsedProgram,
+) -> impl Iterator<Item = &'a str> {
     program
         .row_scope_functions
         .iter()
-        .find(|scope| {
+        .filter(move |scope| {
             scope.function == name
                 || scope
                     .function
@@ -7761,6 +10483,16 @@ fn function_row_scope<'a>(name: &str, program: &'a ParsedProgram) -> Option<&'a 
                     .is_some_and(|source_function| source_function == name)
         })
         .map(|scope| scope.row_scope.as_str())
+}
+
+fn function_has_row_scope(name: &str, program: &ParsedProgram) -> bool {
+    program.row_scope_functions.iter().any(|scope| {
+        scope.function == name
+            || scope
+                .function
+                .strip_prefix("__source_row_scope_")
+                .is_some_and(|source_function| source_function == name)
+    })
 }
 
 fn push_unique(output: &mut Vec<String>, value: String) {
@@ -7819,6 +10551,140 @@ mod tests {
     }
 
     #[test]
+    fn scoped_source_lookup_prefers_source_intent_identity_field() {
+        assert_eq!(
+            select_source_address_lookup_field(
+                "file_tree_row.scope_row_elements.select_scope",
+                vec!["file".to_owned(), "scope_key".to_owned()]
+            )
+            .as_deref(),
+            Some("scope_key")
+        );
+        assert_eq!(
+            select_source_address_lookup_field(
+                "file_tree_row.file_row_elements.select_file",
+                vec!["file".to_owned(), "scope_key".to_owned()]
+            )
+            .as_deref(),
+            Some("file")
+        );
+    }
+
+    #[test]
+    fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
+        let sources = [
+            ("file_tree_row.file_row_elements.select_file", SourceId(0)),
+            ("file_tree_row.scope_row_elements.select_scope", SourceId(1)),
+        ];
+        assert_eq!(
+            canonical_view_source_path(&sources, "row.file_row_elements.select_file")
+                .map(|(path, source_id)| (path, source_id.as_usize())),
+            Some(("file_tree_row.file_row_elements.select_file", 0))
+        );
+
+        let ambiguous = [
+            ("left.file_row_elements.select_file", SourceId(0)),
+            ("right.file_row_elements.select_file", SourceId(1)),
+        ];
+        assert!(
+            canonical_view_source_path(&ambiguous, "row.file_row_elements.select_file").is_none(),
+            "view row aliases must not guess when suffixes are ambiguous"
+        );
+    }
+
+    #[test]
+    fn lower_profile_reports_representation_candidates_without_folding() {
+        let source = r#"
+store: [
+    elements: [
+        click: SOURCE
+    ]
+    active:
+        TEXT { A } |> HOLD active {
+            LATEST {
+                elements.click.event.press |> THEN { TEXT { B } }
+            }
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, label: TEXT { A }]
+            [id: TEXT { b }, label: TEXT { B }]
+        }
+    selected_rows:
+        rows
+        |> List/filter_field_equal(field: "label", value: active)
+        |> List/map(row, new: [id: row.id, label: row.label])
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let parsed = boon_parser::parse_source("representation-candidates.bn", source).unwrap();
+        let (_ir, profile) = lower_profiled(&parsed).unwrap();
+        let analysis = &profile["representation_analysis"];
+
+        assert_eq!(
+            analysis["policy"],
+            "diagnostic_only_no_folding_or_storage_rewrite"
+        );
+        assert!(
+            profile["representation_analysis_ms"].as_f64().unwrap() >= 0.0,
+            "lower profile should time representation diagnostics: {profile:?}"
+        );
+        assert!(
+            analysis["expression_class_counts"]["static_composite"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "literal records/lists should be visible as static composites: {analysis:?}"
+        );
+        assert!(
+            analysis["expression_class_counts"]["source_or_hold_dynamic"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "SOURCE/HOLD paths must be classified as dynamic blockers: {analysis:?}"
+        );
+        assert!(
+            analysis["expression_class_counts"]["row_dependent"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "row-scoped fields must block global constant hoisting: {analysis:?}"
+        );
+        assert_eq!(
+            analysis["list_storage_mode_candidates"]["constant_array_literal"], 1,
+            "literal LIST rows should be reported as a constant-array candidate"
+        );
+        assert!(
+            analysis["list_storage_mode_candidates"]["selection_view"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "filtered list views should be reported as selection-view candidates"
+        );
+        assert!(
+            analysis["list_storage_mode_candidates"]["incremental_projection"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "List/map list views should be reported as projection candidates"
+        );
+        let samples = analysis["root_derived_samples"]
+            .as_array()
+            .expect("root derived samples should be an array");
+        let selected = samples
+            .iter()
+            .find(|sample| sample["path"] == "store.selected_rows")
+            .expect("selected_rows should be sampled");
+        assert_eq!(selected["kind"], "list_view");
+        assert_eq!(selected["class"], "row_dependent");
+        assert!(
+            selected["line"].as_u64().unwrap() > 0,
+            "samples should point back to source lines: {selected:?}"
+        );
+    }
+
+    #[test]
     fn document_view_bindings_resolve_function_arguments_generically() {
         let source = r#"
 store: [
@@ -7860,6 +10726,231 @@ FUNCTION counter_button(press, label) {
                 .iter()
                 .any(|binding| binding.kind == ViewBindingKind::Data && binding.path == "label")
         );
+    }
+
+    #[test]
+    fn document_view_bindings_include_style_layout_expression_reads() {
+        let source = r#"
+store: [
+    source: SOURCE
+
+    offset:
+        10 |> HOLD offset { LATEST {} }
+]
+
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: [width: PASSED.store.offset + 2, height: 20, paint: False]
+        child: Element/text(element: [], style: [paint: False], text: TEXT { x })
+    )
+)
+"#;
+        let parsed = boon_parser::parse_source("style-width-view-binding.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(
+            ir.view_bindings.iter().any(|binding| {
+                binding.node_kind == "container"
+                    && binding.attr == "width"
+                    && binding.kind == ViewBindingKind::Data
+                    && binding.path == "store.offset"
+            }),
+            "style width expression should make the root data path render-observed: {:?}",
+            ir.view_bindings
+        );
+    }
+
+    #[test]
+    fn scene_view_bindings_include_element_target_expression_reads() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+store: [
+    target_label:
+        TEXT { 0 s } |> HOLD target_label { LATEST {} }
+
+    target_offset:
+        10 |> HOLD target_offset { LATEST {} }
+]
+
+scene: main_scene()
+
+FUNCTION main_scene() {
+    Scene/new(
+        root: Scene/Element/stripe(
+        element: [target: PASSED.store.target_label]
+        direction: Row
+        style: [width: PASSED.store.target_offset + 2, height: Fill, paint: False]
+        items: LIST {
+            Scene/Element/block(
+                element: []
+                style: [width: 2, height: Fill, paint: False]
+                child: Scene/Element/text(element: [], style: [paint: False], text: TEXT { x })
+            )
+        }
+    )
+    )
+}
+"#;
+        let parsed =
+            boon_parser::parse_source("scene-element-target-view-binding.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(
+            ir.view_bindings.iter().any(|binding| {
+                binding.attr == "target"
+                    && binding.kind == ViewBindingKind::Target
+                    && binding.path == "store.target_label"
+            }),
+            "element target expression should make the root target path render-observed: {:?}",
+            ir.view_bindings
+        );
+        assert!(
+            ir.view_bindings.iter().any(|binding| {
+                binding.attr == "width"
+                    && binding.kind == ViewBindingKind::Data
+                    && binding.path == "store.target_offset"
+            }),
+            "scene style width expression should still make the root data path render-observed: {:?}",
+            ir.view_bindings
+        );
+    }
+
+    #[test]
+    fn scene_view_bindings_resolve_forwarded_style_arguments() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+store: [
+    panel_width:
+        430 |> HOLD panel_width { LATEST {} }
+]
+
+scene: main_scene()
+
+FUNCTION main_scene() {
+    Scene/new(root: left_panel())
+}
+
+FUNCTION left_panel() {
+    left_panel_base(panel_width: PASSED.store.panel_width, panel_height: Fill)
+}
+
+FUNCTION left_panel_base(panel_width, panel_height) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 6
+        style: [
+            width: panel_width
+            height: panel_height
+            paint: False
+        ]
+        items: LIST {}
+    )
+}
+"#;
+        let parsed =
+            boon_parser::parse_source("forwarded-style-arg-view-binding.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(
+            ir.view_bindings.iter().any(|binding| {
+                binding.attr == "width"
+                    && binding.kind == ViewBindingKind::Data
+                    && binding.path == "store.panel_width"
+            }),
+            "forwarded style width should make the root data path render-observed: {:?}",
+            ir.view_bindings
+        );
+    }
+
+    #[test]
+    fn semantic_index_skeleton_reuses_parser_ir_and_typecheck_facts() {
+        let source = r#"
+store: [
+    sources: [
+        increment_button: [press: SOURCE]
+    ]
+
+    count:
+        0 |> HOLD count {
+            LATEST {
+                sources.increment_button.press |> THEN { count + 1 }
+            }
+        }
+]
+
+document: Document/new(
+    root: counter_button(press: store.sources.increment_button.press, label: TEXT { + })
+)
+
+FUNCTION counter_button(press, label) {
+    Element/button(
+        element: [event: [press: press]]
+        style: []
+        label: label
+    )
+}
+"#;
+        let parsed = boon_parser::parse_source("semantic-index-counter.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let index = &ir.semantic_index;
+
+        assert_eq!(index.version, 1);
+        assert_eq!(index.computed_from, "parser_ast_ir_typecheck_tables");
+        assert_eq!(
+            index.parser_policy_phase,
+            "syntax_parse_then_semantic_index_policy_checks"
+        );
+        assert!(index.reuse.parser_reused_by_ir);
+        assert!(index.reuse.typecheck_reused_by_ir);
+        assert!(index.reuse.runtime_reports_reuse_index);
+        assert!(index.sources.iter().any(|source| source.path
+            == "store.sources.increment_button.press"
+            && source.payload_schema_known));
+        assert!(
+            index
+                .functions
+                .iter()
+                .any(|function| function.name == "counter_button" && function.type_known)
+        );
+        assert!(
+            index
+                .fields
+                .iter()
+                .any(|field| field.path == "store.count" && field.kind == "state_cell")
+        );
+        assert!(index.view_bindings.iter().any(|binding| binding.path
+            == "store.sources.increment_button.press"
+            && binding.source_id.is_some()
+            && binding.render_contract_known));
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.category == "field_name" && symbol.text == "count")
+        );
+        assert!(
+            index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.category == "source_label"
+                    && symbol.text == "store.sources.increment_button.press")
+        );
+        assert!(index
+            .symbols
+            .iter()
+            .any(|symbol| symbol.category == "operator_name" && symbol.text == "Element/button"));
+        assert!(index.report()["symbol_count"].as_u64().unwrap() > 0);
+        assert_eq!(index.readiness.source_payload_schemas.fallback_count, 0);
+        assert_eq!(index.readiness.render_contracts.fallback_count, 0);
+        assert!(index.report()["present"].as_bool().unwrap());
     }
 
     #[test]
@@ -7942,6 +11033,40 @@ scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
             ],
         )
         .unwrap();
+        assert!(
+            parsed.source_ports.iter().any(|source| source.path
+                == "external_file_tree_row.file_row_elements.select_file"
+                && source.scoped),
+            "NovyWave parser must expose scoped external file row source ports, sources={:?}, row_scopes={:?}, lists={:?}",
+            parsed
+                .source_ports
+                .iter()
+                .filter(|source| source.path.contains("external"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            parsed.row_scope_functions,
+            parsed.list_memories
+        );
+        let fields = typed_field_defs(&parsed);
+        let direct_sources = direct_source_refs_by_path(&fields, &parsed);
+        let external_selector_sources = direct_sources
+            .get("store.external_file_tree_file_selected_scope")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            external_selector_sources
+                .iter()
+                .any(|source| source == "external_file_tree_row.file_row_elements.select_file"),
+            "external selector field must directly reference external file source, sources={external_selector_sources:?}"
+        );
+        let active_scope_sources =
+            candidate_sources_cached(&parsed, &fields, &direct_sources, "store.active_scope");
+        assert!(
+            active_scope_sources
+                .iter()
+                .any(|source| source == "external_file_tree_row.file_row_elements.select_file"),
+            "active_scope candidates must include external file source, candidates={active_scope_sources:?}"
+        );
         let ir = lower(&parsed).unwrap();
 
         assert!(ir.view_bindings.iter().any(|binding| {
@@ -7951,6 +11076,52 @@ scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
                 && binding.path == "store.button"
                 && binding.source_id.is_some()
         }));
+    }
+
+    #[test]
+    fn inline_empty_render_slot_lists_inside_row_constructors_get_unique_names() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+items:
+    LIST { [label: TEXT { A }] }
+rows:
+    items |> List/map(item, new: row(item: item))
+
+document:
+    root:
+        Element/stripe(items: rows)
+
+FUNCTION row(item) {
+    Element/stripe(
+        items: LIST {}
+    )
+}
+"#;
+        let parsed = boon_parser::parse_source("inline-row-render-slot-list.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let mut names = std::collections::BTreeSet::new();
+        for list in &ir.lists {
+            assert!(
+                names.insert(list.name.as_str()),
+                "list names must be unique after lowering inline row lists: {:?}",
+                ir.lists
+                    .iter()
+                    .map(|list| list.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            ir.lists
+                .iter()
+                .any(|list| list.name != "items" && list.name.contains("items_list")),
+            "anonymous row render-slot LIST should get a generated name, got {:?}",
+            ir.lists
+                .iter()
+                .map(|list| list.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -8023,6 +11194,46 @@ FUNCTION wrapped_button(source) {
         )
         .unwrap();
         let ir = lower(&parsed).unwrap();
+        assert!(
+            !ir.derived_values
+                .iter()
+                .any(|value| value.path == "store.file_tree_rows"),
+            "inline initialized file_tree_rows must not be emitted as a derived list view: {:#?}",
+            ir.derived_values
+                .iter()
+                .filter(|value| matches!(value.kind, DerivedValueKind::ListView))
+                .map(|value| value.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        for expected_view in [
+            "store.external_catalog_file_tree_rows",
+            "store.external_fallback_file_tree_rows",
+            "store.external_file_tree_rows",
+        ] {
+            assert!(
+                ir.derived_values.iter().any(|value| {
+                    value.path == expected_view && value.kind == DerivedValueKind::ListView
+                }),
+                "{expected_view} must be emitted as a materialized derived list view: {:#?}",
+                ir.derived_values
+                    .iter()
+                    .filter(|value| matches!(value.kind, DerivedValueKind::ListView))
+                    .map(|value| value.path.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            ir.lists.iter().any(|list| {
+                list.name == "external_catalog_file_tree_rows"
+                    && list
+                        .row_scope_id
+                        .and_then(|scope_id| ir.row_scopes.get(scope_id.as_usize()))
+                        .is_some_and(|scope| scope.row_scope == "external_file_tree_row")
+            }),
+            "external catalog list must own external_file_tree_row scope, lists={:?}, row_scopes={:?}",
+            ir.lists,
+            ir.row_scopes
+        );
 
         for expected_path in [
             "store.elements.signal_search_input",
@@ -8046,6 +11257,47 @@ FUNCTION wrapped_button(source) {
                         path: "formatter".to_owned(),
                     }
         }));
+        let external_file_tree_file = ir
+            .state_cells
+            .iter()
+            .find(|cell| cell.path == "store.external_file_tree_file")
+            .expect("NovyWave external loaded file should be a state cell");
+        assert_eq!(
+            external_file_tree_file.initial_value,
+            InitialValue::Text {
+                value: "none".to_owned()
+            }
+        );
+        assert!(
+            ir.state_cells
+                .iter()
+                .any(|cell| cell.path == "store.active_file" && !cell.indexed),
+            "NovyWave active_file must remain a root state cell: {:#?}",
+            ir.state_cells
+                .iter()
+                .filter(|cell| cell.path.contains("active_file"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !ir.derived_values.iter().any(|value| value.path == "store"),
+            "container path `store` must not be emitted as a derived value"
+        );
+        assert!(
+            ir.update_branches.iter().any(|branch| {
+                branch.source == "external_file_tree_row.file_row_elements.select_file"
+                    && branch.target == "store.active_scope"
+                    && branch.expression
+                        == UpdateExpression::Const {
+                            value: "none".to_owned(),
+                        }
+            }),
+            "external file row source must clear active_scope, branches={:?}",
+            ir.update_branches
+                .iter()
+                .filter(|branch| branch.source.contains("file_row_elements.select_file"))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -8371,6 +11623,37 @@ document:
     }
 
     #[test]
+    fn list_record_literal_signed_numbers_lower_to_numeric_initializers() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+items: LIST {
+    [kind: Inset, elevation: -4]
+}
+document: []
+"#;
+        let parsed = boon_parser::parse_source("signed-list-literal.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let items = ir
+            .lists
+            .iter()
+            .find(|list| list.name == "items")
+            .expect("items list should lower");
+        let ListInitializer::RecordLiteral { rows } = &items.initializer else {
+            panic!(
+                "items should lower as record literal, got {:?}",
+                items.initializer
+            );
+        };
+        assert!(rows.iter().any(|row| {
+            row.fields.iter().any(|field| {
+                field.name == "elevation" && field.value == InitialValue::Number { value: -4 }
+            })
+        }));
+    }
+
+    #[test]
     fn nested_then_when_lowers_to_match_const_before_path_readback() {
         let source = r#"
 store: [
@@ -8410,6 +11693,43 @@ store: [
                         ],
                     }
         }));
+    }
+
+    #[test]
+    fn hold_text_initializer_survives_later_list_filter_reference() {
+        let source = r#"
+store: [
+    elements: [
+        load: SOURCE
+    ]
+    external_file_tree_file:
+        TEXT { none } |> HOLD external_file_tree_file {
+            LATEST {
+                elements.load.text
+            }
+        }
+    file_tree_rows:
+        LIST {
+            [file: TEXT { simple.vcd }]
+        }
+    external_catalog_file_tree_rows:
+        file_tree_rows
+        |> List/filter_field_equal(field: "file", value: external_file_tree_file)
+]
+"#;
+        let parsed = boon_parser::parse_source("hold-filter-reference.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let cell = ir
+            .state_cells
+            .iter()
+            .find(|cell| cell.path == "store.external_file_tree_file")
+            .expect("external loaded file should be a state cell");
+        assert_eq!(
+            cell.initial_value,
+            InitialValue::Text {
+                value: "none".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -8776,10 +12096,17 @@ FUNCTION new_todo(todo) {
                 source_line: cell.line,
             })
             .collect::<Vec<_>>();
-        let unknown_branches = update_branches(&parsed, &state_cells, &fields, &direct_sources)
-            .into_iter()
-            .filter(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
-            .collect::<Vec<_>>();
+        let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources);
+        let unknown_branches = update_branches(
+            &parsed,
+            &state_cells,
+            &fields,
+            &direct_sources,
+            &mut candidate_sources,
+        )
+        .into_iter()
+        .filter(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
+        .collect::<Vec<_>>();
         assert!(unknown_branches.is_empty(), "{unknown_branches:#?}");
         let ir = lower(&parsed).unwrap();
         assert!(
@@ -9059,6 +12386,343 @@ store: [
             UpdateExpression::Const {
                 value: "clk".to_owned()
             }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn source_payload_concat_inside_latest_lowers_without_then_wrapper() {
+        let source = r#"
+store: [
+    elements: [
+        external_file_loaded_name: SOURCE
+        show_empty: SOURCE
+    ]
+    external_file_tree_label:
+        TEXT { - local file } |> HOLD external_file_tree_label {
+            LATEST {
+                TEXT { - } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+                elements.show_empty.event.press |> THEN { TEXT { - local file } }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("source-payload-concat-latest.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let loaded_branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.external_file_tree_label"
+                    && branch.source == "store.elements.external_file_loaded_name"
+            })
+            .expect("loaded file source should update the held label");
+        assert_eq!(
+            loaded_branch.expression,
+            UpdateExpression::PrefixPayloadConcat {
+                prefix: "-".to_owned(),
+                payload_path: "elements.external_file_loaded_name.text".to_owned(),
+                separator: " ".to_owned(),
+            }
+        );
+        let reset_branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.external_file_tree_label"
+                    && branch.source == "store.elements.show_empty"
+            })
+            .expect("show empty source should reset the held label");
+        assert_eq!(
+            reset_branch.expression,
+            UpdateExpression::Const {
+                value: "- local file".to_owned()
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn derived_local_event_branches_lower_dependent_branch_expressions() {
+        let source = r#"
+store: [
+    elements: [
+        select_next: SOURCE
+    ]
+    selected_event:
+        LATEST {
+            elements.select_next.event.press |> THEN { TEXT { second } }
+        }
+    selected:
+        TEXT { first } |> HOLD selected {
+            LATEST {
+                selected_event
+            }
+        }
+    response:
+        TEXT { response:first } |> HOLD response {
+            LATEST {
+                selected_event |> THEN {
+                    TEXT { response } |> Text/concat(with: selected_event, separator: ":")
+                }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("derived-local-event-branches.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let selected_branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.selected" && branch.source == "store.elements.select_next"
+            })
+            .expect("selected should be driven by the source behind selected_event");
+        assert_eq!(
+            selected_branch.expression,
+            UpdateExpression::ReadPath {
+                path: "store.selected_event".to_owned()
+            }
+        );
+        let response_branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.response" && branch.source == "store.elements.select_next"
+            })
+            .expect("response should be driven by the source behind selected_event");
+        assert_eq!(
+            response_branch.expression,
+            UpdateExpression::PrefixRootConcat {
+                prefix: "response".to_owned(),
+                path: "store.selected_event".to_owned(),
+                separator: ":".to_owned()
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn derived_local_event_branches_lower_dependent_match_expressions() {
+        let source = r#"
+store: [
+    rows:
+        LIST {
+            [file: TEXT { wave_27.fst }]
+            [file: TEXT { simple.vcd }]
+        }
+        |> List/map(row, new: [
+            file: row.file
+            elements: [
+                select: SOURCE
+            ]
+        ])
+    selected_file:
+        LATEST {
+            rows
+                |> List/map(row, new: LATEST {
+                    row.elements.select.event.press |> THEN { row.file }
+                })
+                |> List/latest()
+        }
+    active_signal_key:
+        TEXT { A_SIGNAL } |> HOLD active_signal_key {
+            LATEST {
+                selected_file |> THEN {
+                    selected_file |> WHEN {
+                        TEXT { wave_27.fst } => TEXT { TX_DATA }
+                        TEXT { simple.vcd } => TEXT { A_SIGNAL }
+                        __ => TEXT { NONE }
+                    }
+                }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("derived-local-match-branches.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.active_signal_key"
+                    && branch.source == "store.rows.elements.select"
+            })
+            .expect("dependent match should be routed to the row source behind selected_file");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::MatchConst {
+                input: "store.selected_file".to_owned(),
+                arms: vec![
+                    UpdateMatchArm {
+                        pattern: "wave_27.fst".to_owned(),
+                        output: "TX_DATA".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "simple.vcd".to_owned(),
+                        output: "A_SIGNAL".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "__".to_owned(),
+                        output: "NONE".to_owned(),
+                    },
+                ],
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn transitive_derived_event_branches_reach_dependent_match_expressions() {
+        let source = r#"
+store: [
+    rows:
+        LIST {
+            [file: TEXT { wave_27.fst }]
+            [file: TEXT { simple.vcd }]
+        }
+        |> List/map(row, new: [
+            file: row.file
+            elements: [
+                select: SOURCE
+            ]
+        ])
+    selected_file_leaf:
+        LATEST {
+            rows
+                |> List/map(row, new: LATEST {
+                    row.elements.select.event.press |> THEN { row.file }
+                })
+                |> List/latest()
+        }
+    selected_file:
+        LATEST {
+            selected_file_leaf
+        }
+    active_signal_key:
+        TEXT { A_SIGNAL } |> HOLD active_signal_key {
+            LATEST {
+                selected_file |> THEN {
+                    selected_file |> WHEN {
+                        TEXT { wave_27.fst } => TEXT { TX_DATA }
+                        TEXT { simple.vcd } => TEXT { A_SIGNAL }
+                        __ => TEXT { NONE }
+                    }
+                }
+            }
+        }
+]
+"#;
+        let parsed =
+            boon_parser::parse_source("transitive-derived-event-branches.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "store.active_signal_key"
+                    && branch.source == "store.rows.elements.select"
+            })
+            .expect("dependent match should be routed through transitive derived fields");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::MatchConst {
+                input: "store.selected_file".to_owned(),
+                arms: vec![
+                    UpdateMatchArm {
+                        pattern: "wave_27.fst".to_owned(),
+                        output: "TX_DATA".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "simple.vcd".to_owned(),
+                        output: "A_SIGNAL".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "__".to_owned(),
+                        output: "NONE".to_owned(),
+                    },
+                ],
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn derived_dependency_routes_do_not_borrow_payload_specific_branches() {
+        let source = r#"
+store: [
+    elements: [
+        hover: SOURCE
+        scope: SOURCE
+    ]
+    range_start:
+        0 |> HOLD range_start {
+            LATEST {
+                elements.scope.event.press |> THEN { 10 }
+            }
+        }
+    range_end: 100
+    zoom_center:
+        range_start |> HOLD zoom_center {
+            LATEST {
+                elements.hover.pointer_x |> THEN { Number/project_time(pointer_x: elements.hover.pointer_x, pointer_width: elements.hover.pointer_width, viewport_start: range_start, viewport_end: range_end, fallback: zoom_center) }
+            }
+        }
+]
+"#;
+        let parsed =
+            boon_parser::parse_source("derived-dependency-non-trigger.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            !ir.update_branches.iter().any(|branch| {
+                branch.target == "store.zoom_center"
+                    && branch.source == "store.elements.scope"
+                    && matches!(branch.expression, UpdateExpression::ProjectTime { .. })
+            }),
+            "scope changes range_start, but it must not reuse the hover pointer payload branch"
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn list_latest_source_field_is_scalar_source_event_transform_not_list_view() {
+        let source = r#"
+store: [
+    rows:
+        LIST {
+            [file: TEXT { wave_27.fst }]
+            [file: TEXT { simple.vcd }]
+        }
+        |> List/map(row, new: [
+            file: row.file
+            elements: [
+                select: SOURCE
+            ]
+        ])
+    selected_file:
+        rows
+            |> List/map(row, new: LATEST {
+                row.elements.select.event.press |> THEN { row.file }
+            })
+            |> List/latest()
+    noop: TEXT { ready } |> HOLD noop { LATEST {} }
+]
+"#;
+        let parsed = boon_parser::parse_source("list-latest-source-scalar.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let selected_file = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.selected_file")
+            .expect("selected_file should be a derived scalar");
+        assert_eq!(
+            selected_file.kind,
+            DerivedValueKind::SourceEventTransform,
+            "List/latest selects one scalar event payload; it is not a list view"
+        );
+        assert_eq!(
+            selected_file.sources,
+            vec!["store.rows.elements.select".to_owned()]
         );
         assert!(ir.static_schedule_verified);
     }
@@ -9738,11 +13402,11 @@ FUNCTION row(item) {
         );
 
         let mut with_bad_state = ir.clone();
-        with_bad_state.state_cells[0].path = "todo.generation".to_owned();
+        with_bad_state.state_cells[0].path = "todo.hidden_generation".to_owned();
         assert!(
             verify_hidden_identity(&with_bad_state)
                 .unwrap_err()
-                .contains("generation")
+                .contains("hidden_generation")
         );
 
         let mut with_bad_branch = ir.clone();

@@ -23,3 +23,107 @@ FUNCTION effect_exports_label() {
 FUNCTION data_policy_label() {
     TEXT { comparable descriptors only; no Rust handles }
 }
+
+FUNCTION artifact_ref(file, format, digest, generation, byte_length, status) {
+    [
+        ref_type: TEXT { ArtifactRef }
+        module: TEXT { wellen.v1 }
+        provider: provider_version()
+        schema_version: schema_version()
+        artifact_kind: TEXT { waveform_file }
+        file: file
+        format: format
+        digest: digest
+        generation: generation
+        byte_length: byte_length
+        status: status
+    ]
+}
+
+FUNCTION blob_ref(digest, byte_length, media_type, storage, encoding, generation, status) {
+    [
+        ref_type: TEXT { BlobRef }
+        module: TEXT { wellen.v1 }
+        digest: digest
+        byte_length: byte_length
+        media_type: media_type
+        storage: storage
+        encoding: encoding
+        generation: generation
+        status: status
+    ]
+}
+
+FUNCTION page_ref(page_kind_value, artifact_digest, schema_version_number, schema_hash, request_fingerprint, response_fingerprint, input_digest, page_digest, generation, row_count, sample_count, transition_count, byte_length, status) {
+    [
+        ref_type: TEXT { PageRef }
+        page_kind: page_kind_value
+        artifact_digest: artifact_digest
+        schema_version: schema_version_number
+        schema_hash: schema_hash
+        request_fingerprint: request_fingerprint
+        response_fingerprint: response_fingerprint
+        input_digest: input_digest
+        page_digest: page_digest
+        generation: generation
+        row_count: row_count
+        sample_count: sample_count
+        transition_count: transition_count
+        byte_length: byte_length
+        status: status
+    ]
+}
+
+FUNCTION open_result(artifact_ref, blob_ref, status, diagnostic) {
+    [
+        result_type: TEXT { OpenResult }
+        module: TEXT { wellen.v1 }
+        artifact_ref: artifact_ref
+        blob_ref: blob_ref
+        status: status
+        diagnostic: diagnostic
+        diagnostic_count: 1
+    ]
+}
+
+FUNCTION page(page_kind_value, page_ref, descriptor, status) {
+    [
+        page_type: page_kind_value
+        page_ref: page_ref
+        descriptor: descriptor
+        status: status
+    ]
+}
+
+FUNCTION cursor_values(page_ref, cursor_label, rows, status) {
+    [
+        page_type: TEXT { cursor_values }
+        page_ref: page_ref
+        cursor: cursor_label
+        rows: rows
+        status: status
+    ]
+}
+
+FUNCTION file_stats(page_ref, file, format, byte_length, row_count, transition_count, status) {
+    [
+        page_type: TEXT { file_stats }
+        page_ref: page_ref
+        file: file
+        format: format
+        byte_length: byte_length
+        row_count: row_count
+        transition_count: transition_count
+        status: status
+    ]
+}
+
+FUNCTION diagnostic(diagnostic_kind, file, message) {
+    [
+        diagnostic_type: TEXT { BridgeDiagnostic }
+        kind: diagnostic_kind
+        file: file
+        library: TEXT { wellen.v1 }
+        message: message
+    ]
+}

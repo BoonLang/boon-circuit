@@ -1415,36 +1415,49 @@ FUNCTION files_list_loaded() {
 }
 
 FUNCTION files_list_default_workspace() {
+    file_tree_workspace_rows(list_height: 224)
+}
+
+FUNCTION file_tree_workspace_rows(list_height) {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 2
-        style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
-        items: LIST {
-            file_tree_counter_file_button(row: [label: TEXT { - simple.vcd }, indent_width: 0, selected_file: TEXT { simple.vcd }])
-            file_tree_simple_scope_button(row: [scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18])
-            file_tree_uart_file_button(row: [label: TEXT { - wave_27.fst }, indent_width: 0, selected_file: TEXT { wave_27.fst }])
-            file_tree_uart_scope_button(row: [scope_key: TEXT { top_uart }, label: TEXT { + top.uart }, indent_width: 18])
-            file_tree_analog_scope_button(row: [scope_key: TEXT { top_analog }, label: TEXT { + top.analog }, indent_width: 18])
-            file_tree_ghw_file_button(row: [label: TEXT { - simple_test.ghw }, indent_width: 0, selected_file: TEXT { simple_test.ghw }])
-            file_tree_ghw_scope_button(row: [scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, indent_width: 18])
-        }
+        style: [width: Fill, height: list_height, paint: False, scroll_y: True, scrollbars: True]
+        items:
+            PASSED.store.file_tree_rows
+            |> List/map(row, new: file_tree_row(row: row))
     )
 }
 
 FUNCTION files_list_external_loaded() {
+    PASSED.store.external_catalog_file_tree_rows |> List/is_not_empty() |> WHEN {
+        True => external_catalog_file_tree_row_list()
+        False => external_fallback_file_tree_row_list()
+    }
+}
+
+FUNCTION external_catalog_file_tree_row_list() {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 2
         style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
-        items: LIST {
-            file_tree_loaded_file_button(row: [label: PASSED.store.external_file_tree_label, indent_width: 0, selected_file: PASSED.store.active_file])
-            PASSED.store.active_file == TEXT { simple.vcd } |> WHEN {
-                True => file_tree_simple_scope_button(row: [scope_key: TEXT { simple_tb_s }, label: TEXT { + simple_tb.s }, expanded_label: TEXT { - simple_tb.s }, collapsed_label: TEXT { + simple_tb.s }, indent_width: 18])
-                False => NoElement
-            }
-        }
+        items:
+            PASSED.store.external_catalog_file_tree_rows
+            |> List/map(external_file_tree_row, new: file_tree_row(row: external_file_tree_row))
+    )
+}
+
+FUNCTION external_fallback_file_tree_row_list() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
+        items:
+            PASSED.store.external_fallback_file_tree_rows
+            |> List/map(external_file_tree_row, new: file_tree_row(row: external_file_tree_row))
     )
 }
 
@@ -1516,41 +1529,8 @@ FUNCTION file_tree_row(row) {
 }
 
 FUNCTION file_tree_file_button(row) {
-    row.source_key |> WHEN {
-        SelectCounterFile => file_tree_counter_file_button(row: row)
-        SelectUartCompareFile => file_tree_uart_file_button(row: row)
-        SelectGhwFile => file_tree_ghw_file_button(row: row)
-        __ => file_tree_counter_file_button(row: row)
-    }
-}
-
-FUNCTION file_tree_counter_file_button(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.select_counter_file], hovered: PASSED.store.elements.select_counter_file]
-        style: [width: Fill, height: 22, paint: False]
-        label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
-    )
-}
-
-FUNCTION file_tree_loaded_file_button(row) {
-    Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.file_row_select], hovered: PASSED.store.elements.file_row_select]
-        style: [width: Fill, height: 22, paint: False]
-        label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
-    )
-}
-
-FUNCTION file_tree_uart_file_button(row) {
-    Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.select_uart_compare_file], hovered: PASSED.store.elements.select_uart_compare_file]
-        style: [width: Fill, height: 22, paint: False]
-        label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
-    )
-}
-
-FUNCTION file_tree_ghw_file_button(row) {
-    Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.select_ghw_file], hovered: PASSED.store.elements.select_ghw_file]
+        element: [event: [press: row.file_row_elements.select_file], hovered: row.file_row_elements.select_file]
         style: [width: Fill, height: 22, paint: False]
         label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
     )
@@ -1561,7 +1541,7 @@ FUNCTION file_tree_scope_button(row) {
         SelectSimpleScope => file_tree_simple_scope_button(row: row)
         SelectUartScope => file_tree_uart_scope_button(row: row)
         SelectAnalogScope => file_tree_analog_scope_button(row: row)
-        SelectGhwFile => file_tree_ghw_scope_button(row: row)
+        SelectGhwScope => file_tree_ghw_scope_button(row: row)
         __ => file_tree_simple_scope_button(row: row)
     }
 }
@@ -1575,7 +1555,7 @@ FUNCTION file_tree_simple_scope_button(row) {
 
 FUNCTION file_tree_simple_scope_select_button(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.scope_cpu], hovered: PASSED.store.elements.scope_cpu]
+        element: [event: [press: row.scope_row_elements.select_scope], hovered: row.scope_row_elements.select_scope]
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_row(label_text: simple_scope_row_label(row: row), indent_width: row.indent_width, selected: PASSED.store.active_scope == TEXT { simple_tb_s })
     )
@@ -1620,7 +1600,7 @@ FUNCTION file_tree_simple_scope_collapse_control(row) {
 
 FUNCTION file_tree_simple_scope_select_label(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.scope_cpu], hovered: PASSED.store.elements.scope_cpu]
+        element: [event: [press: row.scope_row_elements.select_scope], hovered: row.scope_row_elements.select_scope]
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_scope_label_row(label_text: row.expanded_label, selected: PASSED.store.active_scope == TEXT { simple_tb_s })
     )
@@ -1644,7 +1624,7 @@ FUNCTION tree_scope_label_row(label_text, selected) {
 
 FUNCTION file_tree_uart_scope_button(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.scope_uart], hovered: PASSED.store.elements.scope_uart]
+        element: [event: [press: row.scope_row_elements.select_scope], hovered: row.scope_row_elements.select_scope]
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_row(label_text: file_tree_row_label(row: row), indent_width: row.indent_width, selected: PASSED.store.active_scope == row.scope_key)
     )
@@ -1652,7 +1632,7 @@ FUNCTION file_tree_uart_scope_button(row) {
 
 FUNCTION file_tree_analog_scope_button(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.scope_analog], hovered: PASSED.store.elements.scope_analog]
+        element: [event: [press: row.scope_row_elements.select_scope], hovered: row.scope_row_elements.select_scope]
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_row(label_text: file_tree_row_label(row: row), indent_width: row.indent_width, selected: PASSED.store.active_scope == row.scope_key)
     )
@@ -1660,7 +1640,7 @@ FUNCTION file_tree_analog_scope_button(row) {
 
 FUNCTION file_tree_ghw_scope_button(row) {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.select_ghw_file], hovered: PASSED.store.elements.select_ghw_file]
+        element: [event: [press: row.scope_row_elements.select_scope], hovered: row.scope_row_elements.select_scope]
         style: [width: Fill, height: 22, paint: False, spring_range: 3]
         label: tree_row(label_text: file_tree_row_label(row: row), indent_width: row.indent_width, selected: PASSED.store.active_scope == row.scope_key)
     )
@@ -2098,7 +2078,7 @@ FUNCTION selected_name_column_body() {
             paint: False
         ]
         items:
-            PASSED.store.selected_visible_items |> List/map(row, new: selected_name_column_row(row: row))
+            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_name_column_row(row: row))
     )
 }
 
@@ -2113,7 +2093,7 @@ FUNCTION selected_value_column_body() {
             paint: False
         ]
         items:
-            PASSED.store.selected_visible_items |> List/map(row, new: selected_value_column_row(row: row))
+            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_value_column_row(row: row))
     )
 }
 
@@ -2168,7 +2148,7 @@ FUNCTION selected_wave_rows_column() {
             paint: False
         ]
         items:
-            PASSED.store.selected_visible_items |> List/map(row, new: selected_wave_column_row(row: row))
+            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_wave_column_row(row: row))
     )
 }
 
@@ -4039,8 +4019,7 @@ FUNCTION waveform_segment_lane(signal) {
         gap: 2
         style: [width: Fill, height: Fill, paint: False]
         items:
-            PASSED.store.selected_waveform_segments
-            |> List/filter_field_equal(field: "signal_id", value: signal.id)
+            signal.segments
             |> List/map(segment, new: waveform_segment(segment: waveform_segment_for_signal(segment: segment, signal: signal)))
     )
 }

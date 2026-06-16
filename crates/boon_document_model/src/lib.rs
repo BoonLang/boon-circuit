@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -27,11 +27,83 @@ pub enum DocumentNodeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+pub struct StyleRichTextSpan {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_weight: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StyleEditorTypeHint {
+    #[serde(default)]
+    pub line: usize,
+    #[serde(default)]
+    pub start: usize,
+    #[serde(default)]
+    pub end: usize,
+    #[serde(default)]
+    pub anchor_column: usize,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub compact_label: String,
+    #[serde(default)]
+    pub detail_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StyleValue {
     Text(String),
     Number(f64),
     Bool(bool),
+    RichTextSpans(Vec<StyleRichTextSpan>),
+    EditorTypeHints(Vec<StyleEditorTypeHint>),
+}
+
+impl Serialize for StyleValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            StyleValue::Text(value) => serializer.serialize_str(value),
+            StyleValue::Number(value) => serializer.serialize_f64(*value),
+            StyleValue::Bool(value) => serializer.serialize_bool(*value),
+            StyleValue::RichTextSpans(spans) => {
+                let value = serde_json::to_string(spans).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&value)
+            }
+            StyleValue::EditorTypeHints(hints) => {
+                let value = serde_json::to_string(hints).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&value)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StyleValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(value) => Ok(StyleValue::Text(value)),
+            serde_json::Value::Number(value) => value
+                .as_f64()
+                .map(StyleValue::Number)
+                .ok_or_else(|| serde::de::Error::custom("style number must fit f64")),
+            serde_json::Value::Bool(value) => Ok(StyleValue::Bool(value)),
+            _ => Err(serde::de::Error::custom(
+                "style value must be a string, number, or bool",
+            )),
+        }
+    }
 }
 
 pub type StyleMap = BTreeMap<String, StyleValue>;
@@ -147,5 +219,33 @@ impl DocumentFrame {
             focus: None,
             scroll_roots: BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_style_payloads_serialize_as_legacy_json_strings() {
+        let value = StyleValue::RichTextSpans(vec![StyleRichTextSpan {
+            text: "SOURCE".to_owned(),
+            source_text: Some("SOURCE".to_owned()),
+            color: Some("#ff0000".to_owned()),
+            font_style: Some("italic".to_owned()),
+            font_weight: Some("bold".to_owned()),
+        }]);
+
+        let encoded = serde_json::to_value(&value).expect("style value should serialize");
+        let encoded_text = encoded
+            .as_str()
+            .expect("typed style payloads must keep legacy string JSON shape");
+        let decoded_payload: Vec<StyleRichTextSpan> =
+            serde_json::from_str(encoded_text).expect("legacy payload string should be valid JSON");
+        assert_eq!(decoded_payload[0].text, "SOURCE");
+
+        let decoded_value: StyleValue =
+            serde_json::from_value(encoded).expect("legacy style value should deserialize");
+        assert!(matches!(decoded_value, StyleValue::Text(_)));
     }
 }

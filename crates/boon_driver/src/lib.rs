@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::{fs, io};
 
 pub const TIER_RUNTIME: &str = "runtime";
 pub const TIER_BOON_DRIVER: &str = "boon-driver";
@@ -9,6 +12,383 @@ pub const LEGACY_TIER_HOST_SYNTHETIC: &str = "host-synthetic";
 
 pub const METHOD_APP_OWNED_HOST_INPUT: &str = "boon-driver-app-owned-host-input";
 pub const METHOD_LINUX_HUMAN_LIKE: &str = "linux-human-like-isolated-compositor";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceIntent {
+    pub sequence_id: u64,
+    pub event_id: u64,
+    pub source_path: String,
+    pub source_id: Option<u64>,
+    pub source_epoch: Option<u64>,
+    pub payload: BTreeMap<String, String>,
+    pub row_identity: Option<SourceRowIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRowIdentity {
+    pub list: String,
+    pub key: u64,
+    pub generation: u64,
+}
+
+impl SourceIntent {
+    pub fn new(sequence_id: u64, event_id: u64, source_path: impl Into<String>) -> Self {
+        Self {
+            sequence_id,
+            event_id,
+            source_path: source_path.into(),
+            source_id: None,
+            source_epoch: None,
+            payload: BTreeMap::new(),
+            row_identity: None,
+        }
+    }
+}
+
+pub fn source_intent_boundary_schema() -> Value {
+    json!({
+        "boundary": "BoonDriver SourceIntent -> playground SourceBatch -> boon_runtime dispatch",
+        "driver_depends_on_boon_runtime": false,
+        "required_fields": [
+            "sequence_id",
+            "event_id",
+            "source_path",
+            "payload"
+        ],
+        "runtime_resolved_fields": [
+            "source_id",
+            "source_epoch",
+            "row_identity.key",
+            "row_identity.generation"
+        ],
+        "private_runtime_mutation_allowed": false
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DriverScenario {
+    pub name: String,
+    pub source: String,
+    #[serde(default)]
+    pub step: Vec<DriverScenarioStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DriverScenarioStep {
+    pub id: String,
+    #[serde(default)]
+    pub user_action: Option<BTreeMap<String, toml::Value>>,
+    #[serde(default)]
+    pub expected_source_event: Option<BTreeMap<String, toml::Value>>,
+    #[serde(default)]
+    pub source_intent_exemption: Option<String>,
+}
+
+pub fn parse_scenario_str(source: &str) -> Result<DriverScenario, toml::de::Error> {
+    toml::from_str(source)
+}
+
+pub fn parse_scenario_path(path: &Path) -> Result<DriverScenario, DriverScenarioParseError> {
+    let source = fs::read_to_string(path).map_err(DriverScenarioParseError::Io)?;
+    parse_scenario_str(&source).map_err(DriverScenarioParseError::Toml)
+}
+
+#[derive(Debug)]
+pub enum DriverScenarioParseError {
+    Io(io::Error),
+    Toml(toml::de::Error),
+}
+
+impl std::fmt::Display for DriverScenarioParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::Toml(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DriverScenarioParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Toml(error) => Some(error),
+        }
+    }
+}
+
+pub fn scenario_engine_proof(
+    scenario: &DriverScenario,
+    runtime_report: &Value,
+    native_preview_proof: Option<&Value>,
+) -> Value {
+    let runtime_steps = runtime_report
+        .get("per_step_pass_fail")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let native_action_proofs = native_preview_proof
+        .and_then(|proof| proof.get("action_proofs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let runtime_status_pass = runtime_report.get("status").and_then(Value::as_str) == Some("pass");
+    let native_proof_pass = native_preview_proof
+        .and_then(|proof| proof.get("status"))
+        .and_then(Value::as_str)
+        == Some("pass");
+    let no_real_window_claim = native_preview_proof
+        .and_then(|proof| proof.get("real_window_claimed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        == false;
+    let no_human_claim = native_preview_proof
+        .and_then(|proof| proof.get("human_observation_claimed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        == false;
+    let runtime_step_by_id = runtime_steps
+        .iter()
+        .filter_map(|step| Some((step.get("id")?.as_str()?.to_owned(), step.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut action_index = 0usize;
+    let mut per_step = Vec::new();
+    let mut blockers = Vec::new();
+    let mut source_intent_recorded = true;
+    let mut runtime_dispatch_recorded = true;
+    let mut document_render_evidence_recorded = true;
+    let mut selectors_resolved = true;
+    let mut host_input_routed = true;
+    for step in &scenario.step {
+        let runtime_step = runtime_step_by_id.get(&step.id).cloned();
+        let user_action_present = step.user_action.is_some();
+        let expected_source = step_expected_source(step);
+        let source_producing_action = user_action_present && expected_source.is_some();
+        let exempt_action = user_action_present
+            && expected_source.is_none()
+            && step.source_intent_exemption.is_some();
+        let expected_event_json = toml_map_to_json(step.expected_source_event.as_ref());
+        let target_selector = target_selector_for_step(step);
+        let native_action = if source_producing_action {
+            let action = native_action_proofs.get(action_index).cloned();
+            action_index += 1;
+            action
+        } else {
+            None
+        };
+        let runtime_source = runtime_step
+            .as_ref()
+            .and_then(|step| step.pointer("/source_route_execution/source"))
+            .and_then(Value::as_str);
+        let native_source = native_action
+            .as_ref()
+            .and_then(|action| action.pointer("/runtime_event/source"))
+            .and_then(Value::as_str);
+        let runtime_pass = runtime_step
+            .as_ref()
+            .and_then(|step| step.get("pass"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let runtime_input_route = runtime_step
+            .as_ref()
+            .and_then(|step| step.get("input_route_verified"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let native_status_pass = native_action
+            .as_ref()
+            .and_then(|action| action.get("status"))
+            .and_then(Value::as_str)
+            == Some("pass");
+        let native_source_binding = native_action
+            .as_ref()
+            .and_then(|action| action.get("source_binding_resolved"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let native_hit_test = native_action
+            .as_ref()
+            .and_then(|action| action.get("hit_test_performed"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let source_matches = match expected_source {
+            Some(expected) => runtime_source == Some(expected) && native_source == Some(expected),
+            None => !source_producing_action,
+        };
+        let has_runtime_dispatch = !source_producing_action
+            || runtime_step
+                .as_ref()
+                .and_then(|step| step.get("source_route_execution"))
+                .is_some();
+        let has_document_render_evidence = !source_producing_action
+            || runtime_step
+                .as_ref()
+                .and_then(|step| step.get("render_patch_count"))
+                .and_then(Value::as_u64)
+                .is_some()
+                && native_action
+                    .as_ref()
+                    .and_then(|action| action.get("framebuffer_delta_evidence"))
+                    .is_some();
+        let step_pass = runtime_pass
+            && (!source_producing_action && (!user_action_present || exempt_action)
+                || source_producing_action
+                    && expected_source.is_some()
+                    && runtime_input_route
+                    && native_status_pass
+                    && native_source_binding
+                    && native_hit_test
+                    && source_matches
+                    && has_runtime_dispatch
+                    && has_document_render_evidence);
+        if user_action_present
+            && expected_source.is_none()
+            && step.source_intent_exemption.is_none()
+        {
+            source_intent_recorded = false;
+        }
+        if source_producing_action && !has_runtime_dispatch {
+            runtime_dispatch_recorded = false;
+        }
+        if source_producing_action && !has_document_render_evidence {
+            document_render_evidence_recorded = false;
+        }
+        if source_producing_action
+            && !(native_status_pass && native_source_binding && native_hit_test)
+        {
+            selectors_resolved = false;
+            host_input_routed = false;
+        }
+        if !step_pass {
+            blockers.push(format!(
+                "scenario step `{}` did not prove driver route",
+                step.id
+            ));
+        }
+        per_step.push(json!({
+            "id": &step.id,
+            "pass": step_pass,
+            "user_action_present": user_action_present,
+            "source_producing_action": source_producing_action,
+            "source_intent_exempt_action": exempt_action,
+            "target_selector": target_selector,
+            "expected_source_event": expected_event_json,
+            "source_intent_recorded": expected_source.is_some() || step.source_intent_exemption.is_some(),
+            "source_intent_exemption": step.source_intent_exemption.clone(),
+            "runtime_step_present": runtime_step.is_some(),
+            "runtime_step_pass": runtime_pass,
+            "runtime_input_route_verified": runtime_input_route,
+            "runtime_source": runtime_source,
+            "native_action_index": if source_producing_action { Some(action_index - 1) } else { None },
+            "native_action_present": native_action.is_some(),
+            "native_action_status": native_action
+                .as_ref()
+                .and_then(|action| action.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "native_source": native_source,
+            "source_matches_scenario": source_matches,
+            "host_input_routed": !source_producing_action || (native_status_pass && native_source_binding),
+            "hit_focus_scroll_evidence": native_action
+                .as_ref()
+                .and_then(|action| action.get("hit_focus_scroll_evidence"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "runtime_dispatch_recorded": has_runtime_dispatch,
+            "document_render_evidence_recorded": has_document_render_evidence,
+            "runtime_dispatch": runtime_step
+                .as_ref()
+                .and_then(|step| step.get("source_route_execution"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "semantic_delta_count": runtime_step
+                .as_ref()
+                .and_then(|step| step.get("semantic_delta_count"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "render_patch_count": runtime_step
+                .as_ref()
+                .and_then(|step| step.get("render_patch_count"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "framebuffer_delta_evidence": native_action
+                .as_ref()
+                .and_then(|action| action.get("framebuffer_delta_evidence"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+        }));
+    }
+    let action_step_count = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_some())
+        .count();
+    let action_counts_match =
+        action_index == native_action_proofs.len() && action_index == action_step_count;
+    if !action_counts_match {
+        blockers.push(format!(
+            "scenario action count {action_step_count} did not match native action proof count {}",
+            native_action_proofs.len()
+        ));
+    }
+    if !runtime_status_pass {
+        blockers.push("fresh runtime scenario report did not pass".to_owned());
+    }
+    if !native_proof_pass {
+        blockers.push("app-owned native preview proof did not pass".to_owned());
+    }
+    if !no_real_window_claim {
+        blockers.push("BoonDriver scenario proof cannot claim real-window evidence".to_owned());
+    }
+    if !no_human_claim {
+        blockers.push("BoonDriver scenario proof cannot claim human observation".to_owned());
+    }
+    let all_steps_pass = per_step
+        .iter()
+        .all(|step| step.get("pass").and_then(Value::as_bool) == Some(true));
+    let pass = runtime_status_pass
+        && native_proof_pass
+        && no_real_window_claim
+        && no_human_claim
+        && action_counts_match
+        && all_steps_pass
+        && source_intent_recorded
+        && runtime_dispatch_recorded
+        && document_render_evidence_recorded
+        && selectors_resolved
+        && host_input_routed;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "evidence_tier": TIER_BOON_DRIVER,
+        "runtime_evidence_tier": TIER_RUNTIME,
+        "method": METHOD_APP_OWNED_HOST_INPUT,
+        "scenario_parser": {
+            "name": &scenario.name,
+            "source": &scenario.source,
+            "step_count": scenario.step.len(),
+            "action_step_count": action_step_count,
+        },
+        "parsed_scenario": true,
+        "selectors_resolved": selectors_resolved,
+        "waits_performed": runtime_steps.len() == scenario.step.len() && runtime_status_pass,
+        "actions_dispatched": action_counts_match && action_step_count > 0,
+        "host_input_routed": host_input_routed,
+        "source_intent_recorded": source_intent_recorded,
+        "runtime_dispatch_recorded": runtime_dispatch_recorded,
+        "document_render_evidence_recorded": document_render_evidence_recorded,
+        "assertions_performed": all_steps_pass,
+        "driver_owns_per_step_route": true,
+        "real_window_claimed": false,
+        "human_observation_claimed": false,
+        "cannot_claim_real_window_or_human": true,
+        "runtime_status": runtime_report.get("status").cloned().unwrap_or_else(|| json!(null)),
+        "native_preview_status": native_preview_proof
+            .and_then(|proof| proof.get("status"))
+            .cloned()
+            .unwrap_or_else(|| json!(null)),
+        "action_proofs": per_step,
+        "native_preview_proof": native_preview_proof.cloned().unwrap_or_else(|| json!(null)),
+        "blockers": if blockers.is_empty() { json!(null) } else { json!(blockers) },
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriverEvidenceTier {
@@ -140,6 +520,7 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
                         .unwrap_or_else(|| json!(null)),
                     "hit_region": route.get("target_hit_region").cloned()
                         .unwrap_or_else(|| json!(null)),
+                    "hit_focus_scroll_evidence": route_hit_focus_scroll_evidence(route),
                     "source_binding_resolved": source_binding_resolved,
                     "hit_test_performed": route.get("target_hit_region").is_some(),
                     "runtime_event": route.get("host_events").cloned().unwrap_or_else(|| json!([])),
@@ -173,6 +554,7 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
                         .unwrap_or_else(|| json!(null)),
                     "hit_region": route.get("target_hit_region").cloned()
                         .unwrap_or_else(|| json!(null)),
+                    "hit_focus_scroll_evidence": route_hit_focus_scroll_evidence(&route),
                     "source_binding_resolved": route.get("source_binding_resolved").cloned()
                         .unwrap_or_else(|| json!(false)),
                     "hit_test_performed": route.get("hit_test_performed").cloned()
@@ -225,6 +607,8 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
             "driver_action",
             "target_resolution",
             "hit_or_scroll_region",
+            "focus_route",
+            "scroll_route",
             "source_binding",
             "runtime_dispatch",
             "document_or_render_patch",
@@ -253,6 +637,19 @@ pub fn app_owned_dev_window_proof(report: &Value) -> Value {
                     .pointer("/host_synthetic_activation/hit_test_performed")
                     .cloned()
                     .unwrap_or_else(|| json!(null)),
+                "target_hit_region": command_report
+                    .pointer("/host_synthetic_activation/target_hit_region")
+                    .cloned()
+                    .unwrap_or_else(|| json!(null)),
+                "typed_hit_side_table": command_report
+                    .pointer("/host_synthetic_activation/typed_hit_side_table")
+                    .cloned()
+                    .unwrap_or_else(|| json!(null)),
+                "hit_focus_scroll_evidence": route_hit_focus_scroll_evidence(
+                    command_report
+                        .get("host_synthetic_activation")
+                        .unwrap_or(&Value::Null)
+                ),
                 "direct_dispatch_without_hit_test": command_report
                     .get("direct_dispatch_without_hit_test")
                     .cloned()
@@ -367,6 +764,109 @@ fn pointer_str<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
     value.pointer(pointer).and_then(Value::as_str)
 }
 
+fn route_hit_focus_scroll_evidence(route: &Value) -> Value {
+    let hit_region = route
+        .get("target_hit_region")
+        .or_else(|| route.pointer("/host_synthetic_activation/target_hit_region"))
+        .unwrap_or(&Value::Null);
+    json!({
+        "hit_region": hit_region,
+        "hit_node": hit_region.get("node").cloned().unwrap_or_else(|| json!(null)),
+        "source_binding_id": hit_region
+            .get("source_binding_id")
+            .cloned()
+            .unwrap_or_else(|| json!(null)),
+        "focus": {
+            "node": route
+                .get("focus_node")
+                .or_else(|| route.get("focused_node"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "status": route
+                .get("focus_status")
+                .cloned()
+                .unwrap_or_else(|| json!("not-required-for-pointer-route"))
+        },
+        "scroll": {
+            "root": route
+                .get("scroll_root")
+                .or_else(|| hit_region.get("scroll_root"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "region": route
+                .get("scroll_region")
+                .cloned()
+                .unwrap_or_else(|| json!(null))
+        },
+        "row_identity": {
+            "key": hit_region
+                .get("row_key")
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "generation": hit_region
+                .get("row_generation")
+                .cloned()
+                .unwrap_or_else(|| json!(null))
+        }
+    })
+}
+
+fn step_expected_source(step: &DriverScenarioStep) -> Option<&str> {
+    step.expected_source_event
+        .as_ref()
+        .and_then(|event| event.get("source"))
+        .and_then(toml_value_as_str)
+}
+
+fn toml_value_as_str(value: &toml::Value) -> Option<&str> {
+    match value {
+        toml::Value::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn target_selector_for_step(step: &DriverScenarioStep) -> Value {
+    let Some(action) = step.user_action.as_ref() else {
+        return json!(null);
+    };
+    json!({
+        "kind": action.get("kind").and_then(toml_value_as_str),
+        "target": action.get("target").and_then(toml_value_as_str),
+        "target_text": action.get("target_text").and_then(toml_value_as_str),
+        "address": action.get("address").and_then(toml_value_as_str),
+        "raw": toml_map_to_json(Some(action)),
+    })
+}
+
+fn toml_map_to_json(map: Option<&BTreeMap<String, toml::Value>>) -> Value {
+    let Some(map) = map else {
+        return json!(null);
+    };
+    let mut object = serde_json::Map::new();
+    for (key, value) in map {
+        object.insert(key.clone(), toml_value_to_json(value));
+    }
+    Value::Object(object)
+}
+
+fn toml_value_to_json(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(value) => json!(value),
+        toml::Value::Integer(value) => json!(value),
+        toml::Value::Float(value) => json!(value),
+        toml::Value::Boolean(value) => json!(value),
+        toml::Value::Datetime(value) => json!(value.to_string()),
+        toml::Value::Array(values) => Value::Array(values.iter().map(toml_value_to_json).collect()),
+        toml::Value::Table(table) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in table {
+                object.insert(key.clone(), toml_value_to_json(value));
+            }
+            Value::Object(object)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +879,33 @@ mod tests {
         ));
         assert!(evidence_tier_satisfies(TIER_REAL_WINDOW, TIER_BOON_DRIVER));
         assert!(!evidence_tier_satisfies(TIER_BOON_DRIVER, TIER_REAL_WINDOW));
+    }
+
+    #[test]
+    fn source_intent_schema_is_host_neutral_and_batch_ready() {
+        let mut intent = SourceIntent::new(7, 11, "store.sources.submit.press");
+        intent.source_id = Some(3);
+        intent.source_epoch = Some(99);
+        intent.payload.insert("key".to_owned(), "Enter".to_owned());
+        intent.row_identity = Some(SourceRowIdentity {
+            list: "todos".to_owned(),
+            key: 42,
+            generation: 2,
+        });
+        let value = serde_json::to_value(&intent).unwrap();
+        assert_eq!(value["sequence_id"], 7);
+        assert_eq!(value["event_id"], 11);
+        assert_eq!(value["source_id"], 3);
+        assert_eq!(value["source_epoch"], 99);
+        assert_eq!(value["row_identity"]["generation"], 2);
+
+        let schema = source_intent_boundary_schema();
+        assert_eq!(
+            schema["boundary"],
+            "BoonDriver SourceIntent -> playground SourceBatch -> boon_runtime dispatch"
+        );
+        assert_eq!(schema["driver_depends_on_boon_runtime"], false);
+        assert_eq!(schema["private_runtime_mutation_allowed"], false);
     }
 
     #[test]
@@ -403,7 +930,13 @@ mod tests {
                         "pass": true,
                         "source_binding_resolved": true,
                         "hit_test_performed": true,
-                        "target_hit_region": {"node": "submit_button"}
+                        "target_hit_region": {
+                            "node": "submit_button",
+                            "source_binding_id": "source:submit_button:press",
+                            "scroll_root": "main-scroll",
+                            "row_key": 42,
+                            "row_generation": 3
+                        }
                     }]
                 }
             }
@@ -413,6 +946,139 @@ mod tests {
         assert_eq!(
             proof.get("real_window_claimed").and_then(Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            proof["action_proofs"][0]["hit_focus_scroll_evidence"]["scroll"]["root"],
+            "main-scroll"
+        );
+        assert_eq!(
+            proof["action_proofs"][0]["hit_focus_scroll_evidence"]["row_identity"]["generation"],
+            3
+        );
+    }
+
+    #[test]
+    fn scenario_engine_proof_binds_parsed_steps_to_runtime_and_native_actions() {
+        let scenario = parse_scenario_str(
+            r#"
+name = "driver-smoke"
+source = "examples/driver-smoke.bn"
+
+[[step]]
+id = "initial"
+
+[[step]]
+id = "press-submit"
+user_action = { kind = "click", target = "submit", target_text = "Submit" }
+expected_source_event = { source = "store.sources.submit.press", target_text = "Submit" }
+"#,
+        )
+        .unwrap();
+        let runtime_report = json!({
+            "status": "pass",
+            "per_step_pass_fail": [
+                {"id": "initial", "pass": true, "input_route_verified": false, "semantic_delta_count": 0, "render_patch_count": 0},
+                {
+                    "id": "press-submit",
+                    "pass": true,
+                    "input_route_verified": true,
+                    "semantic_delta_count": 1,
+                    "render_patch_count": 1,
+                    "source_route_execution": {
+                        "source": "store.sources.submit.press",
+                        "source_id": 7,
+                        "route_id": 3
+                    }
+                }
+            ]
+        });
+        let native_proof = json!({
+            "status": "pass",
+            "real_window_claimed": false,
+            "human_observation_claimed": false,
+            "action_proofs": [{
+                "status": "pass",
+                "source_binding_resolved": true,
+                "hit_test_performed": true,
+                "runtime_event": {"source": "store.sources.submit.press"},
+                "hit_focus_scroll_evidence": {
+                    "hit_node": "submit_button",
+                    "scroll": {"root": "main"},
+                    "focus": {"status": "not-required-for-pointer-route"}
+                },
+                "framebuffer_delta_evidence": {"method": "render-patch-backed-framebuffer-change-required"}
+            }]
+        });
+        let proof = scenario_engine_proof(&scenario, &runtime_report, Some(&native_proof));
+        assert_eq!(proof.get("status").and_then(Value::as_str), Some("pass"));
+        assert_eq!(
+            proof
+                .pointer("/scenario_parser/action_step_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            proof
+                .pointer("/action_proofs/1/target_selector/target_text")
+                .and_then(Value::as_str),
+            Some("Submit")
+        );
+        assert_eq!(
+            proof
+                .pointer("/action_proofs/1/runtime_dispatch/source")
+                .and_then(Value::as_str),
+            Some("store.sources.submit.press")
+        );
+    }
+
+    #[test]
+    fn scenario_engine_proof_rejects_missing_native_route_and_tier_inflation() {
+        let scenario = parse_scenario_str(
+            r#"
+name = "driver-smoke"
+source = "examples/driver-smoke.bn"
+
+[[step]]
+id = "press-submit"
+user_action = { kind = "click", target = "submit" }
+expected_source_event = { source = "store.sources.submit.press" }
+"#,
+        )
+        .unwrap();
+        let runtime_report = json!({
+            "status": "pass",
+            "per_step_pass_fail": [{
+                "id": "press-submit",
+                "pass": true,
+                "input_route_verified": true,
+                "semantic_delta_count": 1,
+                "render_patch_count": 1,
+                "source_route_execution": {"source": "store.sources.submit.press"}
+            }]
+        });
+        let inflated_native_proof = json!({
+            "status": "pass",
+            "real_window_claimed": true,
+            "human_observation_claimed": false,
+            "action_proofs": []
+        });
+        let proof = scenario_engine_proof(&scenario, &runtime_report, Some(&inflated_native_proof));
+        assert_eq!(proof.get("status").and_then(Value::as_str), Some("fail"));
+        assert_eq!(
+            proof
+                .get("cannot_claim_real_window_or_human")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            proof
+                .get("blockers")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker
+                    .as_str()
+                    .is_some_and(|text| text.contains("real-window")))
         );
     }
 

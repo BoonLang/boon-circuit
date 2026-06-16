@@ -392,6 +392,16 @@ fn parse_combined_source(
     let list_memory_names = collect_list_memory_names(&ast);
     let source_row_scope_functions = collect_row_scope_functions(&ast, true, &list_memory_names);
     let mut row_scope_functions = collect_row_scope_functions(&ast, false, &list_memory_names);
+    let mut structure_row_scope_functions = row_scope_functions.clone();
+    for source_scope in &source_row_scope_functions {
+        if !structure_row_scope_functions.iter().any(|existing| {
+            existing.list == source_scope.list
+                && existing.function == source_scope.function
+                && existing.row_scope == source_scope.row_scope
+        }) {
+            structure_row_scope_functions.push(source_scope.clone());
+        }
+    }
     for source_scope in &source_row_scope_functions {
         if !row_scope_functions.iter().any(|existing| {
             existing.list == source_scope.list && existing.row_scope == source_scope.row_scope
@@ -403,7 +413,7 @@ fn parse_combined_source(
             });
         }
     }
-    let structure = derive_program_tables(&ast, &source_row_scope_functions);
+    let structure = derive_program_tables(&ast, &structure_row_scope_functions);
     Ok(ParsedProgram {
         expressions: ast.expressions.clone(),
         sources: collect_sources(&ast),
@@ -1053,7 +1063,8 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         .flatten();
     let source_event = ast_insource_slice_event(&symbols).map(ToOwned::to_owned);
     let operators = ast_expression_operators(&symbols);
-    let is_list = symbols.iter().any(|lexeme| is_list_constructor(lexeme));
+    let is_list = symbols.iter().any(|lexeme| is_list_constructor(lexeme))
+        && find_top_level_pipe(&symbols).is_none();
     ParserItem {
         line: line.line,
         indent: line.indent,
@@ -1291,6 +1302,9 @@ fn ast_expr_kind(
     {
         return AstExprKind::Identifier("BLOCK".to_owned());
     }
+    if let Some(pipe) = find_top_level_pipe(tokens) {
+        return ast_pipe_expr_kind(tokens, pipe, item, expressions, source);
+    }
     if tokens.first().map(String::as_str) == Some("LATEST") {
         return AstExprKind::Latest;
     }
@@ -1329,54 +1343,6 @@ fn ast_expr_kind(
         return AstExprKind::TaggedObject {
             tag: tokens[0].clone(),
             fields: ast_record_fields(&tokens[1..], item, expressions, source),
-        };
-    }
-    if let Some(pipe) = find_top_level_pipe(tokens) {
-        let input = parse_ast_expr(&tokens[..pipe], item, expressions, source);
-        let op = tokens
-            .get(pipe + 1)
-            .cloned()
-            .unwrap_or_else(|| "pipe".to_owned());
-        if op == "HOLD" {
-            let name = tokens
-                .get(pipe + 2)
-                .cloned()
-                .unwrap_or_else(|| "hold".to_owned());
-            return AstExprKind::Hold {
-                initial: input,
-                name,
-            };
-        }
-        if op == "WHEN" {
-            return AstExprKind::When { input };
-        }
-        if op == "THEN" {
-            return AstExprKind::Then {
-                input,
-                output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source),
-            };
-        }
-        if op == "SOURCE"
-            && let Some(value) =
-                ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source)
-        {
-            let (start, end) =
-                span_for_tokens(&tokens[pipe + 1..], item).unwrap_or((item.start, item.end));
-            return AstExprKind::Pipe {
-                input,
-                op,
-                args: vec![AstCallArg {
-                    name: None,
-                    value,
-                    start,
-                    end,
-                }],
-            };
-        }
-        return AstExprKind::Pipe {
-            input,
-            op,
-            args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source),
         };
     }
     if let Some((left, op, right)) = split_infix(tokens) {
@@ -1456,6 +1422,60 @@ fn ast_number_literal(tokens: &[String]) -> Option<String> {
             Some(format!("-{left}.{}", right.join("")))
         }
         _ => None,
+    }
+}
+
+fn ast_pipe_expr_kind(
+    tokens: &[String],
+    pipe: usize,
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> AstExprKind {
+    let input = parse_ast_expr(&tokens[..pipe], item, expressions, source);
+    let op = tokens
+        .get(pipe + 1)
+        .cloned()
+        .unwrap_or_else(|| "pipe".to_owned());
+    if op == "HOLD" {
+        let name = tokens
+            .get(pipe + 2)
+            .cloned()
+            .unwrap_or_else(|| "hold".to_owned());
+        return AstExprKind::Hold {
+            initial: input,
+            name,
+        };
+    }
+    if op == "WHEN" {
+        return AstExprKind::When { input };
+    }
+    if op == "THEN" {
+        return AstExprKind::Then {
+            input,
+            output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source),
+        };
+    }
+    if op == "SOURCE"
+        && let Some(value) = ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source)
+    {
+        let (start, end) =
+            span_for_tokens(&tokens[pipe + 1..], item).unwrap_or((item.start, item.end));
+        return AstExprKind::Pipe {
+            input,
+            op,
+            args: vec![AstCallArg {
+                name: None,
+                value,
+                start,
+                end,
+            }],
+        };
+    }
+    AstExprKind::Pipe {
+        input,
+        op,
+        args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source),
     }
 }
 
@@ -2270,7 +2290,6 @@ fn hidden_runtime_identity_token(value: &str) -> Option<&'static str> {
         "row_key",
         "hidden_key",
         "hidden_keys",
-        "generation",
         "hidden_generation",
         "target_key",
         "target_generation",
@@ -2407,6 +2426,7 @@ fn derive_program_tables(
 ) -> StructureTables {
     let mut tables = StructureTables::default();
     let function_bodies = function_body_index(&ast.statements);
+    let inferred_list_memory_names = collect_list_memory_names(ast);
     derive_structure_from_statements(
         &ast.statements,
         &ast.expressions,
@@ -2417,7 +2437,132 @@ fn derive_program_tables(
         &mut Vec::new(),
         &mut tables,
     );
+    add_missing_row_scope_list_memories(&mut tables, row_scopes);
+    let published_list_memory_names = tables
+        .list_memories
+        .iter()
+        .map(|list| list.name.clone())
+        .collect::<BTreeSet<_>>();
+    add_inferred_list_memories(
+        &mut tables,
+        ast,
+        &inferred_list_memory_names,
+        &published_list_memory_names,
+    );
     tables
+}
+
+fn add_inferred_list_memories(
+    tables: &mut StructureTables,
+    ast: &AstProgram,
+    candidate_names: &BTreeSet<String>,
+    published_list_names: &BTreeSet<String>,
+) {
+    for name in candidate_names {
+        if matches!(
+            name.as_str(),
+            "store" | "document" | "scene" | "items" | "children"
+        ) || tables.list_memories.iter().any(|list| &list.name == name)
+        {
+            continue;
+        }
+        let Some(statement) = list_memory_statement(ast, name) else {
+            continue;
+        };
+        if !statement_returns_existing_list_from_branch(statement, ast, published_list_names) {
+            continue;
+        }
+        tables.list_memories.push(ParsedListMemory {
+            name: name.clone(),
+            line: statement.line,
+            capacity: None,
+        });
+    }
+}
+
+fn list_memory_statement<'a>(ast: &'a AstProgram, name: &str) -> Option<&'a AstStatement> {
+    list_memory_statement_in_statements(&ast.statements, name)
+}
+
+fn list_memory_statement_in_statements<'a>(
+    statements: &'a [AstStatement],
+    name: &str,
+) -> Option<&'a AstStatement> {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Field { name: field }
+            | AstStatementKind::List {
+                field: Some(field), ..
+            } if field == name => return Some(statement),
+            _ => {}
+        }
+        if let Some(statement) = list_memory_statement_in_statements(&statement.children, name) {
+            return Some(statement);
+        }
+    }
+    None
+}
+
+fn statement_returns_existing_list_from_branch(
+    statement: &AstStatement,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+) -> bool {
+    statement.children.iter().any(|child| {
+        statement_returns_existing_list_from_branch_inner(child, ast, list_names, false)
+    })
+}
+
+fn statement_returns_existing_list_from_branch_inner(
+    statement: &AstStatement,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+    allow_list_reference: bool,
+) -> bool {
+    let is_when = statement
+        .expr
+        .and_then(|expr_id| ast.expressions.get(expr_id))
+        .is_some_and(|expr| {
+            matches!(expr.kind, AstExprKind::When { .. })
+                || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHEN")
+        });
+    if allow_list_reference
+        && statement.expr.is_some_and(|expr_id| {
+            expr_returns_list_collection_inner(expr_id, ast, list_names, true)
+        })
+    {
+        return true;
+    }
+    statement.children.iter().any(|child| {
+        statement_returns_existing_list_from_branch_inner(
+            child,
+            ast,
+            list_names,
+            allow_list_reference || is_when,
+        )
+    })
+}
+
+fn add_missing_row_scope_list_memories(
+    tables: &mut StructureTables,
+    row_scopes: &[ParsedRowScopeFunction],
+) {
+    for row_scope in row_scopes {
+        if matches!(row_scope.list.as_str(), "items" | "children") {
+            continue;
+        }
+        if !tables
+            .list_memories
+            .iter()
+            .any(|list| list.name == row_scope.list)
+        {
+            tables.list_memories.push(ParsedListMemory {
+                name: row_scope.list.clone(),
+                line: 0,
+                capacity: None,
+            });
+        }
+    }
 }
 
 fn function_body_index<'a>(
@@ -2459,11 +2604,12 @@ fn collect_row_scope_functions(
 
 fn collect_list_memory_names(ast: &AstProgram) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    collect_list_memory_name_statements(&ast.statements, &mut Vec::new(), &mut names);
+    collect_list_memory_name_statements(ast, &ast.statements, &mut Vec::new(), &mut names);
     names
 }
 
 fn collect_list_memory_name_statements(
+    ast: &AstProgram,
     statements: &[AstStatement],
     scope: &mut Vec<String>,
     names: &mut BTreeSet<String>,
@@ -2475,7 +2621,7 @@ fn collect_list_memory_name_statements(
             } => {
                 names.insert(name.clone());
                 scope.push(name.clone());
-                collect_list_memory_name_statements(&statement.children, scope, names);
+                collect_list_memory_name_statements(ast, &statement.children, scope, names);
                 scope.pop();
             }
             AstStatementKind::List { field: None, .. } => {
@@ -2484,12 +2630,23 @@ fn collect_list_memory_name_statements(
                 {
                     names.insert(name.clone());
                 }
-                collect_list_memory_name_statements(&statement.children, scope, names);
+                collect_list_memory_name_statements(ast, &statement.children, scope, names);
             }
             AstStatementKind::Field { name } => {
+                if name != "document"
+                    && !matches!(name.as_str(), "items" | "children")
+                    && (statement
+                        .expr
+                        .is_some_and(|expr_id| expr_returns_list_collection(expr_id, ast, names))
+                        || statement_children_return_list_collection_with_names(
+                            statement, ast, names,
+                        ))
+                {
+                    names.insert(name.clone());
+                }
                 if !statement.children.is_empty() && name != "document" {
                     scope.push(name.clone());
-                    collect_list_memory_name_statements(&statement.children, scope, names);
+                    collect_list_memory_name_statements(ast, &statement.children, scope, names);
                     scope.pop();
                 }
             }
@@ -2498,7 +2655,7 @@ fn collect_list_memory_name_statements(
             | AstStatementKind::Hold { .. }
             | AstStatementKind::Block
             | AstStatementKind::Expression => {
-                collect_list_memory_name_statements(&statement.children, scope, names);
+                collect_list_memory_name_statements(ast, &statement.children, scope, names);
             }
         }
     }
@@ -2527,19 +2684,36 @@ fn derive_structure_from_statements(
         );
         match &statement.kind {
             AstStatementKind::Function { name, .. } => {
-                if let Some(row_scope) = row_scope_for_function(row_scopes, name) {
-                    scope.push(row_scope.to_owned());
+                let function_row_scopes = row_scopes_for_function(row_scopes, name)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for row_scope in function_row_scopes {
+                    scope.push(row_scope);
                     function_stack.push(name.clone());
-                    derive_structure_from_statements(
-                        &statement.children,
-                        expressions,
-                        lines,
-                        row_scopes,
-                        function_bodies,
-                        function_stack,
-                        scope,
-                        tables,
-                    );
+                    if function_body_defines_record_fields(&statement.children, expressions, lines)
+                    {
+                        derive_structure_from_statements(
+                            &statement.children,
+                            expressions,
+                            lines,
+                            row_scopes,
+                            function_bodies,
+                            function_stack,
+                            scope,
+                            tables,
+                        );
+                    } else {
+                        derive_structure_from_called_functions_in_statements(
+                            &statement.children,
+                            expressions,
+                            lines,
+                            row_scopes,
+                            function_bodies,
+                            function_stack,
+                            scope,
+                            tables,
+                        );
+                    }
                     function_stack.pop();
                     scope.pop();
                 }
@@ -2647,10 +2821,18 @@ fn derive_structure_from_statements(
                 );
             }
             AstStatementKind::List { field, capacity } => {
-                let name = field
-                    .clone()
-                    .or_else(|| scope.last().cloned())
-                    .unwrap_or_else(|| format!("list_{}", tables.list_memories.len()));
+                let name = match field.as_deref() {
+                    Some("items" | "children") if scope_is_indexed(scope, row_scopes) => {
+                        generated_local_list_memory_name(
+                            scope,
+                            field.as_deref(),
+                            statement.line,
+                            tables,
+                        )
+                    }
+                    Some(name) => name.to_owned(),
+                    None => anonymous_list_memory_name(scope, statement.line, tables),
+                };
                 tables.list_memories.push(ParsedListMemory {
                     name,
                     line: statement.line,
@@ -2680,6 +2862,83 @@ fn derive_structure_from_statements(
                 );
             }
         }
+    }
+}
+
+fn anonymous_list_memory_name(scope: &[String], line: usize, tables: &StructureTables) -> String {
+    let scoped_candidate = scope.last().cloned();
+    let candidate_is_generic_render_slot = scoped_candidate
+        .as_deref()
+        .is_some_and(|name| matches!(name, "items" | "children"));
+    if let Some(candidate) = scoped_candidate
+        && !candidate_is_generic_render_slot
+        && !tables
+            .list_memories
+            .iter()
+            .any(|list| list.name == candidate)
+    {
+        return candidate;
+    }
+
+    let scope_label = if scope.is_empty() {
+        "list".to_owned()
+    } else {
+        sanitize_generated_list_name(&scope.join("_"))
+    };
+    unique_generated_list_name(format!("{scope_label}_list_{line}"), tables)
+}
+
+fn generated_local_list_memory_name(
+    scope: &[String],
+    local_name: Option<&str>,
+    line: usize,
+    tables: &StructureTables,
+) -> String {
+    let mut parts = scope.to_vec();
+    if let Some(local_name) = local_name {
+        parts.push(local_name.to_owned());
+    }
+    let scope_label = if parts.is_empty() {
+        "list".to_owned()
+    } else {
+        sanitize_generated_list_name(&parts.join("_"))
+    };
+    unique_generated_list_name(format!("{scope_label}_list_{line}"), tables)
+}
+
+fn unique_generated_list_name(base: String, tables: &StructureTables) -> String {
+    if !tables.list_memories.iter().any(|list| list.name == base) {
+        return base;
+    }
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if !tables
+            .list_memories
+            .iter()
+            .any(|list| list.name == candidate)
+        {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn sanitize_generated_list_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "anonymous".to_owned()
+    } else {
+        sanitized
     }
 }
 
@@ -2731,7 +2990,7 @@ fn derive_structure_from_helper_function(
     let Some(children) = function_bodies.get(function) else {
         return;
     };
-    if row_scope_for_function(row_scopes, function).is_some() {
+    if function_has_row_scope(row_scopes, function) {
         return;
     }
     function_stack.push(function.to_owned());
@@ -2807,6 +3066,13 @@ fn function_body_defines_record_fields(
     lines: &[ParserLine],
 ) -> bool {
     statements.iter().any(|statement| {
+        if statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(expr_is_render_constructor_like)
+        {
+            return false;
+        }
         if statement_is_record_field(statement) {
             return true;
         }
@@ -2832,6 +3098,18 @@ fn function_body_defines_record_fields(
                 )
             })
     })
+}
+
+fn expr_is_render_constructor_like(expr: &AstExpr) -> bool {
+    match &expr.kind {
+        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } => {
+            function == "Document/new"
+                || function == "Scene/new"
+                || function.starts_with("Element/")
+                || function.starts_with("Scene/Element/")
+        }
+        _ => false,
+    }
 }
 
 fn statement_is_record_constructor_block(statement: &AstStatement, lines: &[ParserLine]) -> bool {
@@ -3090,14 +3368,17 @@ fn collect_row_scope_statements(
             scope,
             previous_collection_list.as_deref(),
             include_append_constructors,
-        ) && !matches!(row_scope_function.list.as_str(), "items" | "children")
-            && list_memory_names.contains(&row_scope_function.list)
-            && !functions.iter().any(|existing| {
-                existing.list == row_scope_function.list
-                    && existing.row_scope == row_scope_function.row_scope
-            })
-        {
-            functions.push(row_scope_function);
+        ) {
+            if !matches!(row_scope_function.list.as_str(), "items" | "children")
+                && list_memory_names.contains(&row_scope_function.list)
+                && !functions.iter().any(|existing| {
+                    existing.list == row_scope_function.list
+                        && existing.row_scope == row_scope_function.row_scope
+                        && existing.function == row_scope_function.function
+                })
+            {
+                push_row_scope_function(functions, row_scope_function, ast);
+            }
         }
         let updates_collection_context = !matches!(
             &statement.kind,
@@ -3173,6 +3454,113 @@ fn collect_row_scope_statements(
     }
 }
 
+fn push_row_scope_function(
+    functions: &mut Vec<ParsedRowScopeFunction>,
+    mut row_scope_function: ParsedRowScopeFunction,
+    ast: &AstProgram,
+) {
+    let candidate_defines_runtime_fields =
+        row_scope_function_defines_runtime_fields(&row_scope_function.function, ast);
+    while let Some(existing_index) = functions.iter().position(|existing| {
+        existing.row_scope == row_scope_function.row_scope
+            && existing.list != row_scope_function.list
+    }) {
+        let existing_defines_runtime_fields =
+            row_scope_function_defines_runtime_fields(&functions[existing_index].function, ast);
+        match (
+            candidate_defines_runtime_fields,
+            existing_defines_runtime_fields,
+        ) {
+            (true, false) => {
+                functions.remove(existing_index);
+            }
+            (false, true) => {
+                return;
+            }
+            _ => {
+                row_scope_function.row_scope =
+                    unique_row_scope_name(&row_scope_function.list, functions);
+            }
+        }
+    }
+    functions.push(row_scope_function);
+}
+
+fn row_scope_function_defines_runtime_fields(function: &str, ast: &AstProgram) -> bool {
+    let mut function_bodies = BTreeMap::new();
+    collect_function_body_index(&ast.statements, &mut function_bodies);
+    function_defines_runtime_fields_transitively(
+        function,
+        &function_bodies,
+        &ast.expressions,
+        &mut Vec::new(),
+    )
+}
+
+fn function_defines_runtime_fields_transitively(
+    function: &str,
+    function_bodies: &BTreeMap<&str, &[AstStatement]>,
+    expressions: &[AstExpr],
+    stack: &mut Vec<String>,
+) -> bool {
+    if stack.iter().any(|entry| entry == function) {
+        return false;
+    }
+    let Some(children) = function_bodies.get(function) else {
+        return false;
+    };
+    if function_body_defines_runtime_fields(children) {
+        return true;
+    }
+    stack.push(function.to_owned());
+    let mut calls = Vec::new();
+    collect_called_functions_in_statements(children, expressions, &mut calls);
+    let found = calls.iter().any(|call| {
+        function_defines_runtime_fields_transitively(call, function_bodies, expressions, stack)
+    });
+    stack.pop();
+    found
+}
+
+fn function_body_defines_runtime_fields(statements: &[AstStatement]) -> bool {
+    statements.iter().any(|statement| {
+        matches!(
+            statement.kind,
+            AstStatementKind::Source { .. }
+                | AstStatementKind::Hold { .. }
+                | AstStatementKind::List { field: Some(_), .. }
+        ) || function_body_defines_runtime_fields(&statement.children)
+    })
+}
+
+fn collect_called_functions_in_statements(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    calls: &mut Vec<String>,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr {
+            collect_called_functions(expr_id, expressions, calls);
+        }
+        collect_called_functions_in_statements(&statement.children, expressions, calls);
+    }
+}
+
+fn unique_row_scope_name(list: &str, functions: &[ParsedRowScopeFunction]) -> String {
+    let base = singular_row_scope(list);
+    if !functions.iter().any(|scope| scope.row_scope == base) {
+        return base;
+    }
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if !functions.iter().any(|scope| scope.row_scope == candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
 fn statement_row_scope_function(
     statement: &AstStatement,
     ast: &AstProgram,
@@ -3185,23 +3573,37 @@ fn statement_row_scope_function(
         AstExprKind::Pipe { input, op, args }
             if op == "List/map" || (include_append_constructors && op == "List/append") =>
         {
+            let output_list = statement_row_scope_output_list(statement, op);
+            let input_list = collection_list_name(*input, ast);
             let parent_storage_scope = scope
                 .last()
                 .is_some_and(|name| !matches!(name.as_str(), "items" | "children"));
+            let in_render_slot_scope = scope
+                .last()
+                .is_some_and(|name| matches!(name.as_str(), "items" | "children"));
+            let scoped_output_list = (op == "List/map" && parent_storage_scope)
+                .then(|| scope.last().cloned())
+                .flatten();
             match &statement.kind {
                 AstStatementKind::Field { name }
                     if matches!(name.as_str(), "items" | "children") =>
                 {
                     return None;
                 }
+                AstStatementKind::Field { .. } if output_list.is_some() => {}
                 AstStatementKind::List { field: Some(_), .. } => {}
                 AstStatementKind::List { field: None, .. } if parent_storage_scope => {}
                 AstStatementKind::Field { .. } if previous_collection_list.is_some() => {}
                 AstStatementKind::Expression
-                    if previous_collection_list.is_some() || parent_storage_scope => {}
+                    if !in_render_slot_scope
+                        && (input_list.is_some()
+                            || previous_collection_list.is_some()
+                            || parent_storage_scope) => {}
                 _ => return None,
             }
-            let list = collection_list_name(*input, ast)
+            let list = output_list
+                .or(scoped_output_list)
+                .or(input_list)
                 .or_else(|| previous_collection_list.map(str::to_owned))
                 .or_else(|| scope.last().cloned())?;
             let function = if op == "List/map" {
@@ -3224,6 +3626,55 @@ fn statement_row_scope_function(
                 row_scope,
             })
         }
+        _ => None,
+    }
+}
+
+fn statement_children_return_list_collection_with_names(
+    statement: &AstStatement,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+) -> bool {
+    statement
+        .children
+        .iter()
+        .any(|child| statement_returns_list_collection_with_names(child, ast, list_names, false))
+}
+
+fn statement_returns_list_collection_with_names(
+    statement: &AstStatement,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+    allow_branch_list_reference: bool,
+) -> bool {
+    let is_when = statement
+        .expr
+        .and_then(|expr_id| ast.expressions.get(expr_id))
+        .is_some_and(|expr| {
+            matches!(expr.kind, AstExprKind::When { .. })
+                || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHEN")
+        });
+    statement.expr.is_some_and(|expr_id| {
+        expr_returns_list_collection_inner(expr_id, ast, list_names, allow_branch_list_reference)
+    }) || statement.children.iter().any(|child| {
+        statement_returns_list_collection_with_names(
+            child,
+            ast,
+            list_names,
+            allow_branch_list_reference || is_when,
+        )
+    })
+}
+
+fn statement_row_scope_output_list(statement: &AstStatement, op: &str) -> Option<String> {
+    if op != "List/map" {
+        return None;
+    }
+    match &statement.kind {
+        AstStatementKind::Field { name }
+        | AstStatementKind::List {
+            field: Some(name), ..
+        } if !matches!(name.as_str(), "items" | "children") => Some(name.clone()),
         _ => None,
     }
 }
@@ -3276,6 +3727,64 @@ fn collection_list_name(expr_id: usize, ast: &AstProgram) -> Option<String> {
     }
 }
 
+fn expr_returns_list_collection(
+    expr_id: usize,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+) -> bool {
+    expr_returns_list_collection_inner(expr_id, ast, list_names, false)
+}
+
+fn expr_returns_list_collection_inner(
+    expr_id: usize,
+    ast: &AstProgram,
+    list_names: &BTreeSet<String>,
+    allow_list_reference: bool,
+) -> bool {
+    let Some(expr) = ast.expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Identifier(value) => allow_list_reference && list_names.contains(value),
+        AstExprKind::Path(parts) => {
+            allow_list_reference
+                && parts
+                    .last()
+                    .is_some_and(|value| list_names.contains(value.as_str()))
+        }
+        AstExprKind::ListLiteral { .. } => true,
+        AstExprKind::Call { function, .. } => list_returning_operator(function),
+        AstExprKind::Pipe { op, .. } => list_returning_operator(op),
+        AstExprKind::Then {
+            output: Some(output),
+            ..
+        }
+        | AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expr_returns_list_collection_inner(*output, ast, list_names, true),
+        _ => false,
+    }
+}
+
+fn list_returning_operator(op: &str) -> bool {
+    matches!(
+        op,
+        "List/range"
+            | "List/map"
+            | "List/append"
+            | "List/retain"
+            | "List/remove"
+            | "List/filter_text_contains"
+            | "List/filter_field_equal"
+            | "List/filter_field_not_equal"
+            | "List/move_field_first"
+            | "List/move_field_last"
+            | "List/chunk"
+            | "List/sort_by"
+    )
+}
+
 fn function_name_from_expr(expr_id: usize, ast: &AstProgram) -> Option<String> {
     let expr = ast.expressions.get(expr_id)?;
     match &expr.kind {
@@ -3287,14 +3796,18 @@ fn function_name_from_expr(expr_id: usize, ast: &AstProgram) -> Option<String> {
     }
 }
 
-fn row_scope_for_function<'a>(
+fn row_scopes_for_function<'a>(
     row_scopes: &'a [ParsedRowScopeFunction],
     function: &str,
-) -> Option<&'a str> {
+) -> impl Iterator<Item = &'a str> {
     row_scopes
         .iter()
-        .find(|scope| scope.function == function)
+        .filter(move |scope| scope.function == function)
         .map(|scope| scope.row_scope.as_str())
+}
+
+fn function_has_row_scope(row_scopes: &[ParsedRowScopeFunction], function: &str) -> bool {
+    row_scopes.iter().any(|scope| scope.function == function)
 }
 
 fn join_path<'a>(scope: &[String], tail: impl IntoIterator<Item = &'a str>) -> String {
@@ -4249,6 +4762,57 @@ document: Document/new(root: Element/label(element: [], label: store.label))
     }
 
     #[test]
+    fn list_literal_pipe_on_same_line_is_parsed_as_when_input() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+store: [
+    value:
+        LIST { Compact, Primary } |> WHEN {
+            LIST { Compact, Primary } => TEXT { ok }
+            __ => TEXT { fallback }
+        }
+]
+document: Document/new(root: Element/label(element: [], label: store.value))
+"#;
+        let program = parse_source("examples/list-literal-pipe.bn", source).unwrap();
+        let store = program
+            .ast
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "store")
+            })
+            .expect("store field should parse");
+        let value = store
+            .children
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "value")
+            })
+            .expect("value field should parse");
+        assert!(matches!(
+            value.children.first().map(|statement| &statement.kind),
+            Some(AstStatementKind::Expression)
+        ));
+        let when = program
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))
+            .expect("same-line list literal pipe should preserve WHEN");
+        let AstExprKind::When { input } = when.kind else {
+            unreachable!("checked WHEN expression");
+        };
+        assert!(matches!(
+            &program.ast.expressions[input].kind,
+            AstExprKind::ListLiteral { items, .. } if items.len() == 2
+        ));
+    }
+
+    #[test]
     fn call_result_field_access_keeps_call_input() {
         let source = r#"
 SOURCE
@@ -4437,6 +5001,121 @@ todos |> List/map(todo, new: new_todo(todo: todo))
     }
 
     #[test]
+    fn novywave_list_memory_names_are_unique() {
+        let program = parse_project(
+            "examples/novywave/RUN.bn",
+            [
+                (
+                    "examples/novywave/Bridge/NovyBridge.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Bridge/NovyBridge.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Generated/Assets.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Generated/Assets.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Generated/NovyReference.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Generated/NovyReference.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/novywave/Model/NovyModel.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Model/NovyModel.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Theme/NovyTheme.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Theme/NovyTheme.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/View/NovyView.bn".to_owned(),
+                    include_str!("../../../examples/novywave/View/NovyView.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/RUN.bn".to_owned(),
+                    include_str!("../../../examples/novywave/RUN.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut first_lines = BTreeMap::new();
+        let mut duplicates = Vec::new();
+        for list in &program.list_memories {
+            if let Some(first_line) = first_lines.insert(list.name.clone(), list.line) {
+                duplicates.push((list.name.clone(), first_line, list.line));
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "duplicate list memory names with first/current lines: {duplicates:?}"
+        );
+        assert!(
+            !program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "store"),
+            "`store` is a declaration container and must not become a list memory"
+        );
+        let mut row_scope_lists = BTreeMap::new();
+        let mut conflicting_scopes = Vec::new();
+        for scope in &program.row_scope_functions {
+            if let Some(first) = row_scope_lists.insert(scope.row_scope.clone(), scope.list.clone())
+                && first != scope.list
+            {
+                conflicting_scopes.push((
+                    scope.row_scope.clone(),
+                    first,
+                    scope.list.clone(),
+                    scope.function.clone(),
+                ));
+            }
+        }
+        assert!(
+            conflicting_scopes.is_empty(),
+            "row scope names must not be shared across different lists/functions: {conflicting_scopes:?}"
+        );
+        let list_names = program
+            .list_memories
+            .iter()
+            .map(|list| list.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let unknown_scope_lists = program
+            .row_scope_functions
+            .iter()
+            .filter(|scope| !list_names.contains(scope.list.as_str()))
+            .map(|scope| {
+                (
+                    scope.row_scope.clone(),
+                    scope.list.clone(),
+                    scope.function.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unknown_scope_lists.is_empty(),
+            "row scopes must reference known list memories: {unknown_scope_lists:?}"
+        );
+        assert!(
+            program.row_scope_functions.iter().any(|scope| {
+                scope.list == "selected_signal_defaults" && scope.row_scope == "selected_signal"
+            }),
+            "selected signal model rows must keep their declared row scope: {:#?}",
+            program.row_scope_functions
+        );
+        assert!(
+            program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "external_file_tree_rows"),
+            "conditional external file rows must be a list memory: {:#?}",
+            program
+                .list_memories
+                .iter()
+                .filter(|list| list.name.contains("external"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rejects_malformed_list_capacity() {
         let source = r#"
 todos: LIST[many] {}
@@ -4450,6 +5129,63 @@ todos |> List/map(todo, new: new_todo(todo: todo))
                 .contains("LIST capacity must be a positive integer")
         );
         assert!(err.message.contains("line 2"));
+    }
+
+    #[test]
+    fn reused_row_constructor_derives_sources_for_each_row_scope() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+store: [
+    rows: LIST {
+        [id: TEXT { one }]
+    }
+    selected:
+        TEXT { none } |> HOLD selected {
+            LATEST {
+                row.elements.select.event.press |> THEN { row.id }
+                alternate_row.elements.select.event.press |> THEN { alternate_row.id }
+            }
+        }
+]
+
+store.rows |> List/map(row, new: make_row(row: row))
+store.rows |> List/map(alternate_row, new: make_row(row: alternate_row))
+
+FUNCTION make_row(row) {
+    elements: [
+        select: SOURCE
+    ]
+    label: row.id
+}
+"#;
+        let program = parse_source("reused-row-constructor.bn", source).unwrap();
+        assert!(
+            program
+                .source_ports
+                .iter()
+                .any(|source| source.path == "row.elements.select"),
+            "expected source port for first row scope, got {:?}",
+            program
+                .source_ports
+                .iter()
+                .map(|source| source.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            program
+                .source_ports
+                .iter()
+                .any(|source| source.path == "alternate_row.elements.select"),
+            "expected source port for reused row scope, got {:?}",
+            program
+                .source_ports
+                .iter()
+                .map(|source| source.path.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

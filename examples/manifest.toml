@@ -57,6 +57,12 @@ scroll_focus_scenarios = [
   "shift-wheel-horizontal-scroll",
   "headers-align-during-scroll",
 ]
+scenario_ref_provenance = [
+  { id = "vertical-wheel-scroll", phases = ["scroll_focus"], generated_probe = true, provenance = "native GPU scroll-speed verifier generated probe; validates vertical wheel routing, grid viewport movement, and header alignment outside the semantic .scn runtime path" },
+  { id = "horizontal-wheel-scroll", phases = ["scroll_focus"], generated_probe = true, provenance = "native GPU scroll-speed verifier generated probe; validates horizontal wheel routing, grid viewport movement, and header alignment outside the semantic .scn runtime path" },
+  { id = "shift-wheel-horizontal-scroll", phases = ["scroll_focus"], generated_probe = true, provenance = "native GPU scroll-speed verifier generated probe; validates shifted wheel horizontal routing outside the semantic .scn runtime path" },
+  { id = "headers-align-during-scroll", phases = ["scroll_focus"], generated_probe = true, provenance = "native GPU scroll-speed verifier generated probe; validates header/body alignment from app-owned scroll evidence outside the semantic .scn runtime path" },
+]
 visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",
   "dev-app-owned-framebuffer",
@@ -96,7 +102,8 @@ initial_visible_assertions = [
 input_scenarios = [
   "add-test-todo-type",
   "add-test-todo-submit",
-  "reject-empty-todo",
+  "reject-empty-todo-type",
+  "reject-empty-todo-submit",
   "toggle-all-complete",
   "toggle-all-active",
   "toggle-buy-groceries",
@@ -306,7 +313,7 @@ input_scenarios = [
   "row-tall",
   "row-compact",
   "switch-light",
-  "select-primary-file",
+  "select-primary-file-after-light",
   "show-empty-state",
   "reload-default-file",
   "select-data-before-format",
@@ -340,6 +347,21 @@ scroll_focus_scenarios = [
   "keyboard-zoom-close",
   "keyboard-cursor-right",
   "keyboard-pan-left",
+]
+scenario_ref_provenance = [
+  { id = "zoom-in", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "zoom-out", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "cursor-left", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "cursor-right", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "pan-left", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "pan-right", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-pan-right", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-cursor-left", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-zoom-wide", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-zoom-reset", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-zoom-close", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-cursor-right", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
+  { id = "keyboard-pan-left", phases = ["input", "scroll_focus"], provenance = "same authored .scn step is intentionally consumed by input coverage and timeline scroll-speed coverage" },
 ]
 visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",

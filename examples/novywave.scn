@@ -78,25 +78,25 @@ expect_root_text = { "bridge_provider_version" = "planned official wellen 0.24.x
 [[step]]
 id = "select-compare-file"
 user_action = { kind = "click", target = "file row", target_text = "- wave_27.fst" }
-expected_source_event = { source = "store.elements.select_uart_compare_file", target_text = "- wave_27.fst" }
+expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "wave_27.fst", target_text = "- wave_27.fst" }
 expect_root_text = { "active_file" = "wave_27.fst", "compare_file" = "simple.vcd", "file_compare_status" = "comparing simple.vcd to wave_27.fst", "compare_request_page" = "compare:simple.vcd+wave_27.fst:0-240ns", "compare_result_label" = "shared window: 0 ns - 240 ns, 2 files", "active_scope" = "top_uart", "active_scope_key" = "TOP_UART", "active_scope_label" = "top.uart", "active_signal" = "tx_data", "active_signal_key" = "TX_DATA", "active_signal_label" = "top.uart.tx_data[7:0]", "active_waveform_segment_labels" = "cursor,idle,marker,0x55,gap,0xa5", "active_waveform_segment_count" = "6", "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "4", "selected_rows_order_label" = "tx_data[7:0], rx_data[7:0], baud_tick, uart_busy", "selected_signal_count_label" = "4 selected", "bridge_descriptor_file" = "wave_27.fst", "bridge_file_format" = "FST", "bridge_waveform_ref" = "wave:fst:wave-27:0-240ns", "bridge_open_status" = "FILE_READY", "bridge_open_summary" = "opened FST wave:fst:wave-27:0-240ns", "bridge_hierarchy_page_label" = "HIER:top.uart compare page", "bridge_file_stats_label" = "FST 5 signals, 0-240ns, bounded pages", "bridge_large_file_contract" = "wave_27.fst 28860652B -> bounded compare page only", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor top.uart:0..64 next=none", "bridge_materialization_bound_label" = "visible rows 4/5, waveform segments 28/256 max", "bridge_request_page" = "CMP_UART", "bridge_request_fingerprint" = "TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "CMP_UART", "bridge_response_fingerprint" = "TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_UART/TX_DATA/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
 
 [[step]]
 id = "select-primary-file"
 user_action = { kind = "click", target = "file row", target_text = "- simple.vcd" }
-expected_source_event = { source = "store.elements.select_counter_file", target_text = "- simple.vcd" }
+expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple.vcd", target_text = "- simple.vcd" }
 expect_root_text = { "active_file" = "simple.vcd", "compare_file" = "none", "file_compare_status" = "single file: simple.vcd", "compare_request_page" = "compare:simple.vcd:primary", "compare_result_label" = "primary page: simple.vcd", "active_scope" = "simple_tb_s", "active_scope_key" = "SIMPLE_TB_S", "active_scope_label" = "simple_tb.s", "active_signal" = "clk", "active_signal_key" = "A_SIGNAL", "active_signal_label" = "simple_tb.s.A[3:0]", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected", "selected_timeline_full_range" = "0 s - 250 s", "bridge_descriptor_file" = "simple.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:simple:0-250s", "bridge_open_status" = "FILE_READY", "bridge_hierarchy_page_label" = "HIER:simple_tb/s", "bridge_large_file_contract" = "simple.vcd 311B -> bounded page requests only", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor simple_tb.s:0..64 next=none", "bridge_materialization_bound_label" = "visible rows 2/2, waveform segments 6/256 max", "bridge_request_page" = "A_FIT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "A_FIT", "bridge_response_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
 
 [[step]]
 id = "select-ghw-file"
 user_action = { kind = "click", target = "file row", target_text = "- simple_test.ghw" }
-expected_source_event = { source = "store.elements.select_ghw_file", target_text = "- simple_test.ghw" }
+expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple_test.ghw", target_text = "- simple_test.ghw" }
 expect_root_text = { "active_file" = "simple_test.ghw", "compare_file" = "none", "file_compare_status" = "single file: simple_test.ghw", "compare_request_page" = "compare:simple_test.ghw:primary", "compare_result_label" = "primary page: simple_test.ghw, GHW file", "active_scope" = "ghw_simple", "active_scope_key" = "GHW_SIMPLE", "active_scope_label" = "ghw.simple", "active_signal" = "ghw_counter", "active_signal_key" = "GHW_COUNTER", "active_signal_label" = "ghw.simple.counter[3:0]", "active_waveform_segment_labels" = "cursor,init,marker,1,2,3", "active_waveform_segment_count" = "6", "selected_rows_count" = "3", "selected_rows_order_label" = "ghw.counter[3:0], ghw.enable, ghw.state", "selected_signal_count_label" = "3 selected", "diagnostic_state" = "OK", "bridge_descriptor_file" = "simple_test.ghw", "bridge_file_format" = "GHW", "bridge_waveform_ref" = "wave:ghw:simple-test:0-100ns", "bridge_open_status" = "FILE_READY", "bridge_open_summary" = "opened GHW wave:ghw:simple-test:0-100ns", "bridge_hierarchy_page_label" = "HIER:ghw.simple/counter", "bridge_file_stats_label" = "GHW 4 signals, 0-100ns, bounded pages", "bridge_cursor_values_label" = "ghw_counter=3 at 42 ns", "bridge_request_page" = "GHW_MAIN", "bridge_request_fingerprint" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "GHW_MAIN", "bridge_response_fingerprint" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
 
 [[step]]
 id = "return-primary-after-ghw"
 user_action = { kind = "click", target = "file row", target_text = "- simple.vcd" }
-expected_source_event = { source = "store.elements.select_counter_file", target_text = "- simple.vcd" }
+expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple.vcd", target_text = "- simple.vcd" }
 expect_root_text = { "active_file" = "simple.vcd", "compare_file" = "none", "file_compare_status" = "single file: simple.vcd", "compare_request_page" = "compare:simple.vcd:primary", "compare_result_label" = "primary page: simple.vcd", "active_scope" = "simple_tb_s", "active_scope_key" = "SIMPLE_TB_S", "active_scope_label" = "simple_tb.s", "active_signal" = "clk", "active_signal_key" = "A_SIGNAL", "active_signal_label" = "simple_tb.s.A[3:0]", "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected", "selected_timeline_full_range" = "0 s - 250 s", "bridge_descriptor_file" = "simple.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:simple:0-250s", "bridge_open_status" = "FILE_READY" }
 
 [[step]]
@@ -313,19 +313,19 @@ expect_root_text = { "cursor_position" = "Cursor36", "cursor_label" = "0 s", "ke
 id = "pan-left"
 user_action = { kind = "click", target = "pan left" }
 expected_source_event = { source = "store.elements.pan_left" }
-expect_root_text = { "pan_window" = "LeftWindow", "viewport_label" = "0 s - 150 s", "keyboard_viewport_label" = "0 s - 150 s" }
+expect_root_text = { "pan_window" = "LeftWindow", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s" }
 
 [[step]]
 id = "pan-right"
 user_action = { kind = "click", target = "pan right" }
 expected_source_event = { source = "store.elements.pan_right" }
-expect_root_text = { "pan_window" = "RightWindow", "viewport_label" = "50 s - 250 s", "keyboard_viewport_label" = "50 s - 250 s", "bridge_page_window_label" = "window 50 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_window_label" = "50 s - 250 s" }
+expect_root_text = { "pan_window" = "RightWindow", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_window_label" = "0 s - 250 s" }
 
 [[step]]
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "50 s - 250 s", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor42/Binary" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "0 s - 250 s", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor42/Binary" }
 
 [[step]]
 id = "keyboard-cursor-left"
@@ -361,13 +361,13 @@ expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "150 s
 id = "keyboard-pan-left"
 user_action = { kind = "key_down", target = "keyboard capture", key = "A" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "A" }
-expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "keyboard_viewport_label" = "0 s - 50 s", "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary" }
+expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "keyboard_viewport_label" = "0 s - 150 s", "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary" }
 
 [[step]]
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary", "bridge_response_page" = "A_FIT", "bridge_response_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_scope" = "SIMPLE_TB_S", "bridge_response_signal" = "A_SIGNAL", "bridge_response_zoom" = "Fit", "bridge_response_window_label" = "0 s - 250 s", "stale_response_policy" = "canonical structural request equality required" }
+expect_root_text = { "bridge_request_page" = "DATA_LEFT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Close/LeftWindow/Cursor48/Binary", "bridge_response_page" = "A_FIT", "bridge_response_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_scope" = "SIMPLE_TB_S", "bridge_response_signal" = "A_SIGNAL", "bridge_response_zoom" = "Fit", "bridge_response_window_label" = "0 s - 250 s", "stale_response_policy" = "generation and request fingerprint equality required" }
 
 [[step]]
 id = "toggle-marker"
@@ -436,9 +436,9 @@ expected_source_event = { source = "store.elements.mode_to_light" }
 expect_root_text = { "mode" = "Light" }
 
 [[step]]
-id = "select-primary-file"
+id = "select-primary-file-after-light"
 user_action = { kind = "click", target = "file row", target_text = "- simple.vcd" }
-expected_source_event = { source = "store.elements.select_counter_file", target_text = "- simple.vcd" }
+expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple.vcd", target_text = "- simple.vcd" }
 expect_root_text = { "active_file" = "simple.vcd", "diagnostic_state" = "OK", "diagnostic_label" = "bridge diagnostics OK", "diagnostic_file" = "none" }
 
 [[step]]

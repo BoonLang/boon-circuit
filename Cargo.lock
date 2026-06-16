@@ -520,6 +520,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_bridge"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "boon_cli"
 version = "0.1.0"
 dependencies = [
@@ -536,6 +546,8 @@ dependencies = [
  "boon_document_model",
  "boon_host",
  "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -543,6 +555,7 @@ name = "boon_document_model"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -551,6 +564,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -598,6 +612,7 @@ version = "0.1.0"
 dependencies = [
  "boon_document",
  "boon_host",
+ "bytemuck",
  "futures",
  "glyphon",
  "image 0.24.9",
@@ -4110,6 +4125,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "boon_bridge",
  "boon_document",
  "boon_document_model",
  "boon_driver",

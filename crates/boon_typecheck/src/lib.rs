@@ -395,6 +395,8 @@ pub struct TypeCheckProfile {
     pub source_paths_ms: f64,
     pub source_payload_shape_table_ms: f64,
     pub source_payload_types_ms: f64,
+    #[serde(default)]
+    pub function_index_ms: f64,
     pub object_bindings_ms: f64,
     pub function_param_requirements_ms: f64,
     pub name_bindings_ms: f64,
@@ -417,6 +419,7 @@ struct CheckerInitProfile {
     source_paths_ms: f64,
     source_payload_shape_table_ms: f64,
     source_payload_types_ms: f64,
+    function_index_ms: f64,
     object_bindings_ms: f64,
     function_param_requirements_ms: f64,
     name_bindings_ms: f64,
@@ -432,8 +435,13 @@ struct Checker<'a> {
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
     source_paths: BTreeSet<String>,
+    source_payload_lookup: SourcePayloadPathLookup,
     source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
+    function_statements: BTreeMap<String, &'a AstStatement>,
+    function_call_graph: BTreeMap<String, BTreeSet<String>>,
+    function_args_by_name: BTreeMap<String, Vec<String>>,
+    function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
     object_bindings: BTreeMap<String, ObjectShape>,
     name_bindings: BTreeMap<String, Type>,
     flow_bindings: BTreeMap<String, FlowMode>,
@@ -460,8 +468,10 @@ impl<'a> Checker<'a> {
             .map(|source| source.path.clone())
             .collect();
         let source_paths_ms = typecheck_elapsed_ms(source_paths_started);
+        let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
         let source_payload_shape_table_started = Instant::now();
-        let source_payload_shape_table = source_payload_shape_table(program);
+        let source_payload_shape_table =
+            source_payload_shape_table(program, &source_paths, &source_payload_lookup);
         let source_payload_shape_table_ms =
             typecheck_elapsed_ms(source_payload_shape_table_started);
         let source_payload_types_started = Instant::now();
@@ -470,6 +480,12 @@ impl<'a> Checker<'a> {
             .map(|entry| (entry.source_path.clone(), entry.payload_type.clone()))
             .collect();
         let source_payload_types_ms = typecheck_elapsed_ms(source_payload_types_started);
+        let function_index_started = Instant::now();
+        let function_statements = function_statement_map(&program.ast.statements);
+        let function_call_graph = function_call_graph(program);
+        let function_args_by_name = function_args_by_statement_map(&function_statements);
+        let function_arg_call_sites = function_arg_call_site_index(program, &function_args_by_name);
+        let function_index_ms = typecheck_elapsed_ms(function_index_started);
         let object_bindings_started = Instant::now();
         let object_bindings = object_bindings(program);
         let object_bindings_ms = typecheck_elapsed_ms(object_bindings_started);
@@ -503,8 +519,13 @@ impl<'a> Checker<'a> {
             builtins: BuiltinSignatureRegistry::default(),
             render_contracts,
             source_paths,
+            source_payload_lookup,
             source_payload_shape_table,
             source_payload_types,
+            function_statements,
+            function_call_graph,
+            function_args_by_name,
+            function_arg_call_sites,
             object_bindings,
             name_bindings,
             flow_bindings,
@@ -528,6 +549,7 @@ impl<'a> Checker<'a> {
             source_paths_ms,
             source_payload_shape_table_ms,
             source_payload_types_ms,
+            function_index_ms,
             object_bindings_ms,
             function_param_requirements_ms,
             name_bindings_ms,
@@ -676,6 +698,7 @@ impl<'a> Checker<'a> {
                 source_paths_ms: init_profile.source_paths_ms,
                 source_payload_shape_table_ms: init_profile.source_payload_shape_table_ms,
                 source_payload_types_ms: init_profile.source_payload_types_ms,
+                function_index_ms: init_profile.function_index_ms,
                 object_bindings_ms: init_profile.object_bindings_ms,
                 function_param_requirements_ms: init_profile.function_param_requirements_ms,
                 name_bindings_ms: init_profile.name_bindings_ms,
@@ -788,25 +811,10 @@ impl<'a> Checker<'a> {
     }
 
     fn function_arg_call_site_type(&self, function: &str, arg: &str) -> Option<Type> {
-        let function_args = function_statement_args(self.program, function)?;
+        let arg_expr_ids = self.function_arg_call_sites.get(function)?.get(arg)?;
         let mut ty = None;
-        for expr in &self.program.expressions {
-            let arg_expr_id = match &expr.kind {
-                AstExprKind::Call {
-                    function: call,
-                    args,
-                } if call == function => {
-                    function_call_argument_expr(function_args, arg, None, args)
-                }
-                AstExprKind::Pipe { input, op, args } if op == function => {
-                    function_call_argument_expr(function_args, arg, Some(*input), args)
-                }
-                _ => None,
-            };
-            let Some(arg_expr_id) = arg_expr_id else {
-                continue;
-            };
-            let Some(arg_expr) = self.program.expressions.get(arg_expr_id) else {
+        for arg_expr_id in arg_expr_ids {
+            let Some(arg_expr) = self.program.expressions.get(*arg_expr_id) else {
                 continue;
             };
             let Some(arg_ty) = self.static_expr_type(arg_expr, &mut BTreeSet::new()) else {
@@ -1330,7 +1338,7 @@ impl<'a> Checker<'a> {
         if path == "element.hovered" {
             return true_false_type();
         }
-        if let Some(access) = source_payload_access(&self.source_paths, parts) {
+        if let Some(access) = self.source_payload_lookup.access_for_parts(parts) {
             match access {
                 SourcePayloadAccess::Direct(source_path) => {
                     return source_payload_type_for_path(&self.source_payload_types, &source_path)
@@ -1646,7 +1654,7 @@ impl<'a> Checker<'a> {
             AstExprKind::Identifier(value) => self.name_bindings.get(value).cloned(),
             AstExprKind::Path(parts) => {
                 let path = parts.join(".");
-                if let Some(access) = source_payload_access(&self.source_paths, parts) {
+                if let Some(access) = self.source_payload_lookup.access_for_parts(parts) {
                     match access {
                         SourcePayloadAccess::Direct(source_path) => {
                             return source_payload_type_for_path(
@@ -1843,7 +1851,10 @@ impl<'a> Checker<'a> {
         if !active_functions.insert(function.to_owned()) {
             return None;
         }
-        let result = find_function_statement(&self.program.ast.statements, function)
+        let result = self
+            .function_statements
+            .get(function)
+            .copied()
             .and_then(|statement| self.function_body_return_type(statement, active_functions));
         active_functions.remove(function);
         result
@@ -2279,21 +2290,12 @@ impl<'a> Checker<'a> {
         let Some(requirements) = self.function_param_requirements.get(function).cloned() else {
             return;
         };
-        let Some(function_statement) =
-            find_function_statement(&self.program.ast.statements, function)
-        else {
-            return;
-        };
-        let AstStatementKind::Function {
-            args: function_args,
-            ..
-        } = &function_statement.kind
-        else {
+        let Some(function_args) = self.function_args_by_name.get(function).cloned() else {
             return;
         };
         for (param, expected) in requirements {
             let Some(actual_expr_id) =
-                function_call_argument_expr(function_args, &param, pipe_input, call_args)
+                function_call_argument_expr(&function_args, &param, pipe_input, call_args)
             else {
                 continue;
             };
@@ -2636,16 +2638,14 @@ impl<'a> Checker<'a> {
     }
 
     fn check_recursive_functions(&mut self) {
-        let graph = function_call_graph(self.program);
-        let function_statements = function_statement_map(&self.program.ast.statements);
         let mut visited = BTreeSet::new();
         let mut active = Vec::new();
         let mut reported = BTreeSet::new();
-        for function in graph.keys() {
+        for function in self.function_call_graph.keys() {
             report_recursive_function_cycles(
                 function,
-                &graph,
-                &function_statements,
+                &self.function_call_graph,
+                &self.function_statements,
                 &mut visited,
                 &mut active,
                 &mut reported,
@@ -2876,12 +2876,49 @@ fn function_statement_map(statements: &[AstStatement]) -> BTreeMap<String, &AstS
     functions
 }
 
-fn function_statement_args<'a>(program: &'a ParsedProgram, function: &str) -> Option<&'a [String]> {
-    let statement = find_function_statement(&program.ast.statements, function)?;
-    let AstStatementKind::Function { args, .. } = &statement.kind else {
-        return None;
-    };
-    Some(args)
+fn function_args_by_statement_map(
+    function_statements: &BTreeMap<String, &AstStatement>,
+) -> BTreeMap<String, Vec<String>> {
+    function_statements
+        .iter()
+        .filter_map(|(name, statement)| {
+            let AstStatementKind::Function { args, .. } = &statement.kind else {
+                return None;
+            };
+            Some((name.clone(), args.clone()))
+        })
+        .collect()
+}
+
+fn function_arg_call_site_index(
+    program: &ParsedProgram,
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, BTreeMap<String, Vec<usize>>> {
+    let mut index: BTreeMap<String, BTreeMap<String, Vec<usize>>> = BTreeMap::new();
+    for expr in &program.expressions {
+        let (function, pipe_input, call_args) = match &expr.kind {
+            AstExprKind::Call { function, args } => (function, None, args.as_slice()),
+            AstExprKind::Pipe { input, op, args } => (op, Some(*input), args.as_slice()),
+            _ => continue,
+        };
+        let Some(function_args) = function_args_by_name.get(function) else {
+            continue;
+        };
+        for parameter in function_args {
+            let Some(arg_expr_id) =
+                function_call_argument_expr(function_args, parameter, pipe_input, call_args)
+            else {
+                continue;
+            };
+            index
+                .entry(function.clone())
+                .or_default()
+                .entry(parameter.clone())
+                .or_default()
+                .push(arg_expr_id);
+        }
+    }
+    index
 }
 
 fn collect_function_statements<'a>(
@@ -5933,42 +5970,11 @@ fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SourcePayloadAccess {
     Direct(String),
     Field(String),
     UnknownField(String),
-}
-
-fn source_payload_access(
-    source_paths: &BTreeSet<String>,
-    parts: &[String],
-) -> Option<SourcePayloadAccess> {
-    let normalized_parts = normalized_source_path_parts(parts);
-    let path = normalized_parts.join(".");
-    for source_path in source_paths {
-        let store_relative = source_path.strip_prefix("store.").unwrap_or(source_path);
-        let scoped_relative = source_path
-            .split_once('.')
-            .map(|(_, relative)| relative)
-            .unwrap_or(source_path);
-        for base in [source_path.as_str(), store_relative, scoped_relative] {
-            if path == base || base.ends_with(&format!(".{path}")) {
-                return Some(SourcePayloadAccess::Direct(source_path.clone()));
-            }
-            if let Some(suffix) = path.strip_prefix(&format!("{base}.")) {
-                return Some(source_payload_access_for_suffix(suffix));
-            }
-            if let Some((field, base_without_field)) = normalized_parts.split_last() {
-                let base_without_field = base_without_field.join(".");
-                if !base_without_field.is_empty()
-                    && base.ends_with(&format!(".{base_without_field}"))
-                {
-                    return Some(source_payload_access_for_suffix(field));
-                }
-            }
-        }
-    }
-    None
 }
 
 fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
@@ -6041,13 +6047,11 @@ fn source_payload_type_for_path(
     })
 }
 
-fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShapeEntry> {
-    let source_paths = program
-        .source_ports
-        .iter()
-        .map(|source| source.path.clone())
-        .collect::<BTreeSet<_>>();
-    let source_lookup = SourcePayloadPathLookup::new(&source_paths);
+fn source_payload_shape_table(
+    program: &ParsedProgram,
+    source_paths: &BTreeSet<String>,
+    source_lookup: &SourcePayloadPathLookup,
+) -> Vec<SourcePayloadShapeEntry> {
     let mut fields_by_source = source_paths
         .iter()
         .map(|source_path| (source_path.clone(), BTreeMap::new()))
@@ -6056,8 +6060,7 @@ fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShape
         let AstExprKind::Path(parts) = &expr.kind else {
             continue;
         };
-        let Some(SourcePayloadAccess::Field(field)) = source_payload_access(&source_paths, parts)
-        else {
+        let Some(SourcePayloadAccess::Field(field)) = source_lookup.access_for_parts(parts) else {
             continue;
         };
         for source_path in source_lookup.source_paths_for_parts(parts) {
@@ -6833,13 +6836,16 @@ fn collect_payload_pattern_fields(
 struct SourcePayloadPathLookup {
     exact_prefix: BTreeMap<String, Vec<String>>,
     suffix: BTreeMap<String, Vec<String>>,
+    source_order: BTreeMap<String, usize>,
 }
 
 impl SourcePayloadPathLookup {
     fn new(source_paths: &BTreeSet<String>) -> Self {
         let mut exact_prefix = BTreeMap::<String, Vec<String>>::new();
         let mut suffix = BTreeMap::<String, Vec<String>>::new();
-        for source_path in source_paths {
+        let mut source_order = BTreeMap::new();
+        for (index, source_path) in source_paths.iter().enumerate() {
+            source_order.insert(source_path.clone(), index);
             for alias in source_path_aliases(source_path) {
                 push_unique(
                     exact_prefix.entry(alias.clone()).or_default(),
@@ -6857,7 +6863,53 @@ impl SourcePayloadPathLookup {
         Self {
             exact_prefix,
             suffix,
+            source_order,
         }
+    }
+
+    fn access_for_parts(&self, parts: &[String]) -> Option<SourcePayloadAccess> {
+        let normalized_parts = normalized_source_path_parts(parts);
+        let path = normalized_parts.join(".");
+        if path.is_empty() {
+            return None;
+        }
+
+        let mut best = SourcePayloadAccessMatch::default();
+        if let Some(sources) = self.suffix.get(&path) {
+            for source_path in sources {
+                best.push(self.source_index(source_path), || {
+                    SourcePayloadAccess::Direct(source_path.clone())
+                });
+            }
+        }
+
+        let path_parts = path.split('.').collect::<Vec<_>>();
+        for end in 1..path_parts.len() {
+            let prefix = path_parts[..end].join(".");
+            let suffix = path_parts[end..].join(".");
+            if let Some(sources) = self.exact_prefix.get(&prefix) {
+                for source_path in sources {
+                    best.push(self.source_index(source_path), || {
+                        source_payload_access_for_suffix(&suffix)
+                    });
+                }
+            }
+        }
+
+        if let Some((field, base_without_field)) = normalized_parts.split_last() {
+            let base_without_field = base_without_field.join(".");
+            if !base_without_field.is_empty()
+                && let Some(sources) = self.suffix.get(&base_without_field)
+            {
+                for source_path in sources {
+                    best.push(self.source_index(source_path), || {
+                        source_payload_access_for_suffix(field)
+                    });
+                }
+            }
+        }
+
+        best.access
     }
 
     fn source_paths_for_parts(&self, parts: &[String]) -> Vec<String> {
@@ -6879,6 +6931,28 @@ impl SourcePayloadPathLookup {
             }
         }
         matches
+    }
+
+    fn source_index(&self, source_path: &str) -> usize {
+        self.source_order
+            .get(source_path)
+            .copied()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+#[derive(Default)]
+struct SourcePayloadAccessMatch {
+    index: Option<usize>,
+    access: Option<SourcePayloadAccess>,
+}
+
+impl SourcePayloadAccessMatch {
+    fn push(&mut self, source_index: usize, access: impl FnOnce() -> SourcePayloadAccess) {
+        if self.index.is_none_or(|index| source_index < index) {
+            self.index = Some(source_index);
+            self.access = Some(access());
+        }
     }
 }
 
@@ -7921,6 +7995,47 @@ document:
     }
 
     #[test]
+    fn function_argument_call_site_index_merges_named_positional_and_pipe_calls() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION row(item) {
+    [label: item.a]
+}
+named:
+    row(item: [a: TEXT { named }, b: TEXT { named-b }])
+positional:
+    row([a: TEXT { positional }, c: TEXT { positional-c }])
+pipe:
+    [a: TEXT { pipe }, d: TEXT { pipe-d }] |> row()
+document: []
+"#;
+        let parsed = boon_parser::parse_source("function-arg-call-site-index.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let row_entry = report
+            .function_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.name == "row")
+            .expect("row function type should be reported");
+        let [Type::Object(shape)] = row_entry.arg_types.as_slice() else {
+            panic!("row item arg should be an object shape: {row_entry:?}");
+        };
+        for field in ["a", "b", "c", "d"] {
+            assert_eq!(
+                shape.fields.get(field),
+                Some(&Type::Text),
+                "field `{field}` should be merged from call sites: {shape:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_function_argument_field_with_incompatible_required_type() {
         let source = r#"
 source: SOURCE
@@ -8188,6 +8303,55 @@ document: []
             &key_down.payload_type,
             Type::Object(ObjectShape { open: false, .. })
         ));
+    }
+
+    #[test]
+    fn source_payload_lookup_preserves_alias_and_overlap_rules() {
+        let source_paths = BTreeSet::from([
+            "store.sources.input.change".to_owned(),
+            "todo.editor".to_owned(),
+        ]);
+        let lookup = SourcePayloadPathLookup::new(&source_paths);
+
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts(["sources", "input", "change"])),
+            Some(SourcePayloadAccess::Direct(
+                "store.sources.input.change".to_owned()
+            ))
+        );
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts([
+                "sources", "input", "change", "text"
+            ])),
+            Some(SourcePayloadAccess::Field("text".to_owned()))
+        );
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts(["input", "change", "text"])),
+            Some(SourcePayloadAccess::Field("text".to_owned()))
+        );
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts([
+                "editor", "event", "key_down", "key"
+            ])),
+            Some(SourcePayloadAccess::Field("key".to_owned()))
+        );
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts([
+                "sources", "input", "change", "nested", "value"
+            ])),
+            Some(SourcePayloadAccess::UnknownField("nested.value".to_owned()))
+        );
+
+        let overlapping_paths = BTreeSet::from(["store.a".to_owned(), "store.a.b".to_owned()]);
+        let overlapping_lookup = SourcePayloadPathLookup::new(&overlapping_paths);
+        assert_eq!(
+            overlapping_lookup.access_for_parts(&source_payload_parts(["a", "b"])),
+            Some(SourcePayloadAccess::Field("b".to_owned()))
+        );
+    }
+
+    fn source_payload_parts(parts: impl IntoIterator<Item = &'static str>) -> Vec<String> {
+        parts.into_iter().map(str::to_owned).collect()
     }
 
     #[test]

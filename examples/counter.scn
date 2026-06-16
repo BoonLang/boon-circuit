@@ -8,42 +8,42 @@ id = "initial"
 
 [[step]]
 id = "press-increment"
-user_action = { kind = "button_press", target_text = "+" }
-expected_source_event = { source = "store.sources.increment_button.press" }
+user_action = { kind = "button_press", target = "increment button", target_text = "+" }
+expected_source_event = { source = "store.sources.increment_button.press", target_text = "+" }
   [step.expect_root_text]
   "store.count" = "1"
 
 [[step]]
 id = "press-increment-again"
-user_action = { kind = "button_press", target_text = "+" }
-expected_source_event = { source = "store.sources.increment_button.press" }
+user_action = { kind = "button_press", target = "increment button", target_text = "+" }
+expected_source_event = { source = "store.sources.increment_button.press", target_text = "+" }
   [step.expect_root_text]
   "store.count" = "2"
 
 [[step]]
 id = "press-decrement"
-user_action = { kind = "button_press", target_text = "-" }
-expected_source_event = { source = "store.sources.decrement_button.press" }
+user_action = { kind = "button_press", target = "decrement button", target_text = "-" }
+expected_source_event = { source = "store.sources.decrement_button.press", target_text = "-" }
   [step.expect_root_text]
   "store.count" = "1"
 
 [[step]]
 id = "press-reset"
-user_action = { kind = "button_press", target_text = "Reset" }
-expected_source_event = { source = "store.sources.reset_button.press" }
+user_action = { kind = "button_press", target = "reset button", target_text = "Reset" }
+expected_source_event = { source = "store.sources.reset_button.press", target_text = "Reset" }
   [step.expect_root_text]
   "store.count" = "0"
 
 [[step]]
 id = "press-decrement-negative"
-user_action = { kind = "button_press", target_text = "-" }
-expected_source_event = { source = "store.sources.decrement_button.press" }
+user_action = { kind = "button_press", target = "decrement button", target_text = "-" }
+expected_source_event = { source = "store.sources.decrement_button.press", target_text = "-" }
   [step.expect_root_text]
   "store.count" = "-1"
 
 [[step]]
 id = "press-increment-back-to-zero"
-user_action = { kind = "button_press", target_text = "+" }
-expected_source_event = { source = "store.sources.increment_button.press" }
+user_action = { kind = "button_press", target = "increment button", target_text = "+" }
+expected_source_event = { source = "store.sources.increment_button.press", target_text = "+" }
   [step.expect_root_text]
   "store.count" = "0"

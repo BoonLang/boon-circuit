@@ -70,7 +70,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "toggle-buy-groceries"
-user_action = { kind = "click", target_text = "Buy groceries checkbox" }
+user_action = { kind = "click", target = "todo checkbox", target_text = "Buy groceries checkbox" }
 expected_source_event = { source = "todo.sources.todo_checkbox.click", target_text = "Buy groceries" }
 expect_completed_titles = ["Buy groceries"]
 expect_active_count = 4
@@ -89,7 +89,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "toggle-dynamic-test-todo-under-active-filter"
-user_action = { kind = "click", target_text = "Test todo checkbox" }
+user_action = { kind = "click", target = "todo checkbox", target_text = "Test todo checkbox" }
 expected_source_event = { source = "todo.sources.todo_checkbox.click", target_text = "Test todo" }
 expect_completed_titles = ["Buy groceries", "Test todo"]
 expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"]
@@ -118,7 +118,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "edit-test-todo"
-user_action = { kind = "double_click", target_text = "Test todo" }
+user_action = { kind = "double_click", target = "todo title", target_text = "Test todo" }
 expected_source_event = { source = "todo.sources.todo_title_element.double_click", target_text = "Test todo" }
 expect_editing_title = "Test todo"
 expect_semantic_delta_contains = ["FieldSet:editing"]
@@ -144,7 +144,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "edit-test-todo-cancel-open"
-user_action = { kind = "double_click", target_text = "Test todo edited" }
+user_action = { kind = "double_click", target = "todo title", target_text = "Test todo edited" }
 expected_source_event = { source = "todo.sources.todo_title_element.double_click", target_text = "Test todo edited" }
 expect_editing_title = "Test todo edited"
 expect_edit_text = "Test todo edited"
@@ -171,7 +171,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "edit-test-todo-blur-open"
-user_action = { kind = "double_click", target_text = "Test todo edited" }
+user_action = { kind = "double_click", target = "todo title", target_text = "Test todo edited" }
 expected_source_event = { source = "todo.sources.todo_title_element.double_click", target_text = "Test todo edited" }
 expect_editing_title = "Test todo edited"
 expect_edit_text = "Test todo edited"
@@ -208,12 +208,13 @@ expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "hover-delete-clean-room"
-user_action = { kind = "pointer_hover", target_text = "Walk the dog delete" }
+user_action = { kind = "pointer_hover", target = "remove todo button", target_text = "Walk the dog delete" }
+source_intent_exemption = "hover exposes delete affordance only; no public source event is expected until the following delete click"
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"]
 
 [[step]]
 id = "delete-clean-room"
-user_action = { kind = "click", target_text = "Walk the dog delete" }
+user_action = { kind = "click", target = "remove todo button", target_text = "Walk the dog delete" }
 expected_source_event = { source = "todo.sources.remove_todo_button.press", target_text = "Walk the dog" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer"]
 expect_active_count = 2

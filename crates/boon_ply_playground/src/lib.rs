@@ -4239,6 +4239,7 @@ fn live_source_event_from_json(event: &serde_json::Value) -> Option<LiveSourceEv
             .get("target_occurrence")
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok()),
+        ..LiveSourceEvent::default()
     })
 }
 

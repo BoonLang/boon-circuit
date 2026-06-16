@@ -177,6 +177,16 @@ pub fn main<F: FnOnce() + Send + 'static>(closure: F) {
     main_postlude(closure)
 }
 
+/// Requests that the platform main thread event loop stop.
+///
+/// This is intended for supervised app shutdown after all windows and surfaces
+/// have been dropped. It may be called from worker threads after [`main`] has
+/// initialized the application.
+pub fn stop() {
+    sys::stop_main_thread();
+    IS_MAIN_THREAD_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn main_postlude<F>(closure: F)
 where
     F: FnOnce() + Send + 'static,

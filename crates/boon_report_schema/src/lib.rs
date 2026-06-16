@@ -133,6 +133,7 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         "generated_at_utc",
         "command",
         "command_argv",
+        "measurement_mode",
         "exit_status",
         "git_commit",
         "binary_hash",
@@ -153,12 +154,14 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if status != Some("pass") {
         if status == Some("fail") && report_is_blocker_audit(&report) {
             verify_failing_blocker_report_shape(&report, path)?;
+            verify_measurement_mode(&report, path)?;
             verify_artifact_hashes(&report, path)?;
             return Ok(());
         }
         return Err(format!("{} did not pass", path.display()).into());
     }
     verify_common_report_shape(&report, path)?;
+    verify_measurement_mode(&report, path)?;
     verify_report_file_hash(&report, path, "source_path", "source_hash")?;
     verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
     verify_artifact_hashes(&report, path)?;
@@ -220,6 +223,8 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
                 | "verify-boon-source-syntax"
+                | "verify-scenario-manifest-integrity"
+                | "verify-metamorphic-hidden-fixtures"
                 | "verify-native-visible-launch"
                 | "verify-native-examples"
                 | "verify-native-dev-window-editor"
@@ -467,6 +472,224 @@ fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> Runtime
     Ok(())
 }
 
+fn verify_measurement_mode(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let mode = report
+        .get("measurement_mode")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing measurement_mode", report_path.display()))?;
+    if !matches!(mode, "interaction" | "proof" | "diagnostic") {
+        return Err(format!(
+            "{} has invalid measurement_mode `{mode}`",
+            report_path.display()
+        )
+        .into());
+    }
+    if mode == "interaction" {
+        verify_interaction_flow_id(report, report_path)?;
+        verify_interaction_stage_counters(report, report_path)?;
+        verify_interaction_required_zero_hot_path_counters(report, report_path)?;
+        verify_interaction_mode_excludes_proof_and_diagnostic_hot_path(report, report_path)?;
+    }
+    Ok(())
+}
+
+fn verify_report_mode(report: &JsonValue, report_path: &Path, expected: &str) -> RuntimeResult<()> {
+    let mode = report
+        .get("measurement_mode")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("missing");
+    if mode != expected {
+        return Err(format!(
+            "{} expected measurement_mode `{expected}`, got `{mode}`",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_interaction_mode_excludes_proof_and_diagnostic_hot_path(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let mut violations = Vec::new();
+    collect_interaction_hot_path_violations(report, "$", &mut violations);
+    if !violations.is_empty() {
+        return Err(format!(
+            "{} interaction report counts proof/diagnostic work in the hot path: {}",
+            report_path.display(),
+            violations.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_interaction_flow_id(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let flow_id = report
+        .get("interaction_flow_id")
+        .or_else(|| report.get("frame_flow_id"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if flow_id.trim().is_empty() {
+        return Err(format!(
+            "{} interaction report missing interaction_flow_id or frame_flow_id",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_interaction_stage_counters(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let stages = report
+        .get("stage_counters")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} interaction report missing stage_counters object",
+                report_path.display()
+            )
+        })?;
+    if stages.is_empty() {
+        return Err(format!(
+            "{} interaction report has empty stage_counters",
+            report_path.display()
+        )
+        .into());
+    }
+    for (name, stage) in stages {
+        let object = stage.as_object().ok_or_else(|| {
+            format!(
+                "{} stage_counters.{name} is not an object",
+                report_path.display()
+            )
+        })?;
+        for key in ["p50", "p95", "p99", "max"] {
+            if object.get(key).and_then(JsonValue::as_f64).is_none() {
+                return Err(format!(
+                    "{} stage_counters.{name} missing numeric `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        let sample_count = object
+            .get("sample_count")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_default();
+        if sample_count == 0 {
+            return Err(format!(
+                "{} stage_counters.{name} missing positive sample_count",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_interaction_required_zero_hot_path_counters(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for key in [
+        "hot_path_png_write_count",
+        "hot_path_report_write_count",
+        "hot_path_report_serialization_count",
+        "hot_path_heavy_json_summary_count",
+        "hot_path_proof_readback_count",
+        "hot_path_verbose_trace_event_count",
+        "hot_path_dev_blocking_ipc_count",
+    ] {
+        let value = report.get(key).and_then(JsonValue::as_u64).ok_or_else(|| {
+            format!(
+                "{} interaction report missing explicit zero `{key}`",
+                report_path.display()
+            )
+        })?;
+        if value != 0 {
+            return Err(format!(
+                "{} interaction report `{key}` must be zero, got {value}",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn collect_interaction_hot_path_violations(
+    value: &JsonValue,
+    path: &str,
+    violations: &mut Vec<String>,
+) {
+    match value {
+        JsonValue::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if interaction_hot_path_counter_key(key) && json_number_is_positive(child) {
+                    violations.push(child_path.clone());
+                }
+                if interaction_hot_path_bool_key(key) && child.as_bool().unwrap_or(false) {
+                    violations.push(child_path.clone());
+                }
+                collect_interaction_hot_path_violations(child, &child_path, violations);
+            }
+        }
+        JsonValue::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_interaction_hot_path_violations(
+                    child,
+                    &format!("{path}[{index}]"),
+                    violations,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn interaction_hot_path_counter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "hot_path_png_write_count"
+            | "hot_path_report_write_count"
+            | "hot_path_report_serialization_count"
+            | "hot_path_heavy_json_summary_count"
+            | "hot_path_summary_write_count"
+            | "hot_path_proof_readback_count"
+            | "hot_path_readback_count"
+            | "proof_readback_count_in_hot_path"
+            | "readback_count_in_hot_path"
+            | "hot_path_verbose_trace_event_count"
+            | "verbose_trace_event_count_in_hot_path"
+            | "hot_path_dev_blocking_ipc_count"
+            | "dev_blocking_ipc_count"
+            | "preview_blocked_on_ipc_count"
+    )
+}
+
+fn interaction_hot_path_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "png_write_in_hot_path"
+            | "report_write_in_hot_path"
+            | "report_serialization_in_hot_path"
+            | "heavy_json_summary_in_hot_path"
+            | "proof_readback_in_hot_path"
+            | "readback_in_hot_path"
+            | "verbose_tracing_in_hot_path"
+            | "dev_blocking_ipc_in_hot_path"
+    )
+}
+
+fn json_number_is_positive(value: &JsonValue) -> bool {
+    value.as_u64().is_some_and(|number| number > 0)
+        || value.as_i64().is_some_and(|number| number > 0)
+        || value.as_f64().is_some_and(|number| number > 0.0)
+}
+
 pub fn verify_runtime_execution_metadata(
     report: &JsonValue,
     report_path: &Path,
@@ -486,6 +709,7 @@ pub fn verify_runtime_execution_metadata(
         "runtime_profile_detail",
         "capacities",
         "expression_coverage",
+        "semantic_index",
         "generic_interpreter_complete",
         "example_behavior_adapter",
         "remaining_example_specific_shell_policy",
@@ -560,6 +784,7 @@ pub fn verify_runtime_execution_metadata(
     verify_generic_runtime_slice_metadata(report, execution, report_path)?;
     verify_generic_runtime_slice_evidence(report, execution, report_path)?;
     verify_expression_coverage(report, report_path)?;
+    verify_semantic_index(report, execution, report_path)?;
     verify_runtime_report_contract(report, report_path)?;
     Ok(())
 }
@@ -574,6 +799,7 @@ fn verify_runtime_execution_report_mirror(
         "runtime_profile_detail",
         "capacities",
         "expression_coverage",
+        "semantic_index",
     ] {
         let top_level = report.get(key).ok_or_else(|| {
             format!(
@@ -594,6 +820,197 @@ fn verify_runtime_execution_report_mirror(
             )
             .into());
         }
+    }
+    Ok(())
+}
+
+fn verify_semantic_index(
+    report: &JsonValue,
+    execution: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let index = execution
+        .get("semantic_index")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime_execution missing semantic_index object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "present",
+        "version",
+        "computed_from",
+        "parser_policy_phase",
+        "reuse_key",
+        "source_unit_count",
+        "source_count",
+        "list_count",
+        "row_scope_count",
+        "function_count",
+        "field_count",
+        "view_binding_count",
+        "diagnostic_span_count",
+        "readiness",
+        "reuse",
+    ] {
+        if !index.contains_key(key) {
+            return Err(format!("{} semantic_index missing `{key}`", report_path.display()).into());
+        }
+    }
+    if index.get("present").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!("{} semantic_index is not present", report_path.display()).into());
+    }
+    if index
+        .get("version")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        return Err(format!(
+            "{} semantic_index has invalid version",
+            report_path.display()
+        )
+        .into());
+    }
+    if index.get("computed_from").and_then(JsonValue::as_str)
+        != Some("parser_ast_ir_typecheck_tables")
+    {
+        return Err(format!(
+            "{} semantic_index is not computed from parser, IR, and typecheck tables",
+            report_path.display()
+        )
+        .into());
+    }
+    let reuse = index
+        .get("reuse")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} semantic_index missing reuse object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "parser_reused_by_ir",
+        "typecheck_reused_by_ir",
+        "runtime_reports_reuse_index",
+    ] {
+        if reuse.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} semantic_index reuse `{key}` is not true",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let shared_tables = reuse
+        .get("shared_tables")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} semantic_index reuse missing shared_tables",
+                report_path.display()
+            )
+        })?;
+    if shared_tables.is_empty() {
+        return Err(format!(
+            "{} semantic_index has no shared tables",
+            report_path.display()
+        )
+        .into());
+    }
+    let readiness = index
+        .get("readiness")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} semantic_index missing readiness object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "source_payload_schemas",
+        "source_completions",
+        "route_critical_unknowns",
+        "row_scopes",
+        "row_scope_ambiguity",
+        "selectors",
+        "selector_index_ambiguity",
+        "render_contracts",
+        "bridge_page_descriptors",
+        "dynamic_fallback_count",
+    ] {
+        if !readiness.contains_key(key) {
+            return Err(format!(
+                "{} semantic_index readiness missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "source_payload_schemas",
+        "source_completions",
+        "route_critical_unknowns",
+        "row_scopes",
+        "row_scope_ambiguity",
+        "selectors",
+        "selector_index_ambiguity",
+        "render_contracts",
+        "bridge_page_descriptors",
+    ] {
+        let status = readiness
+            .get(key)
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} semantic_index readiness `{key}` is not an object",
+                    report_path.display()
+                )
+            })?;
+        for field in ["known_count", "fallback_count", "fallback_reasons"] {
+            if !status.contains_key(field) {
+                return Err(format!(
+                    "{} semantic_index readiness `{key}` missing `{field}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if status.get("fallback_count").and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} semantic_index readiness `{key}` has route-critical fallback: {}",
+                report_path.display(),
+                status
+                    .get("fallback_reasons")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new()))
+            )
+            .into());
+        }
+    }
+    if readiness
+        .get("dynamic_fallback_count")
+        .and_then(JsonValue::as_u64)
+        != Some(0)
+    {
+        return Err(format!(
+            "{} semantic_index readiness dynamic_fallback_count is not zero",
+            report_path.display()
+        )
+        .into());
+    }
+    let top_level = report
+        .get("semantic_index")
+        .ok_or_else(|| format!("{} missing top-level semantic_index", report_path.display()))?;
+    if execution.get("semantic_index") != Some(top_level) {
+        return Err(format!(
+            "{} runtime_execution semantic_index does not match top-level semantic_index",
+            report_path.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -931,6 +1348,12 @@ fn verify_generic_runtime_slice_evidence(
         "source_route_id_slot_count",
         "source_route_label_slot_count",
         "source_routes_with_ids",
+        "source_route_op_stream_count",
+        "source_route_total_action_op_count",
+        "source_route_max_action_op_count",
+        "source_action_hot_path_vector_clone_count",
+        "source_route_fallback_count",
+        "source_route_deopt_count",
         "list_source_binding_count",
         "update_branch_count",
         "list_operation_count",
@@ -961,6 +1384,55 @@ fn verify_generic_runtime_slice_evidence(
             )
             .into());
         }
+    }
+    if compiled
+        .get("source_action_hot_path_access")
+        .and_then(JsonValue::as_str)
+        != Some("shared_compiled_arc_slice_by_source_id")
+        || evidence
+            .get("source_action_hot_path_access")
+            .and_then(JsonValue::as_str)
+            != Some("shared_compiled_arc_slice_by_source_id")
+    {
+        return Err(format!(
+            "{} source route evidence does not use shared compiled action slices",
+            report_path.display()
+        )
+        .into());
+    }
+    let Some(op_streams) = evidence
+        .get("source_route_op_streams")
+        .and_then(JsonValue::as_object)
+    else {
+        return Err(format!(
+            "{} generic runtime slice evidence missing source_route_op_streams",
+            report_path.display()
+        )
+        .into());
+    };
+    if compiled
+        .get("source_route_op_streams")
+        .and_then(JsonValue::as_object)
+        .is_none()
+    {
+        return Err(format!(
+            "{} compiled_schedule missing source_route_op_streams",
+            report_path.display()
+        )
+        .into());
+    }
+    if op_streams
+        .get("event_hot_path_vector_clone_count")
+        .and_then(JsonValue::as_u64)
+        != Some(0)
+        || op_streams.get("fallback_count").and_then(JsonValue::as_u64) != Some(0)
+        || op_streams.get("deopt_count").and_then(JsonValue::as_u64) != Some(0)
+    {
+        return Err(format!(
+            "{} source route op streams report clone/fallback/deopt activity",
+            report_path.display()
+        )
+        .into());
     }
     let evidence_storage = evidence
         .get("typed_storage_layout")
@@ -1636,6 +2108,7 @@ fn json_u64(value: &JsonValue, key: &str, report_path: &Path) -> RuntimeResult<u
 }
 
 fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    verify_report_mode(report, report_path, "interaction")?;
     if report.get("build_profile").and_then(JsonValue::as_str) != Some("release") {
         return Err(format!(
             "{} speed report was not generated by a release binary",
@@ -1741,7 +2214,128 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
         )
         .into());
     }
+    verify_speed_allocation_budget_semantics(report, report_path)?;
     verify_speed_stress_profiles(report, report_path)
+}
+
+fn verify_speed_allocation_budget_semantics(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let runtime_profile = report
+        .get("runtime_profile")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report missing runtime_profile",
+                report_path.display()
+            )
+        })?;
+    let allocation_budget = report
+        .get("budget_check")
+        .and_then(|budget| budget.get("allocation_budget"))
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report missing allocation budget check",
+                report_path.display()
+            )
+        })?;
+    if allocation_budget.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} speed report allocation budget did not pass",
+            report_path.display()
+        )
+        .into());
+    }
+    let allocation_budget_applies = allocation_budget
+        .get("applies")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report allocation budget missing applies flag",
+                report_path.display()
+            )
+        })?;
+    let measured_budget_allocs = allocation_budget
+        .get("measured_bounded_profile_allocs_after_warmup")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report allocation budget missing measured allocation count",
+                report_path.display()
+            )
+        })?;
+    let measured_report_allocs = report
+        .get("allocations")
+        .and_then(|allocations| allocations.get("bounded_profile_allocs_after_warmup"))
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report allocations missing bounded_profile_allocs_after_warmup",
+                report_path.display()
+            )
+        })?;
+    if measured_budget_allocs != measured_report_allocs {
+        return Err(format!(
+            "{} speed report allocation budget measured {measured_budget_allocs} but allocations report measured {measured_report_allocs}",
+            report_path.display()
+        )
+        .into());
+    }
+    let unapplied_reason = allocation_budget
+        .get("unapplied_reason")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if runtime_profile == "software_dynamic" {
+        if allocation_budget_applies {
+            return Err(format!(
+                "{} software_dynamic speed report must not claim bounded allocation budget applies",
+                report_path.display()
+            )
+            .into());
+        }
+        if unapplied_reason.trim().is_empty() {
+            return Err(format!(
+                "{} software_dynamic speed report missing allocation-budget unapplied reason",
+                report_path.display()
+            )
+            .into());
+        }
+    } else {
+        if !matches!(runtime_profile, "software_bounded" | "hardware_bounded") {
+            return Err(format!(
+                "{} speed report has unknown runtime_profile `{runtime_profile}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if !allocation_budget_applies {
+            return Err(format!(
+                "{} bounded speed report must apply the allocation budget",
+                report_path.display()
+            )
+            .into());
+        }
+        if allocation_budget
+            .get("unapplied_reason")
+            .is_some_and(|reason| !reason.is_null())
+        {
+            return Err(format!(
+                "{} bounded speed report must not carry an allocation-budget unapplied reason",
+                report_path.display()
+            )
+            .into());
+        }
+        if measured_report_allocs != 0 {
+            return Err(format!(
+                "{} bounded speed report does not prove zero post-warmup allocations",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn verify_runtime_profile_metadata(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -1823,6 +2417,7 @@ fn verify_runtime_profile_metadata(report: &JsonValue, report_path: &Path) -> Ru
 }
 
 fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    verify_report_mode(report, report_path, "diagnostic")?;
     let benchmark = report
         .get("benchmark")
         .and_then(JsonValue::as_object)
@@ -2024,15 +2619,26 @@ fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeRes
 }
 
 fn verify_speed_stress_profiles(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
-    let stress_profiles = report
-        .get("stress_profiles")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
+    let stress_profiles = match report.get("stress_profiles") {
+        Some(stress_profiles) => stress_profiles.as_array().ok_or_else(|| {
             format!(
+                "{} speed report stress_profiles is not an array",
+                report_path.display()
+            )
+        })?,
+        None if report.get("runtime_profile").and_then(JsonValue::as_str)
+            == Some("software_dynamic") =>
+        {
+            return Ok(());
+        }
+        None => {
+            return Err(format!(
                 "{} speed report missing stress_profiles",
                 report_path.display()
             )
-        })?;
+            .into());
+        }
+    };
     if stress_profiles.is_empty() {
         return Err(format!(
             "{} speed report has no stress profiles",
@@ -3792,4 +4398,143 @@ fn report_is_runtime_execution_layer(report: &JsonValue) -> bool {
         report.get("layer").and_then(JsonValue::as_str),
         Some("semantic" | "ply-headless" | "headed-ply" | "speed")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_report_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "boon-report-schema-{name}-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn base_report() -> JsonValue {
+        json!({
+            "status": "pass",
+            "report_version": 1,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "command": "verify-report-schema-test",
+            "command_argv": ["verify-report-schema-test"],
+            "measurement_mode": "proof",
+            "exit_status": 0,
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_hash": "n/a",
+            "scenario_hash": "n/a",
+            "program_hash": "n/a",
+            "budget_hash": "n/a",
+            "graph_node_count": 0,
+            "per_step_pass_fail": [{"id": "shape", "pass": true}],
+            "artifact_sha256s": []
+        })
+    }
+
+    fn interaction_report() -> JsonValue {
+        let mut report = base_report();
+        report["measurement_mode"] = json!("interaction");
+        report["interaction_flow_id"] = json!("test-flow");
+        report["stage_counters"] = json!({
+            "runtime_turn": {
+                "p50": 1.0,
+                "p95": 2.0,
+                "p99": 3.0,
+                "max": 4.0,
+                "sample_count": 2
+            }
+        });
+        report["hot_path_png_write_count"] = json!(0);
+        report["hot_path_report_write_count"] = json!(0);
+        report["hot_path_report_serialization_count"] = json!(0);
+        report["hot_path_heavy_json_summary_count"] = json!(0);
+        report["hot_path_proof_readback_count"] = json!(0);
+        report["hot_path_verbose_trace_event_count"] = json!(0);
+        report["hot_path_dev_blocking_ipc_count"] = json!(0);
+        report
+    }
+
+    fn schema_accepts(report: JsonValue, name: &str) -> bool {
+        let path = temp_report_path(name);
+        write_json(&path, &report).unwrap();
+        let accepted = verify_report_schema(&path).is_ok();
+        let _ = fs::remove_file(path);
+        accepted
+    }
+
+    #[test]
+    fn measurement_mode_is_required_and_enum_validated() {
+        assert!(schema_accepts(base_report(), "valid-proof"));
+
+        let mut missing = base_report();
+        missing.as_object_mut().unwrap().remove("measurement_mode");
+        assert!(!schema_accepts(missing, "missing-mode"));
+
+        let mut invalid = base_report();
+        invalid["measurement_mode"] = json!("fast");
+        assert!(!schema_accepts(invalid, "invalid-mode"));
+    }
+
+    #[test]
+    fn interaction_mode_rejects_hot_path_proof_and_diagnostic_work() {
+        assert!(schema_accepts(interaction_report(), "clean-interaction"));
+
+        let mut png = interaction_report();
+        png["hot_path_png_write_count"] = json!(1);
+        assert!(!schema_accepts(png, "interaction-png"));
+
+        let mut readback = interaction_report();
+        readback["proof_readback_in_hot_path"] = json!(true);
+        assert!(!schema_accepts(readback, "interaction-readback"));
+
+        let mut ipc = interaction_report();
+        ipc["dev_blocking_ipc_count"] = json!(2);
+        assert!(!schema_accepts(ipc, "interaction-ipc"));
+    }
+
+    #[test]
+    fn interaction_mode_requires_flow_id_and_stage_counters() {
+        let mut missing_flow = interaction_report();
+        missing_flow
+            .as_object_mut()
+            .unwrap()
+            .remove("interaction_flow_id");
+        assert!(!schema_accepts(missing_flow, "interaction-missing-flow"));
+
+        let mut missing_stages = interaction_report();
+        missing_stages
+            .as_object_mut()
+            .unwrap()
+            .remove("stage_counters");
+        assert!(!schema_accepts(
+            missing_stages,
+            "interaction-missing-stages"
+        ));
+
+        let mut empty_stage = interaction_report();
+        empty_stage["stage_counters"]["runtime_turn"]["sample_count"] = json!(0);
+        assert!(!schema_accepts(empty_stage, "interaction-empty-stage"));
+    }
+
+    #[test]
+    fn speed_and_benchmark_reports_have_distinct_measurement_modes() {
+        let mut speed = base_report();
+        speed["measurement_mode"] = json!("proof");
+        speed["layer"] = json!("speed");
+        assert!(!schema_accepts(speed, "speed-proof"));
+
+        let mut bench = base_report();
+        bench["measurement_mode"] = json!("interaction");
+        bench["command"] = json!("bench-example");
+        assert!(!schema_accepts(bench, "bench-interaction"));
+    }
 }

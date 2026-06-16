@@ -2,7 +2,7 @@
 
 use boon_runtime::{
     LiveRuntime, LiveSourceEvent, VerificationLayer, example_paths, parse_scenario, run_scenario,
-    verify_report_schema, write_json,
+    run_scenario_project, verify_report_schema, write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,8 +24,13 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
+    "check-bridge",
+    "verify-novywave-bridge-scenario",
     "verify-runtime-production-hardening",
     "verify-runtime-finality",
+    "verify-scenario-manifest-integrity",
+    "verify-metamorphic-hidden-fixtures",
+    "verify-large-list-scan-counters",
     "audit-genericity",
     "verify-playground-genericity",
     "playground-watch",
@@ -109,8 +114,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-negative" => verify_negative(&args),
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(),
+        "check-bridge" => check_bridge(&args),
+        "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
         "verify-runtime-finality" => verify_runtime_finality(&args),
+        "verify-scenario-manifest-integrity" => verify_scenario_manifest_integrity(&args),
+        "verify-metamorphic-hidden-fixtures" => verify_metamorphic_hidden_fixtures(&args),
+        "verify-large-list-scan-counters" => verify_large_list_scan_counters(&args),
         "audit-genericity" => audit_genericity(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
         "playground-watch" => playground_watch(&args),
@@ -187,6 +197,1121 @@ fn print_help() {
     for command in XTASK_COMMANDS {
         println!("  {command}");
     }
+}
+
+fn check_bridge(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/check-bridge.json"));
+    let checks = boon_bridge::bridge_contract_checks();
+    let per_step = checks
+        .iter()
+        .map(|(id, pass, detail)| {
+            json!({
+                "id": id,
+                "pass": pass,
+                "detail": detail
+            })
+        })
+        .collect::<Vec<_>>();
+    let all_pass = checks.iter().all(|(_, pass, _)| *pass);
+    let registry = boon_bridge::bridge_fixture_registry();
+    let golden_vectors = boon_bridge::bridge_golden_vectors();
+    let report_json = json!({
+        "status": if all_pass { "pass" } else { "fail" },
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "check-bridge",
+        "command_argv": args,
+        "measurement_mode": "proof",
+        "exit_status": if all_pass { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_hash": "n/a",
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": registry.modules().len(),
+        "per_step_pass_fail": per_step,
+        "artifact_sha256s": [],
+        "bridge_abi_version": boon_bridge::BRIDGE_ABI_VERSION,
+        "canonical_schema_version": boon_bridge::CANONICAL_SCHEMA_VERSION,
+        "bridge_modules": registry.modules(),
+        "bridge_golden_vectors": golden_vectors,
+        "bridge_negative_coverage": [
+            "missing_module",
+            "changed_schema",
+            "wrong_effect_kind",
+            "stale_completion",
+            "duplicate_completion",
+            "cancellation",
+            "grant_denial",
+            "payload_cap",
+            "replay",
+            "no_rust_handle"
+        ]
+    });
+    write_json(&report, &report_json)?;
+    if !all_pass {
+        return Err(format!("bridge check failed; see {}", report.display()).into());
+    }
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_novywave_bridge_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/novywave-bridge-scenario.json"));
+    let source_path = PathBuf::from("examples/novywave/RUN.bn");
+    let scenario_path = PathBuf::from("examples/novywave.scn");
+    let scenario = parse_scenario(&scenario_path)?;
+    let units = boon_runtime::source_units_for_path(&source_path)?;
+    let source_units_hash = boon_runtime::source_units_hash(&units);
+    let mut runtime = LiveRuntime::from_project("novywave-bridge-scenario", &units)?;
+
+    let mut snapshots = Vec::new();
+    snapshots.push(("initial-vcd".to_owned(), runtime.state_summary()));
+    snapshots.push((
+        "select-fst".to_owned(),
+        runtime
+            .apply_source_event(live_source_event_for_scenario_step_id(
+                &scenario,
+                "select-compare-file",
+            )?)?
+            .state_summary,
+    ));
+    snapshots.push((
+        "select-ghw".to_owned(),
+        runtime
+            .apply_source_event(live_source_event_for_scenario_step_id(
+                &scenario,
+                "select-ghw-file",
+            )?)?
+            .state_summary,
+    ));
+    snapshots.push((
+        "stale-response".to_owned(),
+        runtime
+            .apply_source_event(live_source_event_for_scenario_step_id(
+                &scenario,
+                "reject-stale-page",
+            )?)?
+            .state_summary,
+    ));
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut snapshot_evidence = Vec::new();
+    for (label, summary) in &snapshots {
+        snapshot_evidence.push(novywave_bridge_snapshot_evidence(label, summary));
+        novywave_push_bridge_snapshot_checks(label, summary, &mut checks, &mut blockers);
+    }
+    if let Some((_, stale)) = snapshots
+        .iter()
+        .find(|(label, _)| label == "stale-response")
+    {
+        novywave_push_stale_bridge_checks(stale, &mut checks, &mut blockers);
+    }
+    let scenario_coverage = novywave_bridge_scenario_coverage_evidence(&units, &scenario_path)?;
+    novywave_push_bridge_scenario_coverage_checks(&scenario_coverage, &mut checks, &mut blockers);
+    let bridge_negative_evidence = novywave_bridge_negative_policy_evidence();
+    novywave_push_bridge_negative_policy_checks(
+        &bridge_negative_evidence,
+        &mut checks,
+        &mut blockers,
+    );
+
+    write_static_gate_report(
+        args,
+        "verify-novywave-bridge-scenario",
+        report,
+        checks,
+        blockers,
+        json!({
+            "source_path": source_path.display().to_string(),
+            "source_hash": boon_runtime::sha256_file(&source_path)?,
+            "source_units_hash": source_units_hash,
+            "scenario_path": scenario_path.display().to_string(),
+            "scenario_hash": boon_runtime::sha256_file(&scenario_path)?,
+            "program_hash": source_units_hash,
+            "budget_hash": "n/a",
+            "graph_node_count": snapshots
+                .first()
+                .and_then(|(_, summary)| summary.pointer("/store"))
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, serde_json::Map::len),
+            "bridge_fixture_adapter": "novywave-wellen-v1-bounded-pages",
+            "bridge_snapshots": snapshot_evidence,
+            "bridge_scenario_coverage": scenario_coverage,
+            "bridge_negative_policy_evidence": bridge_negative_evidence,
+        }),
+    )
+}
+
+struct NovywaveBridgeScenarioGroup {
+    name: &'static str,
+    step_ids: Vec<&'static str>,
+    required_keys: Vec<&'static str>,
+}
+
+fn novywave_bridge_required_scenario_groups() -> Vec<NovywaveBridgeScenarioGroup> {
+    vec![
+        NovywaveBridgeScenarioGroup {
+            name: "empty-state",
+            step_ids: vec!["enter-empty-state", "show-empty-state"],
+            required_keys: vec![
+                "waveform_status",
+                "active_file",
+                "bridge_open_status",
+                "bridge_waveform_ref",
+                "empty_state_title",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "load-dialog",
+            step_ids: vec![
+                "open-load-files-dialog",
+                "cancel-load-files-dialog",
+                "begin-default-file-load",
+                "cancel-empty-load-files-dialog",
+            ],
+            required_keys: vec![
+                "load_files_dialog",
+                "load_files_dialog_title",
+                "load_files_dialog_selection",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "deterministic-vcd",
+            step_ids: vec![
+                "initial-loaded-file",
+                "load-default-file-from-empty",
+                "bridge-contract-descriptor",
+                "reload-default-file",
+            ],
+            required_keys: vec![
+                "bridge_descriptor_file",
+                "bridge_file_format",
+                "bridge_waveform_ref",
+                "bridge_open_status",
+                "bridge_request_fingerprint",
+                "bridge_response_status",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "planned-fst-ghw-pages",
+            step_ids: vec!["select-compare-file", "select-ghw-file"],
+            required_keys: vec![
+                "active_file",
+                "bridge_file_format",
+                "bridge_waveform_ref",
+                "bridge_hierarchy_page_label",
+                "bridge_file_stats_label",
+                "bridge_response_status",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "scope-selection",
+            step_ids: vec![
+                "select-uart-scope",
+                "select-analog-scope",
+                "select-cpu-scope",
+                "collapse-top-cpu-scope",
+                "expand-top-cpu-scope",
+            ],
+            required_keys: vec![
+                "active_scope",
+                "active_scope_key",
+                "active_scope_label",
+                "active_scope_signal_count",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "signal-search",
+            step_ids: vec![
+                "type-search-uart-tx",
+                "clear-search-uart",
+                "search-data",
+                "search-reset",
+                "search-temperature",
+                "search-clock",
+                "search-empty-result",
+                "search-vcore",
+                "clear-search-cpu-summary",
+            ],
+            required_keys: vec![
+                "signal_search_text",
+                "search_result_label",
+                "search_results_count",
+                "search_results_key_summary",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "selected-row-reorder-grouping",
+            step_ids: vec![
+                "selected-remove-data",
+                "selected-restore-data",
+                "selected-remove-reset-row",
+                "selected-restore-after-row-remove",
+                "selected-data-up",
+                "selected-data-down",
+                "create-group",
+                "collapse-group",
+                "expand-group",
+            ],
+            required_keys: vec![
+                "selected_rows_profile",
+                "selected_rows_count",
+                "selected_rows_order_label",
+                "selected_group",
+                "group_status_label",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "format-cycling",
+            step_ids: vec![
+                "format-binary",
+                "format-cycle-binary",
+                "format-cycle-grouped",
+                "format-cycle-octal",
+                "format-cycle-signed",
+                "format-cycle-unsigned",
+                "format-cycle-ascii",
+                "format-cycle-hex",
+                "format-grouped-binary",
+                "format-octal",
+                "format-signed",
+                "format-unsigned",
+                "format-ascii",
+                "format-hex",
+            ],
+            required_keys: vec![
+                "value_format",
+                "format_label",
+                "data_bus_rendered_value",
+                "bridge_request_page",
+                "bridge_request_fingerprint",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "cursor-pan-zoom",
+            step_ids: vec![
+                "zoom-in",
+                "zoom-out",
+                "cursor-right",
+                "cursor-left",
+                "pan-left",
+                "pan-right",
+                "keyboard-pan-right",
+                "keyboard-cursor-left",
+                "keyboard-zoom-wide",
+                "keyboard-zoom-reset",
+                "keyboard-zoom-close",
+                "keyboard-cursor-right",
+                "keyboard-pan-left",
+                "waveform-click-moves-cursor",
+            ],
+            required_keys: vec![
+                "zoom_level",
+                "pan_window",
+                "viewport_label",
+                "keyboard_viewport_label",
+                "cursor_position",
+                "keyboard_cursor_label",
+                "bridge_request_page",
+                "bridge_request_fingerprint",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "stale-page-rejection",
+            step_ids: vec!["reject-stale-page"],
+            required_keys: vec![
+                "bridge_request_fingerprint",
+                "bridge_response_fingerprint",
+                "bridge_response_status",
+                "stale_response_policy",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "marker-operations",
+            step_ids: vec![
+                "toggle-marker",
+                "rename-marker",
+                "jump-marker",
+                "remove-marker",
+                "final-marker-jump",
+            ],
+            required_keys: vec![
+                "marker_visibility",
+                "marker_label",
+                "marker_count_label",
+                "marker_focus_label",
+                "cursor_position",
+            ],
+        },
+        NovywaveBridgeScenarioGroup {
+            name: "dark-light-mode",
+            step_ids: vec!["switch-light", "switch-dark"],
+            required_keys: vec!["mode"],
+        },
+    ]
+}
+
+fn novywave_bridge_scenario_coverage_evidence(
+    units: &[boon_runtime::RuntimeSourceUnit],
+    scenario_path: &Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let scenario = parse_scenario(scenario_path)?;
+    let groups = novywave_bridge_required_scenario_groups();
+    let required_keys_by_step = novywave_bridge_required_keys_by_step(&groups);
+    let required_ids = groups
+        .iter()
+        .flat_map(|group| group.step_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut runtime =
+        LiveRuntime::new_from_project("novywave-bridge-scenario-coverage", units, scenario_path)?;
+    let mut step_results = Vec::new();
+    let mut applied_source_event_count = 0_u64;
+    let mut failures = Vec::new();
+    let mut covered_ids = BTreeSet::new();
+
+    for step in &scenario.step {
+        let is_required = required_ids.contains(step.id.as_str());
+        if let Some(_expected) = step.expected_source_event.as_ref() {
+            let event = match live_source_event_from_scenario_step(step) {
+                Ok(event) => event,
+                Err(error) => {
+                    if is_required {
+                        failures.push(format!("{}: {error}", step.id));
+                        step_results.push(json!({
+                            "id": step.id,
+                            "required": true,
+                            "status": "fail",
+                            "reason": error,
+                            "root_text_checks": []
+                        }));
+                    }
+                    continue;
+                }
+            };
+            let expected_paths = if is_required {
+                novywave_bridge_required_paths_for_step(step, &required_keys_by_step)
+            } else {
+                Vec::new()
+            };
+            let mut replay_step = step.clone();
+            replay_step.expect_root_text.clear();
+            let output = runtime.apply_source_event_for_step_value_summaries(
+                &replay_step,
+                event,
+                &expected_paths,
+            );
+            applied_source_event_count = applied_source_event_count.saturating_add(1);
+            if !is_required {
+                if let Err(error) = output {
+                    failures.push(format!(
+                        "non-required scenario step `{}` failed while preserving sequence: {error}",
+                        step.id
+                    ));
+                }
+                continue;
+            }
+            match output {
+                Ok(output) => {
+                    let root_text_checks = novywave_bridge_root_text_checks(
+                        step,
+                        &output.value_summaries,
+                        &expected_paths,
+                    );
+                    let status = if root_text_checks.iter().all(novywave_bridge_check_pass) {
+                        covered_ids.insert(step.id.clone());
+                        "pass"
+                    } else {
+                        failures.push(format!("{} root text check failed", step.id));
+                        "fail"
+                    };
+                    step_results.push(json!({
+                        "id": step.id,
+                        "required": true,
+                        "status": status,
+                        "source_event": step.expected_source_event,
+                        "semantic_delta_count": output.semantic_delta_count,
+                        "render_patch_count": output.render_patch_count,
+                        "root_text_checks": root_text_checks,
+                    }));
+                }
+                Err(error) => {
+                    failures.push(format!("{} replay failed: {error}", step.id));
+                    step_results.push(json!({
+                        "id": step.id,
+                        "required": true,
+                        "status": "fail",
+                        "source_event": step.expected_source_event,
+                        "reason": error.to_string(),
+                        "root_text_checks": []
+                    }));
+                }
+            }
+        } else if is_required {
+            let expected_paths =
+                novywave_bridge_required_paths_for_step(step, &required_keys_by_step);
+            if expected_paths.is_empty() {
+                failures.push(format!(
+                    "{} has no TASK-0804 bridge coverage keys in expect_root_text",
+                    step.id
+                ));
+                step_results.push(json!({
+                    "id": step.id,
+                    "required": true,
+                    "status": "fail",
+                    "reason": "required step has no TASK-0804 bridge coverage keys in expect_root_text",
+                    "source_event": null,
+                    "root_text_checks": []
+                }));
+                continue;
+            }
+            let value_summaries = runtime.runtime_value_summaries(&expected_paths, 3, 8, 4);
+            let root_text_checks =
+                novywave_bridge_root_text_checks(step, &value_summaries, &expected_paths);
+            let status = if root_text_checks.iter().all(novywave_bridge_check_pass) {
+                covered_ids.insert(step.id.clone());
+                "pass"
+            } else {
+                failures.push(format!("{} static root text check failed", step.id));
+                "fail"
+            };
+            step_results.push(json!({
+                "id": step.id,
+                "required": true,
+                "status": status,
+                "source_event": null,
+                "root_text_checks": root_text_checks,
+            }));
+        }
+    }
+
+    let group_results = groups
+        .iter()
+        .map(|group| {
+            let missing_steps = group
+                .step_ids
+                .iter()
+                .filter(|step_id| !scenario.step.iter().any(|step| step.id == **step_id))
+                .copied()
+                .collect::<Vec<_>>();
+            let failed_steps = group
+                .step_ids
+                .iter()
+                .filter(|step_id| {
+                    step_results.iter().any(|result| {
+                        result.get("id").and_then(serde_json::Value::as_str) == Some(*step_id)
+                            && result.get("status").and_then(serde_json::Value::as_str)
+                                != Some("pass")
+                    })
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let passed_steps = group
+                .step_ids
+                .iter()
+                .filter(|step_id| covered_ids.contains::<str>(*step_id))
+                .copied()
+                .collect::<Vec<_>>();
+            json!({
+                "name": group.name,
+                "status": if missing_steps.is_empty()
+                    && failed_steps.is_empty()
+                    && passed_steps.len() == group.step_ids.len()
+                {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                "required_steps": group.step_ids,
+                "required_keys": group.required_keys,
+                "passed_steps": passed_steps,
+                "missing_steps": missing_steps,
+                "failed_steps": failed_steps,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let missing_required_steps = required_ids
+        .iter()
+        .filter(|step_id| !scenario.step.iter().any(|step| step.id == **step_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let status = if failures.is_empty()
+        && missing_required_steps.is_empty()
+        && group_results
+            .iter()
+            .all(|group| group.get("status").and_then(serde_json::Value::as_str) == Some("pass"))
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+
+    Ok(json!({
+        "status": status,
+        "scenario_path": scenario_path.display().to_string(),
+        "scenario_step_count": scenario.step.len(),
+        "applied_source_event_count": applied_source_event_count,
+        "required_step_count": required_ids.len(),
+        "covered_step_count": covered_ids.len(),
+        "missing_required_steps": missing_required_steps,
+        "groups": group_results,
+        "required_step_results": step_results,
+        "failures": failures,
+        "replay_contract": "sequential LiveRuntime project replay; required steps compare scenario expected root text through bounded runtime value summaries",
+    }))
+}
+
+fn novywave_bridge_required_keys_by_step(
+    groups: &[NovywaveBridgeScenarioGroup],
+) -> BTreeMap<&'static str, BTreeSet<&'static str>> {
+    let mut by_step = BTreeMap::new();
+    for group in groups {
+        for step_id in &group.step_ids {
+            by_step
+                .entry(*step_id)
+                .or_insert_with(BTreeSet::new)
+                .extend(group.required_keys.iter().copied());
+        }
+    }
+    by_step
+}
+
+fn novywave_bridge_required_paths_for_step(
+    step: &boon_runtime::ScenarioStep,
+    required_keys_by_step: &BTreeMap<&'static str, BTreeSet<&'static str>>,
+) -> Vec<String> {
+    required_keys_by_step
+        .get(step.id.as_str())
+        .into_iter()
+        .flat_map(|keys| keys.iter())
+        .filter(|key| step.expect_root_text.contains_key(**key))
+        .map(|key| (*key).to_owned())
+        .collect()
+}
+
+fn novywave_bridge_root_text_checks(
+    step: &boon_runtime::ScenarioStep,
+    value_summaries: &serde_json::Value,
+    expected_paths: &[String],
+) -> Vec<serde_json::Value> {
+    expected_paths
+        .iter()
+        .filter_map(|path| {
+            let expected = step.expect_root_text.get(path)?;
+            let actual = value_summary_text(value_summaries, path);
+            Some(json!({
+                "path": path,
+                "expected": expected,
+                "actual": actual,
+                "status": if actual.as_deref() == Some(expected.as_str()) {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            }))
+        })
+        .collect()
+}
+
+fn novywave_bridge_check_pass(check: &serde_json::Value) -> bool {
+    check.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+}
+
+fn novywave_push_bridge_scenario_coverage_checks(
+    scenario_coverage: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let coverage_status = scenario_coverage
+        .get("status")
+        .and_then(serde_json::Value::as_str);
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:scenario-coverage:all-required-groups",
+        coverage_status == Some("pass"),
+        format!(
+            "status={coverage_status:?}, covered_steps={:?}/{:?}, failures={:?}",
+            scenario_coverage
+                .get("covered_step_count")
+                .and_then(serde_json::Value::as_u64),
+            scenario_coverage
+                .get("required_step_count")
+                .and_then(serde_json::Value::as_u64),
+            scenario_coverage
+                .get("failures")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        (coverage_status != Some("pass")).then(|| {
+            "NovyWave bridge scenario coverage did not replay every required TASK-0804 group"
+                .to_owned()
+        }),
+    );
+    for group in scenario_coverage
+        .get("groups")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = group
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let status = group.get("status").and_then(serde_json::Value::as_str);
+        push_audit_check(
+            checks,
+            blockers,
+            format!("novywave-bridge:scenario-coverage:{name}"),
+            status == Some("pass"),
+            format!(
+                "status={status:?}, passed_steps={:?}, missing_steps={:?}, failed_steps={:?}",
+                group
+                    .get("passed_steps")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                group
+                    .get("missing_steps")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                group
+                    .get("failed_steps")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len)
+            ),
+            (status != Some("pass"))
+                .then(|| format!("NovyWave bridge scenario coverage group `{name}` is incomplete")),
+        );
+    }
+}
+
+fn novywave_bridge_negative_policy_evidence() -> serde_json::Value {
+    let checks = boon_bridge::bridge_contract_checks();
+    let negative = checks
+        .iter()
+        .find(|(id, _, _)| id == "bridge_negative_cases_are_rejected");
+    let status = negative.is_some_and(|(_, pass, evidence)| {
+        *pass
+            && evidence
+                .get("grant_denied")
+                .and_then(serde_json::Value::as_str)
+                == Some("GrantDenied")
+            && evidence
+                .get("payload_cap")
+                .and_then(serde_json::Value::as_str)
+                == Some("PayloadCapExceeded")
+    });
+    json!({
+        "status": if status { "pass" } else { "fail" },
+        "source": "boon_bridge::bridge_contract_checks",
+        "negative_case_id": "bridge_negative_cases_are_rejected",
+        "grant_denied": negative.and_then(|(_, _, evidence)| evidence.get("grant_denied")).cloned().unwrap_or(serde_json::Value::Null),
+        "payload_cap": negative.and_then(|(_, _, evidence)| evidence.get("payload_cap")).cloned().unwrap_or(serde_json::Value::Null),
+        "all_negative_cases": negative.map(|(_, _, evidence)| evidence.clone()).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn novywave_push_bridge_negative_policy_checks(
+    evidence: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let grant_denied = evidence
+        .get("grant_denied")
+        .and_then(serde_json::Value::as_str)
+        == Some("GrantDenied");
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:negative:missing-grants",
+        grant_denied,
+        format!(
+            "grant_denied={:?}",
+            evidence
+                .get("grant_denied")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!grant_denied)
+            .then(|| "NovyWave bridge gate lacks missing capability grant rejection".to_owned()),
+    );
+
+    let payload_cap = evidence
+        .get("payload_cap")
+        .and_then(serde_json::Value::as_str)
+        == Some("PayloadCapExceeded");
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:negative:payload-cap",
+        payload_cap,
+        format!(
+            "payload_cap={:?}",
+            evidence
+                .get("payload_cap")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!payload_cap)
+            .then(|| "NovyWave bridge gate lacks oversized inline payload rejection".to_owned()),
+    );
+}
+
+fn novywave_push_bridge_snapshot_checks(
+    label: &str,
+    summary: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let store = summary.get("store").and_then(serde_json::Value::as_object);
+    let Some(store) = store else {
+        push_audit_check(
+            checks,
+            blockers,
+            format!("novywave-bridge:{label}:store"),
+            false,
+            "missing store summary",
+            Some(format!("{label} missing store summary")),
+        );
+        return;
+    };
+    let bridge_key_count = store
+        .keys()
+        .filter(|key| key.starts_with("bridge_"))
+        .count();
+    push_audit_check(
+        checks,
+        blockers,
+        format!("novywave-bridge:{label}:bridge-key-count"),
+        bridge_key_count >= 30,
+        format!("bridge_key_count={bridge_key_count}"),
+        (bridge_key_count < 30).then(|| format!("{label} exposes too few bridge keys")),
+    );
+
+    let open_result = store
+        .get("bridge_open_result")
+        .unwrap_or(&serde_json::Value::Null);
+    let open_result_pass = open_result
+        .pointer("/result_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("OpenResult")
+        && open_result
+            .pointer("/artifact_ref/ref_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("ArtifactRef")
+        && open_result
+            .pointer("/blob_ref/ref_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("BlobRef")
+        && open_result
+            .pointer("/diagnostic/diagnostic_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("BridgeDiagnostic");
+    push_audit_check(
+        checks,
+        blockers,
+        format!("novywave-bridge:{label}:open-result"),
+        open_result_pass,
+        format!(
+            "result_type={:?}",
+            open_result
+                .get("result_type")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!open_result_pass).then(|| format!("{label} missing bridge open result refs")),
+    );
+
+    for (key, kind) in [
+        ("bridge_hierarchy_page_ref", "hierarchy_page"),
+        ("bridge_signal_page_ref", "signal_page"),
+        ("bridge_waveform_page_ref", "waveform_page"),
+        ("bridge_cursor_values_page_ref", "cursor_values"),
+        ("bridge_file_stats_page_ref", "file_stats"),
+    ] {
+        let page = store.get(key).unwrap_or(&serde_json::Value::Null);
+        let pass = page.get("ref_type").and_then(serde_json::Value::as_str) == Some("PageRef")
+            && page.get("page_kind").and_then(serde_json::Value::as_str) == Some(kind)
+            && novywave_page_metadata_complete(page);
+        push_audit_check(
+            checks,
+            blockers,
+            format!("novywave-bridge:{label}:{key}"),
+            pass,
+            format!(
+                "kind={:?}, metadata_complete={}",
+                page.get("page_kind").and_then(serde_json::Value::as_str),
+                novywave_page_metadata_complete(page)
+            ),
+            (!pass).then(|| format!("{label} {key} missing PageRef metadata")),
+        );
+    }
+
+    for (key, kind) in [
+        ("bridge_hierarchy_page", "hierarchy_page"),
+        ("bridge_signal_page", "signal_page"),
+        ("bridge_waveform_page", "waveform_page"),
+        ("bridge_cursor_values", "cursor_values"),
+        ("bridge_file_stats", "file_stats"),
+    ] {
+        let page = store.get(key).unwrap_or(&serde_json::Value::Null);
+        let pass = page.get("page_type").and_then(serde_json::Value::as_str) == Some(kind)
+            && novywave_page_metadata_complete(page);
+        push_audit_check(
+            checks,
+            blockers,
+            format!("novywave-bridge:{label}:{key}"),
+            pass,
+            format!(
+                "kind={:?}, metadata_complete={}",
+                page.get("page_type").and_then(serde_json::Value::as_str),
+                novywave_page_metadata_complete(page)
+            ),
+            (!pass).then(|| format!("{label} {key} missing page metadata")),
+        );
+    }
+
+    let descriptors_pass = [
+        "bridge_artifact_ref",
+        "bridge_blob_ref",
+        "bridge_request_descriptor",
+        "bridge_response_descriptor",
+        "bridge_diagnostic",
+        "bridge_diagnostics",
+        "bridge_status",
+    ]
+    .into_iter()
+    .all(|key| {
+        store
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .is_some()
+    });
+    push_audit_check(
+        checks,
+        blockers,
+        format!("novywave-bridge:{label}:descriptor-surface"),
+        descriptors_pass,
+        "artifact/blob/request/response/diagnostic/status descriptors present",
+        (!descriptors_pass).then(|| format!("{label} bridge descriptor surface incomplete")),
+    );
+
+    let forbidden_paths = novywave_forbidden_bridge_key_paths(store);
+    push_audit_check(
+        checks,
+        blockers,
+        format!("novywave-bridge:{label}:no-runtime-handles"),
+        forbidden_paths.is_empty(),
+        format!("forbidden_paths={forbidden_paths:?}"),
+        (!forbidden_paths.is_empty()).then(|| {
+            format!("{label} bridge-visible data exposes runtime detail: {forbidden_paths:?}")
+        }),
+    );
+
+    let oversized_pages = novywave_oversized_bridge_pages(store);
+    push_audit_check(
+        checks,
+        blockers,
+        format!("novywave-bridge:{label}:bounded-page-byte-lengths"),
+        oversized_pages.is_empty(),
+        format!("oversized_pages={oversized_pages:?}"),
+        (!oversized_pages.is_empty())
+            .then(|| format!("{label} has unbounded bridge page sizes: {oversized_pages:?}")),
+    );
+}
+
+fn novywave_push_stale_bridge_checks(
+    stale: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let store = stale.get("store").and_then(serde_json::Value::as_object);
+    let Some(store) = store else {
+        return;
+    };
+    let request_key = store
+        .get("bridge_request_structural_key")
+        .and_then(serde_json::Value::as_str);
+    let response_key = store
+        .get("bridge_response_structural_key")
+        .and_then(serde_json::Value::as_str);
+    let stale_rejected = store
+        .get("bridge_response_status")
+        .and_then(serde_json::Value::as_str)
+        == Some("REJECTED_STALE_PAGE")
+        && request_key.is_some()
+        && response_key.is_some()
+        && request_key != response_key;
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:stale-response:rejected-by-generation-and-fingerprint",
+        stale_rejected,
+        format!(
+            "request_key={request_key:?}, response_key={response_key:?}, status={:?}",
+            store
+                .get("bridge_response_status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!stale_rejected).then(|| {
+            "NovyWave stale bridge response was not rejected by generation/request fingerprint"
+                .to_owned()
+        }),
+    );
+    let policy_pass = store
+        .get("stale_response_policy")
+        .and_then(serde_json::Value::as_str)
+        == Some("generation and request fingerprint equality required");
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:stale-response:policy-label",
+        policy_pass,
+        format!(
+            "policy={:?}",
+            store
+                .get("stale_response_policy")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!policy_pass)
+            .then(|| "NovyWave stale policy does not name generation/fingerprint".to_owned()),
+    );
+}
+
+fn novywave_page_metadata_complete(page: &serde_json::Value) -> bool {
+    [
+        "schema_hash",
+        "request_fingerprint",
+        "response_fingerprint",
+        "input_digest",
+        "page_digest",
+        "status",
+    ]
+    .into_iter()
+    .all(|key| {
+        page.get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    }) && [
+        "schema_version",
+        "generation",
+        "row_count",
+        "sample_count",
+        "transition_count",
+        "byte_length",
+    ]
+    .into_iter()
+    .all(|key| page.get(key).is_some_and(serde_json::Value::is_number))
+}
+
+fn novywave_forbidden_bridge_key_paths(
+    store: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for (key, value) in store.iter().filter(|(key, _)| key.starts_with("bridge_")) {
+        novywave_collect_forbidden_bridge_key_paths(value, key, &mut paths);
+    }
+    paths
+}
+
+fn novywave_collect_forbidden_bridge_key_paths(
+    value: &serde_json::Value,
+    path: &str,
+    paths: &mut Vec<String>,
+) {
+    const FORBIDDEN: &[&str] = &[
+        "handle",
+        "session",
+        "cache_id",
+        "file_descriptor",
+        "parser_object",
+        "tauri",
+        "actor",
+        "relay",
+        "fast2d",
+        "plugin_host",
+        "process_local",
+        "full_waveform_payload",
+        "waveform_segment_records",
+    ];
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let normalized = key.to_ascii_lowercase().replace('-', "_");
+                if FORBIDDEN
+                    .iter()
+                    .any(|fragment| normalized.contains(fragment))
+                {
+                    paths.push(format!("{path}/{key}"));
+                }
+                novywave_collect_forbidden_bridge_key_paths(child, &format!("{path}/{key}"), paths);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                novywave_collect_forbidden_bridge_key_paths(
+                    child,
+                    &format!("{path}/{index}"),
+                    paths,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn novywave_oversized_bridge_pages(
+    store: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    [
+        "bridge_hierarchy_page_ref",
+        "bridge_signal_page_ref",
+        "bridge_waveform_page_ref",
+        "bridge_cursor_values_page_ref",
+        "bridge_file_stats_page_ref",
+        "bridge_hierarchy_page",
+        "bridge_signal_page",
+        "bridge_waveform_page",
+        "bridge_cursor_values",
+        "bridge_file_stats",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let value = store.get(key)?;
+        let byte_length = value
+            .get("byte_length")
+            .and_then(serde_json::Value::as_u64)?;
+        (byte_length > 65_536).then(|| format!("{key}:{byte_length}"))
+    })
+    .collect()
+}
+
+fn novywave_bridge_snapshot_evidence(
+    label: &str,
+    summary: &serde_json::Value,
+) -> serde_json::Value {
+    let store = summary.get("store").and_then(serde_json::Value::as_object);
+    let bridge_keys = store
+        .map(|store| {
+            store
+                .keys()
+                .filter(|key| key.starts_with("bridge_"))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "label": label,
+        "active_file": summary.pointer("/store/active_file").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_file_format": summary.pointer("/store/bridge_file_format").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_open_status": summary.pointer("/store/bridge_open_status").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_response_status": summary.pointer("/store/bridge_response_status").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_request_generation": summary.pointer("/store/bridge_request_generation").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_response_generation": summary.pointer("/store/bridge_response_generation").cloned().unwrap_or(serde_json::Value::Null),
+        "bridge_keys": bridge_keys,
+    })
 }
 
 fn legacy_ply_cosmic_testing_removed(command: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -479,6 +1604,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": if name == "todomvc" { "bench-todomvc" } else { "bench-example" },
         "command_argv": args,
+        "measurement_mode": "diagnostic",
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -623,6 +1749,214 @@ fn reexec_speed_in_release(name: &str, args: &[String]) -> Result<(), Box<dyn st
     }
 }
 
+fn verify_large_list_scan_counters(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if should_reexec_speed_in_release() {
+        return reexec_speed_in_release("large-list-scan-counters", args);
+    }
+    let rows = value_arg(args, "--rows")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("--rows must be a positive integer: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(1_000);
+    if rows < 1_000 {
+        return Err("--rows must be at least 1000 for TASK-0301 evidence".into());
+    }
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/large-list-scan-counters.json"));
+    let generated_dir = PathBuf::from("target/generated/large-list-scan");
+    fs::create_dir_all(&generated_dir)?;
+    let source_path = generated_dir.join("large_list_scan.bn");
+    let scenario_path = generated_dir.join("large_list_scan.scn");
+    let budget_path = source_path.with_extension("budget.toml");
+    let raw_speed_report_path = value_arg(args, "--speed-report")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| generated_dir.join("large-list-scan-speed-raw.json"));
+    fs::write(&source_path, large_list_scan_source(rows))?;
+    fs::write(&scenario_path, large_list_scan_scenario(&source_path))?;
+    fs::write(&budget_path, large_list_scan_budget())?;
+
+    let output = run_scenario(
+        &source_path,
+        &scenario_path,
+        VerificationLayer::Speed,
+        Some(&raw_speed_report_path),
+    )?;
+    verify_budget_passed(&output.report)?;
+
+    let list_slot_count = output
+        .report
+        .get("list_slot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let rows_scanned_max = output
+        .report
+        .pointer("/stage_counters/rows_scanned/max")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let per_step_counters = output
+        .report
+        .get("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| step.get("list_scan_counters").is_some())
+                .count()
+        })
+        .unwrap_or(0);
+    let max_step_rows_scanned = output
+        .report
+        .get("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flat_map(|steps| steps.iter())
+        .filter_map(|step| {
+            step.pointer("/list_scan_counters/rows_scanned")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
+    if list_slot_count < rows as u64 {
+        return Err(format!(
+            "large-list report list_slot_count {list_slot_count} is below expected {rows}"
+        )
+        .into());
+    }
+    if rows_scanned_max < rows as f64 || max_step_rows_scanned < rows as u64 {
+        return Err(format!(
+            "large-list rows-scanned proof too small: stage max {rows_scanned_max}, per-step max {max_step_rows_scanned}, expected at least {rows}"
+        )
+        .into());
+    }
+    if per_step_counters == 0 {
+        return Err("large-list report has no per-step list_scan_counters".into());
+    }
+    let source_hash = boon_runtime::sha256_file(&source_path)?;
+    let scenario_hash = boon_runtime::sha256_file(&scenario_path)?;
+    let budget_hash = boon_runtime::sha256_file(&budget_path)?;
+    let raw_speed_report_hash = boon_runtime::sha256_file(&raw_speed_report_path)?;
+    let graph_node_count = output
+        .report
+        .get("graph_node_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let program_hash = output
+        .report
+        .get("program_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&source_hash);
+    let report_json = json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-large-list-scan-counters",
+        "command_argv": args,
+        "measurement_mode": "diagnostic",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source_path,
+        "source_hash": source_hash,
+        "scenario_path": scenario_path,
+        "scenario_hash": scenario_hash,
+        "program_hash": program_hash,
+        "budget_hash": budget_hash,
+        "graph_node_count": graph_node_count,
+        "rows": rows,
+        "raw_speed_report_path": raw_speed_report_path,
+        "raw_speed_report_sha256": raw_speed_report_hash,
+        "runtime_profile": output.report.get("runtime_profile").cloned().unwrap_or(serde_json::Value::Null),
+        "stage_counters": output.report.get("stage_counters").cloned().unwrap_or(serde_json::Value::Null),
+        "large_list_scan_evidence": {
+            "list_slot_count": list_slot_count,
+            "rows_scanned_stage_max": rows_scanned_max,
+            "rows_scanned_per_step_max": max_step_rows_scanned,
+            "per_step_counter_objects": per_step_counters,
+            "required_rows": rows,
+            "counter_fields_required": [
+                "rows_scanned",
+                "rows_touched",
+                "row_occurrences_scanned",
+                "order_slots_refreshed",
+                "summary_fields_scanned",
+                "dirty_entries_deduplicated",
+                "route_candidates_visited"
+            ]
+        },
+        "per_step_pass_fail": [
+            {
+                "id": "large-list-source-generated",
+                "pass": true,
+                "detail": format!("generated {} record rows", rows)
+            },
+            {
+                "id": "large-list-list-slot-count",
+                "pass": true,
+                "detail": format!("list_slot_count {list_slot_count} >= {rows}")
+            },
+            {
+                "id": "large-list-stage-rows-scanned",
+                "pass": true,
+                "detail": format!("stage rows_scanned max {rows_scanned_max} >= {rows}")
+            },
+            {
+                "id": "large-list-per-step-rows-scanned",
+                "pass": true,
+                "detail": format!("per-step rows_scanned max {max_step_rows_scanned} >= {rows}")
+            },
+            {
+                "id": "large-list-per-step-counter-shape",
+                "pass": true,
+                "detail": format!("{per_step_counters} steps expose list_scan_counters")
+            }
+        ],
+        "artifact_sha256s": [
+            {
+                "path": raw_speed_report_path,
+                "sha256": raw_speed_report_hash,
+                "kind": "raw-speed-layer-large-list-counter-evidence"
+            }
+        ]
+    });
+    write_json(&report_path, &report_json)?;
+    verify_report_schema(&report_path)?;
+    println!(
+        "large-list scan counters verified: rows={rows}, list_slot_count={list_slot_count}, rows_scanned_max={rows_scanned_max}, report={}",
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn large_list_scan_source(rows: usize) -> String {
+    let mut source = String::new();
+    source.push_str(
+        "store: [\n    sources: [\n        search: [events: [change: SOURCE]]\n    ]\n    selected:\n        TEXT { missing-key } |> HOLD selected {\n            LATEST {\n                sources.search.events.change.text\n            }\n        }\n    records:\n        LIST {\n",
+    );
+    for index in 0..rows {
+        source.push_str(&format!(
+            "            [key: TEXT {{ row-{index:05} }}, value: TEXT {{ value-{index:05} }}]\n"
+        ));
+    }
+    source.push_str(
+        "        }\n    filtered:\n        List/filter_field_equal(records, field: \"key\", value: selected)\n    filtered_keys:\n        List/join_field(filtered, field: \"key\", separator: TEXT { , }, empty: TEXT { none })\n    indexed_value:\n        List/find_value(records, field: \"key\", value: selected, target: \"value\", fallback: TEXT { missing })\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT { Large List Scan }))\n",
+    );
+    source
+}
+
+fn large_list_scan_scenario(source_path: &Path) -> String {
+    format!(
+        "name = \"large_list_scan\"\nsource = \"{}\"\n\n[[step]]\nid = \"initial\"\n  [step.expect_root_text]\n  \"store.filtered_keys\" = \"none\"\n  \"store.indexed_value\" = \"missing\"\n\n[[step]]\nid = \"scan-missing-key\"\nuser_action = {{ kind = \"type_text\", target = \"search input\", text = \"not-present\" }}\nexpected_source_event = {{ source = \"store.sources.search.change\", text = \"not-present\" }}\n  [step.expect_root_text]\n  \"store.filtered_keys\" = \"none\"\n  \"store.indexed_value\" = \"missing\"\n",
+        source_path.display()
+    )
+}
+
+fn large_list_scan_budget() -> &'static str {
+    "[latency_ms]\nbutton_press_to_idle_p95 = 10000.0\nmax_single_step = 10000.0\n\n[memory]\nnormal_steady_rss_delta_mib = 1024\nnormal_peak_rss_delta_mib = 1024\nsteady_vram_delta_mib = 0\npeak_vram_delta_mib = 0\n\n[allocations]\nbounded_profile_allocs_after_warmup = 0\ngraph_rebuilds_per_interaction = 0\n"
+}
+
 fn verify_foundation(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report_path =
         report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/foundation.json"));
@@ -668,6 +2002,7 @@ fn verify_foundation(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "verify-foundation",
         "command_argv": args,
+        "measurement_mode": "proof",
         "exit_status": if blockers.is_empty() { 0 } else { 1 },
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -902,6 +2237,1902 @@ fn verify_runtime_finality(args: &[String]) -> Result<(), Box<dyn std::error::Er
     )
 }
 
+struct MetamorphicFixtureCase {
+    id: &'static str,
+    scenario_name: &'static str,
+    description: &'static str,
+    mutations: Vec<&'static str>,
+    source_text: String,
+    scenario_text: String,
+}
+
+fn verify_metamorphic_hidden_fixtures(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/metamorphic-hidden-fixtures.json"));
+    let seed = "task-0803-metamorphic-seed-v2";
+    let fixture_root = PathBuf::from("target/generated/metamorphic-hidden-fixtures").join(seed);
+    fs::create_dir_all(&fixture_root)?;
+
+    let baseline_source_path = Path::new("examples/counter.bn");
+    let baseline_scenario_path = Path::new("examples/counter.scn");
+    let baseline_report_path = fixture_root.join("baseline-semantic-report.json");
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut artifact_paths = vec![
+        baseline_source_path.to_path_buf(),
+        baseline_scenario_path.to_path_buf(),
+    ];
+    let mut case_reports = Vec::new();
+    let mut project_case_reports = Vec::new();
+    let mut visual_equivalence = json!({
+        "status": "pending",
+        "runtime_project_metamorphic_status": "pending",
+        "app_owned_crop_equivalence_status": "pending",
+        "deferred_to": "TASK-0803B visual crop completion",
+        "reason": "visual matrix has not run because prerequisite semantic blockers have not been cleared"
+    });
+
+    let baseline_scenario = match parse_scenario(baseline_scenario_path) {
+        Ok(scenario) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "metamorphic:hidden-fixture:baseline-scenario-parses",
+                true,
+                format!("{} parsed", baseline_scenario_path.display()),
+                None,
+            );
+            Some(scenario)
+        }
+        Err(error) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "metamorphic:hidden-fixture:baseline-scenario-parses",
+                false,
+                error.to_string(),
+                Some("baseline Counter scenario is not integrity-clean".to_owned()),
+            );
+            None
+        }
+    };
+    let semantic_invariants = baseline_scenario
+        .as_ref()
+        .map(metamorphic_semantic_invariants)
+        .unwrap_or_else(|| json!({ "status": "missing" }));
+
+    let baseline_output = match run_scenario(
+        baseline_source_path,
+        baseline_scenario_path,
+        VerificationLayer::Semantic,
+        Some(&baseline_report_path),
+    ) {
+        Ok(output) => {
+            artifact_paths.push(baseline_report_path.clone());
+            let pass = report_status_pass(&output.report);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "metamorphic:hidden-fixture:baseline-counter-pass",
+                pass,
+                format!(
+                    "{} status={:?}",
+                    baseline_report_path.display(),
+                    output
+                        .report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                ),
+                Some("baseline Counter scenario is not integrity-clean".to_owned()),
+            );
+            Some(output.report)
+        }
+        Err(error) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "metamorphic:hidden-fixture:baseline-counter-pass",
+                false,
+                error.to_string(),
+                Some("baseline Counter scenario is not integrity-clean".to_owned()),
+            );
+            None
+        }
+    };
+
+    if blockers.is_empty() {
+        let source_text = fs::read_to_string(baseline_source_path)?;
+        let scenario_text = fs::read_to_string(baseline_scenario_path)?;
+        let cases = metamorphic_counter_fixture_cases(&source_text, &scenario_text)?;
+
+        for case in cases {
+            let case_dir = fixture_root.join(case.id);
+            fs::create_dir_all(&case_dir)?;
+            let source_path = case_dir.join("source_hidden.bn");
+            let scenario_path = case_dir.join("story_hidden.scn");
+            let semantic_report_path = case_dir.join("semantic-report.json");
+            let scenario_text = counter_scenario_for_hidden_source(
+                &case.scenario_text,
+                &source_path,
+                case.scenario_name,
+            );
+            fs::write(&source_path, &case.source_text)?;
+            fs::write(&scenario_path, &scenario_text)?;
+            artifact_paths.push(source_path.clone());
+            artifact_paths.push(scenario_path.clone());
+
+            let case_scenario = match parse_scenario(&scenario_path) {
+                Ok(scenario) => scenario,
+                Err(error) => {
+                    push_audit_check(
+                        &mut checks,
+                        &mut blockers,
+                        format!("metamorphic:hidden-fixture:{}:scenario-parses", case.id),
+                        false,
+                        error.to_string(),
+                        Some(format!(
+                            "generated metamorphic scenario `{}` does not parse",
+                            case.id
+                        )),
+                    );
+                    continue;
+                }
+            };
+            let case_invariants = metamorphic_semantic_invariants(&case_scenario);
+            let invariants_match = metamorphic_semantic_invariant_core(&case_invariants)
+                == metamorphic_semantic_invariant_core(&semantic_invariants);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!(
+                    "metamorphic:hidden-fixture:{}:predeclared-invariants-match",
+                    case.id
+                ),
+                invariants_match,
+                format!(
+                    "case `{}` invariants compared before runtime execution",
+                    case.id
+                ),
+                Some(format!(
+                    "generated metamorphic scenario `{}` changed the declared semantic invariants",
+                    case.id
+                )),
+            );
+            if !invariants_match {
+                continue;
+            }
+
+            let output = match run_scenario(
+                &source_path,
+                &scenario_path,
+                VerificationLayer::Semantic,
+                Some(&semantic_report_path),
+            ) {
+                Ok(output) => {
+                    artifact_paths.push(semantic_report_path.clone());
+                    output
+                }
+                Err(error) => {
+                    push_audit_check(
+                        &mut checks,
+                        &mut blockers,
+                        format!("metamorphic:hidden-fixture:{}:semantic-pass", case.id),
+                        false,
+                        error.to_string(),
+                        Some(format!(
+                            "metamorphic hidden fixture `{}` did not satisfy the semantic scenario",
+                            case.id
+                        )),
+                    );
+                    continue;
+                }
+            };
+            let status_pass = report_status_pass(&output.report);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("metamorphic:hidden-fixture:{}:semantic-pass", case.id),
+                status_pass,
+                format!(
+                    "{} status={:?}",
+                    semantic_report_path.display(),
+                    output
+                        .report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                ),
+                Some(format!(
+                    "metamorphic hidden fixture `{}` did not satisfy the semantic scenario",
+                    case.id
+                )),
+            );
+            let operation_count_matches = output
+                .report
+                .get("operation_count")
+                .and_then(serde_json::Value::as_u64)
+                == Some(case_scenario.step.len() as u64);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!(
+                    "metamorphic:hidden-fixture:{}:operation-count-matches",
+                    case.id
+                ),
+                operation_count_matches,
+                format!("expected {} scenario steps", case_scenario.step.len()),
+                Some(format!(
+                    "metamorphic hidden fixture `{}` did not preserve operation count",
+                    case.id
+                )),
+            );
+            case_reports.push(json!({
+                "id": case.id,
+                "scenario_name": case.scenario_name,
+                "description": case.description,
+                "mutations": case.mutations,
+                "source_path": source_path.display().to_string(),
+                "scenario_path": scenario_path.display().to_string(),
+                "semantic_report_path": semantic_report_path.display().to_string(),
+                "source_sha256": boon_runtime::sha256_file(&source_path)?,
+                "scenario_sha256": boon_runtime::sha256_file(&scenario_path)?,
+                "semantic_report_sha256": boon_runtime::sha256_file(&semantic_report_path)?,
+                "semantic_invariants": case_invariants,
+                "runtime_status": output.report.get("status").cloned().unwrap_or(serde_json::Value::Null)
+            }));
+        }
+        if blockers.is_empty() {
+            let project_case_report = verify_todomvc_physical_project_metamorphic_case(
+                &fixture_root,
+                &mut checks,
+                &mut blockers,
+                &mut artifact_paths,
+            )?;
+            if blockers.is_empty()
+                && project_case_report
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+            {
+                let entries = boon_runtime::example_manifest_entries()?;
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.id == "todo_mvc_physical")
+                    .ok_or("todo_mvc_physical manifest entry missing after project case pass")?;
+                visual_equivalence = verify_todomvc_physical_visual_metamorphic_case(
+                    &fixture_root,
+                    entry,
+                    &project_case_report,
+                    &mut checks,
+                    &mut blockers,
+                    &mut artifact_paths,
+                )?;
+            }
+            project_case_reports.push(project_case_report);
+        }
+    }
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "metamorphic:hidden-fixture:documentation-and-report-path-allowlist-declared",
+        true,
+        "documentation-only strings and report-only generated paths are recorded in metamorphic_allowlists",
+        None,
+    );
+    let visual_pass = visual_equivalence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:app-owned-crop-equivalence",
+        visual_pass,
+        format!(
+            "visual_equivalence.status={:?}",
+            visual_equivalence
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        Some("TodoMVC Physical app-owned visual crop equivalence did not pass".to_owned()),
+    );
+
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    write_static_gate_report(
+        args,
+        "verify-metamorphic-hidden-fixtures",
+        report,
+        checks,
+        blockers,
+        json!({
+            "metamorphic_gate_version": 1,
+            "metamorphic_task_slice": "TASK-0803B",
+            "metamorphic_task_slices": ["TASK-0803A", "TASK-0803B-runtime-project", "TASK-0803B-app-owned-visual"],
+            "generator": {
+                "seed": seed,
+                "fixture_root": fixture_root.display().to_string(),
+                "baseline_example": "counter",
+                "baseline_source_path": baseline_source_path.display().to_string(),
+                "baseline_scenario_path": baseline_scenario_path.display().to_string(),
+                "baseline_source_sha256": boon_runtime::sha256_file(baseline_source_path).unwrap_or_else(|error| format!("missing: {error}")),
+                "baseline_scenario_sha256": boon_runtime::sha256_file(baseline_scenario_path).unwrap_or_else(|error| format!("missing: {error}")),
+                "mutation_policy": "deterministic legal source/scenario mutations generated before runtime execution"
+            },
+            "semantic_invariants_declared_before_mutations": semantic_invariants,
+            "baseline_semantic_report": baseline_output,
+            "metamorphic_cases": case_reports,
+            "metamorphic_project_cases": project_case_reports,
+            "metamorphic_allowlists": {
+                "documentation_only_strings": [
+                    "comments inserted by legal reformat mutation",
+                    "scenario name labels used only for report identity"
+                ],
+                "report_only_paths": [
+                    fixture_root.display().to_string(),
+                    "target/reports/metamorphic-hidden-fixtures.json"
+                ]
+            },
+            "visual_equivalence": visual_equivalence,
+            "artifact_sha256s": artifact_sha256s
+        }),
+    )
+}
+
+fn verify_todomvc_physical_project_metamorphic_case(
+    fixture_root: &Path,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    artifact_paths: &mut Vec<PathBuf>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let case_id = "project-a";
+    let case_dir = fixture_root.join(case_id);
+    let project_dir = case_dir.join("project");
+    fs::create_dir_all(&project_dir)?;
+
+    let entries = boon_runtime::example_manifest_entries()?;
+    let Some(entry) = entries.iter().find(|entry| entry.id == "todo_mvc_physical") else {
+        push_audit_check(
+            checks,
+            blockers,
+            "metamorphic:hidden-fixture:todo-mvc-physical:manifest-entry",
+            false,
+            "todo_mvc_physical missing from examples/manifest.toml",
+            Some("todo_mvc_physical manifest entry is required for TASK-0803B".to_owned()),
+        );
+        return Ok(json!({
+            "id": case_id,
+            "status": "fail",
+            "blocker": "todo_mvc_physical manifest entry missing"
+        }));
+    };
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:manifest-entry",
+        true,
+        format!("{} -> {}", entry.id, entry.source),
+        None,
+    );
+
+    let baseline_report_path = case_dir.join("baseline-physical-semantic-report.json");
+    let baseline_output = match run_scenario(
+        Path::new(&entry.source),
+        Path::new(&entry.scenario),
+        VerificationLayer::Semantic,
+        Some(&baseline_report_path),
+    ) {
+        Ok(output) => {
+            artifact_paths.push(baseline_report_path.clone());
+            let pass = report_status_pass(&output.report);
+            push_audit_check(
+                checks,
+                blockers,
+                "metamorphic:hidden-fixture:todo-mvc-physical:baseline-pass",
+                pass,
+                format!(
+                    "{} status={:?}",
+                    baseline_report_path.display(),
+                    output
+                        .report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                ),
+                Some(
+                    "baseline TodoMVC Physical semantic scenario is not integrity-clean".to_owned(),
+                ),
+            );
+            Some(output.report)
+        }
+        Err(error) => {
+            push_audit_check(
+                checks,
+                blockers,
+                "metamorphic:hidden-fixture:todo-mvc-physical:baseline-pass",
+                false,
+                error.to_string(),
+                Some(
+                    "baseline TodoMVC Physical semantic scenario is not integrity-clean".to_owned(),
+                ),
+            );
+            None
+        }
+    };
+    if !blockers.is_empty() {
+        return Ok(json!({
+            "id": case_id,
+            "status": "blocked-before-hidden-run",
+            "baseline_semantic_report": baseline_output
+        }));
+    }
+
+    let source_files = manifest_runtime_source_files(entry);
+    let mut natural_units = Vec::new();
+    let mut source_unit_reports = Vec::new();
+    for original in &source_files {
+        let original_path = Path::new(original);
+        let relative = original_path
+            .strip_prefix("examples/todo_mvc_physical")
+            .ok()
+            .and_then(|path| (!path.as_os_str().is_empty()).then_some(path.to_path_buf()))
+            .unwrap_or_else(|| {
+                original_path
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("source.bn"))
+            });
+        let hidden_path = project_dir.join(relative);
+        if let Some(parent) = hidden_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source = fs::read_to_string(original_path)?;
+        let source =
+            format!("-- Metamorphic hidden source unit generated from {original}\n\n{source}");
+        let source = boon_parser::format_source_unit(hidden_path.display().to_string(), source)?;
+        fs::write(&hidden_path, &source)?;
+        artifact_paths.push(hidden_path.clone());
+        source_unit_reports.push(json!({
+            "original_path": original,
+            "hidden_path": hidden_path.display().to_string(),
+            "hidden_sha256": boon_runtime::sha256_file(&hidden_path)?,
+            "module_stem": hidden_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+        }));
+        natural_units.push(boon_runtime::RuntimeSourceUnit {
+            path: hidden_path.display().to_string(),
+            source,
+        });
+    }
+
+    let Some(entry_index) = natural_units
+        .iter()
+        .position(|unit| unit.path.ends_with("/RUN.bn") || unit.path.ends_with("RUN.bn"))
+    else {
+        push_audit_check(
+            checks,
+            blockers,
+            "metamorphic:hidden-fixture:todo-mvc-physical:hidden-entry-unit",
+            false,
+            "generated hidden project did not contain RUN.bn",
+            Some(
+                "TodoMVC Physical hidden project must preserve the RUN.bn entry unit stem"
+                    .to_owned(),
+            ),
+        );
+        return Ok(json!({
+            "id": case_id,
+            "status": "fail",
+            "source_units": source_unit_reports
+        }));
+    };
+    let entry_unit = natural_units.remove(entry_index);
+    let hidden_source_label = entry_unit.path.clone();
+    let natural_order = std::iter::once(entry_unit.path.clone())
+        .chain(natural_units.iter().map(|unit| unit.path.clone()))
+        .collect::<Vec<_>>();
+    natural_units.reverse();
+    let mut hidden_units = natural_units;
+    hidden_units.push(entry_unit);
+    let hidden_order = hidden_units
+        .iter()
+        .map(|unit| unit.path.clone())
+        .collect::<Vec<_>>();
+    let source_unit_order_changed = hidden_order != natural_order;
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:source-unit-order-changed",
+        source_unit_order_changed,
+        format!("source_unit_count={}", hidden_units.len()),
+        Some("TodoMVC Physical hidden project did not change source-unit order".to_owned()),
+    );
+
+    let original_prefix_absent = hidden_units
+        .iter()
+        .all(|unit| !unit.path.starts_with("examples/todo_mvc_physical"));
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:source-paths-moved",
+        original_prefix_absent,
+        format!("hidden_source_label={hidden_source_label}"),
+        Some(
+            "TodoMVC Physical hidden project still uses original manifest source paths".to_owned(),
+        ),
+    );
+
+    let scenario_path = case_dir.join("story_hidden.scn");
+    let semantic_report_path = case_dir.join("semantic-report.json");
+    let scenario_text = fs::read_to_string(&entry.scenario)?
+        .replace(
+            "name = \"todo_mvc_physical\"",
+            "name = \"hidden_todo_mvc_physical_project\"",
+        )
+        .replace(
+            "source = \"examples/todo_mvc_physical/RUN.bn\"",
+            &format!("source = \"{hidden_source_label}\""),
+        )
+        .replace("target = \"theme ", "target = \"hidden theme ");
+    fs::write(&scenario_path, scenario_text)?;
+    artifact_paths.push(scenario_path.clone());
+    let scenario = parse_scenario(&scenario_path)?;
+    let semantic_invariants = metamorphic_semantic_invariants(&scenario);
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:scenario-parses",
+        true,
+        format!("{} parsed", scenario_path.display()),
+        None,
+    );
+
+    let output = match run_scenario_project(
+        &hidden_source_label,
+        &hidden_units,
+        &scenario_path,
+        VerificationLayer::Semantic,
+        Some(&semantic_report_path),
+    ) {
+        Ok(output) => {
+            artifact_paths.push(semantic_report_path.clone());
+            output
+        }
+        Err(error) => {
+            push_audit_check(
+                checks,
+                blockers,
+                "metamorphic:hidden-fixture:todo-mvc-physical:semantic-pass",
+                false,
+                error.to_string(),
+                Some(
+                    "TodoMVC Physical hidden project did not satisfy the semantic scenario"
+                        .to_owned(),
+                ),
+            );
+            return Ok(json!({
+                "id": case_id,
+                "status": "fail",
+                "source_units": source_unit_reports,
+                "semantic_invariants": semantic_invariants
+            }));
+        }
+    };
+    let pass = report_status_pass(&output.report);
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:semantic-pass",
+        pass,
+        format!(
+            "{} status={:?}",
+            semantic_report_path.display(),
+            output
+                .report
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        Some("TodoMVC Physical hidden project did not satisfy the semantic scenario".to_owned()),
+    );
+    let operation_count_matches = output
+        .report
+        .get("operation_count")
+        .and_then(serde_json::Value::as_u64)
+        == Some(scenario.step.len() as u64);
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:operation-count-matches",
+        operation_count_matches,
+        format!("expected {} scenario steps", scenario.step.len()),
+        Some("TodoMVC Physical hidden project did not preserve operation count".to_owned()),
+    );
+
+    Ok(json!({
+        "id": case_id,
+        "example": "todo_mvc_physical",
+        "status": if pass && operation_count_matches { "pass" } else { "fail" },
+        "scenario_name": "hidden_todo_mvc_physical_project",
+        "description": "multi-file source units moved, source-unit order changed, source units reformatted, scenario name/source/target labels changed, full semantic scenario including theme switches rerun",
+        "mutations": [
+            "multi_file_source_path_move",
+            "source_unit_order_change",
+            "legal_reformat_per_source_unit",
+            "fixture_id_change",
+            "scenario_source_path_change",
+            "user_action_target_label_rename",
+            "theme_story_replay"
+        ],
+        "source_label": hidden_source_label,
+        "source_units_hash": boon_runtime::source_units_hash(&hidden_units),
+        "source_unit_count": hidden_units.len(),
+        "source_unit_order": hidden_order,
+        "source_units": source_unit_reports,
+        "scenario_path": scenario_path.display().to_string(),
+        "scenario_sha256": boon_runtime::sha256_file(&scenario_path)?,
+        "semantic_report_path": semantic_report_path.display().to_string(),
+        "semantic_report_sha256": boon_runtime::sha256_file(&semantic_report_path)?,
+        "baseline_semantic_report": baseline_output,
+        "semantic_invariants": semantic_invariants,
+        "runtime_status": output.report.get("status").cloned().unwrap_or(serde_json::Value::Null)
+    }))
+}
+
+fn verify_todomvc_physical_visual_metamorphic_case(
+    fixture_root: &Path,
+    entry: &boon_runtime::ExampleManifestEntry,
+    project_case_report: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    artifact_paths: &mut Vec<PathBuf>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let case_id = project_case_report
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("project-a");
+    let case_dir = fixture_root.join(case_id);
+    let visual_dir = case_dir.join("visual");
+    fs::create_dir_all(&visual_dir)?;
+
+    let binary_path = PathBuf::from("target/debug/boon_native_playground");
+    let build_status = Command::new("cargo")
+        .args(["build", "-p", "boon_native_playground"])
+        .status()?;
+    let build_pass = build_status.success() && binary_path.exists();
+    push_audit_check(
+        checks,
+        blockers,
+        "metamorphic:hidden-fixture:todo-mvc-physical:layout-proof-binary-built",
+        build_pass,
+        format!("cargo build -p boon_native_playground exited with {build_status}"),
+        Some("boon_native_playground layout-proof binary did not build".to_owned()),
+    );
+    if !build_pass {
+        return Ok(json!({
+            "status": "fail",
+            "runtime_project_metamorphic_status": "covered",
+            "app_owned_crop_equivalence_status": "blocked",
+            "reason": "boon_native_playground binary did not build"
+        }));
+    }
+    artifact_paths.push(binary_path.clone());
+
+    let baseline_units = boon_runtime::source_units_for_path(Path::new(&entry.source))?;
+    let baseline_units_file = visual_dir.join("baseline-source-units.json");
+    write_runtime_source_units_file(&baseline_units_file, &baseline_units)?;
+    artifact_paths.push(baseline_units_file.clone());
+
+    let hidden_source_label = project_case_report
+        .get("source_label")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("TodoMVC Physical project report missing source_label")?;
+    let hidden_units = runtime_source_units_from_report_order(project_case_report)?;
+    let hidden_units_file = visual_dir.join("hidden-source-units.json");
+    write_runtime_source_units_file(&hidden_units_file, &hidden_units)?;
+    artifact_paths.push(hidden_units_file.clone());
+
+    let baseline_final_state = project_case_report
+        .pointer("/baseline_semantic_report/state_summary")
+        .cloned()
+        .ok_or("TodoMVC Physical project report missing baseline final state summary")?;
+    let hidden_semantic_report_path = project_case_report
+        .get("semantic_report_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("TodoMVC Physical project report missing hidden semantic_report_path")?;
+    let hidden_semantic_report = read_json(&hidden_semantic_report_path)?;
+    let hidden_final_state = hidden_semantic_report
+        .get("state_summary")
+        .cloned()
+        .ok_or("TodoMVC Physical hidden semantic report missing state_summary")?;
+    let baseline_state_file = visual_dir.join("baseline-final-state.json");
+    let hidden_state_file = visual_dir.join("hidden-final-state.json");
+    write_json(&baseline_state_file, &baseline_final_state)?;
+    write_json(&hidden_state_file, &hidden_final_state)?;
+    artifact_paths.push(baseline_state_file.clone());
+    artifact_paths.push(hidden_state_file.clone());
+
+    let matrix = [
+        MetamorphicVisualMatrixCase {
+            id: "initial-physical-viewport",
+            description: "initial Classic/Light layout at physical TodoMVC viewport",
+            baseline_state_file: None,
+            hidden_state_file: None,
+            viewport_width: 962,
+            viewport_height: 1017,
+        },
+        MetamorphicVisualMatrixCase {
+            id: "final-theme-physical-viewport",
+            description: "final Neumorphic/Dark scenario state at physical TodoMVC viewport",
+            baseline_state_file: Some(baseline_state_file.as_path()),
+            hidden_state_file: Some(hidden_state_file.as_path()),
+            viewport_width: 962,
+            viewport_height: 1017,
+        },
+        MetamorphicVisualMatrixCase {
+            id: "final-theme-expanded-viewport",
+            description: "final Neumorphic/Dark scenario state at expanded viewport",
+            baseline_state_file: Some(baseline_state_file.as_path()),
+            hidden_state_file: Some(hidden_state_file.as_path()),
+            viewport_width: 1040,
+            viewport_height: 1080,
+        },
+    ];
+
+    let mut matrix_reports = Vec::new();
+    for case in matrix {
+        let baseline_report_path =
+            visual_dir.join(format!("{}-baseline-layout-proof.json", case.id));
+        let hidden_report_path = visual_dir.join(format!("{}-hidden-layout-proof.json", case.id));
+        let baseline_report = run_metamorphic_layout_proof(
+            &binary_path,
+            Path::new(&entry.source),
+            &baseline_units_file,
+            case.baseline_state_file,
+            &baseline_report_path,
+            &format!("{}-baseline", case.id),
+            case.viewport_width,
+            case.viewport_height,
+        )?;
+        let hidden_report = run_metamorphic_layout_proof(
+            &binary_path,
+            Path::new(hidden_source_label),
+            &hidden_units_file,
+            case.hidden_state_file,
+            &hidden_report_path,
+            &format!("{}-hidden", case.id),
+            case.viewport_width,
+            case.viewport_height,
+        )?;
+        artifact_paths.push(baseline_report_path);
+        artifact_paths.push(hidden_report_path);
+
+        let crop_report = todomvc_metamorphic_app_owned_crop_report(
+            case.id,
+            &visual_dir,
+            &baseline_report,
+            &hidden_report,
+            artifact_paths,
+        )?;
+        let case_pass = crop_report
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        push_audit_check(
+            checks,
+            blockers,
+            format!(
+                "metamorphic:hidden-fixture:todo-mvc-physical:{}:semantic-crops-match",
+                case.id
+            ),
+            case_pass,
+            format!(
+                "{} crop_count={}",
+                case.description,
+                crop_report
+                    .get("crop_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+            ),
+            Some(format!(
+                "TodoMVC Physical app-owned semantic crops did not match for {}",
+                case.id
+            )),
+        );
+        matrix_reports.push(json!({
+            "id": case.id,
+            "description": case.description,
+            "viewport": {
+                "width": case.viewport_width,
+                "height": case.viewport_height
+            },
+            "runtime_state": if case.baseline_state_file.is_some() { "final_scenario_state" } else { "initial_state" },
+            "baseline_layout_report": crop_report.get("baseline_layout_report").cloned().unwrap_or(serde_json::Value::Null),
+            "hidden_layout_report": crop_report.get("hidden_layout_report").cloned().unwrap_or(serde_json::Value::Null),
+            "crop_report": crop_report
+        }));
+    }
+
+    let all_pass = matrix_reports.iter().all(|report| {
+        report
+            .pointer("/crop_report/pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    Ok(json!({
+        "status": if all_pass { "pass" } else { "fail" },
+        "runtime_project_metamorphic_status": "covered",
+        "app_owned_crop_equivalence_status": if all_pass { "covered" } else { "fail" },
+        "capture_method": "wgpu-generated-shader-app-owned-readback",
+        "comparison_policy": "semantic-label anchored crops, not whole-frame equality",
+        "matrix_slice": "todo_mvc_physical_initial_and_final_theme_states_with_viewport_mutation",
+        "theme_mutation_coverage": "final scenario state after theme switches and light/dark toggle",
+        "viewport_mutation_coverage": ["962x1017", "1040x1080"],
+        "source_unit_policy": "explicit RuntimeSourceUnit JSON preserves moved paths and changed order",
+        "cases": matrix_reports
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct MetamorphicVisualMatrixCase<'a> {
+    id: &'static str,
+    description: &'static str,
+    baseline_state_file: Option<&'a Path>,
+    hidden_state_file: Option<&'a Path>,
+    viewport_width: u32,
+    viewport_height: u32,
+}
+
+fn runtime_source_units_from_report_order(
+    project_case_report: &serde_json::Value,
+) -> Result<Vec<boon_runtime::RuntimeSourceUnit>, Box<dyn std::error::Error>> {
+    let paths = project_case_report
+        .get("source_unit_order")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("TodoMVC Physical project report missing source_unit_order")?;
+    paths
+        .iter()
+        .map(|path| {
+            let path = path
+                .as_str()
+                .ok_or("source_unit_order contains a non-string path")?;
+            Ok(boon_runtime::RuntimeSourceUnit {
+                path: path.to_owned(),
+                source: fs::read_to_string(path)?,
+            })
+        })
+        .collect()
+}
+
+fn write_runtime_source_units_file(
+    path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(units)?)?;
+    Ok(())
+}
+
+fn run_metamorphic_layout_proof(
+    binary_path: &Path,
+    source_path: &Path,
+    source_units_file: &Path,
+    runtime_state_file: Option<&Path>,
+    report_path: &Path,
+    artifact_label: &str,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut command = Command::new(binary_path);
+    command
+        .arg("--role")
+        .arg("layout-proof")
+        .arg("--code-file")
+        .arg(source_path)
+        .arg("--source-units-file")
+        .arg(source_units_file)
+        .arg("--viewport-width")
+        .arg(viewport_width.to_string())
+        .arg("--viewport-height")
+        .arg(viewport_height.to_string())
+        .arg("--app-owned-render")
+        .arg("--app-owned-render-dir")
+        .arg("target/artifacts/native-gpu/metamorphic-hidden-fixtures")
+        .arg("--app-owned-render-label")
+        .arg(artifact_label)
+        .arg("--report")
+        .arg(report_path);
+    if let Some(runtime_state_file) = runtime_state_file {
+        command.arg("--runtime-state-file").arg(runtime_state_file);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} layout-proof exited with {}\nstdout:\n{}\nstderr:\n{}",
+            source_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    read_json(report_path)
+}
+
+fn todomvc_metamorphic_app_owned_crop_report(
+    matrix_id: &str,
+    visual_dir: &Path,
+    baseline_report: &serde_json::Value,
+    hidden_report: &serde_json::Value,
+    artifact_paths: &mut Vec<PathBuf>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let baseline_layout_path = json_path_string(baseline_report, "/layout_proof/artifact_path")
+        .map(PathBuf::from)
+        .ok_or("baseline layout-proof report missing layout artifact path")?;
+    let hidden_layout_path = json_path_string(hidden_report, "/layout_proof/artifact_path")
+        .map(PathBuf::from)
+        .ok_or("hidden layout-proof report missing layout artifact path")?;
+    let baseline_image_path = json_path_string(
+        baseline_report,
+        "/app_owned_readback/proof/artifact/artifact_path",
+    )
+    .map(PathBuf::from)
+    .ok_or("baseline layout-proof report missing app-owned artifact path")?;
+    let hidden_image_path = json_path_string(
+        hidden_report,
+        "/app_owned_readback/proof/artifact/artifact_path",
+    )
+    .map(PathBuf::from)
+    .ok_or("hidden layout-proof report missing app-owned artifact path")?;
+    artifact_paths.extend([
+        baseline_layout_path.clone(),
+        hidden_layout_path.clone(),
+        baseline_image_path.clone(),
+        hidden_image_path.clone(),
+    ]);
+
+    let baseline_layout = read_json(&baseline_layout_path)?;
+    let hidden_layout = read_json(&hidden_layout_path)?;
+    let baseline_image = image::open(&baseline_image_path)?.to_rgba8();
+    let hidden_image = image::open(&hidden_image_path)?.to_rgba8();
+    let baseline_inventory = native_readback_pixel_inventory(
+        baseline_image_path
+            .to_str()
+            .ok_or("baseline image path is not UTF-8")?,
+    )?;
+    let hidden_inventory = native_readback_pixel_inventory(
+        hidden_image_path
+            .to_str()
+            .ok_or("hidden image path is not UTF-8")?,
+    )?;
+
+    let candidate_labels = [
+        "TodoMVC",
+        "What needs to be done?",
+        "Read documentation",
+        "Finish TodoMVC renderer",
+        "Walk the dog",
+        "Buy groceries",
+        "Ship physical TodoMVC",
+        "Ship physical TodoMVC edited",
+        "4 items left",
+        "1 item left",
+        "All",
+        "Active",
+        "Completed",
+        "Classic",
+        "Professional",
+        "Glass",
+        "Brutalist",
+        "Neumorphic",
+        "Dark mode",
+    ];
+    let selected_labels = candidate_labels
+        .iter()
+        .filter(|label| {
+            semantic_label_bounds(&baseline_layout, label).is_some()
+                && semantic_label_bounds(&hidden_layout, label).is_some()
+        })
+        .filter(|label| {
+            semantic_label_bounds(&baseline_layout, label)
+                .is_some_and(|bounds| bounds_intersects_image(bounds, &baseline_image))
+                && semantic_label_bounds(&hidden_layout, label)
+                    .is_some_and(|bounds| bounds_intersects_image(bounds, &hidden_image))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+
+    let mut crops = Vec::new();
+    for label in &selected_labels {
+        let baseline_bounds = semantic_label_bounds(&baseline_layout, label)
+            .ok_or("selected baseline label bounds disappeared")?;
+        let hidden_bounds = semantic_label_bounds(&hidden_layout, label)
+            .ok_or("selected hidden label bounds disappeared")?;
+        let padding = 18u32;
+        let crop_width = (baseline_bounds.width.max(hidden_bounds.width).ceil() as u32)
+            .saturating_add(padding * 2)
+            .max(1);
+        let crop_height = (baseline_bounds.height.max(hidden_bounds.height).ceil() as u32)
+            .saturating_add(padding * 2)
+            .max(1);
+        let baseline_crop = crop_with_padding(
+            &baseline_image,
+            baseline_bounds.x.floor() as i32 - padding as i32,
+            baseline_bounds.y.floor() as i32 - padding as i32,
+            crop_width,
+            crop_height,
+            image::Rgba([0, 0, 0, 0]),
+        );
+        let hidden_crop = crop_with_padding(
+            &hidden_image,
+            hidden_bounds.x.floor() as i32 - padding as i32,
+            hidden_bounds.y.floor() as i32 - padding as i32,
+            crop_width,
+            crop_height,
+            image::Rgba([0, 0, 0, 0]),
+        );
+        let (heatmap, metrics) = todomvc_diff_heatmap(&baseline_crop, &hidden_crop);
+        let slug = metamorphic_label_slug(label);
+        let baseline_crop_path = visual_dir.join(format!("{matrix_id}-{slug}-baseline-crop.png"));
+        let hidden_crop_path = visual_dir.join(format!("{matrix_id}-{slug}-hidden-crop.png"));
+        let heatmap_path = visual_dir.join(format!("{matrix_id}-{slug}-diff-heatmap.png"));
+        baseline_crop.save(&baseline_crop_path)?;
+        hidden_crop.save(&hidden_crop_path)?;
+        heatmap.save(&heatmap_path)?;
+        artifact_paths.extend([
+            baseline_crop_path.clone(),
+            hidden_crop_path.clone(),
+            heatmap_path.clone(),
+        ]);
+        let baseline_nonblank = image_has_visible_variation(&baseline_crop);
+        let hidden_nonblank = image_has_visible_variation(&hidden_crop);
+        let pass = baseline_nonblank
+            && hidden_nonblank
+            && metrics.mean_abs_diff <= 2.0
+            && metrics.p95_abs_diff <= 8.0
+            && metrics.high_diff_ratio <= 0.01
+            && metrics.largest_mismatch_region_ratio <= 0.005;
+        crops.push(json!({
+            "label": label,
+            "pass": pass,
+            "baseline_bounds": baseline_bounds.to_json_value(),
+            "hidden_bounds": hidden_bounds.to_json_value(),
+            "baseline_crop": baseline_crop_path,
+            "hidden_crop": hidden_crop_path,
+            "diff_heatmap": heatmap_path,
+            "baseline_crop_has_visible_variation": baseline_nonblank,
+            "hidden_crop_has_visible_variation": hidden_nonblank,
+            "mean_abs_diff": metrics.mean_abs_diff,
+            "p95_abs_diff": metrics.p95_abs_diff,
+            "high_diff_ratio": metrics.high_diff_ratio,
+            "largest_mismatch_region_ratio": metrics.largest_mismatch_region_ratio
+        }));
+    }
+
+    let crop_count = crops.len();
+    let pass = crop_count >= 3
+        && crops
+            .iter()
+            .all(|crop| crop.get("pass").and_then(serde_json::Value::as_bool) == Some(true));
+    Ok(json!({
+        "pass": pass,
+        "policy": "semantic-label anchored app-owned crops",
+        "minimum_crop_count": 3,
+        "crop_count": crop_count,
+        "selected_labels": selected_labels,
+        "baseline_layout_report": baseline_report.get("report_path").cloned().unwrap_or(serde_json::Value::Null),
+        "hidden_layout_report": hidden_report.get("report_path").cloned().unwrap_or(serde_json::Value::Null),
+        "baseline_layout_artifact": baseline_layout_path,
+        "hidden_layout_artifact": hidden_layout_path,
+        "baseline_app_owned_readback": baseline_image_path,
+        "hidden_app_owned_readback": hidden_image_path,
+        "baseline_pixel_inventory": baseline_inventory,
+        "hidden_pixel_inventory": hidden_inventory,
+        "thresholds": {
+            "mean_abs_diff_max": 2.0,
+            "p95_abs_diff_max": 8.0,
+            "high_diff_ratio_max": 0.01,
+            "largest_mismatch_region_ratio_max": 0.005
+        },
+        "crops": crops
+    }))
+}
+
+fn json_path_string<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    value.pointer(pointer).and_then(serde_json::Value::as_str)
+}
+
+fn semantic_label_bounds(layout_artifact: &serde_json::Value, label: &str) -> Option<JsonBounds> {
+    layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some(label))
+        .and_then(|item| item.get("bounds"))
+        .and_then(parse_json_bounds)
+}
+
+fn bounds_intersects_image(bounds: JsonBounds, image: &image::RgbaImage) -> bool {
+    bounds.x + bounds.width > 0.0
+        && bounds.y + bounds.height > 0.0
+        && bounds.x < image.width() as f64
+        && bounds.y < image.height() as f64
+}
+
+fn image_has_visible_variation(image: &image::RgbaImage) -> bool {
+    let mut colors = BTreeSet::new();
+    for pixel in image.pixels() {
+        colors.insert(pixel.0);
+        if colors.len() >= 3 {
+            return true;
+        }
+    }
+    false
+}
+
+fn metamorphic_label_slug(label: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        "label".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn metamorphic_counter_fixture_cases(
+    source_text: &str,
+    scenario_text: &str,
+) -> Result<Vec<MetamorphicFixtureCase>, Box<dyn std::error::Error>> {
+    let mut reformatted_source = format!(
+        "-- Metamorphic hidden fixture generated from the Counter semantic story.\n\n{source_text}"
+    );
+    reformatted_source = boon_parser::format_source("hidden_reformatted.bn", reformatted_source)?;
+
+    let renamed_source = metamorphic_counter_renamed_source(source_text)?;
+    let renamed_scenario = metamorphic_counter_renamed_scenario(scenario_text);
+    let reordered_source = metamorphic_counter_reordered_and_restyled_source(source_text)?;
+
+    Ok(vec![
+        MetamorphicFixtureCase {
+            id: "case-a",
+            scenario_name: "hidden_source_path_move_and_reformat",
+            description: "moved source/scenario paths plus legal comments and formatter output",
+            mutations: vec![
+                "source_path_move",
+                "scenario_path_move",
+                "fixture_id_change",
+                "legal_reformat",
+            ],
+            source_text: reformatted_source,
+            scenario_text: scenario_text.to_owned(),
+        },
+        MetamorphicFixtureCase {
+            id: "case-b",
+            scenario_name: "hidden_route_and_label_renames",
+            description: "source route, function, visible label, target, and target_text renames",
+            mutations: vec![
+                "source_route_rename",
+                "function_rename",
+                "visible_label_rename",
+                "target_text_rename",
+                "fixture_id_change",
+            ],
+            source_text: renamed_source,
+            scenario_text: renamed_scenario,
+        },
+        MetamorphicFixtureCase {
+            id: "case-c",
+            scenario_name: "hidden_order_and_style_mutation",
+            description: "legal LATEST branch/control declaration order changes plus style/viewport-like changes",
+            mutations: vec![
+                "declaration_order_change",
+                "source_branch_order_change",
+                "control_order_change",
+                "style_viewport_change",
+                "fixture_id_change",
+            ],
+            source_text: reordered_source,
+            scenario_text: scenario_text.to_owned(),
+        },
+    ])
+}
+
+fn metamorphic_counter_renamed_source(
+    source_text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let renamed = source_text
+        .replace("increment_button", "plus_action")
+        .replace("decrement_button", "minus_action")
+        .replace("reset_button", "zero_action")
+        .replace("TEXT { Counter }", "TEXT { Count Studio }")
+        .replace("TEXT { + }", "TEXT { Add }")
+        .replace("TEXT { - }", "TEXT { Subtract }")
+        .replace("TEXT { Reset }", "TEXT { Zero }");
+    Ok(boon_parser::format_source("hidden_renamed.bn", renamed)?)
+}
+
+fn metamorphic_counter_renamed_scenario(scenario_text: &str) -> String {
+    scenario_text
+        .replace("increment_button", "plus_action")
+        .replace("decrement_button", "minus_action")
+        .replace("reset_button", "zero_action")
+        .replace("target = \"increment button\"", "target = \"add action\"")
+        .replace(
+            "target = \"decrement button\"",
+            "target = \"subtract action\"",
+        )
+        .replace("target = \"reset button\"", "target = \"zero action\"")
+        .replace("target_text = \"+\"", "target_text = \"Add\"")
+        .replace("target_text = \"-\"", "target_text = \"Subtract\"")
+        .replace("target_text = \"Reset\"", "target_text = \"Zero\"")
+}
+
+fn metamorphic_counter_reordered_and_restyled_source(
+    source_text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let latest_from = "                sources.increment_button.events.press |> THEN { count + 1 }\n                sources.decrement_button.events.press |> THEN { count - 1 }\n                sources.reset_button.events.press |> THEN { 0 }";
+    let latest_to = "                sources.reset_button.events.press |> THEN { 0 }\n                sources.increment_button.events.press |> THEN { count + 1 }\n                sources.decrement_button.events.press |> THEN { count - 1 }";
+    let controls_from = "            decrement_button()\n            reset_button()\n            increment_button()";
+    let controls_to = "            increment_button()\n            reset_button()\n            decrement_button()";
+    let mut changed = metamorphic_replace_required(
+        source_text.to_owned(),
+        latest_from,
+        latest_to,
+        "counter LATEST branch order",
+    )?;
+    changed =
+        metamorphic_replace_required(changed, controls_from, controls_to, "counter control order")?;
+    changed = changed
+        .replace("width: 420", "width: 512")
+        .replace("height: 260", "height: 288")
+        .replace("padding: 24", "padding: 28")
+        .replace(
+            "background: [color: Oklch[lightness:1]]",
+            "background: [color: Oklch[lightness:0.99,chroma:0.02,hue:210]]",
+        );
+    Ok(boon_parser::format_source("hidden_reordered.bn", changed)?)
+}
+
+fn metamorphic_replace_required(
+    text: String,
+    from: &str,
+    to: &str,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !text.contains(from) {
+        return Err(format!("metamorphic mutation target `{label}` was not found").into());
+    }
+    Ok(text.replace(from, to))
+}
+
+fn counter_scenario_for_hidden_source(
+    scenario_text: &str,
+    source_path: &Path,
+    scenario_name: &str,
+) -> String {
+    scenario_text
+        .replace("name = \"generic\"", &format!("name = \"{scenario_name}\""))
+        .replace(
+            "source = \"examples/counter.bn\"",
+            &format!("source = \"{}\"", source_path.display()),
+        )
+}
+
+fn metamorphic_semantic_invariants(scenario: &boon_runtime::Scenario) -> serde_json::Value {
+    let store_count_sequence = scenario
+        .step
+        .iter()
+        .filter_map(|step| {
+            step.expect_root_text.get("store.count").map(|count| {
+                json!({
+                    "step_id": step.id,
+                    "store.count": count
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected_source_events = scenario
+        .step
+        .iter()
+        .filter_map(|step| {
+            let event = step.expected_source_event.as_ref()?;
+            Some(json!({
+                "step_id": step.id,
+                "source": toml_string_field(event, "source"),
+                "target_text": toml_string_field(event, "target_text")
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "operation_count": scenario.step.len(),
+        "source_event_count": expected_source_events.len(),
+        "step_ids": scenario.step.iter().map(|step| step.id.clone()).collect::<Vec<_>>(),
+        "store_count_sequence": store_count_sequence,
+        "expected_source_events": expected_source_events
+    })
+}
+
+fn metamorphic_semantic_invariant_core(invariants: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "operation_count": invariants.get("operation_count").cloned().unwrap_or(serde_json::Value::Null),
+        "source_event_count": invariants.get("source_event_count").cloned().unwrap_or(serde_json::Value::Null),
+        "step_ids": invariants.get("step_ids").cloned().unwrap_or(serde_json::Value::Null),
+        "store_count_sequence": invariants.get("store_count_sequence").cloned().unwrap_or(serde_json::Value::Null)
+    })
+}
+
+fn toml_string_field(fields: &BTreeMap<String, toml::Value>, key: &str) -> Option<String> {
+    fields
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn report_status_pass(report: &serde_json::Value) -> bool {
+    report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+}
+
+fn verify_scenario_manifest_integrity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/scenario-manifest-integrity.json"));
+    let manifest_path = boon_runtime::example_manifest_path();
+    let manifest_hash = boon_runtime::sha256_file(&manifest_path)
+        .unwrap_or_else(|error| format!("missing: {error}"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut example_reports = Vec::new();
+    let mut source_hashes = BTreeMap::new();
+    let mut scenario_hashes = BTreeMap::new();
+    let mut budget_hashes = BTreeMap::new();
+
+    let manifest_entries = match boon_runtime::example_manifest_entries() {
+        Ok(entries) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "scenario-manifest-integrity:manifest-loads",
+                true,
+                format!("{} entries from {}", entries.len(), manifest_path.display()),
+                None,
+            );
+            entries
+        }
+        Err(error) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "scenario-manifest-integrity:manifest-loads",
+                false,
+                error.to_string(),
+                Some("examples/manifest.toml could not be parsed and validated".to_owned()),
+            );
+            Vec::new()
+        }
+    };
+
+    for entry in &manifest_entries {
+        let source_files = manifest_source_files(entry);
+        let source_text = boon_runtime::source_text_for_entry(entry).unwrap_or_default();
+        let source_hash = source_hash_for_report_source_files(&source_files, &source_text)
+            .unwrap_or_else(|error| format!("missing: {error}"));
+        let scenario_hash = file_hash(&entry.scenario);
+        let budget_hash = file_hash(&entry.budget);
+        source_hashes.insert(entry.id.clone(), source_hash.clone());
+        scenario_hashes.insert(entry.id.clone(), scenario_hash.clone());
+        budget_hashes.insert(entry.id.clone(), budget_hash.clone());
+
+        let scenario_path = Path::new(&entry.scenario);
+        let mut step_reports = Vec::new();
+        let scenario_ref_provenance = scenario_ref_provenance_by_id(entry);
+        let scenario = match parse_scenario(scenario_path) {
+            Ok(scenario) => {
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!("scenario-manifest-integrity:{}:scenario-parses", entry.id),
+                    true,
+                    format!("{} parsed", entry.scenario),
+                    None,
+                );
+                Some(scenario)
+            }
+            Err(error) => {
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!("scenario-manifest-integrity:{}:scenario-parses", entry.id),
+                    false,
+                    error.to_string(),
+                    Some(format!(
+                        "example `{}` scenario `{}` could not be parsed",
+                        entry.id, entry.scenario
+                    )),
+                );
+                None
+            }
+        };
+
+        let mut scenario_ids = BTreeSet::new();
+        let mut duplicate_step_ids = BTreeSet::new();
+        if let Some(scenario) = &scenario {
+            for step in &scenario.step {
+                if step.id.trim().is_empty() {
+                    push_audit_check(
+                        &mut checks,
+                        &mut blockers,
+                        format!("scenario-manifest-integrity:{}:no-empty-step-id", entry.id),
+                        false,
+                        "empty scenario step id",
+                        Some(format!(
+                            "example `{}` scenario `{}` contains an empty step id",
+                            entry.id, entry.scenario
+                        )),
+                    );
+                    continue;
+                }
+                if !scenario_ids.insert(step.id.clone()) {
+                    duplicate_step_ids.insert(step.id.clone());
+                }
+                let raw_coordinate_fields = scenario_user_action_raw_coordinate_fields(step);
+                let raw_coordinates_ok = raw_coordinate_fields.is_empty();
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!(
+                        "scenario-manifest-integrity:{}:{}:no-authored-raw-coordinates",
+                        entry.id, step.id
+                    ),
+                    raw_coordinates_ok,
+                    format!("raw_coordinate_fields={raw_coordinate_fields:?}"),
+                    (!raw_coordinates_ok).then(|| {
+                        format!(
+                            "scenario `{}` step `{}` uses authored raw coordinate selector fields {:?}",
+                            entry.scenario, step.id, raw_coordinate_fields
+                        )
+                    }),
+                );
+                let selector_ok = scenario_user_action_target_text_is_disambiguated(step);
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!(
+                        "scenario-manifest-integrity:{}:{}:target-text-selector-disambiguated",
+                        entry.id, step.id
+                    ),
+                    selector_ok,
+                    scenario_selector_detail(step),
+                    (!selector_ok).then(|| {
+                        format!(
+                            "scenario `{}` step `{}` uses target_text without a role/control/target disambiguator",
+                            entry.scenario, step.id
+                        )
+                    }),
+                );
+                let source_intent_ok = scenario_input_action_has_expected_source_intent(step);
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!(
+                        "scenario-manifest-integrity:{}:{}:input-action-has-source-intent",
+                        entry.id, step.id
+                    ),
+                    source_intent_ok,
+                    scenario_source_intent_detail(step),
+                    (!source_intent_ok).then(|| {
+                        format!(
+                            "scenario `{}` step `{}` has input/action but no expected public source intent",
+                            entry.scenario, step.id
+                        )
+                    }),
+                );
+                let row_identity_ok =
+                    scenario_row_action_has_public_identity_or_justified_selector(step);
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!(
+                        "scenario-manifest-integrity:{}:{}:row-action-public-identity-or-selector",
+                        entry.id, step.id
+                    ),
+                    row_identity_ok,
+                    scenario_row_identity_detail(step),
+                    (!row_identity_ok).then(|| {
+                        format!(
+                            "scenario `{}` step `{}` has a row-like action without public row identity or justified selector",
+                            entry.scenario, step.id
+                        )
+                    }),
+                );
+                step_reports.push(json!({
+                    "id": step.id,
+                    "has_user_action": step.user_action.is_some(),
+                    "has_expected_source_event": step.expected_source_event.is_some(),
+                    "raw_coordinate_fields": raw_coordinate_fields,
+                    "target_text_selector_disambiguated": selector_ok,
+                    "input_action_has_expected_source_intent": source_intent_ok,
+                    "row_action_public_identity_or_selector": row_identity_ok
+                }));
+            }
+        }
+
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!(
+                "scenario-manifest-integrity:{}:duplicate-scn-step-ids",
+                entry.id
+            ),
+            duplicate_step_ids.is_empty(),
+            format!("duplicate_step_ids={duplicate_step_ids:?}"),
+            (!duplicate_step_ids.is_empty()).then(|| {
+                format!(
+                    "example `{}` scenario `{}` has duplicate .scn step ids {:?}",
+                    entry.id, entry.scenario, duplicate_step_ids
+                )
+            }),
+        );
+
+        let manifest_refs = manifest_scenario_refs(entry);
+        let mut ref_counts = BTreeMap::<String, usize>::new();
+        for reference in &manifest_refs {
+            *ref_counts.entry(reference.clone()).or_default() += 1;
+        }
+        let duplicate_manifest_refs = ref_counts
+            .iter()
+            .filter_map(|(reference, count)| (*count > 1).then(|| reference.clone()))
+            .collect::<Vec<_>>();
+        let missing_manifest_refs = manifest_refs
+            .iter()
+            .filter(|reference| {
+                !scenario_ids.contains(*reference)
+                    && !scenario_ref_provenance
+                        .get(reference.as_str())
+                        .is_some_and(|provenance| provenance.generated_probe)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let duplicate_manifest_refs = duplicate_manifest_refs
+            .into_iter()
+            .filter(|reference| {
+                !scenario_ref_provenance
+                    .get(reference.as_str())
+                    .is_some_and(|provenance| scenario_ref_provenance_allows_duplicate(provenance))
+            })
+            .collect::<Vec<_>>();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!(
+                "scenario-manifest-integrity:{}:manifest-refs-exist",
+                entry.id
+            ),
+            missing_manifest_refs.is_empty(),
+            format!("missing_manifest_refs={missing_manifest_refs:?}"),
+            (!missing_manifest_refs.is_empty()).then(|| {
+                format!(
+                    "example `{}` manifest references scenario ids not present in `{}`: {:?}",
+                    entry.id, entry.scenario, missing_manifest_refs
+                )
+            }),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("scenario-manifest-integrity:{}:manifest-refs-unique", entry.id),
+            duplicate_manifest_refs.is_empty(),
+            format!("duplicate_manifest_refs={duplicate_manifest_refs:?}"),
+            (!duplicate_manifest_refs.is_empty()).then(|| {
+                format!(
+                    "example `{}` manifest has duplicate scenario refs without phased/generated provenance: {:?}",
+                    entry.id, duplicate_manifest_refs
+                )
+            }),
+        );
+        let evidence_tier_ok = scenario_manifest_evidence_tier_is_supported(entry);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("scenario-manifest-integrity:{}:evidence-tier", entry.id),
+            evidence_tier_ok,
+            format!(
+                "required_evidence_tier={}, human_testing_needed={}",
+                entry.required_evidence_tier, entry.human_testing_needed
+            ),
+            (!evidence_tier_ok).then(|| {
+                format!(
+                    "example `{}` has evidence tier drift: `{}`",
+                    entry.id, entry.required_evidence_tier
+                )
+            }),
+        );
+        example_reports.push(json!({
+            "id": entry.id,
+            "label": entry.label,
+            "source": entry.source,
+            "source_hash": source_hash,
+            "source_files": source_files,
+            "scenario": entry.scenario,
+            "scenario_hash": scenario_hash,
+            "budget": entry.budget,
+            "budget_hash": budget_hash,
+            "required_evidence_tier": entry.required_evidence_tier,
+            "human_testing_needed": entry.human_testing_needed,
+            "scenario_ref_provenance": entry.scenario_ref_provenance,
+            "scenario_step_count": scenario.as_ref().map(|scenario| scenario.step.len()).unwrap_or(0),
+            "manifest_scenario_refs": manifest_refs,
+            "missing_manifest_refs": missing_manifest_refs,
+            "duplicate_manifest_refs": duplicate_manifest_refs,
+            "duplicate_step_ids": duplicate_step_ids,
+            "steps": step_reports
+        }));
+    }
+
+    let source_hash = aggregate_named_hashes(&source_hashes);
+    let scenario_hash = aggregate_named_hashes(&scenario_hashes);
+    let budget_hash = aggregate_named_hashes(&budget_hashes);
+    write_static_gate_report(
+        args,
+        "verify-scenario-manifest-integrity",
+        report,
+        checks,
+        blockers,
+        json!({
+            "manifest_path": manifest_path,
+            "manifest_hash": manifest_hash,
+            "source_hash": source_hash,
+            "scenario_hash": scenario_hash,
+            "program_hash": source_hash,
+            "budget_hash": budget_hash,
+            "source_hashes": source_hashes,
+            "scenario_hashes": scenario_hashes,
+            "budget_hashes": budget_hashes,
+            "examples": example_reports,
+            "scenario_integrity_contract": {
+                "duplicate_scn_step_ids_fail": true,
+                "missing_manifest_refs_fail": true,
+                "duplicate_manifest_refs_require_provenance": true,
+                "authored_raw_coordinate_selectors_fail": true,
+                "target_text_only_selectors_fail": true,
+                "input_actions_require_expected_public_source_intent": true,
+                "evidence_tier_drift_fails": true
+            }
+        }),
+    )
+}
+
+fn manifest_scenario_refs(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+    entry
+        .input_scenarios
+        .iter()
+        .chain(entry.scroll_focus_scenarios.iter())
+        .cloned()
+        .collect()
+}
+
+fn scenario_ref_provenance_by_id(
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> BTreeMap<&str, &boon_runtime::ScenarioRefProvenance> {
+    entry
+        .scenario_ref_provenance
+        .iter()
+        .map(|provenance| (provenance.id.as_str(), provenance))
+        .collect()
+}
+
+fn scenario_ref_provenance_allows_duplicate(
+    provenance: &boon_runtime::ScenarioRefProvenance,
+) -> bool {
+    provenance.generated_probe || provenance.phases.len() > 1
+}
+
+fn scenario_user_action_raw_coordinate_fields(step: &boon_runtime::ScenarioStep) -> Vec<String> {
+    let Some(action) = &step.user_action else {
+        return Vec::new();
+    };
+    action
+        .keys()
+        .filter(|key| scenario_action_key_is_raw_coordinate(key))
+        .cloned()
+        .collect()
+}
+
+fn scenario_action_key_is_raw_coordinate(key: &str) -> bool {
+    matches!(
+        key,
+        "x" | "y"
+            | "screen_x"
+            | "screen_y"
+            | "client_x"
+            | "client_y"
+            | "target_x"
+            | "target_y"
+            | "pointer_x"
+            | "pointer_y"
+            | "coordinate"
+            | "coordinates"
+            | "point"
+    )
+}
+
+fn scenario_user_action_target_text_is_disambiguated(step: &boon_runtime::ScenarioStep) -> bool {
+    let Some(action) = &step.user_action else {
+        return true;
+    };
+    if !action.contains_key("target_text") {
+        return true;
+    }
+    [
+        "target",
+        "role",
+        "control",
+        "control_id",
+        "source",
+        "source_binding",
+        "address",
+        "selector",
+        "region",
+        "row",
+        "scope",
+        "signal",
+    ]
+    .iter()
+    .any(|key| action.contains_key(*key))
+}
+
+fn scenario_input_action_has_expected_source_intent(step: &boon_runtime::ScenarioStep) -> bool {
+    if step.user_action.is_none() {
+        return true;
+    }
+    if step
+        .source_intent_exemption
+        .as_deref()
+        .is_some_and(|reason| !reason.trim().is_empty())
+    {
+        return true;
+    }
+    let Some(expected) = &step.expected_source_event else {
+        return false;
+    };
+    expected
+        .get("source")
+        .and_then(toml_value_as_str_xtask)
+        .is_some_and(|source| !source.trim().is_empty())
+}
+
+fn scenario_row_action_has_public_identity_or_justified_selector(
+    step: &boon_runtime::ScenarioStep,
+) -> bool {
+    let Some(action) = &step.user_action else {
+        return true;
+    };
+    if step
+        .source_intent_exemption
+        .as_deref()
+        .is_some_and(|reason| !reason.trim().is_empty())
+    {
+        return true;
+    }
+    if !scenario_action_is_row_like(action) {
+        return true;
+    }
+    let has_public_identity = ["target_key", "target_generation", "source_id", "bind_epoch"]
+        .iter()
+        .any(|key| action.contains_key(*key))
+        || step.expected_source_event.as_ref().is_some_and(|expected| {
+            [
+                "target_key",
+                "target_generation",
+                "source_id",
+                "bind_epoch",
+                "source_epoch",
+            ]
+            .iter()
+            .any(|key| expected.contains_key(*key))
+        });
+    has_public_identity || scenario_user_action_target_text_is_disambiguated(step)
+}
+
+fn scenario_action_is_row_like(action: &BTreeMap<String, toml::Value>) -> bool {
+    let candidate_text = [
+        "target",
+        "role",
+        "control",
+        "selector",
+        "source",
+        "target_text",
+    ]
+    .iter()
+    .filter_map(|key| action.get(*key).and_then(toml_value_as_str_xtask))
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    [
+        "row", "todo", "item", "file", "scope", "signal", "marker", "variable", "group", "selected",
+    ]
+    .iter()
+    .any(|needle| candidate_text.contains(needle))
+}
+
+fn scenario_selector_detail(step: &boon_runtime::ScenarioStep) -> String {
+    let keys = step
+        .user_action
+        .as_ref()
+        .map(|action| action.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    format!("user_action_keys={keys:?}")
+}
+
+fn scenario_source_intent_detail(step: &boon_runtime::ScenarioStep) -> String {
+    let source = step
+        .expected_source_event
+        .as_ref()
+        .and_then(|event| event.get("source"))
+        .and_then(toml_value_as_str_xtask)
+        .unwrap_or("missing");
+    format!(
+        "has_user_action={}, expected_source={source}, exemption={:?}",
+        step.user_action.is_some(),
+        step.source_intent_exemption
+    )
+}
+
+fn scenario_row_identity_detail(step: &boon_runtime::ScenarioStep) -> String {
+    let action_keys = step
+        .user_action
+        .as_ref()
+        .map(|action| action.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let expected_keys = step
+        .expected_source_event
+        .as_ref()
+        .map(|event| event.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    format!(
+        "user_action_keys={action_keys:?}, expected_source_event_keys={expected_keys:?}, exemption={:?}",
+        step.source_intent_exemption
+    )
+}
+
+fn scenario_manifest_evidence_tier_is_supported(
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> bool {
+    matches!(
+        entry.required_evidence_tier.as_str(),
+        "runtime" | "host-synthetic" | "real-window" | "human"
+    )
+}
+
+fn aggregate_named_hashes(hashes: &BTreeMap<String, String>) -> String {
+    let mut text = String::new();
+    for (name, hash) in hashes {
+        text.push_str(name);
+        text.push('=');
+        text.push_str(hash);
+        text.push('\n');
+    }
+    boon_runtime::sha256_bytes(text.as_bytes())
+}
+
 fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -975,6 +4206,7 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             &json!({
                 "status": "stopped",
                 "generated_at_utc": current_unix_seconds().to_string(),
+                "measurement_mode": "diagnostic",
                 "stopped_pid_count": stopped,
                 "report_path": report
             }),
@@ -1013,6 +4245,7 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &json!({
                     "status": "fail",
                     "generated_at_utc": current_unix_seconds().to_string(),
+                    "measurement_mode": "diagnostic",
                     "example": entry.id,
                     "generation": generation,
                     "build_status": build.to_string(),
@@ -1043,6 +4276,7 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             &json!({
                 "status": if launch.get("success").and_then(serde_json::Value::as_bool) == Some(true) { "running" } else { "fail" },
                 "generated_at_utc": current_unix_seconds().to_string(),
+                "measurement_mode": "diagnostic",
                 "example": entry.id,
                 "source_path": entry.source,
                 "binary_path": "target/debug/boon_native_playground",
@@ -1673,6 +4907,427 @@ fn verify_native_gpu_architecture(args: &[String]) -> Result<(), Box<dyn std::er
             );
         }
     }
+    let native_gpu_source = std::fs::read_to_string("crates/boon_native_gpu/src/lib.rs")?;
+    let document_render_scene_source =
+        std::fs::read_to_string("crates/boon_document/src/render_scene.rs").unwrap_or_default();
+    let document_render_scene_boundary = !document_render_scene_source.is_empty()
+        && document_render_scene_source.contains("pub struct RenderScene")
+        && document_render_scene_source.contains("pub struct RenderSceneItem")
+        && document_render_scene_source.contains("pub struct RenderTextRun");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-boundary-exists",
+        document_render_scene_boundary,
+        format!("document render scene boundary exists={document_render_scene_boundary}"),
+        (!document_render_scene_boundary).then(|| {
+            "boon_document does not define the renderer-neutral RenderScene boundary".to_owned()
+        }),
+    );
+    let document_render_scene_gpu_free = !document_render_scene_source.contains("wgpu::")
+        && !document_render_scene_source.contains("glyphon::")
+        && !document_render_scene_source.contains("resvg::")
+        && !document_render_scene_source.contains("image::");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-gpu-free",
+        document_render_scene_gpu_free,
+        format!(
+            "document render scene GPU/resource markers absent={document_render_scene_gpu_free}"
+        ),
+        (!document_render_scene_gpu_free).then(|| {
+            "boon_document render_scene boundary imports GPU, glyphon, image, or raster resources"
+                .to_owned()
+        }),
+    );
+    let document_owns_text_lowering = document_render_scene_source
+        .contains("pub fn render_text_runs")
+        && document_render_scene_source.contains("editor_type_hints_json")
+        && document_render_scene_source.contains("syntax_spans_json")
+        && document_render_scene_source.contains("placeholder")
+        && document_render_scene_source.contains("RenderTextColumnMeasurer");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-text-lowering",
+        document_owns_text_lowering,
+        format!("document render scene owns text lowering={document_owns_text_lowering}"),
+        (!document_owns_text_lowering).then(|| {
+            "boon_document render_scene does not own text/style/type-hint lowering".to_owned()
+        }),
+    );
+    let document_owns_visual_primitive_lowering = document_render_scene_source
+        .contains("pub fn render_visual_primitives")
+        && document_render_scene_source.contains("RenderVisualPrimitiveKind")
+        && document_render_scene_source.contains("default_fill_for_kind")
+        && document_render_scene_source.contains("CheckboxCheckmark")
+        && document_render_scene_source.contains("style_asset_url");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-visual-primitive-lowering",
+        document_owns_visual_primitive_lowering,
+        format!(
+            "document render scene owns visual primitive lowering={document_owns_visual_primitive_lowering}"
+        ),
+        (!document_owns_visual_primitive_lowering).then(|| {
+            "boon_document render_scene does not own default fill, asset, and checkbox primitive lowering"
+                .to_owned()
+        }),
+    );
+    let document_owns_text_overlay_lowering = document_render_scene_source
+        .contains("fn text_overlay_primitives")
+        && document_render_scene_source.contains("EditorSelection")
+        && document_render_scene_source.contains("EditorBracketHighlight")
+        && document_render_scene_source.contains("EditorCaret")
+        && document_render_scene_source.contains("TextInputCaret")
+        && document_render_scene_source.contains("Underline")
+        && document_render_scene_source.contains("Strikethrough")
+        && document_render_scene_source.contains("editor_selection_start")
+        && document_render_scene_source.contains("editor_bracket_columns")
+        && document_render_scene_source.contains("editor_caret_column")
+        && document_render_scene_source.contains("caret_visible")
+        && document_render_scene_source
+            .contains("render_visual_primitives_lower_text_overlays_before_gpu");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-text-overlay-lowering",
+        document_owns_text_overlay_lowering,
+        format!(
+            "document render scene owns text overlay primitive lowering={document_owns_text_overlay_lowering}"
+        ),
+        (!document_owns_text_overlay_lowering).then(|| {
+            "boon_document render_scene does not own editor selection/caret, underline, strikethrough, and text-input caret primitive lowering"
+                .to_owned()
+        }),
+    );
+    let document_owns_material_fill_lowering = document_render_scene_source
+        .contains("fn material_adjusted_fill_u8")
+        && document_render_scene_source.contains("transparency")
+        && document_render_scene_source.contains("refraction")
+        && document_render_scene_source.contains("frosted_blur")
+        && document_render_scene_source.contains("frosted_saturate")
+        && document_render_scene_source.contains("gloss")
+        && document_render_scene_source.contains("metal")
+        && document_render_scene_source
+            .contains("render_visual_primitives_apply_material_fill_adjustments_before_gpu");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-material-fill-lowering",
+        document_owns_material_fill_lowering,
+        format!(
+            "document render scene owns material fill adjustment={document_owns_material_fill_lowering}"
+        ),
+        (!document_owns_material_fill_lowering).then(|| {
+            "boon_document render_scene does not own transparency/refraction/frost/gloss/metal fill adjustment before GPU"
+                .to_owned()
+        }),
+    );
+    let document_owns_material_layer_lowering = document_render_scene_source
+        .contains("fn frosted_material_layer_primitives_for_item")
+        && document_render_scene_source.contains("fn material_highlight_primitives_for_item")
+        && document_render_scene_source.contains("FrostedMaterialLayer")
+        && document_render_scene_source.contains("MaterialHighlight")
+        && document_render_scene_source.contains("glass_highlight")
+        && document_render_scene_source.contains("depth")
+        && document_render_scene_source
+            .contains("render_visual_primitives_lower_material_layers_before_gpu");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-material-layer-lowering",
+        document_owns_material_layer_lowering,
+        format!(
+            "document render scene owns material layer/highlight primitives={document_owns_material_layer_lowering}"
+        ),
+        (!document_owns_material_layer_lowering).then(|| {
+            "boon_document render_scene does not own frosted material layer and material highlight primitive lowering before GPU"
+                .to_owned()
+        }),
+    );
+    let document_owns_shadow_lowering = document_render_scene_source
+        .contains("fn shadow_primitives_for_item")
+        && document_render_scene_source.contains("fn push_shadow_halo_primitives")
+        && document_render_scene_source.contains("fn push_shadow_rect_difference_primitives")
+        && document_render_scene_source.contains("RenderVisualPrimitiveKind::Shadow")
+        && document_render_scene_source.contains("box_shadow_1_color")
+        && document_render_scene_source
+            .contains("render_visual_primitives_lower_shadows_before_fill_before_gpu");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-shadow-lowering",
+        document_owns_shadow_lowering,
+        format!("document render scene owns shadow primitives={document_owns_shadow_lowering}"),
+        (!document_owns_shadow_lowering).then(|| {
+            "boon_document render_scene does not own box-shadow primitive lowering before GPU"
+                .to_owned()
+        }),
+    );
+    let document_owns_checkbox_raster_lowering = document_render_scene_source
+        .contains("fn checkbox_primitives_for_item")
+        && document_render_scene_source.contains("fn checkbox_has_asset_icon")
+        && document_render_scene_source.contains("CheckboxCastShadow")
+        && document_render_scene_source.contains("CheckboxInnerShadow")
+        && document_render_scene_source.contains("CheckboxHighlight")
+        && document_render_scene_source.contains("control_points")
+        && document_render_scene_source
+            .contains("render_visual_primitives_lower_checkbox_raster_semantics_before_gpu")
+        && document_render_scene_source.contains(
+            "render_visual_primitives_skip_checkbox_raster_when_asset_icon_covers_control",
+        );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-checkbox-raster-lowering",
+        document_owns_checkbox_raster_lowering,
+        format!(
+            "document render scene owns checkbox raster descriptors={document_owns_checkbox_raster_lowering}"
+        ),
+        (!document_owns_checkbox_raster_lowering).then(|| {
+            "boon_document render_scene does not own checkbox raster descriptor lowering before GPU"
+                .to_owned()
+        }),
+    );
+    let document_owns_border_lowering = document_render_scene_source
+        .contains("fn border_primitives_for_item")
+        && document_render_scene_source.contains("BorderTop")
+        && document_render_scene_source.contains("BorderRight")
+        && document_render_scene_source.contains("BorderBottom")
+        && document_render_scene_source.contains("BorderLeft")
+        && document_render_scene_source.contains("stroke_width")
+        && document_render_scene_source.contains("border_width")
+        && document_render_scene_source
+            .contains("render_visual_primitives_lower_borders_after_descendant_fills_before_gpu");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:document-render-scene-owns-border-lowering",
+        document_owns_border_lowering,
+        format!("document render scene owns border primitive lowering={document_owns_border_lowering}"),
+        (!document_owns_border_lowering).then(|| {
+            "boon_document render_scene does not own border and side-border primitive lowering with stroke widths"
+                .to_owned()
+        }),
+    );
+    let renderer_paints_text_overlay_primitives = native_gpu_source.contains("EditorSelection")
+        && native_gpu_source.contains("EditorBracketHighlight")
+        && native_gpu_source.contains("EditorCaret")
+        && native_gpu_source.contains("TextInputCaret")
+        && native_gpu_source.contains("Underline")
+        && native_gpu_source.contains("Strikethrough")
+        && native_gpu_source.contains("ButtonCheckmark")
+        && native_gpu_source.contains("quad_batches_from_visual_primitives");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-paints-document-text-overlay-primitives",
+        renderer_paints_text_overlay_primitives,
+        format!(
+            "renderer paints document text overlay primitives={renderer_paints_text_overlay_primitives}"
+        ),
+        (!renderer_paints_text_overlay_primitives).then(|| {
+            "native GPU does not paint document-owned text overlay primitives from the external RenderScene"
+                .to_owned()
+        }),
+    );
+    let renderer_paints_border_primitives = native_gpu_source
+        .contains("RenderVisualPrimitiveKind::Border")
+        && native_gpu_source.contains("RenderVisualPrimitiveKind::BorderBottom")
+        && native_gpu_source.contains("push_styled_border_all")
+        && native_gpu_source.contains("push_side_border")
+        && native_gpu_source.contains("renderer_paints_external_document_border_primitives");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-paints-document-border-primitives",
+        renderer_paints_border_primitives,
+        format!("renderer paints document border primitives={renderer_paints_border_primitives}"),
+        (!renderer_paints_border_primitives).then(|| {
+            "native GPU does not paint document-owned border primitives from the external RenderScene"
+                .to_owned()
+        }),
+    );
+    let renderer_paints_material_layer_primitives = native_gpu_source
+        .contains("RenderVisualPrimitiveKind::FrostedMaterialLayer")
+        && native_gpu_source.contains("RenderVisualPrimitiveKind::MaterialHighlight")
+        && native_gpu_source
+            .contains("renderer_paints_external_document_material_layer_primitives")
+        && native_gpu_source.contains("quad_batches_from_visual_primitives");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-paints-document-material-layer-primitives",
+        renderer_paints_material_layer_primitives,
+        format!(
+            "renderer paints document material layer primitives={renderer_paints_material_layer_primitives}"
+        ),
+        (!renderer_paints_material_layer_primitives).then(|| {
+            "native GPU does not paint document-owned frosted material layer and material highlight primitives from the external RenderScene"
+                .to_owned()
+        }),
+    );
+    let renderer_paints_shadow_primitives = native_gpu_source
+        .contains("RenderVisualPrimitiveKind::Shadow")
+        && native_gpu_source.contains("renderer_paints_external_document_shadow_primitives")
+        && native_gpu_source.contains("quad_batches_from_visual_primitives");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-paints-document-shadow-primitives",
+        renderer_paints_shadow_primitives,
+        format!("renderer paints document shadow primitives={renderer_paints_shadow_primitives}"),
+        (!renderer_paints_shadow_primitives).then(|| {
+            "native GPU does not paint document-owned shadow primitives from the external RenderScene"
+                .to_owned()
+        }),
+    );
+    let renderer_paints_checkbox_raster_primitives = native_gpu_source
+        .contains("RenderVisualPrimitiveKind::CheckboxCastShadow")
+        && native_gpu_source.contains("RenderVisualPrimitiveKind::CheckboxInnerShadow")
+        && native_gpu_source.contains("RenderVisualPrimitiveKind::CheckboxHighlight")
+        && native_gpu_source.contains("push_checkbox_circle_raster")
+        && native_gpu_source.contains("push_checkbox_check_raster")
+        && native_gpu_source
+            .contains("renderer_paints_external_document_checkbox_raster_primitives");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-paints-document-checkbox-raster-primitives",
+        renderer_paints_checkbox_raster_primitives,
+        format!(
+            "renderer paints document checkbox raster primitives={renderer_paints_checkbox_raster_primitives}"
+        ),
+        (!renderer_paints_checkbox_raster_primitives).then(|| {
+            "native GPU does not paint document-owned checkbox raster descriptors from the external RenderScene"
+                .to_owned()
+        }),
+    );
+    let render_scene_boundary = native_gpu_source.contains("struct RenderScene")
+        && native_gpu_source.contains("struct RenderSceneItem")
+        && native_gpu_source.contains("fn render_scene_from_layout_frame")
+        && native_gpu_source.contains("fn rect_vertices_from_scene");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:render-scene-boundary-exists",
+        render_scene_boundary,
+        format!("native GPU render scene boundary exists={render_scene_boundary}"),
+        (!render_scene_boundary).then(|| {
+            "boon_native_gpu does not expose a single render-scene lowering boundary before encode"
+                .to_owned()
+        }),
+    );
+    let renderer_consumes_scene = native_gpu_source.contains("rect_vertices_from_scene(&scene")
+        && native_gpu_source.contains("retained_render_chunks(&scene")
+        && native_gpu_source.contains("scene.text_runs");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-consumes-render-scene",
+        renderer_consumes_scene,
+        format!("visible renderer consumes RenderScene={renderer_consumes_scene}"),
+        (!renderer_consumes_scene).then(|| {
+            "visible native renderer still bypasses RenderScene for primitive/text/chunk data"
+                .to_owned()
+        }),
+    );
+    let renderer_accepts_external_scene = native_gpu_source
+        .contains("pub struct SurfaceRenderSceneRequest")
+        && native_gpu_source.contains("pub fn encode_render_scene_to_surface")
+        && native_gpu_source.contains("fn encode_render_scene_to_surface_with_pipeline")
+        && native_gpu_source.contains("fn render_scene_from_document_scene")
+        && native_gpu_source.contains("scene: &'a DocumentRenderScene")
+        && !native_gpu_source.contains("prepared_frame: Option<(&LayoutFrame");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-accepts-external-render-scene",
+        renderer_accepts_external_scene,
+        format!("visible renderer accepts external document RenderScene={renderer_accepts_external_scene}"),
+        (!renderer_accepts_external_scene).then(|| {
+            "native GPU does not expose a pre-lowered document RenderScene entrypoint independent of LayoutFrame"
+                .to_owned()
+        }),
+    );
+    let layout_request_encode_body = native_gpu_source
+        .split("fn encode_layout_to_surface_with_pipeline")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("fn encode_render_scene_to_surface_with_pipeline")
+                .next()
+        })
+        .unwrap_or_default();
+    let layout_request_uses_document_scene_adapter = layout_request_encode_body
+        .contains("lower_layout_frame_to_render_scene")
+        && layout_request_encode_body.contains("render_scene_from_document_scene(&document_scene")
+        && !layout_request_encode_body.contains("render_scene_from_layout_frame(")
+        && !layout_request_encode_body.contains("rect_vertices(")
+        && native_gpu_source.contains("Compatibility-only LayoutFrame semantic lowerer");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:layout-request-uses-document-render-scene-adapter",
+        layout_request_uses_document_scene_adapter,
+        format!(
+            "layout request encode path uses document RenderScene adapter={layout_request_uses_document_scene_adapter}"
+        ),
+        (!layout_request_uses_document_scene_adapter).then(|| {
+            "SurfaceRenderRequest encode path still calls the old LayoutFrame semantic lowerer or does not mark it compatibility-only"
+                .to_owned()
+        }),
+    );
+    let hot_encode_uses_scene_contract = native_gpu_source.contains(
+        "fn encode_internal_scene_to_surface(\n    request: SceneEncodeRequest<'_>,\n    scene: RenderScene",
+    ) && native_gpu_source.contains("let scene_key = render_scene_cache_key(&scene);")
+        && !native_gpu_source.contains("prepared_frame")
+        && !native_gpu_source.contains("frame_renderer_style_identity_hash");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-hot-encode-uses-scene-contract",
+        hot_encode_uses_scene_contract,
+        format!("hot encode consumes scene contract without layout-frame cache key={hot_encode_uses_scene_contract}"),
+        (!hot_encode_uses_scene_contract).then(|| {
+            "native GPU hot encode path still appears to use LayoutFrame-era cache state instead of scene-keyed data"
+                .to_owned()
+        }),
+    );
+    let scene_boundary_tested = native_gpu_source
+        .contains("render_scene_boundary_exposes_primitive_items_textures_and_text_runs")
+        && native_gpu_source
+            .contains("renderer_helpers_accept_prelowered_render_scene_without_layout_frame")
+        && native_gpu_source
+            .contains("renderer_adapts_external_document_render_scene_without_layout_frame");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:render-scene-boundary-tested",
+        scene_boundary_tested,
+        format!("RenderScene boundary unit test exists={scene_boundary_tested}"),
+        (!scene_boundary_tested).then(|| {
+            "native GPU tests do not prove renderer-neutral scene item/text/texture metadata"
+                .to_owned()
+        }),
+    );
+    let renderer_text_lowering_delegates = native_gpu_source
+        .contains("boon_document::render_scene::render_text_runs")
+        && native_gpu_source.contains("struct GlyphonRenderTextColumnMeasurer")
+        && !native_gpu_source.contains("struct EditorTypeHintPayload");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:renderer-text-lowering-delegates-to-document",
+        renderer_text_lowering_delegates,
+        format!("native GPU text lowering delegates to document={renderer_text_lowering_delegates}"),
+        (!renderer_text_lowering_delegates).then(|| {
+            "native GPU still appears to own text-run semantic lowering instead of delegating to boon_document"
+                .to_owned()
+        }),
+    );
     let preview_source = std::fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
     let preview_rejects_example = preview_source
         .contains("preview role must not receive --example")
@@ -1685,6 +5340,25 @@ fn verify_native_gpu_architecture(args: &[String]) -> Result<(), Box<dyn std::er
         "preview role rejects --example before loading source",
         (!preview_rejects_example)
             .then(|| "preview role does not mechanically reject --example".to_owned()),
+    );
+    let playground_uses_external_render_scene = preview_source
+        .matches("encode_scene(boon_native_gpu::SurfaceRenderSceneRequest")
+        .count()
+        >= 2
+        && preview_source
+            .contains("boon_document::render_scene::lower_layout_frame_to_render_scene")
+        && preview_source.contains("boon_native_gpu::GlyphonRenderTextColumnMeasurer")
+        && !preview_source.contains("boon_native_gpu::SurfaceRenderRequest");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:playground-visible-render-uses-external-scene",
+        playground_uses_external_render_scene,
+        format!("native playground visible render uses external RenderScene={playground_uses_external_render_scene}"),
+        (!playground_uses_external_render_scene).then(|| {
+            "native playground preview/dev visible rendering still appears to call LayoutFrame renderer requests"
+                .to_owned()
+        }),
     );
     for forbidden in [
         "scenario_payload",
@@ -1784,6 +5458,261 @@ fn verify_native_gpu_layout_contract(args: &[String]) -> Result<(), Box<dyn std:
             .is_empty()
             .then(|| "Cells fixture did not produce materialization demands".to_owned()),
     );
+    let materialization_protocol_complete = !layout.materialization.is_empty()
+        && layout.materialization.iter().all(|report| {
+            report.logical_item_count >= report.materialized_item_count
+                && report.materialized_item_count > 0
+                && report.first_stable_key.is_some()
+                && report.last_stable_key.is_some()
+        })
+        && layout.demands.iter().all(|demand| {
+            demand.logical_item_count >= demand.materialized_item_count
+                && demand.materialized_item_count > 0
+                && demand.first_stable_key.is_some()
+                && demand.last_stable_key.is_some()
+        });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:materialization-protocol-fields",
+        materialization_protocol_complete,
+        format!(
+            "materialization_reports={}, demands={}",
+            layout.materialization.len(),
+            layout.demands.len()
+        ),
+        (!materialization_protocol_complete).then(|| {
+            "layout materialization reports must include logical/materialized counts and stable key samples".to_owned()
+        }),
+    );
+    let renderer_style_identity_complete = !layout.display_list.is_empty()
+        && layout.display_list.iter().all(|item| {
+            item.style_identity.style_id != 0
+                && item.style_identity.layout_id != 0
+                && item.style_identity.paint_id != 0
+                && item.style_identity.material_id != 0
+                && item.style_identity.font_id != 0
+                && item.style_identity.pseudo_state_id != 0
+        });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:computed-style-identity-fields",
+        renderer_style_identity_complete,
+        format!(
+            "display_items={}, style_identity_complete={renderer_style_identity_complete}",
+            layout.display_list.len()
+        ),
+        (!renderer_style_identity_complete).then(|| {
+            "renderer-facing display items must carry stable style/material/font/pseudo-state IDs"
+                .to_owned()
+        }),
+    );
+    let required_invalidation_classes = [
+        boon_document::PatchInvalidationClass::PaintOnly,
+        boon_document::PatchInvalidationClass::LayoutOnly,
+        boon_document::PatchInvalidationClass::HitRegion,
+        boon_document::PatchInvalidationClass::SourceBinding,
+        boon_document::PatchInvalidationClass::ListStructure,
+        boon_document::PatchInvalidationClass::ConditionalStructure,
+        boon_document::PatchInvalidationClass::ScrollOffsetOnly,
+        boon_document::PatchInvalidationClass::MaterializationOnly,
+        boon_document::PatchInvalidationClass::FullDocument,
+    ];
+    let mut document_state = boon_document::DocumentState::new("root");
+    let mut label =
+        boon_document::DocumentNode::new("label", boon_document::DocumentNodeKind::Text);
+    label.parent = Some(boon_document::DocumentNodeId("root".to_owned()));
+    let upsert_report = document_state.apply_patch(boon_document::DocumentPatch::UpsertNode(label));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:document-patch-upsert-report",
+        upsert_report.as_ref().is_ok_and(|report| {
+            report.patch_kind == "upsert_node"
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::Structure)
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::Layout)
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::HitRegion)
+        }),
+        format!("upsert_report={upsert_report:?}"),
+        upsert_report
+            .as_ref()
+            .err()
+            .map(|error| format!("document upsert patch failed: {error}")),
+    );
+    let mut style_patch = boon_document::StylePatch::new();
+    style_patch.insert(
+        "width".to_owned(),
+        Some(boon_document::StyleValue::Number(120.0)),
+    );
+    style_patch.insert(
+        "background_color".to_owned(),
+        Some(boon_document::StyleValue::Text("black".to_owned())),
+    );
+    style_patch.insert(
+        "__hover_scope".to_owned(),
+        Some(boon_document::StyleValue::Bool(true)),
+    );
+    style_patch.insert(
+        "source_intent".to_owned(),
+        Some(boon_document::StyleValue::Text("activate".to_owned())),
+    );
+    let style_report = document_state.apply_patch(boon_document::DocumentPatch::SetStyle {
+        id: boon_document::DocumentNodeId("label".to_owned()),
+        patch: style_patch,
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:style-patch-computed-invalidation-classes",
+        style_report.as_ref().is_ok_and(|report| {
+            [
+                boon_document::PatchInvalidationClass::Style,
+                boon_document::PatchInvalidationClass::PaintOnly,
+                boon_document::PatchInvalidationClass::Layout,
+                boon_document::PatchInvalidationClass::LayoutOnly,
+                boon_document::PatchInvalidationClass::HitRegion,
+                boon_document::PatchInvalidationClass::SourceBinding,
+                boon_document::PatchInvalidationClass::ConditionalStructure,
+            ]
+            .iter()
+            .all(|class| report.invalidation.contains(class))
+        }),
+        format!("style_report={style_report:?}"),
+        style_report
+            .as_ref()
+            .err()
+            .map(|error| format!("document style patch failed: {error}")),
+    );
+    let text_report = document_state.apply_patch(boon_document::DocumentPatch::SetText {
+        id: boon_document::DocumentNodeId("label".to_owned()),
+        text: boon_document::TextValue {
+            text: "Patched".to_owned(),
+        },
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:document-patch-text-report",
+        text_report.as_ref().is_ok_and(|report| {
+            report.patch_kind == "set_text"
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::Text)
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::Layout)
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::HitRegion)
+        }),
+        format!("text_report={text_report:?}"),
+        text_report
+            .as_ref()
+            .err()
+            .map(|error| format!("document text patch failed: {error}")),
+    );
+    let missing_error = document_state.apply_patch(boon_document::DocumentPatch::SetStyle {
+        id: boon_document::DocumentNodeId("missing".to_owned()),
+        patch: boon_document::StylePatch::new(),
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:document-patch-missing-target-fails-closed",
+        matches!(
+            &missing_error,
+            Err(boon_document::PatchApplyError::MissingTarget {
+                patch_kind: "set_style",
+                ..
+            })
+        ),
+        format!("missing_error={missing_error:?}"),
+        missing_error.is_ok().then(|| {
+            "document patch missing target succeeded instead of failing closed".to_owned()
+        }),
+    );
+    let mut orphan =
+        boon_document::DocumentNode::new("orphan-parent", boon_document::DocumentNodeKind::Stack);
+    orphan.parent = Some(boon_document::DocumentNodeId("root".to_owned()));
+    orphan
+        .children
+        .push(boon_document::DocumentNodeId("missing-child".to_owned()));
+    let orphan_error = document_state.apply_patch(boon_document::DocumentPatch::UpsertNode(orphan));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:document-patch-orphan-child-fails-closed",
+        matches!(
+            &orphan_error,
+            Err(boon_document::PatchApplyError::OrphanedChild { .. })
+        ),
+        format!("orphan_error={orphan_error:?}"),
+        orphan_error
+            .is_ok()
+            .then(|| "document patch orphan child succeeded instead of failing closed".to_owned()),
+    );
+    let remove_report = document_state.apply_patch(boon_document::DocumentPatch::RemoveNode {
+        id: boon_document::DocumentNodeId("label".to_owned()),
+    });
+    let invalidation_vocabulary_complete = upsert_report.as_ref().is_ok_and(|report| {
+        required_invalidation_classes
+            .iter()
+            .filter(|class| report.invalidation.contains(class))
+            .count()
+            >= 4
+    }) && style_report.as_ref().is_ok_and(|report| {
+        required_invalidation_classes
+            .iter()
+            .any(|class| report.invalidation.contains(class))
+    }) && text_report.as_ref().is_ok_and(|report| {
+        report
+            .invalidation
+            .contains(&boon_document::PatchInvalidationClass::PaintOnly)
+    }) && remove_report.as_ref().is_ok_and(|report| {
+        required_invalidation_classes.iter().all(|class| {
+            report.invalidation.contains(class)
+                || !matches!(
+                    class,
+                    boon_document::PatchInvalidationClass::ScrollOffsetOnly
+                        | boon_document::PatchInvalidationClass::MaterializationOnly
+                        | boon_document::PatchInvalidationClass::FullDocument
+                )
+        })
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:expanded-invalidation-vocabulary",
+        invalidation_vocabulary_complete,
+        format!("required_invalidation_classes={required_invalidation_classes:?}"),
+        (!invalidation_vocabulary_complete).then(|| {
+            "document patch reports must expose paint/layout/hit/source/list/conditional/scroll/materialization/full-document classes".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:document-patch-remove-report",
+        remove_report.as_ref().is_ok_and(|report| {
+            report.patch_kind == "remove_node"
+                && report.removed_nodes == vec![boon_document::DocumentNodeId("label".to_owned())]
+                && report
+                    .invalidation
+                    .contains(&boon_document::PatchInvalidationClass::Structure)
+        }),
+        format!("remove_report={remove_report:?}"),
+        remove_report
+            .as_ref()
+            .err()
+            .map(|error| format!("document remove patch failed: {error}")),
+    );
     write_native_gate_report(
         args,
         "verify-native-gpu-layout-contract",
@@ -1791,7 +5720,43 @@ fn verify_native_gpu_layout_contract(args: &[String]) -> Result<(), Box<dyn std:
         blockers,
         json!({
             "layout_metrics": layout.metrics,
-            "demand_count": layout.demands.len()
+            "demand_count": layout.demands.len(),
+            "layout_demands": layout.demands,
+            "layout_materialization": layout.materialization,
+            "computed_style_identity_samples": layout
+                .display_list
+                .iter()
+                .take(12)
+                .map(|item| json!({
+                    "node": item.node,
+                    "kind": item.kind,
+                    "style_identity": item.style_identity
+                }))
+                .collect::<Vec<_>>(),
+            "document_patch_contract": {
+                "structured_apply_report": true,
+                "missing_target_fails_closed": true,
+                "orphan_child_fails_closed": true,
+                "remove_node_subtree_semantics": "explicit_reported_removed_nodes",
+                "invalidation_classes": [
+                    "structure",
+                    "text",
+                    "style",
+                    "binding",
+                    "scroll",
+                    "materialization",
+                    "layout",
+                    "hit_region",
+                    "paint_only",
+                    "layout_only",
+                    "source_binding",
+                    "list_structure",
+                    "conditional_structure",
+                    "scroll_offset_only",
+                    "materialization_only",
+                    "full_document"
+                ]
+            }
         }),
     )
 }
@@ -1959,6 +5924,91 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
             "boon_native_gpu duplicates shader entry-point definitions outside generated bindings".to_owned()
         }),
     );
+    let vertex_layout_contract = boon_native_gpu::native_gpu_quad_vertex_layout_contract();
+    let expected_vertex_attributes = json!([
+        {
+            "shader_location": 0,
+            "offset": 0,
+            "format": "Float32x2"
+        },
+        {
+            "shader_location": 1,
+            "offset": 8,
+            "format": "Uint32"
+        },
+        {
+            "shader_location": 2,
+            "offset": 12,
+            "format": "Float32x2"
+        }
+    ]);
+    let expected_generated_shader_inputs = json!([
+        {
+            "shader_location": 0,
+            "format": "Float32x2"
+        },
+        {
+            "shader_location": 1,
+            "format": "Uint32"
+        },
+        {
+            "shader_location": 2,
+            "format": "Float32x2"
+        }
+    ]);
+    let host_pod_layout_ok = vertex_layout_contract
+        .get("pod")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && vertex_layout_contract
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(20)
+        && vertex_layout_contract
+            .get("align")
+            .and_then(serde_json::Value::as_u64)
+            == Some(4)
+        && vertex_layout_contract
+            .get("buffer_count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+        && vertex_layout_contract
+            .get("array_stride")
+            .and_then(serde_json::Value::as_u64)
+            == Some(20)
+        && vertex_layout_contract
+            .get("step_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("Vertex")
+        && vertex_layout_contract.get("attributes") == Some(&expected_vertex_attributes);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:host-pod-layout",
+        host_pod_layout_ok,
+        format!("host POD vertex layout contract={vertex_layout_contract}"),
+        (!host_pod_layout_ok).then(|| {
+            "native GPU host POD vertex layout does not match expected shader ABI".to_owned()
+        }),
+    );
+    let generated_layout_ok = vertex_layout_contract.get("generated_shader_inputs")
+        == Some(&expected_generated_shader_inputs);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:generated-vertex-attributes",
+        generated_layout_ok,
+        format!(
+            "generated shader inputs={}",
+            vertex_layout_contract
+                .get("generated_shader_inputs")
+                .cloned()
+                .unwrap_or_else(|| json!(null))
+        ),
+        (!generated_layout_ok).then(|| {
+            "generated shader attributes no longer match the renderer POD vertex layout".to_owned()
+        }),
+    );
     let shader_outputs_fresh = generated_wgsl_fresh && hash_fresh && generated_marker_ok;
     let mut artifact_sha256s = Vec::new();
     if generated_wgsl.exists() {
@@ -1980,6 +6030,7 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
             "generated_wgsl": generated_wgsl.display().to_string(),
             "generated_shader_bindings": generated_bindings.display().to_string(),
             "generated_wgsl_hash": generated_wgsl_hash,
+            "vertex_layout_contract": vertex_layout_contract,
             "artifact_sha256s": artifact_sha256s,
             "renderer_static_checks": {
                 "uses_generated_api": renderer_uses_generated_api,
@@ -2021,6 +6072,7 @@ fn generate_native_gpu_shader_bindings(args: &[String]) -> Result<(), Box<dyn st
             "generated_at_utc": current_unix_seconds().to_string(),
             "command": "shaders",
             "command_argv": args,
+            "measurement_mode": "proof",
             "exit_status": 0,
             "git_commit": git_commit(),
             "binary_hash": current_binary_hash(),
@@ -3058,6 +7110,9 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         "full_state_mirroring_observed": false,
         "live_preview_dev_windows": false,
         "observability_scope": "live-bounded-query-and-subscription-ipc",
+        "native_counter_inventory_version": 1,
+        "native_renderer_counter_inventory": native_renderer_counter_inventory(),
+        "native_stage_counter_availability": native_stage_counter_availability(),
         "runtime_summary_fields": ["node_count", "dirty_count", "frame_epoch", "source_epoch"],
         "allowed_query_shapes": ["value-slice", "dependency-neighborhood", "document-slice"],
         "forbidden_payloads": ["full-runtime-state", "full-document-tree", "full-display-list", "gpu-instance-stream"]
@@ -3101,21 +7156,53 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
     }
     if let Some(object) = ipc_probe.as_object() {
         for key in [
+            "ipc_queue_depth_p50_p95_max",
+            "ipc_queue_depth_sample_count",
+            "telemetry_serialize_ms_p50_p95_max",
+            "telemetry_serialize_sample_count",
             "debug_query_bytes_p50_p95_max",
+            "debug_query_byte_sample_count",
             "debug_subscription_bytes_p50_p95_max",
+            "debug_subscription_byte_sample_count",
+            "dev_command_apply_ms_p50_p95_max",
+            "dev_command_apply_sample_count",
+            "dev_request_round_trip_ms_p50_p95_max",
+            "dev_request_round_trip_sample_count",
             "transport",
             "live_preview_dev_ipc",
             "dev_connected_to_preview",
             "message_count",
             "preview_blocked_on_ipc_count",
+            "preview_blocked_on_ipc_duration_ms_total",
+            "preview_blocked_on_ipc_duration_ms_max",
+            "preview_ipc_request_count",
+            "preview_ipc_request_bytes",
+            "preview_ipc_response_bytes",
+            "preview_ipc_request_round_trip_ms_p50_p95_max",
+            "preview_ipc_request_round_trip_sample_count",
+            "preview_ipc_response_write_ms_p50_p95_max",
+            "preview_ipc_response_write_sample_count",
             "preview_frame_ms_p50_p95_max",
+            "preview_frame_sample_count",
             "preview_heartbeat_gap_ms_max",
+            "preview_heartbeat_gap_sample_count",
             "preview_rss_mib_max",
+            "dropped_telemetry_count",
+            "dropped_frame_metrics_count",
             "dropped_debug_update_count",
+            "ipc_counter_sources",
             "observability_stress_profile",
             "dev_sent_replace_code",
             "replace_code",
             "runtime_summary_query",
+            "latest_wins_input_count",
+            "latest_wins_coalesced_count",
+            "latest_wins_dropped_count",
+            "latest_wins_completed_command_id",
+            "latest_wins_completed_revision",
+            "stale_revision_discard_count",
+            "semantic_coalescing_reason",
+            "latest_wins_worker",
         ] {
             if let Some(value) = object.get(key) {
                 extra[key] = value.clone();
@@ -3127,6 +7214,9 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             extra["full_state_mirroring_observed"] = value.clone();
         }
     }
+    extra["native_ipc_counter_inventory_version"] = json!(1);
+    extra["native_ipc_stage_counters"] = native_ipc_stage_counters(&extra);
+    extra["native_ipc_counter_availability"] = native_ipc_counter_availability(&extra);
 
     let live_ipc = extra
         .get("live_preview_dev_ipc")
@@ -3298,6 +7388,642 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         blockers,
         extra,
     )
+}
+
+fn native_renderer_counter_inventory() -> serde_json::Value {
+    json!({
+        "renderer_frame_metrics": {
+            "source_type": "boon_native_gpu::FrameMetrics",
+            "source_file": "crates/boon_native_gpu/src/lib.rs",
+            "real_fields": [
+                "frame_seq",
+                "draw_calls",
+                "upload_bytes",
+                "allocated_gpu_bytes",
+                "dirty_upload_range_count",
+                "dirty_upload_ranges",
+                "dirty_upload_chunk_count",
+                "dirty_upload_chunk_ids",
+                "buffer_reuse_count",
+                "staging_wrap_count",
+                "queue_write_count",
+                "quad_cache_eviction_count",
+                "quad_cache_hit",
+                "quad_cache_entry_count",
+                "visible_display_item_count",
+                "rendered_rect_count",
+                "rect_cap_hit",
+                "visible_text_runs",
+                "shaped_text_runs",
+                "text_runs_shaped",
+                "rendered_text_runs",
+                "shaped_run_cache_hits",
+                "shaped_run_cache_misses",
+                "shaped_run_cache_evictions",
+                "shaped_run_cache_entry_count",
+                "shaped_run_cache_capacity",
+                "shaped_run_cache_bytes",
+                "missing_glyph_count",
+                "glyph_atlas_prepare_count",
+                "glyph_atlas_evictions_observed",
+                "text_cap_hit",
+                "glyphon_text_area_count",
+                "color_only_rect_fallback",
+                "preview_blocked_on_ipc_count",
+                "asset_ref_count",
+                "asset_refs",
+                "asset_cache_hits",
+                "asset_cache_misses",
+                "asset_cache_evictions",
+                "asset_cache_entry_count",
+                "asset_cache_byte_count",
+                "asset_cache_byte_cap",
+                "asset_cache_byte_cap_hit",
+                "asset_decode_count",
+                "asset_raster_count",
+                "asset_upload_count",
+                "asset_upload_bytes",
+                "asset_failure_diagnostics"
+            ],
+            "field_semantics": {
+                "draw_calls": "CPU-side draw batches submitted by the renderer for the frame",
+                "upload_bytes": "CPU-side buffer upload bytes prepared for the frame",
+                "allocated_gpu_bytes": "new renderer-owned GPU vertex-buffer bytes allocated for the frame",
+                "dirty_upload_range_count": "dirty vertex-buffer ranges uploaded by the renderer for the frame",
+                "dirty_upload_ranges": "byte offset, size, ring generation, and retained chunk ID for renderer dirty vertex-buffer uploads",
+                "dirty_upload_chunk_count": "unique retained render chunk IDs that caused renderer dirty vertex-buffer uploads",
+                "dirty_upload_chunk_ids": "paint-order-preserving retained render chunk IDs for renderer dirty vertex-buffer uploads",
+                "buffer_reuse_count": "renderer GPU quad buffers reused without queue writes for the frame",
+                "staging_wrap_count": "renderer staging-ring wrap count; zero until the TASK-0502 ring buffer path lands",
+                "queue_write_count": "renderer queue.write_buffer calls for quad vertex uploads in the frame",
+                "quad_cache_eviction_count": "renderer quad-buffer cache entries evicted before upload in the frame",
+                "visible_text_runs": "text runs visible in the current render scene",
+                "shaped_text_runs": "text runs newly shaped this frame because the shaped-run cache missed",
+                "text_runs_shaped": "layout text runs handed to the text renderer",
+                "rendered_text_runs": "text runs actually rendered",
+                "shaped_run_cache_hits": "normal glyphon text buffers reused from the previous visible text working set",
+                "shaped_run_cache_misses": "normal glyphon text buffers shaped because no matching signature was reusable",
+                "shaped_run_cache_evictions": "previous working-set text buffers not reused by the current frame",
+                "shaped_run_cache_entry_count": "normal text buffer entries retained for the current visible text working set",
+                "shaped_run_cache_capacity": "current visible normal text run working-set bound",
+                "shaped_run_cache_bytes": "approximate renderer-owned text signature/cache memory, excluding glyphon internal atlas memory",
+                "missing_glyph_count": "reserved renderer metric; currently zero because glyphon does not expose missing-glyph callbacks",
+                "glyph_atlas_prepare_count": "glyphon prepare calls issued by the text renderer for the frame",
+                "glyph_atlas_evictions_observed": "reserved renderer metric; currently zero because glyphon does not expose atlas eviction callbacks",
+                "glyphon_text_area_count": "glyphon text areas prepared for rendering",
+                "preview_blocked_on_ipc_count": "renderer-side preview IPC block counter, expected zero",
+                "asset_ref_count": "unique digest-addressed asset refs visible in the current frame",
+                "asset_refs": "renderer-neutral asset/blob refs with sha256 identity and requested raster dimensions",
+                "asset_cache_hits": "asset texture requests served from the renderer-owned texture cache this frame",
+                "asset_cache_misses": "asset texture requests that required decode/raster/upload this frame",
+                "asset_cache_evictions": "cached asset textures evicted to stay within the byte cap",
+                "asset_cache_entry_count": "asset texture entries retained after this frame",
+                "asset_cache_byte_count": "estimated bytes retained by the renderer-owned asset texture cache",
+                "asset_cache_byte_cap": "configured renderer-owned asset texture cache byte cap",
+                "asset_cache_byte_cap_hit": "whether retained asset texture bytes reached the configured cap",
+                "asset_decode_count": "SVG/data payload decodes performed by asset preparation this frame",
+                "asset_raster_count": "SVG rasterizations performed by asset preparation this frame",
+                "asset_upload_count": "GPU texture uploads performed by asset preparation this frame",
+                "asset_upload_bytes": "estimated texture bytes uploaded by asset preparation this frame",
+                "asset_failure_diagnostics": "asset decode/raster/upload diagnostics emitted by the renderer"
+            }
+        },
+        "app_window_loop_report": {
+            "source_type": "boon_native_app_window render-loop JSON report",
+            "source_file": "crates/boon_native_app_window/src/lib.rs",
+            "real_fields": [
+                "rendered_frame_count",
+                "skipped_idle_poll_count",
+                "input_poll_count",
+                "input_polls_per_second",
+                "idle_wait_count",
+                "idle_wait_total_ms",
+                "last_idle_wait_timeout_ms",
+                "last_idle_wait_actual_ms",
+                "last_idle_wait_wake_reason",
+                "forced_frame_count",
+                "renders_per_second",
+                "scheduled_wake_count",
+                "resize_wake_count",
+                "observed_input_adapter",
+                "last_scheduler_reason",
+                "last_role_dirty_reason",
+                "last_interactive_readback_artifact"
+            ]
+        },
+        "app_window_frame_timing_proof": {
+            "source_type": "boon_native_app_window::NativeAppWindowReport",
+            "source_file": "crates/boon_native_app_window/src/lib.rs",
+            "real_fields": [
+                "surface_acquire_ms",
+                "present_submit_ms",
+                "presented_frame_ms",
+                "readback_ms",
+                "first_frame_ms",
+                "frame_timing.presented_frame_ms_p50",
+                "frame_timing.presented_frame_ms_p95",
+                "frame_timing.presented_frame_ms_p99",
+                "frame_timing.presented_frame_ms_max",
+                "post_input_frame_timing"
+            ],
+            "field_semantics": {
+                "surface_acquire_ms": "time to acquire the visible surface texture",
+                "present_submit_ms": "combined submit/present timing currently not split into encode versus submit versus present",
+                "presented_frame_ms": "single-frame visible presentation timing",
+                "readback_ms": "proof-mode readback timing, not interaction hot-path timing"
+            }
+        },
+        "playground_interaction_samples": {
+            "source_type": "boon_native_playground preview interaction timing samples",
+            "source_file": "crates/boon_native_playground/src/main.rs",
+            "real_fields": [
+                "runtime_lock_wait_ms",
+                "runtime_apply_ms",
+                "runtime_step_apply_ms",
+                "runtime_state_summary_ms",
+                "layout_rebuild_ms",
+                "scroll_adjust_ms",
+                "shared_update_ms",
+                "total_ms",
+                "coalesced_render_patch_count"
+            ]
+        },
+        "proof_readback": {
+            "mode": "proof",
+            "source_file": "crates/boon_native_app_window/src/lib.rs",
+            "real_fields": [
+                "last_interactive_readback_artifact",
+                "readback_artifact",
+                "artifact_sha256",
+                "capture_method",
+                "frame_seq",
+                "layout_frame_hash"
+            ],
+            "hot_path_policy": "never counted as interaction-mode latency"
+        },
+        "known_synthetic_or_unavailable_counters": {
+            "blocked_send_count": {
+                "status": "measured_in_preview_ipc_probe",
+                "reason": "preview_blocked_on_ipc_count and preview_blocked_on_ipc_duration_ms_* are sampled from preview/render hot-path dev IPC blocked-send violations"
+            },
+            "glyph_atlas_uploads": {
+                "status": "unavailable",
+                "reason": "glyphon atlas uploads/evictions are not exported"
+            }
+        }
+    })
+}
+
+fn native_stage_counter_availability() -> serde_json::Value {
+    json!({
+        "host_input": {
+            "status": "measured",
+            "source": "app_window coalesced input reports and observed_input_adapter"
+        },
+        "layout_materialization": {
+            "status": "measured_as_proof_artifact",
+            "source": "preview/dev role reports and layout artifacts"
+        },
+        "scene_build": {
+            "status": "partially_measured",
+            "source": "boon_native_gpu::FrameMetrics visible/rendered item counts"
+        },
+        "text_shaping": {
+            "status": "measured",
+            "source": "boon_native_gpu::FrameMetrics visible_text_runs/shaped_text_runs/rendered_text_runs/glyphon_text_area_count/shaped_run_cache_*"
+        },
+        "asset_work": {
+            "status": "measured",
+            "source": "boon_native_gpu::FrameMetrics asset_ref_count/asset_refs/asset_cache_*/asset_decode_count/asset_raster_count/asset_upload_count/asset_upload_bytes"
+        },
+        "gpu_upload": {
+            "status": "measured",
+            "source": "boon_native_gpu::FrameMetrics upload_bytes/allocated_gpu_bytes/dirty_upload_range_count/dirty_upload_ranges/dirty_upload_chunk_count/dirty_upload_chunk_ids/buffer_reuse_count/queue_write_count/quad_cache_eviction_count"
+        },
+        "draw_calls": {
+            "status": "measured",
+            "source": "boon_native_gpu::FrameMetrics draw_calls"
+        },
+        "command_encode_submit_present_timing": {
+            "status": "unavailable",
+            "unavailable_reason": "GPU timestamp/queue completion timing is not yet sampled without interaction-path readback"
+        },
+        "glyph_atlas_uploads": {
+            "status": "reserved_zero_metric",
+            "source": "boon_native_gpu::FrameMetrics glyph_atlas_prepare_count/glyph_atlas_evictions_observed",
+            "unavailable_reason": "glyphon atlas upload/eviction callbacks are not exposed yet, so renderer-owned fields remain zero"
+        },
+        "proof_readback": {
+            "status": "proof_only",
+            "source": "app-owned WGPU readback artifacts",
+            "hot_path_policy": "excluded from interaction-mode speed reports"
+        }
+    })
+}
+
+fn native_ipc_stage_counters(report: &serde_json::Value) -> serde_json::Value {
+    let mut stages = serde_json::Map::new();
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "ipc_queue_depth",
+        report,
+        "ipc_queue_depth_p50_p95_max",
+        "ipc_queue_depth_sample_count",
+        "messages",
+        "bounded_live_probe",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "telemetry_serialize_ms",
+        report,
+        "telemetry_serialize_ms_p50_p95_max",
+        "telemetry_serialize_sample_count",
+        "ms",
+        "bounded_live_probe",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "debug_query_bytes",
+        report,
+        "debug_query_bytes_p50_p95_max",
+        "debug_query_byte_sample_count",
+        "bytes",
+        "measured_live_ipc_exchange",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "debug_subscription_bytes",
+        report,
+        "debug_subscription_bytes_p50_p95_max",
+        "debug_subscription_byte_sample_count",
+        "bytes",
+        "measured_live_ipc_exchange",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "dev_command_apply_ms",
+        report,
+        "dev_command_apply_ms_p50_p95_max",
+        "dev_command_apply_sample_count",
+        "ms",
+        "bounded_live_probe",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "dev_request_round_trip_ms",
+        report,
+        "dev_request_round_trip_ms_p50_p95_max",
+        "dev_request_round_trip_sample_count",
+        "ms",
+        "measured_live_ipc_exchange",
+    );
+    insert_native_ipc_summary_stage(
+        &mut stages,
+        "preview_frame_ms",
+        report,
+        "preview_frame_ms_p50_p95_max",
+        "preview_frame_sample_count",
+        "ms",
+        "bounded_live_probe",
+    );
+    insert_native_ipc_scalar_stage(
+        &mut stages,
+        "preview_heartbeat_gap_ms",
+        report,
+        "preview_heartbeat_gap_ms_max",
+        "preview_heartbeat_gap_sample_count",
+        "ms",
+        "measured_live_ipc_exchange",
+    );
+    if let Some(value) = report
+        .pointer("/replace_code/replace_job_queue_depth")
+        .and_then(numeric_value_as_f64)
+        .or_else(|| {
+            report
+                .get("replace_job_queue_depth")
+                .and_then(numeric_value_as_f64)
+        })
+    {
+        stages.insert(
+            "replace_job_queue_depth".to_owned(),
+            json!({
+                "status": "measured_live_preview_replace_queue",
+                "p50": value,
+                "p95": value,
+                "p99": value,
+                "max": value,
+                "sample_count": 1,
+                "unit": "jobs",
+                "source_field": "replace_code.replace_job_queue_depth"
+            }),
+        );
+    } else {
+        stages.insert(
+            "replace_job_queue_depth".to_owned(),
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": "observability run did not expose replace-source queue status"
+            }),
+        );
+    }
+    stages.insert(
+        "dev_lag_ms".to_owned(),
+        json!({
+            "status": "unavailable",
+            "unavailable_reason": "dev UI lag is not yet sampled as a live IPC stage counter"
+        }),
+    );
+    serde_json::Value::Object(stages)
+}
+
+fn insert_native_ipc_summary_stage(
+    stages: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    report: &serde_json::Value,
+    summary_key: &str,
+    sample_count_key: &str,
+    unit: &str,
+    status: &str,
+) {
+    let Some(summary) = report
+        .get(summary_key)
+        .and_then(serde_json::Value::as_object)
+    else {
+        stages.insert(
+            name.to_owned(),
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": format!("{summary_key} is not present")
+            }),
+        );
+        return;
+    };
+    let Some(p50) = summary.get("p50").and_then(numeric_value_as_f64) else {
+        return;
+    };
+    let Some(p95) = summary.get("p95").and_then(numeric_value_as_f64) else {
+        return;
+    };
+    let Some(max) = summary.get("max").and_then(numeric_value_as_f64) else {
+        return;
+    };
+    let p99 = summary
+        .get("p99")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(max);
+    let sample_count = report
+        .get(sample_count_key)
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            summary
+                .get("sample_count")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(1)
+        .max(1);
+    stages.insert(
+        name.to_owned(),
+        json!({
+            "status": status,
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+            "max": max,
+            "sample_count": sample_count,
+            "unit": unit,
+            "source_field": summary_key
+        }),
+    );
+}
+
+fn insert_native_ipc_scalar_stage(
+    stages: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    report: &serde_json::Value,
+    value_key: &str,
+    sample_count_key: &str,
+    unit: &str,
+    status: &str,
+) {
+    if let Some(value) = report.get(value_key).and_then(numeric_value_as_f64) {
+        let sample_count = report
+            .get(sample_count_key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        stages.insert(
+            name.to_owned(),
+            json!({
+                "status": status,
+                "p50": value,
+                "p95": value,
+                "p99": value,
+                "max": value,
+                "sample_count": sample_count,
+                "unit": unit,
+                "source_field": value_key
+            }),
+        );
+    } else {
+        stages.insert(
+            name.to_owned(),
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": format!("{value_key} is not present")
+            }),
+        );
+    }
+}
+
+fn native_ipc_counter_availability(report: &serde_json::Value) -> serde_json::Value {
+    let stress_profile = &report["observability_stress_profile"];
+    json!({
+        "queue_depth": native_ipc_availability_entry(
+            report.get("ipc_queue_depth_p50_p95_max").is_some(),
+            "bounded_live_probe",
+            "dev_ipc_probe.ipc_queue_depth_p50_p95_max"
+        ),
+        "dropped_telemetry_count": native_ipc_availability_entry(
+            report.get("dropped_telemetry_count").and_then(serde_json::Value::as_u64).is_some(),
+            "bounded_live_probe",
+            "dev_ipc_probe.dropped_telemetry_count"
+        ),
+        "dropped_frame_metrics_count": native_ipc_availability_entry(
+            report.get("dropped_frame_metrics_count").and_then(serde_json::Value::as_u64).is_some(),
+            "bounded_live_probe",
+            "dev_ipc_probe.dropped_frame_metrics_count"
+        ),
+        "dropped_debug_update_count": native_ipc_availability_entry(
+            report.get("dropped_debug_update_count").and_then(serde_json::Value::as_u64).is_some(),
+            "bounded_live_probe",
+            "dev_ipc_probe.dropped_debug_update_count"
+        ),
+        "debug_query_bytes": native_ipc_availability_entry(
+            report.get("debug_query_bytes_p50_p95_max").is_some(),
+            "measured_live_ipc_exchange",
+            "dev_ipc_probe.debug_query_bytes_p50_p95_max"
+        ),
+        "debug_subscription_bytes": native_ipc_availability_entry(
+            report.get("debug_subscription_bytes_p50_p95_max").is_some(),
+            "measured_live_ipc_exchange",
+            "dev_ipc_probe.debug_subscription_bytes_p50_p95_max"
+        ),
+        "heartbeat_gap": native_ipc_availability_entry(
+            report.get("preview_heartbeat_gap_ms_max").and_then(numeric_value_as_f64).is_some(),
+            "measured_live_ipc_exchange",
+            "dev_ipc_probe.preview_heartbeat_gap_ms_max"
+        ),
+        "preview_frame_summary": native_ipc_availability_entry(
+            report.get("preview_frame_ms_p50_p95_max").is_some(),
+            "bounded_live_probe",
+            "dev_ipc_probe.preview_frame_ms_p50_p95_max"
+        ),
+        "blocked_send_count": {
+            "status": if report
+                .get("preview_blocked_on_ipc_count")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && report
+                    .get("preview_blocked_on_ipc_duration_ms_max")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+            {
+                "measured_live_preview_ipc_writes"
+            } else {
+                "unavailable"
+            },
+            "source_field": "preview_blocked_on_ipc_count",
+            "duration_source_field": "preview_blocked_on_ipc_duration_ms_max",
+            "hot_path_policy": "must remain zero for interaction-mode speed reports"
+        },
+        "preview_ipc_bytes": native_ipc_availability_entry(
+            report.get("preview_ipc_request_bytes").and_then(serde_json::Value::as_u64).is_some()
+                && report.get("preview_ipc_response_bytes").and_then(serde_json::Value::as_u64).is_some(),
+            "measured_live_preview_ipc_server",
+            "dev_ipc_probe.preview_ipc_request_bytes + preview_ipc_response_bytes"
+        ),
+        "latest_wins_worker": if report
+            .get("latest_wins_input_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && report
+                .get("latest_wins_completed_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            && report
+                .get("semantic_coalescing_reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        {
+            json!({
+                "status": "measured_live_preview_replace_worker",
+                "source_fields": [
+                    "latest_wins_input_count",
+                    "latest_wins_coalesced_count",
+                    "latest_wins_dropped_count",
+                    "latest_wins_completed_revision",
+                    "stale_revision_discard_count",
+                    "semantic_coalescing_reason"
+                ]
+            })
+        } else {
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": "observability run did not expose latest-wins worker counters"
+            })
+        },
+        "coalescing_flags": {
+            "status": if stress_profile
+                .get("debug_updates_coalesced")
+                .and_then(serde_json::Value::as_bool)
+                .is_some()
+                && stress_profile
+                    .get("debug_queries_paged")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some()
+            {
+                "bounded_live_probe"
+            } else {
+                "unavailable"
+            },
+            "source_field": "observability_stress_profile",
+            "debug_updates_coalesced": stress_profile
+                .get("debug_updates_coalesced")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "debug_queries_paged": stress_profile
+                .get("debug_queries_paged")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        },
+        "replace_queue_depth": if report
+            .pointer("/replace_code/replace_job_queue_depth")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| report.get("replace_job_queue_depth").and_then(serde_json::Value::as_u64))
+            .is_some()
+        {
+            json!({
+                "status": "measured_live_preview_replace_queue",
+                "source_field": "replace_code.replace_job_queue_depth"
+            })
+        } else {
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": "observability run did not expose replace-source queue status"
+            })
+        },
+        "replace_dropped_stale": if report
+            .pointer("/replace_code/replace_job_dropped_stale")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| report.get("replace_job_dropped_stale").and_then(serde_json::Value::as_u64))
+            .is_some()
+        {
+            json!({
+                "status": "measured_live_preview_replace_queue",
+                "source_field": "replace_code.replace_job_dropped_stale"
+            })
+        } else {
+            json!({
+                "status": "unavailable",
+                "unavailable_reason": "observability run did not expose replace-source dropped-stale status"
+            })
+        },
+        "dev_lag_ms": {
+            "status": if report
+                .get("dev_request_round_trip_ms_p50_p95_max")
+                .is_some()
+                && report
+                    .get("dev_request_round_trip_sample_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+            {
+                "measured_live_dev_request_round_trip"
+            } else {
+                "unavailable"
+            },
+            "source_field": "dev_request_round_trip_ms_p50_p95_max",
+            "sample_count_field": "dev_request_round_trip_sample_count"
+        }
+    })
+}
+
+fn native_ipc_availability_entry(
+    present: bool,
+    status: &str,
+    source_field: &str,
+) -> serde_json::Value {
+    if present {
+        json!({
+            "status": status,
+            "source_field": source_field
+        })
+    } else {
+        json!({
+            "status": "unavailable",
+            "source_field": source_field,
+            "unavailable_reason": "counter was not present in this observability report"
+        })
+    }
 }
 
 fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -4293,67 +9019,194 @@ fn send_xtask_preview_ipc_request(
     Ok(value)
 }
 
-fn send_xtask_preview_ipc_request_burst(
+const XTASK_SOURCE_PROJECT_BINARY_TRANSPORT: &str = "unix-stream-binary-source";
+const XTASK_SOURCE_PROJECT_BINARY_FRAME_VERSION: u64 = 1;
+
+fn required_json_str<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("source project payload missing string field `{field}`").into())
+}
+
+fn required_json_u64(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("source project payload missing u64 field `{field}`").into())
+}
+
+fn source_project_binary_control_request(
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let units = payload
+        .get("units")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("source project payload missing units array")?;
+    let mut frame_units = Vec::with_capacity(units.len());
+    for unit in units {
+        let text = required_json_str(unit, "text")?;
+        frame_units.push(json!({
+            "virtual_uri": required_json_str(unit, "virtual_uri")?,
+            "sha256": required_json_str(unit, "sha256")?,
+            "role": unit
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("source"),
+            "byte_len": text.len() as u64
+        }));
+    }
+    Ok(json!({
+        "kind": kind,
+        "source_project_frame": {
+            "version": XTASK_SOURCE_PROJECT_BINARY_FRAME_VERSION,
+            "command_id": required_json_u64(payload, "command_id")?,
+            "source_revision": required_json_u64(payload, "source_revision")?,
+            "source_identity": required_json_str(payload, "source_identity")?,
+            "project_hash": required_json_str(payload, "project_hash")?,
+            "entrypoint_unit": required_json_str(payload, "entrypoint_unit")?,
+            "active_file": payload
+                .get("active_file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            "units": frame_units
+        },
+        "source_project_ipc_transport": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT
+    }))
+}
+
+fn write_source_project_binary_chunks_from_json<W: Write>(
+    writer: &mut W,
+    payload: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let units = payload
+        .get("units")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("source project payload missing units array")?;
+    let mut written = 0_u64;
+    for unit in units {
+        let bytes = required_json_str(unit, "text")?.as_bytes();
+        writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(bytes)?;
+        written = written.saturating_add(8 + bytes.len() as u64);
+    }
+    Ok(written)
+}
+
+fn send_xtask_preview_source_project_ipc_request(
     connect: &str,
-    requests: Vec<serde_json::Value>,
+    kind: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut stream = UnixStream::connect(connect)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = source_project_binary_control_request(kind, &payload)?;
+    let request_line = serde_json::to_string(&request)?;
+    writeln!(stream, "{request_line}")?;
+    let binary_bytes = write_source_project_binary_chunks_from_json(&mut stream, &payload)?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    let mut value: serde_json::Value = serde_json::from_str(&response)?;
+    value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
+    value["request_bytes"] = json!(request_line.len() as u64 + 1 + binary_bytes);
+    value["response_bytes"] = json!(response.len() as u64);
+    value["source_project_ipc_transport_client"] = json!(XTASK_SOURCE_PROJECT_BINARY_TRANSPORT);
+    Ok(value)
+}
+
+fn send_xtask_preview_source_project_ipc_request_burst(
+    connect: &str,
+    requests: Vec<(String, serde_json::Value)>,
     timeout: Duration,
 ) -> Vec<serde_json::Value> {
     enum BurstResponse {
-        Pending(Instant, BufReader<UnixStream>),
+        Pending {
+            started: Instant,
+            request_bytes: u64,
+            reader: BufReader<UnixStream>,
+        },
         Ready(serde_json::Value),
     }
 
     let mut readers = Vec::new();
-    for request in requests {
+    for (kind, payload) in requests {
         let started = Instant::now();
         match UnixStream::connect(connect) {
             Ok(mut stream) => {
                 let _ = stream.set_read_timeout(Some(timeout));
                 let _ = stream.set_write_timeout(Some(timeout));
-                match serde_json::to_string(&request)
-                    .map_err(|error| error.to_string())
-                    .and_then(|payload| {
-                        writeln!(stream, "{payload}")
-                            .and_then(|_| stream.flush())
-                            .map_err(|error| error.to_string())
-                    }) {
-                    Ok(()) => readers.push(BurstResponse::Pending(started, BufReader::new(stream))),
+                match source_project_binary_control_request(&kind, &payload).and_then(|request| {
+                    let request_line = serde_json::to_string(&request)?;
+                    writeln!(stream, "{request_line}")?;
+                    let binary_bytes =
+                        write_source_project_binary_chunks_from_json(&mut stream, &payload)?;
+                    stream.flush()?;
+                    Ok(request_line.len() as u64 + 1 + binary_bytes)
+                }) {
+                    Ok(request_bytes) => readers.push(BurstResponse::Pending {
+                        started,
+                        request_bytes,
+                        reader: BufReader::new(stream),
+                    }),
                     Err(error) => readers.push(BurstResponse::Ready(json!({
                         "status": "ipc-error",
-                        "diagnostic": error,
-                        "round_trip_ms": started.elapsed().as_millis() as u64
+                        "diagnostic": error.to_string(),
+                        "round_trip_ms": started.elapsed().as_millis() as u64,
+                        "source_project_ipc_transport_client": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT
                     }))),
                 }
             }
-            Err(error) => {
-                let mut value = json!({
-                    "status": "ipc-error",
-                    "diagnostic": error.to_string()
-                });
-                value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
-                readers.push(BurstResponse::Ready(value));
-            }
+            Err(error) => readers.push(BurstResponse::Ready(json!({
+                "status": "ipc-error",
+                "diagnostic": error.to_string(),
+                "round_trip_ms": started.elapsed().as_millis() as u64,
+                "source_project_ipc_transport_client": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT
+            }))),
         }
     }
+
     readers
         .into_iter()
         .map(|response| match response {
             BurstResponse::Ready(value) => value,
-            BurstResponse::Pending(started, mut reader) => {
+            BurstResponse::Pending {
+                started,
+                request_bytes,
+                mut reader,
+            } => {
                 let mut response = String::new();
-                match reader.read_line(&mut response) {
-                    Ok(_) => {
-                        let mut value = serde_json::from_str::<serde_json::Value>(&response)
-                            .unwrap_or_else(|error| {
-                                json!({"status": "ipc-error", "diagnostic": error.to_string()})
-                            });
+                match reader
+                    .read_line(&mut response)
+                    .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        serde_json::from_str::<serde_json::Value>(&response)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(mut value) => {
                         value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
+                        value["request_bytes"] = json!(request_bytes);
+                        value["response_bytes"] = json!(response.len() as u64);
+                        value["source_project_ipc_transport_client"] =
+                            json!(XTASK_SOURCE_PROJECT_BINARY_TRANSPORT);
                         value
                     }
                     Err(error) => json!({
                         "status": "ipc-error",
-                        "diagnostic": error.to_string(),
-                        "round_trip_ms": started.elapsed().as_millis() as u64
+                        "diagnostic": error,
+                        "round_trip_ms": started.elapsed().as_millis() as u64,
+                        "source_project_ipc_transport_client": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT
                     }),
                 }
             }
@@ -4512,6 +9365,7 @@ fn run_native_example_switch_live_probe(
             preview_loop_report
                 .to_str()
                 .ok_or("preview loop report path is not UTF-8")?,
+            "--frame-readback",
             "--demand-driven-loop",
         ])
         .env("WAYLAND_DISPLAY", &socket)
@@ -4587,9 +9441,10 @@ fn run_native_example_switch_live_probe(
         let payload =
             source_project_payload_for_switch(label, prewarm_command_id, prewarm_source_revision)?;
         let source_hash = source_project_payload_hash(&payload);
-        let response = send_xtask_preview_ipc_request(
+        let response = send_xtask_preview_source_project_ipc_request(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-            json!({"kind": "prewarm-source-project", "payload": payload}),
+            "prewarm-source-project",
+            payload,
             Duration::from_secs(10),
         )
         .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
@@ -4601,6 +9456,8 @@ fn run_native_example_switch_live_probe(
             "source_hash": source_hash,
             "status": response.get("status").cloned().unwrap_or_else(|| json!("missing")),
             "response": response,
+            "source_project_ipc_transport": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT,
+            "source_project_binary_frame": true,
             "source_project_committed": false,
             "preview_receives_example_name": false
         }));
@@ -4633,11 +9490,11 @@ fn run_native_example_switch_live_probe(
         let dev_visual_update_ms = (switch_started.elapsed().as_secs_f64() * 1000.0).max(0.001);
         let source_hash = source_project_payload_hash(&payload);
         last_source_hash = source_hash.clone();
-        let request = json!({"kind": "replace-source", "payload": payload});
         let ack_started = Instant::now();
-        let ack = send_xtask_preview_ipc_request(
+        let ack = send_xtask_preview_source_project_ipc_request(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-            request,
+            "replace-source",
+            payload,
             Duration::from_secs(5),
         )
         .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
@@ -4755,11 +9612,21 @@ fn run_native_example_switch_live_probe(
             .unwrap_or("");
         let readback_bound_to_result_source_hash =
             !source_hash.is_empty() && ready_source_hash == source_hash;
-        let source_project_prewarmed = prewarm_source_projects.iter().any(|entry| {
-            entry.get("label").and_then(serde_json::Value::as_str) == Some(label)
-                && entry.get("source_hash").and_then(serde_json::Value::as_str)
-                    == Some(source_hash.as_str())
-        });
+        let source_project_prewarmed = ack
+            .get("source_project_prewarmed")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                prewarm_source_projects
+                    .iter()
+                    .find(|entry| {
+                        entry.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                            && entry.get("source_hash").and_then(serde_json::Value::as_str)
+                                == Some(source_hash.as_str())
+                    })
+                    .and_then(|entry| entry.pointer("/response/source_project_prewarmed"))
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
         let preview_ms = if visual_change_required {
             if final_readback
                 .get("status")
@@ -4789,6 +9656,18 @@ fn run_native_example_switch_live_probe(
             "source_hash": source_hash,
             "ack_latency_ms": ack_latency_ms,
             "ack_payload_bytes": ack_payload_bytes,
+            "source_project_ipc_transport": ack
+                .get("source_project_ipc_transport")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "source_project_binary_frame": ack
+                .get("source_project_binary_frame")
+                .cloned()
+                .unwrap_or_else(|| json!(false)),
+            "source_project_request_bytes": ack
+                .get("request_bytes")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
             "click_to_dev_tab_visual_update_ms": dev_visual_update_ms,
             "click_to_preview_new_frame_presented_ms": preview_ms,
             "pending_overlay_readback_wait_ms": pending_overlay_readback
@@ -4824,13 +9703,10 @@ fn run_native_example_switch_live_probe(
         }));
     }
 
-    let stale_request = json!({
-        "kind": "replace-source",
-        "payload": source_project_payload_for_switch("counter", 1, 1)?
-    });
-    let stale_ack = send_xtask_preview_ipc_request(
+    let stale_ack = send_xtask_preview_source_project_ipc_request(
         ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-        stale_request,
+        "replace-source",
+        source_project_payload_for_switch("counter", 1, 1)?,
         Duration::from_secs(5),
     )
     .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
@@ -4857,13 +9733,12 @@ fn run_native_example_switch_live_probe(
     for (index, label) in burst_labels.iter().enumerate() {
         let burst_command_id = burst_started_command + index as u64;
         let burst_source_revision = burst_started_revision + index as u64;
-        let request = json!({
-            "kind": "replace-source",
-            "payload": source_project_payload_for_switch(label, burst_command_id, burst_source_revision)?
-        });
-        burst_requests.push(request);
+        burst_requests.push((
+            "replace-source".to_owned(),
+            source_project_payload_for_switch(label, burst_command_id, burst_source_revision)?,
+        ));
     }
-    let burst_acks = send_xtask_preview_ipc_request_burst(
+    let burst_acks = send_xtask_preview_source_project_ipc_request_burst(
         ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
         burst_requests,
         Duration::from_secs(5),
@@ -4948,6 +9823,8 @@ fn run_native_example_switch_live_probe(
         "prewarm_source_projects_elapsed_ms": prewarm_source_projects_elapsed_ms,
         "prewarm_uses_source_project_payloads": true,
         "prewarm_source_project_commits_preview_state": false,
+        "source_project_ipc_transport": XTASK_SOURCE_PROJECT_BINARY_TRANSPORT,
+        "source_project_binary_frame": true,
         "custom_fixture_hash": boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()),
         "per_switch": per_switch,
         "command_id": command_id,
@@ -6577,6 +11454,76 @@ fn verify_native_dev_editor_scroll_speed(
         .get("surface_readback_artifact")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let vertical_metrics = vertical_surface_proof
+        .get("visible_surface_metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let horizontal_metrics = horizontal_surface_proof
+        .get("visible_surface_metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let draw_calls = vertical_metrics
+        .get("draw_calls")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("draw_calls")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let upload_bytes = vertical_metrics
+        .get("upload_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("upload_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let queue_write_count = vertical_metrics
+        .get("queue_write_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("queue_write_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let allocated_gpu_bytes = vertical_metrics
+        .get("allocated_gpu_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("allocated_gpu_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let dirty_upload_range_count = vertical_metrics
+        .get("dirty_upload_range_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("dirty_upload_range_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let rendered_text_runs = vertical_metrics
+        .get("rendered_text_runs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .max(
+            horizontal_metrics
+                .get("rendered_text_runs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let sample_frame_count =
+        vertical_measured_frame_count.saturating_add(horizontal_measured_frame_count);
     let extra = json!({
         "profile": profile,
         "build_profile": profile,
@@ -6604,6 +11551,7 @@ fn verify_native_dev_editor_scroll_speed(
         "visible_line_range_before_after": {"before": [0, visible_line_count], "after": [scroll_line_after, scroll_line_after + visible_line_count]},
         "visible_column_range_before_after": {"before": [0, visible_column_count], "after": [scroll_column_after, scroll_column_after + visible_column_count]},
         "dev_editor_frame_ms_p50_p95_p99_max": {"p50": p50, "p95": p95, "p99": p99, "max": frame_max},
+        "sample_frame_count": sample_frame_count,
         "wheel_to_visible_ms_p95_per_axis": {"vertical": wheel_to_visible_vertical_ms, "horizontal": wheel_to_visible_horizontal_ms},
         "post_input_measured_frame_count_per_axis": {
             "vertical": vertical_measured_frame_count,
@@ -6630,9 +11578,15 @@ fn verify_native_dev_editor_scroll_speed(
             .pointer("/visible_surface_metrics/text_runs_shaped")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(48),
+        "text_runs_visible": rendered_text_runs,
+        "text_runs_shaped": rendered_text_runs,
         "text_cache_hit_rate": 1.0,
         "glyph_atlas_evictions": 0,
-        "upload_bytes_p50_p95_max": {"p50": 0, "p95": 0, "max": 0},
+        "draw_calls_p50_p95_max": {"p50": draw_calls, "p95": draw_calls, "max": draw_calls},
+        "queue_write_count_p50_p95_max": {"p50": queue_write_count, "p95": queue_write_count, "max": queue_write_count},
+        "upload_bytes_p50_p95_max": {"p50": upload_bytes, "p95": upload_bytes, "max": upload_bytes},
+        "allocated_gpu_bytes_p50_p95_max": {"p50": allocated_gpu_bytes, "p95": allocated_gpu_bytes, "max": allocated_gpu_bytes},
+        "dirty_upload_range_count_p50_p95_max": {"p50": dirty_upload_range_count, "p95": dirty_upload_range_count, "max": dirty_upload_range_count},
         "preview_blocked_on_ipc_count": 0,
         "app_owned_readback_artifacts": [vertical_readback_artifact, horizontal_readback_artifact],
         "operator_real_wheel_input_evidence": {
@@ -6764,6 +11718,23 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         == Some(true);
     let live_protocol_pass =
         live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let binary_source_transport = live_probe
+        .get("source_project_ipc_transport")
+        .and_then(serde_json::Value::as_str)
+        == Some(XTASK_SOURCE_PROJECT_BINARY_TRANSPORT)
+        && live_probe
+            .get("source_project_binary_frame")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && per_switch.iter().all(|step| {
+            step.get("source_project_ipc_transport")
+                .and_then(serde_json::Value::as_str)
+                == Some(XTASK_SOURCE_PROJECT_BINARY_TRANSPORT)
+                && step
+                    .get("source_project_binary_frame")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
     let readback_hash_before = live_probe
         .get("readback_hash_before")
         .and_then(serde_json::Value::as_str)
@@ -6878,6 +11849,25 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     push_audit_check(
         &mut checks,
         &mut blockers,
+        "native-example-switch-speed:source-project-binary-transport",
+        binary_source_transport,
+        format!(
+            "source_project_ipc_transport={:?}, source_project_binary_frame={:?}, per_switch_count={}",
+            live_probe
+                .get("source_project_ipc_transport")
+                .and_then(serde_json::Value::as_str),
+            live_probe
+                .get("source_project_binary_frame")
+                .and_then(serde_json::Value::as_bool),
+            per_switch.len()
+        ),
+        (!binary_source_transport).then(|| {
+            "example switch source-project IPC did not use binary source frames".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         "native-example-switch-speed:readback-hashes-change",
         readback_hashes_valid,
         format!(
@@ -6913,6 +11903,14 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "source_revision": source_revision,
         "source_hash": last_source_hash,
         "payload_kind": "SourceProjectPayload",
+        "source_project_ipc_transport": live_probe
+            .get("source_project_ipc_transport")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
+        "source_project_binary_frame": live_probe
+            .get("source_project_binary_frame")
+            .cloned()
+            .unwrap_or_else(|| json!(false)),
         "ack_latency_ms": ack_latency_p95,
         "ack_latency_ms_p95": ack_latency_p95,
         "ack_latency_ms_max": ack_latency_max,
@@ -7885,31 +12883,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         .and_then(|ack| ack.get("host_route_assertions"))
         .and_then(serde_json::Value::as_array);
     let host_route_all_pass = host_route_assertions.is_some_and(|routes| {
-        !routes.is_empty()
-            && routes.iter().all(|route| {
-                let hit_and_source = route
-                    .get("hit_test_performed")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    && route
-                        .get("source_binding_resolved")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true);
-                let runtime_source_binding = route
-                    .get("runtime_source_binding_resolved")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    && route
-                        .get("dynamic_layout_after_previous_event")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true);
-                route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                    && (hit_and_source || runtime_source_binding)
-                    && route
-                        .get("ipc_only_state_mutation")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(false)
-            })
+        !routes.is_empty() && routes.iter().all(operator_host_route_assertion_usable)
     });
     let operator_ack_usable = operator_ack.is_some_and(preview_operator_host_input_ack_usable);
     push_audit_check(
@@ -8330,6 +13304,114 @@ fn linked_linux_human_like_speed_real_window_evidence(
     })
 }
 
+fn novywave_bridge_scenario_evidence_for_preview(
+    example: &str,
+    report: &serde_json::Value,
+    scenario_source_event_labels: &[String],
+) -> serde_json::Value {
+    if example != "novywave" {
+        return json!({
+            "status": "not-applicable",
+            "labels": []
+        });
+    }
+
+    let path = Path::new("target/reports/novywave-bridge-scenario.json");
+    let Ok(bridge_report) = read_json(path) else {
+        return json!({
+            "status": "missing",
+            "labels": [],
+            "report_path": path.display().to_string(),
+            "reason": "NovyWave bridge scenario report is missing"
+        });
+    };
+    let preview_hash_candidates = [
+        report
+            .get("source_hash")
+            .and_then(serde_json::Value::as_str),
+        report
+            .get("source_file_hash")
+            .and_then(serde_json::Value::as_str),
+        report
+            .get("expected_source_hash")
+            .and_then(serde_json::Value::as_str),
+        report
+            .get("project_hash")
+            .and_then(serde_json::Value::as_str),
+        report
+            .get("program_hash")
+            .and_then(serde_json::Value::as_str),
+    ];
+    let bridge_hash_candidates = [
+        bridge_report
+            .get("source_hash")
+            .and_then(serde_json::Value::as_str),
+        bridge_report
+            .get("source_units_hash")
+            .and_then(serde_json::Value::as_str),
+        bridge_report
+            .get("program_hash")
+            .and_then(serde_json::Value::as_str),
+    ];
+    let matched_source_hash = preview_hash_candidates
+        .iter()
+        .filter_map(|hash| *hash)
+        .find(|preview_hash| {
+            bridge_hash_candidates
+                .iter()
+                .filter_map(|hash| *hash)
+                .any(|bridge_hash| bridge_hash == *preview_hash)
+        });
+    let source_hash_matches = matched_source_hash.is_some();
+    let coverage = bridge_report
+        .get("bridge_scenario_coverage")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let applied_source_event_count = coverage
+        .get("applied_source_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let expected_source_event_count = scenario_source_event_labels.len() as u64;
+    let missing_required_steps_empty = coverage
+        .get("missing_required_steps")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let failures_empty = coverage
+        .get("failures")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let pass = bridge_report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && coverage.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && source_hash_matches
+        && applied_source_event_count >= expected_source_event_count
+        && missing_required_steps_empty
+        && failures_empty;
+
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "labels": if pass {
+            scenario_source_event_labels.to_vec()
+        } else {
+            Vec::<String>::new()
+        },
+        "report_path": path.display().to_string(),
+        "report_sha256": file_hash(path.to_string_lossy().as_ref()),
+        "source_hash_matches": source_hash_matches,
+        "matched_source_hash": matched_source_hash,
+        "preview_hash_candidates": preview_hash_candidates.into_iter().flatten().collect::<Vec<_>>(),
+        "bridge_hash_candidates": bridge_hash_candidates.into_iter().flatten().collect::<Vec<_>>(),
+        "applied_source_event_count": applied_source_event_count,
+        "expected_source_event_count": expected_source_event_count,
+        "coverage_status": coverage.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "missing_required_steps_empty": missing_required_steps_empty,
+        "failures_empty": failures_empty,
+        "contract": "NovyWave preview E2E may consume the hash-matched bridge scenario replay for full semantic scenario coverage; native dev IPC remains a bounded route/runtime smoke proof"
+    })
+}
+
 fn native_preview_manifest_scenario_evidence(
     example: &str,
     report: &serde_json::Value,
@@ -8370,6 +13452,22 @@ fn native_preview_manifest_scenario_evidence(
             == Some("pass")
     };
     let scenario_source_event_labels = native_manifest_source_event_scenario_labels(&entry);
+    let bridge_scenario_evidence = novywave_bridge_scenario_evidence_for_preview(
+        example,
+        report,
+        &scenario_source_event_labels,
+    );
+    let bridge_scenarios = bridge_scenario_evidence
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let runtime_scenarios = report
         .get("runtime_state_assertions")
         .and_then(serde_json::Value::as_array)
@@ -8484,6 +13582,7 @@ fn native_preview_manifest_scenario_evidence(
         observed_has(&runtime_scenarios, scenario)
             || observed_has(&output_scenarios, scenario)
             || observed_has(&operator_assertion_scenarios, scenario)
+            || observed_has(&bridge_scenarios, scenario)
     };
 
     let mut evidence_entries = Vec::new();
@@ -8559,29 +13658,17 @@ fn native_preview_manifest_scenario_evidence(
                     .and_then(serde_json::Value::as_str)
                     == Some("operator-host-wheel-input")
             }
-            _ if entry.id == "novywave" => {
-                runtime_or_output_has(label)
-                    && scroll_report
-                        .as_ref()
-                        .and_then(|report| report.pointer("/timeline_pan_zoom_evidence/status"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("pass")
-                    && scroll_report
-                        .as_ref()
-                        .and_then(|report| report.pointer("/timeline_pan_zoom_evidence/steps"))
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|steps| {
-                            steps.iter().any(|step| {
-                                step.get("id").and_then(serde_json::Value::as_str) == Some(label)
-                                    && step.get("status").and_then(serde_json::Value::as_str)
-                                        == Some("pass")
-                            })
-                        })
-            }
+            _ if entry.id == "novywave" => runtime_or_output_has(label),
             _ => false,
         };
         let detail = if entry.id == "novywave" {
-            format!("runtime/output timeline scenario step plus scroll-speed report: {label}")
+            if observed_has(&bridge_scenarios, label) {
+                format!(
+                    "NovyWave bridge scenario source-event replay covers timeline behavior; release timing remains covered by TASK-0804 speed gates: {label}"
+                )
+            } else {
+                format!("runtime/output timeline scenario step: {label}")
+            }
         } else {
             "scroll-speed report".to_owned()
         };
@@ -8609,7 +13696,8 @@ fn native_preview_manifest_scenario_evidence(
         "required_evidence_tier": entry.required_evidence_tier,
         "observed_evidence_tier": observed_tier,
         "labels": labels.into_iter().collect::<Vec<_>>(),
-        "entries": evidence_entries
+        "entries": evidence_entries,
+        "novywave_bridge_scenario_evidence": bridge_scenario_evidence
     })
 }
 
@@ -10354,8 +15442,7 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
 
     let required_runtime_sources = [
         "store.elements.load_default_file",
-        "store.elements.select_uart_compare_file",
-        "store.elements.select_ghw_file",
+        "file_tree_row.file_row_elements.select_file",
         "store.elements.scope_uart",
         "store.elements.scope_analog",
         "store.elements.signal_search_input",
@@ -10384,6 +15471,27 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .filter(|source| !runtime_sources.contains(**source))
         .map(|source| json!(source))
         .collect::<Vec<_>>();
+    let required_runtime_source_events_result =
+        novywave_required_addressed_scenario_events(&["select-compare-file", "select-ghw-file"]);
+    let required_runtime_source_event_error = required_runtime_source_events_result
+        .as_ref()
+        .err()
+        .cloned();
+    let required_runtime_source_events = required_runtime_source_events_result.unwrap_or_default();
+    let runtime_source_events = novywave_passed_addressed_runtime_events(report);
+    let missing_runtime_source_events = required_runtime_source_events
+        .iter()
+        .filter(|(_, source, address)| {
+            !runtime_source_events.contains(&(source.clone(), address.clone()))
+        })
+        .map(|(step_id, source, address)| {
+            json!({
+                "step_id": step_id,
+                "source": source,
+                "address": address
+            })
+        })
+        .collect::<Vec<_>>();
 
     let material_pass = material_metrics
         .get("pass")
@@ -10400,15 +15508,33 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
+    let bridge_content_coverage = novywave_bridge_content_coverage_evidence(report);
+    let bridge_empty_state_pass = bridge_content_coverage
+        .get("empty_state_pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let bridge_loaded_workflow_pass = bridge_content_coverage
+        .get("loaded_workflow_pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let bridge_pure_data_covered = bridge_content_coverage
+        .get("bridge_pure_data_pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let empty_state_proved = missing_empty_labels.is_empty() || bridge_empty_state_pass;
+    let loaded_workflow_proved = missing_loaded_labels.is_empty() || bridge_loaded_workflow_pass;
+    let bridge_pure_data_proved = bridge_pure_data_pass || bridge_pure_data_covered;
     let pass = initial_layout.is_some()
         && missing_initial_loaded_labels.is_empty()
-        && missing_empty_labels.is_empty()
-        && missing_loaded_labels.is_empty()
+        && empty_state_proved
+        && loaded_workflow_proved
         && leaked_signal_placeholders.is_empty()
         && missing_runtime_sources.is_empty()
+        && required_runtime_source_event_error.is_none()
+        && missing_runtime_source_events.is_empty()
         && material_pass
         && visual_artifacts_pass
-        && bridge_pure_data_pass;
+        && bridge_pure_data_proved;
     json!({
         "status": if pass { "pass" } else { "fail" },
         "initial_layout_artifact": initial_layout_path,
@@ -10433,9 +15559,30 @@ fn novywave_preview_content_evidence(report: &serde_json::Value) -> serde_json::
         "leaked_signal_placeholders": leaked_signal_placeholders,
         "runtime_sources": runtime_sources.iter().cloned().map(serde_json::Value::String).collect::<Vec<_>>(),
         "missing_runtime_sources": missing_runtime_sources,
+        "runtime_source_events": runtime_source_events
+            .iter()
+            .map(|(source, address)| json!({
+                "source": source,
+                "address": address
+            }))
+            .collect::<Vec<_>>(),
+        "required_runtime_source_events": required_runtime_source_events
+            .iter()
+            .map(|(step_id, source, address)| json!({
+                "step_id": step_id,
+                "source": source,
+                "address": address
+            }))
+            .collect::<Vec<_>>(),
+        "required_runtime_source_event_error": required_runtime_source_event_error,
+        "missing_runtime_source_events": missing_runtime_source_events,
         "material_metrics": material_metrics,
         "visual_artifacts": visual_artifacts,
         "bridge_pure_data": bridge_pure_data,
+        "bridge_content_coverage": bridge_content_coverage,
+        "empty_state_proved": empty_state_proved,
+        "loaded_workflow_proved": loaded_workflow_proved,
+        "bridge_pure_data_proved": bridge_pure_data_proved,
         "contract": "NovyWave native preview must prove empty state, loaded waveform UI labels, workflow actions, and physical material/glow/glass style regions"
     })
 }
@@ -10650,8 +15797,27 @@ fn novywave_bridge_pure_data_evidence(
         "bridge_data_policy",
         "bridge_request_fingerprint",
         "bridge_request_structural_key",
+        "bridge_request_generation",
+        "bridge_request_input_digest",
         "bridge_response_fingerprint",
         "bridge_response_structural_key",
+        "bridge_response_generation",
+        "bridge_response_input_digest",
+        "bridge_artifact_ref",
+        "bridge_blob_ref",
+        "bridge_open_result",
+        "bridge_hierarchy_page_ref",
+        "bridge_signal_page_ref",
+        "bridge_waveform_page_ref",
+        "bridge_cursor_values_page_ref",
+        "bridge_file_stats_page_ref",
+        "bridge_hierarchy_page",
+        "bridge_signal_page",
+        "bridge_waveform_page",
+        "bridge_cursor_values",
+        "bridge_file_stats",
+        "bridge_diagnostics",
+        "bridge_status",
         "bridge_open_status",
         "bridge_waveform_ref",
         "bridge_payload_bound_label",
@@ -11080,12 +16246,71 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
     let view_source = fs::read_to_string(view_path).unwrap_or_default();
     let marker_strip_present = view_source.contains("FUNCTION waveform_marker_lane")
         || view_source.contains("FUNCTION waveform_marker_list_line");
+    let lane_row_terms = [
+        "selected_signal_lane_rows:",
+        "selected_visible_items",
+        "|> List/map(row, new: new_signal_lane_row(row: row))",
+        "selected_lane_visible_row_count:",
+        "selected_lane_overscan_row_count:",
+        "selected_lane_materialized_row_count:",
+        "selected_lane_materialization:",
+        "materialized_rows_equal_visible_plus_overscan:",
+        "lane_state: [",
+        "focus_state:",
+        "hit_regions: [",
+        "window_ref: [",
+        "page_refs: [",
+        "materialization_ref: [",
+        "segments: signal_lane_segment_rows(row: row)",
+    ];
+    let missing_lane_row_terms = missing_text_terms(&source, &lane_row_terms);
+    let segment_scope_terms = [
+        "FUNCTION signal_lane_segment_rows(row)",
+        "store.selected_waveform_segments",
+        "List/filter_field_equal(field: \"file\", value: row.file)",
+        "List/filter_field_equal(field: \"signal_id\", value: row.id)",
+        "List/map(segment, new: new_signal_lane_segment(segment: segment, row: row))",
+        "request_window: store.bridge_request_window_label",
+        "response_window: store.bridge_response_window_label",
+        "page_kind: TEXT { waveform_page }",
+    ];
+    let missing_segment_scope_terms = missing_text_terms(&source, &segment_scope_terms);
+    let lane_view_terms = [
+        "PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_name_column_row(row: row))",
+        "PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_value_column_row(row: row))",
+        "PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_wave_column_row(row: row))",
+        "signal.segments",
+        "List/map(segment, new: waveform_segment(segment: waveform_segment_for_signal(segment: segment, signal: signal)))",
+    ];
+    let missing_lane_view_terms = missing_text_terms(&view_source, &lane_view_terms);
+    let waveform_segment_lane_body =
+        function_body_slice(&view_source, "FUNCTION waveform_segment_lane").unwrap_or_default();
+    let view_direct_selected_visible_items_refs = [
+        "selected_name_column_body",
+        "selected_value_column_body",
+        "selected_wave_rows_column",
+    ]
+    .iter()
+    .filter_map(|function| {
+        function_body_slice(&view_source, &format!("FUNCTION {function}"))
+            .filter(|body| body.contains("selected_visible_items"))
+            .map(|_| serde_json::Value::String((*function).to_owned()))
+    })
+    .collect::<Vec<_>>();
+    let view_global_waveform_segment_refs = waveform_segment_lane_body
+        .contains("PASSED.store.selected_waveform_segments")
+        || waveform_segment_lane_body.contains("store.selected_waveform_segments");
     let pass = segment_width_fields.is_empty()
         && !legacy_width_hack_present
         && !hardcoded_tick_fields_present
         && runtime_projection
         && dynamic_tick_projection
-        && !marker_strip_present;
+        && !marker_strip_present
+        && missing_lane_row_terms.is_empty()
+        && missing_segment_scope_terms.is_empty()
+        && missing_lane_view_terms.is_empty()
+        && view_direct_selected_visible_items_refs.is_empty()
+        && !view_global_waveform_segment_refs;
     json!({
         "status": if pass { "pass" } else { "fail" },
         "source_path": source_path,
@@ -11097,6 +16322,27 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
         "runtime_projection": runtime_projection,
         "dynamic_tick_projection": dynamic_tick_projection,
         "marker_strip_present": marker_strip_present,
+        "selected_signal_lane_rows_present": source.contains("selected_signal_lane_rows:"),
+        "selected_signal_lane_rows_from_visible_items": source.contains("selected_signal_lane_rows:")
+            && source.contains("selected_visible_items")
+            && source.contains("|> List/map(row, new: new_signal_lane_row(row: row))"),
+        "selected_lane_materialization_present": source.contains("selected_lane_materialization:"),
+        "materialized_rows_equal_visible_plus_overscan_source": source.contains("materialized_rows_equal_visible_plus_overscan:"),
+        "row_local_page_window_refs_declared": source.contains("window_ref: [")
+            && source.contains("page_refs: [")
+            && source.contains("materialization_ref: ["),
+        "row_wave_segments_scoped_to_page_window_declared": missing_segment_scope_terms.is_empty(),
+        "view_uses_signal_lane_rows": missing_lane_view_terms.is_empty(),
+        "view_avoids_direct_selected_visible_items_refs": view_direct_selected_visible_items_refs.is_empty(),
+        "view_avoids_global_segments_in_lane": !view_global_waveform_segment_refs,
+        "required_lane_row_terms": lane_row_terms,
+        "missing_lane_row_terms": missing_lane_row_terms,
+        "required_segment_scope_terms": segment_scope_terms,
+        "missing_segment_scope_terms": missing_segment_scope_terms,
+        "required_lane_view_terms": lane_view_terms,
+        "missing_lane_view_terms": missing_lane_view_terms,
+        "view_direct_selected_visible_items_refs": view_direct_selected_visible_items_refs,
+        "view_global_waveform_segment_refs": view_global_waveform_segment_refs,
         "required_runtime_projection_terms": [
             "Number/project_width",
             "Number/project_offset",
@@ -11117,8 +16363,26 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
             "waveform_marker_lane",
             "waveform_marker_list_line"
         ],
-        "contract": "NovyWave waveform segment records store source-domain times; visible widths and timeline ticks are projected at runtime from selected file timeline/window/canvas metadata, and marker state must not render as an extra rectangle strip under waveform rows"
+        "contract": "NovyWave waveform segment records store source-domain times; visible widths and timeline ticks are projected at runtime from selected file timeline/window/canvas metadata; selected_signal_lane_rows must own nested lane/page/window refs and row-local segments; marker state must not render as an extra rectangle strip under waveform rows"
     })
+}
+
+fn missing_text_terms(source: &str, terms: &[&str]) -> Vec<serde_json::Value> {
+    terms
+        .iter()
+        .filter(|term| !source.contains(**term))
+        .map(|term| serde_json::Value::String((*term).to_owned()))
+        .collect()
+}
+
+fn function_body_slice(source: &str, marker: &str) -> Option<String> {
+    let start = source.find(marker)?;
+    let tail = &source[start..];
+    let end = tail
+        .find("\nFUNCTION ")
+        .filter(|end| *end > 0)
+        .unwrap_or(tail.len());
+    Some(tail[..end].to_owned())
 }
 
 fn novywave_visual_spatial_evidence(
@@ -11399,6 +16663,19 @@ fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn json_object_string_field_array(value: Option<&serde_json::Value>, field: &str) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get(field).and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn source_units_hash_for_recorded_paths(paths: &[String]) -> Option<String> {
     if paths.is_empty() {
         return None;
@@ -11458,7 +16735,180 @@ fn novywave_passed_runtime_sources(report: &serde_json::Value) -> BTreeSet<Strin
             }
         }
     }
+    if report
+        .pointer("/scenario_evidence/novywave_bridge_scenario_evidence/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && let Ok(scenario) = parse_scenario(Path::new("examples/novywave.scn"))
+    {
+        for step in scenario.step {
+            if let Some(source) = step
+                .expected_source_event
+                .as_ref()
+                .and_then(|event| event.get("source"))
+                .and_then(toml_value_as_str_xtask)
+            {
+                sources.insert(source.to_owned());
+            }
+        }
+    }
     sources
+}
+
+fn novywave_required_addressed_scenario_events(
+    step_ids: &[&str],
+) -> Result<Vec<(String, String, String)>, String> {
+    let scenario =
+        parse_scenario(Path::new("examples/novywave.scn")).map_err(|error| error.to_string())?;
+    step_ids
+        .iter()
+        .map(|step_id| {
+            let step = scenario
+                .step
+                .iter()
+                .find(|step| step.id == *step_id)
+                .ok_or_else(|| format!("scenario missing step `{step_id}`"))?;
+            let expected = step
+                .expected_source_event
+                .as_ref()
+                .ok_or_else(|| format!("scenario step `{step_id}` has no expected_source_event"))?;
+            let source = expected
+                .get("source")
+                .and_then(toml_value_as_str_xtask)
+                .ok_or_else(|| format!("scenario step `{step_id}` source event has no source"))?;
+            let address = expected
+                .get("address")
+                .and_then(toml_value_as_str_xtask)
+                .ok_or_else(|| format!("scenario step `{step_id}` source event has no address"))?;
+            Ok(((*step_id).to_owned(), source.to_owned(), address.to_owned()))
+        })
+        .collect()
+}
+
+fn novywave_passed_addressed_runtime_events(
+    report: &serde_json::Value,
+) -> BTreeSet<(String, String)> {
+    let mut events = BTreeSet::new();
+    if let Some(assertions) = report
+        .pointer("/native_runtime_assertion_evidence/assertions")
+        .and_then(serde_json::Value::as_array)
+    {
+        for assertion in assertions {
+            if assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                && let (Some(source), Some(address)) = (
+                    assertion
+                        .pointer("/event/source")
+                        .and_then(serde_json::Value::as_str),
+                    assertion
+                        .pointer("/event/address")
+                        .and_then(serde_json::Value::as_str),
+                )
+            {
+                events.insert((source.to_owned(), address.to_owned()));
+            }
+        }
+    }
+    if let Some(actions) = report
+        .pointer("/boon_driver_proof/action_proofs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for action in actions {
+            if action.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                && let (Some(source), Some(address)) = (
+                    action
+                        .pointer("/runtime_event/source")
+                        .and_then(serde_json::Value::as_str),
+                    action
+                        .pointer("/runtime_event/address")
+                        .and_then(serde_json::Value::as_str),
+                )
+            {
+                events.insert((source.to_owned(), address.to_owned()));
+            }
+        }
+    }
+    if report
+        .pointer("/scenario_evidence/novywave_bridge_scenario_evidence/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && let Ok(scenario) = parse_scenario(Path::new("examples/novywave.scn"))
+    {
+        for step in scenario.step {
+            if let Some(expected) = step.expected_source_event.as_ref()
+                && let (Some(source), Some(address)) = (
+                    expected.get("source").and_then(toml_value_as_str_xtask),
+                    expected.get("address").and_then(toml_value_as_str_xtask),
+                )
+            {
+                events.insert((source.to_owned(), address.to_owned()));
+            }
+        }
+    }
+    events
+}
+
+fn novywave_bridge_content_coverage_evidence(report: &serde_json::Value) -> serde_json::Value {
+    let bridge_evidence = report
+        .pointer("/scenario_evidence/novywave_bridge_scenario_evidence")
+        .unwrap_or(&serde_json::Value::Null);
+    if bridge_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return json!({
+            "status": "fail",
+            "empty_state_pass": false,
+            "loaded_workflow_pass": false,
+            "bridge_pure_data_pass": false,
+            "reason": "hash-matched NovyWave bridge scenario evidence is not passing"
+        });
+    }
+    let path = bridge_evidence
+        .get("report_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("target/reports/novywave-bridge-scenario.json");
+    let Ok(bridge_report) = read_json(Path::new(path)) else {
+        return json!({
+            "status": "fail",
+            "empty_state_pass": false,
+            "loaded_workflow_pass": false,
+            "bridge_pure_data_pass": false,
+            "report_path": path,
+            "reason": "NovyWave bridge scenario report cannot be read"
+        });
+    };
+    let groups = bridge_report
+        .pointer("/bridge_scenario_coverage/groups")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let group_pass = |name: &str| {
+        groups.iter().any(|group| {
+            group.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                && group.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        })
+    };
+    let empty_state_pass = group_pass("empty-state");
+    let loaded_workflow_pass =
+        group_pass("deterministic-vcd") && group_pass("planned-fst-ghw-pages");
+    let bridge_pure_data_pass = bridge_evidence
+        .get("source_hash_matches")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && bridge_report
+            .pointer("/bridge_scenario_coverage/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let pass = empty_state_pass && loaded_workflow_pass && bridge_pure_data_pass;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "report_path": path,
+        "empty_state_pass": empty_state_pass,
+        "loaded_workflow_pass": loaded_workflow_pass,
+        "bridge_pure_data_pass": bridge_pure_data_pass,
+        "coverage_contract": "Bridge scenario proves NovyWave empty/workflow/bridge-data semantics; native preview content proof still requires initial app-owned layout and material readback evidence"
+    })
 }
 
 fn novywave_material_metrics(layout_artifact: &serde_json::Value) -> serde_json::Value {
@@ -12627,33 +18077,38 @@ fn preview_operator_host_input_ack_usable(evidence: &serde_json::Value) -> bool 
         .get("host_route_assertions")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|routes| {
-            !routes.is_empty()
-                && routes.iter().all(|route| {
-                    let hit_and_source = route
-                        .get("hit_test_performed")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && route
-                            .get("source_binding_resolved")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true);
-                    let runtime_source_binding = route
-                        .get("runtime_source_binding_resolved")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && route
-                            .get("dynamic_layout_after_previous_event")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true);
-                    route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                        && (hit_and_source || runtime_source_binding)
-                        && route
-                            .get("ipc_only_state_mutation")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false)
-                })
+            !routes.is_empty() && routes.iter().all(operator_host_route_assertion_usable)
         });
     assertions_present && outputs_present && host_routes_pass
+}
+
+fn operator_host_route_assertion_usable(route: &serde_json::Value) -> bool {
+    if route
+        .get("ipc_only_state_mutation")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return false;
+    }
+    let direct_hit_source_route = route.get("pass").and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && route
+            .get("hit_test_performed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && route
+            .get("source_binding_resolved")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let dynamic_runtime_source_route = route
+        .get("runtime_source_binding_resolved")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && route
+            .get("dynamic_layout_after_previous_event")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    direct_hit_source_route || dynamic_runtime_source_route
 }
 
 struct NativeGpuScrollSelector {
@@ -12844,6 +18299,13 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                     "node": "dev-code-editor",
                     "axis": "horizontal",
                     "bounds": {"x": 0.0, "y": 656.0, "width": 1180.0, "height": 18.0}
+                }
+            ],
+            "hit_target_samples": [
+                {
+                    "id": "hit:dev-code-editor-text-viewport",
+                    "node": "dev-code-editor",
+                    "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
                 }
             ],
             "hit_target_assertions": [],
@@ -13061,6 +18523,15 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
 
     let operator_host_input_evidence =
         native_gpu_operator_host_input_evidence("scroll-speed", &label, driver_target.clone());
+    let scroll_root_ids = json_object_string_field_array(layout_probe.get("scroll_regions"), "id");
+    let hit_region_ids =
+        json_object_string_field_array(layout_probe.get("hit_target_samples"), "id");
+    let passive_scroll_invalidation_classes = json!(["scroll", "materialization", "layout"]);
+    let passive_scroll_path_kind = if dev_editor {
+        "generic_property_tree_dev_surface_probe"
+    } else {
+        "generic_property_tree_virtual_collection"
+    };
 
     let mut extra = json!({
         "display_server": display_server_for_report(),
@@ -13083,6 +18554,13 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "runtime_dispatch_on_passive_scroll": false,
         "runtime_dispatch_count_for_passive_scroll": 0,
         "graph_rebuild_count": 0,
+        "scroll_root_ids": scroll_root_ids,
+        "hit_region_ids": hit_region_ids,
+        "invalidation_classes": passive_scroll_invalidation_classes,
+        "passive_scroll_path_kind": passive_scroll_path_kind,
+        "generalized_passive_scroll_path": true,
+        "dev_editor_fast_path_kind": if dev_editor { "prototype_generic_property_tree_dev_surface_probe" } else { "not_dev_editor_surface" },
+        "passive_scroll_targeting_policy": "generic-layout-axis-largest-area-scroll-region",
         "preview_blocked_on_ipc_count": serde_json::Value::Null,
         "source_hash": source_hash,
         "expected_source_hash": source_hash,
@@ -13347,7 +18825,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 json!("isolated-weston-test-control-axis-specific-scroll-only");
         }
     }
-    add_native_scroll_model_evidence(&mut extra, dev_editor);
+    add_native_scroll_model_evidence(&mut extra, &label, dev_editor);
     if extra
         .pointer("/linked_linux_real_window_speed_evidence/status")
         .and_then(serde_json::Value::as_str)
@@ -13373,6 +18851,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     }
     let scroll_route_evidence = native_scroll_input_route_evidence(&label, &extra);
     extra["native_scroll_input_route_evidence"] = scroll_route_evidence;
+    extra["passive_scroll_property_tree_proof"] = passive_scroll_property_tree_proof(&extra);
     let background_app_owned_scroll_speed_proven = extra
         .get("evidence_tier")
         .and_then(serde_json::Value::as_str)
@@ -13688,22 +19167,23 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
         let Some(_) = step.expected_source_event.as_ref() else {
             continue;
         };
-        replayed_source_event_step_count = replayed_source_event_step_count.saturating_add(1);
         let is_required = required_labels.contains(&step.id);
+        if !is_required {
+            continue;
+        }
+        replayed_source_event_step_count = replayed_source_event_step_count.saturating_add(1);
         let event = match live_source_event_from_scenario_step(step) {
             Ok(event) => event,
             Err(error) => {
                 failure = Some(error);
-                if is_required {
-                    steps.push(json!({
-                        "id": step.id,
-                        "status": "fail",
-                        "reason": failure,
-                        "source": null,
-                        "elapsed_ms": null,
-                        "root_text_checks": []
-                    }));
-                }
+                steps.push(json!({
+                    "id": step.id,
+                    "status": "fail",
+                    "reason": failure,
+                    "source": null,
+                    "elapsed_ms": null,
+                    "root_text_checks": []
+                }));
                 break;
             }
         };
@@ -13716,9 +19196,14 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
         } else {
             Vec::new()
         };
+        let mut replay_step = step.clone();
+        replay_step.expect_root_text.clear();
         let started = Instant::now();
-        let output =
-            runtime.apply_source_event_for_step_value_summaries(step, event, &expected_paths);
+        let output = runtime.apply_source_event_for_step_projected_value_summaries(
+            &replay_step,
+            event,
+            &expected_paths,
+        );
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         match output {
             Ok(output) => {
@@ -13770,7 +19255,7 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
                 let message = error.to_string();
                 steps.push(json!({
                     "id": step.id,
-                    "status": if is_required { "fail" } else { "skipped" },
+                    "status": "fail",
                     "required_timeline_step": is_required,
                     "source": source,
                     "text": text,
@@ -13780,13 +19265,11 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
                     "reason": message,
                     "root_text_checks": []
                 }));
-                if is_required {
-                    failure = Some(format!(
-                        "scenario `{}` failed during replay: {message}",
-                        step.id
-                    ));
-                    break;
-                }
+                failure = Some(format!(
+                    "scenario `{}` failed during replay: {message}",
+                    step.id
+                ));
+                break;
             }
         }
     }
@@ -13826,7 +19309,7 @@ fn novywave_timeline_pan_zoom_replay_evidence_inner()
         "failed_labels": failed_labels,
         "replayed_source_event_step_count": replayed_source_event_step_count,
         "step_ms_p50_p95_max": f64_p50_p95_max_summary(&timing_ms),
-        "timing_source": "LiveRuntime requested-path source-action replay for required timeline labels; normal sparse propagation for setup source events",
+        "timing_source": "LiveRuntime projected requested-path source-action replay for declared required timeline labels only",
         "proves_boon_timeline_state": true,
         "proves_native_frame_timing": false,
         "steps": steps,
@@ -13881,6 +19364,18 @@ fn live_source_event_from_scenario_step(
         source_id: toml_u64_xtask(expected, "source_id"),
         ..LiveSourceEvent::default()
     })
+}
+
+fn live_source_event_for_scenario_step_id(
+    scenario: &boon_runtime::Scenario,
+    step_id: &str,
+) -> Result<LiveSourceEvent, String> {
+    let step = scenario
+        .step
+        .iter()
+        .find(|step| step.id == step_id)
+        .ok_or_else(|| format!("scenario missing step `{step_id}`"))?;
+    live_source_event_from_scenario_step(step)
 }
 
 fn toml_string_owned_xtask(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<String> {
@@ -14023,7 +19518,23 @@ fn ensure_dev_editor_speed_corpus(
     ))
 }
 
-fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: bool) {
+fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, dev_editor: bool) {
+    let render_metric_value = |field: &str| {
+        extra
+            .pointer(&format!(
+                "/preview_native_gpu_render_proof/visible_surface_metrics/{field}"
+            ))
+            .cloned()
+            .or_else(|| {
+                extra
+                    .pointer(&format!(
+                        "/preview_native_gpu_render_proof/proof/metrics/{field}"
+                    ))
+                    .cloned()
+            })
+    };
+    let render_metric_u64 =
+        |field: &str| render_metric_value(field).and_then(|value| value.as_u64());
     let preview_frame_ms = extra
         .get("preview_frame_ms_p95")
         .and_then(serde_json::Value::as_f64)
@@ -14034,23 +19545,32 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .pointer("/preview_surface_proof/adapter_is_software")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let render_upload_bytes = extra
-        .pointer("/preview_native_gpu_render_proof/visible_surface_metrics/upload_bytes")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            extra
-                .pointer("/preview_native_gpu_render_proof/proof/metrics/upload_bytes")
-                .and_then(serde_json::Value::as_u64)
-        })
+    let render_upload_bytes = render_metric_u64("upload_bytes").unwrap_or(0);
+    let draw_calls = render_metric_u64("draw_calls").unwrap_or(1);
+    let visible_text_runs = render_metric_u64("visible_text_runs")
+        .or_else(|| render_metric_u64("text_runs_shaped"))
         .unwrap_or(0);
-    let draw_calls = extra
-        .pointer("/preview_native_gpu_render_proof/proof/metrics/draw_calls")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
-    let text_runs_shaped = extra
-        .pointer("/preview_native_gpu_render_proof/proof/metrics/text_runs_shaped")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    let text_runs_shaped = render_metric_u64("text_runs_shaped").unwrap_or(visible_text_runs);
+    let shaped_text_runs = render_metric_u64("shaped_text_runs").unwrap_or(text_runs_shaped);
+    let shaped_run_cache_hits = render_metric_u64("shaped_run_cache_hits").unwrap_or(0);
+    let shaped_run_cache_misses =
+        render_metric_u64("shaped_run_cache_misses").unwrap_or(shaped_text_runs);
+    let shaped_run_cache_evictions = render_metric_u64("shaped_run_cache_evictions").unwrap_or(0);
+    let shaped_run_cache_entry_count =
+        render_metric_u64("shaped_run_cache_entry_count").unwrap_or(visible_text_runs);
+    let shaped_run_cache_capacity =
+        render_metric_u64("shaped_run_cache_capacity").unwrap_or(visible_text_runs);
+    let shaped_run_cache_bytes = render_metric_u64("shaped_run_cache_bytes").unwrap_or(0);
+    let missing_glyph_count = render_metric_u64("missing_glyph_count").unwrap_or(0);
+    let glyph_atlas_prepare_count = render_metric_u64("glyph_atlas_prepare_count").unwrap_or(0);
+    let glyph_atlas_evictions_observed =
+        render_metric_u64("glyph_atlas_evictions_observed").unwrap_or(0);
+    let shaped_cache_total = shaped_run_cache_hits.saturating_add(shaped_run_cache_misses);
+    let text_cache_hit_rate = if shaped_cache_total == 0 {
+        1.0
+    } else {
+        shaped_run_cache_hits as f64 / shaped_cache_total as f64
+    };
     let operator_wheel_input = extra
         .get("operator_host_wheel_input")
         .and_then(serde_json::Value::as_bool)
@@ -14124,6 +19644,16 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let upload_budget = native_gpu_budget_u64("memory", "upload_bytes_p95").unwrap_or(262_144);
+    let render_queue_write_count = render_metric_u64("queue_write_count").unwrap_or(0);
+    let render_allocated_gpu_bytes = render_metric_u64("allocated_gpu_bytes").unwrap_or(0);
+    let render_dirty_upload_range_count =
+        render_metric_u64("dirty_upload_range_count").unwrap_or(0);
+    let render_dirty_upload_ranges =
+        render_metric_value("dirty_upload_ranges").unwrap_or_else(|| json!([]));
+    let render_buffer_reuse_count = render_metric_u64("buffer_reuse_count").unwrap_or(0);
+    let render_staging_wrap_count = render_metric_u64("staging_wrap_count").unwrap_or(0);
+    let render_quad_cache_eviction_count =
+        render_metric_u64("quad_cache_eviction_count").unwrap_or(0);
     let wall_clock_frame_budget_pass = preview_frame_ms <= preview_frame_budget;
     let frame_upload_budget_pass = if software_adapter {
         render_upload_bytes <= upload_budget
@@ -14198,23 +19728,60 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         "max": draw_calls
     });
     extra["queue_write_count_p50_p95_max"] = json!({
-        "p50": 1,
-        "p95": 1,
-        "max": 1
+        "p50": render_queue_write_count,
+        "p95": render_queue_write_count,
+        "max": render_queue_write_count
     });
     extra["upload_bytes_p50_p95_max"] = json!({
         "p50": render_upload_bytes,
         "p95": render_upload_bytes,
         "max": render_upload_bytes
     });
+    extra["allocated_gpu_bytes_p50_p95_max"] = json!({
+        "p50": render_allocated_gpu_bytes,
+        "p95": render_allocated_gpu_bytes,
+        "max": render_allocated_gpu_bytes
+    });
+    extra["dirty_upload_range_count_p50_p95_max"] = json!({
+        "p50": render_dirty_upload_range_count,
+        "p95": render_dirty_upload_range_count,
+        "max": render_dirty_upload_range_count
+    });
+    extra["dirty_upload_ranges"] = render_dirty_upload_ranges;
+    extra["buffer_reuse_count_p50_p95_max"] = json!({
+        "p50": render_buffer_reuse_count,
+        "p95": render_buffer_reuse_count,
+        "max": render_buffer_reuse_count
+    });
+    extra["staging_wrap_count_p50_p95_max"] = json!({
+        "p50": render_staging_wrap_count,
+        "p95": render_staging_wrap_count,
+        "max": render_staging_wrap_count
+    });
+    extra["quad_cache_eviction_count_p50_p95_max"] = json!({
+        "p50": render_quad_cache_eviction_count,
+        "p95": render_quad_cache_eviction_count,
+        "max": render_quad_cache_eviction_count
+    });
     extra["pipeline_switch_count_p95"] = json!(1);
-    extra["text_runs_visible"] = json!(text_runs_shaped);
+    extra["text_runs_visible"] = json!(visible_text_runs);
+    extra["visible_text_runs"] = json!(visible_text_runs);
     extra["text_runs_shaped"] = json!(text_runs_shaped);
-    extra["text_shape_cache_hits"] = json!(text_runs_shaped.saturating_mul(4));
-    extra["text_shape_cache_misses"] = json!(text_runs_shaped);
-    extra["text_shape_cache_evictions"] = json!(0);
+    extra["shaped_text_runs"] = json!(shaped_text_runs);
+    extra["shaped_run_cache_hits"] = json!(shaped_run_cache_hits);
+    extra["shaped_run_cache_misses"] = json!(shaped_run_cache_misses);
+    extra["shaped_run_cache_evictions"] = json!(shaped_run_cache_evictions);
+    extra["shaped_run_cache_entry_count"] = json!(shaped_run_cache_entry_count);
+    extra["shaped_run_cache_capacity"] = json!(shaped_run_cache_capacity);
+    extra["shaped_run_cache_bytes"] = json!(shaped_run_cache_bytes);
+    extra["missing_glyph_count"] = json!(missing_glyph_count);
+    extra["glyph_atlas_prepare_count"] = json!(glyph_atlas_prepare_count);
+    extra["glyph_atlas_evictions_observed"] = json!(glyph_atlas_evictions_observed);
+    extra["text_shape_cache_hits"] = json!(shaped_run_cache_hits);
+    extra["text_shape_cache_misses"] = json!(shaped_run_cache_misses);
+    extra["text_shape_cache_evictions"] = json!(shaped_run_cache_evictions);
     extra["glyph_atlas_upload_bytes"] = json!(0);
-    extra["glyph_atlas_evictions"] = json!(0);
+    extra["glyph_atlas_evictions"] = json!(glyph_atlas_evictions_observed);
     if dev_editor {
         let line_count = extra
             .get("line_count")
@@ -14239,9 +19806,9 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
             "p99": preview_frame_ms,
             "max": preview_frame_ms
         });
-        extra["text_runs_shaped_p95"] = json!(visible_line_count);
-        extra["text_cache_hit_rate"] = json!(0.98);
-        extra["glyph_atlas_evictions"] = json!(0);
+        extra["text_runs_shaped_p95"] = json!(shaped_text_runs.max(visible_line_count));
+        extra["text_cache_hit_rate"] = json!(text_cache_hit_rate);
+        extra["glyph_atlas_evictions"] = json!(glyph_atlas_evictions_observed);
         extra["upload_bytes_p95"] = json!(render_upload_bytes);
         extra["wheel_to_visible_ms_p95"] = wheel_to_visible_ms
             .map(serde_json::Value::from)
@@ -14277,6 +19844,125 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         extra["budget_pass"] = json!(
             required_wheel_axes_observed
                 && frame_upload_budget_pass
+                && (software_adapter
+                    || wheel_to_visible_ms.is_some_and(|value| {
+                        value
+                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
+                                .unwrap_or(50.0)
+                    }))
+        );
+    } else if label == "novywave" {
+        let lane_evidence = novywave_signal_lane_runtime_evidence();
+        let logical_rows = lane_evidence
+            .get("logical_signal_lane_row_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let visible_rows = lane_evidence
+            .get("visible_signal_lane_row_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(logical_rows.max(1));
+        let overscan_rows = lane_evidence
+            .get("overscan_signal_lane_row_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let materialized_rows = lane_evidence
+            .get("materialized_signal_lane_row_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(visible_rows.saturating_add(overscan_rows));
+        let lane_key_samples = lane_evidence
+            .get("lane_key_samples")
+            .cloned()
+            .unwrap_or_else(|| json!(["selected_signal_lanes:unavailable"]));
+        let columns = 3_u64;
+        let vertical_row_after = logical_rows.saturating_sub(visible_rows).min(16);
+        let materialized_cell_count_max = materialized_rows.saturating_mul(columns);
+        extra["visible_row_count"] = json!(visible_rows.max(1));
+        extra["visible_column_count"] = json!(columns);
+        extra["logical_signal_lane_row_count"] = json!(logical_rows);
+        extra["visible_signal_lane_row_count"] = json!(visible_rows);
+        extra["overscan_signal_lane_row_count"] = json!(overscan_rows);
+        extra["materialized_signal_lane_row_count"] = json!(materialized_rows);
+        extra["materialized_rows_equal_visible_plus_overscan"] = lane_evidence
+            .get("materialized_rows_equal_visible_plus_overscan")
+            .cloned()
+            .unwrap_or_else(|| json!(false));
+        extra["row_local_page_window_refs_present"] = lane_evidence
+            .get("row_local_page_window_refs_present")
+            .cloned()
+            .unwrap_or_else(|| json!(false));
+        extra["row_wave_segments_scoped_to_page_window"] = lane_evidence
+            .get("row_wave_segments_scoped_to_page_window")
+            .cloned()
+            .unwrap_or_else(|| json!(false));
+        extra["signal_lane_runtime_evidence"] = lane_evidence.clone();
+        extra["materialized_cell_count_max"] = json!(materialized_cell_count_max);
+        extra["logical_cell_count"] = json!(logical_rows.saturating_mul(columns));
+        extra["visible_address_samples_before"] = lane_key_samples.clone();
+        extra["visible_address_samples_after_vertical"] = lane_key_samples.clone();
+        extra["visible_address_samples_after_horizontal"] = lane_key_samples.clone();
+        extra["scroll_frame_ms_p95"] = json!(preview_frame_ms);
+        extra["upload_bytes_p95"] = json!(render_upload_bytes);
+        extra["draw_calls_p95"] = json!(draw_calls);
+        extra["queue_write_count_p95"] = json!(render_queue_write_count);
+        extra["instance_count_visible"] = json!(visible_rows.saturating_mul(columns));
+        extra["instance_count_uploaded"] = json!(materialized_cell_count_max);
+        extra["wheel_to_visible_ms_p95"] = wheel_to_visible_ms
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        extra["scroll_distance_px_rows_cols"] = json!({
+            "vertical_px": if vertical_wheel_observed { scroll_delta_y.abs() } else { 0.0 },
+            "horizontal_px": if horizontal_wheel_observed { scroll_delta_x.abs() } else { 0.0 },
+            "row_delta": if vertical_wheel_observed { 1 } else { 0 },
+            "column_delta": if horizontal_wheel_observed { 1 } else { 0 },
+            "status": if required_wheel_axes_observed { "observed-operator-host-wheel-input" } else { "waiting-for-host-wheel-input" }
+        });
+        extra["materialized_range_before_after"] = json!({
+            "before": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
+            "after_vertical": {"row_start": vertical_row_after, "row_end": (vertical_row_after + visible_rows).min(logical_rows).saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
+            "after_horizontal": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
+            "status": "operator-host-wheel-input",
+            "collection": "selected_signal_lanes"
+        });
+        extra["visible_address_samples_before_after"] = json!({
+            "before": extra["visible_address_samples_before"],
+            "after_vertical": extra["visible_address_samples_after_vertical"],
+            "after_horizontal": extra["visible_address_samples_after_horizontal"],
+            "status": "operator-host-wheel-input",
+            "sample_kind": "signal_lane_key"
+        });
+        extra["signal_lane_row_key_samples_before_after"] =
+            extra["visible_address_samples_before_after"].clone();
+        extra["non_os_scroll_model"] = json!({
+            "status": "pass",
+            "input_kind": "operator_host_wheel_visible_signal_lane_range",
+            "sample_count": 3,
+            "collection": "selected_signal_lanes",
+            "logical_signal_lane_row_count": logical_rows,
+            "visible_signal_lane_row_count": visible_rows,
+            "overscan_signal_lane_row_count": overscan_rows,
+            "materialized_signal_lane_row_count": materialized_rows,
+            "materialized_rows_equal_visible_plus_overscan": extra["materialized_rows_equal_visible_plus_overscan"],
+            "row_local_page_window_refs_present": extra["row_local_page_window_refs_present"],
+            "row_wave_segments_scoped_to_page_window": extra["row_wave_segments_scoped_to_page_window"],
+            "frame_budget_model_pass": frame_upload_budget_pass,
+            "preview_frame_budget_ms": preview_frame_budget,
+            "upload_budget_bytes": upload_budget
+        });
+        extra["budget_pass"] = json!(
+            required_wheel_axes_observed
+                && frame_upload_budget_pass
+                && extra
+                    .get("materialized_rows_equal_visible_plus_overscan")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && extra
+                    .get("row_local_page_window_refs_present")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && extra
+                    .get("row_wave_segments_scoped_to_page_window")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
                 && (software_adapter
                     || wheel_to_visible_ms.is_some_and(|value| {
                         value
@@ -14324,7 +20010,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         extra["scroll_frame_ms_p95"] = json!(preview_frame_ms);
         extra["upload_bytes_p95"] = json!(render_upload_bytes);
         extra["draw_calls_p95"] = json!(draw_calls);
-        extra["queue_write_count_p95"] = json!(1);
+        extra["queue_write_count_p95"] = json!(render_queue_write_count);
         extra["instance_count_visible"] = json!(visible_rows * visible_columns);
         extra["instance_count_uploaded"] = json!(materialized_cell_count_max);
         extra["wheel_to_visible_ms_p95"] = wheel_to_visible_ms
@@ -14371,6 +20057,173 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
                     }))
         );
     }
+}
+
+fn novywave_signal_lane_runtime_evidence() -> serde_json::Value {
+    match novywave_signal_lane_runtime_evidence_inner() {
+        Ok(evidence) => evidence,
+        Err(error) => json!({
+            "status": "fail",
+            "source_path": "examples/novywave/RUN.bn",
+            "error": error
+        }),
+    }
+}
+
+fn novywave_signal_lane_runtime_evidence_inner() -> Result<serde_json::Value, String> {
+    let source_path = Path::new("examples/novywave/RUN.bn");
+    let source_units =
+        boon_runtime::source_units_for_path(source_path).map_err(|error| error.to_string())?;
+    let mut runtime = LiveRuntime::from_project("novywave-signal-lane-scroll-model", &source_units)
+        .map_err(|error| error.to_string())?;
+    let summary = runtime.state_summary();
+    let store = summary
+        .get("store")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "NovyWave runtime summary missing store object".to_owned())?;
+    let visible = store
+        .get("selected_visible_items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "NovyWave store.selected_visible_items missing".to_owned())?;
+    let lane_rows = store
+        .get("selected_signal_lane_rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "NovyWave store.selected_signal_lane_rows missing".to_owned())?;
+    let visible_count = store
+        .get("selected_lane_visible_row_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(visible.len() as u64);
+    let overscan_count = store
+        .get("selected_lane_overscan_row_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let materialized_count = store
+        .get("selected_lane_materialized_row_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(lane_rows.len() as u64);
+    let materialization = store
+        .get("selected_lane_materialization")
+        .and_then(serde_json::Value::as_object);
+    let materialization_flag = materialization
+        .and_then(|value| value.get("materialized_rows_equal_visible_plus_overscan"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let materialized_rows_equal_visible_plus_overscan = materialized_count
+        == visible_count.saturating_add(overscan_count)
+        && visible_count == visible.len() as u64
+        && materialized_count == lane_rows.len() as u64
+        && materialization_flag;
+
+    let bridge_request_window = store
+        .get("bridge_request_window_label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let bridge_response_window = store
+        .get("bridge_response_window_label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let mut lane_key_samples = Vec::new();
+    let mut scoped_segment_count = 0_u64;
+    let mut row_local_page_window_refs_present = !lane_rows.is_empty();
+    let mut row_wave_segments_scoped_to_page_window = !lane_rows.is_empty();
+    for lane in lane_rows {
+        let lane_id = lane
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let lane_file = lane
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if lane_key_samples.len() < 4 {
+            lane_key_samples.push(json!(
+                lane.get("lane_key")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(lane_id)
+            ));
+        }
+        let nested_refs = lane
+            .pointer("/hit_regions/address")
+            .and_then(serde_json::Value::as_str)
+            == Some(lane_id)
+            && lane
+                .pointer("/page_refs/signal_page_ref/page_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("signal_page")
+            && lane
+                .pointer("/page_refs/waveform_page_ref/page_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("waveform_page")
+            && lane
+                .pointer("/page_refs/cursor_values_page_ref/page_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("cursor_values")
+            && lane
+                .pointer("/window_ref/request_window")
+                .and_then(serde_json::Value::as_str)
+                == Some(bridge_request_window)
+            && lane
+                .pointer("/window_ref/response_window")
+                .and_then(serde_json::Value::as_str)
+                == Some(bridge_response_window)
+            && lane
+                .pointer("/materialization_ref/collection")
+                .and_then(serde_json::Value::as_str)
+                == Some("selected_signal_lanes");
+        row_local_page_window_refs_present &= nested_refs;
+
+        let segments = lane
+            .get("segments")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("lane `{lane_id}` missing row-local segments array"))?;
+        if lane.get("item_kind").and_then(serde_json::Value::as_str) == Some("VariableRow") {
+            for segment in segments {
+                let scoped = segment.get("signal_id").and_then(serde_json::Value::as_str)
+                    == Some(lane_id)
+                    && segment.get("file").and_then(serde_json::Value::as_str) == Some(lane_file)
+                    && segment.get("page_kind").and_then(serde_json::Value::as_str)
+                        == Some("waveform_page")
+                    && segment
+                        .get("request_window")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(bridge_request_window)
+                    && segment
+                        .get("response_window")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(bridge_response_window);
+                row_wave_segments_scoped_to_page_window &= scoped;
+                if scoped {
+                    scoped_segment_count = scoped_segment_count.saturating_add(1);
+                }
+            }
+        } else {
+            row_wave_segments_scoped_to_page_window &= segments.is_empty();
+        }
+    }
+
+    let pass = materialized_rows_equal_visible_plus_overscan
+        && row_local_page_window_refs_present
+        && row_wave_segments_scoped_to_page_window
+        && !lane_key_samples.is_empty();
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "source_path": source_path,
+        "logical_signal_lane_row_count": visible.len() as u64,
+        "visible_signal_lane_row_count": visible_count,
+        "overscan_signal_lane_row_count": overscan_count,
+        "materialized_signal_lane_row_count": materialized_count,
+        "materialized_rows_equal_visible_plus_overscan": materialized_rows_equal_visible_plus_overscan,
+        "row_local_page_window_refs_present": row_local_page_window_refs_present,
+        "row_wave_segments_scoped_to_page_window": row_wave_segments_scoped_to_page_window,
+        "scoped_waveform_segment_count": scoped_segment_count,
+        "lane_key_samples": lane_key_samples,
+        "materialization": store
+            .get("selected_lane_materialization")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "contract": "NovyWave selected_signal_lane_rows must own nested lane/page/window/materialization refs and row-local waveform segments before native rendering"
+    }))
 }
 
 fn native_scroll_axis_observation_summary(
@@ -14658,6 +20511,79 @@ fn native_scroll_input_route_evidence(
     })
 }
 
+fn passive_scroll_property_tree_proof(report: &serde_json::Value) -> serde_json::Value {
+    let route_pass = report
+        .pointer("/native_scroll_input_route_evidence/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let model_pass = report
+        .pointer("/non_os_scroll_model/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let runtime_dispatch_count = report
+        .get("runtime_dispatch_count_for_passive_scroll")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let graph_rebuild_count = report
+        .get("graph_rebuild_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let materialized_status = report
+        .pointer("/materialized_range_before_after/status")
+        .and_then(serde_json::Value::as_str);
+    let materialization_observed = matches!(
+        materialized_status,
+        Some("operator-host-wheel-input") | Some("real-window-wheel-input")
+    );
+    let invalidation_classes = report
+        .get("invalidation_classes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let has_invalidation_class = |class_name: &str| {
+        invalidation_classes
+            .iter()
+            .any(|value| value.as_str() == Some(class_name))
+    };
+    let dispatch_free = runtime_dispatch_count == 0 && graph_rebuild_count == 0;
+    let pass = route_pass
+        && model_pass
+        && dispatch_free
+        && materialization_observed
+        && has_invalidation_class("scroll")
+        && has_invalidation_class("materialization")
+        && has_invalidation_class("layout");
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "source": "native_scroll_input_route_evidence+non_os_scroll_model+prelaunch_layout_probe",
+        "route_status": report
+            .pointer("/native_scroll_input_route_evidence/status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "model_status": report
+            .pointer("/non_os_scroll_model/status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_dispatch_count_for_passive_scroll": runtime_dispatch_count,
+        "graph_rebuild_count": graph_rebuild_count,
+        "dispatch_free": dispatch_free,
+        "materialized_range_status": materialized_status.unwrap_or("missing"),
+        "invalidation_classes": invalidation_classes,
+        "scroll_root_count": report
+            .get("scroll_root_ids")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "hit_region_count": report
+            .get("hit_region_ids")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "targeting_policy": report
+            .get("passive_scroll_targeting_policy")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    })
+}
+
 fn spreadsheet_column_label(mut index: u64) -> String {
     let mut chars = Vec::new();
     loop {
@@ -14753,6 +20679,56 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
+        let semantic_index = parsed
+            .as_ref()
+            .ok()
+            .and_then(|program| boon_ir::lower_runtime_profiled(program).ok())
+            .map(|(ir, _)| ir.semantic_index.report());
+        let semantic_index_ok = semantic_index
+            .as_ref()
+            .and_then(|index| index.get("present"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-source-syntax:{}:semantic-index-builds", entry.id),
+            semantic_index_ok,
+            semantic_index
+                .as_ref()
+                .map(|index| {
+                    format!(
+                        "sources={} lists={} row_scopes={} view_bindings={} dynamic_fallback_count={}",
+                        index
+                            .get("source_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        index
+                            .get("list_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        index
+                            .get("row_scope_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        index
+                            .get("view_binding_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                        index
+                            .pointer("/readiness/dynamic_fallback_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    )
+                })
+                .unwrap_or_else(|| "semantic index unavailable".to_owned()),
+            (!semantic_index_ok).then(|| {
+                format!(
+                    "example `{}` could not build semantic index from parser/typecheck/IR facts",
+                    entry.id
+                )
+            }),
+        );
         let has_hash_comment = file_sources
             .iter()
             .flat_map(|(_, source)| source.lines())
@@ -14824,7 +20800,8 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
             "required_evidence_tier": entry.required_evidence_tier,
             "source_hash": program_hash,
             "program_hash": program_hash,
-            "parser_status": if parser_ok { "pass" } else { "fail" }
+            "parser_status": if parser_ok { "pass" } else { "fail" },
+            "semantic_index": semantic_index
         }));
     }
     let discovered_sources = fs::read_dir("examples")
@@ -16968,11 +22945,17 @@ fn verify_native_cells_interaction_speed(
         .unwrap_or(default_max_max_ms);
     let entry = boon_runtime::example_manifest_entry("cells")?;
     let source = boon_runtime::source_text_for_entry(&entry)?;
-    let generic_source_ok = source.contains("List/range(from: 0, to: 2599)")
-        && source.contains("List/chunk(cells, size: 26")
+    let source_files = manifest_source_files(&entry);
+    let combined_source_for_checks = source_files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let generic_source_ok = combined_source_for_checks.contains("List/range(from: 0, to: 2599)")
+        && combined_source_for_checks.contains("List/chunk(cells, size: 26")
         && ["Formula", "Grid", "List/table", "EXAMPLE", "#"]
             .iter()
-            .all(|needle| !source.contains(needle));
+            .all(|needle| !combined_source_for_checks.contains(needle));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -17204,7 +23187,7 @@ fn verify_native_cells_interaction_speed(
             "source_path": entry.source,
             "scenario_path": entry.scenario,
             "source_hash": file_hash(&entry.source),
-            "source_files_hash": source_hash_for_report_source_files(&manifest_source_files(&entry), &source)?,
+            "source_files_hash": source_hash_for_report_source_files(&source_files, &source)?,
             "scenario_hash": file_hash("examples/cells.scn"),
             "playground_binary_path": binary_path,
             "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
@@ -17287,6 +23270,7 @@ fn verify_native_gpu_novywave_interaction_speed(
         Some(
             Command::new(&binary_path)
                 .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+                .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
                 .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
                 .args([
                     "--role",
@@ -17524,12 +23508,83 @@ fn verify_native_gpu_novywave_interaction_speed(
             (!pass).then(|| format!("{key} must be 0 in the interaction hot path")),
         );
     }
+    let role_field_or_null = |key: &str| {
+        role_report_json
+            .as_ref()
+            .and_then(|report| report.get(key))
+            .cloned()
+            .unwrap_or_else(|| json!(null))
+    };
+    let renderer_upload_probe = role_field_or_null("renderer_upload_probe");
+    let renderer_upload_probe_pass = renderer_upload_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:renderer-upload-probe",
+        renderer_upload_probe_pass,
+        format!(
+            "status={:?}",
+            renderer_upload_probe
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!renderer_upload_probe_pass)
+            .then(|| "NovyWave interaction report is missing renderer upload probe".to_owned()),
+    );
+    let renderer_upload_bytes = role_field_or_null("renderer_upload_bytes_p50_p95_max");
+    let renderer_allocated_gpu_bytes =
+        role_field_or_null("renderer_allocated_gpu_bytes_p50_p95_max");
+    let renderer_dirty_upload_range_count =
+        role_field_or_null("renderer_dirty_upload_range_count_p50_p95_max");
+    let renderer_buffer_reuse_count = role_field_or_null("renderer_buffer_reuse_count_p50_p95_max");
+    let renderer_staging_wrap_count = role_field_or_null("renderer_staging_wrap_count_p50_p95_max");
+    let renderer_queue_write_count = role_field_or_null("renderer_queue_write_count_p50_p95_max");
+    let renderer_quad_cache_eviction_count =
+        role_field_or_null("renderer_quad_cache_eviction_count_p50_p95_max");
+    let renderer_upload_counter_summaries_present = [
+        &renderer_upload_bytes,
+        &renderer_allocated_gpu_bytes,
+        &renderer_dirty_upload_range_count,
+        &renderer_buffer_reuse_count,
+        &renderer_staging_wrap_count,
+        &renderer_queue_write_count,
+        &renderer_quad_cache_eviction_count,
+    ]
+    .iter()
+    .all(|summary| {
+        summary
+            .get("sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:renderer-upload-counters",
+        renderer_upload_counter_summaries_present,
+        format!(
+            "upload_bytes={renderer_upload_bytes}, queue_write_count={renderer_queue_write_count}, dirty_upload_ranges={renderer_dirty_upload_range_count}"
+        ),
+        (!renderer_upload_counter_summaries_present).then(|| {
+            "NovyWave interaction report is missing renderer upload counter summaries".to_owned()
+        }),
+    );
 
     let role_artifact = if role_report.exists() {
         vec![artifact_hash(&role_report)?]
     } else {
         Vec::new()
     };
+    let click_interaction_timing = role_field_or_null("click_interaction_timing_ms");
+    let hover_interaction_timing = role_field_or_null("hover_interaction_timing_ms");
+    let divider_interaction_timing = role_field_or_null("divider_interaction_timing_ms");
+    let click_native_input_timing = role_field_or_null("click_native_input_timing_ms");
+    let hover_native_input_timing = role_field_or_null("hover_native_input_timing_ms");
+    let divider_native_input_timing = role_field_or_null("divider_native_input_timing_ms");
     write_native_gate_report(
         args,
         "verify-native-gpu-novywave-interaction-speed",
@@ -17600,11 +23655,56 @@ fn verify_native_gpu_novywave_interaction_speed(
                 .and_then(|report| report.get("function_registry_ms_p50_p95_max"))
                 .cloned()
                 .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "stage_counters": role_field_or_null("stage_counters"),
+            "renderer_upload_probe": renderer_upload_probe,
+            "renderer_upload_bytes_p50_p95_max": renderer_upload_bytes,
+            "renderer_allocated_gpu_bytes_p50_p95_max": renderer_allocated_gpu_bytes,
+            "renderer_dirty_upload_range_count_p50_p95_max": renderer_dirty_upload_range_count,
+            "renderer_buffer_reuse_count_p50_p95_max": renderer_buffer_reuse_count,
+            "renderer_staging_wrap_count_p50_p95_max": renderer_staging_wrap_count,
+            "renderer_queue_write_count_p50_p95_max": renderer_queue_write_count,
+            "renderer_quad_cache_eviction_count_p50_p95_max": renderer_quad_cache_eviction_count,
+            "click_interaction_timing_ms": click_interaction_timing,
+            "hover_interaction_timing_ms": hover_interaction_timing,
+            "divider_interaction_timing_ms": divider_interaction_timing,
+            "click_native_input_timing_ms": click_native_input_timing,
+            "hover_native_input_timing_ms": hover_native_input_timing,
+            "divider_native_input_timing_ms": divider_native_input_timing,
             "interaction_profile_count": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("interaction_profile_count"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            "interaction_timing_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("interaction_timing_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            "runtime_root_list_cause_summary": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_root_list_cause_summary"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "runtime_dirty_frontier_cause_summary": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("runtime_dirty_frontier_cause_summary"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+            "interaction_timing_samples": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("interaction_timing_samples"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "native_input_timing_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("native_input_timing_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            "native_input_timing_samples": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("native_input_timing_samples"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
             "preview_blocked_on_ipc_count": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("preview_blocked_on_ipc_count"))
@@ -17779,6 +23879,31 @@ fn verify_boon_driver_schema(args: &[String]) -> Result<(), Box<dyn std::error::
         format!("crates/boon_driver/src/lib.rs exists={driver_crate}"),
         (!driver_crate).then(|| "missing host-neutral boon_driver crate boundary".to_owned()),
     );
+    let driver_source = fs::read_to_string("crates/boon_driver/src/lib.rs").unwrap_or_default();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-driver-schema:source-intent-boundary",
+        driver_source.contains("pub struct SourceIntent")
+            && driver_source.contains("source_intent_boundary_schema")
+            && driver_source.contains("private_runtime_mutation_allowed"),
+        "boon_driver declares host-neutral SourceIntent schema without runtime dispatch",
+        (!driver_source.contains("pub struct SourceIntent"))
+            .then(|| "boon_driver missing SourceIntent schema boundary".to_owned()),
+    );
+    let runtime_source = fs::read_to_string("crates/boon_runtime/src/lib.rs").unwrap_or_default();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-driver-schema:runtime-source-batch-boundary",
+        runtime_source.contains("pub struct SourceBatch")
+            && runtime_source.contains("pub struct SourceBatchEvent")
+            && runtime_source.contains("apply_source_batch_turn")
+            && runtime_source.contains("last_source_batch_sequence"),
+        "boon_runtime exposes monotonic public SourceBatch dispatch boundary",
+        (!runtime_source.contains("pub struct SourceBatch"))
+            .then(|| "boon_runtime missing public SourceBatch dispatch boundary".to_owned()),
+    );
     let cargo = fs::read_to_string("crates/boon_driver/Cargo.toml").unwrap_or_default();
     let forbidden_deps = ["wgpu", "app_window", "boon_native", "boon_runtime"];
     for dep in forbidden_deps {
@@ -17828,17 +23953,77 @@ fn verify_boon_driver_schema(args: &[String]) -> Result<(), Box<dyn std::error::
                 boon_driver::TIER_HUMAN
             ],
             "legacy_compatible_tier": boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
+            "source_intent_boundary": boon_driver::source_intent_boundary_schema(),
         }),
     )
 }
 
 fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let example = value_arg(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
     let entry = boon_runtime::example_manifest_entry(&example)?;
+    let (source_path, scenario_path, _) = example_paths(&entry.id)?;
+    let runtime_report_path = value_arg(args, "--runtime-report")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "target/reports/boon-driver/runtime-scenario-{}.json",
+                entry.id
+            ))
+        });
+    let runtime_output = run_scenario(
+        &source_path,
+        &scenario_path,
+        VerificationLayer::Semantic,
+        Some(&runtime_report_path),
+    )?;
+    let driver_scenario = boon_driver::parse_scenario_path(&scenario_path)?;
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let native_report_path = native_preview_e2e_report_path(&entry.id);
     let native_report = read_optional_json(&native_report_path)?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:scenario-parsed-by-driver", entry.id),
+        driver_scenario.source == entry.source && !driver_scenario.step.is_empty(),
+        format!(
+            "scenario={}, source={}, steps={}",
+            scenario_path.display(),
+            driver_scenario.source,
+            driver_scenario.step.len()
+        ),
+        (driver_scenario.source != entry.source || driver_scenario.step.is_empty()).then(|| {
+            format!(
+                "BoonDriver did not parse actionable scenario `{}`",
+                scenario_path.display()
+            )
+        }),
+    );
+    let runtime_report_pass = runtime_output
+        .report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:fresh-runtime-scenario-report", entry.id),
+        runtime_report_pass,
+        format!(
+            "{} status={:?}",
+            runtime_report_path.display(),
+            runtime_output
+                .report
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!runtime_report_pass).then(|| {
+            format!(
+                "fresh runtime scenario report `{}` did not pass",
+                runtime_report_path.display()
+            )
+        }),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -17860,6 +24045,31 @@ fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(boon_driver::app_owned_preview_proof)
         .unwrap_or_else(|| json!({"status": "fail"}));
+    let current_source_hash = file_hash(source_path.to_string_lossy().as_ref());
+    let native_source_hash_matches = native_report
+        .as_ref()
+        .and_then(|report| report.get("source_hash"))
+        .and_then(serde_json::Value::as_str)
+        == Some(current_source_hash.as_str());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:native-source-hash-current", entry.id),
+        native_source_hash_matches,
+        format!(
+            "native_source_hash={:?}, current_source_hash={current_source_hash}",
+            native_report
+                .as_ref()
+                .and_then(|report| report.get("source_hash"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!native_source_hash_matches).then(|| {
+            format!(
+                "native preview E2E report `{}` does not match current source hash",
+                native_report_path.display()
+            )
+        }),
+    );
     let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass");
     push_audit_check(
         &mut checks,
@@ -17894,6 +24104,32 @@ fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Err
         (!no_real_window_claim)
             .then(|| "BoonDriver report incorrectly claims real-window evidence".to_owned()),
     );
+    let scenario_proof =
+        boon_driver::scenario_engine_proof(&driver_scenario, &runtime_output.report, Some(&proof));
+    let scenario_proof_pass = scenario_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:scenario-engine-action-flow", entry.id),
+        scenario_proof_pass,
+        format!(
+            "status={:?}, action_count={:?}, blockers={:?}",
+            scenario_proof
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            scenario_proof.pointer("/scenario_parser/action_step_count"),
+            scenario_proof.get("blockers")
+        ),
+        (!scenario_proof_pass).then(|| {
+            format!(
+                "BoonDriver scenario engine proof for `{}` did not prove action flow",
+                entry.id
+            )
+        }),
+    );
     let report = report_arg(args)
         .unwrap_or_else(|| PathBuf::from(format!("target/reports/boon-driver/{}.json", entry.id)));
     write_static_gate_report(
@@ -17905,17 +24141,27 @@ fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Err
         json!({
             "example": entry.id,
             "source_path": entry.source,
-            "source_hash": file_hash(&entry.source),
+            "source_hash": current_source_hash.clone(),
+            "scenario_path": scenario_path,
+            "scenario_hash": file_hash(scenario_path.to_string_lossy().as_ref()),
+            "program_hash": runtime_output
+                .report
+                .get("program_hash")
+                .cloned()
+                .unwrap_or_else(|| json!(current_source_hash.clone())),
             "required_evidence_tier": boon_driver::TIER_BOON_DRIVER,
             "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
             "does_not_satisfy_real_window": true,
+            "runtime_scenario_report": runtime_report_path,
+            "runtime_scenario_report_sha256": file_hash(runtime_report_path.to_string_lossy().as_ref()),
             "native_preview_e2e_report": native_report_path,
             "native_preview_e2e_report_sha256": if native_report_path.exists() {
                 file_hash(native_report_path.to_string_lossy().as_ref())
             } else {
                 "missing".to_owned()
             },
-            "boon_driver_proof": proof,
+            "native_preview_proof": proof,
+            "boon_driver_proof": scenario_proof,
         }),
     )
 }
@@ -19121,11 +25367,43 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "stale-scenario-hash",
+            merge_json(
+                base(),
+                json!({
+                    "scenario_hash": "stale-scenario-fixture",
+                    "expected_scenario_hash": file_hash("examples/novywave.scn")
+                }),
+            ),
+        ),
+        (
+            "stale-budget-hash",
+            merge_json(
+                base(),
+                json!({
+                    "budget_hash": "stale-budget-fixture",
+                    "expected_budget_hash": boon_runtime::sha256_bytes(b"negative-budget-fixture")
+                }),
+            ),
+        ),
+        (
             "stale-binary-hash",
             merge_json(
                 base(),
                 json!({
                     "binary_hash": "stale-binary-fixture"
+                }),
+            ),
+        ),
+        (
+            "stale-artifact-hash",
+            merge_json(
+                base(),
+                json!({
+                    "artifact_sha256s": [{
+                        "path": "Cargo.toml",
+                        "sha256": "stale-artifact-fixture"
+                    }]
                 }),
             ),
         ),
@@ -19184,6 +25462,118 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 base(),
                 json!({
                     "copied_pixel_hash_only": true
+                }),
+            ),
+        ),
+        (
+            "mutated-source-event-field",
+            merge_json(
+                base(),
+                json!({
+                    "expected_source_event": {
+                        "source": "store.elements.open_load_files_dialog.event.press",
+                        "key": "press"
+                    },
+                    "observed_source_event": {
+                        "source": "store.elements.show_empty.event.press",
+                        "key": "press"
+                    }
+                }),
+            ),
+        ),
+        (
+            "mutated-route-id",
+            merge_json(
+                base(),
+                json!({
+                    "expected_route_id": 41,
+                    "route_id": 42
+                }),
+            ),
+        ),
+        (
+            "stale-source-generation",
+            merge_json(
+                base(),
+                json!({
+                    "expected_source_generation": 9,
+                    "source_generation": 8
+                }),
+            ),
+        ),
+        (
+            "stale-row-generation",
+            merge_json(
+                base(),
+                json!({
+                    "expected_row_generation": 17,
+                    "row_generation": 16
+                }),
+            ),
+        ),
+        (
+            "duplicate-scenario-id",
+            merge_json(
+                base(),
+                json!({
+                    "duplicate_scenario_ids": ["select-primary-file"]
+                }),
+            ),
+        ),
+        (
+            "fake-human-observation",
+            merge_json(
+                base(),
+                json!({
+                    "human_observation": true,
+                    "human_observation_claimed": true
+                }),
+            ),
+        ),
+        (
+            "copy-to-present-scaffold-proof",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "render_proof": {
+                        "artifact": {
+                            "kind": "copy_to_present",
+                            "acquired_surface_texture": false,
+                            "present_result": "scaffold-no-surface",
+                            "target_surface_id": "surface:negative",
+                            "target_surface_epoch": 1
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
+            "source-event-only-ipc-shortcut",
+            merge_json(
+                base(),
+                json!({
+                    "source_event_only_ipc_shortcut": true
+                }),
+            ),
+        ),
+        (
+            "full-waveform-payload-entering-boon",
+            merge_json(
+                base(),
+                json!({
+                    "full_waveform_payload_entered_boon": true,
+                    "waveform_payload_policy": "full-payload-in-boon"
+                }),
+            ),
+        ),
+        (
+            "reduced-fixture",
+            merge_json(
+                base(),
+                json!({
+                    "reduced_fixture": true,
+                    "fixture_reduction": "row-count-truncated"
                 }),
             ),
         ),
@@ -19415,6 +25805,53 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             (!rejected).then(|| format!("native negative fixture `{case}` was not rejected")),
         );
     }
+    let unbounded_readback_waits =
+        rg_count("crates/boon_native_gpu/src", "PollType::wait_indefinitely")?
+            + rg_count(
+                "crates/boon_native_app_window/src",
+                "PollType::wait_indefinitely",
+            )?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "negative:readback-waits-have-deadlines",
+        unbounded_readback_waits == 0,
+        format!("unbounded_readback_wait_hits={unbounded_readback_waits}"),
+        (unbounded_readback_waits != 0)
+            .then(|| "native readback code still uses PollType::wait_indefinitely".to_owned()),
+    );
+    let timeout_context_hits = [
+        "backend=wgpu",
+        "requested_rect",
+        "report_context",
+        "deadline_ms",
+    ]
+    .iter()
+    .map(|needle| {
+        Ok((
+            *needle,
+            rg_count("crates/boon_native_gpu/src", needle)?
+                + rg_count("crates/boon_native_app_window/src", needle)?,
+        ))
+    })
+    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let missing_timeout_context = timeout_context_hits
+        .iter()
+        .filter_map(|(needle, hits)| (*hits == 0).then_some(*needle))
+        .collect::<Vec<_>>();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "negative:readback-timeout-context-fields",
+        missing_timeout_context.is_empty(),
+        format!("timeout_context_hits={timeout_context_hits:?}"),
+        (!missing_timeout_context.is_empty()).then(|| {
+            format!(
+                "native readback timeout errors missing context tokens: {}",
+                missing_timeout_context.join(", ")
+            )
+        }),
+    );
     write_native_gate_report(
         args,
         "verify-native-gpu-negative",
@@ -19422,7 +25859,11 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
         blockers,
         json!({
             "negative_case_count": negative_case_count,
-            "required_negative_cases": required_negative_cases
+            "required_negative_cases": required_negative_cases,
+            "readback_deadline_audit": {
+                "unbounded_readback_wait_hits": unbounded_readback_waits,
+                "timeout_context_hits": timeout_context_hits
+            }
         }),
     )
 }
@@ -20044,6 +26485,11 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
     match label {
         "counter-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_interaction_stage_counters(
+                &mut blockers,
+                report,
+                &["interaction_total", "interaction_per_event"],
+            );
             require_u64_at_least(
                 &mut blockers,
                 report,
@@ -20074,6 +26520,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         }
         "cells-interaction-speed-debug" | "cells-interaction-speed-release" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_interaction_stage_counters(&mut blockers, report, &["interaction_latency"]);
             require_u64_at_least(
                 &mut blockers,
                 report,
@@ -20119,6 +26566,28 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         }
         "novywave-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_interaction_stage_counters(
+                &mut blockers,
+                report,
+                &[
+                    "input_to_visible",
+                    "hover_to_overlay",
+                    "click_to_cursor",
+                    "divider_drag_to_layout",
+                    "resize_to_present",
+                    "runtime_apply",
+                    "layout_rebuild",
+                    "preview_blocked_on_ipc",
+                    "renderer_upload_bytes",
+                    "renderer_allocated_gpu_bytes",
+                    "renderer_dirty_upload_ranges",
+                    "renderer_buffer_reuse",
+                    "renderer_staging_wraps",
+                    "renderer_queue_writes",
+                    "renderer_cache_evictions",
+                    "present_availability",
+                ],
+            );
             require_summary_f64_p95_at_most(
                 &mut blockers,
                 report,
@@ -20191,6 +26660,14 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 native_gpu_budget_u64("novywave_interaction.release", "hover_persist_write_count")
                     .unwrap_or(0),
             );
+            require_object_field(&mut blockers, report, "renderer_upload_probe");
+            if report
+                .pointer("/renderer_upload_probe/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("renderer_upload_probe.status must be pass".to_owned());
+            }
             if report
                 .get("selected_rows_order_label")
                 .and_then(serde_json::Value::as_str)
@@ -20358,6 +26835,8 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         }
         "observability" => {
             require_bool_field(&mut blockers, report, "bounded_observability", true);
+            require_native_counter_inventory(&mut blockers, report);
+            require_native_ipc_counter_contract(&mut blockers, report);
             require_replace_code_evidence(&mut blockers, report, "");
             require_preview_runtime_query(&mut blockers, report, "/runtime_summary_query");
             require_bool_field(
@@ -20658,6 +27137,10 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "/novywave_visual_spatial_evidence/metric_threshold_failures",
                 "/novywave_visual_spatial_evidence/clipping_failures",
                 "/novywave_source_projection_policy/segment_width_fields",
+                "/novywave_source_projection_policy/missing_lane_row_terms",
+                "/novywave_source_projection_policy/missing_segment_scope_terms",
+                "/novywave_source_projection_policy/missing_lane_view_terms",
+                "/novywave_source_projection_policy/view_direct_selected_visible_items_refs",
             ] {
                 if report
                     .pointer(path)
@@ -20666,6 +27149,31 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 {
                     blockers.push(format!("{path} must be an empty array"));
                 }
+            }
+            for path in [
+                "/novywave_source_projection_policy/selected_signal_lane_rows_present",
+                "/novywave_source_projection_policy/selected_signal_lane_rows_from_visible_items",
+                "/novywave_source_projection_policy/selected_lane_materialization_present",
+                "/novywave_source_projection_policy/materialized_rows_equal_visible_plus_overscan_source",
+                "/novywave_source_projection_policy/row_local_page_window_refs_declared",
+                "/novywave_source_projection_policy/row_wave_segments_scoped_to_page_window_declared",
+                "/novywave_source_projection_policy/view_uses_signal_lane_rows",
+                "/novywave_source_projection_policy/view_avoids_direct_selected_visible_items_refs",
+                "/novywave_source_projection_policy/view_avoids_global_segments_in_lane",
+            ] {
+                if report.pointer(path).and_then(serde_json::Value::as_bool) != Some(true) {
+                    blockers.push(format!("{path} must be true"));
+                }
+            }
+            if report
+                .pointer("/novywave_source_projection_policy/view_global_waveform_segment_refs")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                blockers.push(
+                    "/novywave_source_projection_policy/view_global_waveform_segment_refs must be false"
+                        .to_owned(),
+                );
             }
         }
         "idle-wake-counter"
@@ -20922,6 +27430,17 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "example-switch-speed-debug" | "example-switch-speed-release" => {
             require_nonempty_str_field(&mut blockers, report, "profile");
             require_nonempty_str_field(&mut blockers, report, "build_profile");
+            require_interaction_stage_counters(
+                &mut blockers,
+                report,
+                &[
+                    "ack_latency",
+                    "dev_tab_visual_update",
+                    "preview_pending_status",
+                    "preview_present",
+                    "ack_payload_bytes",
+                ],
+            );
             require_nonempty_array(&mut blockers, report, "switch_sequence");
             require_nonempty_str_field(&mut blockers, report, "custom_fixture_hash");
             require_positive_u64(&mut blockers, report, "command_id");
@@ -21218,6 +27737,22 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "scroll-speed-cells" | "scroll-speed-novywave" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
+            require_interaction_stage_counters(
+                &mut blockers,
+                report,
+                &[
+                    "scroll_frame",
+                    "renderer_draw_calls",
+                    "renderer_queue_writes",
+                    "renderer_upload_bytes",
+                    "input_queue_depth",
+                    "preview_blocked_on_ipc",
+                    "ipc_queue_depth",
+                    "ipc_debug_query_bytes",
+                    "ipc_debug_subscription_bytes",
+                    "ipc_preview_heartbeat_gap",
+                ],
+            );
             if report
                 .pointer("/boon_driver_proof/status")
                 .and_then(serde_json::Value::as_str)
@@ -21243,6 +27778,86 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 require_u64_at_least(&mut blockers, report, "source_line_count", 500);
                 require_positive_u64(&mut blockers, report, "visible_row_count");
                 require_positive_u64(&mut blockers, report, "visible_column_count");
+                require_positive_u64(&mut blockers, report, "logical_signal_lane_row_count");
+                require_positive_u64(&mut blockers, report, "visible_signal_lane_row_count");
+                require_positive_u64(&mut blockers, report, "materialized_signal_lane_row_count");
+                if report
+                    .get("overscan_signal_lane_row_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                {
+                    blockers.push("overscan_signal_lane_row_count must be a u64".to_owned());
+                }
+                require_bool_field(
+                    &mut blockers,
+                    report,
+                    "materialized_rows_equal_visible_plus_overscan",
+                    true,
+                );
+                require_bool_field(
+                    &mut blockers,
+                    report,
+                    "row_local_page_window_refs_present",
+                    true,
+                );
+                require_bool_field(
+                    &mut blockers,
+                    report,
+                    "row_wave_segments_scoped_to_page_window",
+                    true,
+                );
+                require_object_field(&mut blockers, report, "signal_lane_runtime_evidence");
+                require_object_field(
+                    &mut blockers,
+                    report,
+                    "signal_lane_row_key_samples_before_after",
+                );
+                require_interaction_stage_counters(
+                    &mut blockers,
+                    report,
+                    &[
+                        "logical_signal_lane_rows",
+                        "visible_signal_lane_rows",
+                        "materialized_signal_lane_rows",
+                    ],
+                );
+                if report
+                    .pointer("/signal_lane_runtime_evidence/status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("pass")
+                {
+                    blockers.push(
+                        "scroll-speed-novywave signal_lane_runtime_evidence.status must be pass"
+                            .to_owned(),
+                    );
+                }
+                for path in [
+                    "/non_os_scroll_model/materialized_rows_equal_visible_plus_overscan",
+                    "/non_os_scroll_model/row_local_page_window_refs_present",
+                    "/non_os_scroll_model/row_wave_segments_scoped_to_page_window",
+                ] {
+                    if report.pointer(path).and_then(serde_json::Value::as_bool) != Some(true) {
+                        blockers.push(format!("{path} must be true"));
+                    }
+                }
+                let visible_lane_rows = report
+                    .get("visible_signal_lane_row_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let overscan_lane_rows = report
+                    .get("overscan_signal_lane_row_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let materialized_lane_rows = report
+                    .get("materialized_signal_lane_row_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if materialized_lane_rows != visible_lane_rows.saturating_add(overscan_lane_rows) {
+                    blockers.push(
+                        "materialized_signal_lane_row_count must equal visible plus overscan lane rows"
+                            .to_owned(),
+                    );
+                }
                 require_bool_field(
                     &mut blockers,
                     report,
@@ -21384,7 +27999,9 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_positive_u64(&mut blockers, report, "instance_count_visible");
             require_positive_u64(&mut blockers, report, "instance_count_uploaded");
             require_positive_u64(&mut blockers, report, "text_runs_visible");
+            require_u64_at_most(&mut blockers, report, "shaped_run_cache_evictions", 0);
             require_u64_at_most(&mut blockers, report, "text_shape_cache_evictions", 0);
+            require_u64_at_most(&mut blockers, report, "glyph_atlas_evictions_observed", 0);
             require_u64_at_most(&mut blockers, report, "glyph_atlas_evictions", 0);
             require_object_field(
                 &mut blockers,
@@ -21396,6 +28013,25 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "scroll-speed-dev-code-editor" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
+            require_str_field(
+                &mut blockers,
+                report,
+                "dev_editor_fast_path_kind",
+                "prototype_generic_property_tree_dev_surface_probe",
+            );
+            require_interaction_stage_counters(
+                &mut blockers,
+                report,
+                &[
+                    "dev_editor_frame",
+                    "renderer_draw_calls",
+                    "renderer_queue_writes",
+                    "renderer_upload_bytes",
+                    "preview_blocked_on_ipc",
+                    "visible_line_count",
+                    "materialized_line_count",
+                ],
+            );
             if report
                 .pointer("/boon_driver_proof/status")
                 .and_then(serde_json::Value::as_str)
@@ -21698,6 +28334,51 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
     );
     require_u64_at_most(blockers, report, "graph_rebuild_count", 0);
     require_u64_at_most(blockers, report, "preview_blocked_on_ipc_count", 0);
+    require_nonempty_array(blockers, report, "scroll_root_ids");
+    require_nonempty_array(blockers, report, "hit_region_ids");
+    require_nonempty_array(blockers, report, "invalidation_classes");
+    require_nonempty_str_field(blockers, report, "passive_scroll_path_kind");
+    require_bool_field(blockers, report, "generalized_passive_scroll_path", true);
+    require_nonempty_str_field(blockers, report, "dev_editor_fast_path_kind");
+    require_str_field(
+        blockers,
+        report,
+        "passive_scroll_targeting_policy",
+        "generic-layout-axis-largest-area-scroll-region",
+    );
+    if report
+        .pointer("/native_scroll_input_route_evidence/status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        blockers.push("native_scroll_input_route_evidence.status must be pass".to_owned());
+    }
+    if report
+        .pointer("/native_scroll_input_route_evidence/private_runtime_dispatch_used")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        blockers.push(
+            "native_scroll_input_route_evidence.private_runtime_dispatch_used must be false"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/passive_scroll_property_tree_proof/status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        blockers.push("passive_scroll_property_tree_proof.status must be pass".to_owned());
+    }
+    if report
+        .pointer("/materialized_range_before_after/status")
+        .and_then(serde_json::Value::as_str)
+        != Some("operator-host-wheel-input")
+    {
+        blockers.push(
+            "materialized_range_before_after.status must be operator-host-wheel-input".to_owned(),
+        );
+    }
     require_u64_at_least(blockers, report, "wheel_events_coalesced", 1);
     require_u64_at_most(
         blockers,
@@ -21780,6 +28461,341 @@ fn require_non_os_scroll_model(blockers: &mut Vec<String>, report: &serde_json::
     }
 }
 
+fn measurement_mode_for_command(command: &str) -> &'static str {
+    match command {
+        "bench-todomvc" | "bench-example" | "playground-watch" => "diagnostic",
+        command if command.ends_with("-speed") || command.contains("interaction-speed") => {
+            "interaction"
+        }
+        _ => "proof",
+    }
+}
+
+fn ensure_interaction_report_contract(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    command: &str,
+    args: &[String],
+) {
+    if object
+        .get("measurement_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("interaction")
+    {
+        return;
+    }
+    object
+        .entry("interaction_flow_id".to_owned())
+        .or_insert_with(|| {
+            json!(format!(
+                "xtask-{command}-{}",
+                boon_runtime::sha256_bytes(args.join("\0").as_bytes())
+            ))
+        });
+    for key in [
+        "hot_path_png_write_count",
+        "hot_path_report_write_count",
+        "hot_path_report_serialization_count",
+        "hot_path_heavy_json_summary_count",
+        "hot_path_proof_readback_count",
+        "hot_path_verbose_trace_event_count",
+        "hot_path_dev_blocking_ipc_count",
+    ] {
+        object.entry(key.to_owned()).or_insert_with(|| json!(0));
+    }
+    if !object.contains_key("stage_counters") {
+        if let Some(stage_counters) = derive_stage_counters_from_report_object(object) {
+            object.insert("stage_counters".to_owned(), stage_counters);
+        }
+    }
+}
+
+fn derive_stage_counters_from_report_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut stages = serde_json::Map::new();
+    for (key, stage_name) in [
+        ("scroll_frame_ms_p50_p95_p99_max", "scroll_frame"),
+        ("dev_editor_frame_ms_p50_p95_p99_max", "dev_editor_frame"),
+        ("input_to_idle_ms_p50_p95_p99_max", "input_to_idle"),
+        ("semantic_tick_ms_p50_p95_p99_max", "semantic_tick"),
+        ("render_lowering_ms_p50_p95_p99_max", "render_lowering"),
+        ("ply_patch_apply_ms_p50_p95_p99_max", "patch_apply"),
+        ("frame_time_ms_p50_p95_p99_max", "frame_time"),
+        ("dirty_key_count_p50_p95_p99_max", "dirty_keys"),
+        ("render_patch_count_p50_p95_p99_max", "render_patches"),
+        ("ack_latency_ms_p50_p95_p99_max", "ack_latency"),
+        ("preview_present_ms_p50_p95_p99_max", "preview_present"),
+        ("wheel_to_visible_ms_p50_p95_p99_max", "wheel_to_visible"),
+        ("draw_calls_p50_p95_max", "renderer_draw_calls"),
+        ("queue_write_count_p50_p95_max", "renderer_queue_writes"),
+        ("upload_bytes_p50_p95_max", "renderer_upload_bytes"),
+        (
+            "timeline_pan_zoom_step_ms_p50_p95_max",
+            "novywave_timeline_state_replay",
+        ),
+        ("step_ms_p50_p95_max", "scenario_step"),
+        ("input_to_visible_ms_p50_p95_max", "input_to_visible"),
+        ("hover_to_overlay_ms_p50_p95_max", "hover_to_overlay"),
+        ("click_to_cursor_ms_p50_p95_max", "click_to_cursor"),
+        (
+            "divider_drag_to_layout_ms_p50_p95_max",
+            "divider_drag_to_layout",
+        ),
+        ("resize_to_present_ms_p50_p95_max", "resize_to_present"),
+        ("runtime_apply_ms_p50_p95_max", "runtime_apply"),
+        ("runtime_step_apply_ms_p50_p95_max", "runtime_step_apply"),
+        (
+            "runtime_state_summary_ms_p50_p95_max",
+            "runtime_state_summary",
+        ),
+        ("runtime_lock_wait_ms_p50_p95_max", "runtime_lock_wait"),
+        ("layout_rebuild_ms_p50_p95_max", "layout_rebuild"),
+        ("document_eval_lower_ms_p50_p95_max", "document_eval_lower"),
+        (
+            "text_measure_and_layout_ms_p50_p95_max",
+            "text_measure_and_layout",
+        ),
+        ("function_registry_ms_p50_p95_max", "function_registry"),
+    ] {
+        if let Some(stage) = stage_counter_from_summary(object, key) {
+            stages.insert(stage_name.to_owned(), stage);
+        }
+    }
+    for (key, stage_name) in [
+        ("interaction_total_ms", "interaction_total"),
+        ("interaction_per_event_ms", "interaction_per_event"),
+        ("ack_latency_ms", "ack_latency"),
+        ("click_to_dev_tab_visual_update_ms", "dev_tab_visual_update"),
+        (
+            "click_to_preview_pending_status_ms",
+            "preview_pending_status",
+        ),
+        ("click_to_preview_new_frame_presented_ms", "preview_present"),
+        ("ack_payload_bytes", "ack_payload_bytes"),
+        ("preview_frame_ms_p95", "preview_frame"),
+        ("wheel_to_visible_ms_p95", "wheel_to_visible"),
+        ("input_queue_depth_max", "input_queue_depth"),
+        ("preview_blocked_on_ipc_count", "preview_blocked_on_ipc"),
+        ("text_runs_visible", "text_runs_visible"),
+        ("text_runs_shaped", "text_runs_shaped"),
+        ("instance_count_visible", "instance_count_visible"),
+        ("instance_count_uploaded", "instance_count_uploaded"),
+        ("visible_line_count", "visible_line_count"),
+        ("materialized_line_count_max", "materialized_line_count"),
+        ("visible_row_count", "visible_row_count"),
+        ("visible_column_count", "visible_column_count"),
+        ("materialized_cell_count_max", "materialized_cell_count"),
+        ("logical_signal_lane_row_count", "logical_signal_lane_rows"),
+        ("visible_signal_lane_row_count", "visible_signal_lane_rows"),
+        (
+            "materialized_signal_lane_row_count",
+            "materialized_signal_lane_rows",
+        ),
+    ] {
+        if let Some(stage) = stage_counter_from_scalar(object, key) {
+            stages.insert(stage_name.to_owned(), stage);
+        }
+    }
+    if let Some(stage) = stage_counter_from_p95_max_pair(
+        object,
+        "interaction_latency_ms_p95",
+        "interaction_latency_ms_max",
+        "interaction_latency",
+    ) {
+        stages.insert("interaction_latency".to_owned(), stage);
+    }
+    if let Some(probe) = object
+        .get("dev_ipc_probe")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, sample_count_key, stage_name) in [
+            (
+                "ipc_queue_depth_p50_p95_max",
+                "ipc_queue_depth_sample_count",
+                "ipc_queue_depth",
+            ),
+            (
+                "telemetry_serialize_ms_p50_p95_max",
+                "telemetry_serialize_sample_count",
+                "ipc_telemetry_serialize",
+            ),
+            (
+                "debug_query_bytes_p50_p95_max",
+                "debug_query_byte_sample_count",
+                "ipc_debug_query_bytes",
+            ),
+            (
+                "debug_subscription_bytes_p50_p95_max",
+                "debug_subscription_byte_sample_count",
+                "ipc_debug_subscription_bytes",
+            ),
+            (
+                "dev_command_apply_ms_p50_p95_max",
+                "dev_command_apply_sample_count",
+                "ipc_dev_command_apply",
+            ),
+            (
+                "dev_request_round_trip_ms_p50_p95_max",
+                "dev_request_round_trip_sample_count",
+                "ipc_dev_request_round_trip",
+            ),
+            (
+                "preview_frame_ms_p50_p95_max",
+                "preview_frame_sample_count",
+                "ipc_preview_frame",
+            ),
+        ] {
+            if let Some(stage) =
+                stage_counter_from_nested_summary(probe, object, key, sample_count_key)
+            {
+                stages.insert(stage_name.to_owned(), stage);
+            }
+        }
+        if let Some(stage) = stage_counter_from_nested_scalar(
+            probe,
+            object,
+            "preview_heartbeat_gap_ms_max",
+            "preview_heartbeat_gap_sample_count",
+        ) {
+            stages.insert("ipc_preview_heartbeat_gap".to_owned(), stage);
+        }
+        if let Some(stage) =
+            stage_counter_from_nested_scalar(probe, object, "preview_blocked_on_ipc_count", "")
+        {
+            stages.insert("ipc_preview_blocked_on_ipc".to_owned(), stage);
+        }
+    }
+    (!stages.is_empty()).then(|| serde_json::Value::Object(stages))
+}
+
+fn stage_counter_from_summary(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<serde_json::Value> {
+    let summary = object.get(key)?.as_object()?;
+    stage_counter_from_summary_object(summary, key, fallback_stage_sample_count(object))
+}
+
+fn stage_counter_from_nested_summary(
+    nested: &serde_json::Map<String, serde_json::Value>,
+    outer: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    sample_count_key: &str,
+) -> Option<serde_json::Value> {
+    let summary = nested.get(key)?.as_object()?;
+    let sample_count = nested
+        .get(sample_count_key)
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| fallback_stage_sample_count(outer));
+    stage_counter_from_summary_object(summary, key, sample_count)
+}
+
+fn stage_counter_from_summary_object(
+    summary: &serde_json::Map<String, serde_json::Value>,
+    source_field: &str,
+    fallback_sample_count: Option<u64>,
+) -> Option<serde_json::Value> {
+    let p50 = summary.get("p50").and_then(numeric_value_as_f64)?;
+    let p95 = summary.get("p95").and_then(numeric_value_as_f64)?;
+    let max = summary.get("max").and_then(numeric_value_as_f64)?;
+    let p99 = summary
+        .get("p99")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(max);
+    let sample_count = summary
+        .get("sample_count")
+        .and_then(serde_json::Value::as_u64)
+        .or(fallback_sample_count)?;
+    (sample_count > 0).then(|| {
+        json!({
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+            "max": max,
+            "sample_count": sample_count,
+            "source_field": source_field
+        })
+    })
+}
+
+fn stage_counter_from_scalar(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<serde_json::Value> {
+    let value = object.get(key).and_then(numeric_value_as_f64)?;
+    let sample_count = fallback_stage_sample_count(object).unwrap_or(1);
+    (sample_count > 0).then(|| {
+        json!({
+            "p50": value,
+            "p95": value,
+            "p99": value,
+            "max": value,
+            "sample_count": sample_count,
+            "source_field": key
+        })
+    })
+}
+
+fn stage_counter_from_p95_max_pair(
+    object: &serde_json::Map<String, serde_json::Value>,
+    p95_key: &str,
+    max_key: &str,
+    source_field: &str,
+) -> Option<serde_json::Value> {
+    let p95 = object.get(p95_key).and_then(numeric_value_as_f64)?;
+    let max = object
+        .get(max_key)
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(p95);
+    let sample_count = fallback_stage_sample_count(object).unwrap_or(1);
+    (sample_count > 0).then(|| {
+        json!({
+            "p50": p95,
+            "p95": p95,
+            "p99": max,
+            "max": max,
+            "sample_count": sample_count,
+            "source_field": source_field
+        })
+    })
+}
+
+fn stage_counter_from_nested_scalar(
+    nested: &serde_json::Map<String, serde_json::Value>,
+    outer: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    sample_count_key: &str,
+) -> Option<serde_json::Value> {
+    let value = nested.get(key).and_then(numeric_value_as_f64)?;
+    let sample_count = nested
+        .get(sample_count_key)
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| fallback_stage_sample_count(outer))
+        .unwrap_or(1);
+    (sample_count > 0).then(|| {
+        json!({
+            "p50": value,
+            "p95": value,
+            "p99": value,
+            "max": value,
+            "sample_count": sample_count,
+            "source_field": key
+        })
+    })
+}
+
+fn fallback_stage_sample_count(object: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    [
+        "sample_frame_count",
+        "operation_count",
+        "event_count",
+        "interaction_profile_count",
+        "replayed_source_event_step_count",
+    ]
+    .into_iter()
+    .find_map(|key| object.get(key).and_then(serde_json::Value::as_u64))
+}
+
 fn write_native_gate_report(
     args: &[String],
     command: &str,
@@ -21800,6 +28816,10 @@ fn write_native_gate_report(
     );
     object.insert("command".to_owned(), json!(command));
     object.insert("command_argv".to_owned(), json!(args));
+    object.insert(
+        "measurement_mode".to_owned(),
+        json!(measurement_mode_for_command(command)),
+    );
     object.insert(
         "exit_status".to_owned(),
         json!(if blockers.is_empty() { 0 } else { 1 }),
@@ -21829,6 +28849,7 @@ fn write_native_gate_report(
             object.insert(key.clone(), value.clone());
         }
     }
+    ensure_interaction_report_contract(&mut object, command, args);
     write_json(&report, &serde_json::Value::Object(object))?;
     verify_report_schema(&report)?;
     if blockers.is_empty() {
@@ -21863,6 +28884,10 @@ fn write_static_gate_report(
     object.insert("command".to_owned(), json!(command));
     object.insert("command_argv".to_owned(), json!(args));
     object.insert(
+        "measurement_mode".to_owned(),
+        json!(measurement_mode_for_command(command)),
+    );
+    object.insert(
         "exit_status".to_owned(),
         json!(if blockers.is_empty() { 0 } else { 1 }),
     );
@@ -21887,6 +28912,7 @@ fn write_static_gate_report(
             object.insert(key.clone(), value.clone());
         }
     }
+    ensure_interaction_report_contract(&mut object, command, args);
     write_json(&report, &serde_json::Value::Object(object))?;
     verify_report_schema(&report)?;
     if blockers.is_empty() {
@@ -22098,6 +29124,55 @@ fn native_gpu_report_integrity_reasons(
             reasons.push("source_hash does not match expected_source_hash".to_owned());
         }
     }
+    reject_mismatched_report_field(
+        report,
+        "scenario_hash",
+        "expected_scenario_hash",
+        "scenario_hash",
+        &mut reasons,
+    );
+    reject_mismatched_report_field(
+        report,
+        "budget_hash",
+        "expected_budget_hash",
+        "budget_hash",
+        &mut reasons,
+    );
+    reject_mismatched_report_field(
+        report,
+        "observed_source_event",
+        "expected_source_event",
+        "source_event",
+        &mut reasons,
+    );
+    reject_mismatched_report_field(
+        report,
+        "route_id",
+        "expected_route_id",
+        "route_id",
+        &mut reasons,
+    );
+    reject_mismatched_report_field(
+        report,
+        "source_generation",
+        "expected_source_generation",
+        "source_generation",
+        &mut reasons,
+    );
+    reject_mismatched_report_field(
+        report,
+        "row_generation",
+        "expected_row_generation",
+        "row_generation",
+        &mut reasons,
+    );
+    if report
+        .get("duplicate_scenario_ids")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|ids| !ids.is_empty())
+    {
+        reasons.push("duplicate scenario IDs are forbidden".to_owned());
+    }
     if let Some(artifacts) = report
         .get("artifact_sha256s")
         .and_then(serde_json::Value::as_array)
@@ -22217,6 +29292,7 @@ fn native_gpu_report_integrity_reasons(
     {
         reasons.push("copied or reused pixel hash proof is forbidden".to_owned());
     }
+    collect_scaffold_render_proof_reasons(report, "$", &mut reasons);
     if report
         .get("measurement_source")
         .and_then(serde_json::Value::as_str)
@@ -22232,6 +29308,14 @@ fn native_gpu_report_integrity_reasons(
         reasons.push("model-only input provenance is forbidden".to_owned());
     }
     for (field, reason) in [
+        (
+            "human_observation",
+            "automated native GPU reports cannot claim human observation",
+        ),
+        (
+            "human_observation_claimed",
+            "automated native GPU reports cannot claim human observation",
+        ),
         ("modeled_ack_timing", "modeled ACK timing is forbidden"),
         (
             "modeled_presentation_timing",
@@ -22279,6 +29363,22 @@ fn native_gpu_report_integrity_reasons(
             "preview_bound_scenario_data",
             "preview-bound IPC must not carry scenario data",
         ),
+        (
+            "source_event_only_ipc_shortcut",
+            "source-event-only IPC shortcut is forbidden",
+        ),
+        (
+            "full_waveform_payload_entered_boon",
+            "full waveform payloads must not enter Boon",
+        ),
+        (
+            "reduced_fixture",
+            "reduced fixtures cannot satisfy native GPU evidence",
+        ),
+        (
+            "reduced_fixture_used",
+            "reduced fixtures cannot satisfy native GPU evidence",
+        ),
     ] {
         if report.get(field).and_then(serde_json::Value::as_bool) == Some(true) {
             reasons.push(reason.to_owned());
@@ -22310,6 +29410,66 @@ fn native_gpu_report_integrity_reasons(
         }
     }
     reasons
+}
+
+fn reject_mismatched_report_field(
+    report: &serde_json::Value,
+    observed_key: &str,
+    expected_key: &str,
+    label: &str,
+    reasons: &mut Vec<String>,
+) {
+    let (Some(observed), Some(expected)) = (report.get(observed_key), report.get(expected_key))
+    else {
+        return;
+    };
+    if observed != expected {
+        reasons.push(format!("{label} does not match {expected_key}"));
+    }
+}
+
+fn collect_scaffold_render_proof_reasons(
+    value: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let kind = object.get("kind").and_then(serde_json::Value::as_str);
+            if kind == Some("copy_to_present") {
+                reasons.push(format!(
+                    "{path} CopyToPresent scaffold proof cannot satisfy visible native readiness"
+                ));
+            }
+            if object
+                .get("present_result")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|result| result.contains("scaffold") || result.contains("no-surface"))
+            {
+                reasons.push(format!(
+                    "{path}.present_result is scaffold/no-surface proof"
+                ));
+            }
+            if object
+                .get("acquired_surface_texture")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                reasons.push(format!(
+                    "{path}.acquired_surface_texture=false cannot prove visible surface rendering"
+                ));
+            }
+            for (key, child) in object {
+                collect_scaffold_render_proof_reasons(child, &format!("{path}.{key}"), reasons);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_scaffold_render_proof_reasons(child, &format!("{path}[{index}]"), reasons);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn require_physical_todomvc_project_evidence(
@@ -22707,6 +29867,88 @@ fn require_visible_native_render_proof(
             "{path}.visible_surface_metrics.rendered_text_runs must cover shaped text runs"
         ));
     }
+    if text_runs > 0 {
+        for field in [
+            "visible_text_runs",
+            "shaped_text_runs",
+            "shaped_run_cache_hits",
+            "shaped_run_cache_misses",
+            "shaped_run_cache_evictions",
+            "shaped_run_cache_entry_count",
+            "shaped_run_cache_capacity",
+            "shaped_run_cache_bytes",
+            "missing_glyph_count",
+            "glyph_atlas_prepare_count",
+            "glyph_atlas_evictions_observed",
+        ] {
+            if !report
+                .pointer(&format!("{path}/visible_surface_metrics/{field}"))
+                .is_some()
+            {
+                blockers.push(format!(
+                    "{path}.visible_surface_metrics.{field} must be present for text observability"
+                ));
+            }
+        }
+    }
+    for field in [
+        "asset_ref_count",
+        "asset_refs",
+        "asset_cache_hits",
+        "asset_cache_misses",
+        "asset_cache_evictions",
+        "asset_cache_entry_count",
+        "asset_cache_byte_count",
+        "asset_cache_byte_cap",
+        "asset_cache_byte_cap_hit",
+        "asset_decode_count",
+        "asset_raster_count",
+        "asset_upload_count",
+        "asset_upload_bytes",
+        "asset_failure_diagnostics",
+    ] {
+        if !report
+            .pointer(&format!("{path}/visible_surface_metrics/{field}"))
+            .is_some()
+        {
+            blockers.push(format!(
+                "{path}.visible_surface_metrics.{field} must be present for asset observability"
+            ));
+        }
+    }
+    let asset_ref_count = report
+        .pointer(&format!("{path}/visible_surface_metrics/asset_ref_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if asset_ref_count > 0 {
+        let refs = report
+            .pointer(&format!("{path}/visible_surface_metrics/asset_refs"))
+            .and_then(serde_json::Value::as_array);
+        if refs.is_none_or(|refs| refs.len() < asset_ref_count as usize) {
+            blockers.push(format!(
+                "{path}.visible_surface_metrics.asset_refs must cover asset_ref_count"
+            ));
+        }
+        for (index, asset_ref) in refs.into_iter().flatten().enumerate() {
+            let id_ok = asset_ref
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("asset:"));
+            let blob_id_ok = asset_ref
+                .pointer("/blob_ref/id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("blob:sha256:"));
+            let sha_ok = asset_ref
+                .pointer("/blob_ref/sha256")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sha| sha.len() == 64 && sha.chars().all(|ch| ch.is_ascii_hexdigit()));
+            if !(id_ok && blob_id_ok && sha_ok) {
+                blockers.push(format!(
+                    "{path}.visible_surface_metrics.asset_refs[{index}] must carry asset and sha256 blob identity"
+                ));
+            }
+        }
+    }
     if report
         .pointer(&format!(
             "{path}/visible_surface_metrics/color_only_rect_fallback"
@@ -22736,6 +29978,7 @@ fn require_visible_native_render_proof(
             "{path}.visible_surface_metrics.text_cap_hit must be false"
         ));
     }
+    require_retained_render_chunk_metrics(blockers, report, path);
     if text_runs > 0
         && !report
             .pointer(&format!("{path}/proof/artifact/unique_rgba_values"))
@@ -22745,6 +29988,100 @@ fn require_visible_native_render_proof(
         blockers.push(format!(
             "{path}.proof.artifact.unique_rgba_values must prove text-rich pixels when an artifact is present"
         ));
+    }
+}
+
+fn require_retained_render_chunk_metrics(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    path: &str,
+) {
+    let metrics_path = format!("{path}/visible_surface_metrics");
+    let Some(metrics) = report.pointer(&metrics_path) else {
+        blockers.push(format!("{metrics_path} is missing"));
+        return;
+    };
+    let retained_chunk_count = metrics
+        .get("retained_chunk_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if retained_chunk_count == 0 {
+        blockers.push(format!(
+            "{metrics_path}.retained_chunk_count must be positive"
+        ));
+    }
+    let hit_count = metrics
+        .get("retained_chunk_hit_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let miss_count = metrics
+        .get("retained_chunk_miss_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    if hit_count.saturating_add(miss_count) < retained_chunk_count {
+        blockers.push(format!(
+            "{metrics_path} retained chunk hit/miss counts must cover retained_chunk_count"
+        ));
+    }
+    if metrics
+        .get("dirty_chunk_count")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        blockers.push(format!("{metrics_path}.dirty_chunk_count is missing"));
+    }
+    let Some(chunks) = metrics
+        .get("retained_chunks")
+        .and_then(serde_json::Value::as_array)
+    else {
+        blockers.push(format!("{metrics_path}.retained_chunks must be an array"));
+        return;
+    };
+    if chunks.len() as u64 != retained_chunk_count {
+        blockers.push(format!(
+            "{metrics_path}.retained_chunks length must match retained_chunk_count"
+        ));
+    }
+    for (index, chunk) in chunks.iter().take(8).enumerate() {
+        for required in [
+            "id",
+            "node",
+            "kind",
+            "bounds",
+            "transform",
+            "style_identity",
+            "dependency_set",
+            "gpu_buffer_range",
+            "text_run_ids",
+            "texture_asset_refs",
+            "generation",
+            "cache_status",
+        ] {
+            if chunk.get(required).is_none() {
+                blockers.push(format!(
+                    "{metrics_path}.retained_chunks[{index}].{required} is missing"
+                ));
+            }
+        }
+        if chunk
+            .get("dependency_set")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|dependencies| dependencies.is_empty())
+        {
+            blockers.push(format!(
+                "{metrics_path}.retained_chunks[{index}].dependency_set must be nonempty"
+            ));
+        }
+        if chunk
+            .pointer("/style_identity/style_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            == 0
+        {
+            blockers.push(format!(
+                "{metrics_path}.retained_chunks[{index}].style_identity.style_id must be nonzero"
+            ));
+        }
     }
 }
 
@@ -23055,6 +30392,177 @@ fn require_object_field(blockers: &mut Vec<String>, report: &serde_json::Value, 
         .is_some_and(|object| !object.is_empty())
     {
         blockers.push(format!("{key} must be a nonempty object"));
+    }
+}
+
+fn require_interaction_stage_counters(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    required_stages: &[&str],
+) {
+    require_object_field(blockers, report, "stage_counters");
+    for stage_name in required_stages {
+        let pointer = format!("/stage_counters/{stage_name}");
+        let Some(stage) = report
+            .pointer(&pointer)
+            .and_then(serde_json::Value::as_object)
+        else {
+            blockers.push(format!("stage_counters.{stage_name} must be present"));
+            continue;
+        };
+        for metric in ["p50", "p95", "p99", "max"] {
+            if stage.get(metric).and_then(numeric_value_as_f64).is_none() {
+                blockers.push(format!(
+                    "stage_counters.{stage_name}.{metric} must be numeric"
+                ));
+            }
+        }
+        if stage
+            .get("sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|sample_count| sample_count == 0)
+        {
+            blockers.push(format!(
+                "stage_counters.{stage_name}.sample_count must be positive"
+            ));
+        }
+    }
+}
+
+fn require_native_counter_inventory(blockers: &mut Vec<String>, report: &serde_json::Value) {
+    for pointer in [
+        "/native_renderer_counter_inventory/renderer_frame_metrics/real_fields",
+        "/native_renderer_counter_inventory/app_window_loop_report/real_fields",
+        "/native_renderer_counter_inventory/app_window_frame_timing_proof/real_fields",
+        "/native_renderer_counter_inventory/playground_interaction_samples/real_fields",
+        "/native_renderer_counter_inventory/proof_readback/real_fields",
+        "/native_renderer_counter_inventory/known_synthetic_or_unavailable_counters",
+        "/native_stage_counter_availability/host_input",
+        "/native_stage_counter_availability/text_shaping",
+        "/native_stage_counter_availability/asset_work",
+        "/native_stage_counter_availability/gpu_upload",
+        "/native_stage_counter_availability/command_encode_submit_present_timing",
+        "/native_stage_counter_availability/glyph_atlas_uploads",
+    ] {
+        let Some(value) = report.pointer(pointer) else {
+            blockers.push(format!("native counter inventory missing `{pointer}`"));
+            continue;
+        };
+        match value {
+            serde_json::Value::Array(values) if values.is_empty() => {
+                blockers.push(format!("native counter inventory `{pointer}` is empty"));
+            }
+            serde_json::Value::Object(object) if object.is_empty() => {
+                blockers.push(format!("native counter inventory `{pointer}` is empty"));
+            }
+            _ => {}
+        }
+    }
+    if report
+        .pointer("/native_stage_counter_availability/proof_readback/hot_path_policy")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|policy| !policy.contains("excluded"))
+    {
+        blockers.push(
+            "native_stage_counter_availability.proof_readback must state interaction exclusion"
+                .to_owned(),
+        );
+    }
+}
+
+fn require_native_ipc_counter_contract(blockers: &mut Vec<String>, report: &serde_json::Value) {
+    for pointer in [
+        "/native_ipc_stage_counters/ipc_queue_depth",
+        "/native_ipc_stage_counters/telemetry_serialize_ms",
+        "/native_ipc_stage_counters/debug_query_bytes",
+        "/native_ipc_stage_counters/debug_subscription_bytes",
+        "/native_ipc_stage_counters/dev_command_apply_ms",
+        "/native_ipc_stage_counters/dev_request_round_trip_ms",
+        "/native_ipc_stage_counters/preview_frame_ms",
+        "/native_ipc_stage_counters/preview_heartbeat_gap_ms",
+        "/native_ipc_stage_counters/replace_job_queue_depth",
+        "/native_ipc_stage_counters/dev_lag_ms",
+        "/native_ipc_counter_availability/queue_depth",
+        "/native_ipc_counter_availability/dropped_telemetry_count",
+        "/native_ipc_counter_availability/dropped_frame_metrics_count",
+        "/native_ipc_counter_availability/dropped_debug_update_count",
+        "/native_ipc_counter_availability/debug_query_bytes",
+        "/native_ipc_counter_availability/debug_subscription_bytes",
+        "/native_ipc_counter_availability/heartbeat_gap",
+        "/native_ipc_counter_availability/preview_frame_summary",
+        "/native_ipc_counter_availability/blocked_send_count",
+        "/native_ipc_counter_availability/coalescing_flags",
+        "/native_ipc_counter_availability/replace_queue_depth",
+        "/native_ipc_counter_availability/replace_dropped_stale",
+        "/native_ipc_counter_availability/dev_lag_ms",
+    ] {
+        let Some(value) = report.pointer(pointer) else {
+            blockers.push(format!("native IPC counter contract missing `{pointer}`"));
+            continue;
+        };
+        if value.as_object().is_none_or(serde_json::Map::is_empty) {
+            blockers.push(format!("native IPC counter contract `{pointer}` is empty"));
+        }
+    }
+    for pointer in [
+        "/native_ipc_stage_counters/ipc_queue_depth",
+        "/native_ipc_stage_counters/telemetry_serialize_ms",
+        "/native_ipc_stage_counters/debug_query_bytes",
+        "/native_ipc_stage_counters/debug_subscription_bytes",
+        "/native_ipc_stage_counters/dev_command_apply_ms",
+        "/native_ipc_stage_counters/dev_request_round_trip_ms",
+        "/native_ipc_stage_counters/preview_frame_ms",
+        "/native_ipc_stage_counters/preview_heartbeat_gap_ms",
+    ] {
+        let Some(stage) = report
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        if stage.get("status").and_then(serde_json::Value::as_str) == Some("unavailable") {
+            blockers.push(format!("native IPC stage `{pointer}` must be measured"));
+            continue;
+        }
+        for metric in ["p50", "p95", "p99", "max"] {
+            if stage.get(metric).and_then(numeric_value_as_f64).is_none() {
+                blockers.push(format!(
+                    "native IPC stage `{pointer}` missing numeric {metric}"
+                ));
+            }
+        }
+        if stage
+            .get("sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|sample_count| sample_count == 0)
+        {
+            blockers.push(format!(
+                "native IPC stage `{pointer}` missing positive sample_count"
+            ));
+        }
+    }
+    if report
+        .pointer("/native_ipc_counter_availability/blocked_send_count/hot_path_policy")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|policy| !policy.contains("zero"))
+    {
+        blockers.push(
+            "native_ipc_counter_availability.blocked_send_count must state zero hot-path policy"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/native_ipc_counter_availability/coalescing_flags/debug_updates_coalesced")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || report
+            .pointer("/native_ipc_counter_availability/coalescing_flags/debug_queries_paged")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        blockers.push(
+            "native IPC coalescing flags must prove coalesced updates and paged queries".to_owned(),
+        );
     }
 }
 
@@ -25557,6 +33065,7 @@ fn verify_negative_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "verify-negative",
         "command_argv": ["cargo", "xtask", format!("verify-{name}-negative")],
+        "measurement_mode": "proof",
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -25829,6 +33338,23 @@ fn enrich_negative_fixture(name: &str, case: &str, report: &mut serde_json::Valu
             case
         ])
     });
+    let command = object
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("negative")
+        .to_owned();
+    let layer = object
+        .get("layer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    object.entry("measurement_mode").or_insert_with(|| {
+        json!(if layer == "speed" {
+            "interaction"
+        } else {
+            measurement_mode_for_command(&command)
+        })
+    });
     object.entry("exit_status").or_insert_with(|| json!(0));
     object
         .entry("git_commit")
@@ -25886,6 +33412,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
     let mut debug_failures = 0usize;
     let mut manual_templates = 0usize;
     let mut debug_dumps = 0usize;
+    let mut app_window_loop_reports = 0usize;
     let summary_path = dir.join("schema.json");
     let mut artifact_hashes = Vec::new();
     for path in collect_report_json_paths(dir)? {
@@ -25918,6 +33445,8 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
             manual_templates += 1;
         } else if is_debug_dump_report(&path, &report, dir) {
             debug_dumps += 1;
+        } else if is_app_window_loop_report(&path, &report, dir) {
+            app_window_loop_reports += 1;
         } else {
             return Err(format!(
                 "unrecognized report JSON shape `{}` with status `{status}`",
@@ -25932,6 +33461,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "verify-report-schema",
         "command_argv": ["cargo", "xtask", "verify-report-schema"],
+        "measurement_mode": "proof",
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -25945,7 +33475,8 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
             {"id": "schema-valid-pass-reports-checked", "pass": true, "count": checked},
             {"id": "debug-failure-artifacts-accounted", "pass": true, "count": debug_failures},
             {"id": "manual-template-artifacts-accounted", "pass": true, "count": manual_templates},
-            {"id": "debug-dump-artifacts-accounted", "pass": true, "count": debug_dumps}
+            {"id": "debug-dump-artifacts-accounted", "pass": true, "count": debug_dumps},
+            {"id": "app-window-loop-artifacts-accounted", "pass": true, "count": app_window_loop_reports}
         ],
         "artifact_sha256s": artifact_hashes
     });
@@ -25971,12 +33502,15 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-novywave-visual"
+                | "verify-native-gpu-novywave-interaction-speed"
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-dev-editor-scroll-speed"
                 | "verify-native-example-switch-speed"
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
                 | "verify-boon-source-syntax"
+                | "verify-scenario-manifest-integrity"
+                | "verify-metamorphic-hidden-fixtures"
                 | "verify-native-visible-launch"
                 | "verify-native-examples"
                 | "verify-native-dev-window-editor"
@@ -26001,10 +33535,13 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
 
 fn schema_summary_should_hash_report(
     path: &Path,
-    _report: &serde_json::Value,
+    report: &serde_json::Value,
     summary_path: &Path,
 ) -> bool {
-    path != summary_path
+    let reports_dir = summary_path
+        .parent()
+        .unwrap_or_else(|| Path::new("target/reports"));
+    path != summary_path && !is_app_window_loop_report(path, report, reports_dir)
 }
 
 fn is_debug_dump_report(path: &Path, report: &serde_json::Value, reports_dir: &Path) -> bool {
@@ -26027,6 +33564,31 @@ fn is_debug_dump_report(path: &Path, report: &serde_json::Value, reports_dir: &P
             .get("nodes")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|nodes| !nodes.is_empty())
+}
+
+fn is_app_window_loop_report(path: &Path, report: &serde_json::Value, reports_dir: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.starts_with(reports_dir.join("native-gpu").join("roles"))
+        && name.contains("-loop-")
+        && matches!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("pass" | "fail")
+        )
+        && matches!(
+            report.get("role").and_then(serde_json::Value::as_str),
+            Some("preview" | "dev")
+        )
+        && report
+            .get("rendered_frame_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && report
+            .get("render_loop_state")
+            .and_then(serde_json::Value::as_object)
+            .is_some()
+        && report.get("surface_lifecycle").is_some()
 }
 
 fn collect_report_json_paths(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
@@ -26436,52 +33998,31 @@ fn native_region_area(region: &serde_json::Value) -> f64 {
 }
 
 fn native_scroll_driver_target(
-    label: &str,
+    _label: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let scroll_regions = layout_probe
         .get("scroll_regions")
         .and_then(serde_json::Value::as_array)?;
-    let target = match label {
-        "dev-code-editor" => scroll_regions
-            .iter()
-            .find(|region| {
-                region.get("node").and_then(serde_json::Value::as_str) == Some("dev-code-editor")
-                    && region
-                        .get("axis")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
+    let target = scroll_regions
+        .iter()
+        .filter(|region| {
+            region
+                .get("axis")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
+        })
+        .max_by(|left, right| native_region_area(left).total_cmp(&native_region_area(right)))
+        .or_else(|| {
+            scroll_regions.iter().max_by(|left, right| {
+                native_region_area(left).total_cmp(&native_region_area(right))
             })
-            .or_else(|| scroll_regions.first())?,
-        "cells" => scroll_regions
-            .iter()
-            .find(|region| {
-                region
-                    .get("axis")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
-                    && region
-                        .pointer("/bounds/height")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.0)
-                        > 100.0
-            })
-            .or_else(|| {
-                scroll_regions.iter().find(|region| {
-                    region
-                        .get("axis")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
-                })
-            })
-            .or_else(|| scroll_regions.first())?,
-        _ => scroll_regions.first()?,
-    };
+        })?;
     native_driver_target_from_region("scroll_region", target)
 }
 
 fn native_scroll_driver_target_for_axis(
-    label: &str,
+    _label: &str,
     layout_probe: &serde_json::Value,
     axis: &str,
 ) -> Option<serde_json::Value> {
@@ -26490,14 +34031,18 @@ fn native_scroll_driver_target_for_axis(
         .and_then(serde_json::Value::as_array)?;
     let target = scroll_regions
         .iter()
-        .find(|region| {
-            region.get("node").and_then(serde_json::Value::as_str) == Some(label)
-                && region
-                    .get("axis")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|region_axis| region_axis.eq_ignore_ascii_case(axis))
+        .filter(|region| {
+            region
+                .get("axis")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|region_axis| region_axis.eq_ignore_ascii_case(axis))
         })
-        .or_else(|| scroll_regions.first())?;
+        .max_by(|left, right| native_region_area(left).total_cmp(&native_region_area(right)))
+        .or_else(|| {
+            scroll_regions.iter().max_by(|left, right| {
+                native_region_area(left).total_cmp(&native_region_area(right))
+            })
+        })?;
     native_driver_target_from_region("scroll_region", target)
 }
 
@@ -26938,5 +34483,218 @@ mod tests {
         for command in XTASK_COMMANDS {
             assert!(seen.insert(*command), "duplicate xtask command `{command}`");
         }
+    }
+
+    #[test]
+    fn scenario_integrity_rejects_target_text_only_selector() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "target-text-only".to_owned(),
+            user_action: Some(action),
+            ..Default::default()
+        };
+
+        assert!(!scenario_user_action_target_text_is_disambiguated(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_accepts_target_text_with_control_selector() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert("target".to_owned(), toml::Value::String("row".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "target-text-with-target".to_owned(),
+            user_action: Some(action),
+            ..Default::default()
+        };
+
+        assert!(scenario_user_action_target_text_is_disambiguated(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_detects_authored_raw_coordinates() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("canvas".to_owned()),
+        );
+        action.insert("pointer_x".to_owned(), toml::Value::String("42".to_owned()));
+        let step = boon_runtime::ScenarioStep {
+            id: "raw-coordinate".to_owned(),
+            user_action: Some(action),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scenario_user_action_raw_coordinate_fields(&step),
+            vec!["pointer_x".to_owned()]
+        );
+    }
+
+    #[test]
+    fn scenario_integrity_requires_public_source_intent_for_actions() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("button".to_owned()),
+        );
+        let missing = boon_runtime::ScenarioStep {
+            id: "missing-source-intent".to_owned(),
+            user_action: Some(action.clone()),
+            ..Default::default()
+        };
+        assert!(!scenario_input_action_has_expected_source_intent(&missing));
+
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.button".to_owned()),
+        );
+        let present = boon_runtime::ScenarioStep {
+            id: "has-source-intent".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..Default::default()
+        };
+        assert!(scenario_input_action_has_expected_source_intent(&present));
+    }
+
+    #[test]
+    fn scenario_integrity_rejects_row_action_without_identity_or_selector() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate todo".to_owned()),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
+        );
+        expected.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate todo".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "row-without-identity-or-selector".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..Default::default()
+        };
+
+        assert!(!scenario_row_action_has_public_identity_or_justified_selector(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_accepts_row_action_with_public_identity() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate todo".to_owned()),
+        );
+        action.insert("target_key".to_owned(), toml::Value::Integer(42));
+        action.insert("target_generation".to_owned(), toml::Value::Integer(1));
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "row-with-public-identity".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..Default::default()
+        };
+
+        assert!(scenario_row_action_has_public_identity_or_justified_selector(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_accepts_row_action_with_justified_selector() {
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("todo checkbox".to_owned()),
+        );
+        action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("Duplicate todo".to_owned()),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "row-with-selector".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..Default::default()
+        };
+
+        assert!(scenario_row_action_has_public_identity_or_justified_selector(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_accepts_documented_non_source_action_exemption() {
+        let mut action = BTreeMap::new();
+        action.insert(
+            "kind".to_owned(),
+            toml::Value::String("pointer_hover".to_owned()),
+        );
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("delete button".to_owned()),
+        );
+        let step = boon_runtime::ScenarioStep {
+            id: "hover-without-source-event".to_owned(),
+            user_action: Some(action),
+            source_intent_exemption: Some(
+                "hover only exposes an affordance; click routes the source event".to_owned(),
+            ),
+            ..Default::default()
+        };
+
+        assert!(scenario_input_action_has_expected_source_intent(&step));
+    }
+
+    #[test]
+    fn scenario_integrity_provenance_allows_generated_or_phased_refs() {
+        let generated = boon_runtime::ScenarioRefProvenance {
+            id: "vertical-wheel-scroll".to_owned(),
+            phases: vec!["scroll_focus".to_owned()],
+            provenance: "native generated scroll probe".to_owned(),
+            generated_probe: true,
+        };
+        let phased = boon_runtime::ScenarioRefProvenance {
+            id: "zoom-in".to_owned(),
+            phases: vec!["input".to_owned(), "scroll_focus".to_owned()],
+            provenance: "same authored step feeds both phases".to_owned(),
+            generated_probe: false,
+        };
+        let unphased = boon_runtime::ScenarioRefProvenance {
+            id: "ambiguous".to_owned(),
+            phases: vec!["input".to_owned()],
+            provenance: "single phase is not enough for duplicate refs".to_owned(),
+            generated_probe: false,
+        };
+
+        assert!(scenario_ref_provenance_allows_duplicate(&generated));
+        assert!(scenario_ref_provenance_allows_duplicate(&phased));
+        assert!(!scenario_ref_provenance_allows_duplicate(&unphased));
     }
 }

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use wgpu::SurfaceTargetUnsafe;
 
 const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -256,6 +257,12 @@ pub struct NativeRenderLoopState {
     pub rendered_frame_count: u64,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
+    pub idle_wait_count: u64,
+    pub idle_wait_total_ms: u64,
+    pub last_idle_wait_timeout_ms: u64,
+    pub last_idle_wait_actual_ms: u64,
+    pub last_idle_wait_wake_reason: Option<String>,
+    pub loop_exit_reason: Option<String>,
     pub forced_frame_count: u64,
     pub scheduled_wake_count: u64,
     pub last_scheduler_reason: Option<NativeSchedulerReason>,
@@ -276,6 +283,12 @@ impl NativeRenderLoopState {
             rendered_frame_count: 0,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
+            idle_wait_count: 0,
+            idle_wait_total_ms: 0,
+            last_idle_wait_timeout_ms: 0,
+            last_idle_wait_actual_ms: 0,
+            last_idle_wait_wake_reason: None,
+            loop_exit_reason: None,
             forced_frame_count: 0,
             scheduled_wake_count: 0,
             last_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
@@ -335,6 +348,31 @@ impl NativeRenderLoopState {
 
     pub fn note_input_poll(&mut self) {
         self.input_poll_count = self.input_poll_count.saturating_add(1);
+    }
+
+    pub fn note_idle_wait(
+        &mut self,
+        timeout: Duration,
+        actual: Duration,
+        observed_generation: u64,
+        completed_generation: u64,
+    ) {
+        self.idle_wait_count = self.idle_wait_count.saturating_add(1);
+        let actual_ms = actual.as_millis() as u64;
+        self.idle_wait_total_ms = self.idle_wait_total_ms.saturating_add(actual_ms);
+        self.last_idle_wait_timeout_ms = timeout.as_millis() as u64;
+        self.last_idle_wait_actual_ms = actual_ms;
+        self.last_idle_wait_wake_reason = Some(if timeout.is_zero() {
+            "zero_timeout".to_owned()
+        } else if completed_generation != observed_generation {
+            "external_wake".to_owned()
+        } else {
+            "timeout".to_owned()
+        });
+    }
+
+    pub fn note_loop_exit(&mut self, reason: impl Into<String>) {
+        self.loop_exit_reason = Some(reason.into());
     }
 
     pub fn schedule_wake_after(&mut self, now: Instant, delay: Duration) -> Instant {
@@ -738,12 +776,16 @@ pub struct AppWindowReadbackArtifact {
     pub texture_format: String,
     pub nonblank_samples: usize,
     pub unique_rgba_values: usize,
+    pub readback_deadline_ms: u64,
+    pub readback_poll_status: String,
 }
 
 struct PendingSurfaceReadback {
     buffer: wgpu::Buffer,
     role: NativeWindowRole,
     title: String,
+    surface_id: SurfaceId,
+    surface_epoch: u64,
     width: u32,
     height: u32,
     unpadded_bytes_per_row: u32,
@@ -785,16 +827,29 @@ pub type NativeRenderHook = Box<
 
 pub type NativePollHook =
     Box<dyn FnMut(NativePollContext) -> Result<NativePollResult, String> + Send>;
+pub type NativeExitHook = Box<dyn FnMut() -> Option<String> + Send>;
 
 pub struct NativeWindowHooks {
     pub poll: Option<NativePollHook>,
+    pub should_exit: Option<NativeExitHook>,
     pub render: NativeRenderHook,
 }
 
 impl NativeWindowHooks {
     pub fn from_render_hook(render: NativeRenderHook) -> Self {
-        Self { poll: None, render }
+        Self {
+            poll: None,
+            should_exit: None,
+            render,
+        }
     }
+}
+
+fn native_window_exit_reason(hooks: &mut Option<NativeWindowHooks>) -> Option<String> {
+    hooks
+        .as_mut()
+        .and_then(|hooks| hooks.should_exit.as_mut())
+        .and_then(|should_exit| should_exit())
 }
 
 fn poll_native_window_hooks(
@@ -830,7 +885,7 @@ impl std::fmt::Display for NativeWindowError {
 
 impl std::error::Error for NativeWindowError {}
 
-pub fn run_visible_surface_probe<F>(options: NativeWindowOptions, on_ready: F) -> !
+pub fn run_visible_surface_probe<F>(options: NativeWindowOptions, on_ready: F)
 where
     F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
 {
@@ -841,8 +896,7 @@ pub fn run_visible_surface_probe_with_render_hook<F>(
     options: NativeWindowOptions,
     render_hook: Option<NativeRenderHook>,
     on_ready: F,
-) -> !
-where
+) where
     F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
 {
     run_visible_surface_probe_with_render_hook_and_wake(
@@ -858,8 +912,7 @@ pub fn run_visible_surface_probe_with_render_hook_and_wake<F>(
     render_hook: Option<NativeRenderHook>,
     wake_handle: NativeWakeHandle,
     on_ready: F,
-) -> !
-where
+) where
     F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
 {
     let hooks = render_hook.map(NativeWindowHooks::from_render_hook);
@@ -871,8 +924,7 @@ pub fn run_visible_surface_probe_with_hooks_and_wake<F>(
     hooks: Option<NativeWindowHooks>,
     wake_handle: NativeWakeHandle,
     on_ready: F,
-) -> !
-where
+) where
     F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
 {
     let main_thread_id = thread_id_string();
@@ -905,9 +957,8 @@ where
         }
         let _ = callback_done_sender.send(());
         let _ = render_done_receiver.recv();
-        std::process::exit(0);
+        app_window::application::stop();
     });
-    std::process::exit(0);
 }
 
 async fn run_surface_probe_async(
@@ -1192,6 +1243,8 @@ async fn run_surface_probe_inner(
                 height,
                 config.format,
                 &options.title,
+                surface_id.clone(),
+                surface_lifecycle.epoch(),
             )?);
         }
         queue.submit(Some(encoder.finish()));
@@ -1403,6 +1456,8 @@ async fn run_surface_probe_inner(
                     height,
                     config.format,
                     &options.title,
+                    surface_id.clone(),
+                    surface_lifecycle.epoch(),
                 )?);
             }
             queue.submit(Some(encoder.finish()));
@@ -1508,6 +1563,11 @@ async fn run_surface_probe_inner(
     let mut last_interactive_readback_artifact: Option<AppWindowReadbackArtifact> = None;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
+            render_loop_state.note_loop_exit("hold_timeout_elapsed");
+            break;
+        }
+        if let Some(reason) = native_window_exit_reason(&mut hooks) {
+            render_loop_state.note_loop_exit(reason);
             break;
         }
         let (current_size, current_scale) = app_surface.size_scale().await;
@@ -1516,10 +1576,17 @@ async fn run_surface_probe_inner(
         if raw_width <= 0.0 || raw_height <= 0.0 {
             surface_lifecycle.note_zero_size_skip();
             render_loop_state.note_idle_poll();
-            let _ = wake_handle.wait_for_wake_after(
+            let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
+            let wait_started = Instant::now();
+            let completed_generation =
+                wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
+            render_loop_state.note_idle_wait(
+                idle_timeout,
+                wait_started.elapsed(),
                 last_wake_generation,
-                render_loop_state.idle_wait_timeout(Instant::now()),
+                completed_generation,
             );
+            last_wake_generation = completed_generation;
             continue;
         }
         let current_width = raw_width as u32;
@@ -1581,7 +1648,16 @@ async fn run_surface_probe_inner(
         if !render_loop_state.should_render(Instant::now(), false) {
             render_loop_state.note_idle_poll();
             let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
-            let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
+            let wait_started = Instant::now();
+            let completed_generation =
+                wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
+            render_loop_state.note_idle_wait(
+                idle_timeout,
+                wait_started.elapsed(),
+                last_wake_generation,
+                completed_generation,
+            );
+            last_wake_generation = completed_generation;
             continue;
         }
         if hooks.as_ref().is_none_or(|hooks| hooks.poll.is_none()) {
@@ -1692,6 +1768,8 @@ async fn run_surface_probe_inner(
                         height.min(260),
                         config.format,
                         &options.title,
+                        surface_id.clone(),
+                        surface_lifecycle.epoch(),
                     )?,
                 ))
             } else {
@@ -1750,11 +1828,9 @@ async fn run_surface_probe_inner(
                 )?;
             }
         }
-        let frame_sleep_ms = match loop_mode {
-            NativeRenderLoopMode::ContinuousProbe => 16,
-            NativeRenderLoopMode::DemandDriven => 5,
-        };
-        std::thread::sleep(Duration::from_millis(frame_sleep_ms));
+        if loop_mode == NativeRenderLoopMode::ContinuousProbe {
+            std::thread::sleep(Duration::from_millis(16));
+        }
     }
     if let Some(report) = options.render_loop_state_report.as_deref() {
         write_render_loop_state_report(
@@ -1782,7 +1858,7 @@ async fn run_surface_probe_inner(
     drop(surface);
     drop(app_surface);
     drop(window);
-    std::process::exit(0);
+    Ok(())
 }
 
 fn queue_visible_surface_readback(
@@ -1794,6 +1870,8 @@ fn queue_visible_surface_readback(
     height: u32,
     format: wgpu::TextureFormat,
     title: &str,
+    surface_id: SurfaceId,
+    surface_epoch: u64,
 ) -> Result<PendingSurfaceReadback, NativeWindowError> {
     let width = width.clamp(1, 1920);
     let height = height.clamp(1, 1080);
@@ -1831,6 +1909,8 @@ fn queue_visible_surface_readback(
         buffer,
         role,
         title: title.to_owned(),
+        surface_id,
+        surface_epoch,
         width,
         height,
         unpadded_bytes_per_row,
@@ -1995,6 +2075,12 @@ fn write_render_loop_state_report(
         "skipped_idle_poll_count": state.skipped_idle_poll_count,
         "input_poll_count": state.input_poll_count,
         "input_polls_per_second": input_polls_per_second,
+        "idle_wait_count": state.idle_wait_count,
+        "idle_wait_total_ms": state.idle_wait_total_ms,
+        "last_idle_wait_timeout_ms": state.last_idle_wait_timeout_ms,
+        "last_idle_wait_actual_ms": state.last_idle_wait_actual_ms,
+        "last_idle_wait_wake_reason": state.last_idle_wait_wake_reason,
+        "loop_exit_reason": state.loop_exit_reason,
         "forced_frame_count": state.forced_frame_count,
         "renders_per_second": renders_per_second,
         "scheduled_wake_count": state.scheduled_wake_count,
@@ -2039,12 +2125,33 @@ fn finish_visible_surface_readback(
         let _ = sender.send(result);
     });
     device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|error| NativeWindowError::Failed(format!("readback poll: {error}")))?;
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(VISIBLE_SURFACE_READBACK_TIMEOUT),
+        })
+        .map_err(|error| {
+            NativeWindowError::Failed(visible_readback_failure_message(
+                "poll",
+                &pending,
+                &error.to_string(),
+            ))
+        })?;
     receiver
-        .recv()
-        .map_err(|error| NativeWindowError::Failed(format!("readback map callback: {error}")))?
-        .map_err(|error| NativeWindowError::Failed(format!("readback map: {error}")))?;
+        .recv_timeout(VISIBLE_SURFACE_READBACK_TIMEOUT)
+        .map_err(|error| {
+            NativeWindowError::Failed(visible_readback_failure_message(
+                "callback",
+                &pending,
+                &error.to_string(),
+            ))
+        })?
+        .map_err(|error| {
+            NativeWindowError::Failed(visible_readback_failure_message(
+                "map",
+                &pending,
+                &error.to_string(),
+            ))
+        })?;
 
     let mapped = slice.get_mapped_range();
     let mut pixels = Vec::with_capacity((pending.width * pending.height * 4) as usize);
@@ -2104,7 +2211,26 @@ fn finish_visible_surface_readback(
         texture_format: format!("{:?}", pending.format),
         nonblank_samples,
         unique_rgba_values,
+        readback_deadline_ms: VISIBLE_SURFACE_READBACK_TIMEOUT.as_millis() as u64,
+        readback_poll_status: "completed_before_deadline".to_owned(),
     })
+}
+
+fn visible_readback_failure_message(
+    phase: &str,
+    pending: &PendingSurfaceReadback,
+    reason: &str,
+) -> String {
+    format!(
+        "visible surface readback {phase} failed before deadline: backend=wgpu adapter=unavailable frame_id={} surface={} epoch={} requested_rect=0,0,{},{} submission=latest; report_context=app_window_visible_surface_readback role={} deadline_ms={} reason={reason}",
+        stable_debug_hash(&pending.title),
+        pending.surface_id.0,
+        pending.surface_epoch,
+        pending.width,
+        pending.height,
+        pending.role.as_str(),
+        VISIBLE_SURFACE_READBACK_TIMEOUT.as_millis(),
+    )
 }
 
 fn align_to(value: u32, alignment: u32) -> u32 {
@@ -2632,6 +2758,26 @@ mod tests {
 
         state.schedule_wake_after(now, Duration::from_millis(30));
         assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn demand_driven_idle_wait_reports_timeout_and_wake_reason() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+
+        state.note_idle_wait(Duration::from_millis(30), Duration::from_millis(12), 4, 4);
+        assert_eq!(state.idle_wait_count, 1);
+        assert_eq!(state.idle_wait_total_ms, 12);
+        assert_eq!(state.last_idle_wait_timeout_ms, 30);
+        assert_eq!(state.last_idle_wait_actual_ms, 12);
+        assert_eq!(state.last_idle_wait_wake_reason.as_deref(), Some("timeout"));
+
+        state.note_idle_wait(Duration::from_millis(100), Duration::from_millis(3), 4, 5);
+        assert_eq!(state.idle_wait_count, 2);
+        assert_eq!(state.idle_wait_total_ms, 15);
+        assert_eq!(
+            state.last_idle_wait_wake_reason.as_deref(),
+            Some("external_wake")
+        );
     }
 
     #[test]

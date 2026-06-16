@@ -1,6 +1,12 @@
 use boon_document::{
     DisplayItem, DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap,
-    StyleValue,
+    StyleRichTextSpan, StyleValue,
+    render_scene::{
+        RenderAssetRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
+        RenderScene as DocumentRenderScene, RenderTextAlign, RenderTextColumnMeasurer,
+        RenderTextRun, RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
+        RenderVisualPrimitiveKind,
+    },
 };
 use boon_host::SurfaceId;
 use glyphon::{
@@ -11,9 +17,12 @@ use glyphon::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
 
 pub mod generated {
     pub mod shader_bindings;
@@ -33,7 +42,9 @@ const EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 const EDITOR_FONT_FEATURES: &str = "zero,calt";
 const DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
 const DOCUMENT_MONOSPACE_FONT_FAMILY: &str = "Liberation Mono";
-const MAX_CACHED_QUAD_BATCHES: usize = 64;
+const MAX_CACHED_QUAD_BATCHES: usize = 4096;
+const MAX_CACHED_ASSET_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;
+const APP_OWNED_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -67,6 +78,8 @@ pub enum RenderProofArtifact {
         height: u32,
         nonblank_samples: usize,
         unique_rgba_values: usize,
+        readback_deadline_ms: u64,
+        readback_poll_status: String,
     },
     CopyToPresent {
         source_texture_hash: String,
@@ -86,17 +99,108 @@ pub struct FrameMetrics {
     pub frame_seq: u64,
     pub draw_calls: u32,
     pub upload_bytes: u64,
+    pub allocated_gpu_bytes: u64,
+    pub dirty_upload_range_count: u32,
+    pub dirty_upload_ranges: Vec<GpuUploadRangeMetric>,
+    pub dirty_upload_chunk_count: u32,
+    pub dirty_upload_chunk_ids: Vec<String>,
+    pub buffer_reuse_count: u32,
+    pub staging_wrap_count: u32,
+    pub queue_write_count: u32,
+    pub quad_cache_eviction_count: u32,
     pub quad_cache_hit: bool,
     pub quad_cache_entry_count: u32,
     pub visible_display_item_count: u32,
     pub rendered_rect_count: u32,
     pub rect_cap_hit: bool,
+    pub visible_text_runs: u32,
+    pub shaped_text_runs: u32,
     pub text_runs_shaped: u32,
     pub rendered_text_runs: u32,
+    pub shaped_run_cache_hits: u32,
+    pub shaped_run_cache_misses: u32,
+    pub shaped_run_cache_evictions: u32,
+    pub shaped_run_cache_entry_count: u32,
+    pub shaped_run_cache_capacity: u32,
+    pub shaped_run_cache_bytes: u64,
+    pub missing_glyph_count: u32,
+    pub glyph_atlas_prepare_count: u32,
+    pub glyph_atlas_evictions_observed: u32,
     pub text_cap_hit: bool,
     pub glyphon_text_area_count: u32,
     pub color_only_rect_fallback: bool,
     pub preview_blocked_on_ipc_count: u64,
+    pub asset_ref_count: u32,
+    pub asset_refs: Vec<AssetRef>,
+    pub asset_cache_hits: u32,
+    pub asset_cache_misses: u32,
+    pub asset_cache_evictions: u32,
+    pub asset_cache_entry_count: u32,
+    pub asset_cache_byte_count: u64,
+    pub asset_cache_byte_cap: u64,
+    pub asset_cache_byte_cap_hit: bool,
+    pub asset_decode_count: u32,
+    pub asset_raster_count: u32,
+    pub asset_upload_count: u32,
+    pub asset_upload_bytes: u64,
+    pub asset_failure_diagnostics: Vec<String>,
+    pub retained_chunk_count: u32,
+    pub retained_chunk_hit_count: u32,
+    pub retained_chunk_miss_count: u32,
+    pub retained_chunk_reuse_count: u32,
+    pub dirty_chunk_count: u32,
+    pub retained_chunks: Vec<RetainedRenderChunkMetric>,
+}
+
+pub type AssetRef = RenderAssetRef;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuUploadRangeMetric {
+    pub offset: u64,
+    pub size: u64,
+    pub ring_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_chunk_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RetainedRenderChunkMetric {
+    pub id: String,
+    pub node: DocumentNodeId,
+    pub kind: String,
+    pub bounds: Rect,
+    pub clip: Option<Rect>,
+    pub transform: [f32; 6],
+    pub style_identity: boon_document::ComputedStyleIdentity,
+    pub dependency_set: Vec<String>,
+    pub gpu_buffer_range: std::ops::Range<u32>,
+    pub text_run_ids: Vec<String>,
+    pub texture_asset_refs: Vec<String>,
+    pub generation: u64,
+    pub cache_status: String,
+}
+
+#[derive(Clone, Debug)]
+struct RenderScene {
+    viewport: Rect,
+    items: Vec<RenderSceneItem>,
+    quad_batches: Vec<QuadBatch>,
+    rect_metrics: RectVertexMetrics,
+    text_runs: Vec<RenderTextRun>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderSceneItem {
+    node: DocumentNodeId,
+    retained_chunk_id: String,
+    source_kind: String,
+    bounds: Rect,
+    clip: Option<Rect>,
+    transform: [f32; 6],
+    style_identity: boon_document::ComputedStyleIdentity,
+    dependency_set: Vec<String>,
+    texture_asset_refs: Vec<String>,
+    estimated_vertex_count: u32,
 }
 
 pub trait RenderBackend<T: PresentSurface + ?Sized> {
@@ -118,14 +222,14 @@ impl std::fmt::Display for RenderError {
 impl std::error::Error for RenderError {}
 
 pub struct GlyphonTextMeasurer {
-    font_system: FontSystem,
+    service: GlyphonTextService,
     cache: BTreeMap<(String, TextMeasureStyleKey), boon_document::TextMetrics>,
 }
 
 impl GlyphonTextMeasurer {
     pub fn new() -> Self {
         Self {
-            font_system: editor_font_system(),
+            service: GlyphonTextService::new(),
             cache: BTreeMap::new(),
         }
     }
@@ -188,6 +292,30 @@ impl GlyphonTextMeasurer {
                 height: 0.0,
             };
         }
+        let metrics = self.service.measure_text(text, &style_key);
+        self.cache.insert(cache_key, metrics);
+        metrics
+    }
+}
+
+struct GlyphonTextService {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+}
+
+impl GlyphonTextService {
+    fn new() -> Self {
+        Self {
+            font_system: editor_font_system(),
+            swash_cache: SwashCache::new(),
+        }
+    }
+
+    fn measure_text(
+        &mut self,
+        text: &str,
+        style_key: &TextMeasureStyleKey,
+    ) -> boon_document::TextMetrics {
         let font_size = f32::from_bits(style_key.font_size_bits).max(1.0);
         let line_height = f32::from_bits(style_key.line_height_bits).max(font_size);
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
@@ -206,12 +334,112 @@ impl GlyphonTextMeasurer {
             None,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
-        let metrics = boon_document::TextMetrics {
+        boon_document::TextMetrics {
             width: shaped_line_width(&buffer).unwrap_or_default(),
             height: line_height,
-        };
-        self.cache.insert(cache_key, metrics);
-        metrics
+        }
+    }
+
+    fn shape_run(&mut self, run: &TextRun) -> Buffer {
+        shape_text_run(&mut self.font_system, run)
+    }
+
+    fn empty_custom_glyph_buffer(&mut self) -> Buffer {
+        empty_custom_glyph_buffer(&mut self.font_system)
+    }
+
+    fn rotated_text_glyph(&mut self, run: &TextRun) -> Option<RotatedTextGlyph> {
+        rotated_text_glyph_for_run(run, &mut self.font_system, &mut self.swash_cache)
+    }
+
+    fn editor_column_edges(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        font_family: &str,
+        font_features: &str,
+    ) -> Vec<f32> {
+        let color = [217, 225, 242, 255];
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(font_size.max(1.0), line_height.max(font_size.max(1.0))),
+        );
+        buffer.set_size(
+            &mut self.font_system,
+            None,
+            Some(line_height.max(font_size.max(1.0))),
+        );
+        buffer.set_text(
+            &mut self.font_system,
+            text,
+            &text_attrs(
+                font_family,
+                Style::Normal,
+                Weight::NORMAL,
+                color,
+                font_features,
+            ),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let line_width = shaped_line_width(&buffer).unwrap_or_default();
+        shaped_column_edges(text, &buffer, line_width)
+    }
+
+    fn editor_column_edges_for_style(
+        &mut self,
+        text: &str,
+        style: &StyleMap,
+        line_height: f32,
+    ) -> Vec<f32> {
+        let font_size = style_number(style, "size").unwrap_or(14.0).max(1.0);
+        let line_height = line_height.max(font_size);
+        let color = style_color_u8(style, "color").unwrap_or([217, 225, 242, 255]);
+        let font_family = style_text(style, "font").unwrap_or(EDITOR_FONT_FAMILY);
+        let font_features = style_text(style, "font_features").unwrap_or(EDITOR_FONT_FEATURES);
+        let default_attrs = text_attrs(
+            font_family,
+            text_font_style(style),
+            text_font_weight(style),
+            color,
+            font_features,
+        );
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
+        buffer.set_size(&mut self.font_system, None, Some(line_height));
+        let rich_spans = rich_text_spans(style, text, color);
+        if rich_spans.is_empty() {
+            buffer.set_text(
+                &mut self.font_system,
+                text,
+                &default_attrs,
+                Shaping::Advanced,
+                None,
+            );
+        } else {
+            buffer.set_rich_text(
+                &mut self.font_system,
+                rich_spans.iter().map(|span| {
+                    (
+                        span.text.as_str(),
+                        text_attrs(
+                            font_family,
+                            span.font_style,
+                            span.font_weight,
+                            span.color,
+                            font_features,
+                        ),
+                    )
+                }),
+                &default_attrs,
+                Shaping::Advanced,
+                None,
+            );
+        }
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let line_width = shaped_line_width(&buffer).unwrap_or_default();
+        shaped_column_edges(text, &buffer, line_width)
     }
 }
 
@@ -283,17 +511,57 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 frame_seq: self.frame_seq,
                 draw_calls: 0,
                 upload_bytes: 0,
+                allocated_gpu_bytes: 0,
+                dirty_upload_range_count: 0,
+                dirty_upload_ranges: Vec::new(),
+                dirty_upload_chunk_count: 0,
+                dirty_upload_chunk_ids: Vec::new(),
+                buffer_reuse_count: 0,
+                staging_wrap_count: 0,
+                queue_write_count: 0,
+                quad_cache_eviction_count: 0,
                 quad_cache_hit: false,
                 quad_cache_entry_count: 0,
                 visible_display_item_count: 0,
                 rendered_rect_count: 0,
                 rect_cap_hit: false,
+                visible_text_runs: 0,
+                shaped_text_runs: 0,
                 text_runs_shaped: 0,
                 rendered_text_runs: 0,
+                shaped_run_cache_hits: 0,
+                shaped_run_cache_misses: 0,
+                shaped_run_cache_evictions: 0,
+                shaped_run_cache_entry_count: 0,
+                shaped_run_cache_capacity: 0,
+                shaped_run_cache_bytes: 0,
+                missing_glyph_count: 0,
+                glyph_atlas_prepare_count: 0,
+                glyph_atlas_evictions_observed: 0,
                 text_cap_hit: false,
                 glyphon_text_area_count: 0,
                 color_only_rect_fallback: false,
                 preview_blocked_on_ipc_count: 0,
+                asset_ref_count: 0,
+                asset_refs: Vec::new(),
+                asset_cache_hits: 0,
+                asset_cache_misses: 0,
+                asset_cache_evictions: 0,
+                asset_cache_entry_count: 0,
+                asset_cache_byte_count: 0,
+                asset_cache_byte_cap: MAX_CACHED_ASSET_TEXTURE_BYTES,
+                asset_cache_byte_cap_hit: false,
+                asset_decode_count: 0,
+                asset_raster_count: 0,
+                asset_upload_count: 0,
+                asset_upload_bytes: 0,
+                asset_failure_diagnostics: Vec::new(),
+                retained_chunk_count: 0,
+                retained_chunk_hit_count: 0,
+                retained_chunk_miss_count: 0,
+                retained_chunk_reuse_count: 0,
+                dirty_chunk_count: 0,
+                retained_chunks: Vec::new(),
             },
         })
     }
@@ -323,13 +591,37 @@ pub struct SurfaceRenderRequest<'a> {
     pub height: u32,
 }
 
+pub struct SurfaceRenderSceneRequest<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub view: &'a wgpu::TextureView,
+    pub scene: &'a DocumentRenderScene,
+    pub format: wgpu::TextureFormat,
+    pub width: u32,
+    pub height: u32,
+}
+
 type TextureBindGroup = generated::shader_bindings::native_gpu_rect::WgpuBindGroup0;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct AssetTextureKey {
     url: String,
+    asset_ref: RenderAssetRef,
     width: u32,
     height: u32,
+}
+
+impl AssetTextureKey {
+    fn asset_ref(&self) -> AssetRef {
+        self.asset_ref.clone()
+    }
+
+    fn texture_byte_count(&self) -> u64 {
+        u64::from(self.width.max(1))
+            .saturating_mul(u64::from(self.height.max(1)))
+            .saturating_mul(4)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -338,41 +630,311 @@ enum QuadTexture {
     Asset(AssetTextureKey),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct QuadBatch {
+    retained_chunk_id: String,
     texture: QuadTexture,
-    positions: Vec<f32>,
-    colors: Vec<u32>,
-    uvs: Vec<f32>,
+    vertices: Vec<NativeGpuQuadVertex>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct NativeGpuQuadVertex {
+    position: [f32; 2],
+    color: u32,
+    uv: [f32; 2],
 }
 
 #[derive(Clone)]
 struct GpuQuadBatch {
     texture: QuadTexture,
     vertex_count: u32,
-    position_buffer: wgpu::Buffer,
-    color_buffer: wgpu::Buffer,
-    uv_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    byte_range: std::ops::Range<u64>,
+    ring_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct QuadBatchCacheKey {
+    retained_chunk_id: String,
     texture: QuadTexture,
     vertex_count: u32,
-    content_hash: [u8; 32],
+    content_key: u64,
 }
 
 struct CachedGpuQuadBatch {
     vertex_count: u32,
-    position_buffer: wgpu::Buffer,
-    color_buffer: wgpu::Buffer,
-    uv_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    byte_range: std::ops::Range<u64>,
+    ring_generation: u64,
+}
+
+const NATIVE_GPU_QUAD_VERTEX_STRIDE: wgpu::BufferAddress =
+    std::mem::size_of::<NativeGpuQuadVertex>() as wgpu::BufferAddress;
+const NATIVE_GPU_QUAD_VERTEX_POSITION_OFFSET: wgpu::BufferAddress = 0;
+const NATIVE_GPU_QUAD_VERTEX_COLOR_OFFSET: wgpu::BufferAddress = 8;
+const NATIVE_GPU_QUAD_VERTEX_UV_OFFSET: wgpu::BufferAddress = 12;
+const QUAD_UPLOAD_RING_MIN_BYTES: u64 = 256 * 1024;
+const QUAD_UPLOAD_RING_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const QUAD_UPLOAD_RING_ALIGNMENT: u64 = 4;
+const NATIVE_GPU_QUAD_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: NATIVE_GPU_QUAD_VERTEX_POSITION_OFFSET,
+        shader_location: 0,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Uint32,
+        offset: NATIVE_GPU_QUAD_VERTEX_COLOR_OFFSET,
+        shader_location: 1,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: NATIVE_GPU_QUAD_VERTEX_UV_OFFSET,
+        shader_location: 2,
+    },
+];
+
+fn native_gpu_quad_vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: NATIVE_GPU_QUAD_VERTEX_STRIDE,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &NATIVE_GPU_QUAD_VERTEX_ATTRIBUTES,
+    }
+}
+
+pub fn native_gpu_quad_vertex_layout_contract() -> serde_json::Value {
+    let layout = native_gpu_quad_vertex_buffer_layout();
+    let generated = generated::shader_bindings::native_gpu_rect::vs_main_entry(
+        wgpu::VertexStepMode::Vertex,
+        wgpu::VertexStepMode::Vertex,
+        wgpu::VertexStepMode::Vertex,
+    );
+    let generated_attributes = generated
+        .buffers
+        .iter()
+        .flat_map(|buffer| buffer.attributes.iter())
+        .map(|attribute| {
+            serde_json::json!({
+                "shader_location": attribute.shader_location,
+                "offset": attribute.offset,
+                "format": format!("{:?}", attribute.format),
+            })
+        })
+        .collect::<Vec<_>>();
+    let generated_shader_inputs = generated
+        .buffers
+        .iter()
+        .flat_map(|buffer| buffer.attributes.iter())
+        .map(|attribute| {
+            serde_json::json!({
+                "shader_location": attribute.shader_location,
+                "format": format!("{:?}", attribute.format),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "host_struct": "NativeGpuQuadVertex",
+        "pod": true,
+        "size": std::mem::size_of::<NativeGpuQuadVertex>(),
+        "align": std::mem::align_of::<NativeGpuQuadVertex>(),
+        "buffer_count": 1,
+        "array_stride": layout.array_stride,
+        "step_mode": format!("{:?}", layout.step_mode),
+        "attributes": layout
+            .attributes
+            .iter()
+            .map(|attribute| {
+                serde_json::json!({
+                    "shader_location": attribute.shader_location,
+                    "offset": attribute.offset,
+                    "format": format!("{:?}", attribute.format),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "generated_shader_attributes": generated_attributes,
+        "generated_shader_inputs": generated_shader_inputs,
+    })
+}
+
+#[derive(Default)]
+struct QuadUploadRing {
+    buffer: Option<wgpu::Buffer>,
+    capacity_bytes: u64,
+    cursor_bytes: u64,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct QuadUploadStats {
+    allocated_gpu_bytes: u64,
+    upload_bytes: u64,
+    dirty_upload_ranges: Vec<GpuUploadRangeMetric>,
+    staging_wrap_count: u32,
+    queue_write_count: u32,
+    cache_eviction_count: u32,
+    invalidated_cached_ranges: bool,
+}
+
+impl QuadUploadRing {
+    fn begin_frame(
+        &mut self,
+        device: &wgpu::Device,
+        frame_reservation_size: u64,
+        dirty_reservation_size: u64,
+        mut quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
+    ) -> Result<QuadUploadStats, RenderError> {
+        let mut stats = QuadUploadStats::default();
+        if dirty_reservation_size == 0 {
+            return Ok(stats);
+        }
+        if frame_reservation_size > QUAD_UPLOAD_RING_MAX_BYTES {
+            return Err(RenderError {
+                message: format!(
+                    "native GPU quad upload frame reservation of {frame_reservation_size} bytes exceeds ring cap of {QUAD_UPLOAD_RING_MAX_BYTES} bytes"
+                ),
+            });
+        }
+        let would_wrap =
+            self.cursor_bytes.saturating_add(dirty_reservation_size) > self.capacity_bytes;
+        let needs_grow = self.buffer.is_none()
+            || dirty_reservation_size > self.capacity_bytes
+            || (would_wrap && frame_reservation_size > self.capacity_bytes);
+        let needs_wrap = !needs_grow && would_wrap;
+        if needs_grow {
+            let required_capacity = QUAD_UPLOAD_RING_MIN_BYTES
+                .max(frame_reservation_size.next_power_of_two())
+                .min(QUAD_UPLOAD_RING_MAX_BYTES);
+            self.buffer = Some(create_quad_upload_ring_buffer(device, required_capacity));
+            self.capacity_bytes = required_capacity;
+            self.cursor_bytes = 0;
+            self.generation = self.generation.saturating_add(1);
+            stats.allocated_gpu_bytes = stats.allocated_gpu_bytes.saturating_add(required_capacity);
+            stats.invalidated_cached_ranges = true;
+            if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+                stats.cache_eviction_count = stats
+                    .cache_eviction_count
+                    .saturating_add(quad_buffers.len() as u32);
+                quad_buffers.clear();
+            }
+        } else if needs_wrap {
+            self.cursor_bytes = 0;
+            self.generation = self.generation.saturating_add(1);
+            stats.staging_wrap_count = stats.staging_wrap_count.saturating_add(1);
+            stats.invalidated_cached_ranges = true;
+            if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+                stats.cache_eviction_count = stats
+                    .cache_eviction_count
+                    .saturating_add(quad_buffers.len() as u32);
+                quad_buffers.clear();
+            }
+        }
+        Ok(stats)
+    }
+
+    fn upload_reserved(
+        &mut self,
+        queue: &wgpu::Queue,
+        vertex_bytes: &[u8],
+        vertex_count: u32,
+        retained_chunk_id: Option<String>,
+    ) -> Result<(CachedGpuQuadBatch, QuadUploadStats), RenderError> {
+        let byte_count = vertex_bytes.len() as u64;
+        let reservation_size = quad_upload_reservation_size(byte_count);
+        if self.buffer.is_none() {
+            return Err(RenderError {
+                message: "native GPU quad upload ring was not reserved before upload".to_owned(),
+            });
+        }
+        if self.cursor_bytes.saturating_add(reservation_size) > self.capacity_bytes {
+            return Err(RenderError {
+                message: format!(
+                    "native GPU quad upload reservation overflow: cursor={}, reservation={}, capacity={}",
+                    self.cursor_bytes, reservation_size, self.capacity_bytes
+                ),
+            });
+        }
+        let mut stats = QuadUploadStats::default();
+        let offset = self.cursor_bytes;
+        let end = offset.saturating_add(byte_count);
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("quad upload ring buffer allocated")
+            .clone();
+        queue.write_buffer(&buffer, offset, vertex_bytes);
+        self.cursor_bytes = self.cursor_bytes.saturating_add(reservation_size);
+        stats.upload_bytes = stats.upload_bytes.saturating_add(byte_count);
+        stats.queue_write_count = stats.queue_write_count.saturating_add(1);
+        stats.dirty_upload_ranges.push(GpuUploadRangeMetric {
+            offset,
+            size: byte_count,
+            ring_generation: self.generation,
+            retained_chunk_id,
+        });
+        Ok((
+            CachedGpuQuadBatch {
+                vertex_count,
+                vertex_buffer: buffer,
+                byte_range: offset..end,
+                ring_generation: self.generation,
+            },
+            stats,
+        ))
+    }
+
+    fn cached_batch_is_valid(&self, batch: &CachedGpuQuadBatch) -> bool {
+        self.buffer.is_some()
+            && batch.ring_generation == self.generation
+            && upload_range_is_valid(&batch.byte_range, batch.vertex_count, self.capacity_bytes)
+    }
+
+    fn gpu_batch_is_valid(&self, batch: &GpuQuadBatch) -> bool {
+        self.buffer.is_some()
+            && batch.ring_generation == self.generation
+            && upload_range_is_valid(&batch.byte_range, batch.vertex_count, self.capacity_bytes)
+    }
+
+    fn prepared_cache_is_valid(&self, cache: &PreparedQuadCache) -> bool {
+        self.buffer.is_some()
+            && cache.ring_generation == self.generation
+            && cache
+                .gpu_batches
+                .iter()
+                .all(|batch| self.gpu_batch_is_valid(batch))
+    }
+}
+
+fn create_quad_upload_ring_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("boon-native-gpu-quad-upload-ring"),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn align_u64(value: u64, alignment: u64) -> u64 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn quad_upload_reservation_size(byte_count: u64) -> u64 {
+    align_u64(byte_count, QUAD_UPLOAD_RING_ALIGNMENT)
+}
+
+fn upload_range_is_valid(range: &std::ops::Range<u64>, vertex_count: u32, capacity: u64) -> bool {
+    range.start <= range.end
+        && range.end <= capacity
+        && range.start % QUAD_UPLOAD_RING_ALIGNMENT == 0
+        && range.end.saturating_sub(range.start)
+            == u64::from(vertex_count).saturating_mul(NATIVE_GPU_QUAD_VERTEX_STRIDE)
 }
 
 struct PreparedQuadCache {
-    frame: LayoutFrame,
+    scene_key: u64,
     width: u32,
     height: u32,
+    ring_generation: u64,
     gpu_batches: Vec<GpuQuadBatch>,
     rect_metrics: RectVertexMetrics,
 }
@@ -380,9 +942,15 @@ struct PreparedQuadCache {
 #[derive(Debug, Default)]
 struct QuadBuilder {
     batches: Vec<QuadBatch>,
+    retained_chunk_id: String,
 }
 
 impl QuadBuilder {
+    fn set_retained_chunk_id(&mut self, retained_chunk_id: &str) {
+        self.retained_chunk_id.clear();
+        self.retained_chunk_id.push_str(retained_chunk_id);
+    }
+
     fn push_triangle(
         &mut self,
         texture: QuadTexture,
@@ -392,30 +960,30 @@ impl QuadBuilder {
         surface_height: f32,
         color: [f32; 4],
     ) {
-        let batch = if self
-            .batches
-            .last()
-            .is_some_and(|batch| batch.texture == texture)
-        {
+        let batch = if self.batches.last().is_some_and(|batch| {
+            batch.texture == texture && batch.retained_chunk_id == self.retained_chunk_id
+        }) {
             self.batches.last_mut().unwrap()
         } else {
             self.batches.push(QuadBatch {
+                retained_chunk_id: self.retained_chunk_id.clone(),
                 texture,
-                positions: Vec::new(),
-                colors: Vec::new(),
-                uvs: Vec::new(),
+                vertices: Vec::new(),
             });
             self.batches.last_mut().unwrap()
         };
+        let color = pack_rgba8_from_f32(color);
         for (point, uv) in points.into_iter().zip(uvs) {
-            batch.positions.extend_from_slice(&[
-                (point[0] / surface_width.max(1.0))
-                    .mul_add(2.0, -1.0)
-                    .clamp(-1.0, 1.0),
-                (1.0 - (point[1] / surface_height.max(1.0)) * 2.0).clamp(-1.0, 1.0),
-            ]);
-            batch.colors.push(pack_rgba8_from_f32(color));
-            batch.uvs.extend_from_slice(&uv);
+            batch.vertices.push(NativeGpuQuadVertex {
+                position: [
+                    (point[0] / surface_width.max(1.0))
+                        .mul_add(2.0, -1.0)
+                        .clamp(-1.0, 1.0),
+                    (1.0 - (point[1] / surface_height.max(1.0)) * 2.0).clamp(-1.0, 1.0),
+                ],
+                color,
+                uv,
+            });
         }
     }
 }
@@ -426,12 +994,65 @@ struct TextureState {
     _white_view: wgpu::TextureView,
     white_bind_group: TextureBindGroup,
     assets: BTreeMap<AssetTextureKey, GpuTextureAsset>,
+    cached_asset_bytes: u64,
 }
 
 struct GpuTextureAsset {
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: TextureBindGroup,
+    byte_count: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AssetFrameMetrics {
+    refs: BTreeMap<String, AssetRef>,
+    cache_hits: u32,
+    cache_misses: u32,
+    cache_evictions: u32,
+    cache_entry_count: u32,
+    cache_byte_count: u64,
+    cache_byte_cap: u64,
+    cache_byte_cap_hit: bool,
+    decode_count: u32,
+    raster_count: u32,
+    upload_count: u32,
+    upload_bytes: u64,
+    failure_diagnostics: Vec<String>,
+}
+
+impl Default for AssetFrameMetrics {
+    fn default() -> Self {
+        Self {
+            refs: BTreeMap::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
+            cache_entry_count: 0,
+            cache_byte_count: 0,
+            cache_byte_cap: MAX_CACHED_ASSET_TEXTURE_BYTES,
+            cache_byte_cap_hit: false,
+            decode_count: 0,
+            raster_count: 0,
+            upload_count: 0,
+            upload_bytes: 0,
+            failure_diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl AssetFrameMetrics {
+    fn finish(mut self, state: &TextureState) -> Self {
+        self.cache_entry_count = state.assets.len() as u32;
+        self.cache_byte_count = state.assets.values().map(|asset| asset.byte_count).sum();
+        self.cache_byte_cap = MAX_CACHED_ASSET_TEXTURE_BYTES;
+        self.cache_byte_cap_hit = self.cache_byte_count >= MAX_CACHED_ASSET_TEXTURE_BYTES;
+        self
+    }
+
+    fn asset_refs(&self) -> Vec<AssetRef> {
+        self.refs.values().cloned().collect()
+    }
 }
 
 impl TextureState {
@@ -469,6 +1090,7 @@ impl TextureState {
             _white_view: white_view,
             white_bind_group,
             assets: BTreeMap::new(),
+            cached_asset_bytes: 0,
         }
     }
 
@@ -477,15 +1099,28 @@ impl TextureState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         batches: &[QuadBatch],
-    ) -> Result<(), RenderError> {
+    ) -> Result<AssetFrameMetrics, RenderError> {
+        let mut metrics = AssetFrameMetrics::default();
         for batch in batches {
             let QuadTexture::Asset(key) = &batch.texture else {
                 continue;
             };
+            let asset_ref = key.asset_ref();
+            metrics.refs.insert(asset_ref.id.clone(), asset_ref);
             if self.assets.contains_key(key) {
+                metrics.cache_hits = metrics.cache_hits.saturating_add(1);
                 continue;
             }
-            let pixels = rasterize_svg_data_url(&key.url, key.width, key.height)?;
+            metrics.cache_misses = metrics.cache_misses.saturating_add(1);
+            let pixels = match rasterize_svg_data_url(&key.url, key.width, key.height) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    metrics.failure_diagnostics.push(error.to_string());
+                    return Err(error);
+                }
+            };
+            metrics.decode_count = metrics.decode_count.saturating_add(1);
+            metrics.raster_count = metrics.raster_count.saturating_add(1);
             let (texture, view) = upload_rgba_texture(
                 device,
                 queue,
@@ -494,6 +1129,16 @@ impl TextureState {
                 key.height,
                 &pixels,
             );
+            let byte_count = key.texture_byte_count();
+            if self.cached_asset_bytes.saturating_add(byte_count) > MAX_CACHED_ASSET_TEXTURE_BYTES
+                && !self.assets.is_empty()
+            {
+                metrics.cache_evictions = metrics
+                    .cache_evictions
+                    .saturating_add(self.assets.len() as u32);
+                self.assets.clear();
+                self.cached_asset_bytes = 0;
+            }
             let bind_group = TextureBindGroup::from_bindings(
                 device,
                 generated::shader_bindings::native_gpu_rect::WgpuBindGroup0Entries::new(
@@ -509,10 +1154,38 @@ impl TextureState {
                     _texture: texture,
                     _view: view,
                     bind_group,
+                    byte_count,
                 },
             );
+            self.cached_asset_bytes = self.cached_asset_bytes.saturating_add(byte_count);
+            metrics.upload_count = metrics.upload_count.saturating_add(1);
+            metrics.upload_bytes = metrics.upload_bytes.saturating_add(byte_count);
         }
-        Ok(())
+        Ok(metrics.finish(self))
+    }
+
+    fn cached_asset_metrics<'a>(
+        &self,
+        textures: impl IntoIterator<Item = &'a QuadTexture>,
+    ) -> AssetFrameMetrics {
+        let mut metrics = AssetFrameMetrics::default();
+        for texture in textures {
+            let QuadTexture::Asset(key) = texture else {
+                continue;
+            };
+            let asset_ref = key.asset_ref();
+            metrics.refs.insert(asset_ref.id.clone(), asset_ref);
+            if self.assets.contains_key(key) {
+                metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+            } else {
+                metrics.cache_misses = metrics.cache_misses.saturating_add(1);
+                metrics.failure_diagnostics.push(format!(
+                    "asset texture {} was referenced by prepared quads but missing from cache",
+                    key.asset_ref().id
+                ));
+            }
+        }
+        metrics.finish(self)
     }
 
     fn bind_group_for(&self, texture: &QuadTexture) -> Option<&TextureBindGroup> {
@@ -638,7 +1311,9 @@ pub struct VisibleLayoutRenderer {
     text: GlyphonTextState,
     textures: TextureState,
     quad_buffers: BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
+    quad_upload_ring: QuadUploadRing,
     prepared_quads: Option<PreparedQuadCache>,
+    previous_chunk_ids: BTreeSet<String>,
 }
 
 impl VisibleLayoutRenderer {
@@ -646,11 +1321,16 @@ impl VisibleLayoutRenderer {
         let shader = generated::shader_bindings::ShaderEntry::NativeGpuRect;
         let module = shader.create_shader_module_embed_source(device);
         let layout = shader.create_pipeline_layout(device);
-        let vertex_entry = generated::shader_bindings::native_gpu_rect::vs_main_entry(
+        let split_vertex_entry = generated::shader_bindings::native_gpu_rect::vs_main_entry(
             wgpu::VertexStepMode::Vertex,
             wgpu::VertexStepMode::Vertex,
             wgpu::VertexStepMode::Vertex,
         );
+        let vertex_entry = generated::shader_bindings::native_gpu_rect::VertexEntry {
+            entry_point: split_vertex_entry.entry_point,
+            buffers: [native_gpu_quad_vertex_buffer_layout()],
+            constants: split_vertex_entry.constants,
+        };
         let fragment_entry = generated::shader_bindings::native_gpu_rect::fs_main_entry([Some(
             wgpu::ColorTargetState {
                 format,
@@ -681,7 +1361,9 @@ impl VisibleLayoutRenderer {
             text: GlyphonTextState::new(device, queue, format),
             textures: TextureState::new(device, queue),
             quad_buffers: BTreeMap::new(),
+            quad_upload_ring: QuadUploadRing::default(),
             prepared_quads: None,
+            previous_chunk_ids: BTreeSet::new(),
         }
     }
 
@@ -696,7 +1378,27 @@ impl VisibleLayoutRenderer {
             Some(&mut self.text),
             &mut self.textures,
             Some(&mut self.quad_buffers),
+            Some(&mut self.quad_upload_ring),
             Some(&mut self.prepared_quads),
+            Some(&mut self.previous_chunk_ids),
+            self.frame_seq,
+        )
+    }
+
+    pub fn encode_scene(
+        &mut self,
+        request: SurfaceRenderSceneRequest<'_>,
+    ) -> Result<FrameMetrics, RenderError> {
+        self.frame_seq += 1;
+        encode_render_scene_to_surface_with_pipeline(
+            request,
+            &self.pipeline,
+            Some(&mut self.text),
+            &mut self.textures,
+            Some(&mut self.quad_buffers),
+            Some(&mut self.quad_upload_ring),
+            Some(&mut self.prepared_quads),
+            Some(&mut self.previous_chunk_ids),
             self.frame_seq,
         )
     }
@@ -709,118 +1411,307 @@ pub fn encode_layout_to_surface(
     renderer.encode(request)
 }
 
+pub fn encode_render_scene_to_surface(
+    request: SurfaceRenderSceneRequest<'_>,
+) -> Result<FrameMetrics, RenderError> {
+    let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, request.format);
+    renderer.encode_scene(request)
+}
+
 fn encode_layout_to_surface_with_pipeline(
     request: SurfaceRenderRequest<'_>,
     pipeline: &wgpu::RenderPipeline,
-    mut text: Option<&mut GlyphonTextState>,
+    text: Option<&mut GlyphonTextState>,
     textures: &mut TextureState,
-    mut quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
-    mut prepared_quads: Option<&mut Option<PreparedQuadCache>>,
+    quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
+    quad_upload_ring: Option<&mut QuadUploadRing>,
+    prepared_quads: Option<&mut Option<PreparedQuadCache>>,
+    previous_chunk_ids: Option<&mut BTreeSet<String>>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
     let height = request.height.clamp(1, 1080);
-    let visible_text_runs = text_runs(request.frame, width, height);
-    let text_runs_shaped = visible_text_runs.len() as u32;
+    let mut columns = GlyphonRenderTextColumnMeasurer::new();
+    let document_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+        request.frame,
+        width,
+        height,
+        &mut columns,
+    );
+    let scene = render_scene_from_document_scene(&document_scene, width, height);
+    encode_internal_scene_to_surface(
+        SceneEncodeRequest {
+            device: request.device,
+            queue: request.queue,
+            encoder: request.encoder,
+            view: request.view,
+            width,
+            height,
+        },
+        scene,
+        pipeline,
+        text,
+        textures,
+        quad_buffers,
+        quad_upload_ring,
+        prepared_quads,
+        previous_chunk_ids,
+        frame_seq,
+    )
+}
+
+fn encode_render_scene_to_surface_with_pipeline(
+    request: SurfaceRenderSceneRequest<'_>,
+    pipeline: &wgpu::RenderPipeline,
+    text: Option<&mut GlyphonTextState>,
+    textures: &mut TextureState,
+    quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
+    quad_upload_ring: Option<&mut QuadUploadRing>,
+    prepared_quads: Option<&mut Option<PreparedQuadCache>>,
+    previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    frame_seq: u64,
+) -> Result<FrameMetrics, RenderError> {
+    let width = request.width.clamp(1, 1920);
+    let height = request.height.clamp(1, 1080);
+    let scene = render_scene_from_document_scene(request.scene, width, height);
+    encode_internal_scene_to_surface(
+        SceneEncodeRequest {
+            device: request.device,
+            queue: request.queue,
+            encoder: request.encoder,
+            view: request.view,
+            width,
+            height,
+        },
+        scene,
+        pipeline,
+        text,
+        textures,
+        quad_buffers,
+        quad_upload_ring,
+        prepared_quads,
+        previous_chunk_ids,
+        frame_seq,
+    )
+}
+
+struct SceneEncodeRequest<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    encoder: &'a mut wgpu::CommandEncoder,
+    view: &'a wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_internal_scene_to_surface(
+    request: SceneEncodeRequest<'_>,
+    scene: RenderScene,
+    pipeline: &wgpu::RenderPipeline,
+    mut text: Option<&mut GlyphonTextState>,
+    textures: &mut TextureState,
+    mut quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
+    mut quad_upload_ring: Option<&mut QuadUploadRing>,
+    mut prepared_quads: Option<&mut Option<PreparedQuadCache>>,
+    mut previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    frame_seq: u64,
+) -> Result<FrameMetrics, RenderError> {
+    let width = request.width;
+    let height = request.height;
+    let text_runs_shaped = scene.text_runs.len() as u32;
+    let scene_key = render_scene_cache_key(&scene);
     let mut upload_bytes = 0u64;
+    let mut allocated_gpu_bytes = 0u64;
+    let mut dirty_upload_ranges = Vec::new();
+    let mut buffer_reuse_count = 0u32;
+    let mut staging_wrap_count = 0u32;
+    let mut queue_write_count = 0u32;
+    let mut quad_cache_eviction_count = 0u32;
+    let mut fallback_upload_ring = QuadUploadRing::default();
+    let upload_ring = quad_upload_ring
+        .as_deref_mut()
+        .unwrap_or(&mut fallback_upload_ring);
+    if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+        let before = quad_buffers.len();
+        quad_buffers.retain(|_, batch| upload_ring.cached_batch_is_valid(batch));
+        quad_cache_eviction_count = quad_cache_eviction_count
+            .saturating_add(before.saturating_sub(quad_buffers.len()) as u32);
+    }
     let prepared_hit = prepared_quads
         .as_deref()
         .and_then(Option::as_ref)
         .filter(|cache| {
-            cache.width == width && cache.height == height && cache.frame == *request.frame
+            cache.width == width
+                && cache.height == height
+                && cache.scene_key == scene_key
+                && upload_ring.prepared_cache_is_valid(cache)
         })
-        .map(|cache| (cache.gpu_batches.clone(), cache.rect_metrics));
+        .and_then(|cache| {
+            let asset_metrics =
+                textures.cached_asset_metrics(cache.gpu_batches.iter().map(|batch| &batch.texture));
+            asset_metrics
+                .failure_diagnostics
+                .is_empty()
+                .then(|| (cache.gpu_batches.clone(), cache.rect_metrics, asset_metrics))
+        });
     let quad_cache_hit = prepared_hit.is_some();
-    let (gpu_batches, rect_metrics) = if let Some(hit) = prepared_hit {
-        hit
-    } else {
-        let text_layout_nodes = text_layout_metric_nodes(request.frame);
-        let text_layout_metrics = match text.as_mut() {
-            Some(text) if !text_layout_nodes.is_empty() => {
-                Some(text.layout_metrics_for_runs(&visible_text_runs, &text_layout_nodes))
+    let (gpu_batches, rect_metrics, asset_metrics) =
+        if let Some((gpu_batches, rect_metrics, asset_metrics)) = prepared_hit {
+            buffer_reuse_count = gpu_batches.len() as u32;
+            (gpu_batches, rect_metrics, asset_metrics)
+        } else {
+            let (quad_batches, rect_metrics) =
+                rect_vertices_from_scene(&scene, width as f32, height as f32);
+            let asset_metrics =
+                textures.prepare_assets(request.device, request.queue, &quad_batches)?;
+            struct QuadUploadCandidate {
+                batch: QuadBatch,
+                vertex_count: u32,
+                cache_key: QuadBatchCacheKey,
+                reservation_size: u64,
             }
-            None => None,
-            Some(_) => None,
-        };
-        let (quad_batches, rect_metrics) = rect_vertices(
-            request.frame,
-            width as f32,
-            height as f32,
-            text_layout_metrics.as_ref(),
-        );
-        textures.prepare_assets(request.device, request.queue, &quad_batches)?;
-        let mut gpu_batches = Vec::new();
-        for batch in quad_batches {
-            let vertex_count = (batch.positions.len() / 2) as u32;
-            if vertex_count == 0 {
-                continue;
-            }
-            let position_bytes = f32_slice_bytes(&batch.positions);
-            let color_bytes = u32_slice_bytes(&batch.colors);
-            let uv_bytes = f32_slice_bytes(&batch.uvs);
-            let cache_key = QuadBatchCacheKey {
-                texture: batch.texture.clone(),
-                vertex_count,
-                content_hash: quad_batch_content_hash(&position_bytes, &color_bytes, &uv_bytes),
-            };
-            let cached = if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
-                if !quad_buffers.contains_key(&cache_key) {
-                    if quad_buffers.len() >= MAX_CACHED_QUAD_BATCHES {
-                        quad_buffers.clear();
-                    }
-                    let uploaded = create_gpu_quad_batch(
-                        request.device,
-                        request.queue,
-                        &position_bytes,
-                        &color_bytes,
-                        &uv_bytes,
-                        vertex_count,
-                    );
-                    upload_bytes +=
-                        (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
-                    quad_buffers.insert(cache_key.clone(), uploaded);
+            let mut candidates = Vec::new();
+            let mut frame_reservation_size = 0u64;
+            let mut dirty_reservation_size = 0u64;
+            for batch in quad_batches {
+                let vertex_count = batch.vertices.len() as u32;
+                if vertex_count == 0 {
+                    continue;
                 }
-                quad_buffers
-                    .get(&cache_key)
-                    .expect("quad buffer cache insert")
-            } else {
-                let uploaded = create_gpu_quad_batch(
-                    request.device,
-                    request.queue,
-                    &position_bytes,
-                    &color_bytes,
-                    &uv_bytes,
+                let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
+                let reservation_size = quad_upload_reservation_size(vertex_bytes.len() as u64);
+                let cache_key = QuadBatchCacheKey {
+                    retained_chunk_id: batch.retained_chunk_id.clone(),
+                    texture: batch.texture.clone(),
                     vertex_count,
-                );
-                upload_bytes += (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
-                gpu_batches.push(GpuQuadBatch {
-                    texture: batch.texture,
-                    vertex_count: uploaded.vertex_count,
-                    position_buffer: uploaded.position_buffer,
-                    color_buffer: uploaded.color_buffer,
-                    uv_buffer: uploaded.uv_buffer,
+                    content_key: quad_batch_content_key(vertex_bytes),
+                };
+                frame_reservation_size = frame_reservation_size.saturating_add(reservation_size);
+                let cache_hit = quad_buffers
+                    .as_deref()
+                    .and_then(|quad_buffers| quad_buffers.get(&cache_key))
+                    .is_some_and(|cached| upload_ring.cached_batch_is_valid(cached));
+                if !cache_hit {
+                    dirty_reservation_size =
+                        dirty_reservation_size.saturating_add(reservation_size);
+                }
+                candidates.push(QuadUploadCandidate {
+                    batch,
+                    vertex_count,
+                    cache_key,
+                    reservation_size,
                 });
-                continue;
-            };
-            gpu_batches.push(GpuQuadBatch {
-                texture: batch.texture,
-                vertex_count: cached.vertex_count,
-                position_buffer: cached.position_buffer.clone(),
-                color_buffer: cached.color_buffer.clone(),
-                uv_buffer: cached.uv_buffer.clone(),
-            });
-        }
-        if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
-            *prepared_quads = Some(PreparedQuadCache {
-                frame: request.frame.clone(),
-                width,
-                height,
-                gpu_batches: gpu_batches.clone(),
-                rect_metrics,
-            });
-        }
-        (gpu_batches, rect_metrics)
-    };
+            }
+            let begin_stats = upload_ring.begin_frame(
+                request.device,
+                frame_reservation_size,
+                dirty_reservation_size,
+                quad_buffers.as_deref_mut(),
+            )?;
+            upload_bytes = upload_bytes.saturating_add(begin_stats.upload_bytes);
+            allocated_gpu_bytes =
+                allocated_gpu_bytes.saturating_add(begin_stats.allocated_gpu_bytes);
+            staging_wrap_count = staging_wrap_count.saturating_add(begin_stats.staging_wrap_count);
+            queue_write_count = queue_write_count.saturating_add(begin_stats.queue_write_count);
+            quad_cache_eviction_count =
+                quad_cache_eviction_count.saturating_add(begin_stats.cache_eviction_count);
+            let invalidated_cached_ranges = begin_stats.invalidated_cached_ranges;
+            dirty_upload_ranges.extend(begin_stats.dirty_upload_ranges);
+
+            let mut gpu_batches = Vec::new();
+            for candidate in candidates {
+                let QuadUploadCandidate {
+                    batch,
+                    vertex_count,
+                    cache_key,
+                    reservation_size: _reservation_size,
+                } = candidate;
+                let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
+                let gpu_batch = if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+                    if !invalidated_cached_ranges
+                        && let Some(cached) = quad_buffers
+                            .get(&cache_key)
+                            .filter(|cached| upload_ring.cached_batch_is_valid(cached))
+                    {
+                        buffer_reuse_count = buffer_reuse_count.saturating_add(1);
+                        GpuQuadBatch {
+                            texture: batch.texture,
+                            vertex_count: cached.vertex_count,
+                            vertex_buffer: cached.vertex_buffer.clone(),
+                            byte_range: cached.byte_range.clone(),
+                            ring_generation: cached.ring_generation,
+                        }
+                    } else {
+                        if quad_buffers.len() >= MAX_CACHED_QUAD_BATCHES {
+                            quad_cache_eviction_count =
+                                quad_cache_eviction_count.saturating_add(quad_buffers.len() as u32);
+                            quad_buffers.clear();
+                        }
+                        let (uploaded, stats) = upload_ring.upload_reserved(
+                            request.queue,
+                            vertex_bytes,
+                            vertex_count,
+                            Some(batch.retained_chunk_id.clone()),
+                        )?;
+                        upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
+                        allocated_gpu_bytes =
+                            allocated_gpu_bytes.saturating_add(stats.allocated_gpu_bytes);
+                        staging_wrap_count =
+                            staging_wrap_count.saturating_add(stats.staging_wrap_count);
+                        queue_write_count =
+                            queue_write_count.saturating_add(stats.queue_write_count);
+                        quad_cache_eviction_count =
+                            quad_cache_eviction_count.saturating_add(stats.cache_eviction_count);
+                        dirty_upload_ranges.extend(stats.dirty_upload_ranges);
+                        let gpu_batch = GpuQuadBatch {
+                            texture: batch.texture,
+                            vertex_count: uploaded.vertex_count,
+                            vertex_buffer: uploaded.vertex_buffer.clone(),
+                            byte_range: uploaded.byte_range.clone(),
+                            ring_generation: uploaded.ring_generation,
+                        };
+                        quad_buffers.insert(cache_key.clone(), uploaded);
+                        gpu_batch
+                    }
+                } else {
+                    let (uploaded, stats) = upload_ring.upload_reserved(
+                        request.queue,
+                        vertex_bytes,
+                        vertex_count,
+                        Some(batch.retained_chunk_id.clone()),
+                    )?;
+                    upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
+                    allocated_gpu_bytes =
+                        allocated_gpu_bytes.saturating_add(stats.allocated_gpu_bytes);
+                    staging_wrap_count =
+                        staging_wrap_count.saturating_add(stats.staging_wrap_count);
+                    queue_write_count = queue_write_count.saturating_add(stats.queue_write_count);
+                    quad_cache_eviction_count =
+                        quad_cache_eviction_count.saturating_add(stats.cache_eviction_count);
+                    dirty_upload_ranges.extend(stats.dirty_upload_ranges);
+                    GpuQuadBatch {
+                        texture: batch.texture,
+                        vertex_count: uploaded.vertex_count,
+                        vertex_buffer: uploaded.vertex_buffer,
+                        byte_range: uploaded.byte_range,
+                        ring_generation: uploaded.ring_generation,
+                    }
+                };
+                gpu_batches.push(gpu_batch);
+            }
+            if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
+                *prepared_quads = Some(PreparedQuadCache {
+                    scene_key,
+                    width,
+                    height,
+                    ring_generation: upload_ring.generation,
+                    gpu_batches: gpu_batches.clone(),
+                    rect_metrics,
+                });
+            }
+            (gpu_batches, rect_metrics, asset_metrics)
+        };
     {
         let mut pass = request
             .encoder
@@ -854,28 +1745,65 @@ fn encode_layout_to_surface_with_pipeline(
                         message: "native GPU asset texture was not prepared before draw".to_owned(),
                     })?;
             bind_group.set(&mut pass);
-            pass.set_vertex_buffer(0, batch.position_buffer.slice(..));
-            pass.set_vertex_buffer(1, batch.color_buffer.slice(..));
-            pass.set_vertex_buffer(2, batch.uv_buffer.slice(..));
+            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(batch.byte_range.clone()));
             pass.draw(0..batch.vertex_count, 0..1);
         }
     }
-    let rendered_text_runs = match text.as_mut() {
-        Some(text) => text.render(
-            request.device,
-            request.queue,
-            request.encoder,
-            request.view,
-            visible_text_runs,
-            width,
-            height,
-        )?,
-        None => 0,
+    let retained_chunks = retained_render_chunks(&scene, frame_seq, previous_chunk_ids.as_deref());
+    if let Some(previous_chunk_ids) = previous_chunk_ids.as_deref_mut() {
+        previous_chunk_ids.clear();
+        previous_chunk_ids.extend(retained_chunks.iter().map(|chunk| chunk.id.clone()));
+    }
+    let retained_chunk_count = retained_chunks.len() as u32;
+    let retained_chunk_hit_count = retained_chunks
+        .iter()
+        .filter(|chunk| chunk.cache_status == "hit")
+        .count() as u32;
+    let retained_chunk_miss_count = retained_chunk_count.saturating_sub(retained_chunk_hit_count);
+    let retained_chunk_reuse_count = retained_chunk_hit_count;
+    let dirty_chunk_count = retained_chunk_miss_count;
+    let mut dirty_upload_chunk_ids = Vec::new();
+    let mut seen_dirty_upload_chunk_ids = BTreeSet::new();
+    for range in &dirty_upload_ranges {
+        if let Some(retained_chunk_id) = range.retained_chunk_id.as_ref()
+            && seen_dirty_upload_chunk_ids.insert(retained_chunk_id.clone())
+        {
+            dirty_upload_chunk_ids.push(retained_chunk_id.clone());
+        }
+    }
+    let dirty_upload_chunk_count = dirty_upload_chunk_ids.len() as u32;
+    let (rendered_text_runs, text_cache_metrics) = match text.as_mut() {
+        Some(text) => {
+            let glyphon_text_runs = scene
+                .text_runs
+                .into_iter()
+                .map(TextRun::from)
+                .collect::<Vec<_>>();
+            text.render(
+                request.device,
+                request.queue,
+                request.encoder,
+                request.view,
+                glyphon_text_runs,
+                width,
+                height,
+            )?
+        }
+        None => (0, TextFrameCacheMetrics::default()),
     };
     Ok(FrameMetrics {
         frame_seq,
         draw_calls: gpu_batches.len() as u32 + u32::from(rendered_text_runs > 0),
         upload_bytes,
+        allocated_gpu_bytes,
+        dirty_upload_range_count: dirty_upload_ranges.len() as u32,
+        dirty_upload_ranges,
+        dirty_upload_chunk_count,
+        dirty_upload_chunk_ids,
+        buffer_reuse_count,
+        staging_wrap_count,
+        queue_write_count,
+        quad_cache_eviction_count,
         quad_cache_hit,
         quad_cache_entry_count: quad_buffers
             .as_deref()
@@ -883,61 +1811,546 @@ fn encode_layout_to_surface_with_pipeline(
         visible_display_item_count: rect_metrics.visible_display_item_count,
         rendered_rect_count: rect_metrics.rendered_rect_count,
         rect_cap_hit: rect_metrics.cap_hit,
+        visible_text_runs: text_runs_shaped,
+        shaped_text_runs: text_cache_metrics.cache_misses,
         text_runs_shaped,
         rendered_text_runs,
+        shaped_run_cache_hits: text_cache_metrics.cache_hits,
+        shaped_run_cache_misses: text_cache_metrics.cache_misses,
+        shaped_run_cache_evictions: text_cache_metrics.cache_evictions,
+        shaped_run_cache_entry_count: text_cache_metrics.cache_entry_count,
+        shaped_run_cache_capacity: text_cache_metrics.cache_capacity,
+        shaped_run_cache_bytes: text_cache_metrics.cache_memory_bytes,
+        missing_glyph_count: text_cache_metrics.missing_glyph_count,
+        glyph_atlas_prepare_count: text_cache_metrics.glyph_atlas_prepare_count,
+        glyph_atlas_evictions_observed: text_cache_metrics.glyph_atlas_evictions_observed,
         text_cap_hit: false,
         glyphon_text_area_count: rendered_text_runs,
         color_only_rect_fallback: rendered_text_runs == 0 && text_runs_shaped > 0,
         preview_blocked_on_ipc_count: 0,
+        asset_ref_count: asset_metrics.refs.len() as u32,
+        asset_refs: asset_metrics.asset_refs(),
+        asset_cache_hits: asset_metrics.cache_hits,
+        asset_cache_misses: asset_metrics.cache_misses,
+        asset_cache_evictions: asset_metrics.cache_evictions,
+        asset_cache_entry_count: asset_metrics.cache_entry_count,
+        asset_cache_byte_count: asset_metrics.cache_byte_count,
+        asset_cache_byte_cap: asset_metrics.cache_byte_cap,
+        asset_cache_byte_cap_hit: asset_metrics.cache_byte_cap_hit,
+        asset_decode_count: asset_metrics.decode_count,
+        asset_raster_count: asset_metrics.raster_count,
+        asset_upload_count: asset_metrics.upload_count,
+        asset_upload_bytes: asset_metrics.upload_bytes,
+        asset_failure_diagnostics: asset_metrics.failure_diagnostics,
+        retained_chunk_count,
+        retained_chunk_hit_count,
+        retained_chunk_miss_count,
+        retained_chunk_reuse_count,
+        dirty_chunk_count,
+        retained_chunks,
     })
 }
 
-fn create_gpu_quad_batch(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    position_bytes: &[u8],
-    color_bytes: &[u8],
-    uv_bytes: &[u8],
-    vertex_count: u32,
-) -> CachedGpuQuadBatch {
-    let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-visible-position-buffer"),
-        size: position_bytes.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-visible-color-buffer"),
-        size: color_bytes.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let uv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-visible-uv-buffer"),
-        size: uv_bytes.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&position_buffer, 0, position_bytes);
-    queue.write_buffer(&color_buffer, 0, color_bytes);
-    queue.write_buffer(&uv_buffer, 0, uv_bytes);
-    CachedGpuQuadBatch {
-        vertex_count,
-        position_buffer,
-        color_buffer,
-        uv_buffer,
+fn quad_batch_content_key(vertex_bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    vertex_bytes.len().hash(&mut hasher);
+    vertex_bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn render_scene_cache_key(scene: &RenderScene) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_rect(&mut hasher, scene.viewport);
+    scene.items.len().hash(&mut hasher);
+    for item in &scene.items {
+        item.node.0.hash(&mut hasher);
+        item.retained_chunk_id.hash(&mut hasher);
+        item.source_kind.hash(&mut hasher);
+        hash_rect(&mut hasher, item.bounds);
+        item.style_identity.style_id.hash(&mut hasher);
+        item.style_identity.layout_id.hash(&mut hasher);
+        item.style_identity.paint_id.hash(&mut hasher);
+        item.style_identity.material_id.hash(&mut hasher);
+        item.style_identity.font_id.hash(&mut hasher);
+        item.style_identity.pseudo_state_id.hash(&mut hasher);
+        item.estimated_vertex_count.hash(&mut hasher);
+    }
+    scene.quad_batches.len().hash(&mut hasher);
+    for batch in &scene.quad_batches {
+        batch.retained_chunk_id.hash(&mut hasher);
+        match &batch.texture {
+            QuadTexture::Solid => "solid".hash(&mut hasher),
+            QuadTexture::Asset(key) => {
+                "asset".hash(&mut hasher);
+                key.url.hash(&mut hasher);
+                key.width.hash(&mut hasher);
+                key.height.hash(&mut hasher);
+            }
+        }
+        for vertex in &batch.vertices {
+            for coordinate in vertex.position {
+                coordinate.to_bits().hash(&mut hasher);
+            }
+            vertex.color.hash(&mut hasher);
+            for coordinate in vertex.uv {
+                coordinate.to_bits().hash(&mut hasher);
+            }
+        }
+    }
+    scene
+        .rect_metrics
+        .visible_display_item_count
+        .hash(&mut hasher);
+    scene.rect_metrics.rendered_rect_count.hash(&mut hasher);
+    scene.rect_metrics.cap_hit.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_rect(hasher: &mut DefaultHasher, rect: Rect) {
+    rect.x.to_bits().hash(hasher);
+    rect.y.to_bits().hash(hasher);
+    rect.width.to_bits().hash(hasher);
+    rect.height.to_bits().hash(hasher);
+}
+
+// Compatibility-only LayoutFrame semantic lowerer retained for legacy renderer
+// unit tests. Production encode paths must use boon_document::RenderScene via
+// render_scene_from_document_scene.
+fn render_scene_from_layout_frame(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    text_runs: Vec<RenderTextRun>,
+    text_layouts: Option<&TextRunLayoutMap>,
+) -> RenderScene {
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    };
+    let (quad_batches, rect_metrics) =
+        rect_vertices(frame, width as f32, height as f32, text_layouts);
+    let items = frame
+        .display_list
+        .iter()
+        .map(render_scene_item_from_display_item)
+        .collect();
+    RenderScene {
+        viewport,
+        items,
+        quad_batches,
+        rect_metrics,
+        text_runs,
     }
 }
 
-fn quad_batch_content_hash(position_bytes: &[u8], color_bytes: &[u8], uv_bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update((position_bytes.len() as u64).to_le_bytes());
-    hasher.update(position_bytes);
-    hasher.update((color_bytes.len() as u64).to_le_bytes());
-    hasher.update(color_bytes);
-    hasher.update((uv_bytes.len() as u64).to_le_bytes());
-    hasher.update(uv_bytes);
-    hasher.finalize().into()
+fn render_scene_from_document_scene(
+    scene: &DocumentRenderScene,
+    width: u32,
+    height: u32,
+) -> RenderScene {
+    let viewport = Rect {
+        x: scene.viewport.x,
+        y: scene.viewport.y,
+        width: scene.viewport.width.min(width as f32).max(1.0),
+        height: scene.viewport.height.min(height as f32).max(1.0),
+    };
+    let items = scene
+        .items
+        .iter()
+        .map(|item| RenderSceneItem {
+            node: item.node.clone(),
+            retained_chunk_id: document_item_retained_chunk_id(item),
+            source_kind: format!("{:?}", item.source_kind),
+            bounds: item.bounds,
+            clip: item.clip,
+            transform: item.transform,
+            style_identity: item.style_identity,
+            dependency_set: item.dependency_set.clone(),
+            texture_asset_refs: item.texture_asset_refs.clone(),
+            estimated_vertex_count: item.estimated_vertex_count,
+        })
+        .collect();
+    let quad_batches = if scene.quad_batches.is_empty() {
+        quad_batches_from_visual_primitives(&scene.visual_primitives, width as f32, height as f32)
+    } else {
+        scene
+            .quad_batches
+            .iter()
+            .enumerate()
+            .map(|(index, batch)| quad_batch_from_document_batch(batch, index))
+            .collect()
+    };
+    RenderScene {
+        viewport,
+        items,
+        rect_metrics: RectVertexMetrics {
+            visible_display_item_count: scene.metrics.visible_source_item_count,
+            rendered_rect_count: scene.metrics.rendered_rect_count,
+            cap_hit: scene.metrics.cap_hit,
+        },
+        quad_batches,
+        text_runs: scene.text_runs.clone(),
+    }
+}
+
+fn document_item_retained_chunk_id(item: &boon_document::RenderSceneItem) -> String {
+    if !item.retained_chunk_id.is_empty() {
+        return item.retained_chunk_id.clone();
+    }
+    format!(
+        "chunk:{}:{:?}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        item.node.0,
+        item.source_kind,
+        item.style_identity.style_id,
+        item.style_identity.layout_id,
+        item.style_identity.paint_id,
+        item.style_identity.material_id,
+        item.style_identity.pseudo_state_id
+    )
+}
+
+fn document_primitive_retained_chunk_id(primitive: &RenderVisualPrimitive) -> String {
+    if !primitive.retained_chunk_id.is_empty() {
+        return primitive.retained_chunk_id.clone();
+    }
+    format!(
+        "chunk:{}:{:?}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        primitive.node.0,
+        primitive.source_kind,
+        primitive.style_identity.style_id,
+        primitive.style_identity.layout_id,
+        primitive.style_identity.paint_id,
+        primitive.style_identity.material_id,
+        primitive.style_identity.pseudo_state_id
+    )
+}
+
+fn quad_batches_from_visual_primitives(
+    primitives: &[RenderVisualPrimitive],
+    width: f32,
+    height: f32,
+) -> Vec<QuadBatch> {
+    let mut builder = QuadBuilder::default();
+    for primitive in primitives {
+        builder.set_retained_chunk_id(&document_primitive_retained_chunk_id(primitive));
+        match primitive.primitive {
+            RenderVisualPrimitiveKind::Asset => {
+                if let RenderTextureRef::Asset { url, .. } = &primitive.texture {
+                    push_asset_rect(&mut builder, primitive.bounds, width, height, url);
+                }
+            }
+            RenderVisualPrimitiveKind::Border => {
+                push_styled_border_all(
+                    &mut builder,
+                    primitive.bounds,
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.color),
+                    primitive.stroke_width,
+                    primitive.radius,
+                );
+            }
+            RenderVisualPrimitiveKind::BorderTop
+            | RenderVisualPrimitiveKind::BorderRight
+            | RenderVisualPrimitiveKind::BorderBottom
+            | RenderVisualPrimitiveKind::BorderLeft => {
+                let side = match primitive.primitive {
+                    RenderVisualPrimitiveKind::BorderTop => 0,
+                    RenderVisualPrimitiveKind::BorderRight => 1,
+                    RenderVisualPrimitiveKind::BorderBottom => 2,
+                    RenderVisualPrimitiveKind::BorderLeft => 3,
+                    _ => unreachable!(),
+                };
+                push_side_border(
+                    &mut builder,
+                    primitive.bounds,
+                    width,
+                    height,
+                    side,
+                    BorderStroke {
+                        color: linear_f32_from_rgba8(primitive.color),
+                        thickness: primitive.stroke_width,
+                    },
+                );
+            }
+            RenderVisualPrimitiveKind::CheckboxCastShadow
+            | RenderVisualPrimitiveKind::Checkbox
+            | RenderVisualPrimitiveKind::CheckboxInnerShadow
+            | RenderVisualPrimitiveKind::CheckboxHighlight => {
+                let (center_x, center_y) = checkbox_circle_center(primitive.bounds);
+                push_checkbox_circle_raster(
+                    &mut builder,
+                    center_x,
+                    center_y,
+                    primitive.radius.max(1.0),
+                    primitive.stroke_width.max(0.0),
+                    primitive.antialias.max(0.0),
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.color),
+                    linear_f32_from_rgba8(primitive.secondary_color),
+                );
+            }
+            RenderVisualPrimitiveKind::CheckboxCheckmark => {
+                let (start, middle, end) =
+                    if let [start, middle, end, ..] = primitive.control_points.as_slice() {
+                        (
+                            (start[0], start[1]),
+                            (middle[0], middle[1]),
+                            (end[0], end[1]),
+                        )
+                    } else {
+                        checkbox_check_points(primitive.bounds)
+                    };
+                push_checkbox_check_raster(
+                    &mut builder,
+                    start,
+                    middle,
+                    end,
+                    primitive.stroke_width.max(1.0),
+                    primitive.antialias.max(0.0),
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.color),
+                );
+            }
+            RenderVisualPrimitiveKind::ViewportBackground
+            | RenderVisualPrimitiveKind::Shadow
+            | RenderVisualPrimitiveKind::FrostedMaterialLayer
+            | RenderVisualPrimitiveKind::Fill
+            | RenderVisualPrimitiveKind::MaterialHighlight
+            | RenderVisualPrimitiveKind::EditorSelection
+            | RenderVisualPrimitiveKind::EditorBracketHighlight
+            | RenderVisualPrimitiveKind::EditorCaret
+            | RenderVisualPrimitiveKind::TextInputCaret
+            | RenderVisualPrimitiveKind::Underline
+            | RenderVisualPrimitiveKind::Strikethrough
+            | RenderVisualPrimitiveKind::ButtonCheckmark => {
+                push_styled_rect(
+                    &mut builder,
+                    primitive.bounds,
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.color),
+                    primitive.radius,
+                );
+            }
+        }
+    }
+    builder.batches
+}
+
+fn quad_batch_from_document_batch(
+    batch: &boon_document::RenderQuadBatch,
+    fallback_index: usize,
+) -> QuadBatch {
+    QuadBatch {
+        retained_chunk_id: batch
+            .retained_chunk_id
+            .clone()
+            .unwrap_or_else(|| format!("document-quad-batch:{fallback_index}")),
+        texture: quad_texture_from_render_texture_ref(&batch.texture),
+        vertices: quad_vertices_from_split_buffers(&batch.positions, &batch.colors, &batch.uvs),
+    }
+}
+
+fn quad_vertices_from_split_buffers(
+    positions: &[f32],
+    colors: &[u32],
+    uvs: &[f32],
+) -> Vec<NativeGpuQuadVertex> {
+    debug_assert_eq!(positions.len() % 2, 0);
+    debug_assert_eq!(uvs.len() % 2, 0);
+    let vertex_count = (positions.len() / 2).min(colors.len()).min(uvs.len() / 2);
+    let mut vertices = Vec::with_capacity(vertex_count);
+    for index in 0..vertex_count {
+        vertices.push(NativeGpuQuadVertex {
+            position: [positions[index * 2], positions[index * 2 + 1]],
+            color: colors[index],
+            uv: [uvs[index * 2], uvs[index * 2 + 1]],
+        });
+    }
+    vertices
+}
+
+fn quad_texture_from_render_texture_ref(texture: &RenderTextureRef) -> QuadTexture {
+    match texture {
+        RenderTextureRef::Solid => QuadTexture::Solid,
+        RenderTextureRef::Asset {
+            url,
+            asset_ref,
+            width,
+            height,
+        } => QuadTexture::Asset(AssetTextureKey {
+            url: url.clone(),
+            asset_ref: asset_ref.clone(),
+            width: *width,
+            height: *height,
+        }),
+    }
+}
+
+fn linear_f32_from_rgba8(color: [u8; 4]) -> [f32; 4] {
+    [
+        srgb_u8_to_linear_f32(color[0]),
+        srgb_u8_to_linear_f32(color[1]),
+        srgb_u8_to_linear_f32(color[2]),
+        color[3] as f32 / 255.0,
+    ]
+}
+
+fn render_scene_item_from_display_item(item: &DisplayItem) -> RenderSceneItem {
+    RenderSceneItem {
+        node: item.node.clone(),
+        retained_chunk_id: retained_chunk_id_for_display_item(item),
+        source_kind: format!("{:?}", item.kind),
+        bounds: item.bounds,
+        clip: clip_rect_for_style(&item.style),
+        transform: [1.0, 0.0, 0.0, 1.0, item.bounds.x, item.bounds.y],
+        style_identity: item.style_identity,
+        dependency_set: retained_chunk_dependencies(item),
+        texture_asset_refs: style_asset_url(&item.style)
+            .map(|asset| {
+                vec![
+                    RenderAssetRef::inline_svg_data_url(
+                        asset,
+                        item.bounds.width.ceil().clamp(1.0, 2048.0) as u32,
+                        item.bounds.height.ceil().clamp(1.0, 2048.0) as u32,
+                    )
+                    .id,
+                ]
+            })
+            .unwrap_or_default(),
+        estimated_vertex_count: retained_chunk_vertex_estimate_for_bounds(item.bounds),
+    }
+}
+
+fn rect_vertices_from_scene(
+    scene: &RenderScene,
+    _width: f32,
+    _height: f32,
+) -> (Vec<QuadBatch>, RectVertexMetrics) {
+    debug_assert!(scene.viewport.width >= 0.0);
+    debug_assert!(scene.viewport.height >= 0.0);
+    (scene.quad_batches.clone(), scene.rect_metrics)
+}
+
+fn retained_render_chunks(
+    scene: &RenderScene,
+    generation: u64,
+    previous_chunk_ids: Option<&BTreeSet<String>>,
+) -> Vec<RetainedRenderChunkMetric> {
+    let mut text_run_ids_by_node: BTreeMap<DocumentNodeId, Vec<String>> = BTreeMap::new();
+    for run in &scene.text_runs {
+        text_run_ids_by_node
+            .entry(run.node.clone())
+            .or_default()
+            .push(text_run_id(run));
+    }
+    let mut vertex_start = 0_u32;
+    scene
+        .items
+        .iter()
+        .map(|item| {
+            let vertex_count = item.estimated_vertex_count;
+            let start = vertex_start;
+            vertex_start = vertex_start.saturating_add(vertex_count);
+            let id = retained_chunk_id(item, generation);
+            let cache_hit = previous_chunk_ids.is_some_and(|previous| previous.contains(&id));
+            RetainedRenderChunkMetric {
+                id,
+                node: item.node.clone(),
+                kind: item.source_kind.clone(),
+                bounds: item.bounds,
+                clip: item.clip,
+                transform: item.transform,
+                style_identity: item.style_identity,
+                dependency_set: item.dependency_set.clone(),
+                gpu_buffer_range: start..vertex_start,
+                text_run_ids: text_run_ids_by_node.remove(&item.node).unwrap_or_else(|| {
+                    scene
+                        .text_runs
+                        .iter()
+                        .find(|run| run.node == item.node)
+                        .map(|run| vec![text_run_id(run)])
+                        .unwrap_or_default()
+                }),
+                texture_asset_refs: item.texture_asset_refs.clone(),
+                generation,
+                cache_status: if cache_hit {
+                    "hit".to_owned()
+                } else {
+                    "miss".to_owned()
+                },
+            }
+        })
+        .collect()
+}
+
+fn retained_chunk_vertex_estimate_for_bounds(bounds: Rect) -> u32 {
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        0
+    } else {
+        6
+    }
+}
+
+fn retained_chunk_dependencies(item: &DisplayItem) -> Vec<String> {
+    let mut dependencies = vec![
+        format!("node:{}", item.node.0),
+        format!("kind:{:?}", item.kind),
+        format!("style:{}", item.style_identity.style_id),
+        format!("layout:{}", item.style_identity.layout_id),
+        format!("paint:{}", item.style_identity.paint_id),
+        format!("material:{}", item.style_identity.material_id),
+        format!("font:{}", item.style_identity.font_id),
+        format!("pseudo:{}", item.style_identity.pseudo_state_id),
+    ];
+    if item.text.is_some() {
+        dependencies.push("text".to_owned());
+    }
+    if clip_rect_for_style(&item.style).is_some() {
+        dependencies.push("clip".to_owned());
+    }
+    dependencies
+}
+
+fn retained_chunk_id_for_display_item(item: &DisplayItem) -> String {
+    format!(
+        "chunk:{}:{:?}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        item.node.0,
+        item.kind,
+        item.style_identity.style_id,
+        item.style_identity.layout_id,
+        item.style_identity.paint_id,
+        item.style_identity.material_id,
+        item.style_identity.pseudo_state_id
+    )
+}
+
+fn retained_chunk_id(item: &RenderSceneItem, _generation: u64) -> String {
+    item.retained_chunk_id.clone()
+}
+
+fn text_run_id(run: &RenderTextRun) -> String {
+    format!(
+        "text:{}:{:x}:{:x}:{}",
+        run.node.0,
+        run.font_id,
+        run.paint_id,
+        stable_text_hash(&run.text)
+    )
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub fn render_app_owned_pixels(
@@ -982,12 +2395,19 @@ pub fn render_app_owned_pixels(
             label: Some("boon-native-gpu-app-owned-encoder"),
         });
     let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, format);
-    let metrics = renderer.encode(SurfaceRenderRequest {
+    let mut columns = GlyphonRenderTextColumnMeasurer::new();
+    let scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+        request.frame,
+        width,
+        height,
+        &mut columns,
+    );
+    let metrics = renderer.encode_scene(SurfaceRenderSceneRequest {
         device: request.device,
         queue: request.queue,
         encoder: &mut encoder,
         view: &view,
-        frame: request.frame,
+        scene: &scene,
         format,
         width,
         height,
@@ -1013,7 +2433,7 @@ pub fn render_app_owned_pixels(
             depth_or_array_layers: 1,
         },
     );
-    request.queue.submit(Some(encoder.finish()));
+    let submission_index = request.queue.submit(Some(encoder.finish()));
 
     let slice = readback.slice(..);
     let (sender, receiver) = mpsc::channel();
@@ -1022,17 +2442,41 @@ pub fn render_app_owned_pixels(
     });
     request
         .device
-        .poll(wgpu::PollType::wait_indefinitely())
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index.clone()),
+            timeout: Some(APP_OWNED_READBACK_TIMEOUT),
+        })
         .map_err(|error| RenderError {
-            message: format!("native GPU readback poll: {error}"),
+            message: readback_failure_message(
+                "poll",
+                &request,
+                width,
+                height,
+                Some(format!("{submission_index:?}")),
+                &error.to_string(),
+            ),
         })?;
     receiver
-        .recv()
+        .recv_timeout(APP_OWNED_READBACK_TIMEOUT)
         .map_err(|error| RenderError {
-            message: format!("native GPU readback callback: {error}"),
+            message: readback_failure_message(
+                "callback",
+                &request,
+                width,
+                height,
+                Some(format!("{submission_index:?}")),
+                &error.to_string(),
+            ),
         })?
         .map_err(|error| RenderError {
-            message: format!("native GPU readback map: {error}"),
+            message: readback_failure_message(
+                "map",
+                &request,
+                width,
+                height,
+                Some(format!("{submission_index:?}")),
+                &error.to_string(),
+            ),
         })?;
 
     let mapped = slice.get_mapped_range();
@@ -1094,14 +2538,33 @@ pub fn render_app_owned_pixels(
             height,
             nonblank_samples,
             unique_rgba_values,
+            readback_deadline_ms: APP_OWNED_READBACK_TIMEOUT.as_millis() as u64,
+            readback_poll_status: "completed_before_deadline".to_owned(),
         },
         metrics: FrameMetrics { ..metrics },
     })
 }
 
+fn readback_failure_message(
+    phase: &str,
+    request: &AppOwnedRenderRequest<'_>,
+    width: u32,
+    height: u32,
+    submission_index: Option<String>,
+    reason: &str,
+) -> String {
+    format!(
+        "native GPU readback {phase} failed before deadline: backend=wgpu adapter=unavailable frame_id={} surface={} requested_rect=0,0,{width},{height} submission={}; report_context=app_owned_render_pixels artifact_label={} deadline_ms={} reason={reason}",
+        layout_frame_hash(request.frame),
+        request.surface_id.0,
+        submission_index.unwrap_or_else(|| "unsubmitted".to_owned()),
+        request.artifact_label,
+        APP_OWNED_READBACK_TIMEOUT.as_millis(),
+    )
+}
+
 struct GlyphonTextState {
-    font_system: FontSystem,
-    swash_cache: SwashCache,
+    service: GlyphonTextService,
     viewport: Viewport,
     atlas: TextAtlas,
     renderer: TextRenderer,
@@ -1120,21 +2583,6 @@ struct RichTextSpan {
     color: [u8; 4],
     font_style: Style,
     font_weight: Weight,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RichTextSpanPayload {
-    text: String,
-    source_text: Option<String>,
-    color: Option<String>,
-    font_style: Option<String>,
-    font_weight: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct EditorTypeHintPayload {
-    anchor_column: usize,
-    compact_label: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1172,6 +2620,8 @@ type TextRunLayoutMap = BTreeMap<DocumentNodeId, TextRunLayoutMetrics>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextRunSignature {
+    font_id: u64,
+    paint_id: u64,
     text: String,
     rich_spans: Vec<RichTextSpan>,
     font_family: String,
@@ -1237,9 +2687,24 @@ struct RotatedTextGlyph {
     top: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextFrameCacheMetrics {
+    cache_hits: u32,
+    cache_misses: u32,
+    cache_evictions: u32,
+    cache_entry_count: u32,
+    cache_capacity: u32,
+    cache_memory_bytes: u64,
+    missing_glyph_count: u32,
+    glyph_atlas_prepare_count: u32,
+    glyph_atlas_evictions_observed: u32,
+}
+
 impl TextRunSignature {
     fn from_run(run: &TextRun) -> Self {
         Self {
+            font_id: run.font_id,
+            paint_id: run.paint_id,
             text: run.text.clone(),
             rich_spans: run.rich_spans.clone(),
             font_family: run.font_family.clone(),
@@ -1258,6 +2723,24 @@ impl TextRunSignature {
             rotate_degrees: run.rotate_degrees,
         }
     }
+}
+
+fn text_buffer_cache_memory_bytes(signatures: &[TextRunSignature]) -> u64 {
+    signatures
+        .iter()
+        .map(|signature| {
+            let span_bytes = signature
+                .rich_spans
+                .iter()
+                .map(|span| span.text.len() as u64 + 32)
+                .sum::<u64>();
+            std::mem::size_of::<TextRunSignature>() as u64
+                + signature.text.len() as u64
+                + signature.font_family.len() as u64
+                + signature.font_features.len() as u64
+                + span_bytes
+        })
+        .sum()
 }
 
 impl TextRunPlacementSignature {
@@ -1291,16 +2774,13 @@ impl TextRunPlacementSignature {
 
 impl GlyphonTextState {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let font_system = editor_font_system();
-        let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         Self {
-            font_system,
-            swash_cache,
+            service: GlyphonTextService::new(),
             viewport,
             atlas,
             renderer,
@@ -1323,9 +2803,9 @@ impl GlyphonTextState {
         runs: Vec<TextRun>,
         width: u32,
         height: u32,
-    ) -> Result<u32, RenderError> {
+    ) -> Result<(u32, TextFrameCacheMetrics), RenderError> {
         if runs.is_empty() {
-            return Ok(0);
+            return Ok((0, TextFrameCacheMetrics::default()));
         }
         self.viewport.update(queue, Resolution { width, height });
         let placement_signatures = runs
@@ -1345,10 +2825,13 @@ impl GlyphonTextState {
                 normal_runs.push(run);
             }
         }
-        self.ensure_buffers(&normal_runs);
+        let mut text_cache_metrics = self.ensure_buffers(&normal_runs);
         if self.prepared_signatures != placement_signatures
             || self.prepared_viewport != Some((width, height))
         {
+            text_cache_metrics.glyph_atlas_prepare_count = text_cache_metrics
+                .glyph_atlas_prepare_count
+                .saturating_add(1);
             let mut custom_buffers = Vec::with_capacity(rotated_runs.len());
             let mut custom_glyph_lists = Vec::with_capacity(rotated_runs.len());
             for (run, glyph) in &rotated_runs {
@@ -1375,7 +2858,7 @@ impl GlyphonTextState {
                     snap_to_physical_pixel: true,
                     metadata: 0,
                 }]);
-                custom_buffers.push(empty_custom_glyph_buffer(&mut self.font_system));
+                custom_buffers.push(self.service.empty_custom_glyph_buffer());
             }
 
             let mut areas = Vec::with_capacity(self.buffers.len() + custom_buffers.len());
@@ -1420,11 +2903,11 @@ impl GlyphonTextState {
                 .prepare_with_custom(
                     device,
                     queue,
-                    &mut self.font_system,
+                    &mut self.service.font_system,
                     &mut self.atlas,
                     &self.viewport,
                     areas,
-                    &mut self.swash_cache,
+                    &mut self.service.swash_cache,
                     |request: RasterizeCustomGlyphRequest| custom_rasters.get(&request.id).cloned(),
                 )
                 .map_err(|error| RenderError {
@@ -1456,36 +2939,64 @@ impl GlyphonTextState {
                     message: format!("glyphon render: {error}"),
                 })?;
         }
-        Ok((normal_runs.len() + rotated_runs.len()) as u32)
+        text_cache_metrics.cache_entry_count = self.buffers.len() as u32;
+        text_cache_metrics.cache_capacity = normal_runs.len() as u32;
+        text_cache_metrics.cache_memory_bytes =
+            text_buffer_cache_memory_bytes(&self.buffer_signatures);
+        Ok((
+            (normal_runs.len() + rotated_runs.len()) as u32,
+            text_cache_metrics,
+        ))
     }
 
-    fn ensure_buffers(&mut self, runs: &[TextRun]) {
+    fn ensure_buffers(&mut self, runs: &[TextRun]) -> TextFrameCacheMetrics {
         let signatures = runs
             .iter()
             .map(TextRunSignature::from_run)
             .collect::<Vec<_>>();
-        if self.buffer_signatures != signatures {
-            let old_signatures = std::mem::take(&mut self.buffer_signatures);
-            let old_buffers = std::mem::take(&mut self.buffers);
-            let mut old_buffers = old_signatures
-                .into_iter()
-                .zip(old_buffers)
-                .collect::<Vec<_>>();
-            self.buffers.reserve(runs.len());
-            for (signature, run) in signatures.iter().cloned().zip(runs.iter()) {
-                if let Some(index) = old_buffers
-                    .iter()
-                    .position(|(old_signature, _)| *old_signature == signature)
-                {
-                    let (_, buffer) = old_buffers.swap_remove(index);
-                    self.buffers.push(buffer);
-                } else {
-                    let buffer = shape_text_run(&mut self.font_system, run);
-                    self.buffers.push(buffer);
-                }
-            }
-            self.buffer_signatures = signatures;
+        if self.buffer_signatures == signatures {
+            return TextFrameCacheMetrics {
+                cache_hits: signatures.len() as u32,
+                cache_misses: 0,
+                cache_evictions: 0,
+                cache_entry_count: self.buffers.len() as u32,
+                cache_capacity: runs.len() as u32,
+                cache_memory_bytes: text_buffer_cache_memory_bytes(&self.buffer_signatures),
+                ..TextFrameCacheMetrics::default()
+            };
         }
+        let old_signatures = std::mem::take(&mut self.buffer_signatures);
+        let (cache_hits, cache_misses, cache_evictions) =
+            text_cache_reuse_counts(&old_signatures, &signatures);
+        let old_buffers = std::mem::take(&mut self.buffers);
+        let mut old_buffers = old_signatures
+            .into_iter()
+            .zip(old_buffers)
+            .collect::<Vec<_>>();
+        let mut metrics = TextFrameCacheMetrics {
+            cache_hits,
+            cache_misses,
+            cache_evictions,
+            cache_capacity: runs.len() as u32,
+            ..TextFrameCacheMetrics::default()
+        };
+        self.buffers.reserve(runs.len());
+        for (signature, run) in signatures.iter().cloned().zip(runs.iter()) {
+            if let Some(index) = old_buffers
+                .iter()
+                .position(|(old_signature, _)| *old_signature == signature)
+            {
+                let (_, buffer) = old_buffers.swap_remove(index);
+                self.buffers.push(buffer);
+            } else {
+                let buffer = self.service.shape_run(run);
+                self.buffers.push(buffer);
+            }
+        }
+        self.buffer_signatures = signatures;
+        metrics.cache_entry_count = self.buffers.len() as u32;
+        metrics.cache_memory_bytes = text_buffer_cache_memory_bytes(&self.buffer_signatures);
+        metrics
     }
 
     fn layout_metrics_for_runs(
@@ -1493,7 +3004,7 @@ impl GlyphonTextState {
         runs: &[TextRun],
         required_nodes: &BTreeSet<DocumentNodeId>,
     ) -> TextRunLayoutMap {
-        self.ensure_buffers(runs);
+        let _ = self.ensure_buffers(runs);
         runs.iter()
             .zip(self.buffers.iter())
             .filter(|(run, _)| required_nodes.contains(&run.node))
@@ -1521,8 +3032,29 @@ impl GlyphonTextState {
     }
 
     fn rotated_text_glyph(&mut self, run: &TextRun) -> Option<RotatedTextGlyph> {
-        rotated_text_glyph_for_run(run, &mut self.font_system, &mut self.swash_cache)
+        self.service.rotated_text_glyph(run)
     }
+}
+
+fn text_cache_reuse_counts(
+    old_signatures: &[TextRunSignature],
+    new_signatures: &[TextRunSignature],
+) -> (u32, u32, u32) {
+    let mut reusable = old_signatures.to_vec();
+    let mut hits = 0_u32;
+    let mut misses = 0_u32;
+    for signature in new_signatures {
+        if let Some(index) = reusable
+            .iter()
+            .position(|old_signature| old_signature == signature)
+        {
+            reusable.swap_remove(index);
+            hits += 1;
+        } else {
+            misses += 1;
+        }
+    }
+    (hits, misses, reusable.len() as u32)
 }
 
 fn rotated_text_glyph_for_run(
@@ -1753,8 +3285,11 @@ fn editor_font_system() -> FontSystem {
     FontSystem::new_with_locale_and_db("en-US".to_owned(), db)
 }
 
+#[derive(Clone, Debug)]
 struct TextRun {
     node: DocumentNodeId,
+    font_id: u64,
+    paint_id: u64,
     bounds: Rect,
     clip: Option<Rect>,
     text: String,
@@ -1787,208 +3322,112 @@ enum TextVerticalAlign {
     Bottom,
 }
 
+#[cfg(test)]
 fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
-    let viewport = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: width as f32,
-        height: height as f32,
-    };
-    let mut runs = Vec::new();
-    for item in frame
-        .display_list
-        .iter()
-        .filter(|item| rect_intersects(item.bounds, viewport))
-    {
-        let Some(_) = clipped_item_bounds(item) else {
-            continue;
-        };
-        let size = style_number(&item.style, "size").unwrap_or(14.0);
-        let line_height = style_line_height(&item.style, size);
-        let raw_text = item.text.as_deref().unwrap_or_default();
-        if style_bool(&item.style, "paint") == Some(false)
-            || (style_bool(&item.style, "__hover_visible") == Some(true)
-                && style_bool(&item.style, "__hover_paint") != Some(true))
-        {
-            continue;
-        }
-        let checked = style_bool(&item.style, "checked") == Some(true);
-        let input_wants_caret_layout = matches!(item.kind, DocumentNodeKind::TextInput)
-            && (item.focused
-                || style_bool(&item.style, "focus") == Some(true)
-                || style_bool(&item.style, "caret_visible").is_some()
-                || item.style.contains_key("caret_column"));
-        let mut placeholder_active = false;
-        let (text, color) = if raw_text.trim().is_empty() {
-            if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
-                (
-                    "✓".to_owned(),
-                    style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
-                )
-            } else if let Some(placeholder) =
-                style_text(&item.style, "placeholder").filter(|text| !text.trim().is_empty())
-            {
-                placeholder_active = true;
-                (
-                    placeholder.to_owned(),
-                    style_color_u8(&item.style, "placeholder_color")
-                        .unwrap_or([154, 154, 154, 255]),
-                )
-            } else if input_wants_caret_layout {
-                (
-                    String::new(),
-                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
-                )
-            } else {
-                continue;
-            }
-        } else {
-            let color = style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]);
-            (raw_text.to_owned(), color)
-        };
-        let run_size = if placeholder_active {
-            style_number(&item.style, "placeholder_size").unwrap_or(size)
-        } else {
-            size
-        };
-        let run_line_height = if placeholder_active {
-            style_number(&item.style, "placeholder_line_height").unwrap_or(line_height)
-        } else {
-            line_height
-        };
-        let font_family = if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
-            "DejaVu Sans"
-        } else if placeholder_active {
-            style_text(&item.style, "placeholder_font")
-                .or_else(|| style_text(&item.style, "font"))
-                .unwrap_or(DOCUMENT_FONT_FAMILY)
-        } else {
-            style_text(&item.style, "font").unwrap_or(DOCUMENT_FONT_FAMILY)
-        };
-        let rich_spans = rich_text_spans(&item.style, &text, color);
-        runs.push(TextRun {
-            node: item.node.clone(),
-            bounds: text_content_bounds_for_item(item),
-            clip: clip_rect_for_style(&item.style),
-            text,
-            rich_spans,
-            font_family: font_family.to_owned(),
-            font_style: if placeholder_active {
-                style_text(&item.style, "placeholder_style")
-                    .map(text_font_style_value)
-                    .unwrap_or_else(|| text_font_style(&item.style))
-            } else {
-                text_font_style(&item.style)
-            },
-            font_weight: if placeholder_active {
-                placeholder_font_weight(&item.style)
-                    .unwrap_or_else(|| text_font_weight(&item.style))
-            } else {
-                text_font_weight(&item.style)
-            },
-            font_features: style_text(&item.style, "font_features")
-                .unwrap_or("")
-                .to_owned(),
-            text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
-            text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
-            color,
-            size: run_size,
-            line_height: run_line_height,
-            align: text_align(&item.kind, &item.style),
-            vertical_align: text_vertical_align(&item.kind, &item.style),
-            rotate_degrees: normalized_quarter_turn(style_number(&item.style, "rotate")),
-        });
-        runs.extend(editor_type_hint_runs(item, width, height));
-    }
-    runs
-}
-
-fn editor_type_hint_runs(item: &DisplayItem, _width: u32, _height: u32) -> Vec<TextRun> {
-    if !matches!(item.kind, DocumentNodeKind::Text) {
-        return Vec::new();
-    }
-    let Some(hints_json) = style_text(&item.style, "editor_type_hints_json") else {
-        return Vec::new();
-    };
-    let Ok(hints) = serde_json::from_str::<Vec<EditorTypeHintPayload>>(hints_json) else {
-        return Vec::new();
-    };
-    if hints.is_empty() {
-        return Vec::new();
-    }
-    let source_text = item.text.as_deref().unwrap_or_default();
-    let column_edges =
-        editor_text_column_edges_for_style(source_text, &item.style, item.bounds.height);
-    let inset = style_number(&item.style, "text_inset").unwrap_or(0.0);
-    let font_size = (style_number(&item.style, "size").unwrap_or(14.0) - 1.0).max(10.0);
-    let font_family = style_text(&item.style, "font").unwrap_or("JetBrains Mono");
-    let font_features = style_text(&item.style, "font_features")
-        .unwrap_or("")
-        .to_owned();
-    let color =
-        style_color_u8(&item.style, "editor_type_hint_color").unwrap_or([138, 160, 184, 255]);
-    let source_len = source_text.chars().count();
-    hints
+    neutral_text_runs(frame, width, height)
         .into_iter()
-        .take(1)
-        .enumerate()
-        .filter_map(|(index, hint)| {
-            if hint.compact_label.trim().is_empty() {
-                return None;
-            }
-            let column = hint
-                .anchor_column
-                .saturating_sub(1)
-                .max(source_len)
-                .min(source_len);
-            let x = item.bounds.x
-                + inset
-                + column_edges
-                    .get(column)
-                    .copied()
-                    .or_else(|| column_edges.last().copied())
-                    .unwrap_or_default()
-                + 12.0;
-            let available_width = item.bounds.x + item.bounds.width - x;
-            if available_width < font_size * 2.0 {
-                return None;
-            }
-            let text = format!(": {}", hint.compact_label);
-            Some(TextRun {
-                node: DocumentNodeId(format!("{}:type-hint:{index}", item.node.0)),
-                bounds: Rect {
-                    x,
-                    y: item.bounds.y,
-                    width: available_width,
-                    height: item.bounds.height,
-                },
-                clip: clip_rect_for_style(&item.style),
-                text,
-                rich_spans: Vec::new(),
-                font_family: font_family.to_owned(),
-                font_style: Style::Italic,
-                font_weight: Weight::NORMAL,
-                font_features: font_features.clone(),
-                text_inset: 0.0,
-                text_clip_padding: 0.0,
-                color,
-                size: font_size,
-                line_height: item.bounds.height,
-                align: TextAlign::Left,
-                vertical_align: TextVerticalAlign::Center,
-                rotate_degrees: 0,
-            })
-        })
+        .map(TextRun::from)
         .collect()
 }
 
+#[cfg(test)]
+fn neutral_text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<RenderTextRun> {
+    let mut columns = GlyphonRenderTextColumnMeasurer::new();
+    boon_document::render_scene::render_text_runs(frame, width, height, &mut columns)
+}
+
+pub struct GlyphonRenderTextColumnMeasurer {
+    service: GlyphonTextService,
+}
+
+impl GlyphonRenderTextColumnMeasurer {
+    pub fn new() -> Self {
+        Self {
+            service: GlyphonTextService::new(),
+        }
+    }
+}
+
+impl Default for GlyphonRenderTextColumnMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderTextColumnMeasurer for GlyphonRenderTextColumnMeasurer {
+    fn column_edges(&mut self, text: &str, style: &StyleMap, line_height: f32) -> Vec<f32> {
+        self.service
+            .editor_column_edges_for_style(text, style, line_height)
+    }
+}
+
+impl From<RenderTextRun> for TextRun {
+    fn from(run: RenderTextRun) -> Self {
+        Self {
+            node: run.node,
+            font_id: run.font_id,
+            paint_id: run.paint_id,
+            bounds: run.bounds,
+            clip: run.clip,
+            text: run.text,
+            rich_spans: run.rich_spans.into_iter().map(RichTextSpan::from).collect(),
+            font_family: run.font_family,
+            font_style: glyphon_font_style(run.font_style),
+            font_weight: glyphon_font_weight(run.font_weight),
+            font_features: run.font_features,
+            text_inset: run.text_inset,
+            text_clip_padding: run.text_clip_padding,
+            color: run.color,
+            size: run.size,
+            line_height: run.line_height,
+            align: text_align_from_render(run.align),
+            vertical_align: text_vertical_align_from_render(run.vertical_align),
+            rotate_degrees: run.rotate_degrees,
+        }
+    }
+}
+
+impl From<RenderRichTextSpan> for RichTextSpan {
+    fn from(span: RenderRichTextSpan) -> Self {
+        Self {
+            text: span.text,
+            color: span.color,
+            font_style: glyphon_font_style(span.font_style),
+            font_weight: glyphon_font_weight(span.font_weight),
+        }
+    }
+}
+
+fn glyphon_font_style(style: RenderFontStyle) -> Style {
+    match style {
+        RenderFontStyle::Normal => Style::Normal,
+        RenderFontStyle::Italic => Style::Italic,
+        RenderFontStyle::Oblique => Style::Oblique,
+    }
+}
+
+fn glyphon_font_weight(weight: RenderFontWeight) -> Weight {
+    Weight(weight.0)
+}
+
+fn text_align_from_render(align: RenderTextAlign) -> TextAlign {
+    match align {
+        RenderTextAlign::Left => TextAlign::Left,
+        RenderTextAlign::Center => TextAlign::Center,
+        RenderTextAlign::Right => TextAlign::Right,
+    }
+}
+
+fn text_vertical_align_from_render(align: RenderTextVerticalAlign) -> TextVerticalAlign {
+    match align {
+        RenderTextVerticalAlign::Top => TextVerticalAlign::Top,
+        RenderTextVerticalAlign::Center => TextVerticalAlign::Center,
+        RenderTextVerticalAlign::Bottom => TextVerticalAlign::Bottom,
+    }
+}
+
 fn rich_text_spans(style: &StyleMap, text: &str, default_color: [u8; 4]) -> Vec<RichTextSpan> {
-    let Some(spans_json) = style_text(style, "syntax_spans_json") else {
-        return Vec::new();
-    };
-    let Ok(payloads) = serde_json::from_str::<Vec<RichTextSpanPayload>>(spans_json) else {
-        return Vec::new();
-    };
+    let payloads = rich_text_span_payloads(style);
     let mut source_text = String::new();
     let spans = payloads
         .into_iter()
@@ -2021,6 +3460,15 @@ fn rich_text_spans(style: &StyleMap, text: &str, default_color: [u8; 4]) -> Vec<
     }
 }
 
+fn rich_text_span_payloads(style: &StyleMap) -> Vec<StyleRichTextSpan> {
+    match state_style_value(style, "syntax_spans_json") {
+        Some(StyleValue::RichTextSpans(spans)) => spans.clone(),
+        _ => style_text(style, "syntax_spans_json")
+            .and_then(|spans_json| serde_json::from_str::<Vec<StyleRichTextSpan>>(spans_json).ok())
+            .unwrap_or_default(),
+    }
+}
+
 pub fn editor_text_column_edges(
     text: &str,
     font_size: f32,
@@ -2028,33 +3476,13 @@ pub fn editor_text_column_edges(
     font_family: &str,
     font_features: &str,
 ) -> Vec<f32> {
-    let mut font_system = editor_font_system();
-    let color = [217, 225, 242, 255];
-    let mut buffer = Buffer::new(
-        &mut font_system,
-        Metrics::new(font_size.max(1.0), line_height.max(font_size.max(1.0))),
-    );
-    buffer.set_size(
-        &mut font_system,
-        None,
-        Some(line_height.max(font_size.max(1.0))),
-    );
-    buffer.set_text(
-        &mut font_system,
+    GlyphonTextService::new().editor_column_edges(
         text,
-        &text_attrs(
-            font_family,
-            Style::Normal,
-            Weight::NORMAL,
-            color,
-            font_features,
-        ),
-        Shaping::Advanced,
-        None,
-    );
-    buffer.shape_until_scroll(&mut font_system, false);
-    let line_width = shaped_line_width(&buffer).unwrap_or_default();
-    shaped_column_edges(text, &buffer, line_width)
+        font_size,
+        line_height,
+        font_family,
+        font_features,
+    )
 }
 
 pub fn editor_text_column_edges_for_style(
@@ -2062,53 +3490,7 @@ pub fn editor_text_column_edges_for_style(
     style: &StyleMap,
     line_height: f32,
 ) -> Vec<f32> {
-    let mut font_system = editor_font_system();
-    let font_size = style_number(style, "size").unwrap_or(14.0).max(1.0);
-    let line_height = line_height.max(font_size);
-    let color = style_color_u8(style, "color").unwrap_or([217, 225, 242, 255]);
-    let font_family = style_text(style, "font").unwrap_or(EDITOR_FONT_FAMILY);
-    let font_features = style_text(style, "font_features").unwrap_or(EDITOR_FONT_FEATURES);
-    let default_attrs = text_attrs(
-        font_family,
-        text_font_style(style),
-        text_font_weight(style),
-        color,
-        font_features,
-    );
-    let mut buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(&mut font_system, None, Some(line_height));
-    let rich_spans = rich_text_spans(style, text, color);
-    if rich_spans.is_empty() {
-        buffer.set_text(
-            &mut font_system,
-            text,
-            &default_attrs,
-            Shaping::Advanced,
-            None,
-        );
-    } else {
-        buffer.set_rich_text(
-            &mut font_system,
-            rich_spans.iter().map(|span| {
-                (
-                    span.text.as_str(),
-                    text_attrs(
-                        font_family,
-                        span.font_style,
-                        span.font_weight,
-                        span.color,
-                        font_features,
-                    ),
-                )
-            }),
-            &default_attrs,
-            Shaping::Advanced,
-            None,
-        );
-    }
-    buffer.shape_until_scroll(&mut font_system, false);
-    let line_width = shaped_line_width(&buffer).unwrap_or_default();
-    shaped_column_edges(text, &buffer, line_width)
+    GlyphonTextService::new().editor_column_edges_for_style(text, style, line_height)
 }
 
 fn text_font_features(value: &str) -> FontFeatures {
@@ -2166,15 +3548,6 @@ fn text_font_weight(style: &StyleMap) -> Weight {
                 .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
         })
         .unwrap_or(Weight::NORMAL)
-}
-
-fn placeholder_font_weight(style: &StyleMap) -> Option<Weight> {
-    style_text(style, "placeholder_weight")
-        .map(text_font_weight_value)
-        .or_else(|| {
-            style_number(style, "placeholder_weight")
-                .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
-        })
 }
 
 fn text_font_weight_value(value: &str) -> Weight {
@@ -2248,22 +3621,6 @@ fn style_line_height(style: &StyleMap, font_size: f32) -> f32 {
         _ => fallback,
     }
     .max(1.0)
-}
-
-fn normalized_quarter_turn(value: Option<f32>) -> u32 {
-    let Some(value) = value else {
-        return 0;
-    };
-    let rounded = value.round();
-    if (value - rounded).abs() > 0.01 {
-        return 0;
-    }
-    match ((rounded as i32 % 360) + 360) % 360 {
-        90 => 90,
-        180 => 180,
-        270 => 270,
-        _ => 0,
-    }
 }
 
 fn text_top_for_parts(
@@ -2472,26 +3829,6 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
         .collect()
 }
 
-fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextAlign {
-    if style_bool(style, "center") == Some(true) {
-        return TextAlign::Center;
-    }
-    match style_text(style, "text_align")
-        .or_else(|| style_text(style, "align_text"))
-        .or_else(|| style_text(style, "align"))
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("left") => TextAlign::Left,
-        Some("center") => TextAlign::Center,
-        Some("right") => TextAlign::Right,
-        _ if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) => {
-            TextAlign::Center
-        }
-        _ => TextAlign::Left,
-    }
-}
-
 fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVerticalAlign {
     if style_bool(style, "center_y") == Some(true)
         || style_bool(style, "center_vertical") == Some(true)
@@ -2524,7 +3861,7 @@ fn style_number(style: &StyleMap, key: &str) -> Option<f32> {
     match state_style_value(style, key)? {
         StyleValue::Number(value) => Some(*value as f32),
         StyleValue::Text(value) => value.parse::<f32>().ok(),
-        StyleValue::Bool(_) => None,
+        StyleValue::Bool(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
     }
 }
 
@@ -2532,14 +3869,19 @@ fn style_bool(style: &StyleMap, key: &str) -> Option<bool> {
     match state_style_value(style, key)? {
         StyleValue::Bool(value) => Some(*value),
         StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(_) => None,
+        StyleValue::Number(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => {
+            None
+        }
     }
 }
 
 fn style_text<'a>(style: &'a StyleMap, key: &str) -> Option<&'a str> {
     match state_style_value(style, key)? {
         StyleValue::Text(value) => Some(value.as_str()),
-        StyleValue::Number(_) | StyleValue::Bool(_) => None,
+        StyleValue::Number(_)
+        | StyleValue::Bool(_)
+        | StyleValue::RichTextSpans(_)
+        | StyleValue::EditorTypeHints(_) => None,
     }
 }
 
@@ -2565,7 +3907,9 @@ fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
     match style.get(key)? {
         StyleValue::Bool(value) => Some(*value),
         StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(_) => None,
+        StyleValue::Number(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => {
+            None
+        }
     }
 }
 
@@ -2932,6 +4276,11 @@ fn push_asset_rect(
         builder,
         QuadTexture::Asset(AssetTextureKey {
             url: asset_url.to_owned(),
+            asset_ref: RenderAssetRef::inline_svg_data_url(
+                asset_url,
+                texture_width,
+                texture_height,
+            ),
             width: texture_width,
             height: texture_height,
         }),
@@ -4247,10 +5596,13 @@ fn srgb_u8_to_linear_f32(channel: u8) -> f32 {
 }
 
 fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {
-    let StyleValue::Text(value) = state_style_value(style, key)? else {
-        return None;
-    };
-    parse_oklch_color(value).or_else(|| parse_hex_color(value))
+    match state_style_value(style, key)? {
+        StyleValue::Text(value) => parse_oklch_color(value).or_else(|| parse_hex_color(value)),
+        StyleValue::Number(_)
+        | StyleValue::Bool(_)
+        | StyleValue::RichTextSpans(_)
+        | StyleValue::EditorTypeHints(_) => None,
+    }
 }
 
 fn parse_oklch_color(value: &str) -> Option<[u8; 4]> {
@@ -4314,18 +5666,1092 @@ fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_document::{AccessibilityTree, DisplayItem, DocumentNodeId, LayoutMetrics};
+    use boon_document::{
+        AccessibilityTree, ComputedStyleIdentity, DisplayItem, DocumentNodeId, LayoutMetrics,
+    };
+
+    fn test_style_identity() -> ComputedStyleIdentity {
+        ComputedStyleIdentity {
+            style_id: 1,
+            layout_id: 2,
+            paint_id: 3,
+            material_id: 4,
+            font_id: 5,
+            pseudo_state_id: 6,
+        }
+    }
 
     fn flatten_quad_batches(batches: &[QuadBatch]) -> (Vec<f32>, Vec<u8>) {
         let mut positions = Vec::new();
         let mut colors = Vec::new();
         for batch in batches {
-            positions.extend_from_slice(&batch.positions);
-            for color in &batch.colors {
-                colors.extend_from_slice(&rgba8_from_packed(*color));
+            for vertex in &batch.vertices {
+                positions.extend_from_slice(&vertex.position);
+                colors.extend_from_slice(&rgba8_from_packed(vertex.color));
             }
         }
         (positions, colors)
+    }
+
+    #[test]
+    fn native_gpu_quad_vertex_pod_layout_matches_shader_locations() {
+        assert_eq!(std::mem::size_of::<NativeGpuQuadVertex>(), 20);
+        assert_eq!(std::mem::align_of::<NativeGpuQuadVertex>(), 4);
+        assert_eq!(NATIVE_GPU_QUAD_VERTEX_STRIDE, 20);
+        assert_eq!(NATIVE_GPU_QUAD_VERTEX_POSITION_OFFSET, 0);
+        assert_eq!(NATIVE_GPU_QUAD_VERTEX_COLOR_OFFSET, 8);
+        assert_eq!(NATIVE_GPU_QUAD_VERTEX_UV_OFFSET, 12);
+
+        let layout = native_gpu_quad_vertex_buffer_layout();
+        assert_eq!(layout.array_stride, NATIVE_GPU_QUAD_VERTEX_STRIDE);
+        assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
+        assert_eq!(layout.attributes.len(), 3);
+        assert_eq!(
+            layout.attributes[0],
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: NATIVE_GPU_QUAD_VERTEX_POSITION_OFFSET,
+                shader_location: 0,
+            }
+        );
+        assert_eq!(
+            layout.attributes[1],
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: NATIVE_GPU_QUAD_VERTEX_COLOR_OFFSET,
+                shader_location: 1,
+            }
+        );
+        assert_eq!(
+            layout.attributes[2],
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: NATIVE_GPU_QUAD_VERTEX_UV_OFFSET,
+                shader_location: 2,
+            }
+        );
+
+        let generated = generated::shader_bindings::native_gpu_rect::vs_main_entry(
+            wgpu::VertexStepMode::Vertex,
+            wgpu::VertexStepMode::Vertex,
+            wgpu::VertexStepMode::Vertex,
+        );
+        let generated_inputs = generated
+            .buffers
+            .iter()
+            .flat_map(|buffer| buffer.attributes.iter().copied())
+            .map(|attribute| (attribute.shader_location, attribute.format))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generated_inputs,
+            NATIVE_GPU_QUAD_VERTEX_ATTRIBUTES
+                .iter()
+                .map(|attribute| (attribute.shader_location, attribute.format))
+                .collect::<Vec<_>>(),
+            "the host-interleaved POD buffer must feed the same generated shader locations and formats"
+        );
+    }
+
+    #[test]
+    fn split_document_quad_batch_interleaves_without_value_drift() {
+        let batch = boon_document::RenderQuadBatch {
+            retained_chunk_id: None,
+            texture: RenderTextureRef::Solid,
+            positions: vec![1.0, 2.0, 3.0, 4.0],
+            colors: vec![0x4433_2211, 0x8877_6655],
+            uvs: vec![0.25, 0.5, 0.75, 1.0],
+        };
+
+        let converted = quad_batch_from_document_batch(&batch, 0);
+
+        assert_eq!(
+            converted.vertices,
+            vec![
+                NativeGpuQuadVertex {
+                    position: [1.0, 2.0],
+                    color: 0x4433_2211,
+                    uv: [0.25, 0.5],
+                },
+                NativeGpuQuadVertex {
+                    position: [3.0, 4.0],
+                    color: 0x8877_6655,
+                    uv: [0.75, 1.0],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn quad_upload_ring_wraps_and_invalidates_cached_ranges() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!("skipping quad upload ring test: request_adapter failed: {error}");
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-gpu-quad-upload-ring-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let mut ring = QuadUploadRing::default();
+            let mut cache = BTreeMap::new();
+            let first_vertices = vec![
+                NativeGpuQuadVertex {
+                    position: [0.0, 0.0],
+                    color: 0xff00_ffff,
+                    uv: [0.0, 0.0],
+                };
+                5_000
+            ];
+            let first_bytes = bytemuck::cast_slice(&first_vertices);
+            let first_key = QuadBatchCacheKey {
+                retained_chunk_id: "test-first".to_owned(),
+                texture: QuadTexture::Solid,
+                vertex_count: first_vertices.len() as u32,
+                content_key: quad_batch_content_key(first_bytes),
+            };
+            let first_begin_stats = ring
+                .begin_frame(
+                    &device,
+                    quad_upload_reservation_size(first_bytes.len() as u64),
+                    quad_upload_reservation_size(first_bytes.len() as u64),
+                    Some(&mut cache),
+                )
+                .expect("first frame should reserve the minimum ring");
+            let (first_batch, first_upload_stats) = ring
+                .upload_reserved(
+                    &queue,
+                    first_bytes,
+                    first_vertices.len() as u32,
+                    Some("test-first".to_owned()),
+                )
+                .expect("first upload should fit the reserved ring");
+            cache.insert(first_key, first_batch);
+
+            assert_eq!(
+                first_begin_stats.allocated_gpu_bytes,
+                QUAD_UPLOAD_RING_MIN_BYTES
+            );
+            assert_eq!(first_begin_stats.staging_wrap_count, 0);
+            assert_eq!(first_begin_stats.queue_write_count, 0);
+            assert_eq!(first_upload_stats.queue_write_count, 1);
+            assert_eq!(first_upload_stats.dirty_upload_ranges.len(), 1);
+            assert_eq!(first_upload_stats.dirty_upload_ranges[0].offset, 0);
+            assert_eq!(
+                first_upload_stats.dirty_upload_ranges[0].size,
+                first_bytes.len() as u64
+            );
+            assert_eq!(
+                first_upload_stats.dirty_upload_ranges[0]
+                    .retained_chunk_id
+                    .as_deref(),
+                Some("test-first")
+            );
+            assert_eq!(cache.len(), 1);
+
+            let second_vertices = vec![
+                NativeGpuQuadVertex {
+                    position: [1.0, 1.0],
+                    color: 0xffff_00ff,
+                    uv: [1.0, 1.0],
+                };
+                10_000
+            ];
+            let second_bytes = bytemuck::cast_slice(&second_vertices);
+            let second_begin_stats = ring
+                .begin_frame(
+                    &device,
+                    quad_upload_reservation_size(second_bytes.len() as u64),
+                    quad_upload_reservation_size(second_bytes.len() as u64),
+                    Some(&mut cache),
+                )
+                .expect("second frame should wrap before uploading into the existing ring");
+            let (_second_batch, second_upload_stats) = ring
+                .upload_reserved(
+                    &queue,
+                    second_bytes,
+                    second_vertices.len() as u32,
+                    Some("test-second".to_owned()),
+                )
+                .expect("second upload should fit after frame-level wrap");
+
+            assert_eq!(second_begin_stats.allocated_gpu_bytes, 0);
+            assert_eq!(second_begin_stats.staging_wrap_count, 1);
+            assert_eq!(second_begin_stats.cache_eviction_count, 1);
+            assert!(second_begin_stats.invalidated_cached_ranges);
+            assert_eq!(second_upload_stats.queue_write_count, 1);
+            assert_eq!(second_upload_stats.dirty_upload_ranges.len(), 1);
+            assert_eq!(second_upload_stats.dirty_upload_ranges[0].offset, 0);
+            assert_eq!(
+                second_upload_stats.dirty_upload_ranges[0].size,
+                second_bytes.len() as u64
+            );
+            assert_eq!(
+                second_upload_stats.dirty_upload_ranges[0].ring_generation,
+                first_upload_stats.dirty_upload_ranges[0].ring_generation + 1
+            );
+            assert!(
+                cache.is_empty(),
+                "wrapping the ring must invalidate cached ranges that could be overwritten"
+            );
+        });
+    }
+
+    #[test]
+    fn quad_upload_ring_grows_before_multi_batch_frame_can_overwrite_live_ranges() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "skipping multi-batch upload ring test: request_adapter failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-gpu-quad-upload-ring-multi-batch-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let mut ring = QuadUploadRing::default();
+            let first_vertices = vec![
+                NativeGpuQuadVertex {
+                    position: [0.0, 0.0],
+                    color: 0xff00_00ff,
+                    uv: [0.0, 0.0],
+                };
+                10_000
+            ];
+            let second_vertices = vec![
+                NativeGpuQuadVertex {
+                    position: [1.0, 1.0],
+                    color: 0x00ff_00ff,
+                    uv: [1.0, 1.0],
+                };
+                5_000
+            ];
+            let first_bytes = bytemuck::cast_slice(&first_vertices);
+            let second_bytes = bytemuck::cast_slice(&second_vertices);
+            let frame_reservation = quad_upload_reservation_size(first_bytes.len() as u64)
+                .saturating_add(quad_upload_reservation_size(second_bytes.len() as u64));
+            let begin_stats = ring
+                .begin_frame(&device, frame_reservation, frame_reservation, None)
+                .expect("large multi-batch frame should reserve enough ring space up front");
+            assert!(begin_stats.allocated_gpu_bytes > QUAD_UPLOAD_RING_MIN_BYTES);
+            assert_eq!(begin_stats.staging_wrap_count, 0);
+
+            let (_first_batch, first_upload) = ring
+                .upload_reserved(
+                    &queue,
+                    first_bytes,
+                    first_vertices.len() as u32,
+                    Some("test-first".to_owned()),
+                )
+                .expect("first frame batch should upload into reserved ring");
+            let (_second_batch, second_upload) = ring
+                .upload_reserved(
+                    &queue,
+                    second_bytes,
+                    second_vertices.len() as u32,
+                    Some("test-second".to_owned()),
+                )
+                .expect("second frame batch should upload without wrapping over the first batch");
+            let first_range = &first_upload.dirty_upload_ranges[0];
+            let second_range = &second_upload.dirty_upload_ranges[0];
+            assert_eq!(first_range.offset, 0);
+            assert_eq!(second_range.offset, first_range.size);
+            assert_eq!(first_range.ring_generation, second_range.ring_generation);
+        });
+    }
+
+    #[test]
+    fn render_scene_boundary_exposes_primitive_items_textures_and_text_runs() {
+        let mut style = StyleMap::new();
+        style.insert("bg".to_owned(), StyleValue::Text("#101820".to_owned()));
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        style.insert(
+            "asset_url".to_owned(),
+            StyleValue::Text("asset://icon".to_owned()),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("scene-node".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 4.0,
+                    y: 8.0,
+                    width: 96.0,
+                    height: 24.0,
+                },
+                style,
+                text: Some("Scene".to_owned()),
+                focused: false,
+                style_identity: test_style_identity(),
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let text_runs = neutral_text_runs(&frame, 320, 200);
+        let scene = render_scene_from_layout_frame(&frame, 320, 200, text_runs, None);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
+        let chunks = retained_render_chunks(&scene, 1, None);
+
+        assert_eq!(scene.items.len(), 1);
+        assert_eq!(scene.items[0].node.0, "scene-node");
+        assert!(
+            scene.items[0]
+                .texture_asset_refs
+                .iter()
+                .any(|asset| asset.starts_with("asset:svg-data-url:"))
+        );
+        assert_eq!(scene.text_runs.len(), 1);
+        assert!(!batches.is_empty());
+        assert!(metrics.visible_display_item_count >= 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text_run_ids.len(), 1);
+        assert!(
+            chunks[0]
+                .texture_asset_refs
+                .iter()
+                .any(|asset| asset.starts_with("asset:svg-data-url:"))
+        );
+    }
+
+    #[test]
+    fn renderer_helpers_accept_prelowered_render_scene_without_layout_frame() {
+        let item = RenderSceneItem {
+            node: DocumentNodeId("primitive-node".to_owned()),
+            retained_chunk_id: "chunk:primitive-node".to_owned(),
+            source_kind: "Stack".to_owned(),
+            bounds: Rect {
+                x: 8.0,
+                y: 10.0,
+                width: 64.0,
+                height: 32.0,
+            },
+            clip: None,
+            transform: [1.0, 0.0, 0.0, 1.0, 8.0, 10.0],
+            style_identity: test_style_identity(),
+            dependency_set: vec![
+                "node:primitive-node".to_owned(),
+                "kind:Stack".to_owned(),
+                "style:1".to_owned(),
+            ],
+            texture_asset_refs: Vec::new(),
+            estimated_vertex_count: 6,
+        };
+        let mut builder = QuadBuilder::default();
+        builder.set_retained_chunk_id(&item.retained_chunk_id);
+        push_rect(
+            &mut builder,
+            item.bounds,
+            320.0,
+            200.0,
+            [0.1, 0.2, 0.3, 1.0],
+        );
+        let scene = RenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 200.0,
+            },
+            items: vec![item],
+            quad_batches: builder.batches,
+            rect_metrics: RectVertexMetrics {
+                visible_display_item_count: 1,
+                rendered_rect_count: 1,
+                cap_hit: false,
+            },
+            text_runs: Vec::new(),
+        };
+
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
+        let chunks = retained_render_chunks(&scene, 3, None);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(metrics.visible_display_item_count, 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].node.0, "primitive-node");
+        assert_eq!(chunks[0].dependency_set[0], "node:primitive-node");
+    }
+
+    #[test]
+    fn renderer_adapts_external_document_render_scene_without_layout_frame() {
+        let style_identity = test_style_identity();
+        let document_scene = DocumentRenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 200.0,
+            },
+            items: vec![boon_document::RenderSceneItem {
+                node: DocumentNodeId("external-node".to_owned()),
+                retained_chunk_id: "chunk:external-node".to_owned(),
+                source_kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 24.0,
+                    y: 32.0,
+                    width: 80.0,
+                    height: 28.0,
+                },
+                clip: None,
+                transform: [1.0, 0.0, 0.0, 1.0, 24.0, 32.0],
+                style_identity,
+                dependency_set: vec!["prelowered:button".to_owned()],
+                texture_asset_refs: Vec::new(),
+                estimated_vertex_count: 6,
+            }],
+            visual_primitives: vec![RenderVisualPrimitive {
+                node: DocumentNodeId("external-node".to_owned()),
+                retained_chunk_id: "chunk:external-node".to_owned(),
+                source_kind: DocumentNodeKind::Button,
+                primitive: RenderVisualPrimitiveKind::Fill,
+                bounds: Rect {
+                    x: 24.0,
+                    y: 32.0,
+                    width: 80.0,
+                    height: 28.0,
+                },
+                clip: None,
+                radius: 4.0,
+                stroke_width: 0.0,
+                color: [20, 80, 160, 255],
+                secondary_color: [0, 0, 0, 0],
+                antialias: 0.0,
+                control_points: Vec::new(),
+                texture: RenderTextureRef::Solid,
+                style_identity,
+                dependency_set: vec!["prelowered:fill".to_owned()],
+            }],
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics {
+                visible_source_item_count: 1,
+                visual_primitive_count: 1,
+                rendered_rect_count: 1,
+                cap_hit: false,
+            },
+        };
+
+        let scene = render_scene_from_document_scene(&document_scene, 320, 200);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
+        let chunks = retained_render_chunks(&scene, 11, None);
+
+        assert_eq!(scene.items[0].source_kind, "Button");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(metrics.visible_display_item_count, 1);
+        assert_eq!(metrics.rendered_rect_count, 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, "Button");
+        assert_eq!(chunks[0].dependency_set, vec!["prelowered:button"]);
+    }
+
+    #[test]
+    fn renderer_paints_external_document_border_primitives() {
+        let style_identity = test_style_identity();
+        let document_scene = DocumentRenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 160.0,
+                height: 90.0,
+            },
+            items: vec![boon_document::RenderSceneItem {
+                node: DocumentNodeId("bordered".to_owned()),
+                retained_chunk_id: "chunk:bordered".to_owned(),
+                source_kind: DocumentNodeKind::Stack,
+                bounds: Rect {
+                    x: 12.0,
+                    y: 10.0,
+                    width: 80.0,
+                    height: 36.0,
+                },
+                clip: None,
+                transform: [1.0, 0.0, 0.0, 1.0, 12.0, 10.0],
+                style_identity,
+                dependency_set: vec!["prelowered:bordered".to_owned()],
+                texture_asset_refs: Vec::new(),
+                estimated_vertex_count: 12,
+            }],
+            visual_primitives: vec![
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("bordered".to_owned()),
+                    retained_chunk_id: "chunk:bordered".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::Fill,
+                    bounds: Rect {
+                        x: 12.0,
+                        y: 10.0,
+                        width: 80.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    radius: 0.0,
+                    stroke_width: 0.0,
+                    color: [220, 230, 240, 255],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:fill".to_owned()],
+                },
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("bordered".to_owned()),
+                    retained_chunk_id: "chunk:bordered".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::BorderBottom,
+                    bounds: Rect {
+                        x: 12.0,
+                        y: 10.0,
+                        width: 80.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    radius: 0.0,
+                    stroke_width: 4.0,
+                    color: [16, 32, 48, 255],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:border-bottom".to_owned()],
+                },
+            ],
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics {
+                visible_source_item_count: 1,
+                visual_primitive_count: 2,
+                rendered_rect_count: 2,
+                cap_hit: false,
+            },
+        };
+
+        let scene = render_scene_from_document_scene(&document_scene, 160, 90);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 160.0, 90.0);
+        let (positions, colors) = flatten_quad_batches(&batches);
+
+        assert_eq!(metrics.rendered_rect_count, 2);
+        assert!(
+            positions.len() >= 24,
+            "fill plus border should emit at least two rect quads"
+        );
+        let expected_border_color = rgba8_from_f32(linear_f32_from_rgba8([16, 32, 48, 255]));
+        assert!(
+            colors
+                .chunks_exact(4)
+                .any(|color| color == expected_border_color),
+            "external border primitive color should be present in GPU quad data"
+        );
+    }
+
+    #[test]
+    fn renderer_paints_external_document_material_layer_primitives() {
+        let style_identity = test_style_identity();
+        let document_scene = DocumentRenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 160.0,
+                height: 90.0,
+            },
+            items: vec![boon_document::RenderSceneItem {
+                node: DocumentNodeId("glass".to_owned()),
+                retained_chunk_id: "chunk:glass".to_owned(),
+                source_kind: DocumentNodeKind::Stack,
+                bounds: Rect {
+                    x: 12.0,
+                    y: 10.0,
+                    width: 80.0,
+                    height: 36.0,
+                },
+                clip: None,
+                transform: [1.0, 0.0, 0.0, 1.0, 12.0, 10.0],
+                style_identity,
+                dependency_set: vec!["prelowered:glass".to_owned()],
+                texture_asset_refs: Vec::new(),
+                estimated_vertex_count: 18,
+            }],
+            visual_primitives: vec![
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("glass".to_owned()),
+                    retained_chunk_id: "chunk:glass".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::FrostedMaterialLayer,
+                    bounds: Rect {
+                        x: 10.0,
+                        y: 8.0,
+                        width: 84.0,
+                        height: 40.0,
+                    },
+                    clip: None,
+                    radius: 10.0,
+                    stroke_width: 0.0,
+                    color: [255, 255, 255, 12],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:frosted-material-layer".to_owned()],
+                },
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("glass".to_owned()),
+                    retained_chunk_id: "chunk:glass".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::Fill,
+                    bounds: Rect {
+                        x: 12.0,
+                        y: 10.0,
+                        width: 80.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    radius: 8.0,
+                    stroke_width: 0.0,
+                    color: [220, 230, 240, 180],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:fill".to_owned()],
+                },
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("glass".to_owned()),
+                    retained_chunk_id: "chunk:glass".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::MaterialHighlight,
+                    bounds: Rect {
+                        x: 12.0,
+                        y: 10.0,
+                        width: 80.0,
+                        height: 4.0,
+                    },
+                    clip: None,
+                    radius: 8.0,
+                    stroke_width: 0.0,
+                    color: [255, 255, 255, 32],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:material-highlight-top".to_owned()],
+                },
+            ],
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics {
+                visible_source_item_count: 1,
+                visual_primitive_count: 3,
+                rendered_rect_count: 3,
+                cap_hit: false,
+            },
+        };
+
+        let scene = render_scene_from_document_scene(&document_scene, 160, 90);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 160.0, 90.0);
+        let (positions, colors) = flatten_quad_batches(&batches);
+
+        assert_eq!(metrics.rendered_rect_count, 3);
+        assert!(
+            positions.len() >= 36,
+            "frosted layer, fill, and highlight should emit at least three rect quads"
+        );
+        for expected in [[255, 255, 255, 12], [255, 255, 255, 32]] {
+            let expected = rgba8_from_f32(linear_f32_from_rgba8(expected));
+            assert!(
+                colors.chunks_exact(4).any(|color| color == expected),
+                "external material primitive color should be present in GPU quad data"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_paints_external_document_shadow_primitives() {
+        let style_identity = test_style_identity();
+        let document_scene = DocumentRenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 160.0,
+                height: 90.0,
+            },
+            items: vec![boon_document::RenderSceneItem {
+                node: DocumentNodeId("shadowed".to_owned()),
+                retained_chunk_id: "chunk:shadowed".to_owned(),
+                source_kind: DocumentNodeKind::Stack,
+                bounds: Rect {
+                    x: 12.0,
+                    y: 10.0,
+                    width: 80.0,
+                    height: 36.0,
+                },
+                clip: None,
+                transform: [1.0, 0.0, 0.0, 1.0, 12.0, 10.0],
+                style_identity,
+                dependency_set: vec!["prelowered:shadowed".to_owned()],
+                texture_asset_refs: Vec::new(),
+                estimated_vertex_count: 12,
+            }],
+            visual_primitives: vec![
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("shadowed".to_owned()),
+                    retained_chunk_id: "chunk:shadowed".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::Shadow,
+                    bounds: Rect {
+                        x: 10.0,
+                        y: 12.0,
+                        width: 84.0,
+                        height: 40.0,
+                    },
+                    clip: None,
+                    radius: 10.0,
+                    stroke_width: 0.0,
+                    color: [12, 24, 48, 96],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:box-shadow-1".to_owned()],
+                },
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("shadowed".to_owned()),
+                    retained_chunk_id: "chunk:shadowed".to_owned(),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::Fill,
+                    bounds: Rect {
+                        x: 12.0,
+                        y: 10.0,
+                        width: 80.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    radius: 8.0,
+                    stroke_width: 0.0,
+                    color: [240, 244, 248, 255],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:fill".to_owned()],
+                },
+            ],
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics {
+                visible_source_item_count: 1,
+                visual_primitive_count: 2,
+                rendered_rect_count: 2,
+                cap_hit: false,
+            },
+        };
+
+        let scene = render_scene_from_document_scene(&document_scene, 160, 90);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 160.0, 90.0);
+        let (positions, colors) = flatten_quad_batches(&batches);
+
+        assert_eq!(metrics.rendered_rect_count, 2);
+        assert!(
+            positions.len() >= 24,
+            "shadow plus fill should emit at least two rect quads"
+        );
+        let expected_shadow_color = rgba8_from_f32(linear_f32_from_rgba8([12, 24, 48, 96]));
+        assert!(
+            colors
+                .chunks_exact(4)
+                .any(|color| color == expected_shadow_color),
+            "external shadow primitive color should be present in GPU quad data"
+        );
+    }
+
+    #[test]
+    fn renderer_paints_external_document_checkbox_raster_primitives() {
+        let style_identity = test_style_identity();
+        let document_scene = DocumentRenderScene {
+            viewport: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 96.0,
+                height: 96.0,
+            },
+            items: vec![boon_document::RenderSceneItem {
+                node: DocumentNodeId("check".to_owned()),
+                retained_chunk_id: "chunk:check".to_owned(),
+                source_kind: DocumentNodeKind::Checkbox,
+                bounds: Rect {
+                    x: 24.0,
+                    y: 24.0,
+                    width: 24.0,
+                    height: 24.0,
+                },
+                clip: None,
+                transform: [1.0, 0.0, 0.0, 1.0, 24.0, 24.0],
+                style_identity,
+                dependency_set: vec!["prelowered:check".to_owned()],
+                texture_asset_refs: Vec::new(),
+                estimated_vertex_count: 200,
+            }],
+            visual_primitives: vec![
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("check".to_owned()),
+                    retained_chunk_id: "chunk:check".to_owned(),
+                    source_kind: DocumentNodeKind::Checkbox,
+                    primitive: RenderVisualPrimitiveKind::Checkbox,
+                    bounds: Rect {
+                        x: 24.0,
+                        y: 24.0,
+                        width: 24.0,
+                        height: 24.0,
+                    },
+                    clip: None,
+                    radius: 9.5,
+                    stroke_width: 2.0,
+                    color: [16, 96, 72, 255],
+                    secondary_color: [224, 248, 240, 255],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:checkbox-circle".to_owned()],
+                },
+                RenderVisualPrimitive {
+                    node: DocumentNodeId("check".to_owned()),
+                    retained_chunk_id: "chunk:check".to_owned(),
+                    source_kind: DocumentNodeKind::Checkbox,
+                    primitive: RenderVisualPrimitiveKind::CheckboxCheckmark,
+                    bounds: Rect {
+                        x: 24.0,
+                        y: 24.0,
+                        width: 24.0,
+                        height: 24.0,
+                    },
+                    clip: None,
+                    radius: 0.0,
+                    stroke_width: 3.0,
+                    color: [0, 128, 96, 255],
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: vec![[31.92, 37.2], [34.8, 40.08], [40.8, 32.4]],
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec!["primitive:checkbox-checkmark".to_owned()],
+                },
+            ],
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics {
+                visible_source_item_count: 1,
+                visual_primitive_count: 2,
+                rendered_rect_count: 2,
+                cap_hit: false,
+            },
+        };
+
+        let scene = render_scene_from_document_scene(&document_scene, 96, 96);
+        let (batches, metrics) = rect_vertices_from_scene(&scene, 96.0, 96.0);
+        let (positions, colors) = flatten_quad_batches(&batches);
+
+        assert_eq!(metrics.rendered_rect_count, 2);
+        assert!(
+            positions.len() > 300,
+            "checkbox raster descriptors should emit many 1px raster quads"
+        );
+        for expected in [[16, 96, 72, 255], [224, 248, 240, 255], [0, 128, 96, 255]] {
+            let expected = rgba8_from_f32(linear_f32_from_rgba8(expected));
+            assert!(
+                colors.chunks_exact(4).any(|color| color == expected),
+                "external checkbox raster primitive color should be present in GPU quad data"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_render_chunks_report_stable_metadata() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "asset_url".to_owned(),
+            StyleValue::Text("asset://logo".to_owned()),
+        );
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        let item = DisplayItem {
+            node: DocumentNodeId("hero".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 120.0,
+                height: 32.0,
+            },
+            text: Some("Hello".to_owned()),
+            style_identity: test_style_identity(),
+            style,
+            focused: false,
+        };
+        let frame = LayoutFrame {
+            display_list: vec![item],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let scene = render_scene_from_layout_frame(
+            &frame,
+            320,
+            120,
+            neutral_text_runs(&frame, 320, 120),
+            None,
+        );
+        let chunks = retained_render_chunks(&scene, 7, None);
+        let previous_chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.id.clone())
+            .collect::<BTreeSet<_>>();
+        let reused_scene = render_scene_from_layout_frame(
+            &frame,
+            320,
+            120,
+            neutral_text_runs(&frame, 320, 120),
+            None,
+        );
+        let reused_chunks = retained_render_chunks(&reused_scene, 8, Some(&previous_chunk_ids));
+
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert!(chunk.id.starts_with("chunk:hero:Text:"));
+        assert_eq!(chunk.generation, 7);
+        assert_eq!(chunk.bounds.width, 120.0);
+        assert_eq!(chunk.style_identity, test_style_identity());
+        assert!(chunk.dependency_set.iter().any(|dep| dep == "text"));
+        assert!(chunk.gpu_buffer_range.end > chunk.gpu_buffer_range.start);
+        assert_eq!(chunk.text_run_ids.len(), 1);
+        assert!(
+            chunk
+                .texture_asset_refs
+                .iter()
+                .any(|asset| asset.starts_with("asset:svg-data-url:"))
+        );
+        assert_eq!(chunk.cache_status, "miss");
+        assert_eq!(reused_chunks[0].id, chunk.id);
+        assert_eq!(reused_chunks[0].generation, 8);
+        assert_eq!(reused_chunks[0].cache_status, "hit");
+    }
+
+    #[test]
+    fn retained_render_chunks_keep_static_chrome_reusable_when_focus_chunk_changes() {
+        let chrome = DisplayItem {
+            node: DocumentNodeId("chrome".to_owned()),
+            kind: DocumentNodeKind::Stack,
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 48.0,
+            },
+            text: None,
+            style_identity: test_style_identity(),
+            style: StyleMap::new(),
+            focused: false,
+        };
+        let mut focused_identity = test_style_identity();
+        focused_identity.pseudo_state_id = 99;
+        let focused_before = DisplayItem {
+            node: DocumentNodeId("input".to_owned()),
+            kind: DocumentNodeKind::TextInput,
+            bounds: Rect {
+                x: 0.0,
+                y: 52.0,
+                width: 320.0,
+                height: 32.0,
+            },
+            text: Some("abc".to_owned()),
+            style_identity: test_style_identity(),
+            style: StyleMap::new(),
+            focused: false,
+        };
+        let focused_after = DisplayItem {
+            focused: true,
+            style_identity: focused_identity,
+            ..focused_before.clone()
+        };
+        let frame = |display_list| LayoutFrame {
+            display_list,
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let before_frame = frame(vec![chrome.clone(), focused_before]);
+        let before_scene =
+            render_scene_from_layout_frame(&before_frame, 320, 120, Vec::new(), None);
+        let before = retained_render_chunks(&before_scene, 1, None);
+        let previous_chunk_ids = before
+            .iter()
+            .map(|chunk| chunk.id.clone())
+            .collect::<BTreeSet<_>>();
+        let after_frame = frame(vec![chrome, focused_after]);
+        let after_scene = render_scene_from_layout_frame(&after_frame, 320, 120, Vec::new(), None);
+        let after = retained_render_chunks(&after_scene, 2, Some(&previous_chunk_ids));
+
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].node.0, "chrome");
+        assert_eq!(after[0].cache_status, "hit");
+        assert_eq!(after[1].node.0, "input");
+        assert_eq!(after[1].cache_status, "miss");
     }
 
     fn vertex_pixels_for_color(
@@ -4571,11 +6997,13 @@ mod tests {
                 text: Some("(abc)".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4644,11 +7072,13 @@ mod tests {
                 text: Some("abc".to_owned()),
                 style,
                 focused: true,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let text_layouts = test_text_layouts(&frame, 320, 120);
@@ -4698,6 +7128,7 @@ mod tests {
                     text: None,
                     style: parent_style,
                     focused: false,
+                    style_identity: test_style_identity(),
                 },
                 DisplayItem {
                     node: DocumentNodeId("child".to_owned()),
@@ -4711,12 +7142,14 @@ mod tests {
                     text: None,
                     style: child_style,
                     focused: false,
+                    style_identity: test_style_identity(),
                 },
             ],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4754,11 +7187,13 @@ mod tests {
                 text: Some("label".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4787,11 +7222,13 @@ mod tests {
                 text: None,
                 style: StyleMap::new(),
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4827,11 +7264,13 @@ mod tests {
                 text: None,
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4875,11 +7314,13 @@ mod tests {
                 text: None,
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4918,11 +7359,13 @@ mod tests {
                 text: None,
                 style,
                 focused: true,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -4987,11 +7430,13 @@ mod tests {
                     text: None,
                     style,
                     focused: false,
+                    style_identity: test_style_identity(),
                 }],
                 hit_regions: Vec::new(),
                 scroll_regions: Vec::new(),
                 accessibility: AccessibilityTree::default(),
                 demands: Vec::new(),
+                materialization: Vec::new(),
                 metrics: LayoutMetrics::default(),
             };
             let artifact_dir = Path::new("target/artifacts/native-gpu/tests");
@@ -5027,6 +7472,380 @@ mod tests {
     }
 
     #[test]
+    fn asset_refs_are_stable_digest_identities_for_inline_svg_uploads() {
+        let url = "data:image/svg+xml;utf8,%3Csvg%3E%3C/svg%3E".to_owned();
+        let key = AssetTextureKey {
+            asset_ref: RenderAssetRef::inline_svg_data_url(&url, 24, 32),
+            url,
+            width: 24,
+            height: 32,
+        };
+        let same = key.asset_ref();
+        let same_again = key.asset_ref();
+        let different_size = AssetTextureKey {
+            asset_ref: RenderAssetRef::inline_svg_data_url(&key.url, 25, 32),
+            width: 25,
+            ..key.clone()
+        }
+        .asset_ref();
+
+        assert_eq!(same, same_again);
+        assert_eq!(same.blob_ref, same_again.blob_ref);
+        assert_eq!(same.blob_ref.sha256.len(), 64);
+        assert!(same.blob_ref.id.starts_with("blob:sha256:"));
+        assert_eq!(same.width, 24);
+        assert_eq!(same.height, 32);
+        assert_ne!(same.id, different_size.id);
+        assert_eq!(same.blob_ref, different_size.blob_ref);
+    }
+
+    #[test]
+    fn asset_cache_reports_hits_and_avoids_repeat_raster_upload_for_known_svg() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!("skipping SVG asset cache test: request_adapter failed: {error}");
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-gpu-svg-asset-cache-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let mut style = StyleMap::new();
+            style.insert(
+                "asset_url".to_owned(),
+                StyleValue::Text(
+                    "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%3E%3Crect%20x%3D%228%22%20y%3D%228%22%20width%3D%2224%22%20height%3D%2224%22%20fill%3D%22%2300ff00%22/%3E%3C/svg%3E".to_owned(),
+                ),
+            );
+            let frame = LayoutFrame {
+                display_list: vec![DisplayItem {
+                    node: DocumentNodeId("svg-asset-cache".to_owned()),
+                    kind: DocumentNodeKind::Stack,
+                    bounds: Rect {
+                        x: 20.0,
+                        y: 20.0,
+                        width: 40.0,
+                        height: 40.0,
+                    },
+                    text: None,
+                    style,
+                    focused: false,
+                    style_identity: test_style_identity(),
+                }],
+                hit_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                accessibility: AccessibilityTree::default(),
+                demands: Vec::new(),
+                materialization: Vec::new(),
+                metrics: LayoutMetrics::default(),
+            };
+            let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("boon-native-gpu-svg-asset-cache-target"),
+                size: wgpu::Extent3d {
+                    width: 80,
+                    height: 80,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut renderer = VisibleLayoutRenderer::new(&device, &queue, format);
+
+            let mut first_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boon-native-gpu-svg-asset-cache-first"),
+                });
+            let first = renderer
+                .encode(SurfaceRenderRequest {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut first_encoder,
+                    view: &view,
+                    frame: &frame,
+                    format,
+                    width: 80,
+                    height: 80,
+                })
+                .expect("first SVG asset frame should encode");
+            queue.submit([first_encoder.finish()]);
+
+            let mut second_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boon-native-gpu-svg-asset-cache-second"),
+                });
+            let second = renderer
+                .encode(SurfaceRenderRequest {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut second_encoder,
+                    view: &view,
+                    frame: &frame,
+                    format,
+                    width: 80,
+                    height: 80,
+                })
+                .expect("second SVG asset frame should encode");
+            queue.submit([second_encoder.finish()]);
+
+            assert_eq!(first.asset_ref_count, 1);
+            assert_eq!(first.asset_cache_misses, 1);
+            assert_eq!(first.asset_decode_count, 1);
+            assert_eq!(first.asset_raster_count, 1);
+            assert_eq!(first.asset_upload_count, 1);
+            assert!(first.asset_upload_bytes >= 40 * 40 * 4);
+            assert_eq!(first.asset_failure_diagnostics, Vec::<String>::new());
+            assert!(first.queue_write_count > 0);
+            assert_eq!(first.queue_write_count, first.dirty_upload_range_count);
+            assert_eq!(
+                first.dirty_upload_ranges.len(),
+                first.dirty_upload_range_count as usize
+            );
+            assert!(
+                first.queue_write_count < first.dirty_upload_range_count.saturating_mul(3),
+                "interleaved POD uploads should use one queue write per dirty batch instead of the legacy split-buffer three writes"
+            );
+            assert!(first.allocated_gpu_bytes >= first.upload_bytes);
+            assert_eq!(first.upload_bytes % NATIVE_GPU_QUAD_VERTEX_STRIDE, 0);
+            assert_eq!(
+                first
+                    .dirty_upload_ranges
+                    .iter()
+                    .map(|range| range.size)
+                    .sum::<u64>(),
+                first.upload_bytes
+            );
+            assert_eq!(first.buffer_reuse_count, 0);
+            assert_eq!(first.staging_wrap_count, 0);
+            assert_eq!(first.quad_cache_eviction_count, 0);
+
+            assert_eq!(second.asset_ref_count, 1);
+            assert!(second.asset_cache_hits >= 1);
+            assert_eq!(second.asset_cache_misses, 0);
+            assert_eq!(second.asset_decode_count, 0);
+            assert_eq!(second.asset_raster_count, 0);
+            assert_eq!(second.asset_upload_count, 0);
+            assert_eq!(second.asset_upload_bytes, 0);
+            assert_eq!(second.asset_cache_entry_count, 1);
+            assert!(second.asset_cache_byte_count >= 40 * 40 * 4);
+            assert_eq!(first.asset_refs, second.asset_refs);
+            assert_eq!(second.queue_write_count, 0);
+            assert_eq!(second.dirty_upload_range_count, 0);
+            assert!(second.dirty_upload_ranges.is_empty());
+            assert_eq!(second.upload_bytes, 0);
+            assert_eq!(second.allocated_gpu_bytes, 0);
+            assert!(second.buffer_reuse_count >= 1);
+            assert_eq!(second.staging_wrap_count, 0);
+            assert_eq!(second.quad_cache_eviction_count, 0);
+        });
+    }
+
+    #[test]
+    fn renderer_uploads_only_changed_retained_chunk_after_document_scene_interaction() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "skipping retained chunk dirty upload test: request_adapter failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-gpu-retained-chunk-upload-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            fn retained_chunk_test_scene(right_color: [u8; 4]) -> DocumentRenderScene {
+                let style_identity = test_style_identity();
+                let item = |node: &str, x: f32| boon_document::RenderSceneItem {
+                    node: DocumentNodeId(node.to_owned()),
+                    retained_chunk_id: format!("chunk:{node}"),
+                    source_kind: DocumentNodeKind::Stack,
+                    bounds: Rect {
+                        x,
+                        y: 12.0,
+                        width: 48.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    transform: [1.0, 0.0, 0.0, 1.0, x, 12.0],
+                    style_identity,
+                    dependency_set: vec![format!("node:{node}")],
+                    texture_asset_refs: Vec::new(),
+                    estimated_vertex_count: 6,
+                };
+                let primitive = |node: &str, x: f32, color: [u8; 4]| RenderVisualPrimitive {
+                    node: DocumentNodeId(node.to_owned()),
+                    retained_chunk_id: format!("chunk:{node}"),
+                    source_kind: DocumentNodeKind::Stack,
+                    primitive: RenderVisualPrimitiveKind::Fill,
+                    bounds: Rect {
+                        x,
+                        y: 12.0,
+                        width: 48.0,
+                        height: 36.0,
+                    },
+                    clip: None,
+                    radius: 0.0,
+                    stroke_width: 0.0,
+                    color,
+                    secondary_color: [0, 0, 0, 0],
+                    antialias: 0.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity,
+                    dependency_set: vec![format!("primitive:{node}:fill")],
+                };
+                DocumentRenderScene {
+                    viewport: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 128.0,
+                        height: 72.0,
+                    },
+                    items: vec![item("left", 12.0), item("right", 68.0)],
+                    visual_primitives: vec![
+                        primitive("left", 12.0, [30, 90, 150, 255]),
+                        primitive("right", 68.0, right_color),
+                    ],
+                    quad_batches: Vec::new(),
+                    text_runs: Vec::new(),
+                    metrics: boon_document::RenderSceneMetrics {
+                        visible_source_item_count: 2,
+                        visual_primitive_count: 2,
+                        rendered_rect_count: 2,
+                        cap_hit: false,
+                    },
+                }
+            }
+
+            let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("boon-native-gpu-retained-chunk-upload-target"),
+                size: wgpu::Extent3d {
+                    width: 128,
+                    height: 72,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut renderer = VisibleLayoutRenderer::new(&device, &queue, format);
+            let first_scene = retained_chunk_test_scene([170, 80, 40, 255]);
+            let second_scene = retained_chunk_test_scene([210, 110, 60, 255]);
+
+            let mut first_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boon-native-gpu-retained-chunk-upload-first"),
+                });
+            let first = renderer
+                .encode_scene(SurfaceRenderSceneRequest {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut first_encoder,
+                    view: &view,
+                    scene: &first_scene,
+                    format,
+                    width: 128,
+                    height: 72,
+                })
+                .expect("first retained chunk scene should encode");
+            queue.submit([first_encoder.finish()]);
+
+            let mut second_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boon-native-gpu-retained-chunk-upload-second"),
+                });
+            let second = renderer
+                .encode_scene(SurfaceRenderSceneRequest {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut second_encoder,
+                    view: &view,
+                    scene: &second_scene,
+                    format,
+                    width: 128,
+                    height: 72,
+                })
+                .expect("second retained chunk scene should encode");
+            queue.submit([second_encoder.finish()]);
+
+            assert_eq!(first.dirty_upload_chunk_count, 2);
+            assert_eq!(
+                first.dirty_upload_chunk_ids,
+                vec!["chunk:left", "chunk:right"]
+            );
+            assert_eq!(second.dirty_upload_range_count, 1);
+            assert_eq!(second.dirty_upload_chunk_count, 1);
+            assert_eq!(second.dirty_upload_chunk_ids, vec!["chunk:right"]);
+            assert_eq!(
+                second.dirty_upload_ranges[0].retained_chunk_id.as_deref(),
+                Some("chunk:right")
+            );
+            assert_eq!(second.queue_write_count, 1);
+            assert!(second.buffer_reuse_count >= 1);
+            assert!(
+                second.upload_bytes < first.upload_bytes,
+                "one changed retained chunk should not upload the whole scene again: first={} second={}",
+                first.upload_bytes,
+                second.upload_bytes
+            );
+            assert_eq!(second.staging_wrap_count, 0);
+            assert_eq!(second.quad_cache_eviction_count, 0);
+        });
+    }
+
+    #[test]
     fn button_text_runs_are_centered_by_default() {
         let mut style = StyleMap::new();
         style.insert("size".to_owned(), StyleValue::Number(16.0));
@@ -5044,11 +7863,13 @@ mod tests {
                 text: Some("RUN".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 320, 120);
@@ -5093,6 +7914,8 @@ mod tests {
     fn quarter_turn_text_run_rasterizes_a_centered_rotated_mask() {
         let run = TextRun {
             node: DocumentNodeId("toggle-all".to_owned()),
+            font_id: 5,
+            paint_id: 3,
             bounds: Rect {
                 x: 75.0,
                 y: 130.0,
@@ -5265,6 +8088,7 @@ mod tests {
             text: Some("Completed todo".to_owned()),
             style,
             focused: false,
+            style_identity: test_style_identity(),
         };
 
         let rect = strikethrough_rect_for_item(&item, None);
@@ -5388,12 +8212,12 @@ mod tests {
         let flat_vertices = flat_builder
             .batches
             .iter()
-            .map(|batch| batch.colors.len())
+            .map(|batch| batch.vertices.len())
             .sum::<usize>();
         let material_vertices = material_builder
             .batches
             .iter()
-            .map(|batch| batch.colors.len())
+            .map(|batch| batch.vertices.len())
             .sum::<usize>();
         assert!(
             material_vertices > flat_vertices,
@@ -5424,11 +8248,13 @@ mod tests {
                 text: Some("RUN".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 320, 120);
@@ -5461,11 +8287,13 @@ mod tests {
                 text: Some("Line height".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let compact_run = text_runs(&frame(compact_style), 320, 120)
@@ -5484,6 +8312,51 @@ mod tests {
             TextRunPlacementSignature::from_run(&compact_run),
             TextRunPlacementSignature::from_run(&tall_run),
             "changing only line_height must invalidate placement caches"
+        );
+    }
+
+    #[test]
+    fn text_cache_reuse_counts_report_hits_misses_and_evictions() {
+        let run_for_text = |text: &str| {
+            let frame = LayoutFrame {
+                display_list: vec![DisplayItem {
+                    node: DocumentNodeId(format!("text-{text}")),
+                    kind: DocumentNodeKind::Text,
+                    bounds: Rect {
+                        x: 10.0,
+                        y: 20.0,
+                        width: 160.0,
+                        height: 40.0,
+                    },
+                    text: Some(text.to_owned()),
+                    style: StyleMap::new(),
+                    focused: false,
+                    style_identity: test_style_identity(),
+                }],
+                hit_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                accessibility: AccessibilityTree::default(),
+                demands: Vec::new(),
+                materialization: Vec::new(),
+                metrics: LayoutMetrics::default(),
+            };
+            TextRunSignature::from_run(
+                &text_runs(&frame, 320, 120)
+                    .pop()
+                    .expect("text should render"),
+            )
+        };
+        let a = run_for_text("A");
+        let b = run_for_text("B");
+        let c = run_for_text("C");
+
+        assert_eq!(
+            text_cache_reuse_counts(&[a.clone(), b.clone()], &[b.clone(), c.clone()]),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            text_cache_reuse_counts(&[a.clone(), a.clone()], &[a.clone(), a.clone(), a]),
+            (2, 1, 0)
         );
     }
 
@@ -5532,11 +8405,13 @@ mod tests {
                 text: Some("Clear completed".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let mut base_style = StyleMap::new();
@@ -5596,6 +8471,7 @@ mod tests {
             text: Some("Martin Kavík".to_owned()),
             style,
             focused: false,
+            style_identity: test_style_identity(),
         };
 
         let underline = underline_rect_for_item(&item, None);
@@ -5653,11 +8529,13 @@ mod tests {
                 text: Some("count".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 320, 120);
@@ -5703,11 +8581,13 @@ mod tests {
                 text: Some("abcdefghijklmnopqrstuvwxyz".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 320, 120);
@@ -5748,11 +8628,13 @@ mod tests {
                 text: Some("active_count == 0 |> Bool/and(completed_count > 0)".to_owned()),
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 640, 160);
@@ -5789,11 +8671,13 @@ mod tests {
                 text: Some("30".to_owned()),
                 style,
                 focused: true,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let runs = text_runs(&frame, 320, 120);
@@ -5866,11 +8750,13 @@ mod tests {
                 text: None,
                 style,
                 focused: false,
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
 
@@ -6003,6 +8889,7 @@ mod tests {
                         text: None,
                         style: input_style,
                         focused: false,
+                        style_identity: test_style_identity(),
                     },
                     DisplayItem {
                         node: DocumentNodeId("active-title".to_owned()),
@@ -6016,12 +8903,14 @@ mod tests {
                         text: Some(title_text.to_owned()),
                         style: title_style,
                         focused: false,
+                        style_identity: test_style_identity(),
                     },
                 ],
                 hit_regions: Vec::new(),
                 scroll_regions: Vec::new(),
                 accessibility: AccessibilityTree::default(),
                 demands: Vec::new(),
+                materialization: Vec::new(),
                 metrics: LayoutMetrics::default(),
             };
 
@@ -6056,6 +8945,8 @@ mod tests {
     fn text_clip_padding_expands_text_bounds_on_all_edges() {
         let run = TextRun {
             node: DocumentNodeId("accented-footer-link".to_owned()),
+            font_id: 5,
+            paint_id: 3,
             bounds: Rect {
                 x: 10.0,
                 y: 20.0,
@@ -6109,11 +9000,13 @@ mod tests {
                 text: text.map(str::to_owned),
                 style: style.clone(),
                 focused: text.is_some(),
+                style_identity: test_style_identity(),
             }],
             hit_regions: Vec::new(),
             scroll_regions: Vec::new(),
             accessibility: AccessibilityTree::default(),
             demands: Vec::new(),
+            materialization: Vec::new(),
             metrics: LayoutMetrics::default(),
         };
         let placeholder_run = text_runs(&frame_for_text(None), 640, 240)
@@ -6155,10 +9048,29 @@ mod tests {
         let mut style = StyleMap::new();
         style.insert(
             "syntax_spans_json".to_owned(),
-            StyleValue::Text(
-                r##"[{"text":"SOURCE","color":"#D2691E","font_weight":"800","font_style":"italic"},{"text":" ","color":"#d9e1f2","font_weight":null,"font_style":null},{"text":"]","color":"#D2691E","font_weight":"700","font_style":null}]"##
-                    .to_owned(),
-            ),
+            StyleValue::RichTextSpans(vec![
+                StyleRichTextSpan {
+                    text: "SOURCE".to_owned(),
+                    source_text: None,
+                    color: Some("#D2691E".to_owned()),
+                    font_weight: Some("800".to_owned()),
+                    font_style: Some("italic".to_owned()),
+                },
+                StyleRichTextSpan {
+                    text: " ".to_owned(),
+                    source_text: None,
+                    color: Some("#d9e1f2".to_owned()),
+                    font_weight: None,
+                    font_style: None,
+                },
+                StyleRichTextSpan {
+                    text: "]".to_owned(),
+                    source_text: None,
+                    color: Some("#D2691E".to_owned()),
+                    font_weight: Some("700".to_owned()),
+                    font_style: None,
+                },
+            ]),
         );
 
         let spans = rich_text_spans(&style, "SOURCE ]", [217, 225, 242, 255]);
@@ -6188,22 +9100,6 @@ mod tests {
         assert_eq!(spans[0].text, "|>");
         assert!(rich_text_spans(&style, "\u{276F} ", [255, 159, 67, 255]).is_empty());
     }
-}
-
-fn f32_slice_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    bytes
-}
-
-fn u32_slice_bytes(values: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-    for value in values {
-        bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    bytes
 }
 
 fn align_to(value: u32, alignment: u32) -> u32 {

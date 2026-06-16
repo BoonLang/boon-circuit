@@ -1556,6 +1556,15 @@ fn verify_compiled_artifact_inspection(args: &[String]) -> Result<(), Box<dyn st
     {
         return Err("compiled artifact inspection must not claim runtime instantiation".into());
     }
+    if report_value
+        .pointer("/inspection_result/runtime_plan_generic_derived_deserialized_from_artifact")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact inspection must deserialize generic-derived runtime plan".into(),
+        );
+    }
     Ok(())
 }
 

@@ -392,6 +392,8 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "loaded_runtime_from_artifact",
         "runtime_instantiated_from_artifact",
         "runtime_plan_present",
+        "runtime_plan_generic_derived_deserialized_from_artifact",
+        "runtime_plan_generic_derived_deserialized_counts",
         "source_free_runtime_load_available",
         "source_reparse_required_for_current_runtime",
         "source_reparse_attempted",
@@ -424,6 +426,10 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             .and_then(JsonValue::as_bool)
             != Some(false)
         || inspection
+            .get("runtime_plan_generic_derived_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection
             .get("source_reparse_required_for_current_runtime")
             .and_then(JsonValue::as_bool)
             != Some(true)
@@ -445,6 +451,33 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             path.display()
         )
         .into());
+    }
+    let generic_counts = inspection
+        .get("runtime_plan_generic_derived_deserialized_counts")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} inspection_result runtime_plan_generic_derived_deserialized_counts is not an object",
+                path.display()
+            )
+        })?;
+    for key in [
+        "function_count",
+        "root_supported_count",
+        "indexed_supported_count",
+        "unsupported_reason_count",
+    ] {
+        if generic_counts
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} inspection_result runtime_plan_generic_derived_deserialized_counts missing `{key}`",
+                path.display()
+            )
+            .into());
+        }
     }
     if inspection
         .get("parser_ast_required_for_execution")
@@ -4965,6 +4998,13 @@ mod tests {
                 "loaded_runtime_from_artifact": false,
                 "runtime_instantiated_from_artifact": false,
                 "runtime_plan_present": true,
+                "runtime_plan_generic_derived_deserialized_from_artifact": true,
+                "runtime_plan_generic_derived_deserialized_counts": {
+                    "function_count": 0,
+                    "root_supported_count": 1,
+                    "indexed_supported_count": 0,
+                    "unsupported_reason_count": 0
+                },
                 "source_free_runtime_load_available": false,
                 "source_reparse_required_for_current_runtime": true,
                 "source_reparse_attempted": false,

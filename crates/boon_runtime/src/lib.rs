@@ -2336,6 +2336,7 @@ pub fn inspect_compiled_artifact_report(
     let artifact_hash = artifact.sha256.clone();
     let runtime_plan_present = artifact.body.get("runtime_plan").is_some();
     let missing_runtime_plan_sections = artifact.missing_runtime_plan_sections();
+    let generic_derived_runtime_plan = artifact.runtime_generic_derived_plan()?;
     let report = json!({
         "status": "pass",
         "report_version": 1,
@@ -2360,6 +2361,13 @@ pub fn inspect_compiled_artifact_report(
             "loaded_runtime_from_artifact": false,
             "runtime_instantiated_from_artifact": false,
             "runtime_plan_present": runtime_plan_present,
+            "runtime_plan_generic_derived_deserialized_from_artifact": true,
+            "runtime_plan_generic_derived_deserialized_counts": {
+                "function_count": generic_derived_runtime_plan.functions.len(),
+                "root_supported_count": generic_derived_runtime_plan.supported_root_count(),
+                "indexed_supported_count": generic_derived_runtime_plan.supported_indexed_count(),
+                "unsupported_reason_count": generic_derived_runtime_plan.unsupported_reasons.len()
+            },
             "source_free_runtime_load_available": false,
             "source_reparse_required_for_current_runtime": true,
             "source_reparse_attempted": false,
@@ -7292,6 +7300,437 @@ fn runtime_generic_arg_artifact(arg: &RuntimeGenericArg) -> JsonValue {
     })
 }
 
+impl RuntimeGenericDerivedPlan {
+    fn from_artifact(value: &JsonValue) -> RuntimeResult<Self> {
+        let object = artifact_object(value, "runtime_plan.generic_derived")?;
+        artifact_string_field(object, "format", "runtime_plan.generic_derived").and_then(
+            |format| {
+                if format == "boonc-runtime-generic-derived-partial-json-v1" {
+                    Ok(format)
+                } else {
+                    Err(format!("runtime_plan.generic_derived has wrong format `{format}`").into())
+                }
+            },
+        )?;
+        if !artifact_bool_field(
+            object,
+            "generic_derived_runtime_ast_free",
+            "runtime_plan.generic_derived",
+        )? {
+            return Err("runtime_plan.generic_derived must be AST-free".into());
+        }
+
+        let mut functions = BTreeMap::new();
+        for (index, value) in
+            artifact_array_field(object, "functions", "runtime_plan.generic_derived")?
+                .iter()
+                .enumerate()
+        {
+            let context = format!("runtime_plan.generic_derived.functions[{index}]");
+            let function = RuntimeGenericFunction::from_artifact(value, &context)?;
+            if functions.insert(function.name.clone(), function).is_some() {
+                return Err(format!("{context} duplicates a runtime function name").into());
+            }
+        }
+
+        let root_fields =
+            artifact_array_field(object, "root_fields", "runtime_plan.generic_derived")?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeGenericDerivedRootField::from_artifact(
+                        value,
+                        &format!("runtime_plan.generic_derived.root_fields[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+
+        let indexed_fields =
+            artifact_array_field(object, "indexed_fields", "runtime_plan.generic_derived")?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeGenericDerivedIndexedField::from_artifact(
+                        value,
+                        &format!("runtime_plan.generic_derived.indexed_fields[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+
+        let unsupported_reasons = artifact_usize_map_field(
+            object,
+            "unsupported_reasons",
+            "runtime_plan.generic_derived",
+        )?;
+
+        let plan = Self {
+            functions,
+            root_fields,
+            indexed_fields,
+            unsupported_reasons,
+        };
+        artifact_count_matches(
+            object,
+            "function_count",
+            plan.functions.len(),
+            "runtime_plan.generic_derived",
+        )?;
+        artifact_count_matches(
+            object,
+            "root_field_count",
+            plan.root_fields.len(),
+            "runtime_plan.generic_derived",
+        )?;
+        artifact_count_matches(
+            object,
+            "indexed_field_count",
+            plan.indexed_fields.len(),
+            "runtime_plan.generic_derived",
+        )?;
+        artifact_count_matches(
+            object,
+            "root_supported_count",
+            plan.supported_root_count(),
+            "runtime_plan.generic_derived",
+        )?;
+        artifact_count_matches(
+            object,
+            "indexed_supported_count",
+            plan.supported_indexed_count(),
+            "runtime_plan.generic_derived",
+        )?;
+        Ok(plan)
+    }
+}
+
+impl RuntimeGenericFunction {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            name: artifact_string_field(object, "name", context)?,
+            args: artifact_string_array_field(object, "args", context)?,
+            statement: RuntimeGenericStatement::from_artifact(
+                artifact_field(object, "statement", context)?,
+                &format!("{context}.statement"),
+            )?,
+        })
+    }
+}
+
+impl RuntimeGenericDerivedRootField {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let statement = optional_runtime_generic_statement(object, "statement", context)?;
+        let supported = artifact_bool_field(object, "supported", context)?;
+        if supported != statement.is_some() {
+            return Err(
+                format!("{context} supported flag does not match statement presence").into(),
+            );
+        }
+        Ok(Self {
+            path: artifact_string_field(object, "path", context)?,
+            kind: derived_value_kind_from_artifact(&artifact_string_field(
+                object, "kind", context,
+            )?)?,
+            has_sources: artifact_bool_field(object, "has_sources", context)?,
+            statement,
+            unsupported_reason: optional_string_field(object, "unsupported_reason", context)?,
+        })
+    }
+}
+
+impl RuntimeGenericDerivedIndexedField {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let statement = optional_runtime_generic_statement(object, "statement", context)?;
+        let supported = artifact_bool_field(object, "supported", context)?;
+        if supported != statement.is_some() {
+            return Err(
+                format!("{context} supported flag does not match statement presence").into(),
+            );
+        }
+        Ok(Self {
+            list: artifact_string_field(object, "list", context)?,
+            row_scope: artifact_string_field(object, "row_scope", context)?,
+            field: artifact_string_field(object, "field", context)?,
+            kind: derived_value_kind_from_artifact(&artifact_string_field(
+                object, "kind", context,
+            )?)?,
+            statement,
+            unsupported_reason: optional_string_field(object, "unsupported_reason", context)?,
+        })
+    }
+}
+
+impl RuntimeGenericStatement {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let kind = artifact_string_field(object, "kind", context)?;
+        match kind.as_str() {
+            "empty" => Ok(Self::Empty),
+            "expr" => Ok(Self::Expr(RuntimeGenericExpr::from_artifact(
+                artifact_field(object, "expr", context)?,
+                &format!("{context}.expr"),
+            )?)),
+            "binding" => Ok(Self::Binding {
+                name: artifact_string_field(object, "name", context)?,
+                value: Box::new(Self::from_artifact(
+                    artifact_field(object, "value", context)?,
+                    &format!("{context}.value"),
+                )?),
+            }),
+            "expr_with_children" => Ok(Self::ExprWithChildren {
+                expr: RuntimeGenericExpr::from_artifact(
+                    artifact_field(object, "expr", context)?,
+                    &format!("{context}.expr"),
+                )?,
+                children: runtime_generic_statement_vec_from_artifact(
+                    artifact_field(object, "children", context)?,
+                    &format!("{context}.children"),
+                )?,
+            }),
+            "block" => Ok(Self::Block(runtime_generic_statement_vec_from_artifact(
+                artifact_field(object, "statements", context)?,
+                &format!("{context}.statements"),
+            )?)),
+            "list_statement" => Ok(Self::List(runtime_generic_statement_vec_from_artifact(
+                artifact_field(object, "items", context)?,
+                &format!("{context}.items"),
+            )?)),
+            "record_statement" => Ok(Self::Record(
+                artifact_array_field(object, "fields", context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        RuntimeGenericRecordField::from_artifact(
+                            value,
+                            &format!("{context}.fields[{index}]"),
+                        )
+                    })
+                    .collect::<RuntimeResult<Vec<_>>>()?,
+            )),
+            "latest" => Ok(Self::Latest(runtime_generic_statement_vec_from_artifact(
+                artifact_field(object, "branches", context)?,
+                &format!("{context}.branches"),
+            )?)),
+            _ => Err(format!("{context} has unknown runtime statement kind `{kind}`").into()),
+        }
+    }
+}
+
+impl RuntimeGenericRecordField {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            name: artifact_string_field(object, "name", context)?,
+            value: RuntimeGenericStatement::from_artifact(
+                artifact_field(object, "value", context)?,
+                &format!("{context}.value"),
+            )?,
+        })
+    }
+}
+
+impl RuntimeGenericExpr {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let kind = artifact_string_field(object, "kind", context)?;
+        match kind.as_str() {
+            "identifier" => Ok(Self::Identifier(artifact_string_field(
+                object, "name", context,
+            )?)),
+            "path" => Ok(Self::Path(artifact_string_array_field(
+                object, "parts", context,
+            )?)),
+            "text" => Ok(Self::Text(artifact_string_field(object, "value", context)?)),
+            "number" => Ok(Self::Number(artifact_i64_field(object, "value", context)?)),
+            "bool" => Ok(Self::Bool(artifact_bool_field(object, "value", context)?)),
+            "enum" => Ok(Self::Enum(artifact_string_field(object, "value", context)?)),
+            "tagged_object" => Ok(Self::TaggedObject {
+                tag: artifact_string_field(object, "tag", context)?,
+                fields: runtime_generic_record_expr_fields_from_artifact(
+                    artifact_field(object, "fields", context)?,
+                    &format!("{context}.fields"),
+                )?,
+            }),
+            "call" => Ok(Self::Call {
+                function: artifact_string_field(object, "function", context)?,
+                args: runtime_generic_args_from_artifact(
+                    artifact_field(object, "args", context)?,
+                    &format!("{context}.args"),
+                )?,
+            }),
+            "pipe" => Ok(Self::Pipe {
+                input: Box::new(Self::from_artifact(
+                    artifact_field(object, "input", context)?,
+                    &format!("{context}.input"),
+                )?),
+                op: artifact_string_field(object, "op", context)?,
+                args: runtime_generic_args_from_artifact(
+                    artifact_field(object, "args", context)?,
+                    &format!("{context}.args"),
+                )?,
+            }),
+            "infix" => Ok(Self::Infix {
+                left: Box::new(Self::from_artifact(
+                    artifact_field(object, "left", context)?,
+                    &format!("{context}.left"),
+                )?),
+                op: artifact_string_field(object, "op", context)?,
+                right: Box::new(Self::from_artifact(
+                    artifact_field(object, "right", context)?,
+                    &format!("{context}.right"),
+                )?),
+            }),
+            "record" => Ok(Self::Record(
+                runtime_generic_record_expr_fields_from_artifact(
+                    artifact_field(object, "fields", context)?,
+                    &format!("{context}.fields"),
+                )?,
+            )),
+            "list" => Ok(Self::List(
+                artifact_array_field(object, "items", context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        Self::from_artifact(value, &format!("{context}.items[{index}]"))
+                    })
+                    .collect::<RuntimeResult<Vec<_>>>()?,
+            )),
+            "then" => Ok(Self::Then {
+                input: Box::new(Self::from_artifact(
+                    artifact_field(object, "input", context)?,
+                    &format!("{context}.input"),
+                )?),
+                output: optional_runtime_generic_expr(object, "output", context)?,
+            }),
+            "when" => Ok(Self::When {
+                input: Box::new(Self::from_artifact(
+                    artifact_field(object, "input", context)?,
+                    &format!("{context}.input"),
+                )?),
+            }),
+            "match_arm" => Ok(Self::MatchArm {
+                pattern: artifact_string_array_field(object, "pattern", context)?,
+                output: optional_runtime_generic_expr(object, "output", context)?,
+            }),
+            "delimiter" => Ok(Self::Delimiter),
+            _ => Err(format!("{context} has unknown runtime expr kind `{kind}`").into()),
+        }
+    }
+}
+
+impl RuntimeGenericRecordExprField {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            name: artifact_string_field(object, "name", context)?,
+            value: RuntimeGenericExpr::from_artifact(
+                artifact_field(object, "value", context)?,
+                &format!("{context}.value"),
+            )?,
+            spread: artifact_bool_field(object, "spread", context)?,
+        })
+    }
+}
+
+impl RuntimeGenericArg {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        Ok(Self {
+            name: optional_string_field(object, "name", context)?,
+            value: RuntimeGenericExpr::from_artifact(
+                artifact_field(object, "value", context)?,
+                &format!("{context}.value"),
+            )?,
+        })
+    }
+}
+
+fn runtime_generic_statement_vec_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<RuntimeGenericStatement>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            RuntimeGenericStatement::from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect()
+}
+
+fn runtime_generic_record_expr_fields_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<RuntimeGenericRecordExprField>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            RuntimeGenericRecordExprField::from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect()
+}
+
+fn runtime_generic_args_from_artifact(
+    value: &JsonValue,
+    context: &str,
+) -> RuntimeResult<Vec<RuntimeGenericArg>> {
+    artifact_array(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            RuntimeGenericArg::from_artifact(value, &format!("{context}[{index}]"))
+        })
+        .collect()
+}
+
+fn optional_runtime_generic_statement(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<RuntimeGenericStatement>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(RuntimeGenericStatement::from_artifact(
+        value,
+        &format!("{context}.{key}"),
+    )?))
+}
+
+fn optional_runtime_generic_expr(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<Box<RuntimeGenericExpr>>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(RuntimeGenericExpr::from_artifact(
+        value,
+        &format!("{context}.{key}"),
+    )?)))
+}
+
+fn derived_value_kind_from_artifact(kind: &str) -> RuntimeResult<DerivedValueKind> {
+    match kind {
+        "source_event_transform" => Ok(DerivedValueKind::SourceEventTransform),
+        "list_view" => Ok(DerivedValueKind::ListView),
+        "aggregate" => Ok(DerivedValueKind::Aggregate),
+        "pure" => Ok(DerivedValueKind::Pure),
+        "unknown" => Ok(DerivedValueKind::Unknown),
+        _ => Err(format!("unknown derived value kind `{kind}`").into()),
+    }
+}
+
 fn derived_value_kind_artifact(kind: &DerivedValueKind) -> &'static str {
     match kind {
         DerivedValueKind::SourceEventTransform => "source_event_transform",
@@ -7903,6 +8342,154 @@ fn list_source_binding_slot_artifact(slot: &ListSourceBindingSlot) -> JsonValue 
     })
 }
 
+fn artifact_object<'a>(
+    value: &'a JsonValue,
+    context: &str,
+) -> RuntimeResult<&'a serde_json::Map<String, JsonValue>> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{context} is not an object").into())
+}
+
+fn artifact_array<'a>(value: &'a JsonValue, context: &str) -> RuntimeResult<&'a Vec<JsonValue>> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("{context} is not an array").into())
+}
+
+fn artifact_field<'a>(
+    object: &'a serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<&'a JsonValue> {
+    object
+        .get(key)
+        .ok_or_else(|| format!("{context} missing `{key}`").into())
+}
+
+fn artifact_array_field<'a>(
+    object: &'a serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<&'a Vec<JsonValue>> {
+    artifact_array(
+        artifact_field(object, key, context)?,
+        &format!("{context}.{key}"),
+    )
+}
+
+fn artifact_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<String> {
+    artifact_field(object, key, context)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{context}.{key} is not a string").into())
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Option<String>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(|| format!("{context}.{key} is not a string or null").into())
+}
+
+fn artifact_string_array_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<Vec<String>> {
+    artifact_array_field(object, key, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{context}.{key}[{index}] is not a string").into())
+        })
+        .collect()
+}
+
+fn artifact_bool_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<bool> {
+    artifact_field(object, key, context)?
+        .as_bool()
+        .ok_or_else(|| format!("{context}.{key} is not a bool").into())
+}
+
+fn artifact_i64_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<i64> {
+    artifact_field(object, key, context)?
+        .as_i64()
+        .ok_or_else(|| format!("{context}.{key} is not an i64").into())
+}
+
+fn artifact_usize_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<usize> {
+    let value = artifact_field(object, key, context)?
+        .as_u64()
+        .ok_or_else(|| format!("{context}.{key} is not a non-negative integer"))?;
+    usize::try_from(value).map_err(|_| format!("{context}.{key} does not fit in usize").into())
+}
+
+fn artifact_usize_map_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<BTreeMap<String, usize>> {
+    let map = artifact_field(object, key, context)?
+        .as_object()
+        .ok_or_else(|| format!("{context}.{key} is not an object"))?;
+    map.iter()
+        .map(|(name, value)| {
+            let count = value
+                .as_u64()
+                .ok_or_else(|| format!("{context}.{key}.{name} is not a non-negative integer"))?;
+            Ok((
+                name.clone(),
+                usize::try_from(count)
+                    .map_err(|_| format!("{context}.{key}.{name} does not fit in usize"))?,
+            ))
+        })
+        .collect()
+}
+
+fn artifact_count_matches(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    actual: usize,
+    context: &str,
+) -> RuntimeResult<()> {
+    let expected = artifact_usize_field(object, key, context)?;
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(format!("{context}.{key} expected {expected}, decoded {actual}").into())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CompiledArtifact {
     body: JsonValue,
@@ -7994,6 +8581,15 @@ impl CompiledArtifact {
         let artifact = Self { body, sha256 };
         artifact.validate(path)?;
         Ok(artifact)
+    }
+
+    fn runtime_generic_derived_plan(&self) -> RuntimeResult<RuntimeGenericDerivedPlan> {
+        RuntimeGenericDerivedPlan::from_artifact(
+            self.body
+                .get("runtime_plan")
+                .and_then(|plan| plan.get("generic_derived"))
+                .ok_or("compiled artifact missing runtime_plan.generic_derived")?,
+        )
     }
 
     fn validate(&self, path: &Path) -> RuntimeResult<()> {
@@ -39477,6 +40073,96 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn compiled_artifact_decodes_cells_generic_derived_runtime_plan_without_ast() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-generic-derived-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let artifact_path = temp_root.join("cells.boonc");
+        emit_compiled_artifact(Path::new("../../examples/cells.bn"), &artifact_path, None).unwrap();
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let decoded = artifact.runtime_generic_derived_plan().unwrap();
+        assert_eq!(decoded.functions.len(), 11);
+        assert_eq!(decoded.supported_root_count(), 2);
+        assert_eq!(decoded.supported_indexed_count(), 6);
+        assert!(
+            decoded.unsupported_reasons.is_empty(),
+            "decoded Cells generic-derived plan should preserve clean coverage: {:?}",
+            decoded.unsupported_reasons
+        );
+        let decoded_function_count = decoded.functions.len();
+
+        let parsed = parse_cells_project_for_test();
+        let ir = lower(&parsed).unwrap();
+        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        compiled.generic_derived_runtime = decoded;
+
+        let runtime_executed_supported_roots = compiled
+            .generic_derived_runtime
+            .root_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .filter(|field| !matches!(&field.kind, DerivedValueKind::ListView))
+            .map(|field| field.path.clone())
+            .collect::<BTreeSet<_>>();
+        let supported_indexed = compiled
+            .generic_derived_runtime
+            .indexed_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .map(|field| (field.list.clone(), field.field.clone()))
+            .collect::<BTreeSet<_>>();
+        let reachable_functions = compiled
+            .generic_derived_runtime
+            .functions
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let poison = empty_ast_statement_for_test();
+        for field in &mut compiled.generic_derived.root_fields {
+            if runtime_executed_supported_roots.contains(&field.path) {
+                field.statement = poison.clone();
+            }
+        }
+        for field in &mut compiled.generic_derived.indexed_fields {
+            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
+                field.statement = poison.clone();
+            }
+        }
+        for (name, function) in &mut compiled.generic_derived.functions {
+            if reachable_functions.contains(name) {
+                function.statement = poison.clone();
+            }
+        }
+
+        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let summary = runtime.generic_state_summary();
+        assert_eq!(summary["store"]["selected_input"]["address"], "A0");
+        assert_eq!(
+            summary["store"]["sheet_rows"].as_array().unwrap().len(),
+            100
+        );
+        assert_eq!(summary["cells"][0]["address"], "A0");
+        assert_eq!(summary["cells"][0]["default_formula"], "5");
+        assert_eq!(summary["cells"][0]["value"], "5");
+
+        let mut corrupt = artifact.body.clone();
+        corrupt["runtime_plan"]["generic_derived"]["function_count"] =
+            json!(decoded_function_count + 1);
+        let error =
+            RuntimeGenericDerivedPlan::from_artifact(&corrupt["runtime_plan"]["generic_derived"])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("function_count"),
+            "wrong generic-derived count should fail decoding, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
         let parsed = parse_source(
             "examples/todomvc.bn",
@@ -39747,6 +40433,18 @@ FUNCTION decorate(value) {
         assert_eq!(
             loaded["inspection_result"]["runtime_plan_present"],
             json!(true)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_plan_generic_derived_deserialized_from_artifact"],
+            json!(true)
+        );
+        assert!(
+            loaded["inspection_result"]["runtime_plan_generic_derived_deserialized_counts"]
+                .as_object()
+                .is_some_and(|counts| counts
+                    .get("root_supported_count")
+                    .and_then(JsonValue::as_u64)
+                    .is_some())
         );
         assert!(
             !loaded["inspection_result"]["missing_runtime_plan_sections"]

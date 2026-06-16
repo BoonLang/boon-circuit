@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use boon_runtime::{VerificationLayer, run_scenario, write_json};
+use boon_runtime::{VerificationLayer, emit_compiled_artifact, run_scenario, write_json};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,7 @@ const CLI_HELP: &str = "\
 usage:
   boon_cli run <source> [--scenario <path>] [--report <path>]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
+  boon_cli compile <source> --out <path.boonc> [--report <path>]
   boon_cli dump-ir <source>
   boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--target <software_bounded|fpga_todomvc>] [--report <path>]
 
@@ -34,6 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "run" => run_program(&args),
         "scenario" => run_program(&args),
+        "compile" => compile_program(&args),
         "dump-ir" => dump_ir(&args),
         "explain-hardware" => explain_hardware(&args),
         command => Err(format!("unknown command `{command}`").into()),
@@ -74,6 +76,30 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         report.as_deref(),
     )?;
     println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
+    Ok(())
+}
+
+fn compile_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = args.first().ok_or("missing source path")?;
+    let mut out = None;
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                out = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => return Err(format!("unknown compile argument `{other}`").into()),
+        }
+    }
+    let out = out.ok_or("missing --out <path.boonc>")?;
+    let report_value = emit_compiled_artifact(Path::new(source), &out, report.as_deref())?;
+    println!("{}", serde_json::to_string_pretty(&report_value)?);
     Ok(())
 }
 

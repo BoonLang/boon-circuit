@@ -2865,7 +2865,7 @@ Notes:
 ## Phase 10: Compiled Artifact, Bytecode, And Future Kernel Work
 
 ### TASK-0901 `.boonc` Compiled Artifact MVP
-Status: pending
+Status: in_progress
 Type: implementation
 Priority: P2
 Depends on: TASK-0101, TASK-0201, TASK-0802
@@ -2885,6 +2885,16 @@ Rollback / stop condition:
 - Stop if artifact scope is too broad. Split into serialization, runtime load, scenario run, and report hash child tasks.
 Notes:
 - This task should not remove the current interpreter path.
+- Split execution after the first implementation slice:
+  - TASK-0901A deterministic artifact emission and report hash is complete.
+    This adds `boon_cli compile <source> --out <path.boonc> [--report <path>]`
+    and `cargo xtask verify-compiled-artifact <example>` for a JSON MVP
+    artifact that records the static runtime sidecar data and file hash.
+  - TASK-0901B must load `.boonc` into the runtime without reparsing source.
+  - TASK-0901C must run at least one scenario from the loaded artifact and
+    compare output against the interpreter path.
+- Normal source-run reports must not claim artifact-loaded execution until
+  TASK-0901B/TASK-0901C prove that path.
 
 ### TASK-0902 Expression Bytecode Or Micro-Op Interpreter
 Status: pending
@@ -4437,6 +4447,37 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   family, likely checkbox/circle/checkmark. Keep the generated
   WESL/WGSL/bindgen pipeline authoritative and do not hand-edit the generated
   shader path.
+
+- Date: 2026-06-16
+- Task: TASK-0901A `.boonc` deterministic artifact emission and report hash
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`;
+  `crates/boon_cli/src/main.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: design/readiness audit from subagent
+  `019ed179-6dbb-7250-b6b4-e9e51923eda9`; `cargo fmt -p
+  boon_runtime -p boon_report_schema -p boon_cli -p xtask`; `cargo test -p
+  boon_runtime --lib compiled_artifact -- --nocapture`; `cargo test -p
+  boon_report_schema --lib compiled_artifact -- --nocapture`; `cargo check
+  -p boon_cli -p xtask`; `cargo run -p boon_cli -- compile
+  examples/todomvc.bn --out target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc.json`; `cargo xtask
+  verify-compiled-artifact todomvc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-report-schema`; `cargo test -p boon_report_schema --lib`; `cargo
+  test -p xtask`; `cargo test -p boon_runtime --lib`
+- Result: first TASK-0901 child slice is complete, but TASK-0901 remains
+  `in_progress`. The runtime can emit a deterministic `boonc-json-v1` artifact
+  with semantic index, symbol table, storage layout, source schemas, route op
+  streams, dependency graph, document lowering tables, bridge schema status,
+  source unit hashes, report schema hash, and compiled schedule. The schema
+  verifier now validates compile-artifact reports and checks the artifact file
+  hash. No normal source-run report claims `.boonc` execution yet.
+- Follow-up: implement TASK-0901B by deserializing/loading `.boonc` into the
+  runtime without reparsing source, then TASK-0901C by running a scenario from
+  that loaded artifact and proving parity with the interpreter output.
 
 ## File Maintenance Checklist
 

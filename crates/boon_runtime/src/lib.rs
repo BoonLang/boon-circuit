@@ -2244,6 +2244,89 @@ pub fn ir_debug_report(source_path: &Path) -> RuntimeResult<JsonValue> {
     }))
 }
 
+pub fn emit_compiled_artifact(
+    source_path: &Path,
+    out_path: &Path,
+    report_path: Option<&Path>,
+) -> RuntimeResult<JsonValue> {
+    let (parsed, ir) = load_and_lower(source_path)?;
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    let program_hash = report_source_hash_for_parsed(&parsed);
+    let typecheck_hash = typecheck_report_hash(&ir);
+    let render_slot_hash = render_slot_table_hash(&ir);
+    let artifact = CompiledArtifact::from_parts(
+        &parsed,
+        &ir,
+        &compiled,
+        &program_hash,
+        &typecheck_hash,
+        &render_slot_hash,
+    );
+    write_json(out_path, &artifact.body)?;
+    let artifact_hash = sha256_file(out_path)?;
+    if artifact_hash != artifact.sha256 {
+        return Err(format!(
+            "compiled artifact hash changed after write: in-memory {} != file {}",
+            artifact.sha256, artifact_hash
+        )
+        .into());
+    }
+    let source_hash = report_source_hash_for_parsed(&parsed);
+    let mut report = json!({
+        "status": "pass",
+        "report_version": 1,
+        "command": "compile-artifact",
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "measurement_mode": "diagnostic",
+        "exit_status": 0,
+        "generated_at_utc": now_string(),
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source_path.display().to_string(),
+        "source_hash": source_hash,
+        "program_hash": program_hash.clone(),
+        "program_kind": parsed.kind.as_str(),
+        "program_file_count": parsed.files.len(),
+        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "graph_node_count": ir.graph_node_count,
+        "semantic_index": ir.semantic_index.report(),
+        "compiled_schedule": compiled.report(),
+        "compiled_artifact": {
+            "path": out_path.display().to_string(),
+            "sha256": artifact_hash.clone(),
+            "format": artifact.body["format"].clone(),
+            "artifact_version": artifact.body["artifact_version"].clone(),
+            "program_hash": artifact.body["program_hash"].clone(),
+            "report_schema_hash": artifact.body["report_schema_hash"].clone(),
+            "source_unit_count": artifact
+                .body
+                .get("source_unit_hashes")
+                .and_then(JsonValue::as_array)
+                .map_or(0, Vec::len),
+        },
+        "artifact_sections": {
+            "semantic_index": artifact.body.get("semantic_index").is_some(),
+            "symbol_table": artifact.body.get("symbol_table").is_some(),
+            "storage_layout": artifact.body.get("storage_layout").is_some(),
+            "source_schemas": artifact.body.get("source_schemas").is_some(),
+            "route_op_streams": artifact.body.get("route_op_streams").is_some(),
+            "dependency_graph": artifact.body.get("dependency_graph").is_some(),
+            "document_lowering_tables": artifact.body.get("document_lowering_tables").is_some(),
+            "bridge_schemas": artifact.body.get("bridge_schemas").is_some(),
+            "compiled_schedule": artifact.body.get("compiled_schedule").is_some(),
+        },
+        "artifact_sha256s": [{
+            "path": out_path.display().to_string(),
+            "sha256": artifact_hash.clone()
+        }]
+    });
+    if let Some(report_path) = report_path {
+        report["report_path"] = json!(report_path.display().to_string());
+        write_json(report_path, &report)?;
+    }
+    Ok(report)
+}
+
 pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
     let text = fs::read_to_string(path)?;
     Ok(toml::from_str(&text)?)
@@ -3648,10 +3731,10 @@ fn assert_live_source_event_numeric_field(
 }
 
 pub use boon_report_schema::{
-    command_argv_value_after, command_argv_values_after, require_command_argv_f64,
-    require_command_argv_value, require_generic_runtime_slice_flags, sha256_bytes, sha256_file,
-    verify_playground_surface_report, verify_report_schema, verify_runtime_execution_metadata,
-    verify_semantic_delta_protocol_batches, write_json,
+    command_argv_value_after, command_argv_values_after, report_schema_hash,
+    require_command_argv_f64, require_command_argv_value, require_generic_runtime_slice_flags,
+    sha256_bytes, sha256_file, verify_playground_surface_report, verify_report_schema,
+    verify_runtime_execution_metadata, verify_semantic_delta_protocol_batches, write_json,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5306,6 +5389,121 @@ impl CompiledProgram {
             "graph_clones_per_item": 0
         })
     }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledArtifact {
+    body: JsonValue,
+    sha256: String,
+}
+
+impl CompiledArtifact {
+    fn from_parts(
+        parsed: &ParsedProgram,
+        ir: &TypedProgram,
+        compiled: &CompiledProgram,
+        program_hash: &str,
+        typecheck_report_hash: &str,
+        render_slot_table_hash: &str,
+    ) -> Self {
+        let semantic_index = ir.semantic_index.report();
+        let compiled_schedule = compiled.report();
+        let source_units = compiled_artifact_source_units(parsed);
+        let body = json!({
+            "artifact_kind": "boonc.compiled_program",
+            "artifact_version": 1,
+            "format": "boonc-json-v1",
+            "runtime_load_mode": "compiled_static_graph_sidecar",
+            "parser_ast_required_for_execution": false,
+            "typed_ir_required_for_mvp_loader": true,
+            "program_kind": parsed.kind.as_str(),
+            "program_hash": program_hash,
+            "source_unit_hashes": source_units,
+            "report_schema_hash": compiled_artifact_report_schema_hash(),
+            "semantic_index": semantic_index,
+            "symbol_table": compiled_schedule["runtime_symbol_table"].clone(),
+            "runtime_symbol_count": compiled_schedule["runtime_symbol_count"].clone(),
+            "runtime_symbol_ownership": compiled_schedule["runtime_symbol_ownership"].clone(),
+            "storage_layout": compiled_schedule["typed_storage_layout"].clone(),
+            "source_schemas": {
+                "source_payload_schema_count": compiled_schedule["source_payload_schema_count"].clone(),
+                "source_payload_field_count": compiled_schedule["source_payload_field_count"].clone(),
+                "source_payload_text_field_count": compiled_schedule["source_payload_text_field_count"].clone(),
+                "source_payload_key_field_count": compiled_schedule["source_payload_key_field_count"].clone(),
+                "source_payload_address_field_count": compiled_schedule["source_payload_address_field_count"].clone(),
+                "source_payload_pointer_field_count": compiled_schedule["source_payload_pointer_field_count"].clone()
+            },
+            "route_op_streams": compiled_schedule["source_route_op_streams"].clone(),
+            "dependency_graph": {
+                "static_schedule_verified": ir.static_schedule_verified,
+                "hidden_identity_verified": ir.hidden_identity_verified,
+                "graph_node_count": ir.graph_node_count,
+                "schedule_node_count": compiled_schedule["schedule_node_count"].clone(),
+                "source_route_count": compiled_schedule["source_route_count"].clone(),
+                "list_source_binding_count": compiled_schedule["list_source_binding_count"].clone()
+            },
+            "document_lowering_tables": {
+                "render_slot_table_hash": render_slot_table_hash,
+                "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
+                "render_slot_count": ir.typecheck_report.render_slot_count,
+                "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count
+            },
+            "bridge_schemas": {
+                "status": "not_present_or_not_separate_from_source_payload_schemas",
+                "schema_count": 0
+            },
+            "typecheck_report_hash": typecheck_report_hash,
+            "compiled_schedule": compiled_schedule
+        });
+        let bytes =
+            serde_json::to_vec_pretty(&body).expect("compiled artifact JSON must serialize");
+        let sha256 = sha256_bytes(&bytes);
+        Self { body, sha256 }
+    }
+
+    fn report(&self) -> JsonValue {
+        json!({
+            "artifact_kind": "boonc.compiled_program",
+            "artifact_version": self.body["artifact_version"].clone(),
+            "format": self.body["format"].clone(),
+            "sha256": self.sha256,
+            "program_hash": self.body["program_hash"].clone(),
+            "report_schema_hash": self.body["report_schema_hash"].clone(),
+            "parser_ast_required_for_execution": self.body["parser_ast_required_for_execution"].clone(),
+            "typed_ir_required_for_mvp_loader": self.body["typed_ir_required_for_mvp_loader"].clone(),
+            "source_unit_count": self
+                .body
+                .get("source_unit_hashes")
+                .and_then(JsonValue::as_array)
+                .map_or(0, Vec::len),
+            "semantic_index_version": self.body["semantic_index"]["version"].clone(),
+            "runtime_symbol_count": self.body["runtime_symbol_count"].clone(),
+            "source_route_count": self.body["compiled_schedule"]["source_route_count"].clone(),
+            "source_route_op_stream_count": self.body["compiled_schedule"]["source_route_op_stream_count"].clone(),
+            "storage_layout": self.body["storage_layout"].clone(),
+            "bridge_schema_count": self.body["bridge_schemas"]["schema_count"].clone()
+        })
+    }
+}
+
+fn compiled_artifact_source_units(parsed: &ParsedProgram) -> Vec<JsonValue> {
+    parsed
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "start_line": file.start_line,
+                "module": file.module,
+                "source_hash": sha256_bytes(file.source.as_bytes()),
+                "source_bytes": file.source.len()
+            })
+        })
+        .collect()
+}
+
+fn compiled_artifact_report_schema_hash() -> String {
+    report_schema_hash()
 }
 
 fn ir_list_has_derived_list_view(ir: &TypedProgram, list_name: &str) -> bool {
@@ -34852,6 +35050,50 @@ FUNCTION icon_code(item) {
             .to_string()
             .contains("unknown_ast_expression_count")
         );
+    }
+
+    #[test]
+    fn compiled_artifact_emission_is_deterministic_and_schema_valid() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let artifact = temp_root.join("todomvc.boonc");
+        let report = temp_root.join("todomvc-compile-report.json");
+        let first = emit_compiled_artifact(
+            Path::new("../../examples/todomvc.bn"),
+            &artifact,
+            Some(&report),
+        )
+        .unwrap();
+        verify_report_schema(&report).unwrap();
+        let first_hash = first["compiled_artifact"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(first_hash, sha256_file(&artifact).unwrap());
+
+        let second =
+            emit_compiled_artifact(Path::new("../../examples/todomvc.bn"), &artifact, None)
+                .unwrap();
+        assert_eq!(
+            second["compiled_artifact"]["sha256"].as_str(),
+            Some(first_hash.as_str())
+        );
+
+        let artifact_json: JsonValue =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(artifact_json["format"], json!("boonc-json-v1"));
+        assert_eq!(
+            artifact_json["parser_ast_required_for_execution"],
+            json!(false)
+        );
+        assert!(artifact_json["semantic_index"].is_object());
+        assert!(artifact_json["compiled_schedule"]["source_route_op_streams"].is_object());
+        assert!(artifact_json["storage_layout"].is_object());
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]

@@ -126,8 +126,16 @@ pub fn sha256_file(path: &Path) -> RuntimeResult<String> {
     Ok(sha256_bytes(&fs::read(path)?))
 }
 
+pub fn report_schema_hash() -> String {
+    sha256_bytes(include_str!("lib.rs").as_bytes())
+}
+
 pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
+    if report.get("command").and_then(JsonValue::as_str) == Some("compile-artifact") {
+        verify_compiled_artifact_report(&report, path)?;
+        return Ok(());
+    }
     let required = [
         "report_version",
         "generated_at_utc",
@@ -192,6 +200,102 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report_command_is(&report, "verify-cells-visible-reality") {
         verify_cells_visible_reality_report(&report, path)?;
     }
+    Ok(())
+}
+
+fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "status",
+        "report_version",
+        "command",
+        "command_argv",
+        "measurement_mode",
+        "exit_status",
+        "generated_at_utc",
+        "git_commit",
+        "binary_hash",
+        "source_path",
+        "source_hash",
+        "program_hash",
+        "graph_node_count",
+        "semantic_index",
+        "compiled_schedule",
+        "compiled_artifact",
+        "artifact_sections",
+        "artifact_sha256s",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} missing compile-artifact report field `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!("{} compile-artifact report did not pass", path.display()).into());
+    }
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("diagnostic") {
+        return Err(format!(
+            "{} compile-artifact report measurement_mode must be diagnostic",
+            path.display()
+        )
+        .into());
+    }
+    let artifact = report
+        .get("compiled_artifact")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} compiled_artifact is not an object", path.display()))?;
+    for key in [
+        "path",
+        "sha256",
+        "format",
+        "artifact_version",
+        "program_hash",
+        "report_schema_hash",
+        "source_unit_count",
+    ] {
+        if artifact.get(key).is_none() {
+            return Err(format!("{} compiled_artifact missing `{key}`", path.display()).into());
+        }
+    }
+    if artifact.get("format").and_then(JsonValue::as_str) != Some("boonc-json-v1") {
+        return Err(format!("{} compiled_artifact has wrong format", path.display()).into());
+    }
+    if artifact.get("artifact_version").and_then(JsonValue::as_u64) != Some(1) {
+        return Err(format!(
+            "{} compiled_artifact has wrong artifact_version",
+            path.display()
+        )
+        .into());
+    }
+    if artifact.get("program_hash") != report.get("program_hash") {
+        return Err(format!(
+            "{} compiled_artifact program_hash does not match report",
+            path.display()
+        )
+        .into());
+    }
+    let sections = report
+        .get("artifact_sections")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} artifact_sections is not an object", path.display()))?;
+    for key in [
+        "semantic_index",
+        "symbol_table",
+        "storage_layout",
+        "source_schemas",
+        "route_op_streams",
+        "dependency_graph",
+        "document_lowering_tables",
+        "bridge_schemas",
+        "compiled_schedule",
+    ] {
+        if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
+        }
+    }
+    verify_artifact_hashes(report, path)?;
     Ok(())
 }
 
@@ -4536,5 +4640,69 @@ mod tests {
         bench["measurement_mode"] = json!("interaction");
         bench["command"] = json!("bench-example");
         assert!(!schema_accepts(bench, "bench-interaction"));
+    }
+
+    #[test]
+    fn compiled_artifact_report_links_real_artifact_and_sections() {
+        let artifact_path = temp_report_path("compiled-artifact-file");
+        write_json(
+            &artifact_path,
+            &json!({
+                "artifact_kind": "boonc.compiled_program",
+                "artifact_version": 1,
+                "format": "boonc-json-v1"
+            }),
+        )
+        .unwrap();
+        let artifact_hash = sha256_file(&artifact_path).unwrap();
+        let mut report = json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "compile-artifact",
+            "command_argv": ["boon_cli", "compile"],
+            "measurement_mode": "diagnostic",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": "examples/todomvc.bn",
+            "source_hash": "source",
+            "program_hash": "program",
+            "graph_node_count": 1,
+            "semantic_index": {},
+            "compiled_schedule": {},
+            "compiled_artifact": {
+                "path": artifact_path.display().to_string(),
+                "sha256": artifact_hash,
+                "format": "boonc-json-v1",
+                "artifact_version": 1,
+                "program_hash": "program",
+                "report_schema_hash": report_schema_hash(),
+                "source_unit_count": 1
+            },
+            "artifact_sections": {
+                "semantic_index": true,
+                "symbol_table": true,
+                "storage_layout": true,
+                "source_schemas": true,
+                "route_op_streams": true,
+                "dependency_graph": true,
+                "document_lowering_tables": true,
+                "bridge_schemas": true,
+                "compiled_schedule": true
+            },
+            "artifact_sha256s": [{
+                "path": artifact_path.display().to_string(),
+                "sha256": sha256_file(&artifact_path).unwrap()
+            }]
+        });
+        assert!(schema_accepts(report.clone(), "compiled-artifact-valid"));
+        report["artifact_sections"]["route_op_streams"] = json!(false);
+        assert!(!schema_accepts(report, "compiled-artifact-missing-section"));
+        let _ = fs::remove_file(artifact_path);
     }
 }

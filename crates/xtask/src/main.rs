@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 
 use boon_runtime::{
-    LiveRuntime, LiveSourceEvent, VerificationLayer, example_paths, parse_scenario, run_scenario,
-    run_scenario_project, verify_report_schema, write_json,
+    LiveRuntime, LiveSourceEvent, VerificationLayer, emit_compiled_artifact, example_paths,
+    parse_scenario, run_scenario, run_scenario_project, verify_report_schema, write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +24,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
+    "verify-compiled-artifact",
     "check-bridge",
     "verify-novywave-bridge-scenario",
     "verify-runtime-production-hardening",
@@ -114,6 +115,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-negative" => verify_negative(&args),
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(),
+        "verify-compiled-artifact" => verify_compiled_artifact(&args),
         "check-bridge" => check_bridge(&args),
         "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
@@ -1395,6 +1397,52 @@ fn verify_specific(
         verify_budget_passed(&output.report)?;
     }
     verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = named_arg(args, 1)?;
+    let (source, _, _) = example_paths(name)?;
+    let artifact = args
+        .windows(2)
+        .find(|window| window[0] == "--out")
+        .map(|window| PathBuf::from(&window[1]))
+        .unwrap_or_else(|| PathBuf::from(format!("target/artifacts/boonc/{name}.boonc")));
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from(format!("target/reports/compiled-artifact-{name}.json")));
+    let report_value = emit_compiled_artifact(&source, &artifact, Some(&report))?;
+    verify_report_schema(&report)?;
+    let artifact_value = read_json(&artifact)?;
+    let expected_hash = boon_runtime::sha256_file(&artifact)?;
+    if report_value
+        .pointer("/compiled_artifact/sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_hash.as_str())
+    {
+        return Err("compiled artifact report hash does not match artifact file".into());
+    }
+    for key in [
+        "semantic_index",
+        "symbol_table",
+        "storage_layout",
+        "source_schemas",
+        "route_op_streams",
+        "dependency_graph",
+        "document_lowering_tables",
+        "bridge_schemas",
+        "compiled_schedule",
+    ] {
+        if artifact_value.get(key).is_none() {
+            return Err(format!("compiled artifact missing `{key}`").into());
+        }
+    }
+    if artifact_value
+        .get("parser_ast_required_for_execution")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err("compiled artifact must not require parser AST for execution".into());
+    }
     Ok(())
 }
 

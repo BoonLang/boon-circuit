@@ -2740,7 +2740,7 @@ Notes:
   was added.
 
 ### EXP-0004 Dirty Set Representation
-Status: pending
+Status: done
 Type: experiment
 Depends on: TASK-0303
 Hypothesis:
@@ -2757,6 +2757,31 @@ Verification:
 - `cargo test -p boon_runtime --lib dirty`
 Notes:
 - Do not choose the representation before `TASK-0303` reports data.
+- Result: keep the current `SmallVec<[DirtyKeyEntry; 8]>` / linear
+  `current_vec` representation as the canonical `DirtyKeySets` path for now.
+  The measured dirty sets are tiny enough that `fixedbitset`, `roaring`, and
+  sort/dedup would add complexity at the wrong boundary.
+- Fresh TodoMVC speed evidence in `target/reports/todomvc-speed.json` reports
+  `dirty_entry_count.max = 21`, `dirty_entry_count.p95 = 14`,
+  `dirty_duplicate_attempt_count.max = 18`, and
+  `dirty_density_estimate.max = 0.5`. This is high density only over a tiny
+  key universe, which is not a good fixed-bitset signal.
+- The current NovyWave interaction report still points away from dirty-set
+  container replacement: click `dirty_set_metrics.p95 = 0.041408ms`, while
+  `source_action_root_dirty_scheduler.p95 = 2.526055ms`,
+  `source_action_root_dependent_visit_count.p95 = 194`,
+  `source_action_root_dependent_enqueue_count.p95 = 32`, and
+  `source_action_root_dirty_pop_count.p95 = 38`.
+- `cargo xtask verify-large-list-scan-counters --report
+  target/reports/large-list-scan-counters.json` failed during this experiment
+  with `large-list rows-scanned proof too small: stage max 0, per-step max 0,
+  expected at least 1000`; do not use that stale/failed large-list report as
+  promotion evidence until the verifier/data scenario is repaired.
+- Follow-up direction: if dirty propagation remains hot, work on the compiled
+  row/field dirty frontier, field-only list-root scheduling, or precomputed
+  dirty-field probes. Reopen container replacement only if refreshed reports
+  show representative dirty cardinality above `64`, `roaring`-scale sparse
+  sets, or dirty-set timing above roughly `1%` of apply time.
 
 ### EXP-0005 Shader-Side Shapes
 Status: pending
@@ -4336,6 +4361,34 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   If string work is needed later, start with measured `FieldSlotId::from_path`,
   source-route lookup, or text-lookup/cache-key clone counters rather than a
   cross-stage dependency swap.
+
+- Date: 2026-06-16
+- Task: EXP-0004 Dirty Set Representation
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: read-only dirty-set representation audit from subagent
+  `019ed170-ae51-7630-a3c3-eed241ffb9f6`;
+  `cargo test -p boon_runtime --lib dirty -- --nocapture`;
+  `cargo xtask verify-example-speed todomvc --report target/reports/todomvc-speed.json`;
+  `jq` inspection of TodoMVC dirty-set counters; `jq` inspection of the
+  current NovyWave interaction report.
+- Failed/non-authoritative evidence:
+  `cargo xtask verify-large-list-scan-counters --report
+  target/reports/large-list-scan-counters.json` failed with
+  `large-list rows-scanned proof too small: stage max 0, per-step max 0,
+  expected at least 1000`. Treat the large-list scan counter scenario as
+  needing repair before it can choose dirty-set representation.
+- Result: current `SmallVec<[DirtyKeyEntry; 8]>` / linear `current_vec`
+  remains the dirty-set representation. The refreshed TodoMVC report has
+  tiny absolute dirty cardinality (`dirty_entry_count.p95 = 14`, max `21`);
+  density is high only because the universe is tiny. The current NovyWave
+  report shows `dirty_set_metrics.p95 = 0.041408ms`, far below
+  `source_action_root_dirty_scheduler.p95 = 2.526055ms`, so swapping in
+  `fixedbitset`, `roaring`, or sorted `Vec` is rejected for this data shape.
+- Next direction: move to dependency-frontier, field-only list-root, or
+  compiled row scheduling tasks instead of continuing generic dirty-set
+  container swaps.
 
 ## File Maintenance Checklist
 

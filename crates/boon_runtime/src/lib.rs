@@ -12543,16 +12543,23 @@ impl GenericScheduledRuntime {
         let initial_dependency_started = source_action_profile.as_ref().map(|_| Instant::now());
         let mut dirty = BTreeSet::new();
         if let Some(frontier) = dirty_frontier_causes.as_mut() {
-            for (read, dependent) in self
+            let dependent_edges = self
                 .generic_derived_state
-                .root_dependent_edges_for_reads(changed_reads.iter().cloned())
-            {
+                .root_dependent_edges_for_reads(changed_reads.iter().cloned());
+            let pending_dependents = dependent_edges
+                .iter()
+                .map(|(_, dependent)| dependent.clone())
+                .collect::<BTreeSet<_>>();
+            for (read, dependent) in dependent_edges {
                 let dependent_kind = self
                     .generic_derived
                     .root_field_plan(&dependent)
                     .map(|field| derived_value_kind_label(&field.kind))
                     .unwrap_or("unknown");
-                let enqueued = dirty.insert(dependent.clone());
+                let structured_parent_skip = self
+                    .structured_pending_parent_for_path(&dependent, &dirty, &pending_dependents)
+                    .is_some();
+                let enqueued = !structured_parent_skip && dirty.insert(dependent.clone());
                 record_dirty_frontier_cause(
                     frontier,
                     None,
@@ -12560,16 +12567,28 @@ impl GenericScheduledRuntime {
                     &dependent,
                     dependent_kind,
                     enqueued,
-                    !enqueued,
+                    !enqueued && !structured_parent_skip,
                     false,
-                    false,
+                    structured_parent_skip,
                 );
             }
         } else {
-            dirty = self
+            let dependents = self
                 .generic_derived_state
                 .root_dependents_for_reads(changed_reads)
                 .into_iter()
+                .collect::<BTreeSet<_>>();
+            dirty = dependents
+                .iter()
+                .filter(|dependent| {
+                    self.structured_pending_parent_for_path(
+                        dependent,
+                        &BTreeSet::new(),
+                        &dependents,
+                    )
+                    .is_none()
+                })
+                .cloned()
                 .collect::<BTreeSet<_>>();
         }
         if let Some(profile) = source_action_profile.as_deref_mut() {
@@ -12779,6 +12798,7 @@ impl GenericScheduledRuntime {
                             .source_action_root_dependent_visit_count
                             .saturating_add(dependents.len());
                     }
+                    let pending_dependents = dependents.iter().cloned().collect::<BTreeSet<_>>();
                     let dependent_enqueue_started =
                         source_action_profile.as_ref().map(|_| Instant::now());
                     let mut enqueued_count = 0usize;
@@ -12805,6 +12825,39 @@ impl GenericScheduledRuntime {
                         let mut structured_parent_skip = false;
                         if dependent == path {
                             skipped_self = true;
+                            if let Some(frontier) = dirty_frontier_causes.as_mut() {
+                                for read in &edge_reads {
+                                    record_dirty_frontier_cause(
+                                        frontier,
+                                        Some(&path),
+                                        read,
+                                        &dependent,
+                                        &dependent_kind,
+                                        enqueued,
+                                        already_dirty,
+                                        skipped_self,
+                                        structured_parent_skip,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        if !dirty.contains(&dependent)
+                            && self
+                                .structured_pending_parent_for_path(
+                                    &dependent,
+                                    &dirty,
+                                    &pending_dependents,
+                                )
+                                .is_some()
+                        {
+                            structured_parent_skip = true;
+                            removed_root_value_cache.remove(&dependent);
+                            self.generic_derived_state
+                                .root_value_cache
+                                .remove(&dependent);
+                            self.generic_derived_state
+                                .remove_root_numeric_stability_guards(&dependent);
                             if let Some(frontier) = dirty_frontier_causes.as_mut() {
                                 for read in &edge_reads {
                                     record_dirty_frontier_cause(
@@ -13006,6 +13059,7 @@ impl GenericScheduledRuntime {
                     .source_action_root_dependent_visit_count
                     .saturating_add(dependents.len());
             }
+            let pending_dependents = dependents.iter().cloned().collect::<BTreeSet<_>>();
             let dependent_enqueue_started = source_action_profile.as_ref().map(|_| Instant::now());
             let mut enqueued_count = 0usize;
             for dependent in dependents {
@@ -13031,6 +13085,35 @@ impl GenericScheduledRuntime {
                 let mut structured_parent_skip = false;
                 if dependent == path {
                     skipped_self = true;
+                    if let Some(frontier) = dirty_frontier_causes.as_mut() {
+                        for read in &edge_reads {
+                            record_dirty_frontier_cause(
+                                frontier,
+                                Some(&path),
+                                read,
+                                &dependent,
+                                &dependent_kind,
+                                enqueued,
+                                already_dirty,
+                                skipped_self,
+                                structured_parent_skip,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if !dirty.contains(&dependent)
+                    && self
+                        .structured_pending_parent_for_path(&dependent, &dirty, &pending_dependents)
+                        .is_some()
+                {
+                    structured_parent_skip = true;
+                    removed_root_value_cache.remove(&dependent);
+                    self.generic_derived_state
+                        .root_value_cache
+                        .remove(&dependent);
+                    self.generic_derived_state
+                        .remove_root_numeric_stability_guards(&dependent);
                     if let Some(frontier) = dirty_frontier_causes.as_mut() {
                         for read in &edge_reads {
                             record_dirty_frontier_cause(
@@ -13250,7 +13333,6 @@ impl GenericScheduledRuntime {
         field_reads.insert(GenericReadKey::Root {
             field: field.path.clone(),
         });
-        collect_boon_value_root_read_keys(&field.path, &value, &mut field_reads);
         self.generic_derived_state
             .replace_root_reads(field.path.clone(), field_reads);
         if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
@@ -14750,6 +14832,51 @@ impl GenericScheduledRuntime {
         for end in (1..parts.len()).rev() {
             let parent = parts[..end].join(".");
             if dirty.contains(&parent)
+                && matches!(
+                    self.storage.root.owned_value(&parent),
+                    Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
+                )
+            {
+                return Some(parent);
+            }
+        }
+        None
+    }
+
+    fn structured_pending_parent_for_path(
+        &self,
+        path: &str,
+        dirty: &BTreeSet<String>,
+        pending: &BTreeSet<String>,
+    ) -> Option<String> {
+        let Some(field) = self
+            .generic_derived
+            .root_fields
+            .iter()
+            .find(|field| field.path == path)
+        else {
+            return None;
+        };
+        if !matches!(field.kind, DerivedValueKind::Pure) || field.has_sources {
+            return None;
+        }
+        if self.generic_derived.root_field_is_observed(path)
+            || self.root_field_drives_observed_projection(path)
+        {
+            return None;
+        }
+        let parts = path.split('.').collect::<Vec<_>>();
+        if parts.len() <= 1 {
+            return None;
+        }
+        for end in (1..parts.len()).rev() {
+            let parent = parts[..end].join(".");
+            if (dirty.contains(&parent) || pending.contains(&parent))
+                && self
+                    .generic_derived
+                    .root_fields
+                    .iter()
+                    .any(|field| field.path == parent)
                 && matches!(
                     self.storage.root.owned_value(&parent),
                     Some(FieldValue::Json(JsonValue::Object(_) | JsonValue::Array(_)))
@@ -20787,7 +20914,6 @@ impl GenericScheduledRuntime {
         field_reads.insert(GenericReadKey::Root {
             field: plan.path.clone(),
         });
-        collect_boon_value_root_read_keys(&plan.path, &value, &mut field_reads);
         self.generic_derived_state
             .replace_root_reads(plan.path.clone(), field_reads);
         self.generic_derived_state
@@ -35335,6 +35461,21 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
         assert_eq!(
             child_materialization_count, 0,
             "a structured child root should be pruned when its dirty parent will publish child changed reads: {materialized_paths:#?}"
+        );
+        assert!(
+            output
+                .runtime_step_profile
+                .source_action_root_dirty_frontier_samples
+                .iter()
+                .any(|sample| {
+                    sample.dependent_root == "store.page_ref.cursor"
+                        && sample.dependent_enqueue_count == 0
+                        && sample.structured_parent_skip_count > 0
+                }),
+            "a structured child projection should not be separately enqueued when its dirty parent is pending: {:#?}",
+            output
+                .runtime_step_profile
+                .source_action_root_dirty_frontier_samples
         );
     }
 

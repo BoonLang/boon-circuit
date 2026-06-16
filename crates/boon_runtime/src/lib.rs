@@ -4934,6 +4934,7 @@ struct CompiledProgram {
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
     storage_initialization: RuntimeStorageInitializationPlan,
+    document_lowering: RuntimeDocumentLoweringTables,
     root_state_paths: Vec<String>,
     list_summary_fields: Vec<ListSummaryFields>,
     dynamic_list_view_lists: BTreeSet<String>,
@@ -4977,7 +4978,7 @@ struct RuntimeSymbols {
     by_path: BTreeMap<Box<str>, RuntimeSymbolId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ListSummaryFields {
     list: String,
     row_scope: String,
@@ -5054,6 +5055,66 @@ enum RuntimeInitialValue {
     Enum(String),
     RootInitialField { path: String },
     RowInitialField { path: String },
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeDocumentLoweringTables {
+    summary_limits: RuntimeDocumentSummaryLimits,
+    root_summary_paths: Vec<String>,
+    list_summary_fields: Vec<ListSummaryFields>,
+    dynamic_list_view_lists: BTreeSet<String>,
+    projection_storage_resolutions: BTreeMap<String, String>,
+    unresolved_projection_storage_paths: BTreeSet<String>,
+    render_slot_table_hash: String,
+    render_slot_count: usize,
+    render_slot_failure_count: usize,
+    full_document_typecheck_coverage: bool,
+    list_map_binding_count_render_slot_materialization: usize,
+    observed_root_paths: BTreeSet<String>,
+    render_slots: Vec<RuntimeDocumentRenderSlot>,
+    render_patch_lowering: RuntimeRenderPatchLoweringTables,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeDocumentSummaryLimits {
+    preview_list_row_start: usize,
+    preview_list_rows: Option<usize>,
+    preview_chunk_row_start: usize,
+    preview_chunk_rows: Option<usize>,
+    preview_chunk_column_start: usize,
+    preview_chunk_columns: Option<usize>,
+    windowed_limits_are_request_driven: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeDocumentRenderSlot {
+    slot_statement_id: usize,
+    slot_name: String,
+    expected_contract: String,
+    value_expr_id: Option<usize>,
+    actual_type: JsonValue,
+    diagnostic_count: usize,
+    optional_list_map_binding_id: Option<usize>,
+    item_scope_id: Option<usize>,
+    template_function: Option<String>,
+    template_arg_count: usize,
+    materialization_policy: RuntimeDocumentMaterializationPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDocumentMaterializationPolicy {
+    RuntimeValue,
+    RenderSlotMaterialization,
+    StaticChildren,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRenderPatchLoweringTables {
+    root_patch_target_kind: &'static str,
+    row_field_patch_target_kind: &'static str,
+    structural_invalidation_target: &'static str,
+    semantic_only_root_patch_suppression: bool,
+    observed_root_filtering: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -5574,6 +5635,214 @@ impl RuntimeInitialValue {
     }
 }
 
+impl RuntimeDocumentLoweringTables {
+    fn from_ir(
+        ir: &TypedProgram,
+        root_summary_paths: Vec<String>,
+        list_summary_fields: Vec<ListSummaryFields>,
+        dynamic_list_view_lists: BTreeSet<String>,
+        list_projections: &ListProjectionPlan,
+        storage_initialization: &RuntimeStorageInitializationPlan,
+    ) -> Self {
+        let (projection_storage_resolutions, unresolved_projection_storage_paths) =
+            runtime_document_projection_storage_resolutions(
+                ir,
+                list_projections,
+                storage_initialization,
+            );
+        let render_slots = ir
+            .typecheck_report
+            .render_slot_table
+            .slots
+            .iter()
+            .map(|slot| RuntimeDocumentRenderSlot {
+                slot_statement_id: slot.slot_statement_id,
+                slot_name: slot.slot_name.clone(),
+                expected_contract: slot.expected_contract.clone(),
+                value_expr_id: slot.value_expr_id,
+                actual_type: serde_json::to_value(&slot.actual_type)
+                    .unwrap_or_else(|_| json!({"serialization_error": "actual_type"})),
+                diagnostic_count: slot.diagnostics.len(),
+                optional_list_map_binding_id: slot.optional_list_map_binding_id,
+                item_scope_id: slot.item_scope_id,
+                template_function: slot.template_function.clone(),
+                template_arg_count: slot.template_args.len(),
+                materialization_policy: RuntimeDocumentMaterializationPolicy::from_typecheck(
+                    slot.materialization_policy,
+                ),
+            })
+            .collect();
+        Self {
+            summary_limits: RuntimeDocumentSummaryLimits::document_preview(),
+            root_summary_paths,
+            list_summary_fields,
+            dynamic_list_view_lists,
+            projection_storage_resolutions,
+            unresolved_projection_storage_paths,
+            render_slot_table_hash: render_slot_table_hash(ir),
+            render_slot_count: ir.typecheck_report.render_slot_count,
+            render_slot_failure_count: ir.typecheck_report.render_slot_failure_count,
+            full_document_typecheck_coverage: ir.typecheck_report.full_document_typecheck_coverage,
+            list_map_binding_count_render_slot_materialization: ir
+                .typecheck_report
+                .list_map_binding_count_render_slot_materialization,
+            observed_root_paths: observed_root_paths_from_view_bindings(ir),
+            render_slots,
+            render_patch_lowering: RuntimeRenderPatchLoweringTables::generic(),
+        }
+    }
+
+    fn has_observed_root_paths(&self) -> bool {
+        !self.observed_root_paths.is_empty()
+    }
+
+    fn root_field_is_observed(&self, path: &str) -> bool {
+        root_path_observation_variants(path)
+            .into_iter()
+            .any(|candidate| {
+                self.observed_root_paths.contains(&candidate)
+                    || self
+                        .observed_root_paths
+                        .iter()
+                        .any(|observed| observed_path_is_descendant_of_root(observed, &candidate))
+            })
+    }
+}
+
+impl RuntimeDocumentSummaryLimits {
+    fn document_preview() -> Self {
+        let preview = SummaryLimits::document_preview();
+        Self {
+            preview_list_row_start: preview.list_row_start,
+            preview_list_rows: preview.list_rows,
+            preview_chunk_row_start: preview.chunk_row_start,
+            preview_chunk_rows: preview.chunk_rows,
+            preview_chunk_column_start: preview.chunk_column_start,
+            preview_chunk_columns: preview.chunk_columns,
+            windowed_limits_are_request_driven: true,
+        }
+    }
+}
+
+impl RuntimeDocumentMaterializationPolicy {
+    fn from_typecheck(policy: boon_typecheck::MaterializationPolicy) -> Self {
+        match policy {
+            boon_typecheck::MaterializationPolicy::RuntimeValue => Self::RuntimeValue,
+            boon_typecheck::MaterializationPolicy::RenderSlotMaterialization => {
+                Self::RenderSlotMaterialization
+            }
+            boon_typecheck::MaterializationPolicy::StaticChildren => Self::StaticChildren,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeValue => "runtime_value",
+            Self::RenderSlotMaterialization => "render_slot_materialization",
+            Self::StaticChildren => "static_children",
+        }
+    }
+}
+
+impl RuntimeRenderPatchLoweringTables {
+    fn generic() -> Self {
+        Self {
+            root_patch_target_kind: "root_path",
+            row_field_patch_target_kind: "row_field",
+            structural_invalidation_target: "document",
+            semantic_only_root_patch_suppression: true,
+            observed_root_filtering: true,
+        }
+    }
+}
+
+fn runtime_document_projection_storage_resolutions(
+    ir: &TypedProgram,
+    list_projections: &ListProjectionPlan,
+    storage_initialization: &RuntimeStorageInitializationPlan,
+) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let storage_list_names = storage_initialization
+        .list_slots
+        .iter()
+        .map(|slot| slot.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut resolutions = BTreeMap::new();
+    let mut unresolved = BTreeSet::new();
+    for projection in &list_projections.projections {
+        if resolutions.contains_key(&projection.list) {
+            continue;
+        }
+        if let Some(list) =
+            runtime_document_storage_list_name_for_path(&projection.list, &storage_list_names)
+        {
+            resolutions.insert(projection.list.clone(), list);
+            continue;
+        }
+        if let Some((_, list)) = runtime_document_direct_root_list_ref_for_path(
+            ir,
+            &projection.list,
+            &storage_list_names,
+        ) {
+            resolutions.insert(projection.list.clone(), list);
+            continue;
+        }
+        unresolved.insert(projection.list.clone());
+    }
+    (resolutions, unresolved)
+}
+
+fn runtime_document_storage_list_name_for_path(
+    path: &str,
+    storage_list_names: &BTreeSet<String>,
+) -> Option<String> {
+    if storage_list_names.contains(path) {
+        return Some(path.to_owned());
+    }
+    if let Some(stripped) = path.strip_prefix("store.")
+        && storage_list_names.contains(stripped)
+    {
+        return Some(stripped.to_owned());
+    }
+    let local = row_field_name(path);
+    storage_list_names.contains(local).then(|| local.to_owned())
+}
+
+fn runtime_document_direct_root_list_ref_for_path(
+    ir: &TypedProgram,
+    path: &str,
+    storage_list_names: &BTreeSet<String>,
+) -> Option<(String, String)> {
+    let value = ir
+        .derived_values
+        .iter()
+        .find(|value| !value.indexed && root_state_path_matches_runtime_path(&value.path, path))?;
+    runtime_document_direct_root_list_ref_for_statement(ir, &value.statement, storage_list_names)
+}
+
+fn runtime_document_direct_root_list_ref_for_statement(
+    ir: &TypedProgram,
+    statement: &AstStatement,
+    storage_list_names: &BTreeSet<String>,
+) -> Option<(String, String)> {
+    if !statement.children.is_empty() {
+        return None;
+    }
+    let expr = ir.expressions.get(statement.expr?)?;
+    let referenced = match &expr.kind {
+        AstExprKind::Identifier(name) => name.clone(),
+        AstExprKind::Path(parts) if !parts.is_empty() => parts.join("."),
+        _ => return None,
+    };
+    let plan = ir.derived_values.iter().find(|value| {
+        !value.indexed
+            && value.scope_id.is_none()
+            && matches!(value.kind, DerivedValueKind::ListView)
+            && root_state_path_matches_runtime_path(&value.path, &referenced)
+    })?;
+    let list = runtime_document_storage_list_name_for_path(&plan.path, storage_list_names)?;
+    Some((plan.path.clone(), list))
+}
+
 impl CompiledProgram {
     fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
         let symbols = RuntimeSymbols::from_ir(ir);
@@ -5668,6 +5937,14 @@ impl CompiledProgram {
         root_state_paths.dedup();
         let list_summary_fields = list_summary_fields_from_ir(ir);
         let dynamic_list_view_lists = dynamic_list_view_lists_from_ir(ir);
+        let document_lowering = RuntimeDocumentLoweringTables::from_ir(
+            ir,
+            root_state_paths.clone(),
+            list_summary_fields.clone(),
+            dynamic_list_view_lists.clone(),
+            &list_projections,
+            &storage_initialization,
+        );
         let field_slot_collision_diagnostics = field_slot_collision_diagnostics(ir);
         let root_targets = ir
             .state_cells
@@ -5696,6 +5973,7 @@ impl CompiledProgram {
             source_routes,
             list_source_bindings,
             storage_initialization,
+            document_lowering,
             root_state_paths,
             list_summary_fields,
             dynamic_list_view_lists,
@@ -5817,8 +6095,7 @@ impl CompiledProgram {
             "ast_free": true,
             "source_free_runtime_instantiation_ready": false,
             "runtime_instantiation_blocked_by": [
-                "generic_derived_ast_free_plan",
-                "document_lowering_runtime_tables"
+                "generic_derived_ast_free_plan"
             ],
             "included_runtime_owned_sections": {
                 "runtime_symbols": true,
@@ -5829,6 +6106,7 @@ impl CompiledProgram {
                 "source_routes": true,
                 "list_source_bindings": true,
                 "runtime_storage_initialization_plan": true,
+                "document_lowering_runtime_tables": true,
                 "root_state_paths": true,
                 "list_summary_fields": true,
                 "dynamic_list_view_lists": true,
@@ -5853,7 +6131,8 @@ impl CompiledProgram {
             "list_projections": list_projection_plan_artifact(&self.list_projections),
             "source_routes": source_route_plan_artifact(&self.source_routes),
             "list_source_bindings": list_source_binding_plan_artifact(&self.list_source_bindings),
-            "storage_initialization": runtime_storage_initialization_plan_artifact(&self.storage_initialization)
+            "storage_initialization": runtime_storage_initialization_plan_artifact(&self.storage_initialization),
+            "document_lowering": runtime_document_lowering_tables_artifact(&self.document_lowering)
         })
     }
 }
@@ -6029,6 +6308,84 @@ fn value_columns_artifact(columns: &ValueColumns) -> JsonValue {
             .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
     });
     JsonValue::Array(fields)
+}
+
+fn runtime_document_lowering_tables_artifact(tables: &RuntimeDocumentLoweringTables) -> JsonValue {
+    json!({
+        "format": "boonc-document-lowering-runtime-tables-json-v1",
+        "document_lowering_runtime_ast_free": true,
+        "summary_limits": runtime_document_summary_limits_artifact(&tables.summary_limits),
+        "root_summary_paths": tables.root_summary_paths,
+        "list_summary_fields": tables.list_summary_fields.iter().map(list_summary_fields_artifact).collect::<Vec<_>>(),
+        "dynamic_list_view_lists": tables.dynamic_list_view_lists.iter().collect::<Vec<_>>(),
+        "projection_storage_resolution_count": tables.projection_storage_resolutions.len(),
+        "projection_storage_resolutions": string_map_artifact(&tables.projection_storage_resolutions),
+        "unresolved_projection_storage_paths": tables.unresolved_projection_storage_paths.iter().collect::<Vec<_>>(),
+        "render_slot_table_hash": tables.render_slot_table_hash,
+        "render_slot_count": tables.render_slot_count,
+        "render_slot_failure_count": tables.render_slot_failure_count,
+        "full_document_typecheck_coverage": tables.full_document_typecheck_coverage,
+        "list_map_binding_count_render_slot_materialization": tables.list_map_binding_count_render_slot_materialization,
+        "observed_root_paths": tables.observed_root_paths.iter().collect::<Vec<_>>(),
+        "render_slots": tables.render_slots.iter().map(runtime_document_render_slot_artifact).collect::<Vec<_>>(),
+        "render_patch_lowering": runtime_render_patch_lowering_artifact(&tables.render_patch_lowering),
+        "excluded_parser_ast_sections": [
+            "RenderSlot.template_args",
+            "document AstStatement tree",
+            "document AstExpr table"
+        ]
+    })
+}
+
+fn runtime_document_summary_limits_artifact(limits: &RuntimeDocumentSummaryLimits) -> JsonValue {
+    json!({
+        "preview_list_row_start": limits.preview_list_row_start,
+        "preview_list_rows": limits.preview_list_rows,
+        "preview_chunk_row_start": limits.preview_chunk_row_start,
+        "preview_chunk_rows": limits.preview_chunk_rows,
+        "preview_chunk_column_start": limits.preview_chunk_column_start,
+        "preview_chunk_columns": limits.preview_chunk_columns,
+        "windowed_limits_are_request_driven": limits.windowed_limits_are_request_driven
+    })
+}
+
+fn string_map_artifact(map: &BTreeMap<String, String>) -> JsonValue {
+    JsonValue::Object(
+        map.iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect(),
+    )
+}
+
+fn runtime_document_render_slot_artifact(slot: &RuntimeDocumentRenderSlot) -> JsonValue {
+    json!({
+        "slot_statement_id": slot.slot_statement_id,
+        "slot_name": slot.slot_name,
+        "expected_contract": slot.expected_contract,
+        "value_expr_id": slot.value_expr_id,
+        "actual_type": slot.actual_type,
+        "diagnostic_count": slot.diagnostic_count,
+        "optional_list_map_binding_id": slot.optional_list_map_binding_id,
+        "item_scope_id": slot.item_scope_id,
+        "template_function": slot.template_function,
+        "template_arg_count": slot.template_arg_count,
+        "template_args_embedded_ast": false,
+        "materialization_policy": slot.materialization_policy.as_str()
+    })
+}
+
+fn runtime_render_patch_lowering_artifact(tables: &RuntimeRenderPatchLoweringTables) -> JsonValue {
+    json!({
+        "lowerer": "generic_render_patch_lowering",
+        "root_patch_target_kind": tables.root_patch_target_kind,
+        "row_field_patch_target_kind": tables.row_field_patch_target_kind,
+        "structural_invalidation_target": tables.structural_invalidation_target,
+        "semantic_only_root_patch_suppression": tables.semantic_only_root_patch_suppression,
+        "observed_root_filtering": tables.observed_root_filtering,
+        "root_mutation_patch_kinds": ["PatchRootField"],
+        "row_mutation_patch_kinds": ["PatchListRowField"],
+        "structural_patch_kinds": ["InvalidateDocument"]
+    })
 }
 
 fn scalar_equation_plan_artifact(plan: &ScalarEquationPlan) -> JsonValue {
@@ -6657,6 +7014,7 @@ impl CompiledArtifact {
             "source_routes",
             "list_source_bindings",
             "storage_initialization",
+            "document_lowering",
         ] {
             if !plan.contains_key(key) {
                 return Err(format!("{} runtime_plan missing `{key}`", path.display()).into());
@@ -6711,6 +7069,7 @@ impl CompiledArtifact {
             "source_routes",
             "list_source_bindings",
             "runtime_storage_initialization_plan",
+            "document_lowering_runtime_tables",
             "root_state_paths",
             "list_summary_fields",
             "dynamic_list_view_lists",
@@ -6782,6 +7141,71 @@ impl CompiledArtifact {
             if storage.get(key).and_then(JsonValue::as_array).is_none() {
                 return Err(format!(
                     "{} runtime_plan storage_initialization missing array `{key}`",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        let document_lowering = plan
+            .get("document_lowering")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} runtime_plan document_lowering is not an object",
+                    path.display()
+                )
+            })?;
+        if document_lowering.get("format").and_then(JsonValue::as_str)
+            != Some("boonc-document-lowering-runtime-tables-json-v1")
+        {
+            return Err(format!(
+                "{} runtime_plan document_lowering has wrong format",
+                path.display()
+            )
+            .into());
+        }
+        if document_lowering
+            .get("document_lowering_runtime_ast_free")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "{} runtime_plan document_lowering must be AST-free",
+                path.display()
+            )
+            .into());
+        }
+        for key in [
+            "root_summary_paths",
+            "list_summary_fields",
+            "dynamic_list_view_lists",
+            "render_slots",
+            "unresolved_projection_storage_paths",
+        ] {
+            if document_lowering
+                .get(key)
+                .and_then(JsonValue::as_array)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} runtime_plan document_lowering missing array `{key}`",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        for key in [
+            "summary_limits",
+            "projection_storage_resolutions",
+            "render_patch_lowering",
+        ] {
+            if document_lowering
+                .get(key)
+                .and_then(JsonValue::as_object)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} runtime_plan document_lowering missing object `{key}`",
                     path.display()
                 )
                 .into());
@@ -11636,6 +12060,7 @@ struct GenericScheduledRuntime {
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
+    document_lowering: RuntimeDocumentLoweringTables,
     last_source_route_execution: Option<SourceRouteExecutionStats>,
     list_scan_counters: RuntimeListScanCounters,
     root_materialization_stats: LiveRuntimeRootMaterializationStats,
@@ -11843,6 +12268,7 @@ impl GenericScheduledRuntime {
             list_projections: compiled.list_projections.clone(),
             source_routes: compiled.source_routes.clone(),
             list_source_bindings: compiled.list_source_bindings.clone(),
+            document_lowering: compiled.document_lowering.clone(),
             last_source_route_execution: None,
             list_scan_counters: RuntimeListScanCounters::default(),
             root_materialization_stats: LiveRuntimeRootMaterializationStats::default(),
@@ -11855,9 +12281,9 @@ impl GenericScheduledRuntime {
             root_list_view_field_cache_pass: 0,
             list_count_cache: RefCell::new(BTreeMap::new()),
             indexed_lookup_cache: IndexedLookupCache::default(),
-            root_state_paths: compiled.root_state_paths.clone(),
-            list_summary_fields: compiled.list_summary_fields.clone(),
-            dynamic_list_view_lists: compiled.dynamic_list_view_lists.clone(),
+            root_state_paths: compiled.document_lowering.root_summary_paths.clone(),
+            list_summary_fields: compiled.document_lowering.list_summary_fields.clone(),
+            dynamic_list_view_lists: compiled.document_lowering.dynamic_list_view_lists.clone(),
         };
         let clone_ms = runtime_elapsed_ms(clone_started);
         let root_initial_started = Instant::now();
@@ -15188,8 +15614,8 @@ impl GenericScheduledRuntime {
     }
 
     fn should_emit_root_render_patch(&self, path: &str) -> bool {
-        !self.generic_derived.has_observed_root_paths()
-            || self.generic_derived.root_field_is_observed(path)
+        !self.document_lowering.has_observed_root_paths()
+            || self.document_lowering.root_field_is_observed(path)
             || self.root_field_drives_observed_projection(path)
     }
 
@@ -15200,7 +15626,7 @@ impl GenericScheduledRuntime {
                 RuntimeListProjectionKind::Find { value, .. }
                     if root_paths_observation_overlap(value, path)
             ) && self
-                .generic_derived
+                .document_lowering
                 .root_field_is_observed(&projection.target)
         })
     }
@@ -15210,7 +15636,7 @@ impl GenericScheduledRuntime {
         path: &str,
         field: Option<&GenericDerivedRootField>,
     ) -> &'static str {
-        if !self.generic_derived.has_observed_root_paths() {
+        if !self.document_lowering.has_observed_root_paths() {
             return "blocked_no_observed_root_index";
         }
         let Some(field) = field.or_else(|| self.generic_derived.root_field_plan(path)) else {
@@ -15222,7 +15648,7 @@ impl GenericScheduledRuntime {
         if !matches!(field.kind, DerivedValueKind::Pure) || field.has_sources {
             return "blocked_source_or_impure";
         }
-        if self.generic_derived.root_field_is_observed(&field.path) {
+        if self.document_lowering.root_field_is_observed(&field.path) {
             return "blocked_observed_root";
         }
         if self.root_field_drives_observed_projection(&field.path) {
@@ -15276,7 +15702,7 @@ impl GenericScheduledRuntime {
                     continue;
                 };
                 if self
-                    .generic_derived
+                    .document_lowering
                     .root_field_is_observed(&dependent_field.path)
                     || self.root_field_drives_observed_projection(&dependent_field.path)
                 {
@@ -23412,6 +23838,13 @@ impl GenericScheduledRuntime {
     fn projection_storage_list_name(&mut self, path: &str) -> Option<String> {
         if let Some(list) = self.storage.list_name_for_path(path) {
             return Some(list.to_owned());
+        }
+        if let Some(list) = self
+            .document_lowering
+            .projection_storage_resolutions
+            .get(path)
+        {
+            return Some(list.clone());
         }
         if let Some(value) = self.generic_derived_state.root_value_cache.get(path) {
             match value {
@@ -36526,8 +36959,34 @@ FUNCTION icon_code(item) {
             json!(true)
         );
         assert_eq!(
+            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["document_lowering_runtime_tables"],
+            json!(true)
+        );
+        assert_eq!(
             artifact_json["runtime_plan"]["storage_initialization"]["storage_runtime_ast_free"],
             json!(true)
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["document_lowering"]["document_lowering_runtime_ast_free"],
+            json!(true)
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["document_lowering"]["format"],
+            json!("boonc-document-lowering-runtime-tables-json-v1")
+        );
+        assert!(
+            artifact_json["runtime_plan"]["document_lowering"]["root_summary_paths"]
+                .as_array()
+                .is_some_and(|paths| !paths.is_empty())
+        );
+        assert!(
+            artifact_json["runtime_plan"]["document_lowering"]["list_summary_fields"]
+                .as_array()
+                .is_some()
+        );
+        assert!(
+            artifact_json["runtime_plan"]["document_lowering"]["projection_storage_resolutions"]
+                .is_object()
         );
         assert!(
             artifact_json["runtime_plan"]["storage_initialization"]["root_slots"]
@@ -36594,6 +37053,13 @@ FUNCTION icon_code(item) {
                 .unwrap()
                 .iter()
                 .any(|section| section.as_str() == Some("runtime_storage_initialization_plan"))
+        );
+        assert!(
+            !loaded["inspection_result"]["missing_runtime_plan_sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|section| section.as_str() == Some("document_lowering_runtime_tables"))
         );
         assert_eq!(
             loaded["inspection_result"]["source_reparse_attempted"],
@@ -36667,6 +37133,50 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
+    fn document_lowering_runtime_tables_drive_runtime_summary_metadata() {
+        for example in ["counter", "todomvc", "cells"] {
+            let (source, _, _) = example_paths(example).unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+            let expected_root_state_paths = compiled.root_state_paths.clone();
+            let expected_list_summary_fields = compiled.list_summary_fields.clone();
+            let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
+
+            assert_eq!(
+                compiled.document_lowering.root_summary_paths, expected_root_state_paths,
+                "document root summary paths differ for {example}"
+            );
+            assert_eq!(
+                compiled.document_lowering.list_summary_fields, expected_list_summary_fields,
+                "document list summary fields differ for {example}"
+            );
+            assert_eq!(
+                compiled.document_lowering.dynamic_list_view_lists,
+                expected_dynamic_list_view_lists,
+                "document dynamic list-view list set differs for {example}"
+            );
+
+            compiled.root_state_paths.clear();
+            compiled.list_summary_fields.clear();
+            compiled.dynamic_list_view_lists.clear();
+            let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+            assert_eq!(
+                runtime.root_state_paths, expected_root_state_paths,
+                "runtime did not use document lowering root paths for {example}"
+            );
+            assert_eq!(
+                runtime.list_summary_fields, expected_list_summary_fields,
+                "runtime did not use document lowering list summary fields for {example}"
+            );
+            assert_eq!(
+                runtime.dynamic_list_view_lists, expected_dynamic_list_view_lists,
+                "runtime did not use document lowering dynamic list-view set for {example}"
+            );
+        }
+    }
+
+    #[test]
     fn compiled_artifact_rejects_non_ast_free_runtime_plan() {
         let temp_root = std::env::temp_dir().join(format!(
             "boon-compiled-artifact-runtime-plan-test-{}",
@@ -36684,6 +37194,31 @@ FUNCTION icon_code(item) {
         assert!(
             error.to_string().contains("runtime_plan must be AST-free"),
             "unexpected runtime_plan validation error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn compiled_artifact_rejects_non_ast_free_document_lowering_plan() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-document-lowering-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let artifact = temp_root.join("counter.boonc");
+        emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
+        let mut artifact_json: JsonValue =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        artifact_json["runtime_plan"]["document_lowering"]["document_lowering_runtime_ast_free"] =
+            json!(false);
+        write_json(&artifact, &artifact_json).unwrap();
+        let error = inspect_compiled_artifact_report(&artifact, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_plan document_lowering must be AST-free"),
+            "unexpected document lowering validation error: {error}"
         );
         let _ = std::fs::remove_dir_all(&temp_root);
     }

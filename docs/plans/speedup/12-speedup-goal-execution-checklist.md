@@ -2895,9 +2895,11 @@ Notes:
     without source access and carries a partial AST-free `runtime_plan`.
     The normal source runtime now builds generic storage from the compiled-owned
     storage initialization plan, so storage initialization is no longer a
-    missing runtime-plan section. `.boonc` still cannot instantiate
-    `LoadedRuntime` because the plan lacks AST-free generic-derived execution
-    and document-lowering runtime tables.
+    missing runtime-plan section. The normal source runtime also reads document
+    summary metadata from compiled-owned document-lowering runtime tables, so
+    document lowering is no longer a missing runtime-plan section. `.boonc`
+    still cannot instantiate `LoadedRuntime` because the plan lacks AST-free
+    generic-derived execution.
   - TASK-0901C must run at least one scenario from the loaded artifact and
     compare output against the interpreter path.
 - Normal source-run reports must not claim artifact-loaded execution until
@@ -4565,7 +4567,7 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 
 - Date: 2026-06-16
 - Task: TASK-0901B storage initialization runtime-plan slice
-- Commit: uncommitted
+- Commit: 4b6fafd
 - Files changed in this slice:
   `crates/boon_runtime/src/lib.rs`;
   `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
@@ -4604,7 +4606,8 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   `runtime_plan.storage_initialization` with
   `storage_runtime_ast_free = true`. `inspect-artifact` reports the remaining
   missing runtime-plan sections as only `generic_derived_ast_free_plan` and
-  `document_lowering_runtime_tables`; it still correctly keeps
+  `document_lowering_runtime_tables` before the follow-up document-lowering
+  slice; it still correctly keeps
   `runtime_instantiated_from_artifact = false`,
   `source_free_runtime_load_available = false`, and
   `scenario_execution_available = false`.
@@ -4612,6 +4615,58 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   document-lowering runtime tables, then add a real artifact-backed runtime
   constructor and scenario parity gate before flipping any source-free runtime
   execution booleans.
+
+- Date: 2026-06-16
+- Task: TASK-0901B document-lowering runtime-table slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: document-lowering runtime-table audit from subagents
+  `019ed1ad-c9e7-7411-9d26-b4b1387501d8` and
+  `019ed1ad-e192-7df1-b525-a045a4489a1d`; `cargo fmt -p
+  boon_runtime -p boon_report_schema -p xtask`; `cargo check -p
+  boon_runtime -p boon_cli -p xtask`; `cargo test -p boon_runtime --lib
+  compiled_artifact -- --nocapture`; `cargo test -p boon_runtime --lib
+  document_lowering_runtime_tables_drive_runtime_summary_metadata --
+  --nocapture`; `cargo test -p boon_report_schema --lib compiled_artifact --
+  --nocapture`; `cargo xtask verify-compiled-artifact todomvc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo run -p
+  boon_cli -- compile examples/todomvc.bn --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc.json`; `cargo run -p boon_cli --
+  inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `jq`
+  inspection of `runtime_plan.document_lowering` and
+  `inspection_result.missing_runtime_plan_sections`; `cargo xtask
+  verify-report-schema`; `cargo test -p boon_report_schema --lib`; `cargo
+  test -p xtask`; `cargo test -p boon_runtime --lib`
+- Result: TASK-0901B remains incomplete, but document lowering is now a
+  runtime-owned AST-free runtime-plan slice instead of a source-side companion
+  table. `CompiledProgram` owns `RuntimeDocumentLoweringTables` with document
+  preview summary limits, root summary paths, list summary fields, dynamic
+  list-view list names, render slot metadata, generic render-patch lowering
+  rules, observed root paths, and conservative projection-to-storage-list
+  resolutions. `GenericScheduledRuntime::new_profiled` now initializes its
+  summary metadata from `compiled.document_lowering`; the regression test
+  clears the old adjacent fields and proves runtime construction still gets the
+  expected root/list summary metadata from the new table.
+- Artifact/result detail: `.boonc` now exposes
+  `runtime_plan.document_lowering` with format
+  `boonc-document-lowering-runtime-tables-json-v1` and
+  `document_lowering_runtime_ast_free = true`. Artifact validation and xtask
+  gates reject missing or non-AST-free document-lowering runtime tables. The
+  refreshed CLI inspection report lists the remaining missing runtime-plan
+  sections as only `generic_derived_ast_free_plan`; it still correctly keeps
+  `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`, and
+  `scenario_execution_available = false`.
+- Remaining blocker: implement AST-free generic-derived execution, then add a
+  real artifact-backed runtime constructor and scenario parity gate before
+  flipping any source-free runtime execution booleans.
 
 ## File Maintenance Checklist
 

@@ -4975,8 +4975,7 @@ mod tests {
                 "blocked_task": "TASK-0901B",
                 "scenario_execution_pending_task": "TASK-0901C",
                 "missing_runtime_plan_sections": [
-                    "generic_derived_ast_free_plan",
-                    "document_lowering_runtime_tables"
+                    "generic_derived_ast_free_plan"
                 ]
             }
         });

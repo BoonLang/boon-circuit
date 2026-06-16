@@ -13474,9 +13474,7 @@ impl GenericScheduledRuntime {
             .get(&field.path)
             .cloned();
         let mut field_reads = frame.reads;
-        field_reads.insert(GenericReadKey::Root {
-            field: field.path.clone(),
-        });
+        field_reads.extend(root_dependency_read_keys_for_path(&field.path));
         self.generic_derived_state
             .replace_root_reads(field.path.clone(), field_reads);
         if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
@@ -15241,15 +15239,7 @@ impl GenericScheduledRuntime {
                 };
                 insert_changed_list_field_read_keys(&mut reads, list, index, field);
             } else {
-                reads.insert(GenericReadKey::Root {
-                    field: field.to_string(),
-                });
-                let leaf = row_field_name(field);
-                if leaf != field {
-                    reads.insert(GenericReadKey::Root {
-                        field: leaf.to_string(),
-                    });
-                }
+                reads.extend(root_read_keys_for_path(field));
             }
         }
         Ok(reads)
@@ -15282,15 +15272,7 @@ impl GenericScheduledRuntime {
                 };
                 insert_changed_list_field_read_keys(&mut reads, list, index, &delta.field);
             } else {
-                reads.insert(GenericReadKey::Root {
-                    field: delta.field.to_string(),
-                });
-                let leaf = row_field_name(&delta.field);
-                if leaf != delta.field {
-                    reads.insert(GenericReadKey::Root {
-                        field: leaf.to_string(),
-                    });
-                }
+                reads.extend(root_read_keys_for_path(&delta.field));
             }
         }
         Ok(reads)
@@ -16170,22 +16152,18 @@ impl GenericScheduledRuntime {
         if frame.row.is_some()
             && let Some(value) = self.runtime_scalar_boon_value(name)
         {
-            frame.reads.insert(GenericReadKey::Root {
-                field: name.to_owned(),
-            });
+            frame.reads.extend(root_dependency_read_keys_for_path(name));
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
-            frame.reads.insert(GenericReadKey::Root {
-                field: name.to_owned(),
-            });
+            frame.reads.extend(root_dependency_read_keys_for_path(name));
             return Ok(value);
         }
         let store_name = format!("store.{name}");
         if let Some(value) = self.runtime_scalar_boon_value(&store_name) {
             frame
                 .reads
-                .insert(GenericReadKey::Root { field: store_name });
+                .extend(root_dependency_read_keys_for_path(&store_name));
             return Ok(value);
         }
         if let Some(value) = self.root_pure_derived_boon_value(name, frame)? {
@@ -16208,9 +16186,7 @@ impl GenericScheduledRuntime {
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
-            frame.reads.insert(GenericReadKey::Root {
-                field: name.to_owned(),
-            });
+            frame.reads.extend(root_dependency_read_keys_for_path(name));
             return Ok(value);
         }
         Ok(BoonValue::Text(name.to_owned()))
@@ -16243,9 +16219,9 @@ impl GenericScheduledRuntime {
             .filter(|list| !self.dynamic_list_view_lists.contains(*list))
             .map(str::to_owned)
         {
-            frame.reads.insert(GenericReadKey::Root {
-                field: full_path.clone(),
-            });
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&full_path));
             frame.reads.insert(list_read_key(&list));
             return Ok(BoonValue::ListRef(list));
         }
@@ -16257,13 +16233,13 @@ impl GenericScheduledRuntime {
         {
             frame
                 .reads
-                .insert(GenericReadKey::Root { field: full_path });
+                .extend(root_dependency_read_keys_for_path(&full_path));
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(&full_path) {
-            frame.reads.insert(GenericReadKey::Root {
-                field: full_path.clone(),
-            });
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&full_path));
             return Ok(value);
         }
         if let Some(value) = self.root_pure_derived_boon_value(&full_path, frame)? {
@@ -16275,7 +16251,7 @@ impl GenericScheduledRuntime {
         if let Some(value) = self.runtime_scalar_boon_value(&full_path) {
             frame
                 .reads
-                .insert(GenericReadKey::Root { field: full_path });
+                .extend(root_dependency_read_keys_for_path(&full_path));
             return Ok(value);
         }
         Ok(BoonValue::Text(full_path))
@@ -20982,7 +20958,7 @@ impl GenericScheduledRuntime {
         if let Some(value) = self
             .root_state_paths
             .iter()
-            .find(|root_path| row_field_name(root_path) == path)
+            .find(|root_path| root_state_path_matches_runtime_path(root_path, path))
             .and_then(|root_path| self.storage.root.owned_value(root_path))
         {
             return Some(field_value_json(value));
@@ -21026,7 +21002,7 @@ impl GenericScheduledRuntime {
         if let Some(value) = self
             .root_state_paths
             .iter()
-            .find(|root_path| row_field_name(root_path) == path)
+            .find(|root_path| root_state_path_matches_runtime_path(root_path, path))
             .and_then(|root_path| self.storage.root.owned_value(root_path))
         {
             return Some(field_value_to_boon(value));
@@ -21068,9 +21044,9 @@ impl GenericScheduledRuntime {
             && plan.has_sources
             && let Some(value) = self.runtime_scalar_boon_value(&plan.path)
         {
-            frame.reads.insert(GenericReadKey::Root {
-                field: plan.path.clone(),
-            });
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&plan.path));
             return Ok(Some(value));
         }
         if let Some(value) = self.generic_derived_state.root_value_cache.get(&plan.path) {
@@ -21081,9 +21057,9 @@ impl GenericScheduledRuntime {
             {
                 frame.reads.extend(reads.iter().cloned());
             }
-            frame.reads.insert(GenericReadKey::Root {
-                field: plan.path.clone(),
-            });
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&plan.path));
             if let Some(guards) = self
                 .generic_derived_state
                 .root_numeric_stability_guards_by_field
@@ -21134,12 +21110,9 @@ impl GenericScheduledRuntime {
             .difference(&reads_before)
             .cloned()
             .collect::<BTreeSet<_>>();
-        frame.reads.insert(GenericReadKey::Root {
-            field: plan.path.clone(),
-        });
-        field_reads.insert(GenericReadKey::Root {
-            field: plan.path.clone(),
-        });
+        let plan_dependency_reads = root_dependency_read_keys_for_path(&plan.path);
+        frame.reads.extend(plan_dependency_reads.iter().cloned());
+        field_reads.extend(plan_dependency_reads);
         self.generic_derived_state
             .replace_root_reads(plan.path.clone(), field_reads);
         self.generic_derived_state
@@ -21199,9 +21172,9 @@ impl GenericScheduledRuntime {
             .list_name_for_path(&plan.path)
             .map(str::to_owned)
         {
-            frame.reads.insert(GenericReadKey::Root {
-                field: plan.path.clone(),
-            });
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&plan.path));
             frame.reads.insert(list_read_key(&list));
             return Ok(Some(BoonValue::ListRef(list)));
         }
@@ -25095,6 +25068,10 @@ fn runtime_path_matches_target(path: &str, target: &str) -> bool {
     path == target || path == row_field_name(target)
 }
 
+fn root_state_path_matches_runtime_path(root_path: &str, path: &str) -> bool {
+    root_path == path || root_path.strip_prefix("store.") == Some(path)
+}
+
 fn runtime_path_tail_for_target(path: &str, target: &str) -> Option<RuntimePathTail> {
     runtime_path_tail_after_head(path, target)
         .or_else(|| runtime_path_tail_after_head(path, row_field_name(target)))
@@ -27272,13 +27249,12 @@ fn observed_root_paths_from_view_bindings(ir: &TypedProgram) -> BTreeSet<String>
 }
 
 fn root_path_observation_variants(path: &str) -> Vec<String> {
-    let mut variants = BTreeSet::from([path.to_owned(), row_field_name(path).to_owned()]);
+    let mut variants = BTreeSet::from([path.to_owned()]);
     if let Some(passed) = path.strip_prefix("PASSED.") {
         variants.extend(root_path_observation_variants(passed));
     }
     if let Some(local) = path.strip_prefix("store.") {
         variants.insert(local.to_owned());
-        variants.insert(row_field_name(local).to_owned());
     } else if !path.starts_with('@') && !path.contains(':') {
         variants.insert(format!("store.{path}"));
     }
@@ -27404,6 +27380,10 @@ enum GenericReadKey {
     Root {
         field: String,
     },
+    RootChild {
+        root: String,
+        path: String,
+    },
     List {
         list: String,
     },
@@ -27487,7 +27467,7 @@ fn generic_read_key_list(read: &GenericReadKey) -> Option<&str> {
         GenericReadKey::List { list }
         | GenericReadKey::ListColumn { list, .. }
         | GenericReadKey::ListField { list, .. } => Some(list),
-        GenericReadKey::Root { .. } => None,
+        GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => None,
     }
 }
 
@@ -27498,7 +27478,9 @@ fn generic_read_key_kind_counts(reads: &BTreeSet<GenericReadKey>) -> (usize, usi
     let mut list_field_count = 0usize;
     for read in reads {
         match read {
-            GenericReadKey::Root { .. } => root_count = root_count.saturating_add(1),
+            GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => {
+                root_count = root_count.saturating_add(1);
+            }
             GenericReadKey::List { .. } => list_count = list_count.saturating_add(1),
             GenericReadKey::ListColumn { .. } => {
                 list_column_count = list_column_count.saturating_add(1);
@@ -27514,6 +27496,7 @@ fn generic_read_key_kind_counts(reads: &BTreeSet<GenericReadKey>) -> (usize, usi
 fn generic_read_key_kind_label(read: &GenericReadKey) -> &'static str {
     match read {
         GenericReadKey::Root { .. } => "root",
+        GenericReadKey::RootChild { .. } => "root_child",
         GenericReadKey::List { .. } => "list",
         GenericReadKey::ListColumn { .. } => "list_column",
         GenericReadKey::ListField { .. } => "list_field",
@@ -27523,6 +27506,9 @@ fn generic_read_key_kind_label(read: &GenericReadKey) -> &'static str {
 fn generic_read_key_label(read: &GenericReadKey) -> String {
     match read {
         GenericReadKey::Root { field } => format!("root:{field}"),
+        GenericReadKey::RootChild { root, path } => {
+            format!("root_child:{root}.{path}")
+        }
         GenericReadKey::List { list } => format!("list:{list}"),
         GenericReadKey::ListColumn { list, field } => {
             format!("list_column:{list}.{field}")
@@ -27857,10 +27843,14 @@ fn root_scalar_field_depends_on_changed_read(
         return true;
     }
     reads.iter().any(|read| {
-        let GenericReadKey::Root { field: dependency } = read else {
-            return false;
+        let dependency = match read {
+            GenericReadKey::Root { field } => field.clone(),
+            GenericReadKey::RootChild { root, path } => format!("{root}.{path}"),
+            GenericReadKey::List { .. }
+            | GenericReadKey::ListColumn { .. }
+            | GenericReadKey::ListField { .. } => return false,
         };
-        root_scalar_read_path_candidates(dependency)
+        root_scalar_read_path_candidates(&dependency)
             .into_iter()
             .any(|candidate| {
                 root_scalar_field_depends_on_changed_read(
@@ -27910,32 +27900,54 @@ fn root_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
             field: field.to_owned(),
         });
     });
+    if let Some(child) = root_child_read_key_for_path(path) {
+        keys.push(child);
+    }
     keys
+}
+
+fn root_dependency_read_keys_for_path(path: &str) -> Vec<GenericReadKey> {
+    root_child_read_key_for_path(path)
+        .map(|key| vec![key])
+        .unwrap_or_else(|| root_read_keys_for_path(path))
 }
 
 fn push_root_read_key_for_path_aliases(path: &str, mut push: impl FnMut(&str)) {
     push(path);
-    let leaf = row_field_name(path);
-    if leaf != path {
-        push(leaf);
-    }
     if let Some(local) = path.strip_prefix("store.")
         && local != path
-        && local != leaf
     {
         push(local);
     }
 }
 
+fn root_child_read_key_for_path(path: &str) -> Option<GenericReadKey> {
+    let local = path.strip_prefix("store.").unwrap_or(path);
+    let (root_name, child_path) = local.split_once('.')?;
+    if root_name.is_empty() || child_path.is_empty() {
+        return None;
+    }
+    Some(GenericReadKey::RootChild {
+        root: format!("store.{root_name}"),
+        path: child_path.to_owned(),
+    })
+}
+
 fn root_read_key_matches_path(read: &GenericReadKey, path: &str) -> bool {
-    let GenericReadKey::Root { field } = read else {
-        return false;
-    };
-    field == path
-        || field == row_field_name(path)
-        || path
-            .strip_prefix("store.")
-            .is_some_and(|local| field == local)
+    match read {
+        GenericReadKey::Root { field } => {
+            field == path
+                || path
+                    .strip_prefix("store.")
+                    .is_some_and(|local| field == local)
+        }
+        GenericReadKey::RootChild { .. } => root_child_read_key_for_path(path)
+            .as_ref()
+            .is_some_and(|candidate| candidate == read),
+        GenericReadKey::List { .. }
+        | GenericReadKey::ListColumn { .. }
+        | GenericReadKey::ListField { .. } => false,
+    }
 }
 
 fn root_reads_include_path(reads: &BTreeSet<GenericReadKey>, path: &str) -> bool {
@@ -27977,13 +27989,11 @@ fn remove_root_dirty_read_key_counts(counts: &mut BTreeMap<GenericReadKey, usize
 }
 
 fn root_read_keys_for_nested_path(path: &str) -> Vec<GenericReadKey> {
-    let mut keys = BTreeSet::from([GenericReadKey::Root {
-        field: path.to_owned(),
-    }]);
-    if let Some(local) = path.strip_prefix("store.") {
-        keys.insert(GenericReadKey::Root {
-            field: local.to_owned(),
-        });
+    let mut keys = BTreeSet::new();
+    if let Some(child) = root_child_read_key_for_path(path) {
+        keys.insert(child);
+    } else {
+        keys.extend(root_read_keys_for_path(path));
     }
     keys.into_iter().collect()
 }
@@ -30289,14 +30299,9 @@ impl GenericDerivedPlan {
     }
 
     fn root_field_plan(&self, path: &str) -> Option<&GenericDerivedRootField> {
-        let local_store_path = path.strip_prefix("store.");
-        self.root_fields.iter().find(|field| {
-            field.path == path
-                || row_field_name(&field.path) == path
-                || local_store_path.is_some_and(|local| {
-                    field.path == local || row_field_name(&field.path) == local
-                })
-        })
+        self.root_fields
+            .iter()
+            .find(|field| root_state_path_matches_runtime_path(&field.path, path))
     }
 
     fn root_field_plan_for_source_read_path(&self, path: &str) -> Option<&GenericDerivedRootField> {
@@ -35759,6 +35764,85 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
     }
 
     #[test]
+    fn nested_structured_child_change_does_not_dirty_top_level_leaf_alias() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    cursor:
+        TEXT { top-cursor } |> HOLD cursor { LATEST {} }
+    page_ref: [
+        ref_type: TEXT { PageRef }
+        cursor: TEXT { nested-cursor }
+    ]
+    cursor_label:
+        cursor |> Text/concat(with: TEXT { label }, separator: " ")
+    page_label:
+        page_ref.cursor |> Text/concat(with: page_ref.ref_type, separator: " ")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.page_label))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-structured-child-no-leaf-alias-collision", source)
+                .unwrap();
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["cursor_label"], "top-cursor label");
+        assert_eq!(initial["store"]["page_label"], "top-cursor PageRef");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let page_label_reads = generic
+            .generic_derived_state
+            .root_reads_by_field
+            .get("store.page_label")
+            .expect("page label should have recorded root reads");
+        assert!(
+            page_label_reads.contains(&GenericReadKey::RootChild {
+                root: "store.page_ref".to_owned(),
+                path: "cursor".to_owned(),
+            }),
+            "page_ref.cursor consumers should subscribe to a structured child key: {page_label_reads:#?}"
+        );
+        assert!(
+            !page_label_reads.contains(&GenericReadKey::Root {
+                field: "store.page_ref".to_owned(),
+            }),
+            "page_ref.cursor consumers must not subscribe to the whole parent root: {page_label_reads:#?}"
+        );
+        let sample_start = generic.root_materialization_stats.samples.len();
+        let dirty_reads = root_read_keys_for_path("store.page_ref.cursor")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let materializations = generic
+            .materialize_root_derived_field_commits_for_changed_reads(dirty_reads, None)
+            .expect("synthetic nested-child dirty wave should materialize");
+        let materialized_paths = generic.root_materialization_stats.samples[sample_start..]
+            .iter()
+            .map(|sample| sample.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            materialized_paths.contains("store.page_label")
+                || materializations
+                    .iter()
+                    .any(|materialization| materialization.target == "store.page_label"),
+            "a nested page_ref.cursor dirty key should still reach page_label: {materialized_paths:#?}"
+        );
+        assert!(
+            !materialized_paths.contains("store.cursor_label")
+                && materializations
+                    .iter()
+                    .all(|materialization| materialization.target != "store.cursor_label"),
+            "a change to store.page_ref.cursor must not dirty a root that only read top-level store.cursor: {:#?}",
+            materialized_paths
+        );
+    }
+
+    #[test]
     fn structured_root_changed_reads_only_dirty_changed_children() {
         let previous = FieldValue::Json(json!({
             "ref_type": "PageRef",
@@ -35780,30 +35864,34 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
             ),
         ]));
 
-        let reads = root_changed_read_keys_for_materialized_value(
+        let changed_reads = root_changed_read_keys_for_materialized_value(
             "store.page_ref",
             &value,
             Some(&previous),
-        )
-        .into_iter()
-        .filter_map(|read| match read {
-            GenericReadKey::Root { field } => Some(field),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+        );
+        let reads = changed_reads
+            .iter()
+            .filter_map(|read| match read {
+                GenericReadKey::Root { field } => Some(field.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let child_reads = changed_reads
+            .iter()
+            .filter_map(|read| match read {
+                GenericReadKey::RootChild { root, path } => Some((root.as_str(), path.as_str())),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
 
         assert!(reads.contains("store.page_ref"));
         assert!(reads.contains("page_ref"));
-        assert!(reads.contains("store.page_ref.cursor"));
-        assert!(reads.contains("page_ref.cursor"));
-        assert!(reads.contains("store.page_ref.metadata.version"));
-        assert!(reads.contains("page_ref.metadata.version"));
+        assert!(child_reads.contains(&("store.page_ref", "cursor")));
+        assert!(child_reads.contains(&("store.page_ref", "metadata.version")));
         assert!(
-            !reads.contains("store.page_ref.ref_type")
-                && !reads.contains("page_ref.ref_type")
-                && !reads.contains("store.page_ref.metadata.stable")
-                && !reads.contains("page_ref.metadata.stable"),
-            "stable sibling fields must not be dirtied by structured root diff: {reads:#?}"
+            !child_reads.contains(&("store.page_ref", "ref_type"))
+                && !child_reads.contains(&("store.page_ref", "metadata.stable")),
+            "stable sibling fields must not be dirtied by structured root diff: {changed_reads:#?}"
         );
     }
 
@@ -35832,28 +35920,33 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
             ),
         ]));
 
-        let reads = root_changed_read_keys_for_materialized_value(
+        let changed_reads = root_changed_read_keys_for_materialized_value(
             "store.bridge_cursor_values",
             &value,
             Some(&previous),
-        )
-        .into_iter()
-        .filter_map(|read| match read {
-            GenericReadKey::Root { field } => Some(field),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+        );
+        let reads = changed_reads
+            .iter()
+            .filter_map(|read| match read {
+                GenericReadKey::Root { field } => Some(field.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let child_reads = changed_reads
+            .iter()
+            .filter_map(|read| match read {
+                GenericReadKey::RootChild { root, path } => Some((root.as_str(), path.as_str())),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
 
         assert!(reads.contains("store.bridge_cursor_values"));
         assert!(reads.contains("bridge_cursor_values"));
-        assert!(reads.contains("store.bridge_cursor_values.cursor"));
-        assert!(reads.contains("bridge_cursor_values.cursor"));
+        assert!(child_reads.contains(&("store.bridge_cursor_values", "cursor")));
         assert!(
-            !reads.contains("store.bridge_cursor_values.rows")
-                && !reads.contains("bridge_cursor_values.rows")
-                && !reads.contains("store.bridge_cursor_values.selection")
-                && !reads.contains("bridge_cursor_values.selection"),
-            "stable list reference children must not be dirtied by structured root diff: {reads:#?}"
+            !child_reads.contains(&("store.bridge_cursor_values", "rows"))
+                && !child_reads.contains(&("store.bridge_cursor_values", "selection")),
+            "stable list reference children must not be dirtied by structured root diff: {changed_reads:#?}"
         );
     }
 
@@ -41054,16 +41147,20 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
-    fn root_read_key_aliases_match_store_local_and_leaf_without_duplicates() {
+    fn root_read_key_aliases_match_store_local_without_nested_leaf_collision() {
         let keys = root_read_keys_for_path("store.group.value");
         let fields = keys
             .iter()
-            .map(|key| match key {
-                GenericReadKey::Root { field } => field.as_str(),
-                _ => panic!("root path aliases should only produce root read keys"),
+            .filter_map(|key| match key {
+                GenericReadKey::Root { field } => Some(field.as_str()),
+                _ => None,
             })
-            .collect::<Vec<_>>();
-        assert_eq!(fields, vec!["store.group.value", "value", "group.value"]);
+            .collect::<BTreeSet<_>>();
+        assert_eq!(fields, BTreeSet::from(["store.group.value", "group.value"]));
+        assert!(keys.contains(&GenericReadKey::RootChild {
+            root: "store.group".to_owned(),
+            path: "value".to_owned(),
+        }));
         assert!(
             keys.iter()
                 .any(|key| root_read_key_matches_path(key, "store.group.value"))
@@ -41074,11 +41171,39 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             },
             "store.group.value"
         ));
+        assert!(
+            !root_read_key_matches_path(
+                &GenericReadKey::Root {
+                    field: "value".to_owned(),
+                },
+                "store.group.value"
+            ),
+            "a nested store root must not publish the bare leaf alias because it can collide with a real top-level store root"
+        );
+
+        let nested_cursor = root_read_keys_for_path("store.page_ref.cursor")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !nested_cursor.contains(&GenericReadKey::Root {
+                field: "cursor".to_owned()
+            }),
+            "store.page_ref.cursor must not collide with store.cursor dependents"
+        );
+        assert!(
+            !root_read_key_matches_path(
+                &GenericReadKey::Root {
+                    field: "cursor".to_owned(),
+                },
+                "store.page_ref.cursor"
+            ),
+            "matching must follow the same no-nested-leaf dependency contract"
+        );
         assert!(root_read_key_matches_path(
             &GenericReadKey::Root {
                 field: "value".to_owned(),
             },
-            "store.group.value"
+            "store.value"
         ));
 
         let deduped = root_read_keys_for_path("store.value")

@@ -1475,6 +1475,18 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
         return Err("compiled artifact runtime_plan must include document lowering tables".into());
     }
     if artifact_value
+        .pointer(
+            "/runtime_plan/included_runtime_owned_sections/generic_derived_partial_ast_free_plan",
+        )
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "compiled artifact runtime_plan must include partial generic derived runtime plan"
+                .into(),
+        );
+    }
+    if artifact_value
         .pointer("/runtime_plan/storage_initialization/storage_runtime_ast_free")
         .and_then(serde_json::Value::as_bool)
         != Some(true)
@@ -1489,6 +1501,13 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
         != Some(true)
     {
         return Err("compiled artifact runtime_plan document lowering must be AST-free".into());
+    }
+    if artifact_value
+        .pointer("/runtime_plan/generic_derived/generic_derived_runtime_ast_free")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("compiled artifact runtime_plan generic derived plan must be AST-free".into());
     }
     if artifact_value
         .get("parser_ast_required_for_execution")

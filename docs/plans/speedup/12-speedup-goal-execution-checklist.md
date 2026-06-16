@@ -4668,6 +4668,62 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   real artifact-backed runtime constructor and scenario parity gate before
   flipping any source-free runtime execution booleans.
 
+- Date: 2026-06-16
+- Task: TASK-0901B partial generic-derived runtime-plan slice
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`; `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: generic-derived artifact/load audit from subagent
+  `019ed1bd-7a09-76d1-9f99-96cf26b23121`; example coverage audit from
+  subagent `019ed1bd-6833-7753-bec5-e42f3ca04329`; `cargo fmt -p
+  boon_runtime -p xtask`; `cargo test -p boon_runtime --lib
+  generic_derived_runtime_plan_executes_supported_fields_without_ast_statements
+  -- --nocapture`; `cargo test -p boon_runtime --lib
+  compiled_artifact_emission_is_deterministic_and_schema_valid --
+  --nocapture`; `cargo test -p boon_runtime --lib compiled_artifact --
+  --nocapture`; `cargo check -p boon_runtime -p boon_cli -p xtask`; `cargo
+  xtask verify-compiled-artifact todomvc --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc-xtask.json`; `cargo xtask
+  verify-compiled-artifact-inspection todomvc --artifact
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc.json`; `cargo run -p
+  boon_cli -- compile examples/todomvc.bn --out
+  target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-todomvc.json`; `cargo run -p boon_cli --
+  inspect-artifact target/artifacts/boonc/todomvc.boonc --report
+  target/reports/compiled-artifact-inspection-todomvc-cli.json`; `cargo xtask
+  verify-report-schema`; `jq` inspection of
+  `runtime_plan.generic_derived` and
+  `inspection_result.missing_runtime_plan_sections`.
+- Result: TASK-0901B remains incomplete, but generic-derived execution now has
+  its first runtime-owned AST-free slice. `CompiledProgram` builds a
+  `RuntimeGenericDerivedPlan` beside the legacy AST-backed `GenericDerivedPlan`,
+  serializes it as
+  `runtime_plan.generic_derived.format =
+  boonc-runtime-generic-derived-partial-json-v1`, and marks
+  `included_runtime_owned_sections.generic_derived_partial_ast_free_plan =
+  true`. Source-path runtime evaluation now prefers runtime-owned statements
+  for supported root and indexed generic-derived fields and falls back to the
+  legacy AST plan only for unsupported shapes. The regression test poisons the
+  legacy AST statements for supported TodoMVC root/indexed fields and still
+  proves `store.has_completed`, `store.all_completed`, `todo.not_completed`,
+  and `todo.not_editing` are computed correctly from the runtime-owned plan.
+- Artifact/result detail: refreshed TodoMVC artifact coverage is
+  `root_supported_count = 3`, `indexed_supported_count = 2`, and
+  `unsupported_reasons = { statement_children: 1, when_expr: 1 }`. Inspection
+  still correctly reports
+  `missing_runtime_plan_sections = ["generic_derived_ast_free_plan"]`,
+  `runtime_instantiated_from_artifact = false`,
+  `source_free_runtime_load_available = false`, and
+  `scenario_execution_available = false`.
+- Remaining blocker: finish the generic-derived runtime compiler/evaluator for
+  the remaining statement-child/list-view and `WHEN` shapes, serialize enough
+  function/builtin/runtime expression coverage for NovyWave, then add a real
+  artifact-backed runtime constructor before removing
+  `generic_derived_ast_free_plan`.
+
 ## File Maintenance Checklist
 
 After editing this file, run:

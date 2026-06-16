@@ -4929,6 +4929,7 @@ struct CompiledProgram {
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
+    generic_derived_runtime: RuntimeGenericDerivedPlan,
     list_equations: ListEquationPlan,
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
@@ -5055,6 +5056,94 @@ enum RuntimeInitialValue {
     Enum(String),
     RootInitialField { path: String },
     RowInitialField { path: String },
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeGenericDerivedPlan {
+    root_fields: Vec<RuntimeGenericDerivedRootField>,
+    indexed_fields: Vec<RuntimeGenericDerivedIndexedField>,
+    unsupported_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericDerivedRootField {
+    path: String,
+    kind: DerivedValueKind,
+    has_sources: bool,
+    statement: Option<RuntimeGenericStatement>,
+    unsupported_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericDerivedIndexedField {
+    list: String,
+    row_scope: String,
+    field: String,
+    kind: DerivedValueKind,
+    statement: Option<RuntimeGenericStatement>,
+    unsupported_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeGenericStatement {
+    Empty,
+    Expr(RuntimeGenericExpr),
+    Record(Vec<RuntimeGenericRecordField>),
+    Latest(Vec<RuntimeGenericStatement>),
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericRecordField {
+    name: String,
+    value: RuntimeGenericStatement,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeGenericExpr {
+    Identifier(String),
+    Path(Vec<String>),
+    Text(String),
+    Number(i64),
+    Bool(bool),
+    Enum(String),
+    TaggedObject {
+        tag: String,
+        fields: Vec<RuntimeGenericRecordExprField>,
+    },
+    Call {
+        function: String,
+        args: Vec<RuntimeGenericArg>,
+    },
+    Pipe {
+        input: Box<RuntimeGenericExpr>,
+        op: String,
+        args: Vec<RuntimeGenericArg>,
+    },
+    Infix {
+        left: Box<RuntimeGenericExpr>,
+        op: String,
+        right: Box<RuntimeGenericExpr>,
+    },
+    Record(Vec<RuntimeGenericRecordExprField>),
+    List(Vec<RuntimeGenericExpr>),
+    Then {
+        input: Box<RuntimeGenericExpr>,
+        output: Option<Box<RuntimeGenericExpr>>,
+    },
+    Delimiter,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericRecordExprField {
+    name: String,
+    value: RuntimeGenericExpr,
+    spread: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericArg {
+    name: Option<String>,
+    value: RuntimeGenericExpr,
 }
 
 #[derive(Clone, Debug)]
@@ -5635,6 +5724,328 @@ impl RuntimeInitialValue {
     }
 }
 
+impl RuntimeGenericDerivedPlan {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let mut plan = Self::default();
+        for value in ir.derived_values.iter().filter(|value| {
+            !value.indexed
+                && value.scope_id.is_none()
+                && matches!(
+                    value.kind,
+                    DerivedValueKind::Pure
+                        | DerivedValueKind::SourceEventTransform
+                        | DerivedValueKind::ListView
+                )
+        }) {
+            let compiled = RuntimeGenericStatement::from_ast(&value.statement, &ir.expressions);
+            let (statement, unsupported_reason) = match compiled {
+                Ok(statement) => (Some(statement), None),
+                Err(reason) => {
+                    *plan.unsupported_reasons.entry(reason.clone()).or_default() += 1;
+                    (None, Some(reason))
+                }
+            };
+            plan.root_fields.push(RuntimeGenericDerivedRootField {
+                path: value.path.clone(),
+                kind: value.kind.clone(),
+                has_sources: !value.sources.is_empty(),
+                statement,
+                unsupported_reason,
+            });
+        }
+        for value in ir.derived_values.iter().filter(|value| {
+            (value.indexed || value.scope_id.is_some())
+                && matches!(
+                    value.kind,
+                    DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
+                )
+        }) {
+            if let Some((row_scope, field)) = value.path.split_once('.') {
+                let list = ir
+                    .row_scopes
+                    .iter()
+                    .find(|scope| scope.row_scope == row_scope)
+                    .map(|scope| scope.list.clone());
+                let Some(list) = list else {
+                    continue;
+                };
+                let compiled = RuntimeGenericStatement::from_ast(&value.statement, &ir.expressions);
+                let (statement, unsupported_reason) = match compiled {
+                    Ok(statement) => (Some(statement), None),
+                    Err(reason) => {
+                        *plan.unsupported_reasons.entry(reason.clone()).or_default() += 1;
+                        (None, Some(reason))
+                    }
+                };
+                plan.indexed_fields.push(RuntimeGenericDerivedIndexedField {
+                    list,
+                    row_scope: row_scope.to_owned(),
+                    field: field.to_owned(),
+                    kind: value.kind.clone(),
+                    statement,
+                    unsupported_reason,
+                });
+            }
+        }
+        plan
+    }
+
+    fn root_field_plan(&self, path: &str) -> Option<&RuntimeGenericDerivedRootField> {
+        self.root_fields
+            .iter()
+            .find(|field| root_state_path_matches_runtime_path(&field.path, path))
+    }
+
+    fn indexed_field_plan(
+        &self,
+        key: &GenericDerivedKey,
+    ) -> Option<&RuntimeGenericDerivedIndexedField> {
+        self.indexed_fields
+            .iter()
+            .find(|field| field.list == key.list && field.field == key.field)
+    }
+
+    fn supported_root_count(&self) -> usize {
+        self.root_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .count()
+    }
+
+    fn supported_indexed_count(&self) -> usize {
+        self.indexed_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .count()
+    }
+}
+
+impl RuntimeGenericStatement {
+    fn from_ast(statement: &AstStatement, expressions: &[AstExpr]) -> Result<Self, String> {
+        if statement.children.is_empty() {
+            return statement
+                .expr
+                .map(|expr| RuntimeGenericExpr::from_ast(expr, expressions).map(Self::Expr))
+                .unwrap_or(Ok(Self::Empty));
+        }
+        if statement.expr.is_none()
+            && statement.children.len() == 1
+            && matches!(statement.children[0].kind, AstStatementKind::Expression)
+        {
+            return Self::from_ast(&statement.children[0], expressions);
+        }
+        if statement.expr.is_some_and(|expr| {
+            expressions
+                .get(expr)
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::Latest))
+        }) {
+            return statement
+                .children
+                .iter()
+                .map(|child| Self::from_ast(child, expressions))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::Latest);
+        }
+        if record_statement_children(&statement.children) {
+            return RuntimeGenericRecordField::from_ast_children(&statement.children, expressions)
+                .map(Self::Record);
+        }
+        if statement.children.len() == 1
+            && matches!(statement.children[0].kind, AstStatementKind::Block)
+            && record_statement_children(&statement.children[0].children)
+        {
+            return RuntimeGenericRecordField::from_ast_children(
+                &statement.children[0].children,
+                expressions,
+            )
+            .map(Self::Record);
+        }
+        if let Some(expr) = statement.expr {
+            return RuntimeGenericExpr::from_ast(expr, expressions).and_then(|expr| {
+                if statement.children.is_empty() {
+                    Ok(Self::Expr(expr))
+                } else {
+                    Err("attached_children".to_owned())
+                }
+            });
+        }
+        Err("statement_children".to_owned())
+    }
+}
+
+impl RuntimeGenericRecordField {
+    fn from_ast_children(
+        children: &[AstStatement],
+        expressions: &[AstExpr],
+    ) -> Result<Vec<Self>, String> {
+        children
+            .iter()
+            .map(|child| {
+                let name = record_statement_child_name(child)
+                    .ok_or_else(|| "record_child_name".to_owned())?
+                    .to_owned();
+                RuntimeGenericStatement::from_ast(child, expressions)
+                    .map(|value| RuntimeGenericRecordField { name, value })
+            })
+            .collect()
+    }
+}
+
+impl RuntimeGenericExpr {
+    fn from_ast(expr_id: usize, expressions: &[AstExpr]) -> Result<Self, String> {
+        let expr = expressions
+            .get(expr_id)
+            .ok_or_else(|| "missing_expr".to_owned())?;
+        match &expr.kind {
+            AstExprKind::Identifier(name) => Ok(Self::Identifier(name.clone())),
+            AstExprKind::Path(parts) => Ok(Self::Path(parts.clone())),
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+                Ok(Self::Text(value.clone()))
+            }
+            AstExprKind::Number(value) => value
+                .parse::<i64>()
+                .map(Self::Number)
+                .map_err(|_| "number_literal".to_owned()),
+            AstExprKind::Bool(value) => Ok(Self::Bool(*value)),
+            AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(Self::Enum(value.clone())),
+            AstExprKind::TaggedObject { tag, fields } => Ok(Self::TaggedObject {
+                tag: tag.clone(),
+                fields: RuntimeGenericRecordExprField::from_ast_fields(fields, expressions)?,
+            }),
+            AstExprKind::Call { function, args } => {
+                runtime_generic_call_supported(function)?;
+                Ok(Self::Call {
+                    function: function.clone(),
+                    args: RuntimeGenericArg::from_ast_args(args, expressions)?,
+                })
+            }
+            AstExprKind::Pipe { input, op, args } => {
+                runtime_generic_call_supported(op)?;
+                Ok(Self::Pipe {
+                    input: Box::new(Self::from_ast(*input, expressions)?),
+                    op: op.clone(),
+                    args: RuntimeGenericArg::from_ast_args(args, expressions)?,
+                })
+            }
+            AstExprKind::Infix { left, op, right } => Ok(Self::Infix {
+                left: Box::new(Self::from_ast(*left, expressions)?),
+                op: op.clone(),
+                right: Box::new(Self::from_ast(*right, expressions)?),
+            }),
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => Ok(Self::Record(
+                RuntimeGenericRecordExprField::from_ast_fields(fields, expressions)?,
+            )),
+            AstExprKind::ListLiteral { items, .. } => items
+                .iter()
+                .map(|item| Self::from_ast(*item, expressions))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::List),
+            AstExprKind::Then { input, output } => Ok(Self::Then {
+                input: Box::new(Self::from_ast(*input, expressions)?),
+                output: output
+                    .map(|output| Self::from_ast(output, expressions).map(Box::new))
+                    .transpose()?,
+            }),
+            AstExprKind::Delimiter => Ok(Self::Delimiter),
+            AstExprKind::Source
+            | AstExprKind::Hold { .. }
+            | AstExprKind::Latest
+            | AstExprKind::When { .. }
+            | AstExprKind::MatchArm { .. }
+            | AstExprKind::Unknown(_) => {
+                Err(runtime_generic_expr_kind_label(&expr.kind).to_owned())
+            }
+        }
+    }
+}
+
+impl RuntimeGenericRecordExprField {
+    fn from_ast_fields(
+        fields: &[AstRecordField],
+        expressions: &[AstExpr],
+    ) -> Result<Vec<Self>, String> {
+        fields
+            .iter()
+            .map(|field| {
+                Ok(Self {
+                    name: field.name.clone(),
+                    value: RuntimeGenericExpr::from_ast(field.value, expressions)?,
+                    spread: field.spread,
+                })
+            })
+            .collect()
+    }
+}
+
+impl RuntimeGenericArg {
+    fn from_ast_args(args: &[AstCallArg], expressions: &[AstExpr]) -> Result<Vec<Self>, String> {
+        args.iter()
+            .map(|arg| {
+                Ok(Self {
+                    name: arg.name.clone(),
+                    value: RuntimeGenericExpr::from_ast(arg.value, expressions)?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn runtime_generic_call_supported(function: &str) -> Result<(), String> {
+    if function.strip_prefix("Field/").is_some()
+        || is_generic_render_constructor(function)
+        || is_light_constructor(function)
+    {
+        return Ok(());
+    }
+    match function {
+        "SOURCE"
+        | "Text/empty"
+        | "Text/concat"
+        | "Text/trim"
+        | "Text/is_empty"
+        | "Text/is_not_empty"
+        | "Number/min"
+        | "Number/max"
+        | "Number/interpolate"
+        | "Number/project_time"
+        | "Bool/not"
+        | "Bool/and"
+        | "Error/new"
+        | "Error/text"
+        | "Router/route"
+        | "Router/go_to" => Ok(()),
+        _ => Err(format!("call:{function}")),
+    }
+}
+
+fn runtime_generic_expr_kind_label(kind: &AstExprKind) -> &'static str {
+    match kind {
+        AstExprKind::Source => "source_expr",
+        AstExprKind::Hold { .. } => "hold_expr",
+        AstExprKind::Latest => "latest_expr",
+        AstExprKind::When { .. } => "when_expr",
+        AstExprKind::MatchArm { .. } => "match_arm_expr",
+        AstExprKind::Unknown(_) => "unknown_expr",
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::TaggedObject { .. }
+        | AstExprKind::Call { .. }
+        | AstExprKind::Pipe { .. }
+        | AstExprKind::Then { .. }
+        | AstExprKind::Infix { .. }
+        | AstExprKind::Object(_)
+        | AstExprKind::Record(_)
+        | AstExprKind::ListLiteral { .. }
+        | AstExprKind::Delimiter => "supported",
+    }
+}
+
 impl RuntimeDocumentLoweringTables {
     fn from_ir(
         ir: &TypedProgram,
@@ -5912,6 +6323,7 @@ impl CompiledProgram {
         let scalar_equations = ScalarEquationPlan::from_ir(ir);
         let derived_equations = DerivedEquationPlan::from_ir(ir);
         let generic_derived = GenericDerivedPlan::from_ir(ir);
+        let generic_derived_runtime = RuntimeGenericDerivedPlan::from_ir(ir);
         let derived_text_transform_count = derived_equations.text_transforms.len();
         let list_equations = ListEquationPlan::from_ir(ir);
         let list_projections = ListProjectionPlan::from_ir(ir);
@@ -5968,6 +6380,7 @@ impl CompiledProgram {
             scalar_equations,
             derived_equations,
             generic_derived,
+            generic_derived_runtime,
             list_equations,
             list_projections,
             source_routes,
@@ -6110,7 +6523,8 @@ impl CompiledProgram {
                 "root_state_paths": true,
                 "list_summary_fields": true,
                 "dynamic_list_view_lists": true,
-                "source_route_payload_fields": true
+                "source_route_payload_fields": true,
+                "generic_derived_partial_ast_free_plan": true
             },
             "excluded_parser_ast_sections": [
                 "GenericDerivedPlan.expressions",
@@ -6131,6 +6545,7 @@ impl CompiledProgram {
             "list_projections": list_projection_plan_artifact(&self.list_projections),
             "source_routes": source_route_plan_artifact(&self.source_routes),
             "list_source_bindings": list_source_binding_plan_artifact(&self.list_source_bindings),
+            "generic_derived": runtime_generic_derived_plan_artifact(&self.generic_derived_runtime),
             "storage_initialization": runtime_storage_initialization_plan_artifact(&self.storage_initialization),
             "document_lowering": runtime_document_lowering_tables_artifact(&self.document_lowering)
         })
@@ -6253,6 +6668,149 @@ fn runtime_initial_value_artifact(value: &RuntimeInitialValue) -> JsonValue {
     }
 }
 
+fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> JsonValue {
+    json!({
+        "format": "boonc-runtime-generic-derived-partial-json-v1",
+        "generic_derived_runtime_ast_free": true,
+        "partial_coverage": true,
+        "root_field_count": plan.root_fields.len(),
+        "indexed_field_count": plan.indexed_fields.len(),
+        "root_supported_count": plan.supported_root_count(),
+        "indexed_supported_count": plan.supported_indexed_count(),
+        "unsupported_reasons": usize_map_artifact(&plan.unsupported_reasons),
+        "root_fields": plan.root_fields.iter().map(runtime_generic_derived_root_field_artifact).collect::<Vec<_>>(),
+        "indexed_fields": plan.indexed_fields.iter().map(runtime_generic_derived_indexed_field_artifact).collect::<Vec<_>>(),
+        "excluded_parser_ast_sections": [
+            "AstStatement",
+            "AstExpr",
+            "FunctionDefinition"
+        ]
+    })
+}
+
+fn runtime_generic_derived_root_field_artifact(
+    field: &RuntimeGenericDerivedRootField,
+) -> JsonValue {
+    json!({
+        "path": field.path,
+        "kind": derived_value_kind_artifact(&field.kind),
+        "has_sources": field.has_sources,
+        "supported": field.statement.is_some(),
+        "unsupported_reason": field.unsupported_reason,
+        "statement": field.statement.as_ref().map(runtime_generic_statement_artifact)
+    })
+}
+
+fn runtime_generic_derived_indexed_field_artifact(
+    field: &RuntimeGenericDerivedIndexedField,
+) -> JsonValue {
+    json!({
+        "list": field.list,
+        "row_scope": field.row_scope,
+        "field": field.field,
+        "kind": derived_value_kind_artifact(&field.kind),
+        "supported": field.statement.is_some(),
+        "unsupported_reason": field.unsupported_reason,
+        "statement": field.statement.as_ref().map(runtime_generic_statement_artifact)
+    })
+}
+
+fn runtime_generic_statement_artifact(statement: &RuntimeGenericStatement) -> JsonValue {
+    match statement {
+        RuntimeGenericStatement::Empty => json!({ "kind": "empty" }),
+        RuntimeGenericStatement::Expr(expr) => {
+            json!({ "kind": "expr", "expr": runtime_generic_expr_artifact(expr) })
+        }
+        RuntimeGenericStatement::Record(fields) => json!({
+            "kind": "record_statement",
+            "fields": fields.iter().map(runtime_generic_record_field_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericStatement::Latest(statements) => json!({
+            "kind": "latest",
+            "branches": statements.iter().map(runtime_generic_statement_artifact).collect::<Vec<_>>()
+        }),
+    }
+}
+
+fn runtime_generic_record_field_artifact(field: &RuntimeGenericRecordField) -> JsonValue {
+    json!({
+        "name": field.name,
+        "value": runtime_generic_statement_artifact(&field.value)
+    })
+}
+
+fn runtime_generic_expr_artifact(expr: &RuntimeGenericExpr) -> JsonValue {
+    match expr {
+        RuntimeGenericExpr::Identifier(name) => json!({ "kind": "identifier", "name": name }),
+        RuntimeGenericExpr::Path(parts) => json!({ "kind": "path", "parts": parts }),
+        RuntimeGenericExpr::Text(value) => json!({ "kind": "text", "value": value }),
+        RuntimeGenericExpr::Number(value) => json!({ "kind": "number", "value": value }),
+        RuntimeGenericExpr::Bool(value) => json!({ "kind": "bool", "value": value }),
+        RuntimeGenericExpr::Enum(value) => json!({ "kind": "enum", "value": value }),
+        RuntimeGenericExpr::TaggedObject { tag, fields } => json!({
+            "kind": "tagged_object",
+            "tag": tag,
+            "fields": fields.iter().map(runtime_generic_record_expr_field_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericExpr::Call { function, args } => json!({
+            "kind": "call",
+            "function": function,
+            "args": args.iter().map(runtime_generic_arg_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericExpr::Pipe { input, op, args } => json!({
+            "kind": "pipe",
+            "input": runtime_generic_expr_artifact(input),
+            "op": op,
+            "args": args.iter().map(runtime_generic_arg_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericExpr::Infix { left, op, right } => json!({
+            "kind": "infix",
+            "left": runtime_generic_expr_artifact(left),
+            "op": op,
+            "right": runtime_generic_expr_artifact(right)
+        }),
+        RuntimeGenericExpr::Record(fields) => json!({
+            "kind": "record",
+            "fields": fields.iter().map(runtime_generic_record_expr_field_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericExpr::List(items) => json!({
+            "kind": "list",
+            "items": items.iter().map(runtime_generic_expr_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeGenericExpr::Then { input, output } => json!({
+            "kind": "then",
+            "input": runtime_generic_expr_artifact(input),
+            "output": output.as_deref().map(runtime_generic_expr_artifact)
+        }),
+        RuntimeGenericExpr::Delimiter => json!({ "kind": "delimiter" }),
+    }
+}
+
+fn runtime_generic_record_expr_field_artifact(field: &RuntimeGenericRecordExprField) -> JsonValue {
+    json!({
+        "name": field.name,
+        "spread": field.spread,
+        "value": runtime_generic_expr_artifact(&field.value)
+    })
+}
+
+fn runtime_generic_arg_artifact(arg: &RuntimeGenericArg) -> JsonValue {
+    json!({
+        "name": arg.name,
+        "value": runtime_generic_expr_artifact(&arg.value)
+    })
+}
+
+fn derived_value_kind_artifact(kind: &DerivedValueKind) -> &'static str {
+    match kind {
+        DerivedValueKind::SourceEventTransform => "source_event_transform",
+        DerivedValueKind::ListView => "list_view",
+        DerivedValueKind::Aggregate => "aggregate",
+        DerivedValueKind::Pure => "pure",
+        DerivedValueKind::Unknown => "unknown",
+    }
+}
+
 fn runtime_row_snapshot_artifact(row: &RuntimeRowSnapshot) -> JsonValue {
     json!({
         "fields": value_columns_artifact(&row.columns)
@@ -6350,6 +6908,14 @@ fn runtime_document_summary_limits_artifact(limits: &RuntimeDocumentSummaryLimit
 }
 
 fn string_map_artifact(map: &BTreeMap<String, String>) -> JsonValue {
+    JsonValue::Object(
+        map.iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect(),
+    )
+}
+
+fn usize_map_artifact(map: &BTreeMap<String, usize>) -> JsonValue {
     JsonValue::Object(
         map.iter()
             .map(|(key, value)| (key.clone(), json!(value)))
@@ -7013,6 +7579,7 @@ impl CompiledArtifact {
             "list_projections",
             "source_routes",
             "list_source_bindings",
+            "generic_derived",
             "storage_initialization",
             "document_lowering",
         ] {
@@ -7074,6 +7641,7 @@ impl CompiledArtifact {
             "list_summary_fields",
             "dynamic_list_view_lists",
             "source_route_payload_fields",
+            "generic_derived_partial_ast_free_plan",
         ] {
             if included.get(key).and_then(JsonValue::as_bool) != Some(true) {
                 return Err(format!(
@@ -7102,6 +7670,77 @@ impl CompiledArtifact {
             return Err(
                 format!("{} runtime_plan has no source route slots", path.display()).into(),
             );
+        }
+        let generic_derived = plan
+            .get("generic_derived")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} runtime_plan generic_derived is not an object",
+                    path.display()
+                )
+            })?;
+        if generic_derived.get("format").and_then(JsonValue::as_str)
+            != Some("boonc-runtime-generic-derived-partial-json-v1")
+        {
+            return Err(format!(
+                "{} runtime_plan generic_derived has wrong format",
+                path.display()
+            )
+            .into());
+        }
+        if generic_derived
+            .get("generic_derived_runtime_ast_free")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "{} runtime_plan generic_derived must be AST-free",
+                path.display()
+            )
+            .into());
+        }
+        for key in ["root_fields", "indexed_fields"] {
+            if generic_derived
+                .get(key)
+                .and_then(JsonValue::as_array)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} runtime_plan generic_derived missing array `{key}`",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        if generic_derived
+            .get("unsupported_reasons")
+            .and_then(JsonValue::as_object)
+            .is_none()
+        {
+            return Err(format!(
+                "{} runtime_plan generic_derived missing unsupported_reasons",
+                path.display()
+            )
+            .into());
+        }
+        for key in [
+            "root_field_count",
+            "indexed_field_count",
+            "root_supported_count",
+            "indexed_supported_count",
+        ] {
+            if generic_derived
+                .get(key)
+                .and_then(JsonValue::as_u64)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} runtime_plan generic_derived missing count `{key}`",
+                    path.display()
+                )
+                .into());
+            }
         }
         let storage = plan
             .get("storage_initialization")
@@ -12055,6 +12694,7 @@ struct GenericScheduledRuntime {
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
+    generic_derived_runtime: RuntimeGenericDerivedPlan,
     generic_derived_state: GenericDerivedState,
     list_equations: ListEquationPlan,
     list_projections: ListProjectionPlan,
@@ -12263,6 +12903,7 @@ impl GenericScheduledRuntime {
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
             generic_derived: compiled.generic_derived.clone(),
+            generic_derived_runtime: compiled.generic_derived_runtime.clone(),
             generic_derived_state: GenericDerivedState::default(),
             list_equations: compiled.list_equations.clone(),
             list_projections: compiled.list_projections.clone(),
@@ -15505,7 +16146,8 @@ impl GenericScheduledRuntime {
         }
         let mut frame = GenericEvalFrame::root();
         frame.root_stack.push(field.path.clone());
-        let value = self.eval_root_derived_initial_value(&field.statement, &mut frame);
+        let value =
+            self.eval_root_derived_statement_value(&field.path, &field.statement, &mut frame);
         frame.root_stack.pop();
         let value = value?;
         let numeric_stability_guards = frame.numeric_stability_guards.clone();
@@ -16772,7 +17414,8 @@ impl GenericScheduledRuntime {
         );
         let eval_started = Instant::now();
         frame.root_stack.push(field.path.clone());
-        let value = self.eval_root_derived_initial_value(&field.statement, &mut frame);
+        let value =
+            self.eval_root_derived_statement_value(&field.path, &field.statement, &mut frame);
         frame.root_stack.pop();
         let value = value?;
         let eval_ms = runtime_elapsed_ms(eval_started);
@@ -17237,6 +17880,23 @@ impl GenericScheduledRuntime {
         self.eval_statement_value(statement, frame)
     }
 
+    fn eval_root_derived_statement_value(
+        &mut self,
+        path: &str,
+        statement: &AstStatement,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let runtime_statement = self
+            .generic_derived_runtime
+            .root_field_plan(path)
+            .and_then(|field| field.statement.clone());
+        if let Some(statement) = runtime_statement {
+            self.eval_runtime_generic_statement(&statement, frame)
+        } else {
+            self.eval_root_derived_initial_value(statement, frame)
+        }
+    }
+
     fn root_derived_latest_statement<'a>(
         &self,
         statement: &'a AstStatement,
@@ -17493,7 +18153,15 @@ impl GenericScheduledRuntime {
         let mut frame = GenericEvalFrame::for_row(&plan.list, &plan.row_scope, key.index);
         frame.stack = stack.to_vec();
         frame.stack.push(key.clone());
-        let value = self.eval_statement_value(&plan.statement, &mut frame)?;
+        let runtime_statement = self
+            .generic_derived_runtime
+            .indexed_field_plan(key)
+            .and_then(|field| field.statement.clone());
+        let value = if let Some(statement) = runtime_statement {
+            self.eval_runtime_generic_statement(&statement, &mut frame)?
+        } else {
+            self.eval_statement_value(&plan.statement, &mut frame)?
+        };
         let numeric_stability_guards = frame.numeric_stability_guards.clone();
         let previous_numeric_stability_guards = self
             .generic_derived_state
@@ -17597,6 +18265,374 @@ impl GenericScheduledRuntime {
             }),
             value,
         ))
+    }
+
+    fn eval_runtime_generic_statement(
+        &mut self,
+        statement: &RuntimeGenericStatement,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        match statement {
+            RuntimeGenericStatement::Empty => Ok(BoonValue::Empty),
+            RuntimeGenericStatement::Expr(expr) => self.eval_runtime_generic_expr(expr, frame),
+            RuntimeGenericStatement::Record(fields) => {
+                let mut record = BTreeMap::new();
+                for field in fields {
+                    record.insert(
+                        field.name.clone(),
+                        self.eval_runtime_generic_statement(&field.value, frame)?,
+                    );
+                }
+                Ok(BoonValue::Record(record))
+            }
+            RuntimeGenericStatement::Latest(statements) => {
+                for statement in statements {
+                    let value = self.eval_runtime_generic_statement(statement, frame)?;
+                    if !matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+                        return Ok(value);
+                    }
+                }
+                Ok(BoonValue::Empty)
+            }
+        }
+    }
+
+    fn eval_runtime_generic_expr(
+        &mut self,
+        expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        match expr {
+            RuntimeGenericExpr::Identifier(name) => self.eval_identifier(name, frame),
+            RuntimeGenericExpr::Path(parts) => self.eval_path(parts, frame),
+            RuntimeGenericExpr::Text(value) => Ok(BoonValue::Text(value.clone())),
+            RuntimeGenericExpr::Number(value) => Ok(BoonValue::Number(*value)),
+            RuntimeGenericExpr::Bool(value) => Ok(BoonValue::Bool(*value)),
+            RuntimeGenericExpr::Enum(value) => Ok(BoonValue::Enum(value.clone())),
+            RuntimeGenericExpr::TaggedObject { tag, fields } => {
+                let mut body = Vec::new();
+                for field in fields {
+                    if field.spread {
+                        continue;
+                    }
+                    let value = boon_value_scalar_text(
+                        &self.eval_runtime_generic_expr(&field.value, frame)?,
+                    );
+                    body.push(format!("{}:{}", field.name, value));
+                }
+                Ok(BoonValue::Text(format!("{tag}[{}]", body.join(","))))
+            }
+            RuntimeGenericExpr::Call { function, args } => {
+                self.eval_runtime_generic_call(function, args, None, frame)
+            }
+            RuntimeGenericExpr::Pipe { input, op, args } => {
+                let input = if matches!(input.as_ref(), RuntimeGenericExpr::Delimiter) {
+                    BoonValue::Empty
+                } else {
+                    self.eval_runtime_generic_expr(input, frame)?
+                };
+                self.eval_runtime_generic_call(op, args, Some(input), frame)
+            }
+            RuntimeGenericExpr::Infix { left, op, right } => {
+                let left = self.eval_runtime_generic_expr(left, frame)?;
+                let right = self.eval_runtime_generic_expr(right, frame)?;
+                Ok(generic_infix_value(left, op, right))
+            }
+            RuntimeGenericExpr::Record(fields) => self.eval_runtime_generic_object(fields, frame),
+            RuntimeGenericExpr::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_runtime_generic_expr(item, frame)?);
+                }
+                Ok(BoonValue::List(values))
+            }
+            RuntimeGenericExpr::Then { input, output } => {
+                let input = self.eval_runtime_generic_expr(input, frame)?;
+                if matches!(input, BoonValue::Empty | BoonValue::Error(_)) {
+                    return Ok(BoonValue::Empty);
+                }
+                output
+                    .as_deref()
+                    .map(|output| self.eval_runtime_generic_expr(output, frame))
+                    .unwrap_or(Ok(input))
+            }
+            RuntimeGenericExpr::Delimiter => Ok(BoonValue::Empty),
+        }
+    }
+
+    fn eval_runtime_generic_object(
+        &mut self,
+        fields: &[RuntimeGenericRecordExprField],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        for field in fields {
+            let value = self.eval_runtime_generic_expr(&field.value, frame)?;
+            if field.spread {
+                match value {
+                    BoonValue::Record(fields) => record.extend(fields),
+                    BoonValue::RecordColumns(columns) => {
+                        record.extend(boon_record_from_value_columns(&columns));
+                    }
+                    BoonValue::Empty => {}
+                    BoonValue::Text(value) if value == "UNPLUGGED" => {}
+                    _ => return Ok(BoonValue::Error("type_error".to_owned())),
+                }
+            } else {
+                record.insert(field.name.clone(), value);
+            }
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn eval_runtime_generic_call(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if is_generic_render_constructor(function) || is_light_constructor(function) {
+            return self.eval_runtime_generic_constructor(function, args, input, frame);
+        }
+        if let Some(field) = function.strip_prefix("Field/") {
+            let value = self.runtime_call_input_or_first(input, args, frame)?;
+            return Ok(match value {
+                BoonValue::Record(fields) => fields
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
+                _ => BoonValue::Error("type_error".to_owned()),
+            });
+        }
+        match function {
+            "SOURCE" => self.runtime_call_input_or_first(input, args, frame),
+            "Text/empty" => Ok(BoonValue::Text(String::new())),
+            "Text/concat" => {
+                let left = self.runtime_call_input_or_first(input, args, frame)?;
+                let right = self.runtime_named_or_positional_arg_value(args, "with", 0, frame)?;
+                let separator = self
+                    .runtime_named_arg_value(args, "separator", frame)
+                    .map(BoonValue::into_text_or_default)
+                    .unwrap_or_default();
+                let left = left.into_text_or_default();
+                let right = right.into_text_or_default();
+                let mut text = String::with_capacity(left.len() + separator.len() + right.len());
+                text.push_str(&left);
+                text.push_str(&separator);
+                text.push_str(&right);
+                Ok(BoonValue::Text(text))
+            }
+            "Text/trim" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(
+                    value.as_text().unwrap_or_default().trim().to_owned(),
+                ))
+            }
+            "Text/is_empty" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(
+                    value.as_text().unwrap_or_default().is_empty(),
+                ))
+            }
+            "Text/is_not_empty" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(
+                    !value.as_text().unwrap_or_default().is_empty(),
+                ))
+            }
+            "Number/min" => {
+                let left = self
+                    .runtime_named_or_positional_arg_value(args, "left", 0, frame)?
+                    .number()?;
+                let right = self
+                    .runtime_named_or_positional_arg_value(args, "right", 1, frame)?
+                    .number()?;
+                Ok(BoonValue::Number(left.min(right)))
+            }
+            "Number/max" => {
+                let left = self
+                    .runtime_named_or_positional_arg_value(args, "left", 0, frame)?
+                    .number()?;
+                let right = self
+                    .runtime_named_or_positional_arg_value(args, "right", 1, frame)?
+                    .number()?;
+                Ok(BoonValue::Number(left.max(right)))
+            }
+            "Number/interpolate" => {
+                let start = self
+                    .runtime_named_or_positional_arg_value(args, "start", 0, frame)?
+                    .number()?;
+                let end = self
+                    .runtime_named_or_positional_arg_value(args, "end", 1, frame)?
+                    .number()?;
+                let numerator = self
+                    .runtime_named_or_positional_arg_value(args, "numerator", 2, frame)?
+                    .number()?;
+                let denominator = self
+                    .runtime_named_or_positional_arg_value(args, "denominator", 3, frame)?
+                    .number()?;
+                let fallback = self
+                    .runtime_named_or_positional_arg_value(args, "fallback", 4, frame)
+                    .map(|value| value.number().unwrap_or(start))
+                    .unwrap_or(start);
+                if denominator == 0 {
+                    Ok(BoonValue::Number(fallback))
+                } else {
+                    Ok(BoonValue::Number(
+                        start + ((end - start) * numerator) / denominator,
+                    ))
+                }
+            }
+            "Number/project_time" => {
+                let pointer_x = self
+                    .runtime_named_or_positional_arg_value(args, "pointer_x", 0, frame)?
+                    .number()?;
+                let pointer_width = self
+                    .runtime_named_or_positional_arg_value(args, "pointer_width", 1, frame)?
+                    .number()?;
+                let viewport_start = self
+                    .runtime_named_or_positional_arg_value(args, "viewport_start", 2, frame)?
+                    .number()?;
+                let viewport_end = self
+                    .runtime_named_or_positional_arg_value(args, "viewport_end", 3, frame)?
+                    .number()?;
+                let fallback = self
+                    .runtime_named_or_positional_arg_value(args, "fallback", 4, frame)
+                    .map(|value| value.number().unwrap_or(viewport_start))
+                    .unwrap_or(viewport_start);
+                let viewport_span = viewport_end - viewport_start;
+                if pointer_width <= 0 || viewport_span <= 0 {
+                    Ok(BoonValue::Number(fallback))
+                } else {
+                    let clamped_x = pointer_x.clamp(0, pointer_width);
+                    Ok(BoonValue::Number(
+                        viewport_start + (viewport_span * clamped_x) / pointer_width,
+                    ))
+                }
+            }
+            "Bool/not" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(!value.bool_value().unwrap_or(false)))
+            }
+            "Bool/and" => {
+                let piped = input.is_some();
+                let left = self.runtime_call_input_or_first(input, args, frame)?;
+                let right_position = if piped { 0 } else { 1 };
+                let right = self.runtime_named_or_positional_arg_value(
+                    args,
+                    "right",
+                    right_position,
+                    frame,
+                )?;
+                Ok(BoonValue::Bool(
+                    left.bool_value().unwrap_or(false) && right.bool_value().unwrap_or(false),
+                ))
+            }
+            "Error/new" => {
+                let code = self.runtime_named_arg_value(args, "code", frame)?;
+                Ok(BoonValue::Error(
+                    code.as_text().unwrap_or_else(|| "error".to_owned()),
+                ))
+            }
+            "Error/text" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(match value {
+                    BoonValue::Error(error) => error,
+                    _ => String::new(),
+                }))
+            }
+            "Router/route" => {
+                frame.reads.insert(GenericReadKey::Root {
+                    field: "Router/route".to_owned(),
+                });
+                Ok(BoonValue::Text(self.router_route.clone()))
+            }
+            "Router/go_to" => {
+                let value = self.runtime_call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(value.as_text().unwrap_or_default()))
+            }
+            _ => Ok(BoonValue::Error(
+                "unsupported_runtime_generic_call".to_owned(),
+            )),
+        }
+    }
+
+    fn eval_runtime_generic_constructor(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        record.insert(
+            "kind".to_owned(),
+            BoonValue::Text(generic_constructor_kind(function).to_owned()),
+        );
+        record.insert(
+            "constructor".to_owned(),
+            BoonValue::Text(function.to_owned()),
+        );
+        if let Some(input) = input {
+            record.insert("input".to_owned(), input);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let value = self.eval_runtime_generic_expr(&arg.value, frame)?;
+            let name = arg.name.clone().unwrap_or_else(|| format!("arg_{index}"));
+            record.insert(name, value);
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn runtime_call_input_or_first(
+        &mut self,
+        input: Option<BoonValue>,
+        args: &[RuntimeGenericArg],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match input {
+            Some(value) => Ok(value),
+            None => {
+                let arg = args
+                    .first()
+                    .ok_or("generic runtime call requires an input argument")?;
+                self.eval_runtime_generic_expr(&arg.value, frame)
+            }
+        }
+    }
+
+    fn runtime_named_arg_value(
+        &mut self,
+        args: &[RuntimeGenericArg],
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let arg = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some(name))
+            .ok_or_else(|| format!("generic runtime call requires `{name}`"))?;
+        self.eval_runtime_generic_expr(&arg.value, frame)
+    }
+
+    fn runtime_named_or_positional_arg_value(
+        &mut self,
+        args: &[RuntimeGenericArg],
+        name: &str,
+        position: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) {
+            return self.eval_runtime_generic_expr(&arg.value, frame);
+        }
+        let arg = args
+            .iter()
+            .filter(|arg| arg.name.is_none())
+            .nth(position)
+            .ok_or_else(|| format!("generic runtime call requires `{name}`"))?;
+        self.eval_runtime_generic_expr(&arg.value, frame)
     }
 
     fn eval_statement_block(
@@ -23139,7 +24175,7 @@ impl GenericScheduledRuntime {
         let reads_before = frame.reads.clone();
         let numeric_guards_before = frame.numeric_stability_guards.clone();
         frame.root_stack.push(plan.path.clone());
-        let value = self.eval_root_derived_initial_value(&plan.statement, frame);
+        let value = self.eval_root_derived_statement_value(&plan.path, &plan.statement, frame);
         frame.root_stack.pop();
         let value = value?;
         let numeric_stability_guards = frame
@@ -23509,7 +24545,7 @@ impl GenericScheduledRuntime {
             }
             let mut frame = GenericEvalFrame::root();
             let value = self
-                .eval_statement_value(&field.statement, &mut frame)
+                .eval_root_derived_statement_value(&field.path, &field.statement, &mut frame)
                 .unwrap_or_else(|error| BoonValue::Error(error.to_string()));
             if matches!(value, BoonValue::Error(_) | BoonValue::Empty) {
                 continue;
@@ -23857,7 +24893,7 @@ impl GenericScheduledRuntime {
         let field = self.generic_derived.root_field_plan(path).cloned()?;
         let mut frame = GenericEvalFrame::root();
         let value = self
-            .eval_statement_value(&field.statement, &mut frame)
+            .eval_root_derived_statement_value(&field.path, &field.statement, &mut frame)
             .ok()?;
         match value {
             BoonValue::ListRef(list) | BoonValue::ListSelection { list, .. } => Some(list),
@@ -27845,6 +28881,20 @@ fn close_other_list_editors<'a>(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn empty_ast_statement_for_test() -> AstStatement {
+    AstStatement {
+        id: 0,
+        line: 0,
+        indent: 0,
+        start: 0,
+        end: 0,
+        kind: AstStatementKind::Expression,
+        expr: None,
+        children: Vec::new(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36963,6 +38013,10 @@ FUNCTION icon_code(item) {
             json!(true)
         );
         assert_eq!(
+            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["generic_derived_partial_ast_free_plan"],
+            json!(true)
+        );
+        assert_eq!(
             artifact_json["runtime_plan"]["storage_initialization"]["storage_runtime_ast_free"],
             json!(true)
         );
@@ -36973,6 +38027,27 @@ FUNCTION icon_code(item) {
         assert_eq!(
             artifact_json["runtime_plan"]["document_lowering"]["format"],
             json!("boonc-document-lowering-runtime-tables-json-v1")
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["generic_derived"]["format"],
+            json!("boonc-runtime-generic-derived-partial-json-v1")
+        );
+        assert_eq!(
+            artifact_json["runtime_plan"]["generic_derived"]["generic_derived_runtime_ast_free"],
+            json!(true)
+        );
+        assert!(
+            artifact_json["runtime_plan"]["generic_derived"]["root_fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty())
+        );
+        assert!(
+            artifact_json["runtime_plan"]["generic_derived"]["indexed_fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty())
+        );
+        assert!(
+            artifact_json["runtime_plan"]["generic_derived"]["unsupported_reasons"].is_object()
         );
         assert!(
             artifact_json["runtime_plan"]["document_lowering"]["root_summary_paths"]
@@ -37004,6 +38079,76 @@ FUNCTION icon_code(item) {
                 .is_some_and(|sections| !sections.is_empty())
         );
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
+        let parsed = parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        assert!(
+            compiled.generic_derived_runtime.supported_root_count() > 0,
+            "TodoMVC should expose at least one supported root generic-derived field"
+        );
+        assert!(
+            compiled.generic_derived_runtime.supported_indexed_count() > 0,
+            "TodoMVC should expose at least one supported indexed generic-derived field"
+        );
+        let supported_roots = compiled
+            .generic_derived_runtime
+            .root_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .map(|field| field.path.clone())
+            .collect::<BTreeSet<_>>();
+        let supported_indexed = compiled
+            .generic_derived_runtime
+            .indexed_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .map(|field| (field.list.clone(), field.field.clone()))
+            .collect::<BTreeSet<_>>();
+        let poison = empty_ast_statement_for_test();
+        for field in &mut compiled.generic_derived.root_fields {
+            if supported_roots.contains(&field.path) {
+                field.statement = poison.clone();
+            }
+        }
+        for field in &mut compiled.generic_derived.indexed_fields {
+            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
+                field.statement = poison.clone();
+            }
+        }
+
+        let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        assert_eq!(
+            runtime.storage.root_bool_opt("store.has_completed"),
+            Some(true)
+        );
+        assert_eq!(
+            runtime.storage.root_bool_opt("store.all_completed"),
+            Some(false)
+        );
+        assert_eq!(
+            runtime
+                .storage
+                .list_row_bool_opt("todos", 0, "not_completed"),
+            Some(true)
+        );
+        assert_eq!(
+            runtime
+                .storage
+                .list_row_bool_opt("todos", 1, "not_completed"),
+            Some(false)
+        );
+        assert_eq!(
+            runtime.storage.list_row_bool_opt("todos", 0, "not_editing"),
+            Some(true)
+        );
     }
 
     #[test]

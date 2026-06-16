@@ -294,6 +294,7 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         "document_lowering_tables",
         "bridge_schemas",
         "compiled_schedule",
+        "runtime_plan",
     ] {
         if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
@@ -487,6 +488,7 @@ fn verify_compiled_artifact_sections(report: &JsonValue, path: &Path) -> Runtime
         "document_lowering_tables",
         "bridge_schemas",
         "compiled_schedule",
+        "runtime_plan",
     ] {
         if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
@@ -4889,7 +4891,8 @@ mod tests {
                 "dependency_graph": true,
                 "document_lowering_tables": true,
                 "bridge_schemas": true,
-                "compiled_schedule": true
+                "compiled_schedule": true,
+                "runtime_plan": true
             },
             "artifact_sha256s": [{
                 "path": artifact_path.display().to_string(),
@@ -4950,7 +4953,8 @@ mod tests {
                 "dependency_graph": true,
                 "document_lowering_tables": true,
                 "bridge_schemas": true,
-                "compiled_schedule": true
+                "compiled_schedule": true,
+                "runtime_plan": true
             },
             "artifact_sha256s": [{
                 "path": artifact_path.display().to_string(),
@@ -4960,7 +4964,7 @@ mod tests {
                 "artifact_valid": true,
                 "loaded_runtime_from_artifact": false,
                 "runtime_instantiated_from_artifact": false,
-                "runtime_plan_present": false,
+                "runtime_plan_present": true,
                 "source_free_runtime_load_available": false,
                 "source_reparse_required_for_current_runtime": true,
                 "source_reparse_attempted": false,
@@ -4970,7 +4974,11 @@ mod tests {
                 "scenario_execution_available": false,
                 "blocked_task": "TASK-0901B",
                 "scenario_execution_pending_task": "TASK-0901C",
-                "missing_runtime_plan_sections": ["runtime_plan"]
+                "missing_runtime_plan_sections": [
+                    "generic_derived_ast_free_plan",
+                    "runtime_storage_initialization_plan",
+                    "document_lowering_runtime_tables"
+                ]
             }
         });
         assert!(schema_accepts(

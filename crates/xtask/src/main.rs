@@ -1434,10 +1434,27 @@ fn verify_compiled_artifact(args: &[String]) -> Result<(), Box<dyn std::error::E
         "document_lowering_tables",
         "bridge_schemas",
         "compiled_schedule",
+        "runtime_plan",
     ] {
         if artifact_value.get(key).is_none() {
             return Err(format!("compiled artifact missing `{key}`").into());
         }
+    }
+    if artifact_value
+        .pointer("/runtime_plan/ast_free")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("compiled artifact runtime_plan must be AST-free".into());
+    }
+    if artifact_value
+        .pointer("/runtime_plan/source_free_runtime_instantiation_ready")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return Err(
+            "compiled artifact runtime_plan must not claim source-free instantiation yet".into(),
+        );
     }
     if artifact_value
         .get("parser_ast_required_for_execution")

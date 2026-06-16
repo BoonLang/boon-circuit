@@ -2314,6 +2314,7 @@ pub fn emit_compiled_artifact(
             "document_lowering_tables": artifact.body.get("document_lowering_tables").is_some(),
             "bridge_schemas": artifact.body.get("bridge_schemas").is_some(),
             "compiled_schedule": artifact.body.get("compiled_schedule").is_some(),
+            "runtime_plan": artifact.body.get("runtime_plan").is_some(),
         },
         "artifact_sha256s": [{
             "path": out_path.display().to_string(),
@@ -2334,6 +2335,7 @@ pub fn inspect_compiled_artifact_report(
     let artifact = CompiledArtifact::load_from_path(artifact_path)?;
     let artifact_hash = artifact.sha256.clone();
     let runtime_plan_present = artifact.body.get("runtime_plan").is_some();
+    let missing_runtime_plan_sections = artifact.missing_runtime_plan_sections();
     let report = json!({
         "status": "pass",
         "report_version": 1,
@@ -2367,14 +2369,7 @@ pub fn inspect_compiled_artifact_report(
             "scenario_execution_available": false,
             "blocked_task": "TASK-0901B",
             "scenario_execution_pending_task": "TASK-0901C",
-            "missing_runtime_plan_sections": [
-                "runtime_plan",
-                "lossless_runtime_symbols",
-                "executable_equation_plans",
-                "runtime_storage_initialization_plan",
-                "source_schema_table",
-                "document_lowering_runtime_tables"
-            ]
+            "missing_runtime_plan_sections": missing_runtime_plan_sections
         }
     });
     if let Some(report_path) = report_path {
@@ -5445,6 +5440,518 @@ impl CompiledProgram {
             "graph_clones_per_item": 0
         })
     }
+
+    fn runtime_plan_artifact(&self) -> JsonValue {
+        json!({
+            "runtime_plan_version": 1,
+            "format": "boonc-runtime-plan-json-v1",
+            "ast_free": true,
+            "source_free_runtime_instantiation_ready": false,
+            "runtime_instantiation_blocked_by": [
+                "generic_derived_ast_free_plan",
+                "runtime_storage_initialization_plan",
+                "document_lowering_runtime_tables"
+            ],
+            "included_runtime_owned_sections": {
+                "runtime_symbols": true,
+                "scalar_equations": true,
+                "derived_text_transforms": true,
+                "list_equations": true,
+                "list_projections": true,
+                "source_routes": true,
+                "list_source_bindings": true,
+                "root_state_paths": true,
+                "list_summary_fields": true,
+                "dynamic_list_view_lists": true,
+                "source_route_payload_fields": true
+            },
+            "excluded_parser_ast_sections": [
+                "GenericDerivedPlan.expressions",
+                "GenericDerivedRootField.statement",
+                "GenericDerivedIndexedField.statement",
+                "GenericDerivedPlan.functions"
+            ],
+            "runtime_symbols": {
+                "kind": "dense_runtime_symbol_ids",
+                "paths": self.symbols.paths.iter().map(|path| path.as_ref()).collect::<Vec<_>>()
+            },
+            "root_state_paths": self.root_state_paths,
+            "list_summary_fields": self.list_summary_fields.iter().map(list_summary_fields_artifact).collect::<Vec<_>>(),
+            "dynamic_list_view_lists": self.dynamic_list_view_lists.iter().collect::<Vec<_>>(),
+            "scalar_equations": scalar_equation_plan_artifact(&self.scalar_equations),
+            "derived_text_transforms": derived_equation_plan_artifact(&self.derived_equations),
+            "list_equations": list_equation_plan_artifact(&self.list_equations),
+            "list_projections": list_projection_plan_artifact(&self.list_projections),
+            "source_routes": source_route_plan_artifact(&self.source_routes),
+            "list_source_bindings": list_source_binding_plan_artifact(&self.list_source_bindings)
+        })
+    }
+}
+
+fn list_summary_fields_artifact(summary: &ListSummaryFields) -> JsonValue {
+    json!({
+        "list": summary.list,
+        "row_scope": summary.row_scope,
+        "fields": summary.fields
+    })
+}
+
+fn scalar_equation_plan_artifact(plan: &ScalarEquationPlan) -> JsonValue {
+    json!({
+        "source_paths": plan.source_paths,
+        "branches": plan.branches.iter().map(scalar_update_branch_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn scalar_update_branch_artifact(branch: &ScalarUpdateBranch) -> JsonValue {
+    json!({
+        "target": branch.target,
+        "source": branch.source,
+        "expression": scalar_update_expression_artifact(&branch.expression)
+    })
+}
+
+fn scalar_update_expression_artifact(expression: &ScalarUpdateExpression) -> JsonValue {
+    match expression {
+        ScalarUpdateExpression::SourceText => json!({ "kind": "source_text" }),
+        ScalarUpdateExpression::SourceKey => json!({ "kind": "source_key" }),
+        ScalarUpdateExpression::SourceAddress => json!({ "kind": "source_address" }),
+        ScalarUpdateExpression::SourcePayload(path) => {
+            json!({ "kind": "source_payload", "path": path })
+        }
+        ScalarUpdateExpression::Const(value) => json!({ "kind": "const", "value": value }),
+        ScalarUpdateExpression::NumberInfix { left, op, right } => {
+            json!({ "kind": "number_infix", "left": left, "op": op, "right": right })
+        }
+        ScalarUpdateExpression::ProjectTime {
+            pointer_x,
+            pointer_width,
+            viewport_start,
+            viewport_end,
+            fallback,
+        } => json!({
+            "kind": "project_time",
+            "pointer_x": pointer_x,
+            "pointer_width": pointer_width,
+            "viewport_start": viewport_start,
+            "viewport_end": viewport_end,
+            "fallback": fallback
+        }),
+        ScalarUpdateExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => json!({
+            "kind": "match_number_infix_const",
+            "left": left,
+            "op": op,
+            "right": right,
+            "arms": arms
+        }),
+        ScalarUpdateExpression::ListFindValue {
+            list,
+            field,
+            expected,
+            target,
+            fallback,
+        } => json!({
+            "kind": "list_find_value",
+            "list": list,
+            "field": field,
+            "expected": update_value_expression_artifact(expected),
+            "target": target,
+            "fallback": fallback.as_deref().map(update_value_expression_artifact)
+        }),
+        ScalarUpdateExpression::PreviousValue(path) => {
+            json!({ "kind": "previous_value", "path": path })
+        }
+        ScalarUpdateExpression::ReadPath(path) => json!({ "kind": "read_path", "path": path }),
+        ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
+            json!({ "kind": "text_trim_or_previous", "path": path, "previous": previous })
+        }
+        ScalarUpdateExpression::PrefixPayloadConcat {
+            prefix,
+            payload_path,
+            separator,
+        } => json!({
+            "kind": "prefix_payload_concat",
+            "prefix": prefix,
+            "payload_path": payload_path,
+            "separator": separator
+        }),
+        ScalarUpdateExpression::PrefixRootConcat {
+            prefix,
+            path,
+            separator,
+        } => json!({
+            "kind": "prefix_root_concat",
+            "prefix": prefix,
+            "path": path,
+            "separator": separator
+        }),
+        ScalarUpdateExpression::BoolNot(path) => json!({ "kind": "bool_not", "path": path }),
+        ScalarUpdateExpression::MatchConst { input, arms } => {
+            json!({ "kind": "match_const", "input": input, "arms": arms })
+        }
+        ScalarUpdateExpression::MatchValueConst { input, arms } => json!({
+            "kind": "match_value_const",
+            "input": input,
+            "arms": arms.iter().map(update_value_match_arm_artifact).collect::<Vec<_>>()
+        }),
+        ScalarUpdateExpression::Unsupported => json!({ "kind": "unsupported" }),
+    }
+}
+
+fn update_value_match_arm_artifact(arm: &UpdateValueMatchArm) -> JsonValue {
+    json!({
+        "pattern": arm.pattern,
+        "output": update_value_expression_artifact(&arm.output)
+    })
+}
+
+fn update_value_expression_artifact(expression: &UpdateValueExpression) -> JsonValue {
+    match expression {
+        UpdateValueExpression::Const { value } => json!({ "kind": "const", "value": value }),
+        UpdateValueExpression::ReadPath { path } => json!({ "kind": "read_path", "path": path }),
+        UpdateValueExpression::MatchConst { input, arms } => json!({
+            "kind": "match_const",
+            "input": input,
+            "arms": arms.iter().map(update_value_match_arm_artifact).collect::<Vec<_>>()
+        }),
+        UpdateValueExpression::NumberInfix { left, op, right } => {
+            json!({ "kind": "number_infix", "left": left, "op": op, "right": right })
+        }
+        UpdateValueExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => json!({
+            "kind": "match_number_infix_const",
+            "left": left,
+            "op": op,
+            "right": right,
+            "arms": arms.iter().map(update_value_match_arm_artifact).collect::<Vec<_>>()
+        }),
+    }
+}
+
+fn derived_equation_plan_artifact(plan: &DerivedEquationPlan) -> JsonValue {
+    json!({
+        "text_transforms": plan.text_transforms.iter().map(runtime_derived_text_transform_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_derived_text_transform_artifact(transform: &RuntimeDerivedTextTransform) -> JsonValue {
+    json!({
+        "target": transform.target,
+        "source": transform.source,
+        "expression": runtime_derived_text_expression_artifact(&transform.expression)
+    })
+}
+
+fn runtime_derived_text_expression_artifact(
+    expression: &RuntimeDerivedTextExpression,
+) -> JsonValue {
+    match expression {
+        RuntimeDerivedTextExpression::Const { value } => json!({ "kind": "const", "value": value }),
+        RuntimeDerivedTextExpression::MatchConst { input, arms } => {
+            json!({ "kind": "match_const", "input": input, "arms": arms })
+        }
+        RuntimeDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
+            json!({ "kind": "enter_key_payload_text_trim_non_empty" })
+        }
+        RuntimeDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
+            json!({ "kind": "enter_key_root_text_trim_non_empty", "path": path })
+        }
+        RuntimeDerivedTextExpression::SourceRootText { path } => {
+            json!({ "kind": "source_root_text", "path": path })
+        }
+        RuntimeDerivedTextExpression::ListFindValue {
+            list,
+            field,
+            expected,
+            target,
+            fallback,
+        } => json!({
+            "kind": "list_find_value",
+            "list": list,
+            "field": field,
+            "expected": update_value_expression_artifact(expected),
+            "target": target,
+            "fallback": fallback.as_deref().map(update_value_expression_artifact)
+        }),
+        RuntimeDerivedTextExpression::PrefixRootConcat {
+            prefix,
+            path,
+            separator,
+        } => json!({
+            "kind": "prefix_root_concat",
+            "prefix": prefix,
+            "path": path,
+            "separator": separator
+        }),
+        RuntimeDerivedTextExpression::PrefixPayloadConcat {
+            prefix,
+            payload_path,
+            separator,
+        } => json!({
+            "kind": "prefix_payload_concat",
+            "prefix": prefix,
+            "payload_path": payload_path,
+            "separator": separator
+        }),
+        RuntimeDerivedTextExpression::Unsupported => json!({ "kind": "unsupported" }),
+    }
+}
+
+fn list_equation_plan_artifact(plan: &ListEquationPlan) -> JsonValue {
+    json!({
+        "operations": plan.operations.iter().map(runtime_list_operation_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_list_operation_artifact(operation: &RuntimeListOperation) -> JsonValue {
+    json!({
+        "list": operation.list,
+        "kind": runtime_list_operation_kind_artifact(&operation.kind)
+    })
+}
+
+fn runtime_list_operation_kind_artifact(kind: &RuntimeListOperationKind) -> JsonValue {
+    match kind {
+        RuntimeListOperationKind::Append { trigger, fields } => json!({
+            "kind": "append",
+            "trigger": trigger,
+            "fields": fields.iter().map(runtime_list_append_field_artifact).collect::<Vec<_>>()
+        }),
+        RuntimeListOperationKind::Remove { source, predicate } => json!({
+            "kind": "remove",
+            "source": source,
+            "predicate": runtime_list_predicate_artifact(predicate)
+        }),
+        RuntimeListOperationKind::Retain { target, predicate } => json!({
+            "kind": "retain",
+            "target": target,
+            "predicate": runtime_list_predicate_artifact(predicate)
+        }),
+        RuntimeListOperationKind::Count { target, predicate } => json!({
+            "kind": "count",
+            "target": target,
+            "predicate": runtime_list_predicate_artifact(predicate)
+        }),
+    }
+}
+
+fn runtime_list_append_field_artifact(field: &RuntimeListAppendField) -> JsonValue {
+    json!({
+        "name": field.name,
+        "value": runtime_list_append_field_value_artifact(&field.value)
+    })
+}
+
+fn runtime_list_append_field_value_artifact(value: &RuntimeListAppendFieldValue) -> JsonValue {
+    match value {
+        RuntimeListAppendFieldValue::Source { path } => {
+            json!({ "kind": "source", "path": path })
+        }
+        RuntimeListAppendFieldValue::Const { value } => {
+            json!({ "kind": "const", "value": value })
+        }
+    }
+}
+
+fn runtime_list_predicate_artifact(predicate: &RuntimeListPredicate) -> JsonValue {
+    match predicate {
+        RuntimeListPredicate::AlwaysTrue => json!({ "kind": "always_true" }),
+        RuntimeListPredicate::FieldBool { path } => {
+            json!({ "kind": "field_bool", "path": path })
+        }
+        RuntimeListPredicate::FieldBoolNot { path } => {
+            json!({ "kind": "field_bool_not", "path": path })
+        }
+        RuntimeListPredicate::SelectorVisibility {
+            selector,
+            row_field,
+        } => json!({
+            "kind": "selector_visibility",
+            "selector": selector,
+            "row_field": row_field
+        }),
+        RuntimeListPredicate::Unsupported => json!({ "kind": "unsupported" }),
+    }
+}
+
+fn list_projection_plan_artifact(plan: &ListProjectionPlan) -> JsonValue {
+    json!({
+        "projections": plan.projections.iter().map(runtime_list_projection_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn runtime_list_projection_artifact(projection: &RuntimeListProjection) -> JsonValue {
+    json!({
+        "target": projection.target,
+        "list": projection.list,
+        "columns": projection.columns,
+        "rows": projection.rows,
+        "kind": runtime_list_projection_kind_artifact(&projection.kind)
+    })
+}
+
+fn runtime_list_projection_kind_artifact(kind: &RuntimeListProjectionKind) -> JsonValue {
+    match kind {
+        RuntimeListProjectionKind::Chunk {
+            item_field,
+            label_field,
+        } => json!({
+            "kind": "chunk",
+            "item_field": item_field,
+            "label_field": label_field
+        }),
+        RuntimeListProjectionKind::Find { field, value } => {
+            json!({ "kind": "find", "field": field, "value": value })
+        }
+    }
+}
+
+fn source_route_plan_artifact(plan: &SourceRoutePlan) -> JsonValue {
+    json!({
+        "route_slots": plan.route_slots.iter().enumerate().map(|(index, route)| source_route_artifact(index, route)).collect::<Vec<_>>(),
+        "id_slots": plan.id_slots.iter().map(|slot| slot.map(SourceRouteIndex::slot)).collect::<Vec<_>>(),
+        "label_slots": plan.label_slots.iter().map(source_boundary_label_artifact).collect::<Vec<_>>(),
+        "action_table": plan.action_table.by_source.iter().enumerate().map(|(source_id, actions)| {
+            json!({
+                "source_id": source_id,
+                "actions": actions.as_ref().map(|actions| actions.iter().map(source_action_artifact).collect::<Vec<_>>()).unwrap_or_default()
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn source_boundary_label_artifact(label: &SourceBoundaryLabel) -> JsonValue {
+    json!({
+        "source": label.source,
+        "source_id": label.source_id.as_usize()
+    })
+}
+
+fn source_route_artifact(route_id: usize, route: &SourceRoute) -> JsonValue {
+    json!({
+        "route_id": route_id,
+        "source_id": route.source_id.as_usize(),
+        "source": route.source,
+        "address_lookup_field": route.address_lookup_field,
+        "payload_fields": route.payload_fields,
+        "root_scalar_targets": route.root_scalar_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
+        "indexed_text_targets": route.indexed_text_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
+        "indexed_bool_targets": route.indexed_bool_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
+        "derived_text_targets": route.derived_text_targets,
+        "router_route_targets": route.router_route_targets.iter().map(source_route_router_route_artifact).collect::<Vec<_>>(),
+        "root_text_transform_targets": route.root_text_transform_targets.iter().map(source_route_root_text_transform_artifact).collect::<Vec<_>>(),
+        "list_append_targets": route.list_append_targets.iter().map(source_route_list_append_artifact).collect::<Vec<_>>(),
+        "list_remove_targets": route.list_remove_targets.iter().map(source_route_list_remove_artifact).collect::<Vec<_>>(),
+        "actions": route.actions.iter().map(source_action_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn source_route_scalar_target_artifact(target: &SourceRouteScalarTarget) -> JsonValue {
+    json!({
+        "target": target.target,
+        "expression": scalar_update_expression_artifact(&target.expression)
+    })
+}
+
+fn source_route_router_route_artifact(target: &SourceRouteRouterRoute) -> JsonValue {
+    json!({
+        "source": target.source,
+        "target": target.target,
+        "path": target.path
+    })
+}
+
+fn source_route_root_text_transform_artifact(target: &SourceRouteRootTextTransform) -> JsonValue {
+    json!({
+        "source": target.source,
+        "target": target.target,
+        "value": field_value_artifact(&target.value)
+    })
+}
+
+fn source_route_list_append_artifact(target: &SourceRouteListAppend) -> JsonValue {
+    json!({
+        "list": target.list,
+        "trigger": target.trigger,
+        "append_ordinal": target.append_ordinal
+    })
+}
+
+fn source_route_list_remove_artifact(target: &SourceRouteListRemove) -> JsonValue {
+    json!({
+        "list": target.list,
+        "predicate": runtime_list_predicate_artifact(&target.predicate)
+    })
+}
+
+fn source_action_artifact(action: &SourceAction) -> JsonValue {
+    match action {
+        SourceAction::RootScalar => json!({ "kind": "root_scalar" }),
+        SourceAction::DerivedText { target } => {
+            json!({ "kind": "derived_text", "target": target })
+        }
+        SourceAction::RouterRoute { target, path } => {
+            json!({ "kind": "router_route", "target": target, "path": path })
+        }
+        SourceAction::RootTextTransform { target, value } => json!({
+            "kind": "root_text_transform",
+            "target": target,
+            "value": field_value_artifact(value)
+        }),
+        SourceAction::ListRemove { list } => json!({ "kind": "list_remove", "list": list }),
+        SourceAction::ListAppend {
+            list,
+            trigger,
+            append_ordinal,
+        } => json!({
+            "kind": "list_append",
+            "list": list,
+            "trigger": trigger,
+            "append_ordinal": append_ordinal
+        }),
+        SourceAction::IndexedText { kind, target } => json!({
+            "kind": "indexed_text",
+            "text_action": kind.as_str(),
+            "target": target
+        }),
+        SourceAction::IndexedBool { kind, target } => json!({
+            "kind": "indexed_bool",
+            "bool_action": kind.as_str(),
+            "target": target
+        }),
+    }
+}
+
+fn field_value_artifact(value: &FieldValue) -> JsonValue {
+    match value {
+        FieldValue::Text(value) => json!({ "kind": "text", "value": value }),
+        FieldValue::Bool(value) => json!({ "kind": "bool", "value": value }),
+        FieldValue::Enum(value) => json!({ "kind": "enum", "value": value }),
+        FieldValue::Json(value) => json!({ "kind": "json", "value": value }),
+    }
+}
+
+fn list_source_binding_plan_artifact(plan: &ListSourceBindingPlan) -> JsonValue {
+    json!({
+        "list_slots": plan.list_slots.iter().map(list_source_binding_slot_artifact).collect::<Vec<_>>()
+    })
+}
+
+fn list_source_binding_slot_artifact(slot: &ListSourceBindingSlot) -> JsonValue {
+    json!({
+        "list": slot.list,
+        "row_scope": slot.row_scope,
+        "source_paths": slot.source_paths
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -5454,7 +5961,7 @@ struct CompiledArtifact {
 }
 
 impl CompiledArtifact {
-    const REQUIRED_SECTIONS: [&'static str; 9] = [
+    const REQUIRED_SECTIONS: [&'static str; 10] = [
         "semantic_index",
         "symbol_table",
         "storage_layout",
@@ -5464,6 +5971,7 @@ impl CompiledArtifact {
         "document_lowering_tables",
         "bridge_schemas",
         "compiled_schedule",
+        "runtime_plan",
     ];
 
     fn from_parts(
@@ -5521,6 +6029,7 @@ impl CompiledArtifact {
                 "schema_count": 0
             },
             "typecheck_report_hash": typecheck_report_hash,
+            "runtime_plan": compiled.runtime_plan_artifact(),
             "compiled_schedule": compiled_schedule
         });
         let bytes =
@@ -5587,6 +6096,117 @@ impl CompiledArtifact {
                 .into());
             }
         }
+        self.validate_partial_runtime_plan(path)?;
+        Ok(())
+    }
+
+    fn validate_partial_runtime_plan(&self, path: &Path) -> RuntimeResult<()> {
+        let plan = self
+            .body
+            .get("runtime_plan")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| format!("{} runtime_plan is not an object", path.display()))?;
+        for key in [
+            "runtime_plan_version",
+            "format",
+            "ast_free",
+            "source_free_runtime_instantiation_ready",
+            "runtime_instantiation_blocked_by",
+            "included_runtime_owned_sections",
+            "excluded_parser_ast_sections",
+            "runtime_symbols",
+            "scalar_equations",
+            "derived_text_transforms",
+            "list_equations",
+            "list_projections",
+            "source_routes",
+            "list_source_bindings",
+        ] {
+            if !plan.contains_key(key) {
+                return Err(format!("{} runtime_plan missing `{key}`", path.display()).into());
+            }
+        }
+        if plan.get("runtime_plan_version").and_then(JsonValue::as_u64) != Some(1) {
+            return Err(format!("{} runtime_plan has wrong version", path.display()).into());
+        }
+        if plan.get("format").and_then(JsonValue::as_str) != Some("boonc-runtime-plan-json-v1") {
+            return Err(format!("{} runtime_plan has wrong format", path.display()).into());
+        }
+        if plan.get("ast_free").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!("{} runtime_plan must be AST-free", path.display()).into());
+        }
+        if plan
+            .get("source_free_runtime_instantiation_ready")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        {
+            return Err(format!(
+                "{} runtime_plan must not claim source-free instantiation yet",
+                path.display()
+            )
+            .into());
+        }
+        if plan
+            .get("runtime_instantiation_blocked_by")
+            .and_then(JsonValue::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return Err(format!(
+                "{} runtime_plan must list runtime instantiation blockers",
+                path.display()
+            )
+            .into());
+        }
+        let included = plan
+            .get("included_runtime_owned_sections")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} runtime_plan included_runtime_owned_sections is not an object",
+                    path.display()
+                )
+            })?;
+        for key in [
+            "runtime_symbols",
+            "scalar_equations",
+            "derived_text_transforms",
+            "list_equations",
+            "list_projections",
+            "source_routes",
+            "list_source_bindings",
+            "root_state_paths",
+            "list_summary_fields",
+            "dynamic_list_view_lists",
+            "source_route_payload_fields",
+        ] {
+            if included.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                return Err(format!(
+                    "{} runtime_plan included_runtime_owned_sections `{key}` is not true",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        if plan
+            .get("runtime_symbols")
+            .and_then(JsonValue::as_object)
+            .and_then(|symbols| symbols.get("paths"))
+            .and_then(JsonValue::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return Err(format!("{} runtime_plan has no runtime symbols", path.display()).into());
+        }
+        if plan
+            .get("source_routes")
+            .and_then(JsonValue::as_object)
+            .and_then(|routes| routes.get("route_slots"))
+            .and_then(JsonValue::as_array)
+            .is_none()
+        {
+            return Err(
+                format!("{} runtime_plan has no source route slots", path.display()).into(),
+            );
+        }
         Ok(())
     }
 
@@ -5618,6 +6238,37 @@ impl CompiledArtifact {
         let mut report = self.report();
         report["path"] = json!(path.display().to_string());
         report
+    }
+
+    fn missing_runtime_plan_sections(&self) -> Vec<&'static str> {
+        self.body
+            .get("runtime_plan")
+            .and_then(|plan| plan.get("runtime_instantiation_blocked_by"))
+            .and_then(JsonValue::as_array)
+            .map(|sections| {
+                sections
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .filter_map(|section| match section {
+                        "generic_derived_ast_free_plan" => Some("generic_derived_ast_free_plan"),
+                        "runtime_storage_initialization_plan" => {
+                            Some("runtime_storage_initialization_plan")
+                        }
+                        "document_lowering_runtime_tables" => {
+                            Some("document_lowering_runtime_tables")
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "runtime_plan",
+                    "generic_derived_ast_free_plan",
+                    "runtime_storage_initialization_plan",
+                    "document_lowering_runtime_tables",
+                ]
+            })
     }
 
     fn section_presence(&self) -> JsonValue {
@@ -35236,6 +35887,20 @@ FUNCTION icon_code(item) {
         assert!(artifact_json["semantic_index"].is_object());
         assert!(artifact_json["compiled_schedule"]["source_route_op_streams"].is_object());
         assert!(artifact_json["storage_layout"].is_object());
+        assert_eq!(artifact_json["runtime_plan"]["ast_free"], json!(true));
+        assert_eq!(
+            artifact_json["runtime_plan"]["source_free_runtime_instantiation_ready"],
+            json!(false)
+        );
+        assert!(artifact_json["runtime_plan"]["runtime_symbols"]["paths"].is_array());
+        assert!(artifact_json["runtime_plan"]["scalar_equations"]["branches"].is_array());
+        assert!(artifact_json["runtime_plan"]["list_equations"]["operations"].is_array());
+        assert!(artifact_json["runtime_plan"]["source_routes"]["route_slots"].is_array());
+        assert!(
+            artifact_json["runtime_plan"]["excluded_parser_ast_sections"]
+                .as_array()
+                .is_some_and(|sections| !sections.is_empty())
+        );
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
@@ -35264,7 +35929,21 @@ FUNCTION icon_code(item) {
         );
         assert_eq!(
             loaded["inspection_result"]["runtime_plan_present"],
-            json!(false)
+            json!(true)
+        );
+        assert!(
+            !loaded["inspection_result"]["missing_runtime_plan_sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|section| section.as_str() == Some("runtime_plan"))
+        );
+        assert!(
+            loaded["inspection_result"]["missing_runtime_plan_sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|section| section.as_str() == Some("generic_derived_ast_free_plan"))
         );
         assert_eq!(
             loaded["inspection_result"]["source_reparse_attempted"],
@@ -35281,6 +35960,28 @@ FUNCTION icon_code(item) {
         assert_eq!(
             loaded["compiled_artifact"]["sha256"].as_str(),
             Some(sha256_file(&artifact).unwrap().as_str())
+        );
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn compiled_artifact_rejects_non_ast_free_runtime_plan() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-runtime-plan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let artifact = temp_root.join("counter.boonc");
+        emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
+        let mut artifact_json: JsonValue =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        artifact_json["runtime_plan"]["ast_free"] = json!(false);
+        write_json(&artifact, &artifact_json).unwrap();
+        let error = inspect_compiled_artifact_report(&artifact, None).unwrap_err();
+        assert!(
+            error.to_string().contains("runtime_plan must be AST-free"),
+            "unexpected runtime_plan validation error: {error}"
         );
         let _ = std::fs::remove_dir_all(&temp_root);
     }

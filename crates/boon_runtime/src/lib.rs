@@ -2453,6 +2453,65 @@ pub fn inspect_compiled_artifact_report(
     Ok(report)
 }
 
+pub fn verify_expression_bytecode_report(
+    source_path: &Path,
+    scenario_path: &Path,
+    report_path: Option<&Path>,
+) -> RuntimeResult<JsonValue> {
+    let (parsed, ir) = load_and_lower(source_path)?;
+    let scenario = parse_scenario(scenario_path)?;
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    let program_hash = report_source_hash_for_parsed(&parsed);
+    let source_hash = report_source_hash_for_parsed(&parsed);
+    let scenario_hash = sha256_file(scenario_path)?;
+    let expression_bytecode = scalar_expression_bytecode_report(&ir, &compiled, &scenario)?;
+    let parity_passed = expression_bytecode
+        .get("parity_passed")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let compiled_expression_count = expression_bytecode
+        .get("compiled_expression_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let passed = parity_passed && compiled_expression_count > 0;
+    let report = json!({
+        "status": if passed { "pass" } else { "fail" },
+        "report_version": 1,
+        "command": "verify-bytecode",
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "measurement_mode": "proof",
+        "exit_status": if passed { 0 } else { 1 },
+        "generated_at_utc": now_string(),
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source_path.display().to_string(),
+        "source_hash": source_hash,
+        "scenario_path": scenario_path.display().to_string(),
+        "scenario_hash": scenario_hash,
+        "program_hash": program_hash,
+        "program_kind": parsed.kind.as_str(),
+        "program_file_count": parsed.files.len(),
+        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "budget_hash": "n/a",
+        "graph_node_count": ir.graph_node_count,
+        "semantic_index": ir.semantic_index.report(),
+        "compiled_schedule": compiled.report(),
+        "expression_count": ir.expression_count,
+        "expression_coverage": &ir.expression_coverage,
+        "total_ticks": scenario.step.len(),
+        "per_step_pass_fail": [{
+            "id": "expression-bytecode-interpreter-parity",
+            "pass": passed
+        }],
+        "artifact_sha256s": [],
+        "expression_bytecode": expression_bytecode
+    });
+    if let Some(report_path) = report_path {
+        write_json(report_path, &report)?;
+    }
+    Ok(report)
+}
+
 pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
     let text = fs::read_to_string(path)?;
     Ok(toml::from_str(&text)?)
@@ -33609,6 +33668,723 @@ impl ScalarUpdateExpression {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarBytecodeMode {
+    Text,
+    Bool,
+}
+
+impl ScalarBytecodeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Bool => "bool",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScalarBytecodeCandidate {
+    route_id: usize,
+    source_id: SourceId,
+    source: String,
+    target: String,
+    target_kind: &'static str,
+    mode: ScalarBytecodeMode,
+    expression: ScalarUpdateExpression,
+}
+
+#[derive(Clone, Debug)]
+struct ScalarBytecodeProgram {
+    mode: ScalarBytecodeMode,
+    ops: Vec<ScalarBytecodeOp>,
+}
+
+#[derive(Clone, Debug)]
+enum ScalarBytecodeOp {
+    PayloadText,
+    PayloadKey,
+    PayloadAddress,
+    PayloadField(String),
+    ConstText(String),
+    ConstBool(bool),
+    ReadTextPath(String),
+    ReadBoolPath(String),
+    PreviousValue,
+    NumberInfix {
+        left: String,
+        op: String,
+        right: String,
+    },
+    BoolNot(String),
+    SourcePulseTrue,
+    MatchConstText {
+        input: String,
+        arms: Vec<UpdateMatchArm>,
+    },
+    MatchConstBool {
+        input: String,
+        arms: Vec<UpdateMatchArm>,
+    },
+    PrefixPayloadConcat {
+        prefix: String,
+        payload_path: String,
+        separator: String,
+    },
+    PrefixRootConcat {
+        prefix: String,
+        path: String,
+        separator: String,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScalarBytecodeEvalStats {
+    warm_path_allocation_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ScalarBytecodeEvalOutput<T> {
+    value: Option<T>,
+    stats: ScalarBytecodeEvalStats,
+}
+
+#[derive(Clone, Debug)]
+struct ScalarBytecodeSampleContext {
+    key: Option<String>,
+    text: Option<String>,
+    address: Option<String>,
+    payload: BTreeMap<String, String>,
+    pointer_x: Option<String>,
+    pointer_y: Option<String>,
+    pointer_width: Option<String>,
+    pointer_height: Option<String>,
+    textlike: BTreeMap<String, String>,
+    bools: BTreeMap<String, bool>,
+}
+
+impl ScalarBytecodeProgram {
+    fn compile(
+        mode: ScalarBytecodeMode,
+        expression: &ScalarUpdateExpression,
+    ) -> Result<Self, String> {
+        let op = match mode {
+            ScalarBytecodeMode::Text => Self::compile_text_op(expression)?,
+            ScalarBytecodeMode::Bool => Self::compile_bool_op(expression)?,
+        };
+        Ok(Self {
+            mode,
+            ops: vec![op],
+        })
+    }
+
+    fn compile_text_op(expression: &ScalarUpdateExpression) -> Result<ScalarBytecodeOp, String> {
+        Ok(match expression {
+            ScalarUpdateExpression::SourceText => ScalarBytecodeOp::PayloadText,
+            ScalarUpdateExpression::SourceKey => ScalarBytecodeOp::PayloadKey,
+            ScalarUpdateExpression::SourceAddress => ScalarBytecodeOp::PayloadAddress,
+            ScalarUpdateExpression::SourcePayload(field) => {
+                ScalarBytecodeOp::PayloadField(field.clone())
+            }
+            ScalarUpdateExpression::Const(value) => ScalarBytecodeOp::ConstText(value.clone()),
+            ScalarUpdateExpression::PreviousValue(_) => ScalarBytecodeOp::PreviousValue,
+            ScalarUpdateExpression::ReadPath(path) => ScalarBytecodeOp::ReadTextPath(path.clone()),
+            ScalarUpdateExpression::NumberInfix { left, op, right } => {
+                ScalarBytecodeOp::NumberInfix {
+                    left: left.clone(),
+                    op: op.clone(),
+                    right: right.clone(),
+                }
+            }
+            ScalarUpdateExpression::MatchConst { input, arms } => {
+                ScalarBytecodeOp::MatchConstText {
+                    input: input.clone(),
+                    arms: arms.clone(),
+                }
+            }
+            ScalarUpdateExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => ScalarBytecodeOp::PrefixPayloadConcat {
+                prefix: prefix.clone(),
+                payload_path: payload_path.clone(),
+                separator: separator.clone(),
+            },
+            ScalarUpdateExpression::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            } => ScalarBytecodeOp::PrefixRootConcat {
+                prefix: prefix.clone(),
+                path: path.clone(),
+                separator: separator.clone(),
+            },
+            ScalarUpdateExpression::ProjectTime { .. } => {
+                return Err("project_time_requires_pointer_arithmetic_op".to_owned());
+            }
+            ScalarUpdateExpression::MatchNumberInfixConst { .. } => {
+                return Err("match_number_infix_const_not_compiled_yet".to_owned());
+            }
+            ScalarUpdateExpression::MatchValueConst { .. } => {
+                return Err("match_value_const_not_compiled_yet".to_owned());
+            }
+            ScalarUpdateExpression::ListFindValue { .. } => {
+                return Err("list_find_value_requires_list_lookup_op".to_owned());
+            }
+            ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
+                return Err("text_trim_or_previous_not_compiled_yet".to_owned());
+            }
+            ScalarUpdateExpression::BoolNot(_) => {
+                return Err("bool_not_is_not_text_bytecode".to_owned());
+            }
+            ScalarUpdateExpression::Unsupported => return Err("unsupported_expression".to_owned()),
+        })
+    }
+
+    fn compile_bool_op(expression: &ScalarUpdateExpression) -> Result<ScalarBytecodeOp, String> {
+        Ok(match expression {
+            ScalarUpdateExpression::Const(value) if value == "True" => {
+                ScalarBytecodeOp::ConstBool(true)
+            }
+            ScalarUpdateExpression::Const(value) if value == "False" => {
+                ScalarBytecodeOp::ConstBool(false)
+            }
+            ScalarUpdateExpression::BoolNot(path) => ScalarBytecodeOp::BoolNot(path.clone()),
+            ScalarUpdateExpression::ReadPath(path) => ScalarBytecodeOp::ReadBoolPath(path.clone()),
+            ScalarUpdateExpression::SourcePayload(_) => ScalarBytecodeOp::SourcePulseTrue,
+            ScalarUpdateExpression::MatchConst { input, arms } => {
+                ScalarBytecodeOp::MatchConstBool {
+                    input: input.clone(),
+                    arms: arms.clone(),
+                }
+            }
+            ScalarUpdateExpression::SourceText
+            | ScalarUpdateExpression::SourceKey
+            | ScalarUpdateExpression::SourceAddress
+            | ScalarUpdateExpression::Const(_)
+            | ScalarUpdateExpression::NumberInfix { .. }
+            | ScalarUpdateExpression::ProjectTime { .. }
+            | ScalarUpdateExpression::PreviousValue(_)
+            | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+            | ScalarUpdateExpression::PrefixPayloadConcat { .. }
+            | ScalarUpdateExpression::PrefixRootConcat { .. }
+            | ScalarUpdateExpression::MatchValueConst { .. }
+            | ScalarUpdateExpression::MatchNumberInfixConst { .. }
+            | ScalarUpdateExpression::ListFindValue { .. } => {
+                return Err(format!(
+                    "{}_not_compiled_as_bool_bytecode",
+                    scalar_expression_kind_label(expression)
+                ));
+            }
+            ScalarUpdateExpression::Unsupported => return Err("unsupported_expression".to_owned()),
+        })
+    }
+
+    fn op_labels(&self) -> Vec<&'static str> {
+        self.ops.iter().map(ScalarBytecodeOp::label).collect()
+    }
+
+    fn eval_text(
+        &self,
+        source: &str,
+        context: &ScalarBytecodeSampleContext,
+    ) -> RuntimeResult<ScalarBytecodeEvalOutput<String>> {
+        if self.mode != ScalarBytecodeMode::Text {
+            return Err("attempted to evaluate non-text bytecode as text".into());
+        }
+        let Some(op) = self.ops.first() else {
+            return Ok(ScalarBytecodeEvalOutput {
+                value: None,
+                stats: ScalarBytecodeEvalStats::default(),
+            });
+        };
+        let mut stats = ScalarBytecodeEvalStats::default();
+        let value = match op {
+            ScalarBytecodeOp::PayloadText => context.text.clone(),
+            ScalarBytecodeOp::PayloadKey => context.key.clone(),
+            ScalarBytecodeOp::PayloadAddress => context.address.clone(),
+            ScalarBytecodeOp::PayloadField(field) => context.source_payload_value(field).cloned(),
+            ScalarBytecodeOp::ConstText(value) => Some(value.clone()),
+            ScalarBytecodeOp::ReadTextPath(path) => {
+                stats.warm_path_allocation_count += 1;
+                context.read_textlike(path)
+            }
+            ScalarBytecodeOp::PreviousValue => None,
+            ScalarBytecodeOp::NumberInfix { left, op, right } => {
+                stats.warm_path_allocation_count += 1;
+                scalar_number_infix_value(left, op, right, |path| context.read_textlike(path))
+            }
+            ScalarBytecodeOp::MatchConstText { input, arms } => {
+                let current = context
+                    .source_payload_match_input(input, source)
+                    .or_else(|| context.read_textlike(input));
+                let Some(current) = current else {
+                    return Ok(ScalarBytecodeEvalOutput { value: None, stats });
+                };
+                arms.iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                    .and_then(|arm| (arm.output != "SKIP").then(|| arm.output.clone()))
+            }
+            ScalarBytecodeOp::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => {
+                stats.warm_path_allocation_count += 1;
+                let payload = context.source_payload_match_input(payload_path, source);
+                payload.map(|payload| format!("{prefix}{separator}{payload}"))
+            }
+            ScalarBytecodeOp::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            } => {
+                stats.warm_path_allocation_count += 1;
+                context
+                    .read_textlike(path)
+                    .map(|value| format!("{prefix}{separator}{value}"))
+            }
+            ScalarBytecodeOp::ConstBool(_)
+            | ScalarBytecodeOp::ReadBoolPath(_)
+            | ScalarBytecodeOp::BoolNot(_)
+            | ScalarBytecodeOp::SourcePulseTrue
+            | ScalarBytecodeOp::MatchConstBool { .. } => {
+                return Err(format!("{} is not a text bytecode op", op.label()).into());
+            }
+        };
+        Ok(ScalarBytecodeEvalOutput { value, stats })
+    }
+
+    fn eval_bool(
+        &self,
+        source: &str,
+        context: &ScalarBytecodeSampleContext,
+    ) -> RuntimeResult<ScalarBytecodeEvalOutput<bool>> {
+        if self.mode != ScalarBytecodeMode::Bool {
+            return Err("attempted to evaluate non-bool bytecode as bool".into());
+        }
+        let Some(op) = self.ops.first() else {
+            return Ok(ScalarBytecodeEvalOutput {
+                value: None,
+                stats: ScalarBytecodeEvalStats::default(),
+            });
+        };
+        let stats = ScalarBytecodeEvalStats::default();
+        let value = match op {
+            ScalarBytecodeOp::ConstBool(value) => Some(*value),
+            ScalarBytecodeOp::ReadBoolPath(path) => context.read_bool(path),
+            ScalarBytecodeOp::BoolNot(path) => context.read_bool(path).map(|value| !value),
+            ScalarBytecodeOp::SourcePulseTrue => Some(true),
+            ScalarBytecodeOp::MatchConstBool { input, arms } => {
+                let current = context
+                    .source_payload_match_input(input, source)
+                    .or_else(|| context.read_textlike(input));
+                let Some(current) = current else {
+                    return Ok(ScalarBytecodeEvalOutput { value: None, stats });
+                };
+                let Some(arm) = arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                else {
+                    return Ok(ScalarBytecodeEvalOutput { value: None, stats });
+                };
+                match arm.output.as_str() {
+                    "SKIP" => None,
+                    "True" => Some(true),
+                    "False" => Some(false),
+                    path => context.read_bool(path),
+                }
+            }
+            ScalarBytecodeOp::PayloadText
+            | ScalarBytecodeOp::PayloadKey
+            | ScalarBytecodeOp::PayloadAddress
+            | ScalarBytecodeOp::PayloadField(_)
+            | ScalarBytecodeOp::ConstText(_)
+            | ScalarBytecodeOp::ReadTextPath(_)
+            | ScalarBytecodeOp::PreviousValue
+            | ScalarBytecodeOp::NumberInfix { .. }
+            | ScalarBytecodeOp::MatchConstText { .. }
+            | ScalarBytecodeOp::PrefixPayloadConcat { .. }
+            | ScalarBytecodeOp::PrefixRootConcat { .. } => {
+                return Err(format!("{} is not a bool bytecode op", op.label()).into());
+            }
+        };
+        Ok(ScalarBytecodeEvalOutput { value, stats })
+    }
+}
+
+impl ScalarBytecodeOp {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::PayloadText => "payload_text",
+            Self::PayloadKey => "payload_key",
+            Self::PayloadAddress => "payload_address",
+            Self::PayloadField(_) => "payload_field",
+            Self::ConstText(_) => "const_text",
+            Self::ConstBool(_) => "const_bool",
+            Self::ReadTextPath(_) => "read_text_path",
+            Self::ReadBoolPath(_) => "read_bool_path",
+            Self::PreviousValue => "previous_value",
+            Self::NumberInfix { .. } => "number_infix",
+            Self::BoolNot(_) => "bool_not",
+            Self::SourcePulseTrue => "source_pulse_true",
+            Self::MatchConstText { .. } => "match_const_text",
+            Self::MatchConstBool { .. } => "match_const_bool",
+            Self::PrefixPayloadConcat { .. } => "prefix_payload_concat",
+            Self::PrefixRootConcat { .. } => "prefix_root_concat",
+        }
+    }
+}
+
+impl ScalarBytecodeSampleContext {
+    fn for_candidate(candidate: &ScalarBytecodeCandidate) -> Self {
+        let mut context = Self {
+            key: Some("Enter".to_owned()),
+            text: Some("7".to_owned()),
+            address: Some("row-a".to_owned()),
+            payload: BTreeMap::from([
+                ("text".to_owned(), "7".to_owned()),
+                ("key".to_owned(), "Enter".to_owned()),
+                ("address".to_owned(), "row-a".to_owned()),
+                ("value".to_owned(), "7".to_owned()),
+                ("pointer_x".to_owned(), "125".to_owned()),
+                ("pointer_y".to_owned(), "0".to_owned()),
+                ("pointer_width".to_owned(), "500".to_owned()),
+                ("pointer_height".to_owned(), "20".to_owned()),
+            ]),
+            pointer_x: Some("125".to_owned()),
+            pointer_y: Some("0".to_owned()),
+            pointer_width: Some("500".to_owned()),
+            pointer_height: Some("20".to_owned()),
+            textlike: BTreeMap::new(),
+            bools: BTreeMap::new(),
+        };
+        for path in candidate.expression.same_event_root_read_paths() {
+            context.seed_text_path(path, "2");
+            context.seed_bool_path(path, true);
+        }
+        context.seed_text_path(&candidate.target, "2");
+        context.seed_text_path(row_field_name(&candidate.target), "2");
+        context.seed_bool_path(&candidate.target, true);
+        context.seed_bool_path(row_field_name(&candidate.target), true);
+        context.seed_match_inputs(&candidate.expression, &candidate.source);
+        context
+    }
+
+    fn payload_refs(&self) -> BTreeMap<String, &str> {
+        self.payload
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_str()))
+            .collect()
+    }
+
+    fn read_textlike(&self, path: &str) -> Option<String> {
+        path.parse::<i64>()
+            .ok()
+            .map(|value| value.to_string())
+            .or_else(|| self.textlike.get(path).cloned())
+            .or_else(|| self.payload.get(path).cloned())
+    }
+
+    fn read_bool(&self, path: &str) -> Option<bool> {
+        self.bools.get(path).copied()
+    }
+
+    fn source_payload_value(&self, field: &str) -> Option<&String> {
+        match field {
+            "text" => self.text.as_ref(),
+            "key" => self.key.as_ref(),
+            "address" => self.address.as_ref(),
+            "pointer_x" => self.pointer_x.as_ref(),
+            "pointer_y" => self.pointer_y.as_ref(),
+            "pointer_width" => self.pointer_width.as_ref(),
+            "pointer_height" => self.pointer_height.as_ref(),
+            field => self.payload.get(field),
+        }
+    }
+
+    fn source_payload_match_input(&self, input: &str, source: &str) -> Option<String> {
+        source_payload_field_from_input(input, source)
+            .and_then(|field| self.source_payload_value(&field).cloned())
+            .or_else(|| self.source_payload_value(input).cloned())
+    }
+
+    fn seed_text_path(&mut self, path: &str, value: &str) {
+        if !path.is_empty() {
+            self.textlike.insert(path.to_owned(), value.to_owned());
+        }
+    }
+
+    fn seed_bool_path(&mut self, path: &str, value: bool) {
+        if !path.is_empty() {
+            self.bools.insert(path.to_owned(), value);
+        }
+    }
+
+    fn seed_match_inputs(&mut self, expression: &ScalarUpdateExpression, source: &str) {
+        match expression {
+            ScalarUpdateExpression::MatchConst { input, arms } => {
+                let pattern = arms
+                    .iter()
+                    .find(|arm| arm.pattern != "__")
+                    .or_else(|| arms.first())
+                    .map(|arm| arm.pattern.clone());
+                if let Some(pattern) = pattern {
+                    self.seed_match_input(source, input, &pattern);
+                }
+            }
+            ScalarUpdateExpression::MatchValueConst { input, arms } => {
+                let pattern = arms
+                    .iter()
+                    .find(|arm| arm.pattern != "__")
+                    .or_else(|| arms.first())
+                    .map(|arm| arm.pattern.clone());
+                if let Some(pattern) = pattern {
+                    self.seed_match_input(source, input, &pattern);
+                }
+            }
+            ScalarUpdateExpression::MatchNumberInfixConst {
+                left, right, arms, ..
+            } => {
+                let pattern = arms
+                    .iter()
+                    .find(|arm| arm.pattern != "__")
+                    .or_else(|| arms.first())
+                    .map(|arm| arm.pattern.clone())
+                    .unwrap_or_else(|| "1".to_owned());
+                self.seed_text_path(left, &pattern);
+                self.seed_text_path(right, "0");
+            }
+            _ => {}
+        }
+    }
+
+    fn seed_match_input(&mut self, source: &str, input: &str, pattern: &str) {
+        if let Some(field) = source_payload_field_from_input(input, source) {
+            match field.as_str() {
+                "text" => self.text = Some(pattern.to_owned()),
+                "key" => self.key = Some(pattern.to_owned()),
+                "address" => self.address = Some(pattern.to_owned()),
+                field => {
+                    self.payload.insert(field.to_owned(), pattern.to_owned());
+                }
+            }
+        } else {
+            self.seed_text_path(input, pattern);
+        }
+    }
+}
+
+fn scalar_expression_bytecode_report(
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+    scenario: &Scenario,
+) -> RuntimeResult<JsonValue> {
+    let candidates = scalar_bytecode_candidates(ir, compiled);
+    let mut compiled_expression_count = 0usize;
+    let mut fallback_reasons = Vec::new();
+    let mut deopt_reasons = Vec::new();
+    let mut op_histogram: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut parity_sample_count = 0usize;
+    let mut warm_path_allocation_count = 0usize;
+    let mut samples = Vec::new();
+    for candidate in &candidates {
+        let program = match ScalarBytecodeProgram::compile(candidate.mode, &candidate.expression) {
+            Ok(program) => program,
+            Err(reason) => {
+                fallback_reasons.push(format!(
+                    "{}:{}:{}:{}",
+                    candidate.mode.as_str(),
+                    candidate.source,
+                    candidate.target,
+                    reason
+                ));
+                continue;
+            }
+        };
+        compiled_expression_count += 1;
+        for op in &program.ops {
+            *op_histogram.entry(op.label()).or_default() += 1;
+        }
+        let context = ScalarBytecodeSampleContext::for_candidate(candidate);
+        let pass = match candidate.mode {
+            ScalarBytecodeMode::Text => {
+                let payload_refs = context.payload_refs();
+                let oracle = compiled.scalar_equations.eval_text(
+                    &candidate.target,
+                    &candidate.source,
+                    context.key.as_deref(),
+                    context.text.as_deref(),
+                    context.address.as_deref(),
+                    &payload_refs,
+                    context.pointer_x.as_deref(),
+                    context.pointer_y.as_deref(),
+                    context.pointer_width.as_deref(),
+                    context.pointer_height.as_deref(),
+                    |path| context.read_textlike(path),
+                )?;
+                let bytecode = program.eval_text(&candidate.source, &context)?;
+                warm_path_allocation_count += bytecode.stats.warm_path_allocation_count;
+                let oracle = oracle.map(Cow::into_owned);
+                let pass = oracle == bytecode.value;
+                if !pass {
+                    deopt_reasons.push(format!(
+                        "text:{}:{} oracle={oracle:?} bytecode={:?}",
+                        candidate.source, candidate.target, bytecode.value
+                    ));
+                }
+                samples.push(json!({
+                    "route_id": candidate.route_id,
+                    "source_id": candidate.source_id.as_usize(),
+                    "source": candidate.source,
+                    "target": candidate.target,
+                    "target_kind": candidate.target_kind,
+                    "mode": candidate.mode.as_str(),
+                    "ops": program.op_labels(),
+                    "interpreter_output": oracle,
+                    "bytecode_output": bytecode.value,
+                    "pass": pass
+                }));
+                pass
+            }
+            ScalarBytecodeMode::Bool => {
+                let oracle = compiled.scalar_equations.eval_bool_with_context(
+                    &candidate.target,
+                    &candidate.source,
+                    context.key.as_deref(),
+                    context.text.as_deref(),
+                    context.address.as_deref(),
+                    |path| context.read_bool(path),
+                    |path| context.read_textlike(path),
+                )?;
+                let bytecode = program.eval_bool(&candidate.source, &context)?;
+                warm_path_allocation_count += bytecode.stats.warm_path_allocation_count;
+                let pass = oracle == bytecode.value;
+                if !pass {
+                    deopt_reasons.push(format!(
+                        "bool:{}:{} oracle={oracle:?} bytecode={:?}",
+                        candidate.source, candidate.target, bytecode.value
+                    ));
+                }
+                samples.push(json!({
+                    "route_id": candidate.route_id,
+                    "source_id": candidate.source_id.as_usize(),
+                    "source": candidate.source,
+                    "target": candidate.target,
+                    "target_kind": candidate.target_kind,
+                    "mode": candidate.mode.as_str(),
+                    "ops": program.op_labels(),
+                    "interpreter_output": oracle,
+                    "bytecode_output": bytecode.value,
+                    "pass": pass
+                }));
+                pass
+            }
+        };
+        parity_sample_count += 1;
+        if !pass {
+            continue;
+        }
+    }
+    let fallback_count = fallback_reasons.len();
+    let deopt_count = deopt_reasons.len();
+    let parity_passed = compiled_expression_count > 0 && deopt_count == 0;
+    let hot_path_ready = parity_passed && fallback_count == 0;
+    Ok(json!({
+        "version": 1,
+        "execution_surface": "scalar_source_route_expressions",
+        "interpreter_oracle": "ScalarEquationPlan",
+        "scenario_name": scenario.name,
+        "scenario_step_count": scenario.step.len(),
+        "candidate_expression_count": candidates.len(),
+        "compiled_expression_count": compiled_expression_count,
+        "parity_sample_count": parity_sample_count,
+        "parity_passed": parity_passed,
+        "fallback_count": fallback_count,
+        "fallback_reasons": fallback_reasons,
+        "deopt_count": deopt_count,
+        "deopt_reasons": deopt_reasons,
+        "op_histogram": op_histogram,
+        "warm_path_allocation_count": warm_path_allocation_count,
+        "hot_path_ready": hot_path_ready,
+        "readiness": if hot_path_ready { "hot_path_ready" } else { "proof_only_with_reported_fallbacks" },
+        "samples": samples,
+    }))
+}
+
+fn scalar_bytecode_candidates(
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+) -> Vec<ScalarBytecodeCandidate> {
+    let mut candidates = Vec::new();
+    for (route_id, route) in compiled.source_routes.route_slots.iter().enumerate() {
+        for target in &route.root_scalar_targets {
+            candidates.push(ScalarBytecodeCandidate {
+                route_id,
+                source_id: route.source_id,
+                source: route.source.clone(),
+                target: target.target.clone(),
+                target_kind: "root_scalar",
+                mode: if ir_scalar_target_is_bool(ir, &target.target) {
+                    ScalarBytecodeMode::Bool
+                } else {
+                    ScalarBytecodeMode::Text
+                },
+                expression: target.expression.clone(),
+            });
+        }
+        for target in &route.indexed_text_targets {
+            candidates.push(ScalarBytecodeCandidate {
+                route_id,
+                source_id: route.source_id,
+                source: route.source.clone(),
+                target: target.target.clone(),
+                target_kind: "indexed_text",
+                mode: ScalarBytecodeMode::Text,
+                expression: target.expression.clone(),
+            });
+        }
+        for target in &route.indexed_bool_targets {
+            candidates.push(ScalarBytecodeCandidate {
+                route_id,
+                source_id: route.source_id,
+                source: route.source.clone(),
+                target: target.target.clone(),
+                target_kind: "indexed_bool",
+                mode: ScalarBytecodeMode::Bool,
+                expression: target.expression.clone(),
+            });
+        }
+    }
+    candidates
+}
+
+fn scalar_expression_kind_label(expression: &ScalarUpdateExpression) -> &'static str {
+    match expression {
+        ScalarUpdateExpression::SourceText => "source_text",
+        ScalarUpdateExpression::SourceKey => "source_key",
+        ScalarUpdateExpression::SourceAddress => "source_address",
+        ScalarUpdateExpression::SourcePayload(_) => "source_payload",
+        ScalarUpdateExpression::Const(_) => "const",
+        ScalarUpdateExpression::NumberInfix { .. } => "number_infix",
+        ScalarUpdateExpression::ProjectTime { .. } => "project_time",
+        ScalarUpdateExpression::MatchNumberInfixConst { .. } => "match_number_infix_const",
+        ScalarUpdateExpression::ListFindValue { .. } => "list_find_value",
+        ScalarUpdateExpression::PreviousValue(_) => "previous_value",
+        ScalarUpdateExpression::ReadPath(_) => "read_path",
+        ScalarUpdateExpression::TextTrimOrPrevious { .. } => "text_trim_or_previous",
+        ScalarUpdateExpression::PrefixPayloadConcat { .. } => "prefix_payload_concat",
+        ScalarUpdateExpression::PrefixRootConcat { .. } => "prefix_root_concat",
+        ScalarUpdateExpression::BoolNot(_) => "bool_not",
+        ScalarUpdateExpression::MatchConst { .. } => "match_const",
+        ScalarUpdateExpression::MatchValueConst { .. } => "match_value_const",
+        ScalarUpdateExpression::Unsupported => "unsupported",
+    }
+}
+
 fn update_value_expression_is_bool_compatible(value: &UpdateValueExpression) -> bool {
     match value {
         UpdateValueExpression::Const { value } => {
@@ -43522,6 +44298,31 @@ FUNCTION icon_code(item) {
         assert_eq!(artifact_output.per_step.len(), 7);
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn bytecode_report_compiles_counter_scalar_routes_with_interpreter_parity() {
+        let report = verify_expression_bytecode_report(
+            Path::new("../../examples/counter.bn"),
+            Path::new("../../examples/counter.scn"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(report["status"], json!("pass"));
+        let bytecode = &report["expression_bytecode"];
+        assert_eq!(
+            bytecode["execution_surface"],
+            "scalar_source_route_expressions"
+        );
+        assert_eq!(bytecode["interpreter_oracle"], "ScalarEquationPlan");
+        assert_eq!(bytecode["candidate_expression_count"], json!(3));
+        assert_eq!(bytecode["compiled_expression_count"], json!(3));
+        assert_eq!(bytecode["fallback_count"], json!(0));
+        assert_eq!(bytecode["deopt_count"], json!(0));
+        assert_eq!(bytecode["parity_passed"], json!(true));
+        assert_eq!(bytecode["hot_path_ready"], json!(true));
+        assert_eq!(bytecode["op_histogram"]["number_infix"], json!(2));
+        assert_eq!(bytecode["op_histogram"]["const_text"], json!(1));
     }
 
     #[test]

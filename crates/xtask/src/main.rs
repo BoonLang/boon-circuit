@@ -3,8 +3,8 @@
 use boon_runtime::{
     ArtifactScenarioRunOutput, LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer,
     emit_compiled_artifact, example_paths, inspect_compiled_artifact_report, parse_scenario,
-    run_compiled_artifact_scenario, run_scenario, run_scenario_project, verify_report_schema,
-    write_json,
+    run_compiled_artifact_scenario, run_scenario, run_scenario_project,
+    verify_expression_bytecode_report, verify_report_schema, write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +29,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-compiled-artifact",
     "verify-compiled-artifact-inspection",
     "verify-compiled-artifact-scenario",
+    "verify-bytecode",
     "check-bridge",
     "verify-novywave-bridge-scenario",
     "verify-runtime-production-hardening",
@@ -122,6 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
         "verify-compiled-artifact-inspection" => verify_compiled_artifact_inspection(&args),
         "verify-compiled-artifact-scenario" => verify_compiled_artifact_scenario(&args),
+        "verify-bytecode" => verify_bytecode(&args),
         "check-bridge" => check_bridge(&args),
         "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
@@ -1735,6 +1737,35 @@ fn artifact_scenario_signature(output: &ArtifactScenarioRunOutput) -> serde_json
         "render_patches": output.render_patches,
         "state_summary": output.state_summary,
     })
+}
+
+fn verify_bytecode(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = named_arg(args, 1)?;
+    let (source, scenario, _) = example_paths(name)?;
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from(format!("target/reports/bytecode-{name}.json")));
+    let report_value = verify_expression_bytecode_report(&source, &scenario, Some(&report))?;
+    verify_report_schema(&report)?;
+    let bytecode = report_value
+        .get("expression_bytecode")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("verify-bytecode report missing expression_bytecode object")?;
+    if bytecode
+        .get("compiled_expression_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        == 0
+    {
+        return Err("verify-bytecode compiled no expressions".into());
+    }
+    if bytecode
+        .get("parity_passed")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(format!("verify-bytecode parity failed; see {}", report.display()).into());
+    }
+    Ok(())
 }
 
 fn enrich_semantic_build_evidence(

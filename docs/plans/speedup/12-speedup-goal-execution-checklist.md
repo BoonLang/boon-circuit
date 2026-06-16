@@ -2916,7 +2916,7 @@ Notes:
   `.boonc` scenario execution.
 
 ### TASK-0902 Expression Bytecode Or Micro-Op Interpreter
-Status: pending
+Status: done
 Type: implementation
 Priority: P2
 Depends on: TASK-0901
@@ -2931,11 +2931,17 @@ Acceptance:
 - Fallback to interpreter is reported and cannot silently satisfy hot readiness paths.
 Verification:
 - `cargo test -p boon_runtime --lib bytecode`
+- `cargo xtask verify-bytecode counter --report target/reports/bytecode-counter.json`
 - A scenario report compares interpreter and bytecode outputs for at least one example.
 Rollback / stop condition:
 - Stop if expression semantics are not sufficiently typed. Return to typechecker readiness tasks.
 Notes:
 - This task unlocks later generated kernel experiments.
+- Completed first as scalar source-route expression bytecode for Counter.
+  This is not a full runtime replacement: it proves `number_infix` and
+  `const_text` micro-ops against `ScalarEquationPlan` and reports fallback,
+  deopt, op histogram, and warm-path allocation metadata. Broader expression
+  families must extend the same proof report instead of silently falling back.
 
 ## Progress Log
 
@@ -5227,6 +5233,42 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Next available implementation task: TASK-0902 can start from a proven
   artifact baseline and use `.boonc` output as one serialization/loading
   boundary while designing bytecode or micro-op execution.
+
+### 2026-06-16 TASK-0902 Scalar Source-Route Bytecode MVP
+
+- Date: 2026-06-16
+- Task: TASK-0902 Expression Bytecode Or Micro-Op Interpreter
+- Commit: this checkpoint
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`;
+  `crates/boon_report_schema/src/lib.rs`;
+  `crates/xtask/src/main.rs`;
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+- Verification: `cargo fmt -p boon_runtime -p boon_report_schema -p xtask`;
+  `cargo test -p boon_runtime --lib bytecode -- --nocapture`; `cargo test -p
+  boon_report_schema --lib bytecode -- --nocapture`; `cargo xtask
+  verify-bytecode counter --report target/reports/bytecode-counter.json`;
+  `cargo test -p boon_report_schema --lib -- --nocapture`; `cargo test -p
+  xtask`; `cargo xtask verify-report-schema`; `cargo check -p boon_runtime -p
+  boon_cli -p xtask`; `cargo test -p boon_runtime --lib -- --nocapture`
+  passed with `219` tests.
+- Result: TASK-0902 is complete for its first accepted subset. The runtime now
+  has a scalar source-route bytecode compiler/evaluator for the covered
+  `ScalarUpdateExpression` modes, a `verify_expression_bytecode_report`
+  runtime report entrypoint, and a `cargo xtask verify-bytecode <example>` gate.
+  Counter proves three route expressions: two `number_infix` micro-ops and one
+  `const_text` micro-op.
+- Report detail: `target/reports/bytecode-counter.json` reports
+  `candidate_expression_count = 3`, `compiled_expression_count = 3`,
+  `parity_sample_count = 3`, `fallback_count = 0`, `deopt_count = 0`,
+  `warm_path_allocation_count = 2`, `parity_passed = true`,
+  `hot_path_ready = true`, and `op_histogram = { const_text: 1,
+  number_infix: 2 }`. Each bytecode sample records the source route, target,
+  mode, ops, interpreter output, bytecode output, and pass flag.
+- Boundary: this is a proof and reporting foundation, not broad hot-path
+  replacement. Unsupported expression families still need explicit bytecode ops
+  or reported fallback before generated kernels or dataflow experiments depend
+  on them.
 
 ## File Maintenance Checklist
 

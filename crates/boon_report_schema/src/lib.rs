@@ -146,6 +146,10 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_compiled_artifact_scenario_report(&report, path)?;
         return Ok(());
     }
+    if report.get("command").and_then(JsonValue::as_str) == Some("verify-bytecode") {
+        verify_bytecode_report(&report, path)?;
+        return Ok(());
+    }
     let required = [
         "report_version",
         "generated_at_utc",
@@ -849,6 +853,192 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
     verify_report_file_hash(report, path, "scenario_path", "scenario_hash")?;
     verify_compiled_artifact_sections(report, path)?;
     verify_artifact_hashes(report, path)?;
+    Ok(())
+}
+
+fn verify_bytecode_report(report: &JsonValue, path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "status",
+        "report_version",
+        "command",
+        "command_argv",
+        "measurement_mode",
+        "exit_status",
+        "generated_at_utc",
+        "git_commit",
+        "binary_hash",
+        "source_path",
+        "source_hash",
+        "scenario_path",
+        "scenario_hash",
+        "program_hash",
+        "graph_node_count",
+        "semantic_index",
+        "compiled_schedule",
+        "per_step_pass_fail",
+        "artifact_sha256s",
+        "expression_bytecode",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} missing verify-bytecode report field `{key}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!("{} verify-bytecode report did not pass", path.display()).into());
+    }
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("proof") {
+        return Err(format!(
+            "{} verify-bytecode report measurement_mode must be proof",
+            path.display()
+        )
+        .into());
+    }
+    verify_common_report_shape(report, path)?;
+    verify_measurement_mode(report, path)?;
+    verify_report_file_hash(report, path, "source_path", "source_hash")?;
+    verify_report_file_hash(report, path, "scenario_path", "scenario_hash")?;
+    verify_artifact_hashes(report, path)?;
+
+    let bytecode = report
+        .get("expression_bytecode")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} expression_bytecode is not an object", path.display()))?;
+    for key in [
+        "version",
+        "execution_surface",
+        "interpreter_oracle",
+        "candidate_expression_count",
+        "compiled_expression_count",
+        "parity_sample_count",
+        "parity_passed",
+        "fallback_count",
+        "fallback_reasons",
+        "deopt_count",
+        "deopt_reasons",
+        "op_histogram",
+        "warm_path_allocation_count",
+        "hot_path_ready",
+        "samples",
+    ] {
+        if bytecode.get(key).is_none() {
+            return Err(format!("{} expression_bytecode missing `{key}`", path.display()).into());
+        }
+    }
+    if bytecode.get("version").and_then(JsonValue::as_u64) != Some(1) {
+        return Err(format!("{} expression_bytecode has wrong version", path.display()).into());
+    }
+    let compiled_count = bytecode
+        .get("compiled_expression_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} expression_bytecode compiled_expression_count is not numeric",
+                path.display()
+            )
+        })?;
+    let sample_count = bytecode
+        .get("parity_sample_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} expression_bytecode parity_sample_count is not numeric",
+                path.display()
+            )
+        })?;
+    if compiled_count == 0 || sample_count < compiled_count {
+        return Err(format!(
+            "{} expression_bytecode must compile and sample at least one expression",
+            path.display()
+        )
+        .into());
+    }
+    if bytecode.get("parity_passed").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!("{} expression_bytecode parity did not pass", path.display()).into());
+    }
+    let fallback_count = bytecode
+        .get("fallback_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} expression_bytecode fallback_count is not numeric",
+                path.display()
+            )
+        })?;
+    let deopt_count = bytecode
+        .get("deopt_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} expression_bytecode deopt_count is not numeric",
+                path.display()
+            )
+        })?;
+    if deopt_count != 0 {
+        return Err(format!(
+            "{} expression_bytecode deopt_count is nonzero",
+            path.display()
+        )
+        .into());
+    }
+    if bytecode
+        .get("fallback_reasons")
+        .and_then(JsonValue::as_array)
+        .is_none()
+        || bytecode
+            .get("deopt_reasons")
+            .and_then(JsonValue::as_array)
+            .is_none()
+    {
+        return Err(format!(
+            "{} expression_bytecode fallback/deopt reasons must be arrays",
+            path.display()
+        )
+        .into());
+    }
+    let op_histogram = bytecode
+        .get("op_histogram")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} expression_bytecode op_histogram is not an object",
+                path.display()
+            )
+        })?;
+    if op_histogram.is_empty()
+        || op_histogram
+            .values()
+            .any(|value| value.as_u64().unwrap_or_default() == 0)
+    {
+        return Err(format!(
+            "{} expression_bytecode op_histogram must contain nonzero op counts",
+            path.display()
+        )
+        .into());
+    }
+    if bytecode
+        .get("warm_path_allocation_count")
+        .and_then(JsonValue::as_u64)
+        .is_none()
+    {
+        return Err(format!(
+            "{} expression_bytecode warm_path_allocation_count is not numeric",
+            path.display()
+        )
+        .into());
+    }
+    if bytecode.get("hot_path_ready").and_then(JsonValue::as_bool) == Some(true)
+        && (fallback_count != 0 || deopt_count != 0)
+    {
+        return Err(format!(
+            "{} expression_bytecode cannot claim hot_path_ready with fallback/deopt activity",
+            path.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -5420,6 +5610,79 @@ mod tests {
             "inspected-compiled-artifact-fake-scenario-execution"
         ));
         let _ = fs::remove_file(artifact_path);
+    }
+
+    #[test]
+    fn bytecode_report_requires_parity_and_explicit_readiness() {
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/counter.bn")
+            .canonicalize()
+            .unwrap();
+        let scenario_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/counter.scn")
+            .canonicalize()
+            .unwrap();
+        let mut report = json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "verify-bytecode",
+            "command_argv": ["cargo", "xtask", "verify-bytecode", "counter"],
+            "measurement_mode": "proof",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": source_path.display().to_string(),
+            "source_hash": sha256_file(&source_path).unwrap(),
+            "scenario_path": scenario_path.display().to_string(),
+            "scenario_hash": sha256_file(&scenario_path).unwrap(),
+            "program_hash": "program",
+            "budget_hash": "n/a",
+            "graph_node_count": 1,
+            "semantic_index": {},
+            "compiled_schedule": {},
+            "per_step_pass_fail": [{
+                "id": "expression-bytecode-interpreter-parity",
+                "pass": true
+            }],
+            "artifact_sha256s": [],
+            "expression_bytecode": {
+                "version": 1,
+                "execution_surface": "scalar_source_route_expressions",
+                "interpreter_oracle": "ScalarEquationPlan",
+                "candidate_expression_count": 3,
+                "compiled_expression_count": 3,
+                "parity_sample_count": 3,
+                "parity_passed": true,
+                "fallback_count": 0,
+                "fallback_reasons": [],
+                "deopt_count": 0,
+                "deopt_reasons": [],
+                "op_histogram": {"number_infix": 2, "const_text": 1},
+                "warm_path_allocation_count": 2,
+                "hot_path_ready": true,
+                "samples": [{"pass": true}]
+            }
+        });
+        assert!(schema_accepts(report.clone(), "bytecode-valid"));
+
+        report["expression_bytecode"]["parity_passed"] = json!(false);
+        assert!(!schema_accepts(report.clone(), "bytecode-fake-parity"));
+
+        report["expression_bytecode"]["parity_passed"] = json!(true);
+        report["expression_bytecode"]["fallback_count"] = json!(1);
+        report["expression_bytecode"]["fallback_reasons"] = json!(["unsupported"]);
+        assert!(!schema_accepts(
+            report.clone(),
+            "bytecode-hot-ready-with-fallback"
+        ));
+
+        report["expression_bytecode"]["hot_path_ready"] = json!(false);
+        assert!(schema_accepts(report, "bytecode-proof-only-fallback"));
     }
 
     #[test]

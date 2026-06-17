@@ -27,6 +27,7 @@ The source roadmap is:
 - `docs/plans/speedup/17-representation-next-experiments.md`
 - `docs/plans/speedup/18-binary-bytes-list-constants-execution-memo.md`
 - `docs/plans/speedup/19-user-representation-ledger.md`
+- `docs/plans/speedup/20-task-0804-root-flush-resolution-plan.md`
 
 The ordering principle is correctness first, proof integrity second,
 measurement third, then speed. A faster engine is not acceptable if stale
@@ -67,6 +68,9 @@ Task selection algorithm:
    any new follow-up tasks found while implementing.
 7. Do not mark a task `done` unless its acceptance criteria pass or the file
    records an explicit, narrow exception with a replacement task.
+8. If there are no real `pending` or `in_progress` tasks but real postponed
+   tasks remain, stop and report those task IDs plus the exact user action
+   required to resume them. Do not silently treat the roadmap as complete.
 
 Evidence rules:
 
@@ -2497,7 +2501,7 @@ Status: postponed
 Type: implementation
 Priority: P1
 Depends on: TASK-0502A, TASK-0804
-Source plans: 09, 10, 11, 13, 14, 15, 16, 17, 18
+Source plans: 09, 10, 11, 13, 14, 15, 16, 17, 18, 20
 Likely areas: `crates/boon_runtime/src/lib.rs`, `crates/boon_native_playground/src/main.rs`, `crates/xtask/src/main.rs`
 Goal:
 Reduce the current measured NovyWave interaction slow path in generic engine
@@ -2551,6 +2555,13 @@ Notes:
 - Do not run `EXP-0002` as the next slice merely because it is next in the old
   experiment backlog. Low-level container experiments are deferred until this
   measured root-flush path is addressed or disproven.
+- See `docs/plans/speedup/20-task-0804-root-flush-resolution-plan.md` for the
+  systematic resumption plan. It keeps this task as postponed history and
+  routes future implementation through `TASK-0804B` after an explicit user
+  resume.
+- Current rule after plan 20: do not unpostpone `TASK-0804A`. It remains the
+  historical investigation record; future implementation resumes through
+  `TASK-0804B` only.
 - 2026-06-16 TASK-0804A measurement refresh and killed lazy-ready scheduler
   experiment: refreshed the official NovyWave interaction-speed gate before
   changing code. The fresh canonical report still fails only the release click
@@ -2761,8 +2772,8 @@ Notes:
 Status: postponed
 Type: implementation
 Priority: P1
-Depends on: TASK-0804, TASK-1001, TASK-1002
-Source plans: 09, 10, 11, 13, 14, 15, 16, 17, 18, 19
+Depends on: TASK-0804, TASK-1001, TASK-1002, explicit user resume
+Source plans: 09, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20
 Likely areas: `crates/boon_runtime/src/lib.rs`, `crates/boon_native_playground/src/main.rs`, `crates/xtask/src/main.rs`, NovyWave bridge/page runtime integration
 Goal:
 Resume the unfinished NovyWave root-flush speed work with a narrower,
@@ -2783,21 +2794,19 @@ Acceptance:
   response rejection still works.
 - Cursor-hot telemetry can update without changing stable page/blob/request
   identities unless the real bridge/file/page input changed.
-- The kept slice reduces the `194/32/38` slow-click class, lowers final
-  click/input p95 below the strict budget, or materially lowers one of
-  `source_action_root_flush`, `source_action_root_dirty_scheduler`,
-  `source_action_root_materialization`, `selected_signal_lane_rows.eval_ms`,
-  `selected_signal_lane_rows.diff_ms`, or
-  `selected_cursor_pair_rows.user_function_body_ms`.
+- The kept slice reduces the slow `194/32/38` class occurrence count by at
+  least `25%`, lowers final click/input p95 below the strict `16.700ms`
+  budget, or lowers a named p95/root-list bucket by at least `10%` and
+  `1.0ms` with no click/input p95 regression greater than `0.5ms` or `5%`.
 - Renderer upload remains solved: post-interaction upload stays near the
   retained path (`3360` bytes in the latest report), staging wraps stay zero,
   and quad-cache evictions stay zero.
 Verification:
-- `cargo test -p boon_runtime --lib`
+- `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib`
 - `cargo test -p boon_bridge --lib -- --nocapture`
 - `cargo check -p boon_runtime -p boon_bridge -p boon_native_playground -p xtask`
 - `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
-- `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+- `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
 - `cargo xtask verify-report-schema`
 - `jq` inspection of bridge payload identity, speed p95s, root-flush graph
   counts, root-list by-list counters, and renderer post-interaction upload.
@@ -2816,6 +2825,14 @@ Notes:
 - TASK-1001 and TASK-1002 are prerequisites because the future slice should
   build on real BYTES sidecars and current LIST row-index/selection storage
   modes instead of re-solving payload/list representation.
+- Use `docs/plans/speedup/20-task-0804-root-flush-resolution-plan.md` as the
+  decision-complete resumption plan for this task. Start with `0804R-00`
+  only after this task is explicitly unpostponed.
+- Activation protocol: when the user explicitly resumes `TASK-0804B`, keep
+  `TASK-0804A` postponed, set `TASK-0804B` to `in_progress`, set plan-20
+  `0804R-00` to `pending` or `in_progress`, leave later `0804R-*` tasks
+  blocked until their dependencies are done, and append matching progress-log
+  entries in both files.
 
 ## Phase 9: Low-Level Rust Experiments
 
@@ -6929,9 +6946,11 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Task state audit:
   read-only subagent `019ed406-0400-7602-af4c-680f5860a509` confirmed that
   no real executable `pending` or `in_progress` task/experiment remains besides
-  template placeholders `TASK-0000`/`EXP-0000` and intentionally postponed
-  `TASK-0804A`. The canonical status scan remains `TASK-1001=done`,
-  `TASK-1002=done`, and `TASK-0804A=postponed`.
+  template placeholders `TASK-0000`/`EXP-0000`. Real postponed work remains:
+  `TASK-0804A` as historical investigation evidence and `TASK-0804B` as the
+  future root-flush/bridge-page resumption task. The canonical status scan is
+  `TASK-1001=done`, `TASK-1002=done`, `TASK-0804A=postponed`, and
+  `TASK-0804B=postponed`.
 - Refreshed verification:
   `cargo test -p boon_bridge --lib -- --nocapture` (`12 passed`);
   `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib bytes -- --nocapture`
@@ -6976,9 +6995,9 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   `Stream<Bytes>` sidecars exist.
 - Result:
   this refresh does not reopen BYTES/LIST work and does not unpostpone
-  TASK-0804A. The remaining root-flush/bridge-page identity work is still a
-  future TASK-0804A-style architecture problem or a new explicit task, not a
-  hidden unfinished TASK-1001/TASK-1002 requirement.
+  TASK-0804A or TASK-0804B. The remaining root-flush/bridge-page identity work
+  resumes only through explicit `TASK-0804B` activation, not as a hidden
+  unfinished TASK-1001/TASK-1002 requirement.
 
 ## File Maintenance Checklist
 
@@ -6991,7 +7010,7 @@ git diff --check -- docs/plans/speedup/12-speedup-goal-execution-checklist.md
 
 Before using this file as `/goal` input, confirm:
 
-- Every plan file `01` through `19` except this self-file is
+- Every plan file `01` through `20` except this self-file is
   listed under `Objective`.
 - Every `TASK-*` has status, dependencies, acceptance criteria, verification,
   and rollback/stop condition.

@@ -18046,13 +18046,13 @@ impl GenericScheduledRuntime {
         self.list_source_bindings.source_paths(list)
     }
 
-    fn generic_bool_context(&self, path: &str) -> Option<bool> {
+    fn generic_bool_context(&mut self, path: &str) -> Option<bool> {
         self.derived_bool_value(path).ok().flatten()
     }
 
-    fn generic_bool_contexts(&self) -> BTreeMap<String, bool> {
+    fn generic_bool_contexts(&mut self) -> BTreeMap<String, bool> {
         let mut values = BTreeMap::new();
-        for branch in &self.scalar_equations.branches {
+        for branch in self.scalar_equations.branches.clone() {
             if let ScalarUpdateExpression::BoolNot(path) = &branch.expression
                 && let Some(value) = self.generic_bool_context(path)
             {
@@ -18062,7 +18062,8 @@ impl GenericScheduledRuntime {
         values
     }
 
-    fn derived_bool_value(&self, path: &str) -> RuntimeResult<Option<bool>> {
+    fn derived_bool_value(&mut self, path: &str) -> RuntimeResult<Option<bool>> {
+        self.ensure_root_current(path, RuntimeRootCurrentnessReason::SourceRouteScalarRead)?;
         if let Some(value) = self.storage.root.bool_value(path) {
             return Ok(Some(value));
         }
@@ -20630,7 +20631,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_numeric_values_for_reads(
-        &self,
+        &mut self,
         reads: &BTreeSet<GenericReadKey>,
     ) -> BTreeMap<String, i64> {
         reads
@@ -20645,7 +20646,9 @@ impl GenericScheduledRuntime {
             .collect()
     }
 
-    fn runtime_scalar_number_for_numeric_guard(&self, path: &str) -> Option<i64> {
+    fn runtime_scalar_number_for_numeric_guard(&mut self, path: &str) -> Option<i64> {
+        self.ensure_root_current(path, RuntimeRootCurrentnessReason::NumericGuard)
+            .ok()?;
         for (list, target) in self.list_equations.count_targets() {
             if runtime_path_matches_target(path, target)
                 && let Ok(count) = self.count_list_rows_for_target(list, target)
@@ -22909,16 +22912,18 @@ impl GenericScheduledRuntime {
     }
 
     fn can_skip_generic_derived_key_for_changed_reads(
-        &self,
+        &mut self,
         key: &GenericDerivedKey,
         changed_reads: &BTreeSet<GenericReadKey>,
     ) -> bool {
-        let Some(previous_reads) = self.generic_derived_state.reads_by_field.get(key) else {
+        let Some(previous_reads) = self.generic_derived_state.reads_by_field.get(key).cloned()
+        else {
             return false;
         };
         let relevant_reads = previous_reads
             .iter()
             .filter(|read| changed_reads.contains(*read))
+            .cloned()
             .collect::<Vec<_>>();
         if relevant_reads.is_empty() {
             return false;
@@ -22927,14 +22932,15 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .numeric_stability_guards_by_field
             .get(key)
+            .cloned()
         else {
             return false;
         };
         relevant_reads.into_iter().all(|read| {
-            let GenericReadKey::Root { field } = read else {
+            let GenericReadKey::Root { ref field } = read else {
                 return false;
             };
-            let Some(interval) = guards.get(read).copied() else {
+            let Some(interval) = guards.get(&read).copied() else {
                 return false;
             };
             self.runtime_scalar_boon_value(field)
@@ -22944,16 +22950,22 @@ impl GenericScheduledRuntime {
     }
 
     fn can_skip_root_derived_field_for_changed_reads(
-        &self,
+        &mut self,
         path: &str,
         changed_reads: &BTreeSet<GenericReadKey>,
     ) -> bool {
-        let Some(previous_reads) = self.generic_derived_state.root_reads_by_field.get(path) else {
+        let Some(previous_reads) = self
+            .generic_derived_state
+            .root_reads_by_field
+            .get(path)
+            .cloned()
+        else {
             return false;
         };
         let relevant_reads = previous_reads
             .iter()
             .filter(|read| changed_reads.contains(*read))
+            .cloned()
             .collect::<Vec<_>>();
         if relevant_reads.is_empty() {
             return false;
@@ -22962,14 +22974,15 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_numeric_stability_guards_by_field
             .get(path)
+            .cloned()
         else {
             return false;
         };
         relevant_reads.into_iter().all(|read| {
-            let GenericReadKey::Root { field } = read else {
+            let GenericReadKey::Root { ref field } = read else {
                 return false;
             };
-            let Some(interval) = guards.get(read).copied() else {
+            let Some(interval) = guards.get(&read).copied() else {
                 return false;
             };
             self.runtime_scalar_boon_value(field)
@@ -22978,7 +22991,7 @@ impl GenericScheduledRuntime {
         })
     }
 
-    fn has_cached_or_stored_root_value_for_skip(&self, path: &str) -> bool {
+    fn has_cached_or_stored_root_value_for_skip(&mut self, path: &str) -> bool {
         self.generic_derived_state
             .root_value_cache
             .contains_key(path)
@@ -24068,30 +24081,39 @@ impl GenericScheduledRuntime {
             .get(&cache_key)
             .cloned()
         {
-            let read_key_count = entry.reads.len();
-            let numeric_guard_count = entry.numeric_stability_guards.len();
-            with_root_list_view_attribution(frame, |profile| {
-                profile.user_function_cache_hit_count =
-                    profile.user_function_cache_hit_count.saturating_add(1);
-                profile.user_function_cache_hit_read_key_count = profile
-                    .user_function_cache_hit_read_key_count
-                    .saturating_add(read_key_count);
-                profile.user_function_cache_hit_numeric_guard_count = profile
-                    .user_function_cache_hit_numeric_guard_count
-                    .saturating_add(numeric_guard_count);
-                profile.user_function_cache_hit_ms += runtime_elapsed_ms(cache_hit_started);
-            });
-            frame.reads.extend(entry.reads);
-            frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
-            if let Some(call_started) = call_started {
-                self.record_function_call_sample(
-                    &definition.name,
-                    frame,
-                    runtime_elapsed_ms(call_started),
-                    true,
-                );
+            if self.ensure_root_reads_current(
+                &entry.reads,
+                RuntimeRootCurrentnessReason::FunctionCacheHit,
+            )? {
+                self.generic_derived_state
+                    .function_value_cache
+                    .remove(&cache_key);
+            } else {
+                let read_key_count = entry.reads.len();
+                let numeric_guard_count = entry.numeric_stability_guards.len();
+                with_root_list_view_attribution(frame, |profile| {
+                    profile.user_function_cache_hit_count =
+                        profile.user_function_cache_hit_count.saturating_add(1);
+                    profile.user_function_cache_hit_read_key_count = profile
+                        .user_function_cache_hit_read_key_count
+                        .saturating_add(read_key_count);
+                    profile.user_function_cache_hit_numeric_guard_count = profile
+                        .user_function_cache_hit_numeric_guard_count
+                        .saturating_add(numeric_guard_count);
+                    profile.user_function_cache_hit_ms += runtime_elapsed_ms(cache_hit_started);
+                });
+                frame.reads.extend(entry.reads);
+                frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
+                if let Some(call_started) = call_started {
+                    self.record_function_call_sample(
+                        &definition.name,
+                        frame,
+                        runtime_elapsed_ms(call_started),
+                        true,
+                    );
+                }
+                return Ok(entry.value);
             }
-            return Ok(entry.value);
         }
         let body_started = Instant::now();
         let value = self.eval_runtime_generic_statement(&definition.statement, &mut child)?;
@@ -25853,30 +25875,39 @@ impl GenericScheduledRuntime {
             .get(&cache_key)
             .cloned()
         {
-            let read_key_count = entry.reads.len();
-            let numeric_guard_count = entry.numeric_stability_guards.len();
-            with_root_list_view_attribution(frame, |profile| {
-                profile.user_function_cache_hit_count =
-                    profile.user_function_cache_hit_count.saturating_add(1);
-                profile.user_function_cache_hit_read_key_count = profile
-                    .user_function_cache_hit_read_key_count
-                    .saturating_add(read_key_count);
-                profile.user_function_cache_hit_numeric_guard_count = profile
-                    .user_function_cache_hit_numeric_guard_count
-                    .saturating_add(numeric_guard_count);
-                profile.user_function_cache_hit_ms += runtime_elapsed_ms(cache_hit_started);
-            });
-            frame.reads.extend(entry.reads);
-            frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
-            if let Some(call_started) = call_started {
-                self.record_function_call_sample(
-                    &definition.name,
-                    frame,
-                    runtime_elapsed_ms(call_started),
-                    true,
-                );
+            if self.ensure_root_reads_current(
+                &entry.reads,
+                RuntimeRootCurrentnessReason::FunctionCacheHit,
+            )? {
+                self.generic_derived_state
+                    .function_value_cache
+                    .remove(&cache_key);
+            } else {
+                let read_key_count = entry.reads.len();
+                let numeric_guard_count = entry.numeric_stability_guards.len();
+                with_root_list_view_attribution(frame, |profile| {
+                    profile.user_function_cache_hit_count =
+                        profile.user_function_cache_hit_count.saturating_add(1);
+                    profile.user_function_cache_hit_read_key_count = profile
+                        .user_function_cache_hit_read_key_count
+                        .saturating_add(read_key_count);
+                    profile.user_function_cache_hit_numeric_guard_count = profile
+                        .user_function_cache_hit_numeric_guard_count
+                        .saturating_add(numeric_guard_count);
+                    profile.user_function_cache_hit_ms += runtime_elapsed_ms(cache_hit_started);
+                });
+                frame.reads.extend(entry.reads);
+                frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
+                if let Some(call_started) = call_started {
+                    self.record_function_call_sample(
+                        &definition.name,
+                        frame,
+                        runtime_elapsed_ms(call_started),
+                        true,
+                    );
+                }
+                return Ok(entry.value);
             }
-            return Ok(entry.value);
         }
         let body_started = Instant::now();
         let value = if definition.statement.children.len() == 1
@@ -26129,7 +26160,10 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_list_view_field_cache
             .get(&cache_key)
-            .map(|entry| self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, entry))
+            .cloned()
+            .map(|entry| {
+                self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, &entry)
+            })
             .unwrap_or_default();
         if dirty_forced_miss_read_key_count > 0 {
             self.generic_derived_state
@@ -26149,30 +26183,39 @@ impl GenericScheduledRuntime {
             .get(&cache_key)
             .cloned()
         {
-            let read_key_count = entry.reads.len();
-            let numeric_guard_count = entry.numeric_stability_guards.len();
-            self.root_list_view_field_cache_hits =
-                self.root_list_view_field_cache_hits.saturating_add(1);
-            frame.reads.extend(entry.reads);
-            frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
-            with_root_list_view_attribution(frame, |profile| {
-                profile.field_cache_value_hit_count =
-                    profile.field_cache_value_hit_count.saturating_add(1);
-                profile.field_cache_hit_read_key_count = profile
-                    .field_cache_hit_read_key_count
-                    .saturating_add(read_key_count);
-                profile.field_cache_hit_numeric_guard_count = profile
-                    .field_cache_hit_numeric_guard_count
-                    .saturating_add(numeric_guard_count);
-            });
-            record_root_list_view_field_profile(
-                frame,
-                &cache_key,
-                runtime_elapsed_ms(profile_started),
-                true,
-                false,
-            );
-            return Ok(entry.value);
+            if self.ensure_root_reads_current(
+                &entry.reads,
+                RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
+            )? {
+                self.generic_derived_state
+                    .root_list_view_field_cache
+                    .remove(&cache_key);
+            } else {
+                let read_key_count = entry.reads.len();
+                let numeric_guard_count = entry.numeric_stability_guards.len();
+                self.root_list_view_field_cache_hits =
+                    self.root_list_view_field_cache_hits.saturating_add(1);
+                frame.reads.extend(entry.reads);
+                frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
+                with_root_list_view_attribution(frame, |profile| {
+                    profile.field_cache_value_hit_count =
+                        profile.field_cache_value_hit_count.saturating_add(1);
+                    profile.field_cache_hit_read_key_count = profile
+                        .field_cache_hit_read_key_count
+                        .saturating_add(read_key_count);
+                    profile.field_cache_hit_numeric_guard_count = profile
+                        .field_cache_hit_numeric_guard_count
+                        .saturating_add(numeric_guard_count);
+                });
+                record_root_list_view_field_profile(
+                    frame,
+                    &cache_key,
+                    runtime_elapsed_ms(profile_started),
+                    true,
+                    false,
+                );
+                return Ok(entry.value);
+            }
         }
         self.root_list_view_field_cache_misses =
             self.root_list_view_field_cache_misses.saturating_add(1);
@@ -26290,7 +26333,10 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_list_view_field_cache
             .get(&cache_key)
-            .map(|entry| self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, entry))
+            .cloned()
+            .map(|entry| {
+                self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, &entry)
+            })
             .unwrap_or_default();
         if dirty_forced_miss_read_key_count > 0 {
             self.generic_derived_state
@@ -26308,41 +26354,53 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_list_view_field_cache
             .get(&cache_key)
+            .cloned()
         {
-            let read_key_count = entry.reads.len();
-            let numeric_guard_count = entry.numeric_stability_guards.len();
-            let previous_pass_cache_hit = frame
-                .root_list_view_field_cache_context
-                .as_ref()
-                .is_some_and(|context| entry.materialization_pass != context.materialization_pass);
-            let value = (!previous_pass_cache_hit || value_for_previous_pass_hit)
-                .then(|| entry.field_value.clone());
-            let numeric_stability_guards = entry.numeric_stability_guards.clone();
-            self.root_list_view_field_cache_hits =
-                self.root_list_view_field_cache_hits.saturating_add(1);
-            frame.reads.extend(entry.reads.iter().cloned());
-            frame.merge_numeric_stability_guards(numeric_stability_guards);
-            with_root_list_view_attribution(frame, |profile| {
-                profile.field_cache_field_value_hit_count =
-                    profile.field_cache_field_value_hit_count.saturating_add(1);
-                profile.field_cache_hit_read_key_count = profile
-                    .field_cache_hit_read_key_count
-                    .saturating_add(read_key_count);
-                profile.field_cache_hit_numeric_guard_count = profile
-                    .field_cache_hit_numeric_guard_count
-                    .saturating_add(numeric_guard_count);
-            });
-            record_root_list_view_field_profile(
-                frame,
-                &cache_key,
-                runtime_elapsed_ms(profile_started),
-                true,
-                false,
-            );
-            return Ok(RootListViewEvaluatedFieldValue {
-                value,
-                previous_pass_cache_hit,
-            });
+            if self.ensure_root_reads_current(
+                &entry.reads,
+                RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
+            )? {
+                self.generic_derived_state
+                    .root_list_view_field_cache
+                    .remove(&cache_key);
+            } else {
+                let read_key_count = entry.reads.len();
+                let numeric_guard_count = entry.numeric_stability_guards.len();
+                let previous_pass_cache_hit = frame
+                    .root_list_view_field_cache_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        entry.materialization_pass != context.materialization_pass
+                    });
+                let value = (!previous_pass_cache_hit || value_for_previous_pass_hit)
+                    .then(|| entry.field_value.clone());
+                let numeric_stability_guards = entry.numeric_stability_guards.clone();
+                self.root_list_view_field_cache_hits =
+                    self.root_list_view_field_cache_hits.saturating_add(1);
+                frame.reads.extend(entry.reads.iter().cloned());
+                frame.merge_numeric_stability_guards(numeric_stability_guards);
+                with_root_list_view_attribution(frame, |profile| {
+                    profile.field_cache_field_value_hit_count =
+                        profile.field_cache_field_value_hit_count.saturating_add(1);
+                    profile.field_cache_hit_read_key_count = profile
+                        .field_cache_hit_read_key_count
+                        .saturating_add(read_key_count);
+                    profile.field_cache_hit_numeric_guard_count = profile
+                        .field_cache_hit_numeric_guard_count
+                        .saturating_add(numeric_guard_count);
+                });
+                record_root_list_view_field_profile(
+                    frame,
+                    &cache_key,
+                    runtime_elapsed_ms(profile_started),
+                    true,
+                    false,
+                );
+                return Ok(RootListViewEvaluatedFieldValue {
+                    value,
+                    previous_pass_cache_hit,
+                });
+            }
         }
         self.root_list_view_field_cache_misses =
             self.root_list_view_field_cache_misses.saturating_add(1);
@@ -26435,23 +26493,40 @@ impl GenericScheduledRuntime {
         ) else {
             return false;
         };
-        let Some((read_key_count, numeric_guard_count)) = (|| {
+        let Some((read_key_count, numeric_guard_count, reads)) = (|| {
             let entry = self
                 .generic_derived_state
                 .root_list_view_field_cache
-                .get(&cache_key)?;
+                .get(&cache_key)?
+                .clone();
             if entry.materialization_pass == current_pass {
                 return None;
             }
             if !field_cache_entries_prevalidated
-                && self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, entry) > 0
+                && self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, &entry) > 0
             {
                 return None;
             }
-            Some((entry.reads.len(), entry.numeric_stability_guards.len()))
+            Some((
+                entry.reads.len(),
+                entry.numeric_stability_guards.len(),
+                entry.reads.clone(),
+            ))
         })() else {
             return false;
         };
+        if self
+            .ensure_root_reads_current(
+                &reads,
+                RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
+            )
+            .unwrap_or(true)
+        {
+            self.generic_derived_state
+                .root_list_view_field_cache
+                .remove(&cache_key);
+            return false;
+        }
 
         self.root_list_view_field_cache_hits =
             self.root_list_view_field_cache_hits.saturating_add(1);
@@ -26540,7 +26615,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_map_output_cache_entry_is_invalidated(
-        &self,
+        &mut self,
         frame: &GenericEvalFrame,
         entry: &RootListMapOutputCacheEntry,
     ) -> bool {
@@ -26560,7 +26635,7 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_cache_entry_dirty_invalidated_read_count(
-        &self,
+        &mut self,
         frame: &GenericEvalFrame,
         entry: &RootListViewFieldCacheEntry,
     ) -> usize {
@@ -28653,6 +28728,13 @@ impl GenericScheduledRuntime {
                                 .list_map_output_cache_dirty_forced_miss_count
                                 .saturating_add(1);
                         });
+                    } else if self.ensure_root_reads_current(
+                        &entry.reads,
+                        RuntimeRootCurrentnessReason::RootListMapOutputCacheHit,
+                    )? {
+                        self.generic_derived_state
+                            .root_list_map_output_cache
+                            .remove(&cache_key);
                     } else {
                         frame.reads.extend(entry.reads);
                         frame.merge_numeric_stability_guards(entry.numeric_stability_guards);
@@ -29049,7 +29131,7 @@ impl GenericScheduledRuntime {
     }
 
     fn numeric_guard_root_path_for_expr(
-        &self,
+        &mut self,
         expr_id: usize,
         frame: &GenericEvalFrame,
     ) -> Option<String> {
@@ -29064,7 +29146,7 @@ impl GenericScheduledRuntime {
         self.root_path_for_numeric_guard(&path)
     }
 
-    fn root_path_for_numeric_guard(&self, path: &str) -> Option<String> {
+    fn root_path_for_numeric_guard(&mut self, path: &str) -> Option<String> {
         let mut candidates = vec![path.to_owned()];
         if let Some(local) = path.strip_prefix("store.") {
             candidates.push(local.to_owned());
@@ -30271,7 +30353,7 @@ impl GenericScheduledRuntime {
         None
     }
 
-    fn runtime_path_kind(&self, path: &str) -> Option<&'static str> {
+    fn runtime_path_kind(&mut self, path: &str) -> Option<&'static str> {
         if self.runtime_scalar_json(path).is_some() {
             return Some("value");
         }
@@ -30289,7 +30371,91 @@ impl GenericScheduledRuntime {
         None
     }
 
-    fn runtime_scalar_json(&self, path: &str) -> Option<JsonValue> {
+    fn root_currentness_field_for_path(&self, path: &str) -> Option<GenericDerivedRootField> {
+        if !self.generic_derived_state.has_deferred_dirty_roots() {
+            return None;
+        }
+        let field = self.generic_derived.root_field_plan(path).or_else(|| {
+            self.generic_derived
+                .root_field_plan_for_source_read_path(path)
+        })?;
+        self.generic_derived_state
+            .deferred_dirty_root_contains(&field.path)
+            .then(|| field.clone())
+    }
+
+    fn ensure_root_current(
+        &mut self,
+        path: &str,
+        _reason: RuntimeRootCurrentnessReason,
+    ) -> RuntimeResult<bool> {
+        let Some(field) = self.root_currentness_field_for_path(path) else {
+            return Ok(false);
+        };
+        if !self
+            .generic_derived_state
+            .remove_deferred_dirty_root(&field.path)
+        {
+            return Ok(false);
+        }
+        self.generic_derived_state
+            .root_value_cache
+            .remove(&field.path);
+        self.generic_derived_state
+            .remove_root_numeric_stability_guards(&field.path);
+        match self.materialize_root_derived_field_commit(&field) {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                self.generic_derived_state
+                    .insert_deferred_dirty_root(field.path.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_root_reads_current(
+        &mut self,
+        reads: &BTreeSet<GenericReadKey>,
+        reason: RuntimeRootCurrentnessReason,
+    ) -> RuntimeResult<bool> {
+        if !self.generic_derived_state.has_deferred_dirty_roots() || reads.is_empty() {
+            return Ok(false);
+        }
+        let mut refreshed = false;
+        let paths = reads
+            .iter()
+            .filter_map(|read| match read {
+                GenericReadKey::Root { field } => Some(field.clone()),
+                GenericReadKey::RootChild { root, .. } => Some(root.clone()),
+                GenericReadKey::List { .. }
+                | GenericReadKey::ListColumn { .. }
+                | GenericReadKey::ListField { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for path in paths {
+            refreshed |= self.ensure_root_current(&path, reason)?;
+        }
+        Ok(refreshed)
+    }
+
+    #[cfg(test)]
+    fn mark_root_deferred_dirty_for_test(&mut self, path: &str) -> RuntimeResult<()> {
+        let field = self
+            .generic_derived
+            .root_field_plan(path)
+            .or_else(|| {
+                self.generic_derived
+                    .root_field_plan_for_source_read_path(path)
+            })
+            .ok_or_else(|| format!("test root `{path}` has no derived root plan"))?;
+        self.generic_derived_state
+            .insert_deferred_dirty_root(field.path.clone());
+        Ok(())
+    }
+
+    fn runtime_scalar_json(&mut self, path: &str) -> Option<JsonValue> {
+        self.ensure_root_current(path, RuntimeRootCurrentnessReason::RuntimeScalarJson)
+            .ok()?;
         if let Some(value) = self.storage.root.owned_value(path) {
             self.generic_derived_state
                 .record_candidate_defer_runtime_read(
@@ -30323,17 +30489,20 @@ impl GenericScheduledRuntime {
                 return Some(json!(count));
             }
         }
-        for projection in &self.list_projections.projections {
+        for projection in self.list_projections.projections.clone() {
             if !runtime_path_matches_target(path, &projection.target) {
                 continue;
             }
-            if let RuntimeListProjectionKind::Find { field, value } = &projection.kind {
+            if let RuntimeListProjectionKind::Find { field, value } = projection.kind {
+                self.ensure_root_current(&value, RuntimeRootCurrentnessReason::ProjectionSelector)
+                    .ok()?;
                 let selected = self
                     .storage
-                    .root_textlike_ref(value)
+                    .root_textlike_ref(&value)
                     .map(str::to_owned)
-                    .unwrap_or_else(|_| value.clone());
-                if let Some(value) = self.list_find_projection(&projection.list, field, &selected) {
+                    .unwrap_or(value);
+                if let Some(value) = self.list_find_projection(&projection.list, &field, &selected)
+                {
                     return Some(JsonValue::Object(value));
                 }
             }
@@ -30341,7 +30510,9 @@ impl GenericScheduledRuntime {
         None
     }
 
-    fn runtime_scalar_boon_value(&self, path: &str) -> Option<BoonValue> {
+    fn runtime_scalar_boon_value(&mut self, path: &str) -> Option<BoonValue> {
+        self.ensure_root_current(path, RuntimeRootCurrentnessReason::RuntimeScalarBoonValue)
+            .ok()?;
         for (list, target) in self.list_equations.count_targets() {
             if runtime_path_matches_target(path, target)
                 && let Ok(count) = self.count_list_rows_for_target(list, target)
@@ -30386,12 +30557,17 @@ impl GenericScheduledRuntime {
         None
     }
 
-    fn structured_root_child_boon_value(&self, path: &str) -> Option<BoonValue> {
+    fn structured_root_child_boon_value(&mut self, path: &str) -> Option<BoonValue> {
         let mut candidates = vec![path.to_owned()];
         if !path.starts_with("store.") {
             candidates.push(format!("store.{path}"));
         }
         for candidate in candidates {
+            self.ensure_root_current(
+                &candidate,
+                RuntimeRootCurrentnessReason::StructuredRootChild,
+            )
+            .ok()?;
             let parts = candidate.split('.').collect::<Vec<_>>();
             for end in (1..parts.len()).rev() {
                 let parent = parts[..end].join(".");
@@ -30413,6 +30589,7 @@ impl GenericScheduledRuntime {
         let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
             return Ok(None);
         };
+        self.ensure_root_current(&plan.path, RuntimeRootCurrentnessReason::RootDerived)?;
         self.generic_derived_state
             .record_candidate_defer_derived_read(&plan.path);
         if plan.kind == DerivedValueKind::SourceEventTransform
@@ -30424,26 +30601,39 @@ impl GenericScheduledRuntime {
                 .extend(root_dependency_read_keys_for_path(&plan.path));
             return Ok(Some(value));
         }
-        if let Some(value) = self.generic_derived_state.root_value_cache.get(&plan.path) {
-            if let Some(reads) = self
+        if let Some(value) = self
+            .generic_derived_state
+            .root_value_cache
+            .get(&plan.path)
+            .cloned()
+        {
+            let reads = self
                 .generic_derived_state
                 .root_reads_by_field
                 .get(&plan.path)
-            {
-                frame.reads.extend(reads.iter().cloned());
-            }
-            frame
-                .reads
-                .extend(root_dependency_read_keys_for_path(&plan.path));
-            if let Some(guards) = self
-                .generic_derived_state
-                .root_numeric_stability_guards_by_field
-                .get(&plan.path)
                 .cloned()
-            {
-                frame.merge_numeric_stability_guards(guards);
+                .unwrap_or_default();
+            if self.ensure_root_reads_current(&reads, RuntimeRootCurrentnessReason::RootDerived)? {
+                self.generic_derived_state
+                    .root_value_cache
+                    .remove(&plan.path);
+                self.generic_derived_state
+                    .remove_root_numeric_stability_guards(&plan.path);
+            } else {
+                frame.reads.extend(reads.iter().cloned());
+                frame
+                    .reads
+                    .extend(root_dependency_read_keys_for_path(&plan.path));
+                if let Some(guards) = self
+                    .generic_derived_state
+                    .root_numeric_stability_guards_by_field
+                    .get(&plan.path)
+                    .cloned()
+                {
+                    frame.merge_numeric_stability_guards(guards);
+                }
+                return Ok(Some(value));
             }
-            return Ok(Some(value.clone()));
         }
         if let Some((referenced_path, list)) = self
             .direct_runtime_root_list_ref_for_path(&plan.path)
@@ -31109,13 +31299,19 @@ impl GenericScheduledRuntime {
         let mut root = serde_json::Map::new();
         let mut flat_root = serde_json::Map::new();
         let mut materialization = Vec::new();
-        for path in &self.root_state_paths {
-            let Some(value) = self.storage.root.owned_value(path) else {
+        for path in self.root_state_paths.clone() {
+            if self
+                .ensure_root_current(&path, RuntimeRootCurrentnessReason::DocumentSummary)
+                .is_err()
+            {
+                continue;
+            }
+            let Some(value) = self.storage.root.owned_value(&path) else {
                 continue;
             };
             let json_value = field_value_json(value);
-            insert_nested_json(&mut root, path, json_value.clone());
-            flat_root.insert(row_field_name(path).to_owned(), json_value);
+            insert_nested_json(&mut root, &path, json_value.clone());
+            flat_root.insert(row_field_name(&path).to_owned(), json_value);
         }
         for (key, value) in flat_root {
             root.entry(key).or_insert(value);
@@ -31301,6 +31497,15 @@ impl GenericScheduledRuntime {
                 RuntimeListProjectionKind::Find { field, value } => {
                     let projection_list = self.projection_storage_list_name(&projection.list);
                     let projection_list = projection_list.as_deref().unwrap_or(&projection.list);
+                    if self
+                        .ensure_root_current(
+                            value,
+                            RuntimeRootCurrentnessReason::ProjectionSelector,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
                     let selected_address = self
                         .storage
                         .root_textlike_ref(value)
@@ -31327,6 +31532,8 @@ impl GenericScheduledRuntime {
         {
             return Some(list.clone());
         }
+        self.ensure_root_current(path, RuntimeRootCurrentnessReason::ProjectionStorage)
+            .ok()?;
         if let Some(value) = self.generic_derived_state.root_value_cache.get(path) {
             match value {
                 BoonValue::ListRef(list) | BoonValue::ListSelection { list, .. } => {
@@ -38202,6 +38409,7 @@ struct GenericDerivedState {
         BTreeMap<String, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
     numeric_stability_guards_by_field:
         BTreeMap<GenericDerivedKey, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
+    deferred_dirty_roots: BTreeSet<String>,
     profile_candidate_defer_probe_active: Cell<bool>,
     profile_candidate_defer_probe: RefCell<BTreeMap<String, RuntimeCandidateDeferProbeAccumulator>>,
     profile_candidate_defer_read_context: Cell<RuntimeCandidateDeferReadContext>,
@@ -38430,6 +38638,24 @@ impl RuntimeCandidateDeferReadKind {
             Self::RootDerivedBoonValue => "root_derived_boon_value",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRootCurrentnessReason {
+    Evaluator,
+    RuntimeScalarJson,
+    RuntimeScalarBoonValue,
+    StructuredRootChild,
+    RootDerived,
+    RuntimeValueSummary,
+    DocumentSummary,
+    ProjectionSelector,
+    ProjectionStorage,
+    FunctionCacheHit,
+    RootListViewFieldCacheHit,
+    RootListMapOutputCacheHit,
+    NumericGuard,
+    SourceRouteScalarRead,
 }
 
 fn candidate_defer_name_hint(root_path: &str, tokens: &[&str]) -> bool {
@@ -41687,6 +41913,24 @@ impl GenericDerivedState {
     fn clear_value_caches(&mut self) {
         self.root_value_cache.clear();
         self.function_value_cache.clear();
+    }
+
+    fn has_deferred_dirty_roots(&self) -> bool {
+        !self.deferred_dirty_roots.is_empty()
+    }
+
+    fn deferred_dirty_root_contains(&self, path: &str) -> bool {
+        self.deferred_dirty_roots.contains(path)
+    }
+
+    fn insert_deferred_dirty_root(&mut self, path: String) {
+        self.root_value_cache.remove(&path);
+        self.remove_root_numeric_stability_guards(&path);
+        self.deferred_dirty_roots.insert(path);
+    }
+
+    fn remove_deferred_dirty_root(&mut self, path: &str) -> bool {
+        self.deferred_dirty_roots.remove(path)
     }
 
     fn clear_candidate_defer_probe(&self) {

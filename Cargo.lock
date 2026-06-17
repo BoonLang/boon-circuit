@@ -684,10 +684,12 @@ name = "boon_runtime"
 version = "0.1.0"
 dependencies = [
  "bitvec",
+ "boon_bridge",
  "boon_ir",
  "boon_parser",
  "boon_report_schema",
  "boon_typecheck",
+ "bytes",
  "serde",
  "serde_json",
  "smallvec",

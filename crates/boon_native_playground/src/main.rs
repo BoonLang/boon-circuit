@@ -2072,11 +2072,27 @@ struct RuntimeDirtyRootWorkCounters {
 }
 
 #[derive(Clone, Debug, Default)]
+struct RuntimeCandidateDeferProbeCounters {
+    simulated_defer_enqueue_count: usize,
+    materialization_count: usize,
+    changed_materialization_count: usize,
+    unchanged_materialization_count: usize,
+    demand_read_count: usize,
+    runtime_scalar_read_count: usize,
+    eval_scalar_read_count: usize,
+    state_summary_scalar_read_count: usize,
+    document_state_summary_scalar_read_count: usize,
+    runtime_value_summary_scalar_read_count: usize,
+    derived_read_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
 struct RuntimeDirtyFrontierCauseAggregate {
     interaction_sample_count: usize,
     demand_classifications: BTreeMap<String, RuntimeDirtyFrontierCauseCounters>,
     frontier: BTreeMap<RuntimeDirtyFrontierCauseKey, RuntimeDirtyFrontierCauseCounters>,
     root_work: BTreeMap<String, RuntimeDirtyRootWorkCounters>,
+    candidate_defer_probe: BTreeMap<String, RuntimeCandidateDeferProbeCounters>,
 }
 
 impl RuntimeDirtyFrontierCauseAggregate {
@@ -2196,6 +2212,48 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 .saturating_add(work_sample.changed_read_count);
             counters.materialization_ms += work_sample.materialization_ms;
         }
+        for probe_sample in &sample
+            .runtime_step_profile
+            .source_action_root_candidate_defer_probe_samples
+        {
+            let counters = self
+                .candidate_defer_probe
+                .entry(probe_sample.root_path.clone())
+                .or_default();
+            counters.simulated_defer_enqueue_count = counters
+                .simulated_defer_enqueue_count
+                .saturating_add(probe_sample.simulated_defer_enqueue_count);
+            counters.materialization_count = counters
+                .materialization_count
+                .saturating_add(probe_sample.materialization_count);
+            counters.changed_materialization_count = counters
+                .changed_materialization_count
+                .saturating_add(probe_sample.changed_materialization_count);
+            counters.unchanged_materialization_count = counters
+                .unchanged_materialization_count
+                .saturating_add(probe_sample.unchanged_materialization_count);
+            counters.demand_read_count = counters
+                .demand_read_count
+                .saturating_add(probe_sample.demand_read_count);
+            counters.runtime_scalar_read_count = counters
+                .runtime_scalar_read_count
+                .saturating_add(probe_sample.runtime_scalar_read_count);
+            counters.eval_scalar_read_count = counters
+                .eval_scalar_read_count
+                .saturating_add(probe_sample.eval_scalar_read_count);
+            counters.state_summary_scalar_read_count = counters
+                .state_summary_scalar_read_count
+                .saturating_add(probe_sample.state_summary_scalar_read_count);
+            counters.document_state_summary_scalar_read_count = counters
+                .document_state_summary_scalar_read_count
+                .saturating_add(probe_sample.document_state_summary_scalar_read_count);
+            counters.runtime_value_summary_scalar_read_count = counters
+                .runtime_value_summary_scalar_read_count
+                .saturating_add(probe_sample.runtime_value_summary_scalar_read_count);
+            counters.derived_read_count = counters
+                .derived_read_count
+                .saturating_add(probe_sample.derived_read_count);
+        }
     }
 
     fn to_report(&self) -> serde_json::Value {
@@ -2296,6 +2354,78 @@ impl RuntimeDirtyFrontierCauseAggregate {
         });
         root_work.truncate(32);
 
+        let mut candidate_defer_top_roots = self
+            .candidate_defer_probe
+            .iter()
+            .map(|(root_path, counters)| {
+                json!({
+                    "root_path": root_path,
+                    "simulated_defer_enqueue_count": counters.simulated_defer_enqueue_count,
+                    "materialization_count": counters.materialization_count,
+                    "changed_materialization_count": counters.changed_materialization_count,
+                    "unchanged_materialization_count": counters.unchanged_materialization_count,
+                    "demand_read_count": counters.demand_read_count,
+                    "runtime_scalar_read_count": counters.runtime_scalar_read_count,
+                    "eval_scalar_read_count": counters.eval_scalar_read_count,
+                    "state_summary_scalar_read_count": counters.state_summary_scalar_read_count,
+                    "document_state_summary_scalar_read_count": counters.document_state_summary_scalar_read_count,
+                    "runtime_value_summary_scalar_read_count": counters.runtime_value_summary_scalar_read_count,
+                    "derived_read_count": counters.derived_read_count
+                })
+            })
+            .collect::<Vec<_>>();
+        candidate_defer_top_roots.sort_by(|left, right| {
+            json_u64_for_sort(right, "simulated_defer_enqueue_count")
+                .cmp(&json_u64_for_sort(left, "simulated_defer_enqueue_count"))
+                .then_with(|| {
+                    json_u64_for_sort(right, "demand_read_count")
+                        .cmp(&json_u64_for_sort(left, "demand_read_count"))
+                })
+                .then_with(|| {
+                    json_str_for_sort(left, "root_path").cmp(json_str_for_sort(right, "root_path"))
+                })
+        });
+        candidate_defer_top_roots.truncate(32);
+        let candidate_defer_totals = self.candidate_defer_probe.values().fold(
+            RuntimeCandidateDeferProbeCounters::default(),
+            |mut totals, counters| {
+                totals.simulated_defer_enqueue_count = totals
+                    .simulated_defer_enqueue_count
+                    .saturating_add(counters.simulated_defer_enqueue_count);
+                totals.materialization_count = totals
+                    .materialization_count
+                    .saturating_add(counters.materialization_count);
+                totals.changed_materialization_count = totals
+                    .changed_materialization_count
+                    .saturating_add(counters.changed_materialization_count);
+                totals.unchanged_materialization_count = totals
+                    .unchanged_materialization_count
+                    .saturating_add(counters.unchanged_materialization_count);
+                totals.demand_read_count = totals
+                    .demand_read_count
+                    .saturating_add(counters.demand_read_count);
+                totals.runtime_scalar_read_count = totals
+                    .runtime_scalar_read_count
+                    .saturating_add(counters.runtime_scalar_read_count);
+                totals.eval_scalar_read_count = totals
+                    .eval_scalar_read_count
+                    .saturating_add(counters.eval_scalar_read_count);
+                totals.state_summary_scalar_read_count = totals
+                    .state_summary_scalar_read_count
+                    .saturating_add(counters.state_summary_scalar_read_count);
+                totals.document_state_summary_scalar_read_count = totals
+                    .document_state_summary_scalar_read_count
+                    .saturating_add(counters.document_state_summary_scalar_read_count);
+                totals.runtime_value_summary_scalar_read_count = totals
+                    .runtime_value_summary_scalar_read_count
+                    .saturating_add(counters.runtime_value_summary_scalar_read_count);
+                totals.derived_read_count = totals
+                    .derived_read_count
+                    .saturating_add(counters.derived_read_count);
+                totals
+            },
+        );
+
         json!({
             "cause": if self.frontier.is_empty() && self.root_work.is_empty() {
                 "no_dirty_frontier_samples"
@@ -2306,7 +2436,23 @@ impl RuntimeDirtyFrontierCauseAggregate {
             "demand_classification_count_scope": "all_dirty_frontier_edges_exact",
             "demand_classification_counts": demand_classification_counts,
             "top_frontier_edges": frontier,
-            "top_root_work": root_work
+            "top_root_work": root_work,
+            "candidate_defer_probe": {
+                "scope": "no_behavior_change_simulated_suppression_for_candidate_unobserved_source_free_pure",
+                "root_count": self.candidate_defer_probe.len(),
+                "simulated_defer_enqueue_count": candidate_defer_totals.simulated_defer_enqueue_count,
+                "materialization_count": candidate_defer_totals.materialization_count,
+                "changed_materialization_count": candidate_defer_totals.changed_materialization_count,
+                "unchanged_materialization_count": candidate_defer_totals.unchanged_materialization_count,
+                "demand_read_count": candidate_defer_totals.demand_read_count,
+                "runtime_scalar_read_count": candidate_defer_totals.runtime_scalar_read_count,
+                "eval_scalar_read_count": candidate_defer_totals.eval_scalar_read_count,
+                "state_summary_scalar_read_count": candidate_defer_totals.state_summary_scalar_read_count,
+                "document_state_summary_scalar_read_count": candidate_defer_totals.document_state_summary_scalar_read_count,
+                "runtime_value_summary_scalar_read_count": candidate_defer_totals.runtime_value_summary_scalar_read_count,
+                "derived_read_count": candidate_defer_totals.derived_read_count,
+                "top_roots": candidate_defer_top_roots
+            }
         })
     }
 }
@@ -2852,6 +2998,54 @@ fn interaction_timing_scope_runtime_step_profile_summary_json(
     counter!(
         "source_action_root_dependent_enqueue_count",
         source_action_root_dependent_enqueue_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_root_count",
+        source_action_root_candidate_defer_root_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_enqueue_count",
+        source_action_root_candidate_defer_enqueue_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_materialization_count",
+        source_action_root_candidate_defer_materialization_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_changed_materialization_count",
+        source_action_root_candidate_defer_changed_materialization_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_unchanged_materialization_count",
+        source_action_root_candidate_defer_unchanged_materialization_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_demand_read_count",
+        source_action_root_candidate_defer_demand_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_runtime_scalar_read_count",
+        source_action_root_candidate_defer_runtime_scalar_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_eval_scalar_read_count",
+        source_action_root_candidate_defer_eval_scalar_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_state_summary_scalar_read_count",
+        source_action_root_candidate_defer_state_summary_scalar_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_document_state_summary_scalar_read_count",
+        source_action_root_candidate_defer_document_state_summary_scalar_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_runtime_value_summary_scalar_read_count",
+        source_action_root_candidate_defer_runtime_value_summary_scalar_read_count
+    );
+    counter!(
+        "source_action_root_candidate_defer_derived_read_count",
+        source_action_root_candidate_defer_derived_read_count
     );
     latency!("source_action_route_stats", source_action_route_stats_ms);
     report.insert(
@@ -32474,6 +32668,8 @@ fn preview_apply_live_events_internal(
             runtime_state_summary_ms += elapsed_ms(summary_started);
             summary
         });
+        runtime.refresh_candidate_defer_probe_profile(&mut runtime_step_profile);
+        runtime.clear_candidate_defer_probe();
         runtime_apply_ms = elapsed_ms(runtime_apply_started);
         (state_summary, event_count, changed)
     };

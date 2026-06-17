@@ -98,6 +98,15 @@ Status values:
 - `done`: acceptance and verification completed.
 - `dropped`: intentionally not pursued, with reason recorded.
 - `superseded`: replaced by another task ID.
+- `postponed`: intentionally paused by user direction, experiment cap, or
+  explicit kill criteria. Do not pick it in the task selection algorithm until
+  a later user request or checklist update unpostpones it.
+
+Template placeholders:
+
+- `TASK-0000` and `EXP-0000` inside the schema examples are documentation
+  templates, not executable work items. Ignore those placeholders when counting
+  real pending work.
 
 ## Task Schema
 
@@ -2484,7 +2493,7 @@ Notes:
   recomputing/applying full hover/layout proof work after every cursor move.
 
 ### TASK-0804A Source-Action Root Flush Architecture Pass
-Status: in_progress
+Status: postponed
 Type: implementation
 Priority: P1
 Depends on: TASK-0502A, TASK-0804
@@ -2651,6 +2660,162 @@ Notes:
   `in_progress`; next work should attack the remaining `selected_signal_lane_rows`
   `diff_ms`/field-loop cost or dirty-scheduler fanout with a compiled
   row/field frontier.
+- 2026-06-17 TASK-0804A root-demand refresh and killed row-clean-cache
+  experiment: rechecked the checklist state and confirmed TASK-0804A is the
+  last real unfinished item, excluding template placeholders `TASK-0000` and
+  `EXP-0000`. The refreshed canonical speed report still fails only the strict
+  click/input p95 budgets by a narrow margin:
+  `click_to_cursor_p95=17.111ms`, `input_to_visible_p95=17.111ms`,
+  `runtime_apply_p95=10.356ms`, `runtime_step_apply_p95=8.363ms`, and
+  `layout_rebuild_p95=4.751ms` against the `16.700ms` click/input budget.
+  A diagnostic run with `BOON_PROFILE_ROOT_DEMAND=1` identified the cause as
+  `dirty_frontier_fanout_with_ranked_root_work`, not renderer upload. The
+  largest demand bucket was `candidate_unobserved_source_free_pure`
+  (`dependency_lookup_count=3568`, `dependent_visit_count=3568`,
+  `dependent_enqueue_count=576`), followed by observed/list-view blockers.
+  Top repeated frontier edges route cursor changes into
+  `store.selected_signal_lane_rows`, `store.selected_cursor_pair_rows`, and
+  cursor bridge roots. Top root work was
+  `store.selected_signal_lane_rows` (`pop_count=32`,
+  `materialization_ms=17.121`, `changed_read_count=200`) and
+  `store.selected_cursor_pair_rows` (`pop_count=32`, `skip_count=8`,
+  `materialization_ms=8.088`). The row-list profiles show the remaining
+  engine cause: `selected_signal_lane_rows` still pays
+  `eval_ms=14.688`, `diff_ms=13.555`, and
+  `user_function_body_ms=11.003` while touching `4768` cached fields and
+  `160` evaluated fields; `selected_cursor_pair_rows` still pays
+  `eval_ms=8.803`, `diff_ms=8.382`, and `96` evaluated fields. Two read-only
+  subagent audits agreed the likely next useful slices are either a compiled
+  root-list row/field frontier before active projection or a more explicit
+  dependency-frontier audit; they warned against another broad readiness-set
+  heuristic. A generic direct-projector row-clean cache experiment was then
+  implemented and verified locally (`cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib`, `222 passed`), but the official speed
+  gate regressed and was killed: `click_to_cursor_p95` and
+  `input_to_visible_p95` worsened to `17.880ms`,
+  `runtime_apply_p95=10.708ms`, `runtime_step_apply_p95=8.761ms`, and
+  `selected_signal_lane_rows.eval_ms=17.330`. The code was reverted rather
+  than stacked. After reverting, the canonical report was rerun so
+  `target/reports/native-gpu/novywave-interaction-speed.json` again reflects
+  the current code; that run is noisy but still shows the same shape:
+  `click_to_cursor_p95=19.407ms`, `input_to_visible_p95=19.407ms`,
+  `runtime_apply_p95=11.629ms`, `runtime_step_apply_p95=9.329ms`,
+  `layout_rebuild_p95=5.058ms`,
+  `selected_signal_lane_rows.eval_ms=16.763`, and
+  `selected_signal_lane_rows.diff_ms=15.303`. TASK-0804A remains
+  `in_progress`; the next attempt should avoid speculative row-level cache
+  state and instead measure/attack the real per-field diff/user-function loop
+  and dirty-frontier fanout directly.
+- 2026-06-17 TASK-0804A deep culprit exploration with subagent loop:
+  reran a separate diagnostic report with `BOON_PROFILE_ROOT_DEMAND=1` at
+  `target/reports/native-gpu/novywave-interaction-speed-root-demand.json` and
+  reconciled it with the current canonical
+  `target/reports/native-gpu/novywave-interaction-speed.json`. The real p95
+  culprit is the `cursor_position` changed class, not renderer upload, report
+  writing, full row rebuilds, or a single huge list allocation. Canonical click
+  samples split into three classes: `26` dependent visits (`8` samples,
+  `8.393ms` average total, `1.988ms` root flush), `28` dependent visits
+  (`8` samples, `13.527ms` average total, `2.580ms` root flush), and `194`
+  dependent visits (`16` samples, `17.039ms` average total, `5.315ms` root
+  flush, `2.445ms` dirty scheduler, `2.717ms` root materialization, and
+  `4.780ms` layout). In the `26`/`28` classes `store.cursor_position` is
+  materialized but unchanged; in the `194` class `store.cursor_position`
+  changes and opens the bridge/page wave.
+- The exact trigger path is
+  `selected_timeline_cursor_value -> cursor_position ->
+  bridge_request_descriptor_label`, followed by
+  `bridge_request_fingerprint`, `bridge_request_input_digest`,
+  `bridge_request_structural_key`, response status, bridge page refs/pages,
+  `bridge_cursor_values`, `selected_lane_materialization`, and both selected
+  row list views. Diagnostic slow-class root work ranked the largest concrete
+  work as `store.selected_signal_lane_rows` (`9.008ms` / `16` slow samples),
+  `store.selected_cursor_pair_rows` (`5.501ms` / `16`), then pure bridge/page
+  roots such as `store.bridge_request_descriptor` (`2.803ms` / `32`) and
+  `store.bridge_cursor_values_page_ref` (`2.488ms` / `48`). The current
+  field-only list-view path is active: `full_eval_row_count=0` and
+  `row_materialize_ms=0`; remaining list cost is repeated field-only
+  projection/diff/cache-key/user-function work. In the canonical slow class,
+  `selected_signal_lane_rows` totals `19.164ms` across `32` materialization
+  samples with `2720` field-cache hits and `96` misses, while
+  `selected_cursor_pair_rows` totals `7.991ms` with
+  `RUN/selected_cursor_pair_row:label` missing `64` times.
+- Subagent loop result: explorers `019ed29c-bd25-7ee1-84a2-b6839b969e35` and
+  `019ed29d-3fae-7aa2-9770-f78a10e065a7` converged after a second round. The
+  first implementation target should be a generic compiled demand/currentness
+  frontier before enqueue for safe `candidate_unobserved_source_free_pure`
+  bridge/page roots, with explicit barriers for observed roots, semantic
+  deltas, evaluator reads, summaries, assertions, and observed projections.
+  Do not start by adding another row cache or inside-loop prefilter: earlier
+  row-clean and field-prefilter experiments moved or worsened cost without
+  changing the `194`-visit graph shape. Also do not treat scalar no-change
+  gating as the primary fix: current evidence shows unchanged `cursor_position`
+  samples are already the fast classes; the slow class is a real value change
+  and needs demand/frontier narrowing, not false-positive suppression alone.
+  The second target is the root-list field-only loop for the two selected row
+  lists, but only after or alongside graph-shape work. Kill the next slice if
+  `visits=194`, `dependent_enqueue_count=32`, `dirty_pop_count=38`, or final
+  click/input p95 do not move meaningfully.
+
+### TASK-0804B Bridge/Page Identity And Demand Frontier Resumption
+Status: postponed
+Type: implementation
+Priority: P1
+Depends on: TASK-0804, TASK-1001, TASK-1002
+Source plans: 09, 10, 11, 13, 14, 15, 16, 17, 18, 19
+Likely areas: `crates/boon_runtime/src/lib.rs`, `crates/boon_native_playground/src/main.rs`, `crates/xtask/src/main.rs`, NovyWave bridge/page runtime integration
+Goal:
+Resume the unfinished NovyWave root-flush speed work with a narrower,
+architecture-level target after the capped TASK-0804A loops. Split stable
+bridge/page identity from cursor-hot telemetry or compile an explicit
+demand/currentness frontier so cursor movement does not enqueue and materialize
+the same broad bridge/page/list roots on every click.
+Acceptance:
+- A fresh baseline report identifies the current slow-click graph shape before
+  code changes, including click/input p95, `source_action_root_flush`,
+  `source_action_root_dirty_scheduler`, `source_action_root_materialization`,
+  `source_action_root_dependent_visit_count`,
+  `source_action_root_dependent_enqueue_count`,
+  `source_action_root_dirty_pop_count`, and root-list by-list counters.
+- The implementation is generic engine/bridge/runtime infrastructure, not a
+  NovyWave row/file-name/fixture shortcut and not new Boon syntax.
+- Bridge/page request identity remains deterministic across replay and stale
+  response rejection still works.
+- Cursor-hot telemetry can update without changing stable page/blob/request
+  identities unless the real bridge/file/page input changed.
+- The kept slice reduces the `194/32/38` slow-click class, lowers final
+  click/input p95 below the strict budget, or materially lowers one of
+  `source_action_root_flush`, `source_action_root_dirty_scheduler`,
+  `source_action_root_materialization`, `selected_signal_lane_rows.eval_ms`,
+  `selected_signal_lane_rows.diff_ms`, or
+  `selected_cursor_pair_rows.user_function_body_ms`.
+- Renderer upload remains solved: post-interaction upload stays near the
+  retained path (`3360` bytes in the latest report), staging wraps stay zero,
+  and quad-cache evictions stay zero.
+Verification:
+- `cargo test -p boon_runtime --lib`
+- `cargo test -p boon_bridge --lib -- --nocapture`
+- `cargo check -p boon_runtime -p boon_bridge -p boon_native_playground -p xtask`
+- `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
+- `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+- `cargo xtask verify-report-schema`
+- `jq` inspection of bridge payload identity, speed p95s, root-flush graph
+  counts, root-list by-list counters, and renderer post-interaction upload.
+Rollback / stop condition:
+- Do not start this task while the user cap on TASK-0804A follow-up debugging
+  remains active. When explicitly resumed, revert any slice that leaves
+  `194/32/38` unchanged, does not reduce a named root-flush/list bucket, or
+  changes public bridge hashes/replay semantics without an explicit schema
+  migration.
+Notes:
+- This is the explicit future task created from the TASK-0804A postponed
+  follow-up. It is not active work under the current cap.
+- Prefer a bridge/page identity split or compiled demand/currentness frontier
+  over more field-only loop microchanges, row caches, container swaps, JSON vs
+  binary report rewrites, or renderer upload tweaks.
+- TASK-1001 and TASK-1002 are prerequisites because the future slice should
+  build on real BYTES sidecars and current LIST row-index/selection storage
+  modes instead of re-solving payload/list representation.
 
 ## Phase 9: Low-Level Rust Experiments
 
@@ -2951,6 +3116,83 @@ Notes:
   `const_text` micro-ops against `ScalarEquationPlan` and reports fallback,
   deopt, op histogram, and warm-path allocation metadata. Broader expression
   families must extend the same proof report instead of silently falling back.
+
+### TASK-1001 Runtime BYTES Value And Bridge/File Payload Boundary
+Status: done
+Type: implementation
+Priority: P1
+Depends on: TASK-0902
+Source plans: 14, 15, 18, 19
+Likely areas: `crates/boon_runtime/src/lib.rs`, `crates/boon_bridge/src/lib.rs`, NovyWave bridge/runtime integration
+Goal:
+Add an engine-internal BYTES representation that can be inferred from bridge
+and file/payload contracts without adding Boon syntax. Use it first where
+binary payloads already exist or are unavoidable, and keep public summaries and
+diagnostics stable by exposing digests/refs rather than inline large byte
+arrays.
+Acceptance:
+- Runtime value/storage layers can carry shared byte payloads or byte refs
+  without treating them as UTF-8 `TEXT` or generic JSON arrays.
+- Bridge/file payload paths can construct and validate byte values from Rust
+  contracts without new Boon syntax or manual annotations in examples.
+- Public JSON reports, scenario fixtures, and bridge canonical hashes remain
+  compatible unless an explicit schema migration is recorded.
+- NovyWave integration uses BYTES only for real binary/file/page/blob payloads,
+  not labels, filenames, statuses, formulas, or scenario text.
+- Tests prove byte payload equality, digest/ref stability, serde/report
+  compatibility, and deterministic replay behavior for the first integrated
+  boundary.
+Verification:
+- `cargo test -p boon_bridge --lib -- --nocapture`
+- `cargo test -p boon_runtime --lib bytes -- --nocapture`
+- `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`
+- `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
+- `cargo xtask verify-report-schema`
+Rollback / stop condition:
+- Stop or revert if bytes require unsafe ownership shortcuts, leak into Boon
+  syntax before the upstream design is integrated, change public bridge hashes
+  silently, or make scenario replay nondeterministic.
+Notes:
+- This task starts after postponing TASK-0804A. It is not expected to solve the
+  current cursor-click p95 by itself; it is representation groundwork for real
+  waveform/file/page payload movement.
+
+### TASK-1002 LIST Storage Mode And Incremental Representation Slice
+Status: done
+Type: implementation
+Priority: P1
+Depends on: TASK-0902
+Source plans: 14, 15, 18, 19
+Likely areas: `crates/boon_ir/src/lib.rs`, `crates/boon_runtime/src/lib.rs`, NovyWave list-view paths
+Goal:
+Promote the existing LIST representation classifier into one safe internal
+storage-mode optimization, with generic `LIST` semantics preserved as the
+oracle. Start with constant arrays, dense vectors, selection views, or
+incremental projections only where compiler/runtime usage proves the mode is
+safe.
+Acceptance:
+- The chosen storage mode is inferred by compiler/runtime facts, not user
+  annotations or example-specific branches.
+- Generic LIST execution remains available as the equivalence oracle.
+- Focused tests prove `List/map`, `List/filter_field_equal`, `List/retain`,
+  `List/join_field`, and root list-view materialization produce identical
+  values for the covered mode.
+- NovyWave reports show either neutral correctness-only behavior or a measured
+  improvement in list/root-view buckets such as `eval_ms`, `diff_ms`,
+  `user_function_body_ms`, field-cache misses, or root-flush fanout.
+Verification:
+- `cargo test -p boon_ir --lib representation -- --nocapture`
+- `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`
+- `cargo test -p boon_runtime --lib list_ -- --nocapture`
+- `cargo check -p boon_ir -p boon_runtime -p boon_native_playground -p xtask`
+- `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+Rollback / stop condition:
+- Stop or revert if the storage mode requires NovyWave-specific code, hides a
+  dynamic dependency, changes row identity semantics, or improves only a
+  microbenchmark while regressing the official speed gate.
+Notes:
+- Do not retry killed row-output cache, dense read-ID sidecar, or one-off
+  container swaps unless new counters prove the same bottleneck has changed.
 
 ## Progress Log
 
@@ -5331,6 +5573,1412 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   change. Inserts, removes, moves, selector predicates, and general list
   projections still need fallback handling and report evidence before this can
   replace normal runtime paths.
+
+### 2026-06-17 TASK-0804A Resume After Other Tasks Completed
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`; temporary
+  row-clean cache code in `crates/boon_runtime/src/lib.rs` was reverted before
+  this log entry.
+- Verification: `rg -n "^(### (TASK|EXP)-|Status:|Depends:)" docs/plans/speedup/12-speedup-goal-execution-checklist.md`;
+  read-only root-list/materialization audits from subagents
+  `019ed282-9431-7030-a2ce-2f43eef08aaa` and
+  `019ed282-7fb2-7112-8527-ef7991abaabe`; canonical
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  diagnostic `BOON_PROFILE_ROOT_DEMAND=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-root-demand.json`;
+  during the reverted experiment `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib` passed with `222` tests; canonical speed
+  rejected the experiment; after revert canonical speed was rerun so
+  `target/reports/native-gpu/novywave-interaction-speed.json` again matches
+  current code; `git diff --check -- docs/plans/speedup/12-speedup-goal-execution-checklist.md crates/boon_runtime/src/lib.rs`.
+- Result: TASK-0804A is confirmed as the only real unfinished checklist item
+  after ignoring template placeholders `TASK-0000` and `EXP-0000`. The earlier
+  instruction to skip 0804A until other tasks were done is now satisfied; the
+  later EXP/TASK work after the pause point is done. A generic direct-projector
+  row-clean cache experiment was killed and reverted because it passed focused
+  runtime tests but worsened the official speed gate. No runtime code from that
+  experiment remains.
+- Current cause: the restored current-code report still fails the strict
+  `16.700ms` click/input budget with `click_to_cursor.p95=19.407ms`,
+  `input_to_visible.p95=19.407ms`, `runtime_apply.p95=11.629ms`,
+  `runtime_step_apply.p95=9.329ms`, and `layout_rebuild.p95=5.058ms`.
+  Hot root-list work remains `selected_signal_lane_rows`
+  (`eval_ms=16.763`, `diff_ms=15.303`, `field_cache_hits=4768`,
+  `field_cache_misses=160`) and `selected_cursor_pair_rows`
+  (`eval_ms=9.818`, `diff_ms=9.304`, `field_cache_misses=96`). The
+  env-gated root-demand diagnostic identifies the architecture cause as
+  `dirty_frontier_fanout_with_ranked_root_work`, with cursor changes fanning
+  into bridge roots plus the two selected-row list views. Next work should
+  measure and attack per-field diff/user-function loop cost or the dirty
+  frontier graph directly, not add speculative row-level cache state.
+
+### 2026-06-17 TASK-0804A Deep Culprit Exploration
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md` only.
+- Verification: second-round read-only audits from subagents
+  `019ed29c-bd25-7ee1-84a2-b6839b969e35` and
+  `019ed29d-3fae-7aa2-9770-f78a10e065a7`, followed by a fresh subagent loop
+  with `019ed2aa-dbf2-7dc2-b61a-5deb53db1070` and
+  `019ed2aa-f20b-7011-86fa-6b43cd79ff45`; diagnostic
+  `BOON_PROFILE_ROOT_DEMAND=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-root-demand-current.json`
+  failed the known strict latency budgets while exposing ranked frontier/root
+  work; `jq` grouping of canonical and diagnostic click samples by
+  `runtime_step_profile.source_action_root_dependent_visit_count`; `jq` root
+  work, list-view field profile, demand-classification, and top frontier-edge
+  inspection; code inspection of
+  `materialize_root_derived_field_commits_for_changed_reads`,
+  `root_field_waits_on_dirty_root`, `eval_identifier`, `eval_path`,
+  `root_derived_boon_value`, and `root_derived_summary_values`; source
+  inspection of cursor and bridge definitions in `examples/novywave/RUN.bn`.
+- Result: culprit identified, no runtime code changed. The p95 slow path is the
+  `cursor_position` changed class: half of clicks move from the `26`/`28`
+  dependent-visit classes into the `194` dependent-visit class when
+  `store.cursor_position` changes. That real value change fans out through
+  `bridge_request_descriptor_label`, bridge request fingerprint/input/structural
+  roots, page refs/pages, `bridge_cursor_values`,
+  `selected_lane_materialization`, and the two selected-row list views. The
+  current canonical report still fails the strict `16.700ms` click/input budget
+  with `click_to_cursor.p95=19.407ms`,
+  `input_to_visible.p95=19.407ms`, `runtime_apply.p95=11.629ms`,
+  `runtime_step_apply.p95=9.329ms`, and `layout_rebuild.p95=5.058ms`. Renderer
+  upload is not the culprit, and current list-view evidence shows field-only
+  patching, not full row materialization.
+- Demand-classification evidence: in a representative slow click, frontier
+  visits are dominated by `candidate_unobserved_source_free_pure`
+  (`193` visits and `29` enqueues in the sample) versus
+  `blocked_observed_downstream` (`18` visits, `5` enqueues),
+  `blocked_observed_root` (`9` visits, `3` enqueues), and
+  `blocked_list_view` (`34` visits, `2` enqueues). Across the `16` slow
+  samples, candidate pure roots account for `448` dirty pops and
+  `17.628ms` materialization time; non-candidate roots account for `160` pops
+  and `16.680ms`. The heaviest repeated candidate roots are
+  `store.bridge_request_descriptor` (`32` pops / `2.741ms`, twice per slow
+  click) and `store.bridge_cursor_values_page_ref`
+  (`48` pops / `2.422ms`, three times per slow click). The heaviest blocked
+  roots remain the field-only list views:
+  `store.selected_signal_lane_rows` (`16` slow-sample pops / `8.872ms`) and
+  `store.selected_cursor_pair_rows` (`16` pops / `5.386ms`).
+- Source/evaluator evidence: `cursor_position` is derived from
+  `selected_timeline_cursor_value`; bridge descriptor/page roots are internal
+  pure records/digests, but some candidate roots such as
+  `store.bridge_cursor_values_page_ref` are still read while evaluating
+  rendered lane-row `page_refs`. Therefore "not observed" does not mean "not
+  needed"; it means the root should not have to eagerly publish a semantic-only
+  delta or standalone render patch. The current evaluator order is a correctness
+  hazard for naive deferral: `eval_identifier`, `eval_path`, and
+  `runtime_path_summary` consult stored root scalars before derived-root
+  recomputation in several branches, while `root_derived_boon_value` is the
+  cache-refreshing on-demand evaluator. Any demand/currentness implementation
+  must remove or mark stale deferred pure-root storage/cache entries, or make
+  evaluator/summary reads prefer `root_derived_boon_value` for deferred pure
+  roots, otherwise a skipped internal root could be read stale.
+- Killed follow-up: the smaller generic scheduler-ordering slice from subagent
+  `019ed2aa-f20b-7011-86fa-6b43cd79ff45` was tried and reverted. It made dirty
+  readiness transitive through `root_reads_by_field`, added a ready-frontier
+  rebuild, then tightened that to targeted transitive affected-root refresh
+  after a read-only audit from subagent `019ed2b8-4ca8-7a41-9466-6c7df0a0cae8`
+  found RootChild and self-cycle correctness gaps. Focused correctness tests
+  passed, but the official speed gate rejected the slice. The naive rebuild
+  version reduced the slow class only from `194/32/38` to `189/29/35` while
+  exploding `source_action_root_dirty_scheduler.p95` to `26.064ms` and
+  `click_to_cursor.p95`/`input_to_visible.p95` to `42.410ms`. The targeted
+  refresh version kept the same `189/29/35` counts but still worsened
+  `click_to_cursor.p95`/`input_to_visible.p95` to `24.466ms`,
+  `runtime_apply.p95` to `17.295ms`, `source_action_root_flush.p95` to
+  `11.372ms`, and `source_action_root_dirty_scheduler.p95` to `8.819ms`. The
+  runtime code was reverted; only this checklist remains changed.
+- Verification for the killed scheduler-ordering slice: subagent audits
+  `019ed2aa-f20b-7011-86fa-6b43cd79ff45`,
+  `019ed2aa-dbf2-7dc2-b61a-5deb53db1070`, and
+  `019ed2b8-4ca8-7a41-9466-6c7df0a0cae8`; during the reverted experiment
+  `cargo fmt -p boon_runtime`; `cargo test -p boon_runtime --lib
+  root_dirty_readiness_ -- --nocapture`; `cargo test -p boon_runtime --lib
+  root_derived_ -- --nocapture`; `cargo test -p boon_runtime --lib
+  structured_root_ -- --nocapture`; `cargo test -p boon_runtime --lib
+  root_read_key_aliases_match_store_local_without_nested_leaf_collision
+  -- --nocapture`; `cargo test -p boon_runtime --lib
+  novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them
+  -- --nocapture`; `cargo test -p boon_runtime --lib
+  novywave_bridge_cursor_rows_alias_tracks_list_identity_not_row_content
+  -- --nocapture`; `cargo check -p boon_runtime`; two rejected speed gates with
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json`; after revert
+  `git diff -- crates/boon_runtime/src/lib.rs` was empty and the canonical speed
+  gate was rerun so the report again matches current code.
+- Additional live subagent loop: after the scheduler-ordering experiment was
+  killed, three more read-only subagents audited the current code and reports:
+  `019ed2c9-2b31-7a83-ace2-3663e634c505` for runtime/root scheduling,
+  `019ed2c9-2d94-7b42-9b5f-1c00c33f815c` for layout/renderer/verifier
+  evidence, and `019ed2c9-2ec3-79a2-bee8-cd0355159b29` for the NovyWave Boon
+  source shape. Their consensus matches the live measurements: the current
+  gate is dominated by eager root-currentness fanout for source-free pure
+  bridge/page/status roots, feeding a still-expensive field-only list-view
+  path. The culprit is not full row materialization, not hardcoded fixture rows,
+  and not a renderer upload bottleneck in this gate.
+- Live root-demand diagnostic:
+  `BOON_PROFILE_ROOT_DEMAND=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-root-demand-live.json`
+  failed the known strict latency budgets with diagnostic overhead
+  (`click_to_cursor.p95=18.972ms`, `runtime_apply.p95=12.310ms`), but
+  reproduced the same graph shape. In the slow-click half, the `194` dependent
+  visits / `32` enqueues / `38` dirty pops class averaged `17.135ms` total,
+  `11.758ms` runtime apply, `6.478ms` root flush, `3.721ms` dirty scheduler,
+  and `2.143ms` root materialization. Its frontier classifications were:
+  `candidate_unobserved_source_free_pure=3088` visits / `464` enqueues,
+  `blocked_list_view=544` visits / `32` enqueues,
+  `blocked_observed_downstream=288` visits / `80` enqueues, and
+  `blocked_observed_root=144` visits / `48` enqueues. Top slow-click root work
+  was `store.selected_signal_lane_rows` (`16` pops / `8.843ms`),
+  `store.selected_cursor_pair_rows` (`16` pops / `5.439ms`),
+  `store.bridge_request_descriptor` (`32` pops / `2.711ms`), and
+  `store.bridge_cursor_values_page_ref` (`48` pops / `2.397ms`).
+- Current post-diagnostic canonical report: reran the normal non-demand gate so
+  `target/reports/native-gpu/novywave-interaction-speed.json` and the role
+  artifact match current code again. It still fails only the strict click/input
+  p95 budget with `click_to_cursor.p95=17.359ms`,
+  `input_to_visible.p95=17.359ms`, `runtime_apply.p95=10.376ms`,
+  `runtime_step_apply.p95=8.346ms`, and `layout_rebuild.p95=4.688ms`. The slow
+  click class is still `194` dependent visits, `32` enqueues, and `38` dirty
+  pops; aggregate click root work is `3536` visits, `600` enqueues, and `792`
+  dirty pops. Root-list work remains field-only:
+  `selected_signal_lane_rows.eval_ms=14.756`, `diff_ms=13.633`,
+  `field_cache_hits=4768`, `field_cache_misses=160`,
+  `field_only_evaluated_field_count=160`, `full_eval_row_count=0`, and
+  `row_materialize_ms=0`.
+- Renderer/verifier caveat from subagent review: the current interaction-speed
+  gate measures deterministic app-owned input through runtime/layout/shared
+  update and aliases the click summary as `input_to_visible`; it does not
+  include per-interaction render encode, queue submit, present, or readback
+  timings. The renderer upload probe is a three-sample offscreen counter probe,
+  not a click-by-click render timing oracle. In this gate, renderer evidence is
+  not the culprit (`hot_path_proof_readback_count=0`,
+  `hot_path_heavy_json_summary_count=0`, `preview_blocked_on_ipc_count=0`, and
+  post-interaction upload was small in the probe), but a separate render
+  isolation report should still be added before claiming native-present
+  performance is solved.
+- 2026-06-17 fresh subagent loop and killed invalidated-field-frontier
+  experiment: ran three more read-only subagents on the current code and
+  reports: `019ed2d5-d4f8-7b60-b42b-bf2a504c427f` for runtime dirty-frontier
+  currentness, `019ed2d5-d6a6-7532-b190-f4d6dc7ff41f` for list/materialization
+  evidence, and `019ed2d5-d7d4-7fa3-af98-06fdccce8a4c` for verifier/report
+  semantics. They independently converged on the same cause ranking:
+  root-graph fanout and eager currentness are first, field-only list
+  projection/diff work is second, layout is secondary, and renderer evidence
+  in this gate is only an off-hot-path upload probe. A fresh diagnostic
+  `BOON_PROFILE_ROOT_DEMAND=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-root-demand-live-1781653707.json`
+  failed the known budget with diagnostic overhead
+  (`click_to_cursor.p95=20.511ms`, `runtime_apply.p95=12.779ms`) and preserved
+  the same graph: click frontier classifications were
+  `candidate_unobserved_source_free_pure=3568` visits / `576` enqueues,
+  `blocked_list_view=704` visits / `64` enqueues,
+  `blocked_observed_downstream=304` visits / `96` enqueues, and
+  `blocked_observed_root=240` visits / `80` enqueues. Normal click samples
+  still split into `26/5/11`, `28/6/12`, and `194/32/38` dependent-visit /
+  enqueue / dirty-pop classes; the slow `194/32/38` class averaged
+  `6.660ms` root flush, `10.071ms` runtime step, `4.655ms` layout, and
+  `17.989ms` total in the diagnostic run.
+- Killed experiment: implemented a generic invalidated-field frontier for the
+  root-list field-only path. The patch recorded which root-list field-cache
+  entries were actually removed by dirty-read invalidation, then bulk-skipped
+  provably covered clean record fields during source-action materialization.
+  Focused correctness passed with `cargo fmt -p boon_runtime` and
+  `cargo test -p boon_runtime --lib root_list_view_field_cache_ --
+  --nocapture` (`6` tests passed), but the official speed gate rejected the
+  slice. It did not change the slow `194/32/38` graph class or the aggregate
+  click graph (`3536` visits / `600` enqueues / `792` dirty pops), and the
+  strict p95 still failed (`click_to_cursor.p95=17.485ms`,
+  `input_to_visible.p95=17.485ms`). The runtime patch was reverted; after
+  revert `git diff -- crates/boon_runtime/src/lib.rs` is empty.
+- Restored current-code baseline after the killed experiment: reran
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json` so the official
+  report again matches current code. It still fails only the strict click/input
+  p95 budget with `click_to_cursor.p95=17.558ms`,
+  `input_to_visible.p95=17.558ms`, `runtime_apply.p95=10.286ms`,
+  `runtime_step_apply.p95=8.291ms`, and `layout_rebuild.p95=4.773ms`. The
+  graph class is unchanged (`3536` click dependent visits / `600` enqueues /
+  `792` dirty pops; slow clicks remain `194/32/38`). Root-list profiles still
+  show field-only patching rather than full rows:
+  `selected_signal_lane_rows.eval_ms=14.848`, `diff_ms=13.714`,
+  `field_cache_hits=4768`, `field_cache_misses=160`,
+  `field_only_evaluated_field_count=160`, `full_eval_row_count=0`,
+  `row_materialize_ms=0`; `selected_cursor_pair_rows.eval_ms=8.838` and
+  `diff_ms=8.429` with `96` misses.
+- Next direction: do not try another readiness-set heuristic as the primary
+  fix. Implement a generic demand/currentness frontier before dirty enqueue for
+  safe unobserved source-free pure bridge/page roots, with explicit correctness
+  barriers for observed roots, semantic deltas, evaluator reads, summaries,
+  assertions, observed projections, and row/list-view demand reads. The
+  existing NovyWave internal-root test should preserve "queryable and no render
+  patch" but should not require every internal candidate root to publish an
+  eager semantic delta if demand deferral is active.
+- Kill criteria for the next slice: revert and document if it fails to reduce
+  the `candidate_unobserved_source_free_pure` frontier class, fails to reduce
+  the `194` visits / `32` enqueues / `38` dirty pops slow class, regresses
+  `source_action_root_flush`, `source_action_root_dirty_scheduler`,
+  `source_action_root_materialization`, or click/input p95, or leaves stale
+  summary/evaluator reads for deferred pure roots.
+
+### 2026-06-17 TASK-0804A Real Culprit Loop Addendum
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md` only.
+- Verification: read-only subagent loop with `019ed2eb-c721-7bc3-8ca7-7f7e90a94b69`
+  for runtime scheduler fanout, `019ed2eb-d6cc-7362-a70c-56f841643d22`
+  for NovyWave Boon dependency shape, and
+  `019ed2eb-e599-7e33-9647-1d45c41767bc` for verifier/layout/renderer timing;
+  fresh diagnostic `BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-dirty-frontier-deep-loop.json`
+  failed the known strict latency budget and exposed exact dirty-frontier
+  edges; existing root-demand diagnostic
+  `target/diagnostics/native-gpu/novywave-interaction-speed-root-demand-live-1781653707.json`
+  provided demand classes for the same graph; `jq` grouped click samples by
+  `source_action_root_dependent_visit_count` / enqueue count / dirty-pop count;
+  source inspection covered `examples/novywave/RUN.bn` cursor thresholds,
+  descriptor/page roots, selected-row roots, and lane-row page refs.
+- Corrected measurement interpretation: `3536` visits / `600` enqueues /
+  `792` dirty pops is the aggregate across the 32 click samples, not one click.
+  The real bad per-click class is `194` dependent visits / `32` enqueues /
+  `38` dirty pops. It occurs for 16 of 32 click samples. The other click
+  classes are `28/6/12` for 8 samples and `26/5/11` for 8 samples.
+- Actual trigger: the speed role clicks target times `50`, `100`, `150`, and
+  `200` in a loop. For `simple.vcd`, `cursor_left=0`, `cursor_default=50`,
+  and `cursor_right=150`. The slow `194/32/38` class is the cursor-class
+  crossing work: click `50` moves from `Cursor48` to `Cursor42`, and click
+  `150` moves from `Cursor42` to `Cursor48`. Click `100` stays inside
+  `Cursor42`; click `200` stays inside `Cursor48`.
+- Ranked culprit: the bottleneck is CPU runtime root-scheduler fanout from a
+  real cursor-class change. `selected_timeline_cursor_value` changes
+  `cursor_position`, `cursor_label`, `keyboard_cursor_label`, and
+  `waveform_cursor_offset`; `cursor_position` changes
+  `bridge_request_descriptor_label`; that drives bridge request fingerprint,
+  input digest, structural key, response/status roots, page digests, page refs,
+  bridge pages, `bridge_cursor_values`, `selected_lane_materialization`,
+  `selected_cursor_pair_rows`, and `selected_signal_lane_rows`.
+- Dirty-frontier edge evidence: the fresh dirty-frontier diagnostic ranks the
+  same repeated edges on the click scope. The top edges include
+  `root:selected_timeline_cursor_value -> store.cursor_label`,
+  `root:selected_timeline_cursor_value -> store.cursor_position`,
+  `root:selected_timeline_cursor_value -> store.keyboard_cursor_label`,
+  `root:selected_timeline_cursor_value -> store.waveform_cursor_offset`,
+  `root:selected_timeline_cursor_value -> store.selected_cursor_pair_rows`,
+  `root:selected_timeline_cursor_value -> store.selected_signal_lane_rows`,
+  `root:cursor_label -> store.bridge_request_descriptor`,
+  `root:cursor_label -> store.bridge_cursor_values_page_digest`,
+  `root:keyboard_cursor_label -> store.bridge_cursor_values_label`,
+  `root:bridge_request_descriptor_label -> store.bridge_request_descriptor`,
+  `root:bridge_request_descriptor_label -> store.bridge_request_fingerprint`,
+  `root:bridge_request_descriptor_label -> store.bridge_request_input_digest`,
+  and then the `bridge_request_fingerprint` cascade into bridge file stats,
+  hierarchy/signal/waveform pages, page refs, labels, and digests.
+- Root-work evidence: in the fresh dirty-frontier run, top click root work is
+  `store.selected_signal_lane_rows` (`32` pops / `17.492ms`),
+  `store.selected_cursor_pair_rows` (`32` pops / `8.446ms`),
+  `store.bridge_request_descriptor` (`48` pops / `4.198ms`),
+  `store.bridge_cursor_values_page_ref` (`64` pops / `3.431ms`),
+  `store.bridge_cursor_values` (`32` pops / `1.620ms`),
+  `store.bridge_cursor_values_label` (`56` pops / `1.495ms`), and
+  `store.cursor_label` (`32` pops / `0.914ms`). The root-demand run classifies
+  most of the frontier as `candidate_unobserved_source_free_pure`, but those
+  roots are still sometimes consumed by row/list evaluation, so they cannot be
+  blindly skipped.
+- List-view evidence: list-view materialization is a symptom and secondary
+  cost, not the first cause. The current reports show no broad fallback and no
+  full row materialization: `field_only_fallback_count=0` and
+  `full_eval_row_count=0`. The remaining list cost is field-only projection and
+  diff work over dirty row fields, especially `selected_signal_lane_rows`
+  (`eval_ms` about `15ms`, `diff_ms` about `14ms`, `160` field-cache misses
+  in the click aggregate) and `selected_cursor_pair_rows` (`96` misses in the
+  click aggregate).
+- Renderer/verifier evidence: this gate is not proving live GPU present
+  latency. `input_to_visible` is currently the same click-loop timing summary
+  as `click_to_cursor`; it ends after deterministic input updates runtime,
+  layout, and shared state. The renderer upload probe is a separate three-frame
+  offscreen counter probe. Renderer/upload is therefore not the measured
+  culprit in this failing gate, although a future per-interaction render timing
+  report is still needed before claiming native present latency is solved.
+- Implementation consequence: the next runtime fix should target generic
+  demand/currentness before dirty enqueue for safe source-free pure internal
+  roots, plus exact read barriers so deferred roots cannot be read stale by
+  evaluators, state summaries, assertions, or row/list-view evaluation. A
+  row-list-only optimization will not remove the `194/32/38` slow class by
+  itself, and another readiness-set heuristic is likely to shift cost rather
+  than remove the culprit.
+
+### 2026-06-17 TASK-0804A Current Deep Culprit Measurement Loop
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md` only.
+- Verification: reused the previous read-only subagent findings, then ran a
+  second loop with `019ed2f1-f4fe-7cb3-bcfa-3c4faff69804` on NovyWave root
+  semantics and `019ed2f2-0c09-7370-b4e1-7e445be67dec` on verifier/runtime
+  measurement validity. Fresh current diagnostic:
+  `BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-current-deep-loop.json`.
+  It failed the known strict budget and wrote current evidence from the
+  `e9cc38e` tree plus this checklist-only worktree.
+- Current headline numbers from the fresh diagnostic:
+  `click_to_cursor.p95=19.786ms`, `input_to_visible.p95=19.786ms`,
+  `runtime_apply.p95=12.934ms`, `runtime_step_apply.p95=10.767ms`,
+  `runtime_state_summary.p95=0.836ms`, and `layout_rebuild.p95=4.889ms`.
+  The profile env vars add overhead, but the graph shape matches the normal
+  report and previous diagnostics.
+- Measurement caveat confirmed in code: the verifier writes
+  `input_to_visible_ms_p50_p95_max` from the same `click_summary_ms` as
+  `click_to_cursor_ms_p50_p95_max` in
+  `crates/boon_native_playground/src/main.rs`. This gate measures deterministic
+  input through runtime apply, state summary, layout/patch, scroll adjustment,
+  and shared render-state update. It does not measure per-click GPU present,
+  queue submit, or readback. Renderer upload is only the separate three-frame
+  offscreen probe, so renderer/upload is not the measured culprit here.
+- Slow-class split by dependent visit count in the current diagnostic:
+  `194` visits / `32` enqueues / `38` pops occurs for 16 clicks and averages
+  `17.731ms` total, `12.228ms` runtime apply, `10.217ms` runtime step,
+  `4.530ms` layout, `6.824ms` root flush, `3.933ms` dirty scheduler, and
+  `2.215ms` root materialization. The `28/6/12` class averages `13.032ms`
+  total and `2.616ms` root flush; the `26/5/11` class averages `7.959ms`
+  total and `2.065ms` root flush. Divider and hover classes are not the click
+  budget culprit.
+- Root-flush bucket ranking inside the slow `194/32/38` click class:
+  dirty scheduler is the largest sub-bucket (`3.933ms` average), but most of
+  that is not raw lookup. Average dependent enqueue work is `2.535ms`, changed
+  cache invalidation is `0.657ms`, dirty pop is `0.183ms`, dependent lookup is
+  only `0.095ms`, and dirty-scheduler unattributed work is about `0.42ms`.
+  This rules out "BTreeSet lookup alone" and "dirty pop alone" as the primary
+  fix target; the culprit is repeated frontier/enqueue/currentness propagation.
+- Demand-class evidence across the current diagnostic frontier:
+  `candidate_unobserved_source_free_pure` accounts for `3953` visits and
+  `669` enqueues, more than all observed/list classes combined. The other
+  classes are `blocked_observed_downstream` (`866` visits / `325` enqueues),
+  `blocked_observed_root` (`733` visits / `244` enqueues), and
+  `blocked_list_view` (`1318` visits / `131` enqueues). This confirms that a
+  generic demand/currentness frontier for unobserved pure roots is still the
+  highest-leverage engine fix, provided stale-read barriers are correct.
+- Top root work by materialization milliseconds in the current diagnostic:
+  `store.selected_signal_lane_rows` (`65` pops / `30.153ms`),
+  `store.selected_waveform_segments` (`33` pops / `14.996ms`),
+  `store.selected_cursor_pair_rows` (`33` pops / `8.736ms`),
+  `store.bridge_request_descriptor` (`50` pops / `4.448ms`),
+  `store.bridge_cursor_values_page_ref` (`67` pops / `3.620ms`),
+  `store.bridge_cursor_values` (`33` pops / `1.681ms`), and
+  `store.bridge_cursor_values_label` (`58` pops / `1.575ms`). The first three
+  are list-view work; the next four are unobserved source-free pure bridge/page
+  roots that should be demand-current rather than eagerly materialized.
+- List-view correction: the current row/list path is not doing full-row
+  fallback. For click samples, `selected_signal_lane_rows` reports
+  `field_only_fallback_count=0`, `full_eval_row_count=0`, `row_materialize_ms=0`,
+  `field_cache_hits=4768`, `field_cache_misses=160`, `eval_ms=15.250`, and
+  `diff_ms=14.048` in the aggregate. `selected_cursor_pair_rows` similarly has
+  `full_eval_row_count=0`, `field_cache_misses=96`, `eval_ms=9.040`, and
+  `diff_ms=8.586`. The list-view cost is field-only eval/diff over too many
+  dirty row fields, not old full materialization.
+- Semantically necessary work: `selected_timeline_cursor_value` must update
+  visible cursor label/offset roots and visible row fields that depend on the
+  cursor. `selected_signal_lane_rows` and `selected_cursor_pair_rows` are real
+  visible work on cursor movement. They still need narrower row/field dirty
+  frontiers and cached per-field results, but they are not safe to blindly skip.
+- Semantically questionable eager work: cursor-class crossing should not eagerly
+  rebuild static bridge/file/hierarchy/signal/page roots when they are
+  unobserved. The most suspicious roots are
+  `bridge_request_descriptor`, `bridge_cursor_values_page_ref`,
+  `bridge_cursor_values`, `bridge_cursor_values_label`, `bridge_waveform_page`,
+  `bridge_waveform_page_ref`, `bridge_signal_page`, `bridge_signal_page_ref`,
+  `bridge_hierarchy_page`, `bridge_hierarchy_page_ref`,
+  `bridge_file_stats`, and `bridge_file_stats_page_ref`. Many are classified
+  as `candidate_unobserved_source_free_pure`; their current eager materialized
+  values mainly exist to feed downstream dirty reads rather than visible output.
+- Real culprit statement: the slow path is CPU runtime root-flush fanout from a
+  cursor-class change. The expensive mechanism is eager currentness and dirty
+  frontier propagation through unobserved pure bridge/page roots, which then
+  wakes enough observed/list dependents to force field-only list-view eval/diff
+  and a secondary layout pass. It is not bridge I/O, renderer upload, GPU
+  present, heavy JSON report writing, whole-row materialization, dependent
+  lookup alone, or dirty-pop bookkeeping alone.
+- Implementation consequence for the next slice: implement demand-current
+  unobserved pure roots before enqueue, not a list-only or BTreeSet-only
+  micro-optimization. The implementation must still propagate enough dirty
+  read keys for observed/list dependents, must hide stale storage/cache values
+  behind evaluator/summary/assertion barriers, and must be killed if the
+  `candidate_unobserved_source_free_pure` enqueues and the `194/32/38` class do
+  not materially drop. After that, a second slice can attack list-view field
+  diff cost with a narrower row/field dependency frontier.
+
+### 2026-06-17 TASK-0804A Fresh Subagent Culprit Loop
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md` only.
+- Verification: redirected existing subagents `019ed2ff-d622-7980-a1d8-425219ef0be8`
+  and `019ed2ff-d744-7990-80d2-8292975121a6` into a read-only challenge loop.
+  The first subagent audited the CPU runtime scheduler/root-flush path. The
+  second subagent tried to disprove that diagnosis from layout, renderer, GPU,
+  bridge IO, native input, report writing, and harness angles. Fresh current
+  diagnostic:
+  `BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-real-culprit-loop-20260617T003707Z.json`.
+  Fresh canonical no-diagnostic baseline:
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json`. Both fail only
+  the known strict latency budget.
+- Clean baseline evidence: the canonical report from current code has
+  `click_to_cursor.p95=17.886ms`, `runtime_apply.p95=10.635ms`,
+  `runtime_step_apply.p95=8.393ms`, `layout_rebuild.p95=4.883ms`, and
+  `runtime_state_summary.p95=0.826ms`. All hot-path proof/report counters are
+  zero: `hot_path_proof_readback_count=0`,
+  `hot_path_heavy_json_summary_count=0`, `hot_path_report_write_count=0`,
+  `hot_path_png_write_count=0`, `hot_path_verbose_trace_event_count=0`, and
+  `hot_path_dev_blocking_ipc_count=0`. The renderer probe still shows the
+  post-interaction upload is tiny (`p50=3360` bytes and `p50=3` queue writes);
+  its large p95 is the initial-frame probe, not the per-click hot path.
+- Diagnostic graph evidence: with root-demand and dirty-frontier profiling
+  enabled, every click sample in the current diagnostic has the same bad graph
+  shape: `194` dependent visits, `32` dependent enqueues, `38` dirty pops,
+  `36` scalar root materializations, and `2` list-view materializations.
+  Timing under profiler overhead is `click_to_cursor.p95=19.032ms`,
+  `runtime_apply.p95=12.155ms`, `runtime_step_apply.p95=10.098ms`,
+  `layout_rebuild.p95=4.791ms`, `source_action_root_flush.p95=6.659ms`,
+  `source_action_root_dirty_scheduler.p95=3.750ms`,
+  `source_action_root_dependent_enqueue.p95=2.363ms`,
+  `source_action_root_materialization.p95=2.237ms`,
+  `source_action_root_changed_cache_invalidation.p95=0.601ms`, and
+  `source_action_root_dependent_lookup.p95=0.096ms`.
+- Demand-class ranking from the current diagnostic:
+  `candidate_unobserved_source_free_pure` accounts for `3568` visits and
+  `576` enqueues, ahead of `blocked_list_view` (`704` visits / `64` enqueues),
+  `blocked_observed_downstream` (`304` visits / `96` enqueues), and
+  `blocked_observed_root` (`240` visits / `80` enqueues). This confirms the
+  graph is dominated by unobserved pure bridge/page roots that are still
+  eagerly enqueued and materialized for currentness propagation.
+- Concrete frontier chain: `selected_timeline_cursor_value` wakes visible
+  cursor roots and visible row lists, but also wakes `cursor_label` and
+  `keyboard_cursor_label`. Those wake `bridge_request_descriptor`,
+  `bridge_cursor_values_page_digest`, and `bridge_cursor_values_label`. The
+  bridge request/fingerprint branch then fans out through waveform, hierarchy,
+  signal, file-stats, cursor-values, and page-ref roots. The top scalar
+  materialization work in the diagnostic is `bridge_request_descriptor`
+  (`48` pops / `4.140ms`), `bridge_cursor_values_page_ref`
+  (`64` pops / `3.301ms`), `bridge_cursor_values`
+  (`32` pops / `1.569ms`), and `bridge_cursor_values_label`
+  (`56` pops / `1.432ms`).
+- List-view evidence: layout/list work is real but downstream of the root
+  frontier, not the primary diagnosis. The current canonical report still shows
+  `selected_signal_lane_rows` at `14.831ms` eval / `13.690ms` diff and
+  `selected_cursor_pair_rows` at `8.872ms` eval / `8.446ms` diff, with
+  `full_eval_row_count=0` and `field_only_fallback_count=0`. This is
+  field-only visible row diff work over too many dirty fields, not old full-row
+  materialization.
+- Subagent challenge result: the strongest non-runtime alternative is layout as
+  a secondary cost of roughly `4-5ms` p95. Renderer/GPU upload is not the
+  measured culprit because this gate's click timing does not include per-click
+  present/readback and the separate renderer upload probe passes. Report/JSON,
+  bridge IO, native input dispatch, and IPC are weak explanations because their
+  hot-path counters are zero or their slow shape does not correlate with the
+  click-only cursor frontier.
+- Real culprit statement: the slow path is an engine graph/currentness problem
+  in CPU runtime root flush. A cursor movement causes eager dirty-frontier
+  propagation through many unobserved source-free pure bridge/page roots. That
+  fanout then forces scalar currentness work and wakes visible list-view
+  eval/diff plus a secondary layout pass. This is not a BTreeSet-only issue,
+  not dirty-pop bookkeeping alone, not full-row materialization, not renderer
+  upload, not bridge file IO, and not benchmark report writing.
+- Required next measurement before another broad implementation attempt:
+  add no-behavior-change counters that simulate suppressing
+  `candidate_unobserved_source_free_pure` enqueues, count how many such roots
+  are actually demanded later in the same interaction, and split dirty-frontier
+  edges by value-changing propagation versus currentness-only propagation. Kill
+  any implementation that does not materially reduce the `194/32/38` class or
+  that merely shifts the same work into list-view diff/layout.
+
+### 2026-06-17 TASK-0804A Three-Loop Cap And Postponement
+
+- Date: 2026-06-17
+- Task: TASK-0804A Source-Action Root Flush Architecture Pass
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`,
+  `crates/boon_native_playground/src/main.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime -p boon_native_playground`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo test -p boon_runtime --lib root_derived_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them -- --nocapture`;
+  profiled diagnostics
+  `target/diagnostics/native-gpu/novywave-interaction-speed-candidate-defer-context-window-tagged.json`
+  and
+  `target/diagnostics/native-gpu/novywave-interaction-speed-numeric-guard-reader.json`;
+  canonical report
+  `target/reports/native-gpu/novywave-interaction-speed.json`.
+- Loop 1 result: added no-behavior-change candidate-root demand counters and
+  split demand reads into eval, state-summary, document/window-summary, and
+  sparse-value-summary contexts. After fixing the window-summary context hole,
+  the report still showed all candidate demand reads in evaluator context:
+  `root_count=24`, `simulated_defer_enqueue_count=552`,
+  `materialization_count=552`, `changed_materialization_count=552`,
+  `unchanged_materialization_count=0`, and `eval_scalar_read_count=2064`.
+  This disproves the theory that post-turn summaries alone caused the demand.
+- Loop 2 result: kept a generic runtime optimization for numeric guard
+  invalidation. `root_numeric_values_for_reads` now uses a narrow numeric
+  reader instead of constructing full `BoonValue`s through
+  `runtime_scalar_boon_value` for every root read. This preserved focused
+  correctness and dropped profiled candidate demand reads from `2064` to `512`,
+  but it did not change the graph shape: slow clicks remain `194` dependent
+  visits, `32` enqueues, and `38` dirty pops.
+- Loop 3 result: canonical no-diagnostic gate still fails the strict latency
+  budget: `click_to_cursor.p95=17.551ms` and `input_to_visible.p95=17.551ms`
+  against `16.700ms`; `runtime_apply.p95=10.361ms`,
+  `runtime_step_apply.p95=8.437ms`, and `layout_rebuild.p95=4.812ms`. The
+  canonical click root-list summary still reports
+  `source_action_root_flush_ms=106.943`, `source_action_root_dirty_scheduler_ms=45.050`,
+  `source_action_root_materialization_ms=58.610`, `eval_ms=30.033`,
+  `diff_ms=28.568`, and `user_function_body_ms=35.525`.
+- Subagent/source conclusion: cursor movement semantically flows from
+  `selected_timeline_cursor_value` into `cursor_label`, `keyboard_cursor_label`,
+  `bridge_request_descriptor`, `bridge_cursor_values_page_digest`,
+  `bridge_cursor_values_label`, page refs, and visible lane rows. A source-level
+  bridge identity split is probably the correct larger design: keep stable
+  page/request identity separate from cursor-hot telemetry and avoid embedding
+  volatile page refs in every visible row. That change touches stale-response
+  and bridge fingerprint expectations, so it is larger than this capped loop.
+- Result: TASK-0804A is postponed, not done. The kept numeric-guard reader is a
+  safe runtime cleanup and measurement improvement, but it does not satisfy the
+  official speed budget. Per user direction, stop chasing this task now and
+  continue with representation work: TASK-1001 runtime BYTES, then TASK-1002
+  LIST storage/incremental representation.
+- Follow-up: when TASK-0804A is resumed, start from a bridge/page identity
+  design pass or compiled demand/currentness frontier, not from another
+  microchange. Kill criteria remain: reduce the `194/32/38` class, root-flush
+  buckets, or final click/input p95 without hardcoding NovyWave.
+
+### 2026-06-17 TASK-1001 Runtime BYTES Storage And Bridge Conversion Slice
+
+- Date: 2026-06-17
+- Task: TASK-1001 Runtime BYTES Value And Bridge/File Payload Boundary
+- Commit: uncommitted
+- Files changed in this slice:
+  `Cargo.lock`, `crates/boon_runtime/Cargo.toml`,
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib bytes -- --nocapture`;
+  `cargo test -p boon_bridge --lib -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check -- crates/boon_runtime/Cargo.toml crates/boon_runtime/src/lib.rs crates/boon_native_playground/src/main.rs docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Result: in progress. Added an internal runtime `BYTES` carrier backed by
+  `bytes::Bytes`, with typed inline, blob-ref, and page-ref payload forms.
+  `FieldValue`, `BoonValue`, root `ValueColumns`, and list row storage now carry
+  typed bytes separately from `TEXT` and generic JSON. Public runtime summaries
+  expose byte metadata (`$boon_type`, storage kind, digest, byte length, and ref
+  metadata) and do not inline byte arrays; compiled/runtime artifacts still keep
+  inline bytes only in artifact serialization so deterministic restoration is
+  possible.
+- Bridge boundary: added a single runtime conversion path from existing
+  `BridgeValue::Bytes`, `BridgeValue::BlobRef`, and `BridgeValue::PageRef` into
+  runtime bytes. The bridge ABI and canonical bridge JSON shape were not
+  changed; the existing bridge tests and NovyWave bridge scenario still pass.
+- Tests: added focused bytes tests for public-summary non-leakage, artifact
+  round trip, typed root/list storage, cache-fragment separation from JSON
+  metadata, and bridge bytes/blob/page-ref conversion.
+- Not done yet: TASK-1001 remains open because NovyWave's current Boon bridge
+  descriptor records are still text/record-shaped and intentionally unchanged.
+  Moving page/blob descriptor roots to runtime `BYTES` needs a separate
+  compatibility pass so field access such as page digests/statuses stays
+  descriptor-visible while full binary payloads remain out of Boon source.
+- Follow-up: continue with TASK-1002 as a narrow LIST classifier/report slice
+  before attempting a physical list storage change. When TASK-1001 resumes,
+  integrate BYTES only at true binary file/page/blob boundaries, not for labels,
+  filenames, statuses, or scenario text.
+
+### 2026-06-17 TASK-1001 Bridge Completion Runtime BYTES Boundary Slice
+
+- Date: 2026-06-17
+- Task: TASK-1001 Runtime BYTES Value And Bridge/File Payload Boundary
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib bridge_completion_payload_sidecars_reach_runtime_bytes_boundary -- --nocapture`;
+  `cargo test -p boon_runtime --lib bytes -- --nocapture`;
+  `cargo test -p boon_bridge --lib -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`;
+  `cargo xtask verify-report-schema`.
+- Result: in progress. Added public runtime summary helpers for bridge values
+  and bridge completion outputs. Accepted bridge completions can now be checked
+  at the runtime boundary without exposing private runtime value internals:
+  inline bytes, blob refs, and page refs become public BYTES summaries with
+  storage kind, digest, byte length, and ref metadata.
+- Determinism evidence: added a bridge completion test that registers a generic
+  payload effect, schedules a request, accepts a completion with real blob/page
+  sidecars through `complete_with_payloads`, converts the accepted output to a
+  runtime summary, and proves the same summary after completion
+  serialize/deserialize replay metadata. The public summary keeps raw sidecar
+  bytes out of JSON while preserving digests and byte lengths.
+- Compatibility evidence: the existing bridge suite, runtime BYTES suite,
+  NovyWave bridge scenario, and report schema verifier still pass. No Boon
+  syntax changed, and the NovyWave descriptor records were not rewritten.
+- Not done yet: TASK-1001 remains open because the next step is a real producer
+  integration: waveform/file/page/blob data should enter through this BYTES
+  boundary, while user-visible filenames, labels, statuses, formulas, and
+  scenario text remain TEXT/records.
+
+### 2026-06-17 TASK-1002 LIST Representation Classification Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime -p boon_native_playground`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `cargo check -p boon_ir -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `git diff --check`.
+- Default-stack caveat: `cargo test -p boon_runtime --lib list_ -- --nocapture`
+  overflows the stack in
+  `novywave_marker_count_updates_after_list_insert_and_remove`, while the same
+  test and the full `list_` filter pass with `RUST_MIN_STACK=33554432`. Treat
+  this as a test-harness stack-depth issue to investigate separately, not as
+  evidence that LIST semantics failed.
+- Result: in progress. Added report-visible LIST representation labels to
+  root list-view profiles without changing Boon syntax or row semantics.
+  Existing field-only root list-view patches now report
+  `list_storage_mode=field_only_record_projection` and
+  `list_value_shape=record_field_projection`; stable row-ref reuse reports
+  `list_storage_mode=row_ref_projection_reuse` and
+  `list_value_shape=row_ref_values`; generic fallback paths are labeled by
+  whether source identities are present and by the observed value shape.
+- Current speed evidence: the refreshed NovyWave interaction-speed report still
+  fails strict latency budgets, so this slice is not a speed fix:
+  `click_to_cursor.p95=17.767ms`, `input_to_visible.p95=17.767ms`,
+  `runtime_apply.p95=10.539ms`, `runtime_step_apply.p95=8.591ms`, and
+  `layout_rebuild.p95=4.818ms`. The report confirms the two active LIST shapes
+  are `field_only_record_projection`/`record_field_projection` and
+  `row_ref_projection_reuse`/`row_ref_values`.
+- Follow-up: use these labels to choose the first physical LIST storage mode or
+  projection-preservation optimization. The next kept TASK-1002 slice should
+  reduce a measured list/root-view bucket or preserve row/source identity more
+  directly; do not claim final speed success until the official interaction
+  budget passes.
+- Next-slice review: a fresh subagent review recommended a dirty projected-field
+  frontier for the field-only list-view loop, but this family has already been
+  tried and killed twice under TASK-0804A, including the fresh
+  invalidated-field-frontier experiment. Do not retry that inside-loop
+  prefilter as the next TASK-1002 implementation unless a new report proves the
+  old kill criteria no longer apply. Prefer a real earlier compiled
+  row/source-identity plan, a bridge/page identity split, or a true
+  bridge-payload BYTES ingestion boundary.
+
+### 2026-06-17 TASK-1002 Direct List-View Consumer Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this slice:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo check -p boon_runtime`;
+  `cargo test -p boon_runtime --lib list_view_direct_join_and_fused_map_join_avoid_row_ref_vector -- --nocapture`;
+  `cargo test -p boon_runtime --lib list_index_report_counters_include_task_0301_fields -- --nocapture`;
+  `cargo test -p boon_runtime --lib indexed_filter_retain_map_join_pipeline_fuses_cursor_value_shape -- --nocapture`;
+  `cargo test -p boon_runtime --lib list_filter_field_equal_uses_text_lookup_index_for_homogeneous_row_refs -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `cargo check -p boon_ir -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: in progress. LIST selections now keep their selected row indices in a
+  shared `Arc<[usize]>` representation, and `List/join_field` plus the fused
+  `List/map |> List/join_field` path can consume both `ListSelection` and
+  `ListRef` rows directly without first constructing a `Vec<RowRef>`. This is a
+  generic runtime consumer optimization: no Boon syntax, NovyWave-specific
+  branch, fixture reduction, hardcoded filename, or bridge shortcut was added.
+- Measurement evidence: the refreshed NovyWave speed report now exposes
+  `list_view_direct_rows=8` and
+  `list_view_row_ref_materializations_avoided=8` in a runtime list-scan sample;
+  indexed filters still report `filter_field_rows_scanned=0` and
+  `retain_rows_scanned=0`. This confirms the slice moved the intended row-ref
+  vector materialization path, but the count is too small to solve the current
+  p95 budget.
+- Current speed evidence: the official speed gate still fails:
+  `click_to_cursor.p95=18.020982ms`,
+  `input_to_visible.p95=18.020982ms`,
+  `runtime_apply.p95=11.121077ms`,
+  `runtime_step_apply.p95=8.901886ms`, and
+  `layout_rebuild.p95=4.819564ms`. The remaining click-path architecture cause
+  is still `root_flush_dirty_scheduler_plus_root_list_materialization` with
+  `source_action_root_dependent_visit_count=3536`,
+  `source_action_root_dependent_enqueue_count=600`,
+  `source_action_root_dirty_pop_count=792`, and
+  `source_action_root_list_view_materialization_count=56`.
+- Follow-up: keep TASK-1002 open. The next LIST work should target a larger
+  measured bucket than row-ref vector creation: compiled row/field dependency
+  frontiers, earlier source/page demand identity, or direct physical list-view
+  updates that reduce the `194/32/38` click frontier shape. Do not spend another
+  slice on tiny collection swaps unless a report shows the hot bucket changed.
+
+### 2026-06-17 TASK-1001 Real NovyWave Payload BYTES Slice
+
+- Date: 2026-06-17
+- Task: TASK-1001 Runtime BYTES Value And Bridge/File Payload Boundary
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `Cargo.lock`,
+  `crates/boon_native_playground/src/main.rs`,
+  `crates/boon_runtime/Cargo.toml`,
+  `crates/boon_runtime/src/lib.rs`,
+  `crates/xtask/src/main.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib text_match_patterns_rejoin_pathlike_punctuation_without_spaces -- --nocapture`;
+  `cargo test -p boon_runtime --lib derived_root_summary_recomputes_pure_dependency_before_stored_scalar_alias -- --nocapture`;
+  `cargo test -p boon_runtime --lib root_scalar_same_event_ -- --nocapture`;
+  `cargo test -p boon_runtime --lib bytes -- --nocapture`;
+  `cargo test -p boon_bridge --lib -- --nocapture`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Result: TASK-1001 real-payload boundary is complete for the current roadmap
+  slice. The NovyWave bridge verifier now proves real local waveform payloads
+  at the bridge/runtime boundary: `simple.vcd` and `simple_test.ghw` are accepted
+  as BYTES sidecar completions, while the large `wave_27.fst` is verified by
+  descriptor hash and byte length without routine full sidecar load. No Boon
+  syntax was added and user-visible filenames, statuses, labels, and descriptor
+  records remain TEXT/record-shaped.
+- Real-file evidence from
+  `target/reports/novywave-bridge-scenario.json`:
+  `simple.vcd` descriptor and sidecar match
+  `sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de`
+  at `311` bytes; `simple_test.ghw` descriptor and sidecar match
+  `sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491`
+  at `833` bytes; `wave_27.fst` descriptor matches
+  `sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172`
+  at `28860652` bytes and is intentionally `sidecar_payload=false`.
+- BYTES non-leak evidence: the report's
+  `bridge_real_payload_bytes_evidence.status` is `pass`; small-file completion
+  summaries expose `$boon_type: BYTES`, `storage: blob_ref/page_ref`, digest,
+  byte length, encoding, and ref metadata, with `raw_bytes_leaked=false`.
+- Engine correctness fixes required by this slice:
+  `TEXT { ... }` match patterns now rejoin path-like punctuation, so patterns
+  such as `TEXT { simple_test.ghw }`, `TEXT { wave_27.fst }`,
+  `TEXT { data_bus[7:0] }`, and URL/path-shaped text match the same values as
+  TEXT literals instead of falling through because the parser split punctuation
+  into separate tokens. Sparse runtime value summaries and scenario assertions
+  now recompute current pure roots before reading stale materialized scalar
+  aliases, so deferred root optimization cannot make verification observe the
+  previous step.
+- Scenario evidence: `verify-novywave-bridge-scenario` now passes fully,
+  including `bridge_scenario_coverage.status=pass` and
+  `bridge_real_payload_bytes_evidence.status=pass`.
+- Follow-up: continue TASK-1002/LIST work from the measured larger buckets.
+  Do not spend another slice replacing JSON/container types or loading more
+  waveform bytes unless a report shows bridge payload transport, not root/list
+  fanout, has become a top runtime cost.
+
+### 2026-06-17 TASK-1002 LIST/BYTES Integration Correctness Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_ir/src/lib.rs`,
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime -p boon_ir`;
+  `cargo test -p boon_ir --lib pure_match_function -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_top_level_format_updates_active_selected_row_formatter -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_selected_row_formatter_is_row_scoped_and_rerenders_values -- --nocapture`;
+  `cargo test -p boon_runtime --lib bytes -- --nocapture`;
+  `cargo test -p boon_bridge --lib -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib nested_structured_child_change_does_not_dirty_top_level_leaf_alias -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib derived_root_summary_recomputes_pure_dependency_before_stored_scalar_alias -- --nocapture`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Result: kept correctness fixes required before further LIST/BYTES speed work
+  can be trusted. The compiler no longer treats a nested function call inside a
+  guarded row update as an unconditional row-wide function update. The regression
+  shape is `event |> THEN { condition |> WHEN { True => next_format(...), False
+  => old_value } }`: it now lowers as a guarded match update, so only the active
+  row changes. No Boon syntax changed.
+- Runtime LIST dependency fix: filtered/pass-through list views that expose
+  whole source rows now publish exposed source-row field reads as dependencies,
+  not only the predicate field or the target list field names. This keeps
+  row-ref projection reuse from hiding source-field dependencies.
+- Runtime summary fix: sparse summaries and scenario assertions were able to
+  clear root value caches and recompute root `ListView`s through generic
+  expression evaluation, replacing full materializer dependencies with
+  predicate-only reads. Root list-view summaries now go through the list-view
+  materializer and return the materializer's cached evaluated value, preserving
+  enriched row-local fields such as NovyWave formatter/dropdown state while
+  keeping the dependency graph complete.
+- Current TASK-1002 status: still open. The direct LIST consumer optimization
+  and these correctness fixes are kept, but they do not finish the larger LIST
+  storage/incremental roadmap. Next LIST work should reduce larger measured
+  buckets such as root/list materialization, dirty-frontier fanout, or
+  field-patch/user-function work rather than another tiny vector/container swap.
+
+### 2026-06-17 TASK-1002 Branch-Selector Cache Killed And RecordColumns Field Access Fix
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_list_view_field_cache_separates_same_source_row_by_caller_env -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_top_level_format_updates_active_selected_row_formatter -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_selected_row_formatter_is_row_scoped_and_rerenders_values -- --nocapture`;
+  `cargo check -p boon_runtime`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Subagent review: the best next LIST slice is still earlier
+  root/list-fanout measurement or a real field-only physical patch frontier.
+  The current report already shows field-only patching is active, but it still
+  spends most click-path LIST time in `selected_signal_lane_rows` and
+  `selected_cursor_pair_rows`.
+- Killed experiment: a branch-selector field-cache experiment was tried and
+  removed. It passed focused branch tests, but it did not fire in the NovyWave
+  hot lists, made the official speed report worse during the experiment, and
+  failed the promotion metric. Do not retry selector caching unless a future
+  report proves branch selector evaluation itself is a top bucket.
+- Kept correctness fix: `Field/name` access now supports column-backed
+  `RecordColumns` values as well as plain record values. This fixes optimized
+  root list-view contexts where a nested row such as `detail_row(...).label`
+  previously collapsed to `type_error`. This is a generic runtime fix, not a
+  Boon syntax change and not a NovyWave workaround.
+- Current speed evidence after removing the failed experiment: the official
+  gate still fails strict latency budgets:
+  `click_to_cursor.p95=18.917ms`,
+  `input_to_visible.p95=18.917ms`,
+  `runtime_apply.p95=11.746ms`,
+  `runtime_step_apply.p95=9.600ms`, and
+  `layout_rebuild.p95=4.638ms`. Root-list click counters show
+  `eval_ms=36.845`, `diff_ms=31.362`,
+  `user_function_body_ms=38.954`, `changed_read_count=2240`, and
+  `current_dirty_read_count=4936`.
+- Current measured LIST buckets:
+  `selected_signal_lane_rows eval_ms=20.516 diff_ms=16.179
+  user_function_body_ms=12.490 dirty_reads=2360 row_count=168`;
+  `selected_cursor_pair_rows eval_ms=10.409 diff_ms=8.789
+  user_function_body_ms=24.348 dirty_reads=2136 row_count=96`;
+  `selected_visible_items eval_ms=5.511 diff_ms=5.908
+  user_function_body_ms=2.116 row_count=72`;
+  `selected_signal_rows eval_ms=0.409 diff_ms=0.487 row_count=48`.
+- Current TASK-1002 status: still open. The next kept implementation should
+  target the larger measured root/ListView buckets or the earlier dependency
+  identities feeding them. Avoid another branch-selector cache, tiny container
+  swap, or inside-loop field prefilter unless a fresh report shows that exact
+  bucket became dominant.
+
+### 2026-06-17 TASK-1002 Field-Only Row Binding Cleanup Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `cargo check -p boon_runtime`;
+  `cargo test -p boon_runtime --lib root_list_view_field_cache_separates_same_source_row_by_caller_env -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_top_level_format_updates_active_selected_row_formatter -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_selected_row_formatter_is_row_scoped_and_rerenders_values -- --nocapture`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema`.
+- Result: kept a narrow generic root-list field-only cleanup. The materializer
+  no longer injects the caller map binding into the callee row frame before the
+  active projector also binds the callee row argument. Direct record projectors
+  now move the row value into the callee frame, and branch projectors avoid a
+  second row binding when the selected arm uses the same row argument. This
+  removes duplicate row-value cloning/binding in the hot field-only loop without
+  changing Boon syntax or adding NovyWave-specific behavior.
+- Measured effect: the official speed gate still fails the strict interaction
+  budget, but the current report moved in the right direction versus the
+  immediately preceding post-revert report. `click_to_cursor.p95` and
+  `input_to_visible.p95` moved from `18.917ms` to `18.090ms`;
+  `runtime_apply.p95` moved from `11.746ms` to `11.404ms`;
+  `runtime_step_apply.p95` moved from `9.600ms` to `9.224ms`. Root-list
+  aggregate counters moved from `eval_ms=36.845`, `diff_ms=31.362`, and
+  `user_function_body_ms=38.954` to `eval_ms=35.953`, `diff_ms=30.567`, and
+  `user_function_body_ms=37.944`.
+- Remaining cause: graph shape and root/list work class are unchanged. The
+  largest LIST buckets remain `selected_signal_lane_rows`
+  (`eval_ms=20.029`, `diff_ms=15.759`, `user_function_body_ms=12.137`) and
+  `selected_cursor_pair_rows` (`eval_ms=10.159`, `diff_ms=8.578`,
+  `user_function_body_ms=23.760`). TASK-1002 remains open; the next slice
+  should target field-cache key construction, dirty-read fanout identities, or
+  a larger physical LIST/root-view representation change rather than another
+  tiny clone cleanup.
+
+### 2026-06-17 TASK-1002 Source-Binding Fingerprint Dedup And Three-Loop Cap
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_field_cache_shares_row_independent_fields_across_rows -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_field_cache_separates_same_source_row_by_caller_env -- --nocapture`;
+  `cargo check -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib user_function_cache_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_top_level_format_updates_active_selected_row_formatter -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_selected_row_formatter_is_row_scoped_and_rerenders_values -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  (expected failure against the current strict p95 budget);
+  post-kill refresh of the same speed gate so
+  `target/reports/native-gpu/novywave-interaction-speed.json` matches current
+  code after removing the failed experiment.
+- Kept loop: root list-view field cache keys already include the source row
+  identity/generation when a projected field references the source binding, so
+  the env fingerprint no longer serializes that same source binding a second
+  time. The cache key still includes other free env values, record scope,
+  source list, source key/generation, and field name, so this is a generic
+  key-size/dedup optimization rather than a relaxed dependency rule.
+- Measured effect of the kept loop: the official gate still failed, but the
+  root-list internals moved slightly in the right direction versus the previous
+  field-only row-binding report. The kept-loop report showed
+  `click_to_cursor.p95=18.342ms`,
+  `input_to_visible.p95=18.342ms`,
+  `runtime_apply.p95=11.416ms`,
+  `runtime_step_apply.p95=9.210ms`, and
+  `layout_rebuild.p95=4.550ms`. Root-list counters were
+  `eval_ms=35.879`, `diff_ms=30.481`,
+  `user_function_body_ms=38.059`, with
+  `selected_signal_lane_rows eval_ms=19.707 diff_ms=15.475` and
+  `selected_cursor_pair_rows eval_ms=10.299 diff_ms=8.689`.
+- Killed loop: a precomputed clean-field reuse table for empty-env previous-pass
+  field cache hits was implemented, measured, and removed. It preserved focused
+  root-list correctness tests, but the official speed gate regressed to
+  `click_to_cursor.p95=20.495ms`,
+  `input_to_visible.p95=20.495ms`,
+  `runtime_apply.p95=12.904ms`, and root-list
+  `eval_ms=39.009`. The extra table/bucket work cost more than it saved in the
+  real NovyWave path, so the code was killed rather than kept as speculative
+  complexity.
+- Current post-kill report evidence: after removing that table experiment and
+  refreshing the canonical report, the current worktree still fails only the
+  known strict p95 budget: `click_to_cursor.p95=18.284ms`,
+  `input_to_visible.p95=18.284ms`,
+  `runtime_apply.p95=11.618ms`,
+  `runtime_step_apply.p95=9.198ms`, and
+  `layout_rebuild.p95=4.786ms`. Root-list counters are
+  `eval_ms=36.102`, `diff_ms=30.754`,
+  `user_function_body_ms=37.830`,
+  `user_function_cache_key_ms=3.574`,
+  `field_cache_hits=4768`, `field_cache_misses=256`,
+  `changed_read_count=2240`, and `current_dirty_read_count=4936`.
+  The dominant lists remain `selected_signal_lane_rows`
+  (`eval_ms=20.010`, `diff_ms=15.639`, `user_function_body_ms=12.034`)
+  and `selected_cursor_pair_rows`
+  (`eval_ms=10.186`, `diff_ms=8.594`, `user_function_body_ms=23.771`).
+- Third-loop diagnostic: function-cache counters are already active in the hot
+  lists, so the remaining p95 miss is not a simple disabled-cache bug.
+  `selected_cursor_pair_rows` still spends the largest body time, but it also
+  reports function-cache hits; the next useful work needs finer root/list
+  materialization or function-body attribution before another cache-key rewrite.
+- Current TASK-1002 status: still open, but the immediate NovyWave
+  interaction-speed p95 debugging loop is postponed after this cap. Continue
+  broader LIST representation work only when it reduces a measured bucket such
+  as root/list materialization, dirty-frontier fanout, field-cache key cost, or
+  duplicated cursor-value function bodies. Do not retry the killed clean-field
+  table, branch-selector cache, or tiny container swap without a fresh report
+  proving that exact bucket became dominant.
+
+### 2026-06-17 TASK-1002 ListSelection FindValue Indexed Path
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_index_find_value_uses_text_lookup_index_for_list_selection -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_index_find_value_uses_text_lookup_index_for_runtime_list_ref -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo check -p boon_runtime`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`.
+- Result: kept a generic `ListSelection` storage-mode improvement. `List/find`
+  and therefore `List/find_value` now use the existing selection-aware text
+  lookup index when the input is a `BoonValue::ListSelection`, instead of
+  expanding the selection and scanning selected rows. The fallback scan still
+  exists when no usable index is available, and the function still returns a
+  `RowRef` constrained to the selected row universe.
+- Regression evidence: the new focused test constructs a `ListSelection` over
+  rows `[0, 1, 3]`, searches for `key == row-2`, and proves the result is the
+  selected row value `second` rather than the excluded row value `skipped`.
+  It also asserts `list_find_rows_scanned=0` and a text lookup hit.
+- Scope note: the NovyWave p95 speed gate was not rerun for this slice because
+  the previous entry capped immediate p95 debugging loops and this is a broader
+  LIST representation correctness/coverage improvement, not a claimed
+  interaction-speed fix. TASK-1002 remains open.
+
+### 2026-06-17 TASK-1002 ListSelection Cardinality Length Path
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_selection_length_uses_selection_cardinality_without_row_expansion -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`.
+- Result: kept a generic LIST storage-mode improvement for cardinality-only
+  queries. `List/count`, `List/length`, and `List/is_not_empty` now call a
+  length-specific runtime path that preserves normal list read dependencies but
+  avoids expanding `ListRef` and `ListSelection` inputs into row-ref vectors
+  just to count them.
+- Regression evidence: the focused test constructs a `ListSelection` over three
+  selected row indices, asks the runtime for its length, and asserts that the
+  answer is `3` while `row_occurrences_scanned` stays at `0`. This proves the
+  selection cardinality is used directly rather than hidden behind generic row
+  expansion.
+- Scope note: this is a foundation slice for the broader LIST representation
+  roadmap. It does not change Boon syntax, it does not introduce a
+  NovyWave-specific shortcut, and it does not reopen the capped immediate p95
+  debugging loop. TASK-1002 remains open; the next useful slices are indexed
+  first-match consumers, root `ListView` projection over row-index views, or
+  exact-text index maintenance if measurement makes stale-index risk worth it.
+
+### 2026-06-17 TASK-1002 Identity ListMap Preserves Storage Views
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_map_identity_preserves_storage_views_without_row_expansion -- --nocapture`;
+  `cargo check -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib user_function_cache_keys_row_args_by_accessed_fields_when_safe -- --nocapture`.
+- Result: kept a generic LIST storage-mode optimization for identity maps.
+  `List/map(row, new: row)` now preserves `ListRef` and `ListSelection`
+  values instead of expanding them into row-ref vectors. The optimization is
+  implemented for both the normal AST evaluator and the runtime-generic
+  artifact path, and it still records the list read dependency.
+- Regression evidence: the focused test calls the runtime directly for
+  `ListRef`, `ListSelection`, and runtime-generic `ListSelection` identity
+  maps. It proves the output storage view is preserved, the list read is
+  recorded, `row_occurrences_scanned` stays at `0`, and the existing
+  avoided-row-ref-materialization counter increases by the logical row count.
+- Boundary note: read-only subagent review suggested also indexing the
+  remaining scalar first-match `List/find_value` consumers. That path currently
+  sits behind closure-driven scalar equation evaluation where the exact text
+  index builder requires mutable runtime access. This slice did not force a
+  broad mutability/API change through source-route and summary helpers; that
+  should be handled as a separate task if measurement shows those consumers are
+  still hot.
+- Scope note: this does not change Boon syntax, does not special-case NovyWave,
+  and does not claim the capped NovyWave interaction p95 budget is fixed.
+  TASK-1002 remains open; the next larger slice should carry row-index views
+  directly through root `ListView` materialization or make exact-text lookup
+  indexes incrementally maintained if stale-index risk is justified.
+
+### 2026-06-17 TASK-1002 Root ListView Row-Index Source Projection
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  read-only subagent review `019ed3e2-eed1-71e2-8198-73f514cb1edc`;
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_filtered_rows_preserve_identity_for_downstream_map -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_identity_list_ref_carries_row_index_view -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_identity_list_selection_carries_row_index_view -- --nocapture`;
+  `cargo check -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_map_identity_preserves_storage_views_without_row_expansion -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Result: kept a generic root `ListView` representation improvement. The
+  materializer now has an internal `RootListViewRowIndexSource` for `ListRef`
+  and `ListSelection`. Field-only root list-view patching consumes that source
+  directly instead of first routing through `list_values_for_iteration`, and
+  the broad root list-view materializer uses the same source for identities and
+  source-column reads before creating row refs only as a compatibility bridge
+  to existing reuse/materialization code.
+- Regression evidence: the focused filtered downstream-map test now proves a
+  dirty root map over a stable filtered root list uses
+  `field_only_row_index_projection` with `list_ref_row_index_view`, preserves
+  target row identity, reports direct list-view rows, and keeps
+  `full_eval_row_count=0` and `row_materialize_ms=0.0`. The new identity
+  `ListRef` test proves broad rematerialization reports
+  `generic_vec_with_row_index_source`, `list_ref_row_index_view`,
+  `source_identity_count == row_count`, `row_occurrences_scanned=0`, and direct
+  list-view row consumption. The new identity `ListSelection` test proves the
+  same broad mode for filtered selections, preserves selection order, and
+  rejects same-count selection identity changes as in-place target-index
+  patches.
+- Scope note: this does not change `list_values_for_iteration` globally and
+  does not add Boon syntax. It is not a NovyWave-specific shortcut and it does
+  not claim the capped NovyWave interaction p95 budget is fixed. TASK-1002
+  remains open; the next larger slices are exact-text index maintenance, row
+  source support deeper in non-root list consumers, or a measured dirty-frontier
+  reduction once the current row-index root materialization evidence is
+  committed.
+
+### 2026-06-17 TASK-1002 ListMoveField Ordered Selection Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_move_field_preserves_list_ref_storage_view_without_row_expansion -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_move_field_preserves_selection_order_without_row_expansion -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  (expected failure against the current strict p95 budget).
+- Result: kept a generic LIST storage-mode improvement for
+  `List/move_field_first` and `List/move_field_last`. When the input is a
+  `ListRef` or `ListSelection` and a text-like index is available, the runtime
+  now computes the matching/rest row-index partition and returns an ordered
+  `ListSelection` instead of expanding the input through
+  `list_values_for_iteration` and allocating row refs. Fallback behavior is
+  unchanged when no usable index exists.
+- Regression evidence: the new focused tests prove `ListRef` move-first returns
+  `[1, 3, 0, 2]` as a `ListSelection`, selection move-last preserves selected
+  order as `[1, 3, 4, 0]`, records the list/column read, uses the indexed/direct
+  selection lookup, reports `move_field_rows_scanned=0`, and increments
+  row-ref materialization avoidance for the logical row count.
+- Current NovyWave evidence: the refreshed official report still fails only the
+  known strict interaction p95 budgets:
+  `click_to_cursor.p95=18.127ms` and `input_to_visible.p95=18.127ms` against
+  `16.700ms`. Runtime/list evidence is still useful: the hot root-list profiles
+  have `full_eval_row_count=0` and `row_materialize_ms=0.0`, with
+  `selected_signal_lane_rows` using `field_only_row_index_projection` /
+  `list_ref_row_index_view`. Aggregate root-list counters remain high:
+  `eval_ms=54.237`, `diff_ms=41.832`, `user_function_body_ms=47.350`,
+  `current_dirty_read_count=6217`, and the dominant list is still
+  `selected_signal_lane_rows`. This slice is therefore kept as generic
+  representation coverage, not as the final speed fix.
+- Scope note: this does not change Boon syntax, does not hardcode NovyWave, and
+  does not reopen the capped p95 debugging loop. TASK-1002 remains open; the
+  next useful work should target exact-text index maintenance, source-row views
+  deeper in non-root consumers, or the remaining dirty-frontier/user-function
+  body costs.
+
+### 2026-06-17 TASK-1002 ListGetLatest Row-Index Access Slice
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_get_and_latest_use_row_index_views_without_expansion -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo check -p boon_bridge -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  (expected failure against the current strict p95 budget).
+- Result: kept another generic row-index consumer improvement. `List/get` and
+  `List/latest` now answer directly from `ListRef` and `ListSelection` inputs by
+  reading the requested/last row index and returning the same row-ref pipeline
+  value the old evaluator would have produced. The generic fallback still
+  handles plain lists, text path resolution, and non-row values.
+- Regression evidence: the focused test proves `List/get` over a `ListRef`
+  returns row index `2`, `List/get` over a `ListSelection [3, 1]` returns source
+  row index `1`, and `List/latest` over `ListSelection [0, 3, 1]` returns source
+  row index `1`. Each path records the list read and keeps
+  `row_occurrences_scanned=0`.
+- Current NovyWave evidence: the refreshed speed report still fails the same
+  known p95 budget: `click_to_cursor.p95=18.127ms` and
+  `input_to_visible.p95=18.127ms` against `16.700ms`; `runtime_apply.p95` is
+  `11.577ms`, `runtime_step_apply.p95=9.313ms`, and
+  `layout_rebuild.p95=4.615ms`. Root-list materialization remains the dominant
+  engine-side cost even though row expansion is eliminated in the hot lists:
+  aggregate `eval_ms=55.358`, `diff_ms=42.524`,
+  `user_function_body_ms=47.745`, `full_eval_row_count=0`, and
+  `row_materialize_ms=0.0`; dominant list remains `selected_signal_lane_rows`.
+- Scope note: this does not change Boon syntax, does not hardcode NovyWave, and
+  does not claim the speed gate is fixed. TASK-1002 remains open. Further LIST
+  work needs a larger compiled query/frontier or function-body reduction, not
+  another tiny row-ref allocation avoidance slice unless new measurement shows
+  row expansion became hot again.
+
+### 2026-06-17 TASK-1002 Acceptance Closure
+
+- Date: 2026-06-17
+- Task: TASK-1002 LIST Storage Mode And Incremental Representation Slice
+- Commit: uncommitted
+- Files changed in this checkpoint:
+  `crates/boon_runtime/src/lib.rs`,
+  `docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Verification:
+  read-only subagent acceptance audit `019ed3fb-24e9-7a32-9dec-2f156180af97`;
+  `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_selection_storage_mode_matches_generic_record_oracle_for_core_ops -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo test -p boon_ir --lib representation -- --nocapture`;
+  `cargo check -p boon_ir -p boon_runtime -p boon_native_playground -p xtask`;
+  previously refreshed current-code report
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Acceptance audit: TASK-1002 is closed for its written scope. The promoted
+  storage modes are inferred by runtime/compiler facts (`ListRef`,
+  `ListSelection`, row-index root sources, and representation classifier
+  labels), not by user annotations or NovyWave branches. Generic LIST execution
+  remains the fallback oracle for unsupported shapes. The focused LIST suite now
+  includes one explicit optimized-vs-generic oracle test for the named core
+  operations: text filter, numeric retain, identity map, join-field visible
+  result, and storage-mode preservation. Root list-view materialization is
+  covered by the existing row-index source projection tests that prove
+  `field_only_row_index_projection`, `generic_vec_with_row_index_source`,
+  stable identities, zero generic row occurrence expansion, and
+  `row_materialize_ms=0.0`.
+- Current NovyWave evidence: the latest current-code interaction report remains
+  speed-budget red, but it satisfies the TASK-1002 acceptance path of neutral
+  correctness/report behavior rather than final latency success:
+  `click_to_cursor.p95=18.127ms` and `input_to_visible.p95=18.127ms` against
+  `16.700ms`, with root-list aggregate `full_eval_row_count=0`,
+  `row_materialize_ms=0.0`, `eval_ms=55.358`, `diff_ms=42.524`, and
+  `user_function_body_ms=47.745`. The remaining speed blocker is not row-index
+  LIST storage correctness; it is still dirty-frontier/root-list/function-body
+  work to resume under the postponed root-flush architecture task or a new
+  explicit task.
+- Result: TASK-1002 is `done`. Do not keep adding tiny row-ref allocation
+  avoidance slices under TASK-1002 unless a new task or report proves row
+  expansion is again a dominant cost.
+
+### 2026-06-17 Checklist Continuation Evidence Refresh
+
+- Date: 2026-06-17
+- Scope: active `/goal` continuation after TASK-1001 and TASK-1002 were closed.
+- Task state audit:
+  read-only subagent `019ed406-0400-7602-af4c-680f5860a509` confirmed that
+  no real executable `pending` or `in_progress` task/experiment remains besides
+  template placeholders `TASK-0000`/`EXP-0000` and intentionally postponed
+  `TASK-0804A`. The canonical status scan remains `TASK-1001=done`,
+  `TASK-1002=done`, and `TASK-0804A=postponed`.
+- Refreshed verification:
+  `cargo test -p boon_bridge --lib -- --nocapture` (`12 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib bytes -- --nocapture`
+  (`4 passed`);
+  `cargo test -p boon_ir --lib representation -- --nocapture` (`1 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`
+  (`76 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`
+  (`19 passed`);
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
+  (`status=pass`);
+  `cargo check -p boon_ir -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo xtask verify-report-schema`;
+  `git diff --check`.
+- Current NovyWave speed evidence:
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  refreshed the report and exited with the expected blocked/fail status because
+  the strict interaction p95 budget is still not met:
+  `click_to_cursor.p95=18.150ms` and
+  `input_to_visible.p95=18.150ms` against `16.700ms`;
+  `runtime_apply.p95=11.545ms`,
+  `runtime_step_apply.p95=9.379ms`, and
+  `layout_rebuild.p95=4.470ms`.
+- Current cause summary:
+  the report still names
+  `root_flush_dirty_scheduler_plus_root_list_materialization`. The dominant
+  list remains `selected_signal_lane_rows` with `eval_ms=19.945`,
+  `diff_ms=15.705`, `user_function_body_ms=12.094`,
+  `full_eval_row_count=0`, and `row_materialize_ms=0.0`. Aggregate click
+  root-list counters show field-only projection is active but not enough:
+  `eval_ms=36.141`, `diff_ms=30.788`,
+  `user_function_body_ms=38.038`, `field_only_skipped_field_count=4768`,
+  and `field_cache_misses=256`.
+- Renderer check:
+  renderer upload remains solved for the current report. Post-interaction
+  upload is `3360` bytes with `3` dirty upload ranges, `3` queue writes,
+  `0` staging wraps, and `0` quad-cache evictions.
+- BYTES check:
+  the refreshed NovyWave bridge report proves real VCD/GHW payloads enter the
+  runtime as BYTES sidecars with stable digests and page/blob summaries, while
+  `wave_27.fst` remains hash-and-length descriptor proof only until chunked
+  `Stream<Bytes>` sidecars exist.
+- Result:
+  this refresh does not reopen BYTES/LIST work and does not unpostpone
+  TASK-0804A. The remaining root-flush/bridge-page identity work is still a
+  future TASK-0804A-style architecture problem or a new explicit task, not a
+  hidden unfinished TASK-1001/TASK-1002 requirement.
 
 ## File Maintenance Checklist
 

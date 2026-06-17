@@ -7735,6 +7735,11 @@ fn update_expression_for_routed_branch(
         return expression;
     }
     if let Some(expression) =
+        guarded_then_function_match_update_expression(program, field, target, fields, branch_source)
+    {
+        return expression;
+    }
+    if let Some(expression) =
         then_function_match_update_expression(program, field, target, fields, branch_source)
     {
         return expression;
@@ -7815,16 +7820,7 @@ fn then_function_match_update_expression(
         if !then_input_matches_source(field, input, source) {
             return None;
         }
-        let output = output.or_else(|| {
-            field
-                .ast_exprs
-                .iter()
-                .filter(|candidate| candidate.line > expr.line)
-                .find_map(|candidate| match candidate.kind {
-                    AstExprKind::Call { .. } => Some(candidate.id),
-                    _ => None,
-                })
-        })?;
+        let output = output.or_else(|| following_direct_then_call_expr_id(field, expr.line))?;
         let output = field
             .ast_exprs
             .iter()
@@ -7833,6 +7829,195 @@ fn then_function_match_update_expression(
             return None;
         };
         function_match_const_update_expression(program, field, target, fields, function, args)
+    })
+}
+
+fn following_direct_then_call_expr_id(field: &FieldDef, line: usize) -> Option<usize> {
+    field
+        .ast_exprs
+        .iter()
+        .filter(|candidate| candidate.line > line)
+        .find_map(|candidate| match candidate.kind {
+            AstExprKind::Call { .. } => Some(Some(candidate.id)),
+            AstExprKind::When { .. } | AstExprKind::MatchArm { .. } | AstExprKind::Then { .. } => {
+                Some(None)
+            }
+            _ => None,
+        })
+        .flatten()
+}
+
+fn guarded_then_function_match_update_expression(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+) -> Option<UpdateExpression> {
+    field.ast_exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        if !then_input_matches_source(field, input, source) {
+            return None;
+        }
+        let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
+        guarded_function_match_update_expression_from_expr(
+            program, field, target, fields, output, source,
+        )
+    })
+}
+
+fn guarded_function_match_update_expression_from_expr(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr_id: usize,
+    source: &str,
+) -> Option<UpdateExpression> {
+    let expr = field_expr(field, expr_id)?;
+    let AstExprKind::When { input } = expr.kind else {
+        return None;
+    };
+    let arms =
+        guarded_match_value_arms_after_when_expr(program, field, target, fields, expr.id, source);
+    if arms.is_empty() {
+        return None;
+    }
+    if let Some(input_expr) = field_expr(field, input)
+        && let AstExprKind::Infix { left, op, right } = &input_expr.kind
+    {
+        return Some(UpdateExpression::MatchNumberInfixConst {
+            left: scalar_update_operand_for_source(field, target, fields, *left, source)?,
+            op: op.clone(),
+            right: scalar_update_operand_for_source(field, target, fields, *right, source)?,
+            arms,
+        });
+    }
+    let raw_input = ast_argument_value(field, input)?;
+    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
+    Some(UpdateExpression::MatchValueConst { input, arms })
+}
+
+fn scalar_update_operand_for_source(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr_id: usize,
+    source: &str,
+) -> Option<String> {
+    let value = ast_argument_value(field, expr_id)?;
+    if value.parse::<i64>().is_ok() {
+        return Some(value);
+    }
+    if let Some((_, value_tail)) = value.split_once('.')
+        && let Some((target_parent, _)) = target.rsplit_once('.')
+    {
+        let sibling = format!("{target_parent}.{value_tail}");
+        if fields.iter().any(|candidate| candidate.path == sibling) {
+            return Some(sibling);
+        }
+    }
+    Some(canonical_scalar_update_path_for_source(
+        field, target, &value, fields, source,
+    ))
+}
+
+fn guarded_match_value_arms_after_when_expr(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    when_expr_id: usize,
+    source: &str,
+) -> Vec<UpdateValueMatchArm> {
+    let Some(when_expr) = field_expr(field, when_expr_id) else {
+        return Vec::new();
+    };
+    let end_line = field
+        .ast_exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_expr.line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
+        .filter_map(|expr| {
+            guarded_match_value_arm_expr(program, field, target, fields, expr, source)
+        })
+        .collect()
+}
+
+fn guarded_match_value_arm_expr(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr: &AstExpr,
+    source: &str,
+) -> Option<UpdateValueMatchArm> {
+    let AstExprKind::MatchArm {
+        pattern,
+        output: Some(output),
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let output =
+        guarded_update_value_expression_from_expr(program, field, target, fields, *output, source)?;
+    let pattern = match_const_pattern_label(pattern)?;
+    (!pattern.is_empty()).then(|| UpdateValueMatchArm { pattern, output })
+}
+
+fn guarded_update_value_expression_from_expr(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    expr_id: usize,
+    source: &str,
+) -> Option<UpdateValueExpression> {
+    let expr = field_expr(field, expr_id)?;
+    if let AstExprKind::Call { function, args } = &expr.kind {
+        return function_match_const_update_value_expression(
+            program, field, target, fields, function, args,
+        );
+    }
+    update_value_expression_from_expr(field, target, fields, expr_id, Some(source))
+}
+
+fn function_match_const_update_value_expression(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    function: &str,
+    args: &[AstCallArg],
+) -> Option<UpdateValueExpression> {
+    let UpdateExpression::MatchConst { input, arms } =
+        function_match_const_update_expression(program, field, target, fields, function, args)?
+    else {
+        return None;
+    };
+    Some(UpdateValueExpression::MatchConst {
+        input,
+        arms: arms
+            .into_iter()
+            .map(|arm| UpdateValueMatchArm {
+                pattern: arm.pattern,
+                output: UpdateValueExpression::Const { value: arm.output },
+            })
+            .collect(),
     })
 }
 
@@ -11819,6 +12004,105 @@ FUNCTION next_format(format) {
                     }
         }));
         verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
+    fn guarded_then_call_to_pure_match_function_preserves_row_guard() {
+        let source = r#"
+store: [
+    elements: [
+        format_cycle: SOURCE
+    ]
+    active_signal:
+        TEXT { reset_n } |> HOLD active_signal { LATEST {} }
+    selected_signal_defaults:
+        LIST {
+            [id: TEXT { clk }, formatter: Hexadecimal]
+            [id: TEXT { reset_n }, formatter: Hexadecimal]
+        }
+    selected_signal_rows:
+        selected_signal_defaults
+        |> List/map(selected_signal, new: [
+            id: selected_signal.id
+            formatter:
+                selected_signal.formatter |> HOLD formatter {
+                    LATEST {
+                        elements.format_cycle.event.press |> THEN {
+                            selected_signal.id == store.active_signal |> WHEN {
+                                True => next_format(format: formatter)
+                                False => formatter
+                            }
+                        }
+                    }
+                }
+        ])
+]
+
+FUNCTION next_format(format) {
+    format |> WHEN {
+        Hexadecimal => Binary
+        Binary => GroupedBinary
+        __ => Hexadecimal
+    }
+}
+"#;
+        let parsed =
+            boon_parser::parse_source("guarded-then-call-pure-match-function.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target.ends_with(".formatter")
+                    && branch.source == "store.elements.format_cycle"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "row formatter branch should lower, branches={:#?}",
+                    ir.update_branches
+                )
+            });
+        let UpdateExpression::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } = &branch.expression
+        else {
+            panic!(
+                "guarded formatter update should preserve row guard, got {:#?}",
+                branch.expression
+            );
+        };
+        assert!(
+            left.ends_with(".id"),
+            "left operand should read row id: {left}"
+        );
+        assert_eq!(op, "==");
+        assert_eq!(right, "store.active_signal");
+        assert!(arms.iter().any(|arm| {
+            arm.pattern == "True"
+                && matches!(
+                    &arm.output,
+                    UpdateValueExpression::MatchConst { input, arms }
+                        if input.ends_with(".formatter")
+                            && arms.iter().any(|nested| {
+                                nested.pattern == "Hexadecimal"
+                                    && matches!(
+                                        &nested.output,
+                                        UpdateValueExpression::Const { value } if value == "Binary"
+                                    )
+                            })
+                )
+        }));
+        assert!(arms.iter().any(|arm| {
+            arm.pattern == "False"
+                && matches!(
+                    &arm.output,
+                    UpdateValueExpression::ReadPath { path } if path.ends_with(".formatter")
+                )
+        }));
+        verify_static_schedule(&ir).unwrap();
     }
 
     #[test]

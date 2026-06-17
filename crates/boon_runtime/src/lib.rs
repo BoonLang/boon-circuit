@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use bitvec::prelude::*;
+use boon_bridge::{BridgeBlobRef, BridgePageRef, BridgeTaskCompletion, BridgeValue};
 use boon_ir::{
     DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListAppendFieldValue, ListId,
     ListInitialRecord, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind,
@@ -14,13 +15,14 @@ use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, DocumentAst,
     ParsedProgram, parse_project, parse_source,
 };
+use bytes::Bytes;
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
 use smallvec::SmallVec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::{Bound, Deref, DerefMut};
@@ -466,6 +468,32 @@ pub struct LiveRuntimeStepProfile {
     #[serde(default)]
     pub source_action_root_dirty_root_work_samples: Vec<LiveRuntimeDirtyRootWorkSample>,
     #[serde(default)]
+    pub source_action_root_candidate_defer_probe_samples: Vec<LiveRuntimeCandidateDeferProbeSample>,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_root_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_enqueue_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_materialization_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_changed_materialization_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_unchanged_materialization_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_demand_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_runtime_scalar_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_eval_scalar_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_state_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_document_state_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_runtime_value_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub source_action_root_candidate_defer_derived_read_count: usize,
+    #[serde(default)]
     pub source_action_route_stats_ms: f64,
     pub source_action_observe_ms: f64,
     pub source_action_root_materialization_ms: f64,
@@ -526,8 +554,27 @@ pub struct LiveRuntimeDirtyRootWorkSample {
     pub materialization_ms: f64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LiveRuntimeCandidateDeferProbeSample {
+    pub root_path: String,
+    pub simulated_defer_enqueue_count: usize,
+    pub materialization_count: usize,
+    pub changed_materialization_count: usize,
+    pub unchanged_materialization_count: usize,
+    pub demand_read_count: usize,
+    pub runtime_scalar_read_count: usize,
+    pub eval_scalar_read_count: usize,
+    pub state_summary_scalar_read_count: usize,
+    pub document_state_summary_scalar_read_count: usize,
+    pub runtime_value_summary_scalar_read_count: usize,
+    pub derived_read_count: usize,
+}
+
 const LIVE_RUNTIME_DIRTY_FRONTIER_SAMPLE_LIMIT: usize = 64;
 const LIVE_RUNTIME_DIRTY_ROOT_WORK_SAMPLE_LIMIT: usize = 64;
+const LIVE_RUNTIME_CANDIDATE_DEFER_SAMPLE_LIMIT: usize = 64;
+const ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE: &str =
+    "candidate_unobserved_source_free_pure";
 
 fn runtime_profile_root_demand_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -699,6 +746,55 @@ impl LiveRuntimeStepProfile {
             other.source_action_root_dirty_root_work_samples,
             LIVE_RUNTIME_DIRTY_ROOT_WORK_SAMPLE_LIMIT,
         );
+        extend_bounded_profile_samples(
+            &mut self.source_action_root_candidate_defer_probe_samples,
+            other.source_action_root_candidate_defer_probe_samples,
+            LIVE_RUNTIME_CANDIDATE_DEFER_SAMPLE_LIMIT,
+        );
+        self.source_action_root_candidate_defer_root_count = self
+            .source_action_root_candidate_defer_root_count
+            .saturating_add(other.source_action_root_candidate_defer_root_count);
+        self.source_action_root_candidate_defer_enqueue_count = self
+            .source_action_root_candidate_defer_enqueue_count
+            .saturating_add(other.source_action_root_candidate_defer_enqueue_count);
+        self.source_action_root_candidate_defer_materialization_count = self
+            .source_action_root_candidate_defer_materialization_count
+            .saturating_add(other.source_action_root_candidate_defer_materialization_count);
+        self.source_action_root_candidate_defer_changed_materialization_count = self
+            .source_action_root_candidate_defer_changed_materialization_count
+            .saturating_add(other.source_action_root_candidate_defer_changed_materialization_count);
+        self.source_action_root_candidate_defer_unchanged_materialization_count = self
+            .source_action_root_candidate_defer_unchanged_materialization_count
+            .saturating_add(
+                other.source_action_root_candidate_defer_unchanged_materialization_count,
+            );
+        self.source_action_root_candidate_defer_demand_read_count = self
+            .source_action_root_candidate_defer_demand_read_count
+            .saturating_add(other.source_action_root_candidate_defer_demand_read_count);
+        self.source_action_root_candidate_defer_runtime_scalar_read_count = self
+            .source_action_root_candidate_defer_runtime_scalar_read_count
+            .saturating_add(other.source_action_root_candidate_defer_runtime_scalar_read_count);
+        self.source_action_root_candidate_defer_eval_scalar_read_count = self
+            .source_action_root_candidate_defer_eval_scalar_read_count
+            .saturating_add(other.source_action_root_candidate_defer_eval_scalar_read_count);
+        self.source_action_root_candidate_defer_state_summary_scalar_read_count = self
+            .source_action_root_candidate_defer_state_summary_scalar_read_count
+            .saturating_add(
+                other.source_action_root_candidate_defer_state_summary_scalar_read_count,
+            );
+        self.source_action_root_candidate_defer_document_state_summary_scalar_read_count = self
+            .source_action_root_candidate_defer_document_state_summary_scalar_read_count
+            .saturating_add(
+                other.source_action_root_candidate_defer_document_state_summary_scalar_read_count,
+            );
+        self.source_action_root_candidate_defer_runtime_value_summary_scalar_read_count = self
+            .source_action_root_candidate_defer_runtime_value_summary_scalar_read_count
+            .saturating_add(
+                other.source_action_root_candidate_defer_runtime_value_summary_scalar_read_count,
+            );
+        self.source_action_root_candidate_defer_derived_read_count = self
+            .source_action_root_candidate_defer_derived_read_count
+            .saturating_add(other.source_action_root_candidate_defer_derived_read_count);
         self.source_action_route_stats_ms += other.source_action_route_stats_ms;
         self.source_action_observe_ms += other.source_action_observe_ms;
         self.source_action_root_materialization_ms += other.source_action_root_materialization_ms;
@@ -759,6 +855,19 @@ impl LiveRuntimeStepProfile {
             "source_action_root_dirty_frontier_samples": self.source_action_root_dirty_frontier_samples,
             "source_action_root_dirty_frontier_demand_classification_counts": self.source_action_root_dirty_frontier_demand_classification_counts,
             "source_action_root_dirty_root_work_samples": self.source_action_root_dirty_root_work_samples,
+            "source_action_root_candidate_defer_probe_samples": self.source_action_root_candidate_defer_probe_samples,
+            "source_action_root_candidate_defer_root_count": self.source_action_root_candidate_defer_root_count,
+            "source_action_root_candidate_defer_enqueue_count": self.source_action_root_candidate_defer_enqueue_count,
+            "source_action_root_candidate_defer_materialization_count": self.source_action_root_candidate_defer_materialization_count,
+            "source_action_root_candidate_defer_changed_materialization_count": self.source_action_root_candidate_defer_changed_materialization_count,
+            "source_action_root_candidate_defer_unchanged_materialization_count": self.source_action_root_candidate_defer_unchanged_materialization_count,
+            "source_action_root_candidate_defer_demand_read_count": self.source_action_root_candidate_defer_demand_read_count,
+            "source_action_root_candidate_defer_runtime_scalar_read_count": self.source_action_root_candidate_defer_runtime_scalar_read_count,
+            "source_action_root_candidate_defer_eval_scalar_read_count": self.source_action_root_candidate_defer_eval_scalar_read_count,
+            "source_action_root_candidate_defer_state_summary_scalar_read_count": self.source_action_root_candidate_defer_state_summary_scalar_read_count,
+            "source_action_root_candidate_defer_document_state_summary_scalar_read_count": self.source_action_root_candidate_defer_document_state_summary_scalar_read_count,
+            "source_action_root_candidate_defer_runtime_value_summary_scalar_read_count": self.source_action_root_candidate_defer_runtime_value_summary_scalar_read_count,
+            "source_action_root_candidate_defer_derived_read_count": self.source_action_root_candidate_defer_derived_read_count,
             "source_action_route_stats_ms": self.source_action_route_stats_ms,
             "source_action_unattributed_ms": self.source_action_unattributed_ms(),
             "source_action_observe_ms": self.source_action_observe_ms,
@@ -821,6 +930,8 @@ pub struct LiveRuntimeListScanCounters {
     pub join_field_rows_scanned: usize,
     pub map_join_field_fusions: usize,
     pub map_join_field_rows_fused: usize,
+    pub list_view_direct_rows: usize,
+    pub list_view_row_ref_materializations_avoided: usize,
     pub retain_rows_scanned: usize,
 }
 
@@ -881,6 +992,12 @@ impl LiveRuntimeListScanCounters {
         self.map_join_field_rows_fused = self
             .map_join_field_rows_fused
             .saturating_add(other.map_join_field_rows_fused);
+        self.list_view_direct_rows = self
+            .list_view_direct_rows
+            .saturating_add(other.list_view_direct_rows);
+        self.list_view_row_ref_materializations_avoided = self
+            .list_view_row_ref_materializations_avoided
+            .saturating_add(other.list_view_row_ref_materializations_avoided);
         self.retain_rows_scanned = self
             .retain_rows_scanned
             .saturating_add(other.retain_rows_scanned);
@@ -907,6 +1024,8 @@ impl LiveRuntimeListScanCounters {
             "join_field_rows_scanned": self.join_field_rows_scanned,
             "map_join_field_fusions": self.map_join_field_fusions,
             "map_join_field_rows_fused": self.map_join_field_rows_fused,
+            "list_view_direct_rows": self.list_view_direct_rows,
+            "list_view_row_ref_materializations_avoided": self.list_view_row_ref_materializations_avoided,
             "retain_rows_scanned": self.retain_rows_scanned,
         })
     }
@@ -1056,6 +1175,10 @@ fn record_root_commit_profile_sample(
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LiveRuntimeRootListViewProfile {
     pub list: String,
+    #[serde(default)]
+    pub list_storage_mode: String,
+    #[serde(default)]
+    pub list_value_shape: String,
     pub row_count: usize,
     pub previous_row_count: usize,
     pub changed_row_count: usize,
@@ -3645,6 +3768,14 @@ impl LiveRuntime {
         self.runtime.state_summary()
     }
 
+    pub fn refresh_candidate_defer_probe_profile(&mut self, profile: &mut LiveRuntimeStepProfile) {
+        self.runtime.copy_candidate_defer_probe_to_profile(profile);
+    }
+
+    pub fn clear_candidate_defer_probe(&mut self) {
+        self.runtime.clear_candidate_defer_probe();
+    }
+
     pub fn runtime_value_summaries(
         &mut self,
         paths: &[String],
@@ -4619,9 +4750,31 @@ impl LoadedRuntime {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.generic_derived_state.clear_value_caches();
+        let previous_context = generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::StateSummary);
         let mut summary = generic.generic_summary();
         generic.insert_list_projection_summary(&mut summary);
+        generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
         summary
+    }
+
+    fn copy_candidate_defer_probe_to_profile(&self, profile: &mut LiveRuntimeStepProfile) {
+        let Some(generic) = self.generic.as_ref() else {
+            return;
+        };
+        generic
+            .generic_derived_state
+            .copy_candidate_defer_probe_to_profile(profile);
+    }
+
+    fn clear_candidate_defer_probe(&self) {
+        let Some(generic) = self.generic.as_ref() else {
+            return;
+        };
+        generic.generic_derived_state.clear_candidate_defer_probe();
     }
 
     fn document_state_summary(&mut self) -> JsonValue {
@@ -4629,7 +4782,16 @@ impl LoadedRuntime {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.generic_derived_state.clear_value_caches();
-        generic.document_summary()
+        let previous_context = generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(
+                RuntimeCandidateDeferReadContext::DocumentStateSummary,
+            );
+        let summary = generic.document_summary();
+        generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
+        summary
     }
 
     fn source_payload_has_text(&self, source: &str) -> bool {
@@ -4667,7 +4829,17 @@ impl LoadedRuntime {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.generic_derived_state.clear_value_caches();
-        generic.document_summary_for_window(row_start, row_count, column_start, column_count)
+        let previous_context = generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(
+                RuntimeCandidateDeferReadContext::DocumentStateSummary,
+            );
+        let summary =
+            generic.document_summary_for_window(row_start, row_count, column_start, column_count);
+        generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
+        summary
     }
 
     fn runtime_value_summaries(
@@ -4681,7 +4853,16 @@ impl LoadedRuntime {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.generic_derived_state.clear_value_caches();
-        generic.runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
+        let previous_context = generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(
+                RuntimeCandidateDeferReadContext::RuntimeValueSummary,
+            );
+        let summary = generic.runtime_value_summaries(paths, max_depth, max_fields, max_list_items);
+        generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
+        summary
     }
 
     fn apply_counted_step(&mut self, step: &ScenarioStep) -> RuntimeResult<CountedStepOutput> {
@@ -4862,6 +5043,7 @@ impl LoadedRuntime {
             .as_mut()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
         let mut runtime_step_profile = LiveRuntimeStepProfile::default();
+        generic.generic_derived_state.clear_candidate_defer_probe();
         generic.generic_derived_state.clear_function_value_cache();
         generic.reset_list_scan_counters();
         let delta_start = deltas.len();
@@ -5028,6 +5210,9 @@ impl LoadedRuntime {
         let metrics_snapshot_started = Instant::now();
         let root_materialization_stats = generic.root_materialization_stats.clone();
         let function_call_stats = generic.function_call_stats.clone();
+        generic
+            .generic_derived_state
+            .copy_candidate_defer_probe_to_profile(&mut runtime_step_profile);
         runtime_step_profile.metrics_snapshot_ms = runtime_elapsed_ms(metrics_snapshot_started);
         Ok(StepExecutionMetrics {
             dirty_key_count: deltas.len(),
@@ -5327,6 +5512,10 @@ struct RuntimeGenericRecordExprField {
     name: String,
     value: RuntimeGenericExpr,
     spread: bool,
+}
+
+fn runtime_generic_expr_is_identifier(expr: &RuntimeGenericExpr, binding: &str) -> bool {
+    matches!(expr, RuntimeGenericExpr::Identifier(name) if name == binding)
 }
 
 #[derive(Clone, Debug)]
@@ -10575,6 +10764,7 @@ fn field_value_artifact(value: &FieldValue) -> JsonValue {
         FieldValue::Text(value) => json!({ "kind": "text", "value": value }),
         FieldValue::Bool(value) => json!({ "kind": "bool", "value": value }),
         FieldValue::Enum(value) => json!({ "kind": "enum", "value": value }),
+        FieldValue::Bytes(value) => json!({ "kind": "bytes", "value": value.artifact_json() }),
         FieldValue::Json(value) => json!({ "kind": "json", "value": value }),
     }
 }
@@ -10590,6 +10780,10 @@ fn field_value_from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<
         )?)),
         "enum" => Ok(FieldValue::Enum(artifact_string_field(
             object, "value", context,
+        )?)),
+        "bytes" => Ok(FieldValue::Bytes(RuntimeBytes::from_artifact(
+            artifact_field(object, "value", context)?,
+            &format!("{context}.value"),
         )?)),
         "json" => Ok(FieldValue::Json(
             artifact_field(object, "value", context)?.clone(),
@@ -10839,6 +11033,16 @@ fn artifact_usize_field(
         .as_u64()
         .ok_or_else(|| format!("{context}.{key} is not a non-negative integer"))?;
     usize::try_from(value).map_err(|_| format!("{context}.{key} does not fit in usize").into())
+}
+
+fn artifact_u64_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> RuntimeResult<u64> {
+    artifact_field(object, key, context)?
+        .as_u64()
+        .ok_or_else(|| format!("{context}.{key} is not a non-negative integer").into())
 }
 
 fn artifact_usize_map_field(
@@ -11975,6 +12179,8 @@ struct RuntimeListScanCounters {
     join_field_rows_scanned: usize,
     map_join_field_fusions: usize,
     map_join_field_rows_fused: usize,
+    list_view_direct_rows: usize,
+    list_view_row_ref_materializations_avoided: usize,
     retain_rows_scanned: usize,
 }
 
@@ -12035,6 +12241,12 @@ impl RuntimeListScanCounters {
         self.map_join_field_rows_fused = self
             .map_join_field_rows_fused
             .saturating_add(other.map_join_field_rows_fused);
+        self.list_view_direct_rows = self
+            .list_view_direct_rows
+            .saturating_add(other.list_view_direct_rows);
+        self.list_view_row_ref_materializations_avoided = self
+            .list_view_row_ref_materializations_avoided
+            .saturating_add(other.list_view_row_ref_materializations_avoided);
         self.retain_rows_scanned = self
             .retain_rows_scanned
             .saturating_add(other.retain_rows_scanned);
@@ -12061,6 +12273,8 @@ impl RuntimeListScanCounters {
             "join_field_rows_scanned": self.join_field_rows_scanned,
             "map_join_field_fusions": self.map_join_field_fusions,
             "map_join_field_rows_fused": self.map_join_field_rows_fused,
+            "list_view_direct_rows": self.list_view_direct_rows,
+            "list_view_row_ref_materializations_avoided": self.list_view_row_ref_materializations_avoided,
             "retain_rows_scanned": self.retain_rows_scanned,
         })
     }
@@ -12088,6 +12302,9 @@ impl From<RuntimeListScanCounters> for LiveRuntimeListScanCounters {
             join_field_rows_scanned: counters.join_field_rows_scanned,
             map_join_field_fusions: counters.map_join_field_fusions,
             map_join_field_rows_fused: counters.map_join_field_rows_fused,
+            list_view_direct_rows: counters.list_view_direct_rows,
+            list_view_row_ref_materializations_avoided: counters
+                .list_view_row_ref_materializations_avoided,
             retain_rows_scanned: counters.retain_rows_scanned,
         }
     }
@@ -14156,6 +14373,7 @@ struct ListMemory {
     text_columns: Vec<TextColumn>,
     bool_columns: Vec<BoolColumn>,
     enum_columns: Vec<TextColumn>,
+    bytes_columns: Vec<BytesColumn>,
     json_columns: Vec<JsonColumn>,
     text_lookup_indexes: Vec<TextLookupIndex>,
     numeric_lookup_indexes: Vec<NumericLookupIndex>,
@@ -14179,6 +14397,12 @@ struct BoolColumn {
 struct JsonColumn {
     field_id: FieldSlotId,
     values: Vec<JsonValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BytesColumn {
+    field_id: FieldSlotId,
+    values: Vec<RuntimeBytes>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14247,7 +14471,7 @@ struct TextSelectionLookupCacheKey {
     field: String,
     expected: String,
     equal: bool,
-    selection: Vec<usize>,
+    selection: ListSelectionIndices,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -14266,10 +14490,19 @@ struct NumericSelectionLookupCacheKey {
     scalar: i64,
     op: String,
     row_on_left: bool,
-    selection: Vec<usize>,
+    selection: ListSelectionIndices,
 }
 
 const LIST_SELECTION_DIRECT_SCAN_LIMIT: usize = 32;
+type ListSelectionIndices = Arc<[usize]>;
+
+fn list_selection_indices(indices: Vec<usize>) -> ListSelectionIndices {
+    Arc::from(indices)
+}
+
+fn empty_list_selection_indices() -> ListSelectionIndices {
+    Arc::from(Vec::<usize>::new())
+}
 
 fn selection_indices_matching_sorted(
     selection: &[usize],
@@ -14296,6 +14529,27 @@ fn list_indices_not_in_sorted(total_len: usize, sorted_matching: &[usize]) -> Ve
         output.push(index);
     }
     output
+}
+
+fn selection_indices_not_matching(selection: &[usize], matching: &[usize]) -> Vec<usize> {
+    let mut sorted_matching = matching.to_vec();
+    sorted_matching.sort_unstable();
+    sorted_matching.dedup();
+    selection
+        .iter()
+        .copied()
+        .filter(|index| sorted_matching.binary_search(index).is_err())
+        .collect()
+}
+
+fn moved_indices(mut matching: Vec<usize>, mut rest: Vec<usize>, first: bool) -> Vec<usize> {
+    if first {
+        matching.extend(rest);
+        matching
+    } else {
+        rest.extend(matching);
+        rest
+    }
 }
 
 fn sorted_indices_contain(sorted_indices: &[usize], index: usize) -> bool {
@@ -14373,6 +14627,9 @@ impl ListMemory {
             column.values.reserve(additional);
         }
         for column in &mut self.enum_columns {
+            column.values.reserve(additional);
+        }
+        for column in &mut self.bytes_columns {
             column.values.reserve(additional);
         }
         for column in &mut self.json_columns {
@@ -14513,6 +14770,10 @@ impl ListMemory {
             Some(FieldValueRef::Text(&self.text_columns[index].values[slot]))
         } else if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
             Some(FieldValueRef::Bool(self.bool_columns[index].values[slot]))
+        } else if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+            Some(FieldValueRef::Bytes(
+                &self.bytes_columns[index].values[slot],
+            ))
         } else if let Some(index) = json_column_index(&self.json_columns, &field_id) {
             Some(FieldValueRef::Json(&self.json_columns[index].values[slot]))
         } else {
@@ -15078,6 +15339,7 @@ impl ListMemory {
             self.text_columns.len()
                 + self.enum_columns.len()
                 + self.bool_columns.len()
+                + self.bytes_columns.len()
                 + self.json_columns.len(),
         );
         fields.extend(
@@ -15092,6 +15354,11 @@ impl ListMemory {
         );
         fields.extend(
             self.bool_columns
+                .iter()
+                .map(|column| column.field_id.as_str().to_owned()),
+        );
+        fields.extend(
+            self.bytes_columns
                 .iter()
                 .map(|column| column.field_id.as_str().to_owned()),
         );
@@ -15144,6 +15411,8 @@ impl ListMemory {
             Ok(())
         } else if bool_column_index(&self.bool_columns, &field_id).is_some() {
             Err(format!("cannot write text into bool runtime value `{field}`").into())
+        } else if bytes_column_index(&self.bytes_columns, &field_id).is_some() {
+            Err(format!("cannot write text into bytes runtime value `{field}`").into())
         } else if json_column_index(&self.json_columns, &field_id).is_some() {
             Err(format!("cannot write text into structured runtime value `{field}`").into())
         } else {
@@ -15163,6 +15432,9 @@ impl ListMemory {
         }
         if bool_column_index(&self.bool_columns, &field_id).is_some() {
             return Err(format!("cannot write text into bool runtime value `{field}`").into());
+        }
+        if bytes_column_index(&self.bytes_columns, &field_id).is_some() {
+            return Err(format!("cannot write text into bytes runtime value `{field}`").into());
         }
         if json_column_index(&self.json_columns, &field_id).is_some() {
             return Err(
@@ -15187,6 +15459,8 @@ impl ListMemory {
             || text_column_index(&self.enum_columns, &field_id).is_some()
         {
             Err("cannot write bool into text runtime value".into())
+        } else if bytes_column_index(&self.bytes_columns, &field_id).is_some() {
+            Err("cannot write bool into bytes runtime value".into())
         } else if json_column_index(&self.json_columns, &field_id).is_some() {
             Err("cannot write bool into structured runtime value".into())
         } else {
@@ -15200,6 +15474,10 @@ impl ListMemory {
                 self.set_textlike(index, field, &value)
             }
             FieldValue::Bool(value) => self.set_bool(index, field, value),
+            FieldValue::Bytes(_) => Err(format!(
+                "cannot overwrite bytes runtime value `{field}` through scalar set_value"
+            )
+            .into()),
             FieldValue::Json(_) => Err(format!(
                 "cannot overwrite structured runtime value `{field}` through scalar set_value"
             )
@@ -15229,6 +15507,9 @@ impl ListMemory {
                     self.json_columns.remove(index);
                     self.invalidate_text_lookup_indexes();
                 }
+                if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+                    self.bytes_columns.remove(index);
+                }
                 let index = text_column_index(&self.text_columns, &field_id)
                     .unwrap_or_else(|| self.insert_text_column(field_id, false));
                 self.text_columns[index].values[slot].clear();
@@ -15248,6 +15529,9 @@ impl ListMemory {
                     self.json_columns.remove(index);
                     self.invalidate_text_lookup_indexes();
                 }
+                if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+                    self.bytes_columns.remove(index);
+                }
                 let index = bool_column_index(&self.bool_columns, &field_id)
                     .unwrap_or_else(|| self.insert_bool_column(field_id));
                 self.bool_columns[index].values.set(slot, value);
@@ -15263,11 +15547,34 @@ impl ListMemory {
                     self.json_columns.remove(index);
                     self.invalidate_text_lookup_indexes();
                 }
+                if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+                    self.bytes_columns.remove(index);
+                }
                 let index = text_column_index(&self.enum_columns, &field_id)
                     .unwrap_or_else(|| self.insert_text_column(field_id, true));
                 self.enum_columns[index].values[slot].clear();
                 self.enum_columns[index].values[slot].push_str(&value);
                 self.invalidate_text_lookup_indexes();
+            }
+            FieldValue::Bytes(value) => {
+                if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+                    self.bool_columns.remove(index);
+                }
+                if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+                    self.text_columns.remove(index);
+                    self.invalidate_text_lookup_indexes();
+                }
+                if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+                    self.enum_columns.remove(index);
+                    self.invalidate_text_lookup_indexes();
+                }
+                if let Some(index) = json_column_index(&self.json_columns, &field_id) {
+                    self.json_columns.remove(index);
+                    self.invalidate_text_lookup_indexes();
+                }
+                let index = bytes_column_index(&self.bytes_columns, &field_id)
+                    .unwrap_or_else(|| self.insert_bytes_column(field_id));
+                self.bytes_columns[index].values[slot] = value;
             }
             FieldValue::Json(value) => {
                 if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
@@ -15280,6 +15587,9 @@ impl ListMemory {
                 if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
                     self.enum_columns.remove(index);
                     self.invalidate_text_lookup_indexes();
+                }
+                if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+                    self.bytes_columns.remove(index);
                 }
                 let index = json_column_index(&self.json_columns, &field_id)
                     .unwrap_or_else(|| self.insert_json_column(field_id));
@@ -15326,6 +15636,8 @@ impl ListMemory {
             Ok(())
         } else if bool_column_index(&self.bool_columns, &field_id).is_some() {
             Err("cannot reserve text capacity on bool runtime value".into())
+        } else if bytes_column_index(&self.bytes_columns, &field_id).is_some() {
+            Err("cannot reserve text capacity on bytes runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
         }
@@ -15374,6 +15686,12 @@ impl ListMemory {
                 FieldValue::Enum(column.values[slot].clone()),
             );
         }
+        for column in &self.bytes_columns {
+            columns.insert_value(
+                column.field_id.as_str().to_owned(),
+                FieldValue::Bytes(column.values[slot].clone()),
+            );
+        }
         for column in &self.json_columns {
             columns.insert_value(
                 column.field_id.as_str().to_owned(),
@@ -15408,6 +15726,11 @@ impl ListMemory {
                 self.insert_text_column(slot.field_id.clone(), true);
             }
         }
+        for slot in &columns.bytes {
+            if bytes_column_index(&self.bytes_columns, &slot.field_id).is_none() {
+                self.insert_bytes_column(slot.field_id.clone());
+            }
+        }
         for slot in &columns.json {
             if json_column_index(&self.json_columns, &slot.field_id).is_none() {
                 self.insert_json_column(slot.field_id.clone());
@@ -15425,6 +15748,9 @@ impl ListMemory {
         for column in &mut self.enum_columns {
             column.values[slot].clear();
         }
+        for column in &mut self.bytes_columns {
+            column.values[slot] = RuntimeBytes::empty();
+        }
         for column in &mut self.json_columns {
             column.values[slot] = JsonValue::Null;
         }
@@ -15441,6 +15767,11 @@ impl ListMemory {
         for value in columns.enums {
             if let Some(index) = text_column_index(&self.enum_columns, &value.field_id) {
                 self.enum_columns[index].values[slot] = value.value;
+            }
+        }
+        for value in columns.bytes {
+            if let Some(index) = bytes_column_index(&self.bytes_columns, &value.field_id) {
+                self.bytes_columns[index].values[slot] = value.value;
             }
         }
         for value in columns.json {
@@ -15488,6 +15819,17 @@ impl ListMemory {
         index
     }
 
+    fn insert_bytes_column(&mut self, field_id: FieldSlotId) -> usize {
+        let values = vec![RuntimeBytes::empty(); self.keys.len()];
+        let index = self
+            .bytes_columns
+            .binary_search_by(|slot| slot.field_id.cmp(&field_id))
+            .unwrap_or_else(|index| index);
+        self.bytes_columns
+            .insert(index, BytesColumn { field_id, values });
+        index
+    }
+
     fn push_column_defaults(&mut self) {
         for column in &mut self.text_columns {
             column.values.push(String::new());
@@ -15497,6 +15839,9 @@ impl ListMemory {
         }
         for column in &mut self.enum_columns {
             column.values.push(String::new());
+        }
+        for column in &mut self.bytes_columns {
+            column.values.push(RuntimeBytes::empty());
         }
         for column in &mut self.json_columns {
             column.values.push(JsonValue::Null);
@@ -15633,6 +15978,12 @@ fn bool_column_index(slots: &[BoolColumn], field_id: &FieldSlotId) -> Option<usi
 }
 
 fn json_column_index(slots: &[JsonColumn], field_id: &FieldSlotId) -> Option<usize> {
+    slots
+        .binary_search_by(|slot| slot.field_id.cmp(field_id))
+        .ok()
+}
+
+fn bytes_column_index(slots: &[BytesColumn], field_id: &FieldSlotId) -> Option<usize> {
     slots
         .binary_search_by(|slot| slot.field_id.cmp(field_id))
         .ok()
@@ -16133,7 +16484,40 @@ enum FieldValue {
     Text(String),
     Bool(bool),
     Enum(String),
+    Bytes(RuntimeBytes),
     Json(JsonValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeBytes {
+    digest: String,
+    byte_len: u64,
+    payload: RuntimeBytesPayload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeBytesPayload {
+    Inline(Bytes),
+    BlobRef {
+        media_type: String,
+        storage: String,
+        encoding: String,
+    },
+    PageRef {
+        artifact_digest: String,
+        schema_version: u32,
+        schema_hash: String,
+        request_fingerprint: String,
+        response_fingerprint: String,
+        input_digest: String,
+        generation: u64,
+        offset: u64,
+        limit: u64,
+        row_count: u64,
+        sample_count: u64,
+        transition_count: u64,
+        status: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -16154,6 +16538,7 @@ struct ValueColumns {
     text: Vec<TextValueSlot>,
     bools: Vec<BoolValueSlot>,
     enums: Vec<TextValueSlot>,
+    bytes: Vec<BytesValueSlot>,
     json: Vec<JsonValueSlot>,
 }
 
@@ -16175,6 +16560,12 @@ struct JsonValueSlot {
     value: JsonValue,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BytesValueSlot {
+    field_id: FieldSlotId,
+    value: RuntimeBytes,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FieldSlotId {
     id: FieldId,
@@ -16186,7 +16577,234 @@ enum FieldValueRef<'a> {
     Text(&'a str),
     Bool(bool),
     Enum(&'a str),
+    Bytes(&'a RuntimeBytes),
     Json(&'a JsonValue),
+}
+
+impl RuntimeBytes {
+    fn empty() -> Self {
+        Self::inline(Bytes::new())
+    }
+
+    fn inline(bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        Self {
+            digest: sha256_bytes(bytes.as_ref()),
+            byte_len: bytes.len() as u64,
+            payload: RuntimeBytesPayload::Inline(bytes),
+        }
+    }
+
+    fn inline_with_digest(
+        digest: impl Into<String>,
+        byte_len: u64,
+        bytes: Bytes,
+    ) -> RuntimeResult<Self> {
+        if byte_len != bytes.len() as u64 {
+            return Err(format!(
+                "runtime bytes declare byte_len {byte_len} but carry {} byte(s)",
+                bytes.len()
+            )
+            .into());
+        }
+        let digest = digest.into();
+        if digest.trim().is_empty() {
+            return Err("runtime bytes must carry a digest".into());
+        }
+        Ok(Self {
+            digest,
+            byte_len,
+            payload: RuntimeBytesPayload::Inline(bytes),
+        })
+    }
+
+    fn blob_ref(reference: &BridgeBlobRef) -> RuntimeResult<Self> {
+        if reference.digest.trim().is_empty() {
+            return Err("bridge blob ref must carry a digest".into());
+        }
+        Ok(Self {
+            digest: reference.digest.clone(),
+            byte_len: reference.byte_len,
+            payload: RuntimeBytesPayload::BlobRef {
+                media_type: reference.media_type.clone(),
+                storage: reference.storage.clone(),
+                encoding: reference.encoding.clone(),
+            },
+        })
+    }
+
+    fn page_ref(reference: &BridgePageRef) -> RuntimeResult<Self> {
+        if reference.page_digest.trim().is_empty() {
+            return Err("bridge page ref must carry a page digest".into());
+        }
+        if reference.byte_length != reference.byte_len {
+            return Err(format!(
+                "bridge page ref has byte_length {} but byte_len {}",
+                reference.byte_length, reference.byte_len
+            )
+            .into());
+        }
+        Ok(Self {
+            digest: reference.page_digest.clone(),
+            byte_len: reference.byte_len,
+            payload: RuntimeBytesPayload::PageRef {
+                artifact_digest: reference.artifact_digest.clone(),
+                schema_version: reference.schema_version,
+                schema_hash: reference.schema_hash.clone(),
+                request_fingerprint: reference.request_fingerprint.clone(),
+                response_fingerprint: reference.response_fingerprint.clone(),
+                input_digest: reference.input_digest.clone(),
+                generation: reference.generation,
+                offset: reference.offset,
+                limit: reference.limit,
+                row_count: reference.row_count,
+                sample_count: reference.sample_count,
+                transition_count: reference.transition_count,
+                status: reference.status.clone(),
+            },
+        })
+    }
+
+    fn storage_kind(&self) -> &'static str {
+        match self.payload {
+            RuntimeBytesPayload::Inline(_) => "inline",
+            RuntimeBytesPayload::BlobRef { .. } => "blob_ref",
+            RuntimeBytesPayload::PageRef { .. } => "page_ref",
+        }
+    }
+
+    fn report_json(&self) -> JsonValue {
+        match &self.payload {
+            RuntimeBytesPayload::Inline(_) => json!({
+                "$boon_type": "BYTES",
+                "storage": self.storage_kind(),
+                "digest": self.digest,
+                "byte_len": self.byte_len
+            }),
+            RuntimeBytesPayload::BlobRef {
+                media_type,
+                storage,
+                encoding,
+            } => json!({
+                "$boon_type": "BYTES",
+                "storage": self.storage_kind(),
+                "digest": self.digest,
+                "byte_len": self.byte_len,
+                "media_type": media_type,
+                "payload_storage": storage,
+                "encoding": encoding
+            }),
+            RuntimeBytesPayload::PageRef {
+                artifact_digest,
+                schema_version,
+                schema_hash,
+                request_fingerprint,
+                response_fingerprint,
+                input_digest,
+                generation,
+                offset,
+                limit,
+                row_count,
+                sample_count,
+                transition_count,
+                status,
+            } => json!({
+                "$boon_type": "BYTES",
+                "storage": self.storage_kind(),
+                "digest": self.digest,
+                "byte_len": self.byte_len,
+                "artifact_digest": artifact_digest,
+                "schema_version": schema_version,
+                "schema_hash": schema_hash,
+                "request_fingerprint": request_fingerprint,
+                "response_fingerprint": response_fingerprint,
+                "input_digest": input_digest,
+                "generation": generation,
+                "offset": offset,
+                "limit": limit,
+                "row_count": row_count,
+                "sample_count": sample_count,
+                "transition_count": transition_count,
+                "status": status
+            }),
+        }
+    }
+
+    fn artifact_json(&self) -> JsonValue {
+        let mut value = self.report_json();
+        if let (RuntimeBytesPayload::Inline(bytes), JsonValue::Object(object)) =
+            (&self.payload, &mut value)
+        {
+            object.insert(
+                "inline_bytes".to_owned(),
+                JsonValue::Array(bytes.iter().map(|byte| json!(*byte)).collect()),
+            );
+        }
+        value
+    }
+
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let storage = artifact_string_field(object, "storage", context)?;
+        let digest = artifact_string_field(object, "digest", context)?;
+        let byte_len = artifact_u64_field(object, "byte_len", context)?;
+        match storage.as_str() {
+            "inline" => {
+                let bytes = artifact_array_field(object, "inline_bytes", context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let byte = value.as_u64().ok_or_else(|| {
+                            format!("{context}.inline_bytes[{index}] must be a byte")
+                        })?;
+                        u8::try_from(byte).map_err(|_| {
+                            format!("{context}.inline_bytes[{index}] must be in 0..=255")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::inline_with_digest(digest, byte_len, Bytes::from(bytes))
+            }
+            "blob_ref" => Ok(Self {
+                digest,
+                byte_len,
+                payload: RuntimeBytesPayload::BlobRef {
+                    media_type: artifact_string_field(object, "media_type", context)?,
+                    storage: artifact_string_field(object, "payload_storage", context)?,
+                    encoding: artifact_string_field(object, "encoding", context)?,
+                },
+            }),
+            "page_ref" => Ok(Self {
+                digest,
+                byte_len,
+                payload: RuntimeBytesPayload::PageRef {
+                    artifact_digest: artifact_string_field(object, "artifact_digest", context)?,
+                    schema_version: artifact_u64_field(object, "schema_version", context)?
+                        .try_into()
+                        .map_err(|_| format!("{context}.schema_version exceeds u32"))?,
+                    schema_hash: artifact_string_field(object, "schema_hash", context)?,
+                    request_fingerprint: artifact_string_field(
+                        object,
+                        "request_fingerprint",
+                        context,
+                    )?,
+                    response_fingerprint: artifact_string_field(
+                        object,
+                        "response_fingerprint",
+                        context,
+                    )?,
+                    input_digest: artifact_string_field(object, "input_digest", context)?,
+                    generation: artifact_u64_field(object, "generation", context)?,
+                    offset: artifact_u64_field(object, "offset", context)?,
+                    limit: artifact_u64_field(object, "limit", context)?,
+                    row_count: artifact_u64_field(object, "row_count", context)?,
+                    sample_count: artifact_u64_field(object, "sample_count", context)?,
+                    transition_count: artifact_u64_field(object, "transition_count", context)?,
+                    status: artifact_string_field(object, "status", context)?,
+                },
+            }),
+            other => Err(format!("{context}.storage has unsupported value `{other}`").into()),
+        }
+    }
 }
 
 impl FieldSlotId {
@@ -16869,7 +17487,7 @@ impl GenericScheduledRuntime {
         list: &str,
         field: &str,
         expected: &str,
-        selection: &[usize],
+        selection: &ListSelectionIndices,
         equal: bool,
     ) -> RuntimeResult<(Option<Vec<usize>>, TextLookupProbe)> {
         let field = normalized_field_name(field);
@@ -16878,7 +17496,7 @@ impl GenericScheduledRuntime {
             field: field.clone(),
             expected: expected.to_owned(),
             equal,
-            selection: selection.to_vec(),
+            selection: Arc::clone(selection),
         };
         if let Some(cached) = self.indexed_lookup_cache.text_selection.get(&key) {
             return Ok((
@@ -16892,7 +17510,11 @@ impl GenericScheduledRuntime {
         let (indices, probe) = self
             .storage
             .find_list_indices_in_selection_by_textlike_indexed(
-                list, &field, expected, selection, equal,
+                list,
+                &field,
+                expected,
+                selection.as_ref(),
+                equal,
             )?;
         if probe.used_index {
             self.indexed_lookup_cache.text_selection.insert(
@@ -16957,7 +17579,7 @@ impl GenericScheduledRuntime {
         scalar: i64,
         op: &str,
         row_on_left: bool,
-        selection: &[usize],
+        selection: &ListSelectionIndices,
     ) -> RuntimeResult<(Option<Vec<usize>>, NumericLookupProbe)> {
         let field = normalized_field_name(field);
         let key = NumericSelectionLookupCacheKey {
@@ -16966,7 +17588,7 @@ impl GenericScheduledRuntime {
             scalar,
             op: op.to_owned(),
             row_on_left,
-            selection: selection.to_vec(),
+            selection: Arc::clone(selection),
         };
         if let Some(cached) = self.indexed_lookup_cache.numeric_selection.get(&key) {
             return Ok((
@@ -16985,7 +17607,7 @@ impl GenericScheduledRuntime {
                 scalar,
                 op,
                 row_on_left,
-                selection,
+                selection.as_ref(),
             )?;
         if probe.used_index {
             self.indexed_lookup_cache.numeric_selection.insert(
@@ -18053,7 +18675,7 @@ impl GenericScheduledRuntime {
                                     });
                                 observe(mutation)?;
                             }
-                            FieldValue::Json(_) => {}
+                            FieldValue::Bytes(_) | FieldValue::Json(_) => {}
                         }
                         if mode.materializes_derived() {
                             materialize_root_derived_after_actions = true;
@@ -19157,6 +19779,13 @@ impl GenericScheduledRuntime {
                     .structured_pending_parent_for_path(&dependent, &dirty, &pending_dependents)
                     .is_some();
                 let enqueued = !structured_parent_skip && dirty.insert(dependent.clone());
+                if enqueued
+                    && dependent_demand_classification
+                        == ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE
+                {
+                    self.generic_derived_state
+                        .record_candidate_defer_enqueue(&dependent);
+                }
                 record_dirty_frontier_cause(
                     frontier,
                     None,
@@ -19539,6 +20168,12 @@ impl GenericScheduledRuntime {
                         if dirty.len() > dirty_len_before {
                             enqueued = true;
                             enqueued_count = enqueued_count.saturating_add(1);
+                            if dependent_demand_classification
+                                == ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE
+                            {
+                                self.generic_derived_state
+                                    .record_candidate_defer_enqueue(&dependent);
+                            }
                         } else {
                             already_dirty = true;
                         }
@@ -19589,6 +20224,17 @@ impl GenericScheduledRuntime {
                 .as_ref()
                 .map(|materialization| materialization.changed_reads.len())
                 .unwrap_or_default();
+            if root_demand_classification_enabled {
+                let root_demand_classification = self.cached_root_demand_defer_classification(
+                    &path,
+                    Some(&field),
+                    &mut root_demand_classification_cache,
+                );
+                if root_demand_classification == ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE {
+                    self.generic_derived_state
+                        .record_candidate_defer_materialization(&path, changed);
+                }
+            }
             if let Some(work) = dirty_root_work.as_mut()
                 && let Some(entry) = work.get_mut(&path)
             {
@@ -19809,6 +20455,12 @@ impl GenericScheduledRuntime {
                 if dirty.len() > dirty_len_before {
                     enqueued = true;
                     enqueued_count = enqueued_count.saturating_add(1);
+                    if dependent_demand_classification
+                        == ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE
+                    {
+                        self.generic_derived_state
+                            .record_candidate_defer_enqueue(&dependent);
+                    }
                 } else {
                     already_dirty = true;
                 }
@@ -19890,10 +20542,47 @@ impl GenericScheduledRuntime {
                 let GenericReadKey::Root { field } = read else {
                     return None;
                 };
-                let value = self.runtime_scalar_boon_value(field)?.number().ok()?;
+                let value = self.runtime_scalar_number_for_numeric_guard(field)?;
                 Some((field.clone(), value))
             })
             .collect()
+    }
+
+    fn runtime_scalar_number_for_numeric_guard(&self, path: &str) -> Option<i64> {
+        for (list, target) in self.list_equations.count_targets() {
+            if runtime_path_matches_target(path, target)
+                && let Ok(count) = self.count_list_rows_for_target(list, target)
+            {
+                return Some(count as i64);
+            }
+        }
+        if let Some(value) = self.storage.root.owned_value(path) {
+            return field_value_number_for_numeric_guard(&value);
+        }
+        if let Some(value) = self
+            .root_state_paths
+            .iter()
+            .find(|root_path| root_state_path_matches_runtime_path(root_path, path))
+            .and_then(|root_path| self.storage.root.owned_value(root_path))
+        {
+            return field_value_number_for_numeric_guard(&value);
+        }
+        let mut candidates = vec![path.to_owned()];
+        if !path.starts_with("store.") {
+            candidates.push(format!("store.{path}"));
+        }
+        for candidate in candidates {
+            let parts = candidate.split('.').collect::<Vec<_>>();
+            for end in (1..parts.len()).rev() {
+                let parent = parts[..end].join(".");
+                let Some(FieldValue::Json(value)) = self.storage.root.owned_value(&parent) else {
+                    continue;
+                };
+                let child = json_child_path(&value, &parts[end..])?;
+                return json_number_for_numeric_guard(child);
+            }
+        }
+        None
     }
 
     fn materialize_root_derived_field_commit(
@@ -20472,17 +21161,134 @@ impl GenericScheduledRuntime {
         })
     }
 
+    fn insert_root_list_view_existing_source_column_reads(
+        &self,
+        reads: &mut BTreeSet<GenericReadKey>,
+        target_list: &str,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+    ) -> RuntimeResult<()> {
+        for (index, identity) in source_identities.iter().enumerate() {
+            let Some(identity) = identity else {
+                continue;
+            };
+            for field in self.storage.list_row_field_names(target_list, index)? {
+                reads.insert(list_column_read_key(&identity.list, &field));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_root_list_view_source_column_reads_for_rows(
+        &self,
+        reads: &mut BTreeSet<GenericReadKey>,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+        rows: &[RuntimeRowSnapshot],
+    ) {
+        for (identity, row) in source_identities.iter().zip(rows) {
+            let Some(identity) = identity else {
+                continue;
+            };
+            for field in row.columns.field_id_labels().values() {
+                reads.insert(list_column_read_key(&identity.list, field));
+            }
+        }
+    }
+
+    fn insert_root_list_view_source_column_reads_for_values(
+        &self,
+        reads: &mut BTreeSet<GenericReadKey>,
+        values: &[BoonValue],
+    ) -> RuntimeResult<()> {
+        for value in values {
+            let BoonValue::RowRef { list, index } = value else {
+                continue;
+            };
+            for field in self.storage.list_row_field_names(list, *index)? {
+                reads.insert(list_column_read_key(list, &field));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_root_list_view_source_column_reads_for_row_index_source(
+        &self,
+        reads: &mut BTreeSet<GenericReadKey>,
+        source: &RootListViewRowIndexSource,
+    ) -> RuntimeResult<()> {
+        let source_list = source.list();
+        for target_index in 0..source.len() {
+            let Some(source_index) = source.index_at(target_index) else {
+                continue;
+            };
+            for field in self
+                .storage
+                .list_row_field_names(source_list, source_index)?
+            {
+                reads.insert(list_column_read_key(source_list, &field));
+            }
+        }
+        Ok(())
+    }
+
+    fn root_list_view_row_index_source_for_iteration(
+        &mut self,
+        value: &BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<RootListViewRowIndexSource>> {
+        match value {
+            BoonValue::ListRef(list) => {
+                frame.reads.insert(list_read_key(list));
+                let len = self.storage.list_len(list)?;
+                self.record_list_view_direct_rows(len);
+                Ok(Some(RootListViewRowIndexSource::ListRef {
+                    list: list.clone(),
+                    len,
+                }))
+            }
+            BoonValue::ListSelection { list, indices } => {
+                frame.reads.insert(list_read_key(list));
+                self.record_list_view_direct_rows(indices.len());
+                Ok(Some(RootListViewRowIndexSource::ListSelection {
+                    list: list.clone(),
+                    indices: Arc::clone(indices),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn root_list_view_row_index_source_identities(
+        &self,
+        source: &RootListViewRowIndexSource,
+    ) -> RuntimeResult<Vec<Option<RootListViewFieldSourceIdentity>>> {
+        let source_list = source.list();
+        let list_epoch = self.storage.list_root_identity_epoch(source_list)?;
+        let mut identities = Vec::with_capacity(source.len());
+        for target_index in 0..source.len() {
+            let Some(source_index) = source.index_at(target_index) else {
+                identities.push(None);
+                continue;
+            };
+            let (key, generation) = self.storage.row_identity(source_list, source_index)?;
+            identities.push(Some(RootListViewFieldSourceIdentity {
+                list: source_list.to_owned(),
+                list_epoch,
+                key,
+                generation,
+            }));
+        }
+        Ok(identities)
+    }
+
     fn root_list_view_field_only_active_projector<'a>(
         &mut self,
         projector: &'a RootListViewFieldOnlyProjector,
-        row_value: &BoonValue,
+        row_value: BoonValue,
         child: &mut GenericEvalFrame,
     ) -> RuntimeResult<Result<RootListViewActiveRecordProjector<'a>, String>> {
         match projector {
             RootListViewFieldOnlyProjector::Direct(projector) => {
-                child
-                    .env
-                    .insert(projector.row_arg.clone(), row_value.clone());
+                child.env.insert(projector.row_arg.clone(), row_value);
                 Ok(Ok(RootListViewActiveRecordProjector {
                     function_name: &projector.function.name,
                     row_arg: &projector.row_arg,
@@ -20514,9 +21320,9 @@ impl GenericScheduledRuntime {
                 for arm in arms {
                     match generic_pattern_binding(&arm.pattern, &selector_value) {
                         Some(None) => {
-                            child
-                                .env
-                                .insert(arm.projector.row_arg.clone(), row_value.clone());
+                            if arm.projector.row_arg != *row_arg {
+                                child.env.insert(arm.projector.row_arg.clone(), row_value);
+                            }
                             return Ok(Ok(RootListViewActiveRecordProjector {
                                 function_name: &arm.projector.function.name,
                                 row_arg: &arm.projector.row_arg,
@@ -20573,14 +21379,26 @@ impl GenericScheduledRuntime {
             value = self.eval_pipe_continuation_chain(continuation, value, &mut frame)?;
         }
         let list_values_started = Instant::now();
-        let values = self.list_values_for_iteration(value, &mut frame)?;
+        let row_index_source =
+            self.root_list_view_row_index_source_for_iteration(&value, &mut frame)?;
+        let values = if row_index_source.is_some() {
+            None
+        } else {
+            Some(self.list_values_for_iteration(value, &mut frame)?)
+        };
         let list_values_ms = runtime_elapsed_ms(list_values_started);
         frame.root_stack.pop();
 
-        let source_identities = values
-            .iter()
-            .map(|value| self.root_list_view_field_source_identity(value))
-            .collect::<RuntimeResult<Vec<_>>>()?;
+        let source_identities = if let Some(source) = row_index_source.as_ref() {
+            self.root_list_view_row_index_source_identities(source)?
+        } else {
+            values
+                .as_ref()
+                .expect("values should exist when no row-index source is available")
+                .iter()
+                .map(|value| self.root_list_view_field_source_identity(value))
+                .collect::<RuntimeResult<Vec<_>>>()?
+        };
         if source_identities.iter().any(Option::is_none) {
             return Ok(RootListViewFieldOnlyOutcome::Fallback(
                 "missing_source_identity".to_owned(),
@@ -20597,10 +21415,33 @@ impl GenericScheduledRuntime {
 
         let previous_row_count = self.storage.list_len(list)?;
         let previous_snapshot_ms = 0.0;
-        if previous_row_count != values.len() {
+        let row_count = row_index_source
+            .as_ref()
+            .map(RootListViewRowIndexSource::len)
+            .or_else(|| values.as_ref().map(Vec::len))
+            .unwrap_or_default();
+        if previous_row_count != row_count {
             return Ok(RootListViewFieldOnlyOutcome::Fallback(
                 "row_count_mismatch".to_owned(),
             ));
+        }
+        self.insert_root_list_view_existing_source_column_reads(
+            &mut frame.reads,
+            list,
+            &source_identities,
+        )?;
+        if let Some(source) = row_index_source.as_ref() {
+            self.insert_root_list_view_source_column_reads_for_row_index_source(
+                &mut frame.reads,
+                source,
+            )?;
+        } else {
+            self.insert_root_list_view_source_column_reads_for_values(
+                &mut frame.reads,
+                values
+                    .as_ref()
+                    .expect("values should exist when no row-index source is available"),
+            )?;
         }
 
         let mut patches = Vec::new();
@@ -20620,13 +21461,25 @@ impl GenericScheduledRuntime {
             .get(&field.path)
             .cloned();
         let field_eval_started = Instant::now();
-        for (index, value) in values.into_iter().enumerate() {
+        for index in 0..row_count {
+            let value = if let Some(source) = row_index_source.as_ref() {
+                source.row_ref_at(index).ok_or_else(|| {
+                    format!("root list-view row-index source is missing target row {index}")
+                })?
+            } else {
+                values
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("root list-view materialization value is missing row {index}")
+                    })?
+            };
             let mut child = frame.child();
             child.call_depth += 1;
-            child.env.insert(plan.map_binding.clone(), value.clone());
             let active = match self.root_list_view_field_only_active_projector(
                 &plan.projector,
-                &value,
+                value,
                 &mut child,
             )? {
                 Ok(active) => active,
@@ -20662,10 +21515,17 @@ impl GenericScheduledRuntime {
                 let record_child = &record_field.statement;
                 let field_free_names = &record_field.free_env_names;
                 let env_fingerprint_started = Instant::now();
+                let env_fingerprint_free_names =
+                    self.root_list_view_env_fingerprint_free_names(&child, field_free_names);
                 let cache_env_fingerprint = root_list_view_cached_env_fingerprint(
                     &mut env_fingerprint_cache,
-                    || self.root_list_view_env_fingerprint(&child, Some(&field_free_names)),
-                    &field_free_names,
+                    || {
+                        self.root_list_view_env_fingerprint(
+                            &child,
+                            Some(env_fingerprint_free_names.as_ref()),
+                        )
+                    },
+                    env_fingerprint_free_names.as_ref(),
                 );
                 with_root_list_view_attribution(&mut child, |profile| {
                     profile.user_function_record_env_fingerprint_ms +=
@@ -20815,6 +21675,16 @@ impl GenericScheduledRuntime {
             .sum::<f64>();
         let profile = LiveRuntimeRootListViewProfile {
             list: list.to_owned(),
+            list_storage_mode: if row_index_source.is_some() {
+                "field_only_row_index_projection".to_owned()
+            } else {
+                "field_only_record_projection".to_owned()
+            },
+            list_value_shape: row_index_source
+                .as_ref()
+                .map(RootListViewRowIndexSource::value_shape)
+                .unwrap_or("record_field_projection")
+                .to_owned(),
             row_count: previous_row_count,
             previous_row_count,
             changed_row_count: changed_rows.len(),
@@ -20948,6 +21818,12 @@ impl GenericScheduledRuntime {
             for field in self.storage.list_row_field_names(list, target_index)? {
                 exposed_source_columns.insert((source_list.clone(), field));
             }
+            for field in self
+                .storage
+                .list_row_field_names(source_list, *source_index)?
+            {
+                exposed_source_columns.insert((source_list.clone(), field));
+            }
             for read in current_dirty_reads {
                 match read {
                     GenericReadKey::ListColumn {
@@ -21070,6 +21946,8 @@ impl GenericScheduledRuntime {
             .sum::<f64>();
         let profile = LiveRuntimeRootListViewProfile {
             list: list.to_owned(),
+            list_storage_mode: "row_ref_projection_reuse".to_owned(),
+            list_value_shape: "row_ref_values".to_owned(),
             row_count: values.len(),
             previous_row_count,
             changed_row_count: changed_rows.len(),
@@ -21248,12 +22126,42 @@ impl GenericScheduledRuntime {
         self.generic_derived_state
             .replace_root_numeric_stability_guards(field.path.clone(), numeric_stability_guards);
         let list_values_started = Instant::now();
-        let values = self.list_values_for_iteration(value, &mut frame)?;
+        let row_index_source =
+            self.root_list_view_row_index_source_for_iteration(&value, &mut frame)?;
+        let values = if let Some(source) = row_index_source.as_ref() {
+            (0..source.len())
+                .map(|index| {
+                    source.row_ref_at(index).ok_or_else(|| {
+                        format!("root list-view row-index source is missing target row {index}")
+                            .into()
+                    })
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?
+        } else {
+            self.list_values_for_iteration(value, &mut frame)?
+        };
         let list_values_ms = runtime_elapsed_ms(list_values_started);
-        let value_source_identities = values
-            .iter()
-            .map(|value| self.root_list_view_field_source_identity(value))
-            .collect::<RuntimeResult<Vec<_>>>()?;
+        let value_source_identities = if let Some(source) = row_index_source.as_ref() {
+            self.root_list_view_row_index_source_identities(source)?
+        } else {
+            values
+                .iter()
+                .map(|value| self.root_list_view_field_source_identity(value))
+                .collect::<RuntimeResult<Vec<_>>>()?
+        };
+        if let Some(source) = row_index_source.as_ref() {
+            self.insert_root_list_view_source_column_reads_for_row_index_source(
+                &mut frame.reads,
+                source,
+            )?;
+        } else {
+            self.insert_root_list_view_source_column_reads_for_values(&mut frame.reads, &values)?;
+        }
+        let list_value_shape = row_index_source
+            .as_ref()
+            .map(RootListViewRowIndexSource::value_shape)
+            .unwrap_or_else(|| root_list_view_value_shape(&values))
+            .to_owned();
         if let Some(result) = self.try_materialize_root_list_view_row_ref_reuse(
             field,
             &list,
@@ -21285,6 +22193,11 @@ impl GenericScheduledRuntime {
             })
             .collect::<RuntimeResult<Vec<_>>>()?;
         let row_materialize_ms = runtime_elapsed_ms(row_materialize_started);
+        self.insert_root_list_view_source_column_reads_for_rows(
+            &mut frame.reads,
+            &value_source_identities,
+            &rows,
+        );
         self.generic_derived_state
             .replace_root_reads(field.path.clone(), frame.reads.clone());
         let previous_snapshot_started = Instant::now();
@@ -21308,6 +22221,7 @@ impl GenericScheduledRuntime {
             .as_ref()
             .map(|context| context.mapped_source_identities.borrow().clone())
             .unwrap_or_default();
+        let source_identities_complete = value_source_identities.iter().all(Option::is_some);
         let root_source_identities = if root_source_identities.is_empty() {
             value_source_identities
         } else {
@@ -21325,6 +22239,14 @@ impl GenericScheduledRuntime {
             .sum::<f64>();
         let mut profile = LiveRuntimeRootListViewProfile {
             list: list.clone(),
+            list_storage_mode: if row_index_source.is_some() && source_identities_complete {
+                "generic_vec_with_row_index_source".to_owned()
+            } else if source_identities_complete {
+                "generic_vec_with_source_identities".to_owned()
+            } else {
+                "generic_vec_materialization".to_owned()
+            },
+            list_value_shape,
             row_count: rows.len(),
             previous_row_count: previous_rows.len(),
             changed_row_count: changed.changed_row_count,
@@ -22467,6 +23389,10 @@ impl GenericScheduledRuntime {
                     .get(field)
                     .cloned()
                     .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
+                BoonValue::RecordColumns(columns) => columns
+                    .value_ref_id(&FieldSlotId::from_path(field))
+                    .map(field_ref_to_boon)
+                    .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
                 _ => BoonValue::Error("type_error".to_owned()),
             });
         }
@@ -22914,6 +23840,11 @@ impl GenericScheduledRuntime {
         new_expr: &RuntimeGenericExpr,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        if runtime_generic_expr_is_identifier(new_expr, binding)
+            && let Some((output, _row_count)) = self.list_map_identity_storage_view(&list, frame)?
+        {
+            return Ok(output);
+        }
         let values = self.list_values_for_iteration(list, frame)?;
         let previous = frame.env.get(binding).cloned();
         let mut output = Vec::with_capacity(values.len());
@@ -24079,6 +25010,10 @@ impl GenericScheduledRuntime {
                     .get(field)
                     .cloned()
                     .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
+                BoonValue::RecordColumns(columns) => columns
+                    .value_ref_id(&FieldSlotId::from_path(field))
+                    .map(field_ref_to_boon)
+                    .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
                 _ => BoonValue::Error("type_error".to_owned()),
             });
         }
@@ -24612,19 +25547,19 @@ impl GenericScheduledRuntime {
             "List/count" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Number(
-                    self.list_values_for_iteration(list, frame)?.len() as i64,
+                    self.list_len_for_iteration(list, frame)? as i64
                 ))
             }
             "List/length" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Number(
-                    self.list_values_for_iteration(list, frame)?.len() as i64,
+                    self.list_len_for_iteration(list, frame)? as i64
                 ))
             }
             "List/is_not_empty" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Bool(
-                    !self.list_values_for_iteration(list, frame)?.is_empty(),
+                    self.list_len_for_iteration(list, frame)? > 0,
                 ))
             }
             "List/map" => {
@@ -24904,10 +25839,17 @@ impl GenericScheduledRuntime {
                     };
                     let env_fingerprint_started = Instant::now();
                     let field_free_names = self.statement_free_env_names(child);
+                    let env_fingerprint_free_names =
+                        self.root_list_view_env_fingerprint_free_names(frame, &field_free_names);
                     let cache_env_fingerprint = Some(root_list_view_cached_env_fingerprint(
                         &mut env_fingerprint_cache,
-                        || self.root_list_view_env_fingerprint(frame, Some(&field_free_names)),
-                        &field_free_names,
+                        || {
+                            self.root_list_view_env_fingerprint(
+                                frame,
+                                Some(env_fingerprint_free_names.as_ref()),
+                            )
+                        },
+                        env_fingerprint_free_names.as_ref(),
                     ));
                     with_root_list_view_attribution(frame, |profile| {
                         profile.user_function_record_env_fingerprint_ms +=
@@ -24943,10 +25885,17 @@ impl GenericScheduledRuntime {
                 };
                 let env_fingerprint_started = Instant::now();
                 let field_free_names = self.statement_free_env_names(child);
+                let env_fingerprint_free_names =
+                    self.root_list_view_env_fingerprint_free_names(frame, &field_free_names);
                 let cache_env_fingerprint = Some(root_list_view_cached_env_fingerprint(
                     &mut env_fingerprint_cache,
-                    || self.root_list_view_env_fingerprint(frame, Some(&field_free_names)),
-                    &field_free_names,
+                    || {
+                        self.root_list_view_env_fingerprint(
+                            frame,
+                            Some(env_fingerprint_free_names.as_ref()),
+                        )
+                    },
+                    env_fingerprint_free_names.as_ref(),
                 ));
                 with_root_list_view_attribution(frame, |profile| {
                     profile.user_function_record_env_fingerprint_ms +=
@@ -24976,6 +25925,25 @@ impl GenericScheduledRuntime {
             context.record_scope = previous_record_scope;
         }
         result
+    }
+
+    fn root_list_view_env_fingerprint_free_names<'a>(
+        &self,
+        frame: &GenericEvalFrame,
+        free_names: &'a BTreeSet<String>,
+    ) -> Cow<'a, BTreeSet<String>> {
+        let Some(context) = frame.root_list_view_field_cache_context.as_ref() else {
+            return Cow::Borrowed(free_names);
+        };
+        let Some(source_binding) = context.source_binding.as_ref() else {
+            return Cow::Borrowed(free_names);
+        };
+        if context.source_identity.is_none() || !free_names.contains(source_binding) {
+            return Cow::Borrowed(free_names);
+        }
+        let mut filtered = free_names.clone();
+        filtered.remove(source_binding);
+        Cow::Owned(filtered)
     }
 
     fn root_list_view_env_fingerprint(
@@ -25404,9 +26372,18 @@ impl GenericScheduledRuntime {
                 0
             },
             record_scope: context.record_scope.clone()?,
-            env_fingerprint: env_fingerprint
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.root_list_view_env_fingerprint(frame, free_names)),
+            env_fingerprint: env_fingerprint.map(str::to_owned).unwrap_or_else(|| {
+                if let Some(free_names) = free_names {
+                    let env_fingerprint_free_names =
+                        self.root_list_view_env_fingerprint_free_names(frame, free_names);
+                    self.root_list_view_env_fingerprint(
+                        frame,
+                        Some(env_fingerprint_free_names.as_ref()),
+                    )
+                } else {
+                    self.root_list_view_env_fingerprint(frame, None)
+                }
+            }),
             field: name.to_owned(),
         })
     }
@@ -25712,6 +26689,59 @@ impl GenericScheduledRuntime {
                 })
                 .unwrap_or(BoonValue::Empty));
         }
+        if let BoonValue::ListSelection { list, indices } = &list {
+            let field = normalized_field_name(field);
+            frame.reads.insert(list_read_key(list));
+            frame.reads.insert(list_column_read_key(list, &field));
+            let (output, probe) = self.cached_find_list_indices_in_selection_by_textlike_indexed(
+                list, &field, &expected, indices, true,
+            )?;
+            if probe.used_index {
+                self.list_scan_counters.row_occurrences_scanned = self
+                    .list_scan_counters
+                    .row_occurrences_scanned
+                    .saturating_add(probe.candidate_count);
+                self.list_scan_counters.route_candidates_visited = self
+                    .list_scan_counters
+                    .route_candidates_visited
+                    .saturating_add(probe.candidate_count);
+                self.list_scan_counters.text_lookup_index_hits = self
+                    .list_scan_counters
+                    .text_lookup_index_hits
+                    .saturating_add(1);
+                self.list_scan_counters.text_lookup_index_candidates = self
+                    .list_scan_counters
+                    .text_lookup_index_candidates
+                    .saturating_add(probe.candidate_count);
+                return Ok(output
+                    .and_then(|indices| indices.into_iter().next())
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .unwrap_or(BoonValue::Empty));
+            }
+            self.list_scan_counters.text_lookup_index_misses = self
+                .list_scan_counters
+                .text_lookup_index_misses
+                .saturating_add(1);
+            for index in indices.iter().copied() {
+                self.list_scan_counters.rows_scanned =
+                    self.list_scan_counters.rows_scanned.saturating_add(1);
+                self.list_scan_counters.list_find_rows_scanned = self
+                    .list_scan_counters
+                    .list_find_rows_scanned
+                    .saturating_add(1);
+                let value = BoonValue::RowRef {
+                    list: list.clone(),
+                    index,
+                };
+                if self.list_value_field_text(&value, &field, frame)? == expected {
+                    return Ok(value);
+                }
+            }
+            return Ok(BoonValue::Empty);
+        }
         for value in self.list_values_for_iteration(list, frame)? {
             self.list_scan_counters.rows_scanned =
                 self.list_scan_counters.rows_scanned.saturating_add(1);
@@ -25719,7 +26749,7 @@ impl GenericScheduledRuntime {
                 .list_scan_counters
                 .list_find_rows_scanned
                 .saturating_add(1);
-            if self.list_value_field_text(&value, field, frame)? == expected {
+            if self.list_value_field_text(&value, &field, frame)? == expected {
                 return self.list_value_for_pipeline(value, frame);
             }
         }
@@ -25749,7 +26779,7 @@ impl GenericScheduledRuntime {
                 list: list.to_owned(),
                 index,
             };
-            if self.list_value_field_text(&value, field, frame)? == expected {
+            if self.list_value_field_text(&value, &field, frame)? == expected {
                 return Ok(Some(index));
             }
         }
@@ -25867,7 +26897,7 @@ impl GenericScheduledRuntime {
                 };
                 return Ok(BoonValue::ListSelection {
                     list: list_name.clone(),
-                    indices,
+                    indices: list_selection_indices(indices),
                 });
             }
             self.list_scan_counters.text_lookup_index_misses = self
@@ -25886,7 +26916,7 @@ impl GenericScheduledRuntime {
                 self.record_text_lookup_filter_hit(probe);
                 return Ok(BoonValue::ListSelection {
                     list: list.clone(),
-                    indices: output.unwrap_or_default(),
+                    indices: list_selection_indices(output.unwrap_or_default()),
                 });
             }
             self.list_scan_counters.text_lookup_index_misses = self
@@ -25894,7 +26924,7 @@ impl GenericScheduledRuntime {
                 .text_lookup_index_misses
                 .saturating_add(1);
             let mut output = Vec::new();
-            for index in indices {
+            for index in indices.iter().copied() {
                 self.list_scan_counters.rows_scanned =
                     self.list_scan_counters.rows_scanned.saturating_add(1);
                 self.list_scan_counters.filter_field_rows_scanned = self
@@ -25903,15 +26933,15 @@ impl GenericScheduledRuntime {
                     .saturating_add(1);
                 let value = BoonValue::RowRef {
                     list: list.clone(),
-                    index: *index,
+                    index,
                 };
                 if (self.list_value_field_text(&value, &field, frame)? == expected) == equal {
-                    output.push(*index);
+                    output.push(index);
                 }
             }
             return Ok(BoonValue::ListSelection {
                 list: list.clone(),
-                indices: output,
+                indices: list_selection_indices(output),
             });
         }
         if let BoonValue::List(values) = &list
@@ -25990,8 +27020,60 @@ impl GenericScheduledRuntime {
         first: bool,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        let values = self.list_values_for_iteration(list, frame)?;
         let expected = value.as_text().unwrap_or_default();
+        let field = normalized_field_name(field);
+        if let BoonValue::ListRef(list_name) = &list {
+            frame.reads.insert(list_read_key(list_name));
+            frame.reads.insert(list_column_read_key(list_name, &field));
+            let (indices, probe) =
+                self.cached_find_list_indices_by_textlike_indexed(list_name, &field, &expected)?;
+            if probe.used_index {
+                self.record_text_lookup_filter_hit(probe);
+                let matching = indices.unwrap_or_default();
+                let rest = list_indices_not_in_sorted(self.storage.list_len(list_name)?, &matching);
+                let row_count = matching.len().saturating_add(rest.len());
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(row_count);
+                return Ok(BoonValue::ListSelection {
+                    list: list_name.clone(),
+                    indices: list_selection_indices(moved_indices(matching, rest, first)),
+                });
+            }
+            self.list_scan_counters.text_lookup_index_misses = self
+                .list_scan_counters
+                .text_lookup_index_misses
+                .saturating_add(1);
+        }
+        if let BoonValue::ListSelection { list, indices } = &list {
+            frame.reads.insert(list_read_key(list));
+            frame.reads.insert(list_column_read_key(list, &field));
+            let (output, probe) = self.cached_find_list_indices_in_selection_by_textlike_indexed(
+                list, &field, &expected, indices, true,
+            )?;
+            if probe.used_index {
+                self.record_text_lookup_filter_hit(probe);
+                let matching = output.unwrap_or_default();
+                let rest = selection_indices_not_matching(indices, &matching);
+                let row_count = matching.len().saturating_add(rest.len());
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(row_count);
+                return Ok(BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(moved_indices(matching, rest, first)),
+                });
+            }
+            self.list_scan_counters.text_lookup_index_misses = self
+                .list_scan_counters
+                .text_lookup_index_misses
+                .saturating_add(1);
+        }
+        let values = self.list_values_for_iteration(list, frame)?;
         let mut matched = Vec::new();
         let mut rest = Vec::new();
         for value in values {
@@ -26001,7 +27083,7 @@ impl GenericScheduledRuntime {
                 .list_scan_counters
                 .move_field_rows_scanned
                 .saturating_add(1);
-            if self.list_value_field_text(&value, field, frame)? == expected {
+            if self.list_value_field_text(&value, &field, frame)? == expected {
                 matched.push(self.list_value_for_pipeline(value, frame)?);
             } else {
                 rest.push(self.list_value_for_pipeline(value, frame)?);
@@ -26026,6 +27108,39 @@ impl GenericScheduledRuntime {
         empty_expr: Option<usize>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        if let BoonValue::ListSelection { list, indices } = &list {
+            frame.reads.insert(list_read_key(list));
+            self.list_scan_counters.row_occurrences_scanned = self
+                .list_scan_counters
+                .row_occurrences_scanned
+                .saturating_add(indices.len());
+            self.record_list_view_direct_rows(indices.len());
+            return self.list_join_field_row_indices(
+                list,
+                indices.iter().copied(),
+                field,
+                separator_expr,
+                empty_expr,
+                frame,
+            );
+        }
+        if let BoonValue::ListRef(list) = &list {
+            frame.reads.insert(list_read_key(list));
+            let len = self.storage.list_len(list)?;
+            self.list_scan_counters.row_occurrences_scanned = self
+                .list_scan_counters
+                .row_occurrences_scanned
+                .saturating_add(len);
+            self.record_list_view_direct_rows(len);
+            return self.list_join_field_row_indices(
+                list,
+                0..len,
+                field,
+                separator_expr,
+                empty_expr,
+                frame,
+            );
+        }
         let values = self.list_values_for_iteration(list, frame)?;
         let mut parts = Vec::new();
         for value in values {
@@ -26036,6 +27151,64 @@ impl GenericScheduledRuntime {
                 .join_field_rows_scanned
                 .saturating_add(1);
             let text = self.list_value_field_text(&value, field, frame)?;
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        match parts.len() {
+            0 => self.eval_join_field_empty(empty_expr, frame),
+            1 => Ok(BoonValue::Text(parts.pop().unwrap_or_default())),
+            _ => {
+                let separator = self.eval_join_field_separator(separator_expr, frame)?;
+                Ok(BoonValue::Text(parts.join(&separator)))
+            }
+        }
+    }
+
+    fn record_list_view_direct_rows(&mut self, row_count: usize) {
+        self.list_scan_counters.list_view_direct_rows = self
+            .list_scan_counters
+            .list_view_direct_rows
+            .saturating_add(row_count);
+        self.list_scan_counters
+            .list_view_row_ref_materializations_avoided = self
+            .list_scan_counters
+            .list_view_row_ref_materializations_avoided
+            .saturating_add(row_count);
+    }
+
+    fn list_row_ref_field_text(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<String> {
+        let field = self.resolve_list_row_field(list, index, &normalized_field_name(field))?;
+        Ok(self
+            .read_list_field(list, index, &field, frame)?
+            .as_text()
+            .unwrap_or_default())
+    }
+
+    fn list_join_field_row_indices(
+        &mut self,
+        list: &str,
+        indices: impl IntoIterator<Item = usize>,
+        field: &str,
+        separator_expr: Option<usize>,
+        empty_expr: Option<usize>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut parts = Vec::new();
+        for index in indices {
+            self.list_scan_counters.rows_scanned =
+                self.list_scan_counters.rows_scanned.saturating_add(1);
+            self.list_scan_counters.join_field_rows_scanned = self
+                .list_scan_counters
+                .join_field_rows_scanned
+                .saturating_add(1);
+            let text = self.list_row_ref_field_text(list, index, field, frame)?;
             if !text.is_empty() {
                 parts.push(text);
             }
@@ -26299,7 +27472,7 @@ impl GenericScheduledRuntime {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                (list, Some(indices))
+                (list, Some(list_selection_indices(indices)))
             }
             _ => return Ok(None),
         };
@@ -26312,19 +27485,19 @@ impl GenericScheduledRuntime {
         for predicate_index in planned_order {
             let Some(indices) = self.apply_indexed_pipeline_predicate(
                 &list,
-                selection.as_deref(),
+                selection.as_ref(),
                 &predicates[predicate_index],
                 frame,
             )?
             else {
                 return Ok(None);
             };
-            selection = Some(indices);
+            selection = Some(list_selection_indices(indices));
         }
 
         Ok(Some(BoonValue::ListSelection {
             list,
-            indices: selection.unwrap_or_default(),
+            indices: selection.unwrap_or_else(empty_list_selection_indices),
         }))
     }
 
@@ -26409,7 +27582,7 @@ impl GenericScheduledRuntime {
     fn apply_indexed_pipeline_predicate(
         &mut self,
         list: &str,
-        selection: Option<&[usize]>,
+        selection: Option<&ListSelectionIndices>,
         predicate: &EvaluatedIndexedPipelinePredicate,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<Option<Vec<usize>>> {
@@ -26431,7 +27604,7 @@ impl GenericScheduledRuntime {
     fn indexed_pipeline_text_filter_indices(
         &mut self,
         list: &str,
-        selection: Option<&[usize]>,
+        selection: Option<&ListSelectionIndices>,
         field: &str,
         expected: &str,
         equal: bool,
@@ -26478,7 +27651,7 @@ impl GenericScheduledRuntime {
     fn indexed_pipeline_numeric_retain_indices(
         &mut self,
         list: &str,
-        selection: Option<&[usize]>,
+        selection: Option<&ListSelectionIndices>,
         plan: &NumericRetainComparePlan,
         scalar: i64,
         frame: &mut GenericEvalFrame,
@@ -26497,7 +27670,7 @@ impl GenericScheduledRuntime {
             )?;
             if probe.used_index {
                 self.record_numeric_lookup_retain_hit(probe);
-                (selection.to_vec(), output.unwrap_or_default())
+                (selection.as_ref().to_vec(), output.unwrap_or_default())
             } else {
                 self.list_scan_counters.numeric_lookup_index_misses = self
                     .list_scan_counters
@@ -26735,6 +27908,40 @@ impl GenericScheduledRuntime {
             return Ok(None);
         };
 
+        if let BoonValue::ListSelection { list, indices } = &list {
+            frame.reads.insert(list_read_key(list));
+            self.list_scan_counters.row_occurrences_scanned = self
+                .list_scan_counters
+                .row_occurrences_scanned
+                .saturating_add(indices.len());
+            self.record_list_view_direct_rows(indices.len());
+            return self.try_eval_map_join_field_row_indices(
+                list,
+                indices.iter().copied(),
+                binding,
+                projected_field_expr,
+                join_args,
+                frame,
+            );
+        }
+        if let BoonValue::ListRef(list) = &list {
+            frame.reads.insert(list_read_key(list));
+            let len = self.storage.list_len(list)?;
+            self.list_scan_counters.row_occurrences_scanned = self
+                .list_scan_counters
+                .row_occurrences_scanned
+                .saturating_add(len);
+            self.record_list_view_direct_rows(len);
+            return self.try_eval_map_join_field_row_indices(
+                list,
+                0..len,
+                binding,
+                projected_field_expr,
+                join_args,
+                frame,
+            );
+        }
+
         let values = self.list_values_for_iteration(list, frame)?;
         let previous = frame.env.get(binding).cloned();
         let mut parts = Vec::new();
@@ -26742,6 +27949,70 @@ impl GenericScheduledRuntime {
         for value in values {
             rows_fused = rows_fused.saturating_add(1);
             frame.env.insert(binding.to_owned(), value);
+            let text = self
+                .eval_expr(projected_field_expr, frame)?
+                .as_text()
+                .unwrap_or_default();
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        if let Some(previous) = previous {
+            frame.env.insert(binding.to_owned(), previous);
+        } else {
+            frame.env.remove(binding);
+        }
+
+        let separator_expr = join_args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("separator"))
+            .map(|arg| arg.value);
+        let empty_expr = join_args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("empty"))
+            .map(|arg| arg.value);
+
+        self.list_scan_counters.map_join_field_fusions = self
+            .list_scan_counters
+            .map_join_field_fusions
+            .saturating_add(1);
+        self.list_scan_counters.map_join_field_rows_fused = self
+            .list_scan_counters
+            .map_join_field_rows_fused
+            .saturating_add(rows_fused);
+
+        let value = match parts.len() {
+            0 => self.eval_join_field_empty(empty_expr, frame)?,
+            1 => BoonValue::Text(parts.pop().unwrap_or_default()),
+            _ => {
+                let separator = self.eval_join_field_separator(separator_expr, frame)?;
+                BoonValue::Text(parts.join(&separator))
+            }
+        };
+        Ok(Some(value))
+    }
+
+    fn try_eval_map_join_field_row_indices(
+        &mut self,
+        list: &str,
+        indices: impl IntoIterator<Item = usize>,
+        binding: &str,
+        projected_field_expr: usize,
+        join_args: &[AstCallArg],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        let previous = frame.env.get(binding).cloned();
+        let mut parts = Vec::new();
+        let mut rows_fused = 0usize;
+        for index in indices {
+            rows_fused = rows_fused.saturating_add(1);
+            frame.env.insert(
+                binding.to_owned(),
+                BoonValue::RowRef {
+                    list: list.to_owned(),
+                    index,
+                },
+            );
             let text = self
                 .eval_expr(projected_field_expr, frame)?
                 .as_text()
@@ -26816,7 +28087,8 @@ impl GenericScheduledRuntime {
                     .row_occurrences_scanned
                     .saturating_add(indices.len());
                 Ok(indices
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|index| BoonValue::RowRef {
                         list: list.clone(),
                         index,
@@ -26888,7 +28160,8 @@ impl GenericScheduledRuntime {
                             .row_occurrences_scanned
                             .saturating_add(indices.len());
                         Ok(indices
-                            .into_iter()
+                            .iter()
+                            .copied()
                             .map(|index| BoonValue::RowRef {
                                 list: list.clone(),
                                 index,
@@ -26913,6 +28186,70 @@ impl GenericScheduledRuntime {
                 }
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    fn list_len_for_iteration(
+        &mut self,
+        list: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<usize> {
+        match list {
+            BoonValue::List(values) => Ok(values.len()),
+            BoonValue::ListSelection { list, indices } => {
+                frame.reads.insert(list_read_key(&list));
+                Ok(indices.len())
+            }
+            BoonValue::ListRef(list) => {
+                frame.reads.insert(list_read_key(&list));
+                self.storage.list_len(&list)
+            }
+            BoonValue::Text(path) => {
+                let mut candidates = vec![path.clone()];
+                if let Some(local) = path.strip_prefix("store.") {
+                    candidates.push(local.to_owned());
+                } else {
+                    candidates.push(format!("store.{path}"));
+                }
+                for candidate in &candidates {
+                    if let Some(list_name) = candidate
+                        .strip_prefix("store.")
+                        .filter(|local| self.storage.lists.memory(local).is_some())
+                        .or_else(|| {
+                            self.storage
+                                .lists
+                                .memory(candidate)
+                                .is_some()
+                                .then_some(candidate.as_str())
+                        })
+                        .filter(|list_name| !self.dynamic_list_view_lists.contains(*list_name))
+                    {
+                        let list = list_name.to_owned();
+                        frame.reads.insert(list_read_key(&list));
+                        return self.storage.list_len(&list);
+                    }
+                }
+                let mut resolved = None;
+                for candidate in candidates {
+                    if let Some(value) = self.root_derived_boon_value(&candidate, frame)? {
+                        resolved = Some(value);
+                        break;
+                    }
+                }
+                match resolved {
+                    Some(BoonValue::List(values)) => Ok(values.len()),
+                    Some(BoonValue::ListSelection { list, indices }) => {
+                        frame.reads.insert(list_read_key(&list));
+                        Ok(indices.len())
+                    }
+                    Some(BoonValue::ListRef(list)) => {
+                        frame.reads.insert(list_read_key(&list));
+                        self.storage.list_len(&list)
+                    }
+                    _ => Ok(0),
+                }
+            }
+            _ => Ok(0),
         }
     }
 
@@ -27071,6 +28408,45 @@ impl GenericScheduledRuntime {
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
         let index = usize::try_from(index).map_err(|_| "List/get index is negative")?;
+        match &list {
+            BoonValue::ListRef(list) => {
+                frame.reads.insert(list_read_key(list));
+                if index >= self.storage.list_len(list)? {
+                    return Ok(BoonValue::Empty);
+                }
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(1);
+                return self.list_value_for_pipeline(
+                    BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    },
+                    frame,
+                );
+            }
+            BoonValue::ListSelection { list, indices } => {
+                frame.reads.insert(list_read_key(list));
+                let Some(index) = indices.get(index).copied() else {
+                    return Ok(BoonValue::Empty);
+                };
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(1);
+                return self.list_value_for_pipeline(
+                    BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    },
+                    frame,
+                );
+            }
+            _ => {}
+        }
         let values = self.list_values_for_iteration(list, frame)?;
         match values.get(index).cloned() {
             Some(value) => self.list_value_for_pipeline(value, frame),
@@ -27086,6 +28462,17 @@ impl GenericScheduledRuntime {
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
         let map_started = Instant::now();
+        if self.ast_expr_is_identifier(new_expr, binding)
+            && let Some((output, row_count)) = self.list_map_identity_storage_view(&list, frame)?
+        {
+            let total_ms = runtime_elapsed_ms(map_started);
+            with_root_list_view_attribution(frame, |profile| {
+                profile.list_map_call_count = profile.list_map_call_count.saturating_add(1);
+                profile.list_map_row_count = profile.list_map_row_count.saturating_add(row_count);
+                profile.list_map_total_ms += total_ms;
+            });
+            return Ok(output);
+        }
         let values_started = Instant::now();
         let values = self.list_values_for_iteration(list, frame)?;
         let values_ms = runtime_elapsed_ms(values_started);
@@ -27218,6 +28605,48 @@ impl GenericScheduledRuntime {
         Ok(BoonValue::List(output))
     }
 
+    fn ast_expr_is_identifier(&self, expr_id: usize, binding: &str) -> bool {
+        self.generic_derived.expressions.get(expr_id).is_some_and(
+            |expr| matches!(&expr.kind, AstExprKind::Identifier(name) if name == binding),
+        )
+    }
+
+    fn list_map_identity_storage_view(
+        &mut self,
+        list: &BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<(BoonValue, usize)>> {
+        match list {
+            BoonValue::ListRef(list) => {
+                frame.reads.insert(list_read_key(list));
+                let row_count = self.storage.list_len(list)?;
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(row_count);
+                Ok(Some((BoonValue::ListRef(list.clone()), row_count)))
+            }
+            BoonValue::ListSelection { list, indices } => {
+                frame.reads.insert(list_read_key(list));
+                let row_count = indices.len();
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(row_count);
+                Ok(Some((
+                    BoonValue::ListSelection {
+                        list: list.clone(),
+                        indices: Arc::clone(indices),
+                    },
+                    row_count,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn root_list_view_field_source_identity(
         &self,
         value: &BoonValue,
@@ -27339,7 +28768,7 @@ impl GenericScheduledRuntime {
                 }
                 return Ok(Some(BoonValue::ListSelection {
                     list: list_name.clone(),
-                    indices: output_indices,
+                    indices: list_selection_indices(output_indices),
                 }));
             }
             self.list_scan_counters.numeric_lookup_index_misses = self
@@ -27371,14 +28800,14 @@ impl GenericScheduledRuntime {
                         scalar,
                         &plan.op,
                         plan.row_on_left,
-                        indices,
+                        indices.as_ref(),
                         &output_indices,
                         frame,
                     )?;
                 }
                 return Ok(Some(BoonValue::ListSelection {
                     list: list.clone(),
-                    indices: output_indices,
+                    indices: list_selection_indices(output_indices),
                 }));
             }
             self.list_scan_counters.numeric_lookup_index_misses = self
@@ -27386,7 +28815,7 @@ impl GenericScheduledRuntime {
                 .numeric_lookup_index_misses
                 .saturating_add(1);
             let mut output = Vec::new();
-            for index in indices {
+            for index in indices.iter().copied() {
                 self.list_scan_counters.rows_scanned =
                     self.list_scan_counters.rows_scanned.saturating_add(1);
                 self.list_scan_counters.retain_rows_scanned = self
@@ -27395,7 +28824,7 @@ impl GenericScheduledRuntime {
                     .saturating_add(1);
                 let value = BoonValue::RowRef {
                     list: list.clone(),
-                    index: *index,
+                    index,
                 };
                 let Ok(row_value) = self.list_value_field_number(&value, &plan.field, frame) else {
                     continue;
@@ -27406,12 +28835,12 @@ impl GenericScheduledRuntime {
                     compare_i64(scalar, &plan.op, row_value)
                 };
                 if keep {
-                    output.push(*index);
+                    output.push(index);
                 }
             }
             return Ok(Some(BoonValue::ListSelection {
                 list: list.clone(),
-                indices: output,
+                indices: list_selection_indices(output),
             }));
         }
         if let BoonValue::List(values) = list
@@ -27464,7 +28893,7 @@ impl GenericScheduledRuntime {
                 }
                 return Ok(Some(BoonValue::ListSelection {
                     list: list_name.to_owned(),
-                    indices: output_indices,
+                    indices: list_selection_indices(output_indices),
                 }));
             }
             self.list_scan_counters.numeric_lookup_index_misses = self
@@ -28323,6 +29752,46 @@ impl GenericScheduledRuntime {
         list: BoonValue,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        match &list {
+            BoonValue::ListRef(list) => {
+                frame.reads.insert(list_read_key(list));
+                let len = self.storage.list_len(list)?;
+                let Some(index) = len.checked_sub(1) else {
+                    return Ok(BoonValue::Empty);
+                };
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(1);
+                return self.list_value_for_pipeline(
+                    BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    },
+                    frame,
+                );
+            }
+            BoonValue::ListSelection { list, indices } => {
+                frame.reads.insert(list_read_key(list));
+                let Some(index) = indices.last().copied() else {
+                    return Ok(BoonValue::Empty);
+                };
+                self.list_scan_counters
+                    .list_view_row_ref_materializations_avoided = self
+                    .list_scan_counters
+                    .list_view_row_ref_materializations_avoided
+                    .saturating_add(1);
+                return self.list_value_for_pipeline(
+                    BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    },
+                    frame,
+                );
+            }
+            _ => {}
+        }
         let values = self.list_values_for_iteration(list, frame)?;
         let mut latest = BoonValue::Empty;
         for value in values {
@@ -28459,15 +29928,16 @@ impl GenericScheduledRuntime {
             vec![format!("store.{path}"), path.to_owned()]
         };
         for candidate in &candidates {
-            if let Some(value) = self.runtime_scalar_json(candidate)
-                && let Some(text) = json_scalar_text(&value)
-            {
-                return Ok(text);
-            }
+            self.clear_summary_root_value_cache_for_path(candidate);
             let mut frame = GenericEvalFrame::root();
             if let Some(value) = self.root_pure_derived_boon_value(candidate, &mut frame)?
                 && !matches!(value, BoonValue::Error(_) | BoonValue::Empty)
                 && let Some(text) = value.as_text()
+            {
+                return Ok(text);
+            }
+            if let Some(value) = self.runtime_scalar_json(candidate)
+                && let Some(text) = json_scalar_text(&value)
             {
                 return Ok(text);
             }
@@ -28570,6 +30040,15 @@ impl GenericScheduledRuntime {
                 "collapsed": true
             }));
         }
+        if let Some(value) = self.runtime_path_pure_derived_summary(
+            path,
+            depth,
+            max_depth,
+            max_fields,
+            max_list_items,
+        ) {
+            return Some(value);
+        }
         if let Some(value) = self.runtime_scalar_json(path) {
             return Some(runtime_json_value_summary(
                 &value,
@@ -28582,31 +30061,6 @@ impl GenericScheduledRuntime {
         if !path.contains('.') {
             let store_path = format!("store.{path}");
             if let Some(value) = self.runtime_scalar_json(&store_path) {
-                return Some(runtime_json_value_summary(
-                    &value,
-                    depth,
-                    max_depth,
-                    max_fields,
-                    max_list_items,
-                ));
-            }
-        }
-        let mut frame = GenericEvalFrame::root();
-        if let Ok(Some(value)) = self.root_pure_derived_boon_value(path, &mut frame) {
-            let value = self.boon_value_json_for_summary(&value);
-            return Some(runtime_json_value_summary(
-                &value,
-                depth,
-                max_depth,
-                max_fields,
-                max_list_items,
-            ));
-        }
-        if !path.contains('.') {
-            let store_path = format!("store.{path}");
-            let mut frame = GenericEvalFrame::root();
-            if let Ok(Some(value)) = self.root_pure_derived_boon_value(&store_path, &mut frame) {
-                let value = self.boon_value_json_for_summary(&value);
                 return Some(runtime_json_value_summary(
                     &value,
                     depth,
@@ -28651,6 +30105,39 @@ impl GenericScheduledRuntime {
             return Some(summary);
         }
         self.runtime_object_summary(path, depth, max_depth, max_fields, max_list_items)
+    }
+
+    fn runtime_path_pure_derived_summary(
+        &mut self,
+        path: &str,
+        depth: usize,
+        max_depth: usize,
+        max_fields: usize,
+        max_list_items: usize,
+    ) -> Option<JsonValue> {
+        let candidates = if path.contains('.') {
+            vec![path.to_owned()]
+        } else {
+            vec![format!("store.{path}"), path.to_owned()]
+        };
+        for candidate in candidates {
+            self.clear_summary_root_value_cache_for_path(&candidate);
+            let mut frame = GenericEvalFrame::root();
+            if let Ok(Some(value)) = self.root_pure_derived_boon_value(&candidate, &mut frame) {
+                if matches!(value, BoonValue::Error(_) | BoonValue::Empty) {
+                    continue;
+                }
+                let value = self.boon_value_json_for_summary(&value);
+                return Some(runtime_json_value_summary(
+                    &value,
+                    depth,
+                    max_depth,
+                    max_fields,
+                    max_list_items,
+                ));
+            }
+        }
+        None
     }
 
     fn runtime_path_kind(&self, path: &str) -> Option<&'static str> {
@@ -28717,17 +30204,28 @@ impl GenericScheduledRuntime {
             }
         }
         if let Some(value) = self.storage.root.owned_value(path) {
+            self.generic_derived_state
+                .record_candidate_defer_runtime_scalar_read(path);
             return Some(field_value_to_boon(value));
         }
-        if let Some(value) = self
+        if let Some((root_path, value)) = self
             .root_state_paths
             .iter()
             .find(|root_path| root_state_path_matches_runtime_path(root_path, path))
-            .and_then(|root_path| self.storage.root.owned_value(root_path))
+            .and_then(|root_path| {
+                self.storage
+                    .root
+                    .owned_value(root_path)
+                    .map(|value| (root_path, value))
+            })
         {
+            self.generic_derived_state
+                .record_candidate_defer_runtime_scalar_read(root_path);
             return Some(field_value_to_boon(value));
         }
         if let Some(value) = self.structured_root_child_boon_value(path) {
+            self.generic_derived_state
+                .record_candidate_defer_runtime_scalar_read(path);
             return Some(value);
         }
         None
@@ -28760,6 +30258,8 @@ impl GenericScheduledRuntime {
         let Some(plan) = self.generic_derived.root_field_plan(path).cloned() else {
             return Ok(None);
         };
+        self.generic_derived_state
+            .record_candidate_defer_derived_read(&plan.path);
         if plan.kind == DerivedValueKind::SourceEventTransform
             && plan.has_sources
             && let Some(value) = self.runtime_scalar_boon_value(&plan.path)
@@ -28811,6 +30311,27 @@ impl GenericScheduledRuntime {
         }
         if frame.root_stack.contains(&plan.path) {
             return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
+        }
+        if matches!(plan.kind, DerivedValueKind::ListView) {
+            let _ = self.materialize_root_list_view_field(&plan, &BTreeSet::new())?;
+            if let Some(reads) = self
+                .generic_derived_state
+                .root_reads_by_field
+                .get(&plan.path)
+            {
+                frame.reads.extend(reads.iter().cloned());
+            }
+            frame
+                .reads
+                .extend(root_dependency_read_keys_for_path(&plan.path));
+            if let Some(value) = self.generic_derived_state.root_value_cache.get(&plan.path) {
+                return Ok(Some(value.clone()));
+            }
+            let value = self
+                .storage
+                .list_name_for_path(&plan.path)
+                .map(|list| BoonValue::ListRef(list.to_owned()));
+            return Ok(value);
         }
         let reads_before = frame.reads.clone();
         let numeric_guards_before = frame.numeric_stability_guards.clone();
@@ -29199,18 +30720,24 @@ impl GenericScheduledRuntime {
     }
 
     fn root_derived_summary_values(&mut self, limits: SummaryLimits) -> Vec<(String, JsonValue)> {
-        let fields = self.generic_derived.root_fields.clone();
+        let fields = self
+            .generic_derived
+            .root_fields
+            .iter()
+            .filter(|field| {
+                matches!(
+                    field.kind,
+                    DerivedValueKind::Pure | DerivedValueKind::ListView
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let mut values = Vec::new();
         for field in fields {
-            if !matches!(
-                field.kind,
-                DerivedValueKind::Pure | DerivedValueKind::ListView
-            ) {
-                continue;
-            }
             let mut frame = GenericEvalFrame::root();
             let value = self
-                .eval_root_derived_statement_value(&field.path, &field.statement, &mut frame)
+                .root_derived_boon_value(&field.path, &mut frame)
+                .map(|value| value.unwrap_or(BoonValue::Empty))
                 .unwrap_or_else(|error| BoonValue::Error(error.to_string()));
             if matches!(value, BoonValue::Error(_) | BoonValue::Empty) {
                 continue;
@@ -29219,6 +30746,104 @@ impl GenericScheduledRuntime {
             values.push((field.path, value));
         }
         values
+    }
+
+    fn clear_summary_root_value_cache_for_path(&mut self, path: &str) {
+        let candidates = if path.contains('.') {
+            vec![path.to_owned()]
+        } else {
+            vec![format!("store.{path}"), path.to_owned()]
+        };
+        let mut seen = BTreeSet::new();
+        for candidate in candidates {
+            self.clear_summary_root_value_cache_for_exact_path(&candidate, &mut seen);
+        }
+    }
+
+    fn clear_summary_root_value_cache_for_exact_path(
+        &mut self,
+        path: &str,
+        seen: &mut BTreeSet<String>,
+    ) {
+        let Some(plan) = self.generic_derived.root_field_plan(path) else {
+            return;
+        };
+        if !matches!(
+            plan.kind,
+            DerivedValueKind::Pure | DerivedValueKind::ListView
+        ) {
+            return;
+        }
+        let path = plan.path.clone();
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        if !self.summary_root_value_cache_can_be_cleared(&path) {
+            return;
+        }
+        self.generic_derived_state.root_value_cache.remove(&path);
+        self.generic_derived_state
+            .remove_root_numeric_stability_guards(&path);
+        let reads = self
+            .generic_derived_state
+            .root_reads_by_field
+            .get(&path)
+            .cloned()
+            .unwrap_or_default();
+        for read in reads {
+            for dependency in self.summary_root_dependency_paths_for_read(&read) {
+                self.clear_summary_root_value_cache_for_exact_path(&dependency, seen);
+            }
+        }
+    }
+
+    fn summary_root_dependency_paths_for_read(&self, read: &GenericReadKey) -> Vec<String> {
+        let mut paths = BTreeSet::new();
+        match read {
+            GenericReadKey::Root { field } => {
+                for candidate in root_scalar_read_path_candidates(field) {
+                    if let Some(plan) =
+                        self.generic_derived
+                            .root_field_plan(&candidate)
+                            .or_else(|| {
+                                self.generic_derived
+                                    .root_field_plan_for_source_read_path(&candidate)
+                            })
+                    {
+                        paths.insert(plan.path.clone());
+                    }
+                }
+            }
+            GenericReadKey::RootChild { root, .. } => {
+                for candidate in root_scalar_read_path_candidates(root) {
+                    if let Some(plan) =
+                        self.generic_derived
+                            .root_field_plan(&candidate)
+                            .or_else(|| {
+                                self.generic_derived
+                                    .root_field_plan_for_source_read_path(&candidate)
+                            })
+                    {
+                        paths.insert(plan.path.clone());
+                    }
+                }
+            }
+            GenericReadKey::List { .. }
+            | GenericReadKey::ListColumn { .. }
+            | GenericReadKey::ListField { .. } => {}
+        }
+        paths.into_iter().collect()
+    }
+
+    fn summary_root_value_cache_can_be_cleared(&self, path: &str) -> bool {
+        self.generic_derived_state
+            .root_reads_by_field
+            .get(path)
+            .is_none_or(|reads| {
+                reads
+                    .iter()
+                    .all(|read| matches!(read, GenericReadKey::Root { .. }))
+            })
     }
 
     fn boon_value_json_for_summary(&mut self, value: &BoonValue) -> JsonValue {
@@ -29809,7 +31434,24 @@ fn field_value_to_boon(value: FieldValue) -> BoonValue {
         FieldValue::Text(value) => BoonValue::Text(value),
         FieldValue::Enum(value) => BoonValue::Enum(value),
         FieldValue::Bool(value) => BoonValue::Bool(value),
+        FieldValue::Bytes(value) => BoonValue::Bytes(value),
         FieldValue::Json(value) => json_to_boon_value(&value),
+    }
+}
+
+fn field_value_number_for_numeric_guard(value: &FieldValue) -> Option<i64> {
+    match value {
+        FieldValue::Text(value) => value.trim().parse::<i64>().ok(),
+        FieldValue::Json(value) => json_number_for_numeric_guard(value),
+        FieldValue::Bool(_) | FieldValue::Enum(_) | FieldValue::Bytes(_) => None,
+    }
+}
+
+fn json_number_for_numeric_guard(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Number(value) => value.as_i64(),
+        JsonValue::String(value) => value.trim().parse::<i64>().ok(),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Array(_) | JsonValue::Object(_) => None,
     }
 }
 
@@ -29818,6 +31460,7 @@ fn field_ref_to_boon(value: FieldValueRef<'_>) -> BoonValue {
         FieldValueRef::Text(value) => BoonValue::Text(value.to_owned()),
         FieldValueRef::Enum(value) => BoonValue::Enum(value.to_owned()),
         FieldValueRef::Bool(value) => BoonValue::Bool(value),
+        FieldValueRef::Bytes(value) => BoonValue::Bytes(value.clone()),
         FieldValueRef::Json(value) => json_to_boon_value(value),
     }
 }
@@ -29827,8 +31470,82 @@ fn field_value_ref_owned(value: FieldValueRef<'_>) -> FieldValue {
         FieldValueRef::Text(value) => FieldValue::Text(value.to_owned()),
         FieldValueRef::Enum(value) => FieldValue::Enum(value.to_owned()),
         FieldValueRef::Bool(value) => FieldValue::Bool(value),
+        FieldValueRef::Bytes(value) => FieldValue::Bytes(value.clone()),
         FieldValueRef::Json(value) => FieldValue::Json(value.clone()),
     }
+}
+
+pub fn bridge_value_runtime_summary(value: &BridgeValue) -> RuntimeResult<JsonValue> {
+    Ok(boon_value_json(&bridge_value_to_boon_value(value)?))
+}
+
+pub fn bridge_completion_output_runtime_summary(
+    completion: &BridgeTaskCompletion,
+) -> RuntimeResult<Option<JsonValue>> {
+    completion
+        .output
+        .as_ref()
+        .map(bridge_value_runtime_summary)
+        .transpose()
+}
+
+fn bridge_value_to_boon_value(value: &BridgeValue) -> RuntimeResult<BoonValue> {
+    match value {
+        BridgeValue::Null => Ok(BoonValue::Empty),
+        BridgeValue::Bool(value) => Ok(BoonValue::Bool(*value)),
+        BridgeValue::Int(value) => i64::try_from(*value)
+            .map(BoonValue::Number)
+            .map_err(|_| format!("bridge int `{value}` does not fit in runtime number").into()),
+        BridgeValue::Decimal(value) | BridgeValue::Text(value) => {
+            Ok(BoonValue::Text(value.clone()))
+        }
+        BridgeValue::Bytes {
+            digest,
+            byte_len,
+            bytes,
+        } => Ok(BoonValue::Bytes(RuntimeBytes::inline_with_digest(
+            digest.clone(),
+            *byte_len,
+            bytes.clone(),
+        )?)),
+        BridgeValue::List(values) => Ok(BoonValue::List(
+            values
+                .iter()
+                .map(bridge_value_to_boon_value)
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        )),
+        BridgeValue::Record(fields) => Ok(BoonValue::Record(
+            fields
+                .iter()
+                .map(|(field, value)| Ok((field.clone(), bridge_value_to_boon_value(value)?)))
+                .collect::<RuntimeResult<BTreeMap<_, _>>>()?,
+        )),
+        BridgeValue::Tagged { tag, value } => Ok(BoonValue::Record(BTreeMap::from([
+            ("tag".to_owned(), BoonValue::Text(tag.clone())),
+            ("value".to_owned(), bridge_value_to_boon_value(value)?),
+        ]))),
+        BridgeValue::Result { ok, value } => Ok(BoonValue::Record(BTreeMap::from([
+            ("ok".to_owned(), BoonValue::Bool(*ok)),
+            ("value".to_owned(), bridge_value_to_boon_value(value)?),
+        ]))),
+        BridgeValue::Diagnostic(value) => Ok(BoonValue::Record(BTreeMap::from([
+            ("code".to_owned(), BoonValue::Text(value.code.clone())),
+            ("message".to_owned(), BoonValue::Text(value.message.clone())),
+            (
+                "severity".to_owned(),
+                BoonValue::Text(value.severity.clone()),
+            ),
+        ]))),
+        BridgeValue::BlobRef(reference) => Ok(BoonValue::Bytes(RuntimeBytes::blob_ref(reference)?)),
+        BridgeValue::ArtifactRef(reference) => {
+            Ok(json_to_boon_value(&serde_json::to_value(reference)?))
+        }
+        BridgeValue::PageRef(reference) => Ok(BoonValue::Bytes(RuntimeBytes::page_ref(reference)?)),
+    }
+}
+
+fn bridge_value_to_field_value(value: &BridgeValue) -> RuntimeResult<FieldValue> {
+    Ok(boon_value_field_value(&bridge_value_to_boon_value(value)?))
 }
 
 fn json_to_boon_value(value: &JsonValue) -> BoonValue {
@@ -29945,6 +31662,7 @@ fn boon_value_field_value(value: &BoonValue) -> FieldValue {
         BoonValue::Enum(value) => FieldValue::Enum(value.clone()),
         BoonValue::Number(value) => FieldValue::Json(json!(*value)),
         BoonValue::Bool(value) => FieldValue::Bool(*value),
+        BoonValue::Bytes(value) => FieldValue::Bytes(value.clone()),
         BoonValue::NaN => FieldValue::Text("NaN".to_owned()),
         BoonValue::Empty => FieldValue::Text(String::new()),
         BoonValue::Error(value) => FieldValue::Text(value.clone()),
@@ -29991,7 +31709,8 @@ fn boon_value_protocol_value(value: &BoonValue) -> ProtocolValue<'static> {
         BoonValue::NaN => ProtocolValue::Text(Cow::Borrowed("NaN")),
         BoonValue::Empty => ProtocolValue::Text(Cow::Borrowed("")),
         BoonValue::Error(value) => ProtocolValue::Text(Cow::Owned(value.clone())),
-        BoonValue::Record(_)
+        BoonValue::Bytes(_)
+        | BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
         | BoonValue::RowRef { .. }
@@ -30002,7 +31721,8 @@ fn boon_value_protocol_value(value: &BoonValue) -> ProtocolValue<'static> {
 
 fn boon_value_root_protocol_value(value: &BoonValue) -> Option<ProtocolValue<'static>> {
     match value {
-        BoonValue::Record(_)
+        BoonValue::Bytes(_)
+        | BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
         | BoonValue::RowRef { .. }
@@ -30313,6 +32033,7 @@ fn generic_values_equal(left: &BoonValue, right: &BoonValue) -> bool {
         (BoonValue::Enum(left), BoonValue::Enum(right)) => left == right,
         (BoonValue::Number(left), BoonValue::Number(right)) => left == right,
         (BoonValue::Bool(left), BoonValue::Bool(right)) => left == right,
+        (BoonValue::Bytes(left), BoonValue::Bytes(right)) => left == right,
         (BoonValue::NaN, BoonValue::NaN) => true,
         _ => left
             .as_text()
@@ -30418,7 +32139,48 @@ fn text_match_pattern_value(tokens: &[String]) -> String {
     if tokens.first().map(String::as_str) == Some("/") {
         return format!("/{}", tokens[1..].join(""));
     }
-    tokens.join(" ")
+    let mut text = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 {
+            let previous = tokens[index - 1].as_str();
+            let next = tokens.get(index + 1).map(String::as_str);
+            if text_pattern_token_needs_space(previous, token, next) {
+                text.push(' ');
+            }
+        }
+        text.push_str(token);
+    }
+    text
+}
+
+fn text_pattern_token_needs_space(previous: &str, token: &str, next: Option<&str>) -> bool {
+    if matches!(token, "," | ";" | ")" | "]") {
+        return false;
+    }
+    if matches!(previous, "(" | "[") {
+        return false;
+    }
+    if matches!(token, "." | "/" | ":" | "|") {
+        return !text_pattern_pathlike_token(previous)
+            && !matches!(previous, "." | "/" | ":" | "|" | "[");
+    }
+    if matches!(previous, "." | "/" | ":" | "|") {
+        return !text_pattern_pathlike_token(token)
+            && !matches!(token, "." | "/" | ":" | "|" | "]");
+    }
+    if token == "[" {
+        return !text_pattern_pathlike_token(previous);
+    }
+    if previous == "." {
+        return !next.is_some_and(text_pattern_pathlike_token);
+    }
+    true
+}
+
+fn text_pattern_pathlike_token(token: &str) -> bool {
+    token
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '~')
 }
 
 impl Deref for GenericScheduledRuntime {
@@ -30987,7 +32749,7 @@ impl GenericCircuitRuntime {
             FieldValueRef::Text(value) | FieldValueRef::Enum(value) => Ok(value.to_owned()),
             FieldValueRef::Bool(true) => Ok("True".to_owned()),
             FieldValueRef::Bool(false) => Ok("False".to_owned()),
-            FieldValueRef::Json(_) => {
+            FieldValueRef::Bytes(_) | FieldValueRef::Json(_) => {
                 Err(format!("generic list `{list}` field `{field}` is not text-like").into())
             }
         }
@@ -32390,6 +34152,7 @@ impl FieldValueRef<'_> {
             Self::Text(value) => FieldValue::Text((*value).to_owned()),
             Self::Bool(value) => FieldValue::Bool(*value),
             Self::Enum(value) => FieldValue::Enum((*value).to_owned()),
+            Self::Bytes(value) => FieldValue::Bytes((*value).clone()),
             Self::Json(value) => FieldValue::Json((*value).clone()),
         }
     }
@@ -32398,6 +34161,7 @@ impl FieldValueRef<'_> {
         match self {
             Self::Text(value) | Self::Enum(value) => json!(value),
             Self::Bool(value) => json!(value),
+            Self::Bytes(value) => value.report_json(),
             Self::Json(value) => (*value).clone(),
         }
     }
@@ -32405,7 +34169,7 @@ impl FieldValueRef<'_> {
     fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
-            Self::Text(_) | Self::Enum(_) | Self::Json(_) => None,
+            Self::Text(_) | Self::Enum(_) | Self::Bytes(_) | Self::Json(_) => None,
         }
     }
 }
@@ -32414,6 +34178,7 @@ fn field_value_json(value: FieldValue) -> JsonValue {
     match value {
         FieldValue::Text(value) | FieldValue::Enum(value) => json!(value),
         FieldValue::Bool(value) => json!(value),
+        FieldValue::Bytes(value) => value.report_json(),
         FieldValue::Json(value) => value,
     }
 }
@@ -32477,6 +34242,7 @@ fn boon_value_json(value: &BoonValue) -> JsonValue {
         BoonValue::Text(value) | BoonValue::Enum(value) => json!(value),
         BoonValue::Number(value) => json!(value),
         BoonValue::Bool(value) => json!(value),
+        BoonValue::Bytes(value) => value.report_json(),
         BoonValue::Record(fields) => JsonValue::Object(
             fields
                 .iter()
@@ -32488,7 +34254,7 @@ fn boon_value_json(value: &BoonValue) -> JsonValue {
         BoonValue::RowRef { list, index } => json!({ "list": list, "index": index }),
         BoonValue::ListRef(list) => json!(list),
         BoonValue::ListSelection { list, indices } => {
-            json!({ "list": list, "indices": indices })
+            json!({ "list": list, "indices": indices.as_ref() })
         }
         BoonValue::NaN => JsonValue::Null,
         BoonValue::Error(error) => json!({ "error": error }),
@@ -32518,6 +34284,10 @@ fn push_boon_value_cache_fragment(value: &BoonValue, fragment: &mut String) {
         }
         BoonValue::Bool(value) => {
             fragment.push_str(if *value { "bool:true" } else { "bool:false" });
+        }
+        BoonValue::Bytes(value) => {
+            fragment.push_str("bytes:");
+            push_runtime_bytes_cache_fragment(value, fragment);
         }
         BoonValue::Record(fields) => {
             fragment.push_str("record:{");
@@ -32611,10 +34381,22 @@ fn push_field_value_ref_cache_fragment(value: FieldValueRef<'_>, fragment: &mut 
             fragment.push_str("enum:");
             push_cache_fragment_escaped(value, fragment);
         }
+        FieldValueRef::Bytes(value) => {
+            fragment.push_str("bytes:");
+            push_runtime_bytes_cache_fragment(value, fragment);
+        }
         FieldValueRef::Json(value) => {
             push_json_cache_fragment(value, fragment);
         }
     }
+}
+
+fn push_runtime_bytes_cache_fragment(value: &RuntimeBytes, fragment: &mut String) {
+    fragment.push_str(value.storage_kind());
+    fragment.push(':');
+    push_cache_fragment_escaped(&value.digest, fragment);
+    fragment.push(':');
+    fragment.push_str(&value.byte_len.to_string());
 }
 
 fn push_json_cache_fragment(value: &JsonValue, fragment: &mut String) {
@@ -32994,6 +34776,9 @@ impl ValueColumns {
             FieldValue::Enum(value) => {
                 Self::insert_text_slot(&mut self.enums, field_id, value);
             }
+            FieldValue::Bytes(value) => {
+                Self::insert_bytes_slot(&mut self.bytes, field_id, value);
+            }
             FieldValue::Json(value) => {
                 Self::insert_json_slot(&mut self.json, field_id, value);
             }
@@ -33010,6 +34795,9 @@ impl ValueColumns {
         if let Ok(index) = Self::text_slot_index(&self.enums, field_id) {
             self.enums.remove(index);
         }
+        if let Ok(index) = Self::bytes_slot_index(&self.bytes, field_id) {
+            self.bytes.remove(index);
+        }
         if let Ok(index) = Self::json_slot_index(&self.json, field_id) {
             self.json.remove(index);
         }
@@ -33023,6 +34811,7 @@ impl ValueColumns {
         Self::text_slot_index(&self.text, &field_id).is_ok()
             || Self::bool_slot_index(&self.bools, &field_id).is_ok()
             || Self::text_slot_index(&self.enums, &field_id).is_ok()
+            || Self::bytes_slot_index(&self.bytes, &field_id).is_ok()
             || Self::json_slot_index(&self.json, &field_id).is_ok()
     }
 
@@ -33044,6 +34833,11 @@ impl ValueColumns {
                 .map(|slot| (slot.field_id.clone(), slot.field_id.as_str().to_owned())),
         );
         fields.extend(
+            self.bytes
+                .iter()
+                .map(|slot| (slot.field_id.clone(), slot.field_id.as_str().to_owned())),
+        );
+        fields.extend(
             self.json
                 .iter()
                 .map(|slot| (slot.field_id.clone(), slot.field_id.as_str().to_owned())),
@@ -33058,6 +34852,8 @@ impl ValueColumns {
             Some(FieldValueRef::Bool(self.bools[index].value))
         } else if let Ok(index) = Self::text_slot_index(&self.enums, field_id) {
             Some(FieldValueRef::Enum(self.enums[index].value.as_str()))
+        } else if let Ok(index) = Self::bytes_slot_index(&self.bytes, field_id) {
+            Some(FieldValueRef::Bytes(&self.bytes[index].value))
         } else {
             Self::json_slot_index(&self.json, field_id)
                 .ok()
@@ -33074,8 +34870,12 @@ impl ValueColumns {
             self.enum_index(field)
                 .map(|index| FieldValue::Enum(self.enums[index].value.clone()))
                 .or_else(|| {
-                    self.json_index(field)
-                        .map(|index| FieldValue::Json(self.json[index].value.clone()))
+                    self.bytes_index(field)
+                        .map(|index| FieldValue::Bytes(self.bytes[index].value.clone()))
+                        .or_else(|| {
+                            self.json_index(field)
+                                .map(|index| FieldValue::Json(self.json[index].value.clone()))
+                        })
                 })
         }
     }
@@ -33117,6 +34917,8 @@ impl ValueColumns {
             self.json.remove(index);
             Self::insert_text_slot(&mut self.text, field_id, value.to_owned());
             Ok(())
+        } else if self.bytes_index(field).is_some() {
+            Err(format!("cannot write text into bytes runtime value `{field}`").into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
         }
@@ -33139,6 +34941,8 @@ impl ValueColumns {
             Ok(())
         } else if self.text_index(field).is_some() || self.enum_index(field).is_some() {
             Err("cannot write bool into text runtime value".into())
+        } else if self.bytes_index(field).is_some() {
+            Err("cannot write bool into bytes runtime value".into())
         } else if self.json_index(field).is_some() {
             Err("cannot write bool into structured runtime value".into())
         } else {
@@ -33150,6 +34954,10 @@ impl ValueColumns {
         match value {
             FieldValue::Text(value) | FieldValue::Enum(value) => self.set_textlike(field, &value),
             FieldValue::Bool(value) => self.set_bool(field, value),
+            FieldValue::Bytes(_) => Err(format!(
+                "cannot overwrite bytes runtime value `{field}` through scalar set_value"
+            )
+            .into()),
             FieldValue::Json(_) => Err(format!(
                 "cannot overwrite structured runtime value `{field}` through scalar set_value"
             )
@@ -33212,6 +35020,14 @@ impl ValueColumns {
         Self::json_slot_index(&self.json, &field_id).ok()
     }
 
+    fn bytes_index(&self, field: &str) -> Option<usize> {
+        self.bytes_index_id(FieldSlotId::from_path(field))
+    }
+
+    fn bytes_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
+        Self::bytes_slot_index(&self.bytes, &field_id).ok()
+    }
+
     fn insert_text_slot(slots: &mut Vec<TextValueSlot>, field_id: FieldSlotId, value: String) {
         let index = Self::text_slot_index(slots, &field_id).unwrap_or_else(|index| index);
         slots.insert(index, TextValueSlot { field_id, value });
@@ -33227,6 +35043,15 @@ impl ValueColumns {
         slots.insert(index, JsonValueSlot { field_id, value });
     }
 
+    fn insert_bytes_slot(
+        slots: &mut Vec<BytesValueSlot>,
+        field_id: FieldSlotId,
+        value: RuntimeBytes,
+    ) {
+        let index = Self::bytes_slot_index(slots, &field_id).unwrap_or_else(|index| index);
+        slots.insert(index, BytesValueSlot { field_id, value });
+    }
+
     fn text_slot_index(slots: &[TextValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
         slots.binary_search_by(|slot| slot.field_id.cmp(field_id))
     }
@@ -33236,6 +35061,10 @@ impl ValueColumns {
     }
 
     fn json_slot_index(slots: &[JsonValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
+        slots.binary_search_by(|slot| slot.field_id.cmp(field_id))
+    }
+
+    fn bytes_slot_index(slots: &[BytesValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
         slots.binary_search_by(|slot| slot.field_id.cmp(field_id))
     }
 }
@@ -35432,6 +37261,7 @@ struct RootListViewMaterializationResult {
     profile: LiveRuntimeRootListViewProfile,
 }
 
+#[derive(Clone, Debug)]
 struct RootListViewFieldOnlyPlan {
     input_expr: usize,
     prefix_continuations: Vec<AstStatement>,
@@ -35439,6 +37269,7 @@ struct RootListViewFieldOnlyPlan {
     projector: RootListViewFieldOnlyProjector,
 }
 
+#[derive(Clone, Debug)]
 struct RootListViewFieldOnlyRecordProjector {
     function: FunctionDefinition,
     row_arg: String,
@@ -35446,12 +37277,14 @@ struct RootListViewFieldOnlyRecordProjector {
     record_field_names: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug)]
 struct RootListViewFieldOnlyRecordField {
     name: String,
     statement: AstStatement,
     free_env_names: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug)]
 enum RootListViewFieldOnlyProjector {
     Direct(RootListViewFieldOnlyRecordProjector),
     Branch {
@@ -35462,6 +37295,7 @@ enum RootListViewFieldOnlyProjector {
     },
 }
 
+#[derive(Clone, Debug)]
 struct RootListViewFieldOnlyBranchArm {
     pattern: Vec<String>,
     projector: RootListViewFieldOnlyRecordProjector,
@@ -35486,6 +37320,54 @@ struct RootListViewFieldOnlyPatch {
     row: usize,
     field: String,
     value: FieldValue,
+}
+
+#[derive(Clone, Debug)]
+enum RootListViewRowIndexSource {
+    ListRef {
+        list: String,
+        len: usize,
+    },
+    ListSelection {
+        list: String,
+        indices: ListSelectionIndices,
+    },
+}
+
+impl RootListViewRowIndexSource {
+    fn list(&self) -> &str {
+        match self {
+            Self::ListRef { list, .. } | Self::ListSelection { list, .. } => list,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::ListRef { len, .. } => *len,
+            Self::ListSelection { indices, .. } => indices.len(),
+        }
+    }
+
+    fn index_at(&self, target_index: usize) -> Option<usize> {
+        match self {
+            Self::ListRef { len, .. } => (target_index < *len).then_some(target_index),
+            Self::ListSelection { indices, .. } => indices.get(target_index).copied(),
+        }
+    }
+
+    fn row_ref_at(&self, target_index: usize) -> Option<BoonValue> {
+        self.index_at(target_index).map(|index| BoonValue::RowRef {
+            list: self.list().to_owned(),
+            index,
+        })
+    }
+
+    fn value_shape(&self) -> &'static str {
+        match self {
+            Self::ListRef { .. } => "list_ref_row_index_view",
+            Self::ListSelection { .. } => "list_selection_row_index_view",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -35520,6 +37402,33 @@ struct RootListViewFieldCacheEntry {
 struct RootListViewEvaluatedFieldValue {
     value: Option<FieldValue>,
     previous_pass_cache_hit: bool,
+}
+
+fn root_list_view_value_shape(values: &[BoonValue]) -> &'static str {
+    if values.is_empty() {
+        return "empty";
+    }
+    if values
+        .iter()
+        .all(|value| matches!(value, BoonValue::RowRef { .. }))
+    {
+        return "row_ref_values";
+    }
+    if values
+        .iter()
+        .all(|value| matches!(value, BoonValue::Record(_) | BoonValue::RecordColumns(_)))
+    {
+        return "record_values";
+    }
+    if values.iter().all(|value| {
+        matches!(
+            value,
+            BoonValue::ListRef(_) | BoonValue::ListSelection { .. }
+        )
+    }) {
+        return "list_reference_values";
+    }
+    "mixed_values"
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -36138,6 +38047,8 @@ struct GenericDerivedState {
         BTreeMap<String, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
     numeric_stability_guards_by_field:
         BTreeMap<GenericDerivedKey, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
+    profile_candidate_defer_probe: RefCell<BTreeMap<String, RuntimeCandidateDeferProbeAccumulator>>,
+    profile_candidate_defer_read_context: Cell<RuntimeCandidateDeferReadContext>,
     last_recomputed: Vec<GenericDerivedKey>,
     last_candidate_count: usize,
 }
@@ -36275,6 +38186,36 @@ struct RuntimeDirtyRootWorkAccumulator {
     unchanged_materialization_count: usize,
     changed_read_count: usize,
     materialization_ms: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeCandidateDeferProbeAccumulator {
+    simulated_defer_enqueue_count: usize,
+    materialization_count: usize,
+    changed_materialization_count: usize,
+    unchanged_materialization_count: usize,
+    runtime_scalar_read_count: usize,
+    eval_scalar_read_count: usize,
+    state_summary_scalar_read_count: usize,
+    document_state_summary_scalar_read_count: usize,
+    runtime_value_summary_scalar_read_count: usize,
+    derived_read_count: usize,
+}
+
+impl RuntimeCandidateDeferProbeAccumulator {
+    fn demand_read_count(&self) -> usize {
+        self.runtime_scalar_read_count
+            .saturating_add(self.derived_read_count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RuntimeCandidateDeferReadContext {
+    #[default]
+    Eval,
+    StateSummary,
+    DocumentStateSummary,
+    RuntimeValueSummary,
 }
 
 impl RuntimeDirtyRootWorkAccumulator {
@@ -36961,6 +38902,7 @@ fn collect_boon_value_root_read_keys(
         | BoonValue::Enum(_)
         | BoonValue::Number(_)
         | BoonValue::Bool(_)
+        | BoonValue::Bytes(_)
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. }
@@ -36999,6 +38941,7 @@ fn boon_value_matches_json(value: &BoonValue, previous: &JsonValue) -> bool {
         (BoonValue::Text(value) | BoonValue::Enum(value), JsonValue::String(previous)) => {
             value == previous
         }
+        (BoonValue::Bytes(value), JsonValue::Object(_)) => &value.report_json() == previous,
         (BoonValue::RecordColumns(columns), JsonValue::Object(_)) => {
             &value_columns_json(columns) == previous
         }
@@ -37009,7 +38952,7 @@ fn boon_value_matches_json(value: &BoonValue, previous: &JsonValue) -> bool {
         }
         (BoonValue::ListRef(list), JsonValue::String(previous)) => list == previous,
         (BoonValue::ListSelection { list, indices }, previous) => {
-            previous == &json!({ "list": list, "indices": indices })
+            previous == &json!({ "list": list, "indices": indices.as_ref() })
         }
         _ => false,
     }
@@ -37056,12 +38999,19 @@ enum BoonValue {
     Enum(String),
     Number(i64),
     Bool(bool),
+    Bytes(RuntimeBytes),
     Record(BTreeMap<String, BoonValue>),
     RecordColumns(ValueColumns),
     List(Vec<BoonValue>),
-    RowRef { list: String, index: usize },
+    RowRef {
+        list: String,
+        index: usize,
+    },
     ListRef(String),
-    ListSelection { list: String, indices: Vec<usize> },
+    ListSelection {
+        list: String,
+        indices: ListSelectionIndices,
+    },
     NaN,
     Error(String),
 }
@@ -37075,7 +39025,8 @@ fn boon_value_scalar_text(value: &BoonValue) -> String {
         BoonValue::Empty => String::new(),
         BoonValue::NaN => "NaN".to_owned(),
         BoonValue::Error(value) => value.clone(),
-        BoonValue::Record(_)
+        BoonValue::Bytes(_)
+        | BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
         | BoonValue::RowRef { .. }
@@ -39413,6 +41364,219 @@ impl GenericDerivedState {
         self.function_value_cache.clear();
     }
 
+    fn clear_candidate_defer_probe(&self) {
+        self.profile_candidate_defer_probe.borrow_mut().clear();
+    }
+
+    fn set_candidate_defer_read_context(
+        &self,
+        context: RuntimeCandidateDeferReadContext,
+    ) -> RuntimeCandidateDeferReadContext {
+        self.profile_candidate_defer_read_context.replace(context)
+    }
+
+    fn record_candidate_defer_enqueue(&self, root: &str) {
+        let mut probe = self.profile_candidate_defer_probe.borrow_mut();
+        let entry = probe.entry(root.to_owned()).or_default();
+        entry.simulated_defer_enqueue_count = entry.simulated_defer_enqueue_count.saturating_add(1);
+    }
+
+    fn record_candidate_defer_materialization(&self, root: &str, changed: bool) {
+        let mut probe = self.profile_candidate_defer_probe.borrow_mut();
+        let entry = probe.entry(root.to_owned()).or_default();
+        entry.materialization_count = entry.materialization_count.saturating_add(1);
+        if changed {
+            entry.changed_materialization_count =
+                entry.changed_materialization_count.saturating_add(1);
+        } else {
+            entry.unchanged_materialization_count =
+                entry.unchanged_materialization_count.saturating_add(1);
+        }
+    }
+
+    fn record_candidate_defer_runtime_scalar_read(&self, path: &str) {
+        let Some(root) = self.candidate_defer_probe_root_for_path(path) else {
+            return;
+        };
+        let mut probe = self.profile_candidate_defer_probe.borrow_mut();
+        if let Some(entry) = probe.get_mut(&root) {
+            entry.runtime_scalar_read_count = entry.runtime_scalar_read_count.saturating_add(1);
+            match self.profile_candidate_defer_read_context.get() {
+                RuntimeCandidateDeferReadContext::Eval => {
+                    entry.eval_scalar_read_count = entry.eval_scalar_read_count.saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::StateSummary => {
+                    entry.state_summary_scalar_read_count =
+                        entry.state_summary_scalar_read_count.saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::DocumentStateSummary => {
+                    entry.document_state_summary_scalar_read_count = entry
+                        .document_state_summary_scalar_read_count
+                        .saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::RuntimeValueSummary => {
+                    entry.runtime_value_summary_scalar_read_count = entry
+                        .runtime_value_summary_scalar_read_count
+                        .saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn record_candidate_defer_derived_read(&self, root: &str) {
+        let Some(root) = self.candidate_defer_probe_root_for_path(root) else {
+            return;
+        };
+        let mut probe = self.profile_candidate_defer_probe.borrow_mut();
+        if let Some(entry) = probe.get_mut(&root) {
+            entry.derived_read_count = entry.derived_read_count.saturating_add(1);
+        }
+    }
+
+    fn candidate_defer_probe_root_for_path(&self, path: &str) -> Option<String> {
+        let probe = self.profile_candidate_defer_probe.borrow();
+        if probe.is_empty() {
+            return None;
+        }
+        let mut candidates = vec![path.to_owned()];
+        if let Some(local) = path.strip_prefix("store.") {
+            candidates.push(local.to_owned());
+        } else {
+            candidates.push(format!("store.{path}"));
+        }
+        for candidate in candidates {
+            for root in probe.keys() {
+                if candidate == *root {
+                    return Some(root.clone());
+                }
+                if candidate
+                    .strip_prefix(root)
+                    .is_some_and(|tail| tail.starts_with('.'))
+                {
+                    return Some(root.clone());
+                }
+                if let Some(local_root) = root.strip_prefix("store.") {
+                    if candidate == local_root {
+                        return Some(root.clone());
+                    }
+                    if candidate
+                        .strip_prefix(local_root)
+                        .is_some_and(|tail| tail.starts_with('.'))
+                    {
+                        return Some(root.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn candidate_defer_probe_samples(&self) -> Vec<LiveRuntimeCandidateDeferProbeSample> {
+        let mut samples = self
+            .profile_candidate_defer_probe
+            .borrow()
+            .iter()
+            .map(|(root_path, entry)| LiveRuntimeCandidateDeferProbeSample {
+                root_path: root_path.clone(),
+                simulated_defer_enqueue_count: entry.simulated_defer_enqueue_count,
+                materialization_count: entry.materialization_count,
+                changed_materialization_count: entry.changed_materialization_count,
+                unchanged_materialization_count: entry.unchanged_materialization_count,
+                demand_read_count: entry.demand_read_count(),
+                runtime_scalar_read_count: entry.runtime_scalar_read_count,
+                eval_scalar_read_count: entry.eval_scalar_read_count,
+                state_summary_scalar_read_count: entry.state_summary_scalar_read_count,
+                document_state_summary_scalar_read_count: entry
+                    .document_state_summary_scalar_read_count,
+                runtime_value_summary_scalar_read_count: entry
+                    .runtime_value_summary_scalar_read_count,
+                derived_read_count: entry.derived_read_count,
+            })
+            .collect::<Vec<_>>();
+        samples.sort_by(|left, right| {
+            right
+                .simulated_defer_enqueue_count
+                .cmp(&left.simulated_defer_enqueue_count)
+                .then_with(|| right.demand_read_count.cmp(&left.demand_read_count))
+                .then_with(|| left.root_path.cmp(&right.root_path))
+        });
+        samples.truncate(LIVE_RUNTIME_CANDIDATE_DEFER_SAMPLE_LIMIT);
+        samples
+    }
+
+    fn copy_candidate_defer_probe_to_profile(&self, profile: &mut LiveRuntimeStepProfile) {
+        let (root_count, totals) = {
+            let probe = self.profile_candidate_defer_probe.borrow();
+            let totals = probe.values().fold(
+                RuntimeCandidateDeferProbeAccumulator::default(),
+                |mut totals, entry| {
+                    totals.simulated_defer_enqueue_count = totals
+                        .simulated_defer_enqueue_count
+                        .saturating_add(entry.simulated_defer_enqueue_count);
+                    totals.materialization_count = totals
+                        .materialization_count
+                        .saturating_add(entry.materialization_count);
+                    totals.changed_materialization_count = totals
+                        .changed_materialization_count
+                        .saturating_add(entry.changed_materialization_count);
+                    totals.unchanged_materialization_count = totals
+                        .unchanged_materialization_count
+                        .saturating_add(entry.unchanged_materialization_count);
+                    totals.runtime_scalar_read_count = totals
+                        .runtime_scalar_read_count
+                        .saturating_add(entry.runtime_scalar_read_count);
+                    totals.eval_scalar_read_count = totals
+                        .eval_scalar_read_count
+                        .saturating_add(entry.eval_scalar_read_count);
+                    totals.state_summary_scalar_read_count = totals
+                        .state_summary_scalar_read_count
+                        .saturating_add(entry.state_summary_scalar_read_count);
+                    totals.document_state_summary_scalar_read_count = totals
+                        .document_state_summary_scalar_read_count
+                        .saturating_add(entry.document_state_summary_scalar_read_count);
+                    totals.runtime_value_summary_scalar_read_count = totals
+                        .runtime_value_summary_scalar_read_count
+                        .saturating_add(entry.runtime_value_summary_scalar_read_count);
+                    totals.derived_read_count = totals
+                        .derived_read_count
+                        .saturating_add(entry.derived_read_count);
+                    totals
+                },
+            );
+            (probe.len(), totals)
+        };
+        let samples = self.candidate_defer_probe_samples();
+        profile
+            .source_action_root_candidate_defer_probe_samples
+            .clear();
+        profile.source_action_root_candidate_defer_root_count = root_count;
+        profile.source_action_root_candidate_defer_enqueue_count =
+            totals.simulated_defer_enqueue_count;
+        profile.source_action_root_candidate_defer_materialization_count =
+            totals.materialization_count;
+        profile.source_action_root_candidate_defer_changed_materialization_count =
+            totals.changed_materialization_count;
+        profile.source_action_root_candidate_defer_unchanged_materialization_count =
+            totals.unchanged_materialization_count;
+        profile.source_action_root_candidate_defer_demand_read_count = totals.demand_read_count();
+        profile.source_action_root_candidate_defer_runtime_scalar_read_count =
+            totals.runtime_scalar_read_count;
+        profile.source_action_root_candidate_defer_eval_scalar_read_count =
+            totals.eval_scalar_read_count;
+        profile.source_action_root_candidate_defer_state_summary_scalar_read_count =
+            totals.state_summary_scalar_read_count;
+        profile.source_action_root_candidate_defer_document_state_summary_scalar_read_count =
+            totals.document_state_summary_scalar_read_count;
+        profile.source_action_root_candidate_defer_runtime_value_summary_scalar_read_count =
+            totals.runtime_value_summary_scalar_read_count;
+        profile.source_action_root_candidate_defer_derived_read_count = totals.derived_read_count;
+        extend_bounded_profile_samples(
+            &mut profile.source_action_root_candidate_defer_probe_samples,
+            samples,
+            LIVE_RUNTIME_CANDIDATE_DEFER_SAMPLE_LIMIT,
+        );
+    }
+
     fn clear_function_value_cache(&mut self) {
         self.function_value_cache.clear();
     }
@@ -39803,6 +41967,7 @@ impl BoonValue {
             Self::NaN => Some("NaN".to_owned()),
             Self::Empty => Some(String::new()),
             Self::Error(_)
+            | Self::Bytes(_)
             | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
@@ -39821,6 +41986,7 @@ impl BoonValue {
             Self::NaN => "NaN".to_owned(),
             Self::Empty
             | Self::Error(_)
+            | Self::Bytes(_)
             | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
@@ -39837,7 +42003,8 @@ impl BoonValue {
             Self::Number(value) => value.to_string(),
             Self::Bool(true) => "True".to_owned(),
             Self::Bool(false) => "False".to_owned(),
-            Self::Record(_)
+            Self::Bytes(_)
+            | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
             | Self::RowRef { .. }
@@ -46446,7 +48613,7 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
                 "selection".to_owned(),
                 BoonValue::ListSelection {
                     list: "selected_signal_lane_rows".to_owned(),
-                    indices: vec![0, 2],
+                    indices: list_selection_indices(vec![0, 2]),
                 },
             ),
         ]));
@@ -50527,6 +52694,22 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .as_ref()
             .expect("list-view sample should expose phase profile");
         assert_eq!(profile.list, "selected_waveform_segments");
+        assert!(
+            matches!(
+                profile.list_storage_mode.as_str(),
+                "generic_vec_materialization"
+                    | "generic_vec_with_source_identities"
+                    | "generic_vec_with_row_index_source"
+                    | "row_ref_projection_reuse"
+                    | "field_only_record_projection"
+                    | "field_only_row_index_projection"
+            ),
+            "list-view profile should classify storage mode: {profile:?}"
+        );
+        assert!(
+            !profile.list_value_shape.is_empty(),
+            "list-view profile should classify value shape: {profile:?}"
+        );
         assert_eq!(profile.row_count, 1);
         assert_eq!(profile.previous_row_count, 1);
         assert_eq!(profile.changed_row_count, 1);
@@ -50550,6 +52733,175 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert!(
             profile.eval_unattributed_ms >= 0.0,
             "eval attribution residual should not go negative: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn root_list_view_value_shape_classifies_reusable_list_forms() {
+        let mut columns = ValueColumns::default();
+        columns.insert_value("label".to_owned(), FieldValue::Text("A".to_owned()));
+        assert_eq!(root_list_view_value_shape(&[]), "empty");
+        assert_eq!(
+            root_list_view_value_shape(&[
+                BoonValue::RowRef {
+                    list: "rows".to_owned(),
+                    index: 0
+                },
+                BoonValue::RowRef {
+                    list: "rows".to_owned(),
+                    index: 1
+                },
+            ]),
+            "row_ref_values"
+        );
+        assert_eq!(
+            root_list_view_value_shape(&[BoonValue::RecordColumns(columns)]),
+            "record_values"
+        );
+        assert_eq!(
+            root_list_view_value_shape(&[BoonValue::ListSelection {
+                list: "rows".to_owned(),
+                indices: list_selection_indices(vec![0, 2])
+            }]),
+            "list_reference_values"
+        );
+        assert_eq!(
+            root_list_view_value_shape(&[
+                BoonValue::Text("A".to_owned()),
+                BoonValue::RowRef {
+                    list: "rows".to_owned(),
+                    index: 0
+                },
+            ]),
+            "mixed_values"
+        );
+    }
+
+    #[test]
+    fn root_list_view_identity_list_ref_carries_row_index_view() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    rows:
+        LIST {
+            [id: TEXT { a }, label: TEXT { A }]
+            [id: TEXT { b }, label: TEXT { B }]
+        }
+    visible:
+        rows |> List/map(row, new: row)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-identity-list-ref", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["visible"][0]["label"], "A");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.visible")
+            .expect("visible identity root list should have a plan")
+            .clone();
+        generic.reset_list_scan_counters();
+        let materialization = generic
+            .materialize_root_list_view_field(&field, &BTreeSet::new())
+            .expect("identity root list should rematerialize");
+        let profile = materialization.profile;
+        assert_eq!(
+            profile.list_storage_mode, "generic_vec_with_row_index_source",
+            "identity ListRef root list should keep the source as a row-index view: {profile:?}"
+        );
+        assert_eq!(
+            profile.list_value_shape, "list_ref_row_index_view",
+            "identity ListRef root list should avoid generic row-ref iteration: {profile:?}"
+        );
+        assert_eq!(profile.row_count, 2);
+        assert_eq!(profile.source_identity_count, profile.row_count);
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "row-index root list rematerialization should not route through list_values_for_iteration"
+        );
+        assert_eq!(generic.list_scan_counters.list_view_direct_rows, 2);
+    }
+
+    #[test]
+    fn root_list_view_identity_list_selection_carries_row_index_view() {
+        let source = r#"
+store: [
+    elements: [
+        filter: SOURCE
+    ]
+    selected_kind:
+        TEXT { keep } |> HOLD selected_kind {
+            LATEST {
+                elements.filter.text
+            }
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, kind: TEXT { keep }, label: TEXT { A }]
+            [id: TEXT { b }, kind: TEXT { alt }, label: TEXT { B }]
+            [id: TEXT { c }, kind: TEXT { keep }, label: TEXT { C }]
+            [id: TEXT { d }, kind: TEXT { alt }, label: TEXT { D }]
+        }
+    visible:
+        rows
+        |> List/filter_field_equal(field: "kind", value: selected_kind)
+        |> List/map(row, new: row)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-identity-selection", source).unwrap();
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["visible"][0]["label"], "A");
+        assert_eq!(initial["store"]["visible"][1]["label"], "C");
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.filter".to_owned(),
+                text: Some("alt".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("filter source should update the selected rows");
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["visible"][0]["label"], "B");
+        assert_eq!(summary["store"]["visible"][1]["label"], "D");
+        let profile = output
+            .root_materialization_stats
+            .samples
+            .iter()
+            .find(|sample| sample.path == "store.visible")
+            .and_then(|sample| sample.list_view_profile.as_ref())
+            .expect("visible root list-view sample should be profiled");
+        assert_eq!(
+            profile.list_storage_mode, "generic_vec_with_row_index_source",
+            "identity ListSelection root list should keep the selection as a row-index view: {profile:?}"
+        );
+        assert_eq!(
+            profile.list_value_shape, "list_selection_row_index_view",
+            "identity ListSelection root list should avoid generic row-ref iteration: {profile:?}"
+        );
+        assert_eq!(profile.row_count, 2);
+        assert_eq!(profile.source_identity_count, profile.row_count);
+        assert!(
+            !profile.in_place_patch,
+            "same-count selection identity changes must replace/rebind instead of patching by target index: {profile:?}"
+        );
+        assert!(
+            output.list_scan_counters.list_view_direct_rows >= profile.row_count,
+            "row-index selection root list should report direct row consumption: counters={:?}, profile={profile:?}",
+            output.list_scan_counters
         );
     }
 
@@ -51314,6 +53666,27 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             projected_profile.in_place_patch,
             "downstream root map should patch after the filtered root list preserves identity: {projected_profile:?}"
         );
+        assert_eq!(
+            projected_profile.list_storage_mode, "field_only_row_index_projection",
+            "downstream root map should consume the filtered root list as a row-index view: {projected_profile:?}"
+        );
+        assert_eq!(
+            projected_profile.list_value_shape, "list_ref_row_index_view",
+            "row-index root map should not materialize a row-ref vector before field patching: {projected_profile:?}"
+        );
+        assert_eq!(
+            projected_profile.full_eval_row_count, 0,
+            "row-index root map should stay on the field-only patch path: {projected_profile:?}"
+        );
+        assert_eq!(
+            projected_profile.row_materialize_ms, 0.0,
+            "row-index root map should not build full row snapshots before patching: {projected_profile:?}"
+        );
+        assert!(
+            output.list_scan_counters.list_view_direct_rows >= projected_profile.row_count,
+            "row-index root map should report direct list-view row consumption: counters={:?}, profile={projected_profile:?}",
+            output.list_scan_counters
+        );
     }
 
     #[test]
@@ -51390,6 +53763,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert!(
             row_entries.iter().all(|(key, _)| key.source_key != 0),
             "row-dependent projected fields must keep row identity in their cache keys: {row_entries:?}"
+        );
+        assert!(
+            row_entries
+                .iter()
+                .all(|(key, _)| key.env_fingerprint.is_empty()),
+            "row-dependent projected fields should not duplicate the source row in the env fingerprint when source key/generation already identify it: {row_entries:?}"
         );
     }
 
@@ -52317,6 +54696,109 @@ document: Document/new(root: Element/label(element: [], label: store.rendered_va
         }));
         assert_eq!(output.state_summary["store"]["rendered_value"], "00101010");
         assert_eq!(output.state_summary["rendered_value"], "00101010");
+    }
+
+    #[test]
+    fn derived_root_summary_recomputes_pure_dependency_before_stored_scalar_alias() {
+        let source = r#"
+store: [
+    elements: [
+        select_file: SOURCE
+    ]
+    active_file:
+        TEXT { simple.vcd } |> HOLD active_file {
+            LATEST {
+                elements.select_file.text
+            }
+        }
+    descriptor_file:
+        active_file
+    byte_length:
+        descriptor_file |> WHEN {
+            TEXT { simple_test.ghw } => 833
+            TEXT { wave_27.fst } => 28860652
+            __ => 311
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
+"#;
+        let mut runtime = LiveRuntime::from_source("derived-root-summary-byte-length", source)
+            .expect("runtime should initialize");
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["descriptor_file"], "simple.vcd");
+        assert_eq!(initial["store"]["byte_length"], 311);
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.select_file".to_owned(),
+                text: Some("simple_test.ghw".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("file selection source event should apply");
+        assert_eq!(
+            output.state_summary["store"]["active_file"],
+            "simple_test.ghw"
+        );
+        assert_eq!(
+            output.state_summary["store"]["descriptor_file"],
+            "simple_test.ghw"
+        );
+        assert_eq!(
+            output.state_summary["store"]["byte_length"], 833,
+            "pure root dependencies in summaries must read the current derived value, not the stale scalar alias"
+        );
+
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["descriptor_file"], "simple_test.ghw");
+        assert_eq!(summary["store"]["byte_length"], 833);
+
+        let sparse = runtime.runtime_value_summaries(
+            &["byte_length".to_owned(), "store.byte_length".to_owned()],
+            3,
+            8,
+            4,
+        );
+        assert_eq!(
+            sparse["byte_length"],
+            json!({"kind": "number", "value": 833}),
+            "unqualified sparse summaries must recompute current pure roots before reading stale scalar aliases"
+        );
+        assert_eq!(
+            sparse["store.byte_length"],
+            json!({"kind": "number", "value": 833}),
+            "qualified sparse summaries must recompute current pure roots before reading stale scalar aliases"
+        );
+    }
+
+    #[test]
+    fn text_match_patterns_rejoin_pathlike_punctuation_without_spaces() {
+        let tokens = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            text_match_pattern_value(&tokens(&["simple_test", ".", "ghw"])),
+            "simple_test.ghw"
+        );
+        assert_eq!(
+            text_match_pattern_value(&tokens(&["-", "simple", ".", "vcd"])),
+            "- simple.vcd"
+        );
+        assert_eq!(
+            text_match_pattern_value(&tokens(&["simple_tb", ".", "s", "group"])),
+            "simple_tb.s group"
+        );
+        assert_eq!(
+            text_match_pattern_value(&tokens(&["https", ":", "/", "/", "kavik", ".", "cz", "/"])),
+            "https://kavik.cz/"
+        );
+        assert_eq!(
+            text_match_pattern_value(&tokens(&["data_bus", "[", "7", ":", "0", "]"])),
+            "data_bus[7:0]"
+        );
     }
 
     #[test]
@@ -56198,6 +58680,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             join_field_rows_scanned: 5,
             map_join_field_fusions: 1,
             map_join_field_rows_fused: 2,
+            list_view_direct_rows: 3,
+            list_view_row_ref_materializations_avoided: 3,
             retain_rows_scanned: 6,
         }
         .to_report();
@@ -56222,6 +58706,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "join_field_rows_scanned",
             "map_join_field_fusions",
             "map_join_field_rows_fused",
+            "list_view_direct_rows",
+            "list_view_row_ref_materializations_avoided",
             "retain_rows_scanned",
         ] {
             assert!(report.get(field).is_some(), "missing counter `{field}`");
@@ -56267,6 +58753,656 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "List/find_value should use the exact text lookup index for ListRef rows"
         );
         assert!(generic.list_scan_counters.text_lookup_index_candidates >= 2);
+    }
+
+    #[test]
+    fn list_index_find_value_uses_text_lookup_index_for_list_selection() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [kind: TEXT { keep }, key: TEXT { row-1 }, value: TEXT { first }]
+            [kind: TEXT { keep }, key: TEXT { row-2 }, value: TEXT { second }]
+            [kind: TEXT { skip }, key: TEXT { row-2 }, value: TEXT { skipped }]
+            [kind: TEXT { keep }, key: TEXT { row-3 }, value: TEXT { third }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-find-value-selection-index", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        generic.reset_list_scan_counters();
+        let value = generic
+            .list_find_value(
+                BoonValue::ListSelection {
+                    list,
+                    indices: list_selection_indices(vec![0, 1, 3]),
+                },
+                "key",
+                BoonValue::Text("row-2".to_owned()),
+                "value",
+                BoonValue::Text("missing".to_owned()),
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            value.as_text().as_deref(),
+            Some("second"),
+            "List/find_value should respect the selected row universe"
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits >= 1,
+            "List/find_value should use text indexes for ListSelection rows; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert_eq!(
+            generic.list_scan_counters.list_find_rows_scanned, 0,
+            "List/find_value over an indexed ListSelection should not scan selected rows"
+        );
+    }
+
+    #[test]
+    fn list_selection_length_uses_selection_cardinality_without_row_expansion() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { row-1 }]
+            [key: TEXT { row-2 }]
+            [key: TEXT { row-3 }]
+            [key: TEXT { row-4 }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("list-selection-length", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        generic.reset_list_scan_counters();
+        let len = generic
+            .list_len_for_iteration(
+                BoonValue::ListSelection {
+                    list,
+                    indices: list_selection_indices(vec![0, 2, 3]),
+                },
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "ListSelection length should use selection cardinality without expanding row refs"
+        );
+    }
+
+    #[test]
+    fn list_move_field_preserves_list_ref_storage_view_without_row_expansion() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { stay }, value: TEXT { first }]
+            [key: TEXT { move }, value: TEXT { second }]
+            [key: TEXT { stay }, value: TEXT { third }]
+            [key: TEXT { move }, value: TEXT { fourth }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-move-field-list-ref-view", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+
+        generic.reset_list_scan_counters();
+        let output = generic
+            .list_move_field(
+                BoonValue::ListRef(list.clone()),
+                "key",
+                BoonValue::Text("move".to_owned()),
+                true,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let BoonValue::ListSelection {
+            list: output_list,
+            indices,
+        } = output
+        else {
+            panic!("indexed List/move_field should preserve an ordered row-index view");
+        };
+        assert_eq!(output_list, list);
+        assert_eq!(indices.as_ref(), &[1, 3, 0, 2]);
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits >= 1,
+            "List/move_field should use the text lookup index"
+        );
+        assert_eq!(
+            generic.list_scan_counters.move_field_rows_scanned, 0,
+            "indexed List/move_field should not scan rows through generic iteration"
+        );
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            4
+        );
+    }
+
+    #[test]
+    fn list_move_field_preserves_selection_order_without_row_expansion() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { move }, value: TEXT { first }]
+            [key: TEXT { stay }, value: TEXT { second }]
+            [key: TEXT { move }, value: TEXT { third }]
+            [key: TEXT { stay }, value: TEXT { fourth }]
+            [key: TEXT { move }, value: TEXT { fifth }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-move-field-selection-view", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+
+        generic.reset_list_scan_counters();
+        let output = generic
+            .list_move_field(
+                BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(vec![4, 1, 0, 3]),
+                },
+                "key",
+                BoonValue::Text("move".to_owned()),
+                false,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let BoonValue::ListSelection {
+            list: output_list,
+            indices,
+        } = output
+        else {
+            panic!("indexed List/move_field should keep ListSelection output");
+        };
+        assert_eq!(output_list, list);
+        assert_eq!(
+            indices.as_ref(),
+            &[1, 3, 4, 0],
+            "move-last should keep nonmatches first and matches in selection order"
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits >= 1,
+            "List/move_field over a selection should use indexed/direct selection lookup"
+        );
+        assert_eq!(
+            generic.list_scan_counters.move_field_rows_scanned, 0,
+            "selection List/move_field should not expand selected rows"
+        );
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            4
+        );
+    }
+
+    #[test]
+    fn list_get_and_latest_use_row_index_views_without_expansion() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { row-1 }]
+            [key: TEXT { row-2 }]
+            [key: TEXT { row-3 }]
+            [key: TEXT { row-4 }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-direct-access-row-index-view", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+
+        generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
+        let value = generic
+            .list_get(BoonValue::ListRef(list.clone()), 2, &mut frame)
+            .unwrap();
+        assert_eq!(
+            value,
+            BoonValue::RowRef {
+                list: list.clone(),
+                index: 2
+            }
+        );
+        assert!(frame.reads.contains(&list_read_key(&list)));
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "List/get over ListRef should not expand row refs"
+        );
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            1
+        );
+
+        generic.reset_list_scan_counters();
+        let value = generic
+            .list_get(
+                BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(vec![3, 1]),
+                },
+                1,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            BoonValue::RowRef {
+                list: list.clone(),
+                index: 1
+            }
+        );
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "List/get over ListSelection should use direct selected index lookup"
+        );
+
+        generic.reset_list_scan_counters();
+        let value = generic
+            .list_latest(
+                BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(vec![0, 3, 1]),
+                },
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            BoonValue::RowRef {
+                list: list.clone(),
+                index: 1
+            }
+        );
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "List/latest over ListSelection should use the final selected row directly"
+        );
+    }
+
+    #[test]
+    fn list_selection_storage_mode_matches_generic_record_oracle_for_core_ops() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [kind: TEXT { keep }, score: TEXT { 10 }, label: TEXT { low }]
+            [kind: TEXT { keep }, score: TEXT { 30 }, label: TEXT { high }]
+            [kind: TEXT { skip }, score: TEXT { 50 }, label: TEXT { skipped }]
+            [kind: TEXT { keep }, score: TEXT { 20 }, label: TEXT { mid }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-selection-storage-mode-oracle", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        let score_expr = generic.generic_derived.expressions.len();
+        generic.generic_derived.expressions.push(AstExpr {
+            id: score_expr,
+            line: 0,
+            start: 0,
+            end: 0,
+            kind: AstExprKind::Path(vec!["row".to_owned(), "score".to_owned()]),
+        });
+        let scalar_expr = generic.generic_derived.expressions.len();
+        generic.generic_derived.expressions.push(AstExpr {
+            id: scalar_expr,
+            line: 0,
+            start: 0,
+            end: 0,
+            kind: AstExprKind::TextLiteral("15".to_owned()),
+        });
+        let retain_expr = generic.generic_derived.expressions.len();
+        generic.generic_derived.expressions.push(AstExpr {
+            id: retain_expr,
+            line: 0,
+            start: 0,
+            end: 0,
+            kind: AstExprKind::Infix {
+                left: score_expr,
+                op: ">=".to_owned(),
+                right: scalar_expr,
+            },
+        });
+        let identity_expr = generic.generic_derived.expressions.len();
+        generic.generic_derived.expressions.push(AstExpr {
+            id: identity_expr,
+            line: 0,
+            start: 0,
+            end: 0,
+            kind: AstExprKind::Identifier("row".to_owned()),
+        });
+
+        let row_refs = generic
+            .list_values_for_iteration(
+                BoonValue::ListRef(list.clone()),
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let mut oracle_records = Vec::new();
+        for row_ref in row_refs {
+            oracle_records.push(
+                generic
+                    .list_value_record(row_ref, &mut GenericEvalFrame::root())
+                    .unwrap(),
+            );
+        }
+        generic.reset_list_scan_counters();
+
+        let optimized_filter = generic
+            .list_filter_field_equal(
+                BoonValue::ListRef(list.clone()),
+                "kind",
+                BoonValue::Text("keep".to_owned()),
+                true,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let oracle_filter = generic
+            .list_filter_field_equal(
+                BoonValue::List(oracle_records),
+                "kind",
+                BoonValue::Text("keep".to_owned()),
+                true,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let BoonValue::ListSelection { indices, .. } = &optimized_filter else {
+            panic!("optimized text filter should preserve a row-index selection");
+        };
+        assert_eq!(indices.as_ref(), &[0, 1, 3]);
+        assert_eq!(
+            generic
+                .list_join_field(
+                    optimized_filter.clone(),
+                    "label",
+                    None,
+                    None,
+                    &mut GenericEvalFrame::root(),
+                )
+                .unwrap(),
+            generic
+                .list_join_field(
+                    oracle_filter.clone(),
+                    "label",
+                    None,
+                    None,
+                    &mut GenericEvalFrame::root(),
+                )
+                .unwrap(),
+            "optimized filter output should match the generic record-list oracle"
+        );
+
+        let optimized_retain = generic
+            .list_retain(
+                optimized_filter,
+                "row",
+                retain_expr,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let oracle_retain = generic
+            .list_retain(
+                oracle_filter,
+                "row",
+                retain_expr,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let BoonValue::ListSelection { indices, .. } = &optimized_retain else {
+            panic!("optimized numeric retain should preserve a row-index selection");
+        };
+        assert_eq!(indices.as_ref(), &[1, 3]);
+
+        let optimized_map = generic
+            .list_map(
+                optimized_retain,
+                "row",
+                identity_expr,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        let oracle_map = generic
+            .list_map(
+                oracle_retain,
+                "row",
+                identity_expr,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            generic
+                .list_join_field(
+                    optimized_map,
+                    "label",
+                    None,
+                    None,
+                    &mut GenericEvalFrame::root(),
+                )
+                .unwrap(),
+            generic
+                .list_join_field(
+                    oracle_map,
+                    "label",
+                    None,
+                    None,
+                    &mut GenericEvalFrame::root(),
+                )
+                .unwrap(),
+            "optimized map/join output should match the generic record-list oracle"
+        );
+        assert_eq!(
+            generic.list_scan_counters.filter_field_rows_scanned, 4,
+            "only the generic oracle filter should scan its materialized records"
+        );
+        assert_eq!(
+            generic.list_scan_counters.retain_rows_scanned, 3,
+            "only the generic oracle retain should scan its materialized records"
+        );
+    }
+
+    #[test]
+    fn list_map_identity_preserves_storage_views_without_row_expansion() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { row-1 }]
+            [key: TEXT { row-2 }]
+            [key: TEXT { row-3 }]
+            [key: TEXT { row-4 }]
+        }
+    identity:
+        records |> List/map(row, new: row)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("list-map-identity-view", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        let identity_expr = generic
+            .generic_derived
+            .expressions
+            .iter()
+            .position(|expr| matches!(&expr.kind, AstExprKind::Identifier(name) if name == "row"))
+            .expect("test source should contain an identity row expression");
+
+        generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
+        let output = generic
+            .list_map(
+                BoonValue::ListRef(list.clone()),
+                "row",
+                identity_expr,
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(output, BoonValue::ListRef(list.clone()));
+        assert!(frame.reads.contains(&list_read_key(&list)));
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "identity List/map over ListRef should keep the storage view"
+        );
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            4
+        );
+
+        generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
+        let output = generic
+            .list_map(
+                BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(vec![0, 2, 3]),
+                },
+                "row",
+                identity_expr,
+                &mut frame,
+            )
+            .unwrap();
+        let BoonValue::ListSelection {
+            list: output_list,
+            indices,
+        } = output
+        else {
+            panic!("identity List/map should preserve ListSelection output");
+        };
+        assert_eq!(output_list, list);
+        assert_eq!(indices.as_ref(), &[0, 2, 3]);
+        assert!(frame.reads.contains(&list_read_key(&output_list)));
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, 0,
+            "identity List/map over ListSelection should not expand selected rows"
+        );
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            3
+        );
+
+        generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
+        let output = generic
+            .runtime_list_map(
+                BoonValue::ListSelection {
+                    list: output_list.clone(),
+                    indices: list_selection_indices(vec![1, 3]),
+                },
+                "row",
+                &RuntimeGenericExpr::Identifier("row".to_owned()),
+                &mut frame,
+            )
+            .unwrap();
+        let BoonValue::ListSelection { list, indices } = output else {
+            panic!("runtime-generic identity List/map should preserve ListSelection output");
+        };
+        assert_eq!(list, output_list);
+        assert_eq!(indices.as_ref(), &[1, 3]);
+        assert_eq!(generic.list_scan_counters.row_occurrences_scanned, 0);
+        assert_eq!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided,
+            2
+        );
     }
 
     #[test]
@@ -57127,6 +60263,75 @@ document: Document/new(root: Element/label(element: [], label: store.value))
     }
 
     #[test]
+    fn list_view_direct_join_and_fused_map_join_avoid_row_ref_vector() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    selected_file:
+        TEXT { wave.fst } |> HOLD selected_file { LATEST {} }
+    selected_signal:
+        TEXT { data } |> HOLD selected_signal { LATEST {} }
+    segments:
+        LIST {
+            [file: TEXT { wave.fst }, signal_id: TEXT { data }, state: Segment, start: 0, end: 50, label: TEXT { old }]
+            [file: TEXT { wave.fst }, signal_id: TEXT { data }, state: Segment, start: 50, end: 100, label: TEXT { mid-a }]
+            [file: TEXT { wave.fst }, signal_id: TEXT { other }, state: Segment, start: 50, end: 100, label: TEXT { other }]
+            [file: TEXT { other.fst }, signal_id: TEXT { data }, state: Segment, start: 50, end: 100, label: TEXT { wrong-file }]
+            [file: TEXT { wave.fst }, signal_id: TEXT { data }, state: Segment, start: 100, end: 150, label: TEXT { mid-b }]
+        }
+    selected_segments:
+        segments
+        |> List/filter_field_equal(field: "file", value: selected_file)
+        |> List/filter_field_equal(field: "signal_id", value: selected_signal)
+    direct_labels:
+        selected_segments |> List/join_field(field: "label", separator: "|", empty: TEXT { missing })
+    fused_labels:
+        selected_segments
+        |> List/map(segment, new: [value: segment.label])
+        |> List/join_field(field: "value", separator: "|", empty: TEXT { missing })
+]
+
+document: Document/new(root: Element/label(element: [], label: store.direct_labels))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("list-selection-view-direct-join", source).unwrap();
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["direct_labels"], "old|mid-a|mid-b");
+        assert_eq!(summary["store"]["fused_labels"], "old|mid-a|mid-b");
+        let generic = runtime.runtime.generic.as_ref().unwrap();
+        assert!(
+            generic.list_scan_counters.list_view_direct_rows >= 6,
+            "direct join and fused map/join should both consume list-view rows directly; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert!(
+            generic
+                .list_scan_counters
+                .list_view_row_ref_materializations_avoided
+                >= generic.list_scan_counters.list_view_direct_rows,
+            "list-view direct path should account for avoided row-ref vector materialization; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert!(
+            generic.list_scan_counters.map_join_field_fusions >= 1,
+            "selected map/join should keep the existing fusion path; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert!(
+            generic.list_scan_counters.map_join_field_rows_fused >= 3,
+            "selected map/join should fuse the three selected rows; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert_eq!(
+            generic.list_scan_counters.filter_field_rows_scanned, 0,
+            "indexed filters should produce a reusable selection without fallback scanning; counters={:?}",
+            generic.list_scan_counters
+        );
+    }
+
+    #[test]
     fn indexed_pipeline_reorders_text_equal_filters_by_bucket_size() {
         let mut rows = String::new();
         for index in 0..40 {
@@ -57568,6 +60773,290 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_ne!(
             boon_value_cache_fragment(&BoonValue::RecordColumns(text_a)),
             boon_value_cache_fragment(&BoonValue::RecordColumns(enum_a))
+        );
+    }
+
+    #[test]
+    fn bytes_value_summary_hides_inline_payload() {
+        let bytes = RuntimeBytes::inline(Bytes::from_static(b"abc"));
+        let summary = bytes.report_json();
+
+        assert_eq!(summary["$boon_type"], "BYTES");
+        assert_eq!(summary["storage"], "inline");
+        assert_eq!(summary["byte_len"], 3);
+        assert_eq!(summary["digest"], sha256_bytes(b"abc"));
+        assert!(
+            summary.get("inline_bytes").is_none(),
+            "public summaries must not expose inline bytes: {summary:#?}"
+        );
+
+        let artifact = bytes.artifact_json();
+        assert_eq!(artifact["inline_bytes"], json!([97, 98, 99]));
+        assert_eq!(
+            RuntimeBytes::from_artifact(&artifact, "test.bytes")
+                .expect("bytes artifact should restore"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn bytes_field_and_list_storage_round_trip_as_typed_columns() {
+        let payload = RuntimeBytes::inline(Bytes::from_static(b"wave-page"));
+        let mut columns = ValueColumns::default();
+        columns.insert_value("payload".to_owned(), FieldValue::Bytes(payload.clone()));
+        columns.insert_value("label".to_owned(), FieldValue::Text("visible".to_owned()));
+
+        let summary = value_columns_json(&columns);
+        assert_eq!(summary["payload"]["$boon_type"], "BYTES");
+        assert_eq!(summary["payload"]["byte_len"], 9);
+        assert!(
+            summary["payload"].get("inline_bytes").is_none(),
+            "record summary must not inline payload bytes: {summary:#?}"
+        );
+
+        let list = ListMemory::from_values([RuntimeRowSnapshot {
+            columns: columns.clone(),
+        }]);
+        assert!(matches!(
+            list.value(0, "payload"),
+            Some(FieldValueRef::Bytes(value)) if value == &payload
+        ));
+        assert_eq!(
+            list.snapshot_slot(list.visible_slot(0).unwrap()).columns,
+            columns
+        );
+
+        let mut json_like = ValueColumns::default();
+        json_like.insert_value(
+            "payload".to_owned(),
+            FieldValue::Json(payload.report_json()),
+        );
+        assert_ne!(
+            boon_value_cache_fragment(&BoonValue::RecordColumns(columns)),
+            boon_value_cache_fragment(&BoonValue::RecordColumns(json_like)),
+            "typed BYTES must not collide with equivalent-looking JSON metadata"
+        );
+    }
+
+    #[test]
+    fn bridge_value_bytes_and_refs_convert_to_runtime_bytes() {
+        let inline = BridgeValue::inline_bytes(
+            sha256_bytes(b"bridge-inline"),
+            Bytes::from_static(b"bridge-inline"),
+        );
+        let inline_field = bridge_value_to_field_value(&inline)
+            .expect("inline bridge bytes should convert to runtime bytes");
+        let FieldValue::Bytes(inline_bytes) = inline_field else {
+            panic!("inline bridge bytes should become FieldValue::Bytes");
+        };
+        assert_eq!(inline_bytes.byte_len, b"bridge-inline".len() as u64);
+        assert_eq!(inline_bytes.report_json()["storage"], "inline");
+
+        let blob = BridgeBlobRef {
+            digest: "sha256:blob".to_owned(),
+            byte_len: 4096,
+            media_type: "application/octet-stream".to_owned(),
+            storage: "fixture-bounded-pages".to_owned(),
+            encoding: "fst".to_owned(),
+        };
+        let blob_field = bridge_value_to_field_value(&BridgeValue::BlobRef(blob.clone()))
+            .expect("blob ref should convert to bytes metadata");
+        let FieldValue::Bytes(blob_bytes) = blob_field else {
+            panic!("blob ref should become FieldValue::Bytes");
+        };
+        assert_eq!(blob_bytes.report_json()["storage"], "blob_ref");
+        assert_eq!(blob_bytes.report_json()["digest"], blob.digest);
+        assert_eq!(blob_bytes.report_json()["byte_len"], blob.byte_len);
+
+        let page = BridgePageRef {
+            artifact_digest: "sha256:artifact".to_owned(),
+            schema_version: 1,
+            schema_hash: "sha256:schema".to_owned(),
+            request_fingerprint: "request".to_owned(),
+            response_fingerprint: "response".to_owned(),
+            input_digest: "sha256:input".to_owned(),
+            page_digest: "sha256:page".to_owned(),
+            generation: 7,
+            offset: 128,
+            limit: 256,
+            row_count: 32,
+            sample_count: 64,
+            transition_count: 16,
+            byte_length: 2048,
+            byte_len: 2048,
+            status: "ready".to_owned(),
+        };
+        let page_field = bridge_value_to_field_value(&BridgeValue::PageRef(page.clone()))
+            .expect("page ref should convert to bytes metadata");
+        let FieldValue::Bytes(page_bytes) = page_field else {
+            panic!("page ref should become FieldValue::Bytes");
+        };
+        let page_summary = page_bytes.report_json();
+        assert_eq!(page_summary["storage"], "page_ref");
+        assert_eq!(page_summary["digest"], page.page_digest);
+        assert_eq!(page_summary["artifact_digest"], page.artifact_digest);
+        assert_eq!(page_summary["byte_len"], page.byte_len);
+    }
+
+    #[test]
+    fn bridge_completion_payload_sidecars_reach_runtime_bytes_boundary() {
+        use boon_bridge::{
+            BRIDGE_ABI_VERSION, BridgeCompletionPayloads, BridgeCompletionStatus,
+            BridgeEffectScheduler, BridgeExportKind, BridgeExportMetadata, BridgeModuleMetadata,
+            BridgeProviderMetadata, BridgeRegistry, BridgeSchema, BridgeSchemaShape,
+            BridgeTaskCompletion, BridgeTaskRequest, CANONICAL_SCHEMA_VERSION, bridge_bytes_digest,
+        };
+
+        let input = BridgeSchema {
+            name: "PayloadRuntimeRequest".to_owned(),
+            version: CANONICAL_SCHEMA_VERSION,
+            shape: BridgeSchemaShape::Record {
+                fields: BTreeMap::new(),
+            },
+        };
+        let output = BridgeSchema {
+            name: "PayloadRuntimeOutput".to_owned(),
+            version: CANONICAL_SCHEMA_VERSION,
+            shape: BridgeSchemaShape::Record {
+                fields: BTreeMap::from([
+                    ("blob".to_owned(), BridgeSchemaShape::BlobRef),
+                    ("inline".to_owned(), BridgeSchemaShape::Bytes),
+                    ("page".to_owned(), BridgeSchemaShape::PageRef),
+                    ("status".to_owned(), BridgeSchemaShape::Text),
+                ]),
+            },
+        };
+        let export = BridgeExportMetadata {
+            name: "load_payloads".to_owned(),
+            kind: BridgeExportKind::Effect,
+            input_schema_version: input.version,
+            input_schema_hash: input.hash(),
+            output_schema_version: output.version,
+            output_schema_hash: output.hash(),
+            required_capabilities: Vec::new(),
+        };
+        let mut registry = BridgeRegistry::new();
+        registry
+            .register_module(BridgeModuleMetadata {
+                module: "payloads.v1".to_owned(),
+                abi_version: BRIDGE_ABI_VERSION.to_owned(),
+                canonical_schema_version: CANONICAL_SCHEMA_VERSION,
+                provider: BridgeProviderMetadata {
+                    provider: "payload-runtime-test".to_owned(),
+                    provider_version: "0.1.fixture".to_owned(),
+                    bridge_crate: "boon_payload_runtime_test_bridge".to_owned(),
+                    bridge_crate_version: "0.1.0".to_owned(),
+                    features: vec!["bytes-boundary".to_owned()],
+                },
+                exports: BTreeMap::from([("load_payloads".to_owned(), export.clone())]),
+            })
+            .expect("payload runtime test module should register once");
+        registry
+            .register_export_schemas("payloads.v1", "load_payloads", input, output)
+            .expect("payload runtime schemas should match metadata");
+
+        let blob_bytes = Bytes::from_static(b"raw waveform blob bytes");
+        let page_bytes = Bytes::from_static(b"decoded waveform page bytes");
+        let inline_bytes = Bytes::from_static(b"inline header");
+        let blob_ref = BridgeBlobRef {
+            digest: bridge_bytes_digest(blob_bytes.as_ref()),
+            byte_len: blob_bytes.len() as u64,
+            media_type: "application/vnd.boon.wave-page".to_owned(),
+            storage: "bridge-payload-store".to_owned(),
+            encoding: "packed-wave-page".to_owned(),
+        };
+        let page_ref = BridgePageRef {
+            artifact_digest: "sha256:artifact".to_owned(),
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            schema_hash: "sha256:schema".to_owned(),
+            request_fingerprint: "request:fingerprint".to_owned(),
+            response_fingerprint: "response:fingerprint".to_owned(),
+            input_digest: "sha256:input".to_owned(),
+            page_digest: bridge_bytes_digest(page_bytes.as_ref()),
+            generation: 1,
+            offset: 0,
+            limit: page_bytes.len() as u64,
+            row_count: 2,
+            sample_count: 8,
+            transition_count: 4,
+            byte_length: page_bytes.len() as u64,
+            byte_len: page_bytes.len() as u64,
+            status: "ready".to_owned(),
+        };
+        let inline_digest = bridge_bytes_digest(inline_bytes.as_ref());
+
+        let request = BridgeTaskRequest::new(
+            &export,
+            "payloads.v1",
+            "payload-runtime",
+            1,
+            BridgeValue::Record(BTreeMap::new()),
+            Vec::new(),
+            "cancel:payload-runtime",
+            0,
+        );
+        let mut scheduler = BridgeEffectScheduler::new(128);
+        scheduler
+            .schedule(&registry, request.clone())
+            .expect("payload runtime request should schedule");
+        let output = BridgeValue::Record(BTreeMap::from([
+            ("blob".to_owned(), BridgeValue::BlobRef(blob_ref.clone())),
+            (
+                "inline".to_owned(),
+                BridgeValue::inline_bytes(inline_digest.clone(), inline_bytes.clone()),
+            ),
+            ("page".to_owned(), BridgeValue::PageRef(page_ref.clone())),
+            ("status".to_owned(), BridgeValue::Text("ready".to_owned())),
+        ]));
+        let mut payloads = BridgeCompletionPayloads::new();
+        payloads
+            .insert_blob(&blob_ref, blob_bytes)
+            .expect("blob sidecar should match blob ref");
+        payloads
+            .insert_page(&page_ref, page_bytes)
+            .expect("page sidecar should match page ref");
+        let accepted = scheduler
+            .complete_with_payloads(
+                BridgeTaskCompletion::for_request(
+                    &request,
+                    BridgeCompletionStatus::Ok,
+                    Some(output),
+                    Vec::new(),
+                ),
+                &payloads,
+            )
+            .expect("completion with matching payload sidecars should be accepted");
+
+        let summary = bridge_completion_output_runtime_summary(&accepted)
+            .expect("accepted bridge completion should convert to runtime summary")
+            .expect("OK completion should carry output");
+        assert_eq!(summary["status"], "ready");
+        assert_eq!(summary["blob"]["$boon_type"], "BYTES");
+        assert_eq!(summary["blob"]["storage"], "blob_ref");
+        assert_eq!(summary["blob"]["digest"], blob_ref.digest);
+        assert_eq!(summary["blob"]["byte_len"], blob_ref.byte_len);
+        assert!(summary["blob"].get("inline_bytes").is_none());
+        assert_eq!(summary["page"]["$boon_type"], "BYTES");
+        assert_eq!(summary["page"]["storage"], "page_ref");
+        assert_eq!(summary["page"]["digest"], page_ref.page_digest);
+        assert_eq!(summary["page"]["artifact_digest"], page_ref.artifact_digest);
+        assert_eq!(summary["page"]["byte_len"], page_ref.byte_len);
+        assert!(summary["page"].get("inline_bytes").is_none());
+        assert_eq!(summary["inline"]["$boon_type"], "BYTES");
+        assert_eq!(summary["inline"]["storage"], "inline");
+        assert_eq!(summary["inline"]["digest"], inline_digest);
+        assert_eq!(summary["inline"]["byte_len"], inline_bytes.len() as u64);
+        assert!(summary["inline"].get("inline_bytes").is_none());
+
+        let restored: BridgeTaskCompletion = serde_json::from_value(
+            serde_json::to_value(&accepted).expect("completion should serialize"),
+        )
+        .expect("completion should deserialize");
+        assert_eq!(
+            bridge_completion_output_runtime_summary(&restored)
+                .expect("restored completion should convert"),
+            Some(summary),
+            "runtime BYTES summaries must be deterministic across completion replay metadata"
         );
     }
 

@@ -2,9 +2,9 @@
 
 use boon_runtime::{
     ArtifactScenarioRunOutput, LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer,
-    emit_compiled_artifact, example_paths, inspect_compiled_artifact_report, parse_scenario,
-    run_compiled_artifact_scenario, run_scenario, run_scenario_project,
-    verify_expression_bytecode_report, verify_report_schema, write_json,
+    bridge_completion_output_runtime_summary, emit_compiled_artifact, example_paths,
+    inspect_compiled_artifact_report, parse_scenario, run_compiled_artifact_scenario, run_scenario,
+    run_scenario_project, verify_expression_bytecode_report, verify_report_schema, write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -280,33 +280,21 @@ fn verify_novywave_bridge_scenario(args: &[String]) -> Result<(), Box<dyn std::e
 
     let mut snapshots = Vec::new();
     snapshots.push(("initial-vcd".to_owned(), runtime.state_summary()));
-    snapshots.push((
-        "select-fst".to_owned(),
-        runtime
-            .apply_source_event(live_source_event_for_scenario_step_id(
-                &scenario,
-                "select-compare-file",
-            )?)?
-            .state_summary,
-    ));
-    snapshots.push((
-        "select-ghw".to_owned(),
-        runtime
-            .apply_source_event(live_source_event_for_scenario_step_id(
-                &scenario,
-                "select-ghw-file",
-            )?)?
-            .state_summary,
-    ));
-    snapshots.push((
-        "stale-response".to_owned(),
-        runtime
-            .apply_source_event(live_source_event_for_scenario_step_id(
-                &scenario,
-                "reject-stale-page",
-            )?)?
-            .state_summary,
-    ));
+    runtime.apply_source_event(live_source_event_for_scenario_step_id(
+        &scenario,
+        "select-compare-file",
+    )?)?;
+    snapshots.push(("select-fst".to_owned(), runtime.state_summary()));
+    runtime.apply_source_event(live_source_event_for_scenario_step_id(
+        &scenario,
+        "select-ghw-file",
+    )?)?;
+    snapshots.push(("select-ghw".to_owned(), runtime.state_summary()));
+    runtime.apply_source_event(live_source_event_for_scenario_step_id(
+        &scenario,
+        "reject-stale-page",
+    )?)?;
+    snapshots.push(("stale-response".to_owned(), runtime.state_summary()));
 
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -329,6 +317,8 @@ fn verify_novywave_bridge_scenario(args: &[String]) -> Result<(), Box<dyn std::e
         &mut checks,
         &mut blockers,
     );
+    let bridge_real_payload_bytes_evidence =
+        novywave_bridge_real_payload_bytes_evidence(&snapshots, &mut checks, &mut blockers)?;
 
     write_static_gate_report(
         args,
@@ -353,8 +343,373 @@ fn verify_novywave_bridge_scenario(args: &[String]) -> Result<(), Box<dyn std::e
             "bridge_snapshots": snapshot_evidence,
             "bridge_scenario_coverage": scenario_coverage,
             "bridge_negative_policy_evidence": bridge_negative_evidence,
+            "bridge_real_payload_bytes_evidence": bridge_real_payload_bytes_evidence,
         }),
     )
+}
+
+struct NovywaveBridgePayloadFileSpec {
+    label: &'static str,
+    file: &'static str,
+    path: &'static str,
+    snapshot_label: &'static str,
+    sidecar_payload: bool,
+}
+
+fn novywave_bridge_real_payload_bytes_evidence(
+    snapshots: &[(String, serde_json::Value)],
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let files = [
+        NovywaveBridgePayloadFileSpec {
+            label: "simple-vcd",
+            file: "simple.vcd",
+            path: "/home/martinkavik/repos/NovyWave/test_files/simple.vcd",
+            snapshot_label: "initial-vcd",
+            sidecar_payload: true,
+        },
+        NovywaveBridgePayloadFileSpec {
+            label: "simple-ghw",
+            file: "simple_test.ghw",
+            path: "/home/martinkavik/repos/NovyWave/test_files/simple_test.ghw",
+            snapshot_label: "select-ghw",
+            sidecar_payload: true,
+        },
+        NovywaveBridgePayloadFileSpec {
+            label: "wave-fst-large",
+            file: "wave_27.fst",
+            path: "/home/martinkavik/repos/NovyWave/test_files/wave_27.fst",
+            snapshot_label: "select-fst",
+            sidecar_payload: false,
+        },
+    ];
+
+    let input_schema = boon_bridge::BridgeSchema {
+        name: "NovyWaveRealPayloadRequest".to_owned(),
+        version: boon_bridge::CANONICAL_SCHEMA_VERSION,
+        shape: boon_bridge::BridgeSchemaShape::Record {
+            fields: BTreeMap::from([
+                ("file".to_owned(), boon_bridge::BridgeSchemaShape::Text),
+                ("digest".to_owned(), boon_bridge::BridgeSchemaShape::Text),
+                ("byte_len".to_owned(), boon_bridge::BridgeSchemaShape::Int),
+            ]),
+        },
+    };
+    let output_schema = boon_bridge::BridgeSchema {
+        name: "NovyWaveRealPayloadCompletion".to_owned(),
+        version: boon_bridge::CANONICAL_SCHEMA_VERSION,
+        shape: boon_bridge::BridgeSchemaShape::Record {
+            fields: BTreeMap::from([
+                ("status".to_owned(), boon_bridge::BridgeSchemaShape::Text),
+                ("blob".to_owned(), boon_bridge::BridgeSchemaShape::BlobRef),
+                ("page".to_owned(), boon_bridge::BridgeSchemaShape::PageRef),
+            ]),
+        },
+    };
+    let mut exports = BTreeMap::new();
+    exports.insert(
+        "load_payloads".to_owned(),
+        boon_bridge::BridgeExportMetadata {
+            name: "load_payloads".to_owned(),
+            kind: boon_bridge::BridgeExportKind::Effect,
+            input_schema_version: input_schema.version,
+            input_schema_hash: input_schema.hash(),
+            output_schema_version: output_schema.version,
+            output_schema_hash: output_schema.hash(),
+            required_capabilities: Vec::new(),
+        },
+    );
+    let mut registry = boon_bridge::BridgeRegistry::new();
+    registry.register_module(boon_bridge::BridgeModuleMetadata {
+        module: "novywave.bytes.v1".to_owned(),
+        abi_version: boon_bridge::BRIDGE_ABI_VERSION.to_owned(),
+        canonical_schema_version: boon_bridge::CANONICAL_SCHEMA_VERSION,
+        provider: boon_bridge::BridgeProviderMetadata {
+            provider: "novywave-fixture".to_owned(),
+            provider_version: "0.1".to_owned(),
+            bridge_crate: "xtask".to_owned(),
+            bridge_crate_version: "0.1.0".to_owned(),
+            features: vec![
+                "real-file-digest".to_owned(),
+                "blob-sidecar".to_owned(),
+                "page-sidecar".to_owned(),
+            ],
+        },
+        exports,
+    })?;
+    registry.register_export_schemas(
+        "novywave.bytes.v1",
+        "load_payloads",
+        input_schema.clone(),
+        output_schema.clone(),
+    )?;
+    let export = registry
+        .export("novywave.bytes.v1", "load_payloads")?
+        .clone();
+
+    let mut file_evidence = Vec::new();
+    let mut completion_evidence = Vec::new();
+    let mut descriptor_matches = true;
+    let mut sidecar_completion_pass = true;
+    let mut runtime_summary_pass = true;
+    let mut large_file_descriptor_only = true;
+
+    for spec in files {
+        let path = Path::new(spec.path);
+        let metadata = fs::metadata(path)?;
+        let actual_len = metadata.len();
+        let actual_digest = bridge_digest_for_file(path)?;
+        let summary = snapshots
+            .iter()
+            .find(|(label, _)| label == spec.snapshot_label)
+            .map(|(_, summary)| summary)
+            .ok_or_else(|| format!("missing NovyWave snapshot `{}`", spec.snapshot_label))?;
+        let descriptor_digest =
+            store_string(summary, "bridge_file_digest").unwrap_or_else(|| "missing".to_owned());
+        let descriptor_len = store_u64(summary, "bridge_artifact_byte_length").unwrap_or_default();
+        let active_file = store_string(summary, "bridge_descriptor_file")
+            .or_else(|| store_string(summary, "active_file"))
+            .unwrap_or_else(|| "missing".to_owned());
+        let descriptor_match = descriptor_digest == actual_digest
+            && descriptor_len == actual_len
+            && active_file == spec.file;
+        descriptor_matches &= descriptor_match;
+
+        let mut file_report = json!({
+            "label": spec.label,
+            "file": spec.file,
+            "path": spec.path,
+            "snapshot_label": spec.snapshot_label,
+            "active_file": active_file,
+            "actual_digest": actual_digest,
+            "descriptor_digest": descriptor_digest,
+            "actual_byte_len": actual_len,
+            "descriptor_byte_len": descriptor_len,
+            "descriptor_matches_real_file": descriptor_match,
+            "sidecar_payload": spec.sidecar_payload
+        });
+
+        if spec.sidecar_payload {
+            let bytes = fs::read(path)?;
+            let blob_ref = boon_bridge::BridgeBlobRef {
+                digest: actual_digest.clone(),
+                byte_len: actual_len,
+                media_type: "application/vnd.wellen.waveform".to_owned(),
+                storage: "novywave-test-files".to_owned(),
+                encoding: novywave_payload_encoding(spec.file).to_owned(),
+            };
+            let request_input = boon_bridge::BridgeValue::Record(BTreeMap::from([
+                (
+                    "file".to_owned(),
+                    boon_bridge::BridgeValue::Text(spec.file.to_owned()),
+                ),
+                (
+                    "digest".to_owned(),
+                    boon_bridge::BridgeValue::Text(actual_digest.clone()),
+                ),
+                (
+                    "byte_len".to_owned(),
+                    boon_bridge::BridgeValue::Int(actual_len as i128),
+                ),
+            ]));
+            let request = boon_bridge::BridgeTaskRequest::new(
+                &export,
+                "novywave.bytes.v1",
+                format!("{}:{}", spec.label, actual_digest),
+                1,
+                request_input,
+                Vec::new(),
+                format!("{}:cancel", spec.label),
+                0,
+            );
+            let page_ref = boon_bridge::BridgePageRef {
+                artifact_digest: actual_digest.clone(),
+                schema_version: boon_bridge::CANONICAL_SCHEMA_VERSION,
+                schema_hash: output_schema.hash(),
+                request_fingerprint: request.request_key.clone(),
+                response_fingerprint: boon_bridge::canonical_hash(&json!({
+                    "file": spec.file,
+                    "digest": actual_digest,
+                    "byte_len": actual_len
+                })),
+                input_digest: request.input_digest.clone(),
+                page_digest: actual_digest.clone(),
+                generation: 1,
+                offset: 0,
+                limit: actual_len,
+                row_count: 0,
+                sample_count: 0,
+                transition_count: 0,
+                byte_length: actual_len,
+                byte_len: actual_len,
+                status: "FILE_READY".to_owned(),
+            };
+            let mut scheduler = boon_bridge::BridgeEffectScheduler::new(0);
+            let schedule = scheduler.schedule(&registry, request.clone());
+            let mut payloads = boon_bridge::BridgeCompletionPayloads::new();
+            let blob_insert = payloads.insert_blob(&blob_ref, bytes.clone());
+            let page_insert = payloads.insert_page(&page_ref, bytes);
+            let completion = boon_bridge::BridgeTaskCompletion::for_request(
+                &request,
+                boon_bridge::BridgeCompletionStatus::Ok,
+                Some(boon_bridge::BridgeValue::Record(BTreeMap::from([
+                    (
+                        "status".to_owned(),
+                        boon_bridge::BridgeValue::Text("ready".to_owned()),
+                    ),
+                    (
+                        "blob".to_owned(),
+                        boon_bridge::BridgeValue::BlobRef(blob_ref.clone()),
+                    ),
+                    (
+                        "page".to_owned(),
+                        boon_bridge::BridgeValue::PageRef(page_ref.clone()),
+                    ),
+                ]))),
+                Vec::new(),
+            );
+            let accepted = scheduler.complete_with_payloads(completion, &payloads);
+            let runtime_summary = accepted
+                .as_ref()
+                .ok()
+                .and_then(|completion| {
+                    bridge_completion_output_runtime_summary(completion)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_else(|| json!({ "error": "missing-runtime-summary" }));
+            let blob_summary_pass = runtime_summary.pointer("/blob/$boon_type")
+                == Some(&json!("BYTES"))
+                && runtime_summary.pointer("/blob/storage") == Some(&json!("blob_ref"))
+                && runtime_summary.pointer("/blob/digest") == Some(&json!(blob_ref.digest.clone()))
+                && runtime_summary.pointer("/blob/byte_len") == Some(&json!(blob_ref.byte_len));
+            let page_summary_pass = runtime_summary.pointer("/page/$boon_type")
+                == Some(&json!("BYTES"))
+                && runtime_summary.pointer("/page/storage") == Some(&json!("page_ref"))
+                && runtime_summary.pointer("/page/digest")
+                    == Some(&json!(page_ref.page_digest.clone()))
+                && runtime_summary.pointer("/page/byte_len") == Some(&json!(page_ref.byte_len));
+            let raw_bytes_leaked = runtime_summary.to_string().contains("\"bytes\"");
+            let completion_pass =
+                schedule.is_ok() && blob_insert.is_ok() && page_insert.is_ok() && accepted.is_ok();
+            sidecar_completion_pass &= completion_pass;
+            runtime_summary_pass &= blob_summary_pass && page_summary_pass && !raw_bytes_leaked;
+            completion_evidence.push(json!({
+                "label": spec.label,
+                "file": spec.file,
+                "schedule_status": schedule.as_ref().map(|result| format!("{:?}", result.outcome)).unwrap_or_else(|error| format!("error:{:?}", error.code)),
+                "blob_insert_ok": blob_insert.is_ok(),
+                "page_insert_ok": page_insert.is_ok(),
+                "accepted": accepted.is_ok(),
+                "payload_blob_count": payloads.blob_count(),
+                "payload_page_count": payloads.page_count(),
+                "runtime_summary": runtime_summary,
+                "blob_summary_pass": blob_summary_pass,
+                "page_summary_pass": page_summary_pass,
+                "raw_bytes_leaked": raw_bytes_leaked
+            }));
+            if let serde_json::Value::Object(object) = &mut file_report {
+                object.insert("runtime_sidecar_digest".to_owned(), json!(actual_digest));
+            }
+        } else {
+            large_file_descriptor_only &=
+                spec.file == "wave_27.fst" && actual_len > 1_000_000 && descriptor_match;
+        }
+
+        file_evidence.push(file_report);
+    }
+
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:real-payload-bytes:descriptor-digests",
+        descriptor_matches,
+        format!("all descriptor digests and byte lengths matched real files: {descriptor_matches}"),
+        (!descriptor_matches)
+            .then(|| "NovyWave bridge descriptors do not match real test files".to_owned()),
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:real-payload-bytes:sidecar-completions",
+        sidecar_completion_pass,
+        format!("small-file sidecar completions accepted: {sidecar_completion_pass}"),
+        (!sidecar_completion_pass)
+            .then(|| "NovyWave real small-file sidecar bridge completions failed".to_owned()),
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:real-payload-bytes:runtime-summary",
+        runtime_summary_pass,
+        format!("runtime BYTES summaries valid without raw bytes: {runtime_summary_pass}"),
+        (!runtime_summary_pass).then(|| {
+            "NovyWave real payloads did not reach runtime BYTES summaries cleanly".to_owned()
+        }),
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        "novywave-bridge:real-payload-bytes:large-fst-descriptor-only",
+        large_file_descriptor_only,
+        format!(
+            "large FST hash/length checked without routine sidecar load: {large_file_descriptor_only}"
+        ),
+        (!large_file_descriptor_only).then(|| {
+            "NovyWave large FST payload proof loaded or mismatched the descriptor".to_owned()
+        }),
+    );
+
+    Ok(json!({
+        "status": if descriptor_matches && sidecar_completion_pass && runtime_summary_pass && large_file_descriptor_only {
+            "pass"
+        } else {
+            "fail"
+        },
+        "contract": "real NovyWave file payloads may enter runtime as bridge BYTES sidecars, while Boon-visible filenames, labels, statuses, and descriptor records remain structural TEXT/records",
+        "file_evidence": file_evidence,
+        "completion_evidence": completion_evidence,
+        "large_file_policy": "hash-and-length descriptor proof only for wave_27.fst until chunked Stream<Bytes> sidecars exist"
+    }))
+}
+
+fn bridge_digest_for_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let digest = boon_runtime::sha256_file(path)?;
+    Ok(if digest.starts_with("sha256:") {
+        digest
+    } else {
+        format!("sha256:{digest}")
+    })
+}
+
+fn novywave_payload_encoding(file: &str) -> &'static str {
+    match Path::new(file)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+    {
+        "vcd" => "vcd",
+        "ghw" => "ghw",
+        "fst" => "fst",
+        _ => "binary",
+    }
+}
+
+fn store_string(summary: &serde_json::Value, key: &str) -> Option<String> {
+    summary
+        .pointer(&format!("/store/{key}"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn store_u64(summary: &serde_json::Value, key: &str) -> Option<u64> {
+    summary.pointer(&format!("/store/{key}")).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
 }
 
 struct NovywaveBridgeScenarioGroup {

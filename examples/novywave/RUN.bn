@@ -2667,6 +2667,29 @@ store: [
     bridge_request_fingerprint:
         bridge_request_descriptor_label
 
+    bridge_page_request_fingerprint:
+        active_signal_key == TEXT { NONE } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                TEXT { request }
+                |> Text/concat(with: active_scope_key, separator: "|")
+                |> Text/concat(with: active_signal_key, separator: "|")
+                |> Text/concat(with: zoom_level, separator: "|")
+                |> Text/concat(with: pan_window, separator: "|")
+                |> Text/concat(with: active_signal_format, separator: "|")
+        }
+
+    bridge_page_request_descriptor_label:
+        active_signal_key == TEXT { NONE } |> WHEN {
+            True => TEXT { No request scheduled }
+            False =>
+                active_scope_key
+                |> Text/concat(with: active_signal_key, separator: "/")
+                |> Text/concat(with: zoom_level, separator: "/")
+                |> Text/concat(with: pan_window, separator: "/")
+                |> Text/concat(with: active_signal_format, separator: "/")
+        }
+
     bridge_request_page:
         bridge_request_compact_label
 
@@ -2842,6 +2865,16 @@ store: [
                 |> Text/concat(with: bridge_request_window_label, separator: "|")
         }
 
+    bridge_page_request_input_digest:
+        bridge_page_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
+            True => TEXT { input:none }
+            False =>
+                bridge_file_digest
+                |> Text/concat(with: bridge_waveform_ref, separator: "|")
+                |> Text/concat(with: bridge_page_request_fingerprint, separator: "|")
+                |> Text/concat(with: bridge_request_window_label, separator: "|")
+        }
+
     bridge_request_structural_key:
         bridge_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
             True => TEXT { no-request }
@@ -2850,6 +2883,16 @@ store: [
                 |> Text/concat(with: bridge_request_generation, separator: ":")
                 |> Text/concat(with: bridge_request_fingerprint, separator: "|")
                 |> Text/concat(with: bridge_request_input_digest, separator: "|")
+        }
+
+    bridge_page_request_structural_key:
+        bridge_page_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                TEXT { gen }
+                |> Text/concat(with: bridge_request_generation, separator: ":")
+                |> Text/concat(with: bridge_page_request_fingerprint, separator: "|")
+                |> Text/concat(with: bridge_page_request_input_digest, separator: "|")
         }
 
     bridge_response_file_digest:
@@ -2918,6 +2961,16 @@ store: [
                 |> Text/concat(with: bridge_response_window_label, separator: "|")
         }
 
+    bridge_page_response_input_digest:
+        bridge_page_response_descriptor_label == TEXT { No response available } |> WHEN {
+            True => TEXT { input:none }
+            False =>
+                bridge_response_file_digest
+                |> Text/concat(with: bridge_response_waveform_ref, separator: "|")
+                |> Text/concat(with: bridge_page_response_fingerprint, separator: "|")
+                |> Text/concat(with: bridge_response_window_label, separator: "|")
+        }
+
     bridge_response_structural_key:
         bridge_response_descriptor_label == TEXT { No response available } |> WHEN {
             True => TEXT { no-request }
@@ -2928,8 +2981,41 @@ store: [
                 |> Text/concat(with: bridge_response_input_digest, separator: "|")
         }
 
+    bridge_page_response_structural_key:
+        bridge_page_response_descriptor_label == TEXT { No response available } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                TEXT { gen }
+                |> Text/concat(with: bridge_response_generation, separator: ":")
+                |> Text/concat(with: bridge_page_response_fingerprint, separator: "|")
+                |> Text/concat(with: bridge_page_response_input_digest, separator: "|")
+        }
+
     bridge_response_fingerprint:
         bridge_response_descriptor_label
+
+    bridge_page_response_fingerprint:
+        bridge_response_signal == TEXT { NONE } |> WHEN {
+            True => TEXT { no-request }
+            False =>
+                TEXT { request }
+                |> Text/concat(with: bridge_response_scope, separator: "|")
+                |> Text/concat(with: bridge_response_signal, separator: "|")
+                |> Text/concat(with: bridge_response_zoom, separator: "|")
+                |> Text/concat(with: bridge_response_pan, separator: "|")
+                |> Text/concat(with: bridge_response_format, separator: "|")
+        }
+
+    bridge_page_response_descriptor_label:
+        bridge_response_signal == TEXT { NONE } |> WHEN {
+            True => TEXT { No response available }
+            False =>
+                bridge_response_scope
+                |> Text/concat(with: bridge_response_signal, separator: "/")
+                |> Text/concat(with: bridge_response_zoom, separator: "/")
+                |> Text/concat(with: bridge_response_pan, separator: "/")
+                |> Text/concat(with: bridge_response_format, separator: "/")
+        }
 
     bridge_response_page:
         bridge_response_compact_label
@@ -2960,9 +3046,9 @@ store: [
 
     bridge_request_descriptor:
         [
-            page: bridge_request_page
-            descriptor: bridge_request_descriptor_label
-            fingerprint: bridge_request_fingerprint
+            page: bridge_page_request_descriptor_label
+            descriptor: bridge_page_request_descriptor_label
+            fingerprint: bridge_page_request_fingerprint
             identity: [
                 module: TEXT { wellen.v1 }
                 file_digest: bridge_file_digest
@@ -2978,7 +3064,6 @@ store: [
                 signal: active_signal_key
                 zoom: zoom_level
                 pan: pan_window
-                cursor: cursor_label
                 format: active_signal_format
                 window: bridge_request_window_label
             ]
@@ -3021,9 +3106,9 @@ store: [
         ]
 
     bridge_signal_page_label:
-        bridge_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
+        bridge_page_request_descriptor_label == TEXT { No request scheduled } |> WHEN {
             True => TEXT { no-request }
-            False => bridge_request_descriptor_label
+            False => bridge_page_request_descriptor_label
         }
 
     bridge_cursor_values_label:
@@ -3160,6 +3245,12 @@ store: [
     bridge_response_status_compact_label:
         bridge_page_match_compact_label(request: bridge_request_structural_key, response: bridge_response_structural_key)
 
+    bridge_page_response_status:
+        bridge_page_match_status(request: bridge_page_request_structural_key, response: bridge_page_response_structural_key)
+
+    bridge_page_response_status_compact_label:
+        bridge_page_match_compact_label(request: bridge_page_request_structural_key, response: bridge_page_response_structural_key)
+
     bridge_artifact_byte_length:
         bridge_descriptor_file |> WHEN {
             TEXT { wave_27.fst } => 28860652
@@ -3201,17 +3292,17 @@ store: [
     bridge_hierarchy_page_digest:
         TEXT { page:hierarchy }
         |> Text/concat(with: bridge_file_digest, separator: "|")
-        |> Text/concat(with: bridge_request_fingerprint, separator: "|")
+        |> Text/concat(with: bridge_page_request_fingerprint, separator: "|")
 
     bridge_signal_page_digest:
         TEXT { page:signal }
         |> Text/concat(with: bridge_file_digest, separator: "|")
-        |> Text/concat(with: bridge_request_fingerprint, separator: "|")
+        |> Text/concat(with: bridge_page_request_fingerprint, separator: "|")
 
     bridge_waveform_page_digest:
         TEXT { page:waveform }
         |> Text/concat(with: bridge_file_digest, separator: "|")
-        |> Text/concat(with: bridge_request_fingerprint, separator: "|")
+        |> Text/concat(with: bridge_page_request_fingerprint, separator: "|")
         |> Text/concat(with: bridge_request_window_label, separator: "|")
 
     bridge_cursor_values_page_digest:
@@ -3234,9 +3325,9 @@ store: [
             artifact_digest: bridge_file_digest
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_hierarchy_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
@@ -3253,9 +3344,9 @@ store: [
             artifact_digest: bridge_file_digest
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_signal_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
@@ -3272,16 +3363,16 @@ store: [
             artifact_digest: bridge_file_digest
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_waveform_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
             sample_count: bridge_waveform_sample_count
             transition_count: bridge_waveform_sample_count
             byte_length: bridge_payload_limit_bytes
-            status: bridge_response_status
+            status: bridge_page_response_status
         ]
 
     bridge_cursor_values_page_ref:
@@ -3310,9 +3401,9 @@ store: [
             artifact_digest: bridge_file_digest
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_file_stats_page_digest
             generation: bridge_request_generation
             row_count: 1
@@ -3328,9 +3419,9 @@ store: [
             descriptor: bridge_hierarchy_page_label
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_hierarchy_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
@@ -3346,9 +3437,9 @@ store: [
             descriptor: bridge_signal_page_label
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_signal_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
@@ -3361,19 +3452,19 @@ store: [
     bridge_waveform_page:
         [
             page_type: TEXT { waveform_page }
-            descriptor: bridge_request_descriptor_label
+            descriptor: bridge_page_request_descriptor_label
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_waveform_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
             sample_count: bridge_waveform_sample_count
             transition_count: bridge_waveform_sample_count
             byte_length: bridge_payload_limit_bytes
-            status: bridge_response_status
+            status: bridge_page_response_status
         ]
 
     bridge_cursor_values:
@@ -3402,9 +3493,9 @@ store: [
             format: bridge_file_format
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
-            request_fingerprint: bridge_request_fingerprint
-            response_fingerprint: bridge_response_fingerprint
-            input_digest: bridge_request_input_digest
+            request_fingerprint: bridge_page_request_fingerprint
+            response_fingerprint: bridge_page_response_fingerprint
+            input_digest: bridge_page_request_input_digest
             page_digest: bridge_file_stats_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count

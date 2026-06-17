@@ -56734,11 +56734,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         for internal in [
             "store.cursor_position",
             "store.bridge_request_fingerprint",
-            "store.bridge_hierarchy_page_digest",
             "store.bridge_request_input_digest",
             "store.bridge_request_structural_key",
-            "store.bridge_signal_page_digest",
-            "store.bridge_waveform_page_digest",
             "store.bridge_cursor_values_page_digest",
         ] {
             assert!(
@@ -56750,6 +56747,19 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 "internal pure root `{internal}` should update without a render patch: {patched_root_fields:?}"
             );
         }
+        for stable_page_identity in [
+            "store.bridge_hierarchy_page_digest",
+            "store.bridge_signal_page_digest",
+            "store.bridge_waveform_page_digest",
+            "store.bridge_page_request_fingerprint",
+            "store.bridge_page_request_input_digest",
+            "store.bridge_page_request_structural_key",
+        ] {
+            assert!(
+                !fields.contains(stable_page_identity),
+                "cursor-only clicks should not churn stable page identity `{stable_page_identity}`: {fields:?}"
+            );
+        }
         let state_summary = runtime.state_summary();
         assert!(
             state_summary
@@ -56757,6 +56767,90 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 .and_then(JsonValue::as_str)
                 .is_some_and(|value| !value.is_empty()),
             "silent internal pure roots must remain queryable in state summary: {state_summary:#?}"
+        );
+    }
+
+    #[test]
+    fn novywave_cursor_click_splits_page_identity_from_cursor_freshness() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-bridge-identity-split", &units)
+            .expect("NovyWave runtime should initialize");
+        let before = runtime.state_summary();
+        let before_store = &before["store"];
+        let before_page_identity = json!({
+            "page_request_fingerprint": before_store["bridge_page_request_fingerprint"].clone(),
+            "page_request_input_digest": before_store["bridge_page_request_input_digest"].clone(),
+            "page_request_structural_key": before_store["bridge_page_request_structural_key"].clone(),
+            "hierarchy_digest": before_store["bridge_hierarchy_page_digest"].clone(),
+            "signal_digest": before_store["bridge_signal_page_digest"].clone(),
+            "waveform_digest": before_store["bridge_waveform_page_digest"].clone(),
+            "signal_page_ref": before_store["bridge_signal_page_ref"].clone(),
+            "waveform_page_ref": before_store["bridge_waveform_page_ref"].clone(),
+        });
+        let before_cursor_page_digest =
+            before_store["bridge_cursor_values_page_ref"]["page_digest"].clone();
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.waveform_click".to_owned(),
+                pointer_x: Some("216".to_owned()),
+                pointer_y: Some("0".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                pointer_height: Some("1".to_owned()),
+                target_text: Some("waveform canvas".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform click should apply");
+        let after = runtime.state_summary();
+        let after_store = &after["store"];
+        let after_page_identity = json!({
+            "page_request_fingerprint": after_store["bridge_page_request_fingerprint"].clone(),
+            "page_request_input_digest": after_store["bridge_page_request_input_digest"].clone(),
+            "page_request_structural_key": after_store["bridge_page_request_structural_key"].clone(),
+            "hierarchy_digest": after_store["bridge_hierarchy_page_digest"].clone(),
+            "signal_digest": after_store["bridge_signal_page_digest"].clone(),
+            "waveform_digest": after_store["bridge_waveform_page_digest"].clone(),
+            "signal_page_ref": after_store["bridge_signal_page_ref"].clone(),
+            "waveform_page_ref": after_store["bridge_waveform_page_ref"].clone(),
+        });
+
+        assert_ne!(
+            before_store["keyboard_cursor_label"], after_store["keyboard_cursor_label"],
+            "the scenario must be a real cursor movement"
+        );
+        assert_ne!(
+            before_store["bridge_request_fingerprint"], after_store["bridge_request_fingerprint"],
+            "full request freshness must stay cursor-aware"
+        );
+        assert_ne!(
+            before_store["bridge_request_structural_key"],
+            after_store["bridge_request_structural_key"],
+            "full stale-response guard must stay cursor-aware"
+        );
+        assert_eq!(
+            before_page_identity, after_page_identity,
+            "stable non-cursor page identity should not change on cursor-only movement"
+        );
+        assert_ne!(
+            before_cursor_page_digest, after_store["bridge_cursor_values_page_ref"]["page_digest"],
+            "cursor-values page identity should still change when cursor is a real bridge input"
+        );
+        assert_eq!(
+            after_store["bridge_response_status"], "REJECTED_STALE_PAGE",
+            "full cursor-aware stale guard should still reject the old response"
+        );
+        assert_eq!(
+            after_store["bridge_page_response_status"],
+            "ACCEPTED_CURRENT_PAGE",
+            "non-cursor page guard should remain current for cursor-only movement: request_key={:?}, response_key={:?}, request_fp={:?}, response_fp={:?}, request_input={:?}, response_input={:?}",
+            after_store["bridge_page_request_structural_key"],
+            after_store["bridge_page_response_structural_key"],
+            after_store["bridge_page_request_fingerprint"],
+            after_store["bridge_page_response_fingerprint"],
+            after_store["bridge_page_request_input_digest"],
+            after_store["bridge_page_response_input_digest"]
         );
     }
 

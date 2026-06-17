@@ -26,23 +26,27 @@ an explicit user resume activates `TASK-0804B` only.
   activation. Current progress is tracked in this file and the master
   checklist progress log.
 - Latest canonical speed refresh still misses the strict `16.700ms`
-  click/input budget, with `click_to_cursor.p95` and `input_to_visible.p95`
-  around `18ms` in the latest recorded refresh.
+  click/input budget. After `0804R-03`, `click_to_cursor.p95` and
+  `input_to_visible.p95` are `17.701393ms`.
 - The report still names
   `root_flush_dirty_scheduler_plus_root_list_materialization`.
 - Slow clicks are the cursor-class crossing path, not false-positive no-op
-  cursor samples. Fast classes have about `26` or `28` dependent visits; slow
-  samples remain `194/32/38`.
+  cursor samples. Before `0804R-03`, slow samples were `194/32/38`; after
+  `0804R-03`, the slow class is `80/17/23`, with faster click classes
+  `21/4/10` and `23/5/11`.
 - Root-list materialization is already field-only for the hot NovyWave rows:
   `full_eval_row_count=0` and `row_materialize_ms=0`.
 - Hot visible list work remains `selected_signal_lane_rows` and
   `selected_cursor_pair_rows`; this work is real and must not be blindly
   skipped.
-- Hot internal bridge/page roots include
+- Hot internal bridge/page roots originally included
   `bridge_request_descriptor`, `bridge_cursor_values_page_ref`,
   `bridge_cursor_values`, `bridge_cursor_values_label`,
   `bridge_waveform_page(_ref)`, `bridge_signal_page(_ref)`,
-  `bridge_hierarchy_page(_ref)`, and `bridge_file_stats(_ref)`.
+  `bridge_hierarchy_page(_ref)`, and `bridge_file_stats(_ref)`. After
+  `0804R-03`, cursor movement no longer churns the stable non-cursor
+  hierarchy/signal/waveform page identities; remaining bridge churn is mostly
+  cursor-values and visible selected-row list work.
 - Renderer upload is not the current measured culprit: post-interaction upload
   remains around `3360` bytes, with zero staging wraps and zero quad-cache
   evictions in the recorded probe.
@@ -94,7 +98,9 @@ These plan-local tasks are not directly picked by the master checklist until
 
 Status values:
 
-- `blocked`: cannot start while `TASK-0804B` is postponed.
+- `blocked`: cannot start while `TASK-0804B` is postponed, while dependencies
+  are incomplete, or while a decision gate explicitly says the task is not
+  selected yet. The reason must be recorded in this file.
 - `pending`: ready after `TASK-0804B` is unpostponed.
 - `in_progress`: actively being implemented.
 - `done`: acceptance and verification passed.
@@ -306,7 +312,7 @@ Kill criteria:
 
 ## 0804R-03 Bridge/Page Identity Split
 
-Status: pending
+Status: done
 Depends on: `0804R-01`, `0804R-02`
 
 Goal: separate stable bridge/page/blob/request identity from cursor-hot
@@ -369,7 +375,8 @@ Kill criteria:
 
 ## 0804R-04 Demand/Currentness Frontier Before Dirty Enqueue
 
-Status: blocked
+Status: blocked; not selected after `0804R-03` because the fresh diagnostic
+still reports `currentness_only=0`
 Depends on: `0804R-02`; run after `0804R-03` unless the `0804R-01` decision
 table selects demand-frontier-first
 
@@ -429,7 +436,7 @@ Kill criteria:
 
 ## 0804R-05 Root List-View Field Frontier
 
-Status: blocked
+Status: pending
 Depends on: one completed graph/identity slice: `0804R-03` or `0804R-04`;
 that slice must satisfy the strict p95 budget or the meaningful-movement
 threshold from the Resolution Strategy section.
@@ -732,3 +739,69 @@ Requirements:
   `0` quad-cache evictions. Next task is `0804R-03` bridge/page identity
   split; `0804R-04` remains blocked/not selected first by the `0804R-01`
   decision table.
+- 2026-06-17: Completed `0804R-03` bridge/page identity split. The behavior
+  slice was committed at `74ca85f` and changed only
+  `examples/novywave/RUN.bn` plus focused runtime tests in
+  `crates/boon_runtime/src/lib.rs`. The Boon source now separates full
+  cursor-aware request freshness/stale guards from stable non-cursor page
+  identity roots (`bridge_page_request_*` and `bridge_page_response_*`).
+  Cursor-only movement keeps hierarchy/signal/waveform page identity stable,
+  while cursor-values remains cursor-aware because cursor is a real payload
+  input.
+- 2026-06-17: `0804R-03` correctness verification: `cargo fmt -p
+  boon_runtime -p boon_bridge -p boon_native_playground -p xtask`;
+  `cargo test -p boon_bridge --lib -- --nocapture` (`12 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib
+  root_derived_ -- --nocapture` (`6 passed`); `cargo check -p
+  boon_runtime -p boon_bridge -p boon_native_playground -p xtask`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json`; and `cargo xtask
+  verify-report-schema` all passed. Focused `boon_runtime` tests passed for:
+  `novywave_cursor_click_splits_page_identity_from_cursor_freshness`,
+  `novywave_hover_label_updates_do_not_change_bridge_page_identity`,
+  `novywave_pan_zoom_and_format_are_real_page_identity_inputs`,
+  `novywave_bridge_page_identity_is_deterministic_across_replay`,
+  `novywave_waveform_metadata_drives_selected_file_and_timeline_window`, and
+  `novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them`.
+  The broad `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib
+  novywave -- --nocapture` command still fails one pre-existing test,
+  `novywave_selected_visible_items_model_group_headers_and_collapse`; the same
+  focused failure was reproduced on parent commit `7557f82`, so it is not an
+  `0804R-03` regression. It remains a final verification blocker for later
+  closeout work.
+- 2026-06-17: `0804R-03` fresh diagnostic report
+  `target/diagnostics/native-gpu/novywave-interaction-speed-bridge-identity.json`
+  exited with the expected failing gate status but wrote current diagnostic
+  evidence. Candidate roots dropped from `24` to `10`, simulated defer
+  enqueues from `552` to `296`, later demand reads from `512` to `240`, and
+  hidden semantic-delta materializations from `248` to `184`. The diagnostic
+  still reports `currentness_only=0`, so `0804R-04` remains not selected.
+  Remaining top work is dominated by `store.selected_signal_lane_rows`,
+  `store.selected_cursor_pair_rows`, and cursor-values roots.
+- 2026-06-17: `0804R-03` fresh canonical no-diagnostic speed report
+  `target/reports/native-gpu/novywave-interaction-speed.json` was generated at
+  `git_commit=74ca85f`, `binary_hash=9b694ccbba130ad1dfbc506ce0f800982a4031eecf1a6f44c29a4eded1c17a76`,
+  and clean `worktree_fingerprint=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+  The gate still fails only the strict click/input p95 budgets:
+  `click_to_cursor.p95=17.701393ms` and
+  `input_to_visible.p95=17.701393ms` against `16.700ms`.
+  Meaningful movement passed relative to both the post-R02 baseline and the
+  original `0804R-00` graph shape: root-flush p95 dropped from
+  `6.113463ms` to `3.506412ms`, dirty-scheduler p95 from `2.649652ms` to
+  `1.181580ms`, root-materialization p95 from `3.324309ms` to
+  `2.207607ms`, and the slow click graph class from `194/32/38` to
+  `80/17/23` (`16` samples). Aggregate click graph counts dropped from
+  `3536/600/792` to `1632/344/536`. Renderer upload remains separated:
+  post-interaction upload `3360` bytes, `3` queue writes, `0` staging wraps,
+  and `0` quad-cache evictions. Per the closeout matrix, `0804R-05` is now
+  the next pending task because p95 still fails and visible list-view buckets
+  dominate.
+- 2026-06-17: `0804R-03` subagent review effects: correctness review required
+  more than the initial cursor-only test, so label-only hover, pan/zoom/format,
+  page-level stale rejection, replay determinism, and row page-ref semantics
+  tests were added before marking the task done. Performance review required
+  fresh canonical and diagnostic reports for `74ca85f`; stale reports were not
+  used for the keep/kill decision. Docs review required the status to remain
+  `in_progress` until current evidence existed and required expected failing
+  speed gates to be recorded as failing budget gates, not as passed
+  verification.

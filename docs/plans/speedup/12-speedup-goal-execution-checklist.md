@@ -2888,6 +2888,46 @@ Notes:
   `0804R-01` was `done` and `0804R-02` was `in_progress`. The decision table rejects
   demand-deferral-first and points toward `0804R-03` bridge/page identity after
   the `0804R-02` currentness/stale-read contract.
+- 2026-06-17 TASK-0804B `0804R-03` bridge/page identity split completed.
+  `TASK-0804B` remains `in_progress`, `TASK-0804A` remains postponed, plan 20
+  has `0804R-00=done`, `0804R-01=done`, `0804R-02=done`,
+  `0804R-03=done`, `0804R-04=blocked/not selected`, `0804R-05=pending`, and
+  `0804R-06=blocked`. The kept implementation separates stable page identity
+  from cursor-aware freshness/stale guards without new Boon syntax, hardcoded
+  file branches, fixture reductions, or report/budget weakening.
+  Correctness checks passed for the focused bridge/page identity tests,
+  `cargo test -p boon_bridge --lib -- --nocapture`, `RUST_MIN_STACK=33554432
+  cargo test -p boon_runtime --lib root_derived_ -- --nocapture`, `cargo
+  check -p boon_runtime -p boon_bridge -p boon_native_playground -p xtask`,
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json`, and `cargo xtask
+  verify-report-schema`. The broad `RUST_MIN_STACK=33554432 cargo test -p
+  boon_runtime --lib novywave -- --nocapture` command still fails the
+  pre-existing `novywave_selected_visible_items_model_group_headers_and_collapse`
+  lane-segment assertion; the same focused failure reproduced on parent commit
+  `7557f82`, so this is not an `0804R-03` regression but it remains a final
+  closeout blocker.
+- 2026-06-17 TASK-0804B `0804R-03` performance evidence: fresh canonical
+  report `target/reports/native-gpu/novywave-interaction-speed.json` at
+  `git_commit=74ca85f`, binary hash
+  `9b694ccbba130ad1dfbc506ce0f800982a4031eecf1a6f44c29a4eded1c17a76`, and
+  clean worktree fingerprint
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+  still exits with `status=fail` because `click_to_cursor.p95` and
+  `input_to_visible.p95` are `17.701393ms` against the strict `16.700ms`
+  budget. The slice is kept because it satisfies the meaningful-movement
+  threshold: root-flush p95 dropped from the post-R02 `6.113463ms` to
+  `3.506412ms`, dirty-scheduler p95 from `2.649652ms` to `1.181580ms`,
+  root-materialization p95 from `3.324309ms` to `2.207607ms`, aggregate click
+  graph counts from `3536/600/792` to `1632/344/536`, and the slow click class
+  from `194/32/38` to `80/17/23`. Renderer upload remains solved and
+  separated: post-interaction upload `3360` bytes, `3` queue writes, `0`
+  staging wraps, and `0` quad-cache evictions. Fresh diagnostic report
+  `target/diagnostics/native-gpu/novywave-interaction-speed-bridge-identity.json`
+  shows candidates dropped from `24` to `10`, simulated defer enqueues from
+  `552` to `296`, and `currentness_only=0`, so `0804R-04` remains not
+  selected. Next task is `0804R-05` list-view field frontier, because p95
+  still fails and selected-row list-view buckets dominate.
 
 ## Phase 9: Low-Level Rust Experiments
 
@@ -7151,6 +7191,76 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   have a mutable barrier-aware API. R02 is not a speed closeout and does not
   claim the click/input p95 budget is solved. Next implementation slice is
   `0804R-03` bridge/page identity split.
+
+### 2026-06-17 TASK-0804B 0804R-03 Bridge/Page Identity Completion
+
+- Scope: completed `0804R-03` from plan `20` as the first behavior slice
+  after the currentness contract. TASK-0804B remains `in_progress`;
+  `TASK-0804A` remains postponed historical evidence. Plan `20` now has
+  `0804R-00=done`, `0804R-01=done`, `0804R-02=done`, `0804R-03=done`,
+  `0804R-04=blocked/not selected`, `0804R-05=pending`, and
+  `0804R-06=blocked`.
+- Result: `examples/novywave/RUN.bn` now separates stable page identity from
+  cursor-aware request freshness. Non-cursor hierarchy/signal/waveform page
+  identity uses `bridge_page_request_*` and `bridge_page_response_*`; the full
+  `bridge_request_*` / `bridge_response_*` guard remains cursor-aware and
+  still rejects stale cursor responses. Cursor-values page refs intentionally
+  remain cursor-aware because cursor is a real cursor-values payload input.
+  No Boon syntax, hardcoded NovyWave filename branch, fixture reduction,
+  generic runtime report weakening, or renderer shortcut was added.
+- Focused correctness tests passed:
+  `novywave_cursor_click_splits_page_identity_from_cursor_freshness`,
+  `novywave_hover_label_updates_do_not_change_bridge_page_identity`,
+  `novywave_pan_zoom_and_format_are_real_page_identity_inputs`,
+  `novywave_bridge_page_identity_is_deterministic_across_replay`,
+  `novywave_waveform_metadata_drives_selected_file_and_timeline_window`, and
+  `novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them`.
+  Other verification that passed: `cargo fmt -p boon_runtime -p boon_bridge -p
+  boon_native_playground -p xtask`; `cargo test -p boon_bridge --lib --
+  --nocapture`; `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib
+  root_derived_ -- --nocapture`; `cargo check -p boon_runtime -p boon_bridge
+  -p boon_native_playground -p xtask`; `timeout 240 cargo xtask
+  verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json`; and `cargo xtask
+  verify-report-schema`.
+- Verification caveat: `RUST_MIN_STACK=33554432 cargo test -p boon_runtime
+  --lib novywave -- --nocapture` failed with `24 passed` and one failing test,
+  `novywave_selected_visible_items_model_group_headers_and_collapse`. The same
+  focused lane-segment assertion failed on the parent `7557f82` R02 checkpoint,
+  so this is not an `0804R-03` regression. It still blocks final `0804R-06`
+  closeout until fixed, replaced by a more precise regression, or otherwise
+  resolved with evidence.
+- Performance evidence: canonical no-diagnostic report
+  `target/reports/native-gpu/novywave-interaction-speed.json` was generated at
+  `git_commit=74ca85f`, binary hash
+  `9b694ccbba130ad1dfbc506ce0f800982a4031eecf1a6f44c29a4eded1c17a76`, and
+  clean worktree fingerprint
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+  The report still fails the strict p95 budget:
+  `click_to_cursor.p95=17.701393ms` and
+  `input_to_visible.p95=17.701393ms` against `16.700ms`. It satisfies the
+  meaningful-movement threshold: root-flush p95 `6.113463ms -> 3.506412ms`,
+  dirty-scheduler p95 `2.649652ms -> 1.181580ms`, root-materialization p95
+  `3.324309ms -> 2.207607ms`, aggregate click graph counts
+  `3536/600/792 -> 1632/344/536`, and slow click class
+  `194/32/38 -> 80/17/23`. Renderer post-interaction upload remains `3360`
+  bytes with `3` queue writes, `0` staging wraps, and `0` quad-cache
+  evictions.
+- Diagnostic evidence:
+  `target/diagnostics/native-gpu/novywave-interaction-speed-bridge-identity.json`
+  shows candidate roots `24 -> 10`, simulated defer enqueues `552 -> 296`,
+  later demand reads `512 -> 240`, hidden semantic-delta materializations
+  `248 -> 184`, and `currentness_only=0`. Remaining top work is dominated by
+  `store.selected_signal_lane_rows`, `store.selected_cursor_pair_rows`, and
+  cursor-values roots. This keeps `0804R-04` blocked/not selected and makes
+  `0804R-05` the next pending task.
+- Subagent review effect: correctness review required label-only hover,
+  pan/zoom/format, page-level stale rejection, replay determinism, and row
+  page-ref tests before `0804R-03` could be marked done. Performance review
+  required fresh canonical/diagnostic reports for `74ca85f` and explicit
+  keep/kill interpretation. Docs review required the expected failing speed
+  gate to be recorded as a failing strict budget gate with meaningful movement,
+  not as a passed speed gate.
 
 ## File Maintenance Checklist
 

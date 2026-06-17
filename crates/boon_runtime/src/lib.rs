@@ -56770,25 +56770,52 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
     }
 
-    #[test]
-    fn novywave_cursor_click_splits_page_identity_from_cursor_freshness() {
+    fn novywave_runtime_from_run(project: &str) -> LiveRuntime {
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-bridge-identity-split", &units)
-            .expect("NovyWave runtime should initialize");
+        LiveRuntime::from_project(project, &units).expect("NovyWave runtime should initialize")
+    }
+
+    fn novywave_apply_source(
+        runtime: &mut LiveRuntime,
+        source: &str,
+        key: Option<&str>,
+    ) -> JsonValue {
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: source.to_owned(),
+                key: key.map(str::to_owned),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap_or_else(|error| panic!("{source} should apply: {error}"))
+            .state_summary
+    }
+
+    fn novywave_stable_page_identity(store: &JsonValue) -> JsonValue {
+        json!({
+            "page_request_fingerprint": store["bridge_page_request_fingerprint"].clone(),
+            "page_request_input_digest": store["bridge_page_request_input_digest"].clone(),
+            "page_request_structural_key": store["bridge_page_request_structural_key"].clone(),
+            "hierarchy_digest": store["bridge_hierarchy_page_digest"].clone(),
+            "signal_digest": store["bridge_signal_page_digest"].clone(),
+            "waveform_digest": store["bridge_waveform_page_digest"].clone(),
+            "signal_page_ref": store["bridge_signal_page_ref"].clone(),
+            "waveform_page_ref": store["bridge_waveform_page_ref"].clone(),
+        })
+    }
+
+    fn novywave_selected_lane_page_refs(store: &JsonValue) -> JsonValue {
+        store["selected_signal_lane_rows"][0]["page_refs"].clone()
+    }
+
+    #[test]
+    fn novywave_cursor_click_splits_page_identity_from_cursor_freshness() {
+        let mut runtime = novywave_runtime_from_run("novywave-bridge-identity-split");
         let before = runtime.state_summary();
         let before_store = &before["store"];
-        let before_page_identity = json!({
-            "page_request_fingerprint": before_store["bridge_page_request_fingerprint"].clone(),
-            "page_request_input_digest": before_store["bridge_page_request_input_digest"].clone(),
-            "page_request_structural_key": before_store["bridge_page_request_structural_key"].clone(),
-            "hierarchy_digest": before_store["bridge_hierarchy_page_digest"].clone(),
-            "signal_digest": before_store["bridge_signal_page_digest"].clone(),
-            "waveform_digest": before_store["bridge_waveform_page_digest"].clone(),
-            "signal_page_ref": before_store["bridge_signal_page_ref"].clone(),
-            "waveform_page_ref": before_store["bridge_waveform_page_ref"].clone(),
-        });
+        let before_page_identity = novywave_stable_page_identity(before_store);
+        let before_lane_refs = novywave_selected_lane_page_refs(before_store);
         let before_cursor_page_digest =
             before_store["bridge_cursor_values_page_ref"]["page_digest"].clone();
 
@@ -56805,16 +56832,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .expect("waveform click should apply");
         let after = runtime.state_summary();
         let after_store = &after["store"];
-        let after_page_identity = json!({
-            "page_request_fingerprint": after_store["bridge_page_request_fingerprint"].clone(),
-            "page_request_input_digest": after_store["bridge_page_request_input_digest"].clone(),
-            "page_request_structural_key": after_store["bridge_page_request_structural_key"].clone(),
-            "hierarchy_digest": after_store["bridge_hierarchy_page_digest"].clone(),
-            "signal_digest": after_store["bridge_signal_page_digest"].clone(),
-            "waveform_digest": after_store["bridge_waveform_page_digest"].clone(),
-            "signal_page_ref": after_store["bridge_signal_page_ref"].clone(),
-            "waveform_page_ref": after_store["bridge_waveform_page_ref"].clone(),
-        });
+        let after_page_identity = novywave_stable_page_identity(after_store);
+        let after_lane_refs = novywave_selected_lane_page_refs(after_store);
 
         assert_ne!(
             before_store["keyboard_cursor_label"], after_store["keyboard_cursor_label"],
@@ -56838,6 +56857,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "cursor-values page identity should still change when cursor is a real bridge input"
         );
         assert_eq!(
+            before_lane_refs["signal_page_ref"], after_lane_refs["signal_page_ref"],
+            "row-local signal page ref should stay stable on cursor-only movement"
+        );
+        assert_eq!(
+            before_lane_refs["waveform_page_ref"], after_lane_refs["waveform_page_ref"],
+            "row-local waveform page ref should stay stable on cursor-only movement"
+        );
+        assert_ne!(
+            before_lane_refs["cursor_values_page_ref"], after_lane_refs["cursor_values_page_ref"],
+            "row-local cursor-values page ref should remain cursor-aware"
+        );
+        assert_eq!(
             after_store["bridge_response_status"], "REJECTED_STALE_PAGE",
             "full cursor-aware stale guard should still reject the old response"
         );
@@ -56851,6 +56882,115 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             after_store["bridge_page_response_fingerprint"],
             after_store["bridge_page_request_input_digest"],
             after_store["bridge_page_response_input_digest"]
+        );
+    }
+
+    #[test]
+    fn novywave_hover_label_updates_do_not_change_bridge_page_identity() {
+        let mut runtime = novywave_runtime_from_run("novywave-hover-page-identity");
+        let before = runtime.state_summary();
+        let before_store = &before["store"];
+        let before_page_identity = novywave_stable_page_identity(before_store);
+
+        let after = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.waveform_hover".to_owned(),
+                pointer_x: Some("288".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform hover should apply")
+            .state_summary;
+        let after_store = &after["store"];
+
+        assert_ne!(
+            before_store["zoom_center_label"], after_store["zoom_center_label"],
+            "hover should be a real label/presentation update"
+        );
+        assert_eq!(
+            before_page_identity,
+            novywave_stable_page_identity(after_store),
+            "hover-only presentation state must not perturb stable bridge/page identity"
+        );
+        assert_eq!(
+            before_store["bridge_request_fingerprint"], after_store["bridge_request_fingerprint"],
+            "hover-only presentation state must not schedule a cursor-aware bridge request"
+        );
+    }
+
+    #[test]
+    fn novywave_pan_zoom_and_format_are_real_page_identity_inputs() {
+        let mut runtime = novywave_runtime_from_run("novywave-page-identity-inputs");
+        let initial = runtime.state_summary();
+        let initial_store = &initial["store"];
+        let initial_identity = novywave_stable_page_identity(initial_store);
+
+        let zoomed = novywave_apply_source(&mut runtime, "store.elements.zoom_in", None);
+        let zoomed_store = &zoomed["store"];
+        assert_eq!(zoomed_store["zoom_level"], "Close");
+        assert_ne!(
+            initial_identity,
+            novywave_stable_page_identity(zoomed_store),
+            "zoom changes the requested waveform/page payload"
+        );
+        assert!(
+            !zoomed_store["bridge_page_request_fingerprint"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Cursor"),
+            "stable page request fingerprint must not encode cursor presentation state"
+        );
+
+        let panned = novywave_apply_source(&mut runtime, "store.elements.pan_right", None);
+        let panned_store = &panned["store"];
+        assert_eq!(panned_store["pan_window"], "RightWindow");
+        assert_ne!(
+            novywave_stable_page_identity(zoomed_store),
+            novywave_stable_page_identity(panned_store),
+            "pan changes the requested waveform/page payload"
+        );
+
+        let formatted = novywave_apply_source(&mut runtime, "store.elements.format_cycle", None);
+        let formatted_store = &formatted["store"];
+        assert_eq!(formatted_store["value_format"], "Binary");
+        assert_ne!(
+            novywave_stable_page_identity(panned_store),
+            novywave_stable_page_identity(formatted_store),
+            "format changes formatted page payload values and must remain in page identity"
+        );
+    }
+
+    #[test]
+    fn novywave_bridge_page_identity_is_deterministic_across_replay() {
+        fn replayed_page_identity(project: &str) -> JsonValue {
+            let mut runtime = novywave_runtime_from_run(project);
+            for (source, key) in [
+                ("store.elements.waveform_hover", None),
+                ("store.elements.zoom_in", None),
+                ("store.elements.pan_right", None),
+                ("store.elements.keyboard_capture", Some("E")),
+                ("store.elements.format_cycle", None),
+            ] {
+                if source == "store.elements.waveform_hover" {
+                    runtime
+                        .apply_source_event(LiveSourceEvent {
+                            source: source.to_owned(),
+                            pointer_x: Some("288".to_owned()),
+                            pointer_width: Some("360".to_owned()),
+                            ..LiveSourceEvent::default()
+                        })
+                        .expect("hover should apply");
+                } else {
+                    novywave_apply_source(&mut runtime, source, key);
+                }
+            }
+            novywave_stable_page_identity(&runtime.state_summary()["store"])
+        }
+
+        assert_eq!(
+            replayed_page_identity("novywave-page-replay-a"),
+            replayed_page_identity("novywave-page-replay-b"),
+            "bridge/page identity should be deterministic across equivalent replay"
         );
     }
 
@@ -58054,6 +58194,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
         assert_eq!(
             stale["store"]["bridge_response_status"],
+            "REJECTED_STALE_PAGE"
+        );
+        assert_ne!(
+            stale["store"]["bridge_page_request_structural_key"],
+            stale["store"]["bridge_page_response_structural_key"]
+        );
+        assert_eq!(
+            stale["store"]["bridge_page_response_status"],
             "REJECTED_STALE_PAGE"
         );
         assert_eq!(

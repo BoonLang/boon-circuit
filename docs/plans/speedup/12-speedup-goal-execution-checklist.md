@@ -2817,8 +2817,9 @@ Rollback / stop condition:
   changes public bridge hashes/replay semantics without an explicit schema
   migration.
 Notes:
-- This is the explicit future task created from the TASK-0804A postponed
-  follow-up. It is not active work under the current cap.
+- Before the explicit 2026-06-17 TASK-0804B resume, this was the future task
+  created from the TASK-0804A postponed follow-up. It is now active through
+  plan `20`; TASK-0804A remains postponed.
 - Prefer a bridge/page identity split or compiled demand/currentness frontier
   over more field-only loop microchanges, row caches, container swaps, JSON vs
   binary report rewrites, or renderer upload tweaks.
@@ -2855,6 +2856,38 @@ Notes:
   evictions. Schema validation passed after refreshing the canonical report
   once more because diagnostics rewrote the shared native role artifact.
   Plan 20 `0804R-00` is `done`; `0804R-01` is now `in_progress`.
+- 2026-06-17 TASK-0804B `0804R-01` candidate-demand diagnostic completed as a
+  no-behavior runtime/reporting slice. Verification: `cargo fmt -p
+  boon_runtime -p boon_native_playground -p xtask`; `cargo check -p
+  boon_runtime -p boon_native_playground -p xtask`; diagnostic speed run
+  `BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json`
+  wrote an expected failing report with `status=fail` due the existing p95
+  budget blockers and enriched candidate fields; canonical speed run
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json` wrote an expected
+  failing report with diagnostics disabled and the same p95 blockers; `timeout
+  240 cargo xtask
+  verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json` passed; `cargo xtask
+  verify-report-schema` passed; enriched diagnostic `jq` checks passed;
+  canonical no-regression `jq` check passed; `git diff --check` passed.
+  Diagnostic evidence: `24` candidate roots, `552` simulated defer enqueues,
+  `552` changed materializations, `512` later demand reads, `248` hidden
+  semantic-delta materializations, and `336` aggregate visible/list dependency
+  hits, split as `208` changed-read list dependencies and `128`
+  root-list-evaluation demand dependencies. Classification counts show
+  `currentness_only=0` enqueues,
+  `bridge_identity=472`, `cursor_telemetry=264`,
+  `must_publish_semantic_delta=248`, and `visible_list_dependency=208`.
+  Canonical p95s are `click_to_cursor=18.653014ms` and
+  `input_to_visible=18.653014ms`, within the `0804R-01` no-regression limit
+  but still above the strict `16.700ms` budget. Plan 20 `0804R-01` is `done`;
+  `0804R-02` is now `in_progress`. The decision table rejects
+  demand-deferral-first and points toward `0804R-03` bridge/page identity after
+  the `0804R-02` currentness/stale-read contract.
 
 ## Phase 9: Low-Level Rust Experiments
 
@@ -6964,7 +6997,8 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 ### 2026-06-17 Checklist Continuation Evidence Refresh
 
 - Date: 2026-06-17
-- Scope: active `/goal` continuation after TASK-1001 and TASK-1002 were closed.
+- Scope: active `/goal` continuation after TASK-1001 and TASK-1002 were closed,
+  before the later explicit TASK-0804B activation.
 - Task state audit:
   read-only subagent `019ed406-0400-7602-af4c-680f5860a509` confirmed that
   no real executable `pending` or `in_progress` task/experiment remains besides
@@ -7019,7 +7053,37 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   this refresh does not reopen BYTES/LIST work and does not unpostpone
   TASK-0804A or TASK-0804B. The remaining root-flush/bridge-page identity work
   resumes only through explicit `TASK-0804B` activation, not as a hidden
-  unfinished TASK-1001/TASK-1002 requirement.
+  unfinished TASK-1001/TASK-1002 requirement. This status was superseded later
+  on 2026-06-17 by explicit TASK-0804B activation.
+
+### 2026-06-17 TASK-0804B Activation And 0804R-01 Completion
+
+- Scope: explicit TASK-0804B continuation under plan `20`; this supersedes the
+  earlier pre-activation checklist refresh. TASK-0804A remains postponed.
+- Current status: TASK-0804B is `in_progress`; plan `20` has `0804R-00=done`,
+  `0804R-01=done`, and `0804R-02=in_progress`.
+- Verification refreshed for the `0804R-01` diagnostic-only slice:
+  `cargo fmt -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json`
+  wrote an expected failing report with `status=fail` because the known
+  click/input p95 budget blockers remain; `env -u BOON_PROFILE_ROOT_DEMAND -u
+  BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  wrote the canonical no-diagnostic report with the same p95 blockers;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`
+  passed; `cargo xtask verify-report-schema` passed; enriched diagnostic `jq`
+  checks passed; canonical no-regression `jq` check passed; `git diff --check`
+  passed.
+- Evidence: candidate-demand diagnostics show `24` candidate roots, `552`
+  simulated defer enqueues, `552` changed materializations, `512` later demand
+  reads, `248` hidden semantic-delta materializations, and `336` aggregate
+  visible/list dependency hits, split as `208` changed-read list dependencies
+  and `128` root-list-evaluation demand dependencies. Classification counts
+  reject demand-deferral-first:
+  `currentness_only=0`, `bridge_identity=472`, `cursor_telemetry=264`,
+  `must_publish_semantic_delta=248`, and `visible_list_dependency=208`.
+- Next: implement `0804R-02` currentness/stale-read contract first, then move
+  to `0804R-03` bridge/page identity unless fresh evidence changes the plan.
 
 ## File Maintenance Checklist
 

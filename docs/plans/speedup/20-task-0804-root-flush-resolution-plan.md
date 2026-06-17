@@ -160,7 +160,7 @@ Kill criteria:
 
 ## 0804R-01 No-Behavior Candidate-Demand Simulation
 
-Status: in_progress
+Status: done
 Depends on: `0804R-00`
 
 Goal: measure whether candidate internal roots can be deferred safely before
@@ -195,8 +195,8 @@ cargo check -p boon_runtime -p boon_native_playground -p xtask
 env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json
 BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json
 cargo xtask verify-report-schema
-jq -e '.runtime_dirty_frontier_cause_summary.click.candidate_defer_probe.scope == "no_behavior_change_simulated_suppression_for_candidate_unobserved_source_free_pure"' target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json
-jq -e '.runtime_dirty_frontier_cause_summary.click.candidate_defer_probe.top_roots | length > 0' target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json
+jq -e '.runtime_dirty_frontier_cause_summary.click.candidate_defer_probe as $p | $p.scope == "no_behavior_change_simulated_suppression_for_candidate_unobserved_source_free_pure" and $p.root_count > 0 and $p.simulated_defer_enqueue_count > 0 and ($p.later_demand_read_count | type) == "number" and ($p.hidden_semantic_delta_count | type) == "number" and ($p.visible_root_list_dependency_count | type) == "number" and ($p.visible_root_list_changed_dependency_count | type) == "number" and ($p.root_list_evaluation_dependency_count | type) == "number" and ($p.classification_counts | type) == "object" and ($p.classification_counts | has("currentness_only") and has("must_publish_semantic_delta") and has("bridge_identity") and has("cursor_telemetry") and has("visible_list_dependency"))' target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json
+jq -e '.runtime_dirty_frontier_cause_summary.click.candidate_defer_probe.top_roots | length > 0 and all(.[]; (.root_path | type) == "string" and (.simulated_defer_enqueue_count | type) == "number" and (.later_demand_read_count | type) == "number" and (.changed_read_keys | type) == "array" and (.would_hide_semantic_delta | type) == "boolean" and (.visible_root_list_dependency | type) == "boolean" and (.visible_root_list_changed_dependency_count | type) == "number" and (.root_list_evaluation_dependency_count | type) == "number" and (.classification as $c | ["currentness_only","must_publish_semantic_delta","bridge_identity","cursor_telemetry","visible_list_dependency"] | index($c) != null) and (if .later_demand_read_count > 0 then (.first_demand | type) == "object" and (.first_demand.context as $c | ["evaluator","state_summary","document_window_summary","sparse_value_summary","assertion","root_list_evaluation","observed_projection"] | index($c) != null) and (.first_demand.read_kind | type) == "string" and (.first_demand.read_key | type) == "string" else (.first_demand == null or (.first_demand | type) == "object") end))' target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json
 ```
 
 Acceptance:
@@ -220,7 +220,7 @@ Kill criteria:
 
 ## 0804R-02 Currentness And Stale-Read Contract
 
-Status: blocked
+Status: in_progress
 Depends on: `0804R-01`
 
 Goal: define and test the correctness contract required before any root can be
@@ -583,3 +583,60 @@ Requirements:
   `eval_ms=20.513292`, `user_function_body_ms=12.373484`,
   `full_eval_row_count=0`, and `row_materialize_ms=0.0`. Started `0804R-01`
   after baseline acceptance passed; no runtime behavior changed yet.
+- 2026-06-17: Completed `0804R-01` as diagnostic-only runtime/reporting
+  infrastructure. Code changes are limited to gated candidate-demand
+  instrumentation in `crates/boon_runtime/src/lib.rs` and report aggregation in
+  `crates/boon_native_playground/src/main.rs`; dirty enqueue and materialize
+  behavior did not change. Commands: `cargo fmt -p boon_runtime -p
+  boon_native_playground -p xtask`; `cargo check -p boon_runtime -p
+  boon_native_playground -p xtask`; `BOON_PROFILE_ROOT_DEMAND=1
+  BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json`
+  (expected failing exit with `status=fail` due the existing click/input p95
+  budget blockers, report written); `env -u BOON_PROFILE_ROOT_DEMAND -u
+  BOON_PROFILE_DIRTY_FRONTIER cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json` (expected failing
+  exit with diagnostics disabled and the same p95 blockers, report written);
+  `timeout 240 cargo xtask
+  verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json`; `cargo xtask
+  verify-report-schema`; enriched diagnostic `jq -e` checks; canonical
+  no-diagnostic/no-regression `jq -e` checks; and `git diff --check`.
+- 2026-06-17: `0804R-01` evidence from
+  `target/diagnostics/native-gpu/novywave-interaction-speed-candidate-demand.json`:
+  candidate probe is `enabled=true` with `24` candidate roots, `552` simulated
+  defer enqueues, `552` materializations, `552` changed materializations, `512`
+  later demand reads, `248` hidden semantic-delta materializations, and `336`
+  aggregate visible/list dependency hits, split as `208` changed-read list
+  dependencies and `128` root-list-evaluation demand dependencies.
+  Classification counts are not
+  currentness-only: `currentness_only=0` enqueues, `bridge_identity=472`,
+  `cursor_telemetry=264`, `must_publish_semantic_delta=248`, and
+  `visible_list_dependency=208`. The top root
+  `store.bridge_cursor_values_page_ref` has first demand context
+  `root_list_evaluation`, first read kind `runtime_scalar_boon_value`,
+  visible list root `store.selected_signal_lane_rows`, `64` later demand
+  reads, and changed read keys including page digest, request fingerprint,
+  input digest, and status.
+- 2026-06-17: `0804R-01` canonical overhead check passed. The refreshed
+  canonical report `target/reports/native-gpu/novywave-interaction-speed.json`
+  has candidate probe `enabled=false`, `root_count=0`, and p95s
+  `click_to_cursor=18.653014ms`, `input_to_visible=18.653014ms`,
+  `runtime_apply=12.355368ms`, `runtime_step_apply=9.997917ms`, and
+  `layout_rebuild=4.940346ms`, within the no-regression threshold relative to
+  the `0804R-00` baseline. The slow graph remains `194/32/38` at p95, with
+  `root_flush.p95=5.810345ms`, `dirty_scheduler.p95=2.370330ms`, and
+  `root_materialization.p95=3.296347ms`. The root-list cause remains
+  `root_flush_dirty_scheduler_plus_root_list_materialization`; aggregate list
+  counters show `eval_ms=35.999336`, `diff_ms=30.612126`,
+  `full_eval_row_count=0`, and `row_materialize_ms=0.0`; dominant list remains
+  `selected_signal_lane_rows` with `eval_ms=19.894158`.
+- 2026-06-17: `0804R-01` decision: do not implement demand deferral from this
+  evidence. Candidate roots are value-changing, bridge/page/cursor identity
+  roots and visible list dependencies, not mostly currentness-only. Per the
+  decision table, proceed to `0804R-02` currentness/stale-read contract before
+  behavior changes; `0804R-03` bridge/page identity split remains the likely
+  first behavior slice after the contract. `0804R-04` demand/currentness
+  frontier is not selected first.

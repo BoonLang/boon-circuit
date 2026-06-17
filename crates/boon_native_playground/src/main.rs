@@ -2079,11 +2079,34 @@ struct RuntimeCandidateDeferProbeCounters {
     unchanged_materialization_count: usize,
     demand_read_count: usize,
     runtime_scalar_read_count: usize,
+    runtime_scalar_boon_value_read_count: usize,
+    runtime_scalar_json_read_count: usize,
     eval_scalar_read_count: usize,
     state_summary_scalar_read_count: usize,
+    window_summary_scalar_read_count: usize,
+    sparse_value_summary_scalar_read_count: usize,
+    assertion_scalar_read_count: usize,
+    root_list_evaluation_scalar_read_count: usize,
+    observed_projection_scalar_read_count: usize,
     document_state_summary_scalar_read_count: usize,
     runtime_value_summary_scalar_read_count: usize,
     derived_read_count: usize,
+    first_demand_context: Option<String>,
+    first_demand_read_kind: Option<String>,
+    first_demand_path: Option<String>,
+    first_demand_read_key: Option<String>,
+    own_eager_materialization_read_excluded_count: usize,
+    changed_read_key_count: usize,
+    changed_read_keys: BTreeSet<String>,
+    changed_read_key_kind_counts: BTreeMap<String, usize>,
+    hidden_semantic_delta_count: usize,
+    visible_root_list_dependency_count: usize,
+    visible_root_list_changed_dependency_count: usize,
+    root_list_evaluation_dependency_count: usize,
+    visible_root_list_roots: BTreeSet<String>,
+    classification: String,
+    candidate_classes: BTreeSet<String>,
+    classification_reason: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2238,12 +2261,33 @@ impl RuntimeDirtyFrontierCauseAggregate {
             counters.runtime_scalar_read_count = counters
                 .runtime_scalar_read_count
                 .saturating_add(probe_sample.runtime_scalar_read_count);
+            counters.runtime_scalar_boon_value_read_count = counters
+                .runtime_scalar_boon_value_read_count
+                .saturating_add(probe_sample.runtime_scalar_boon_value_read_count);
+            counters.runtime_scalar_json_read_count = counters
+                .runtime_scalar_json_read_count
+                .saturating_add(probe_sample.runtime_scalar_json_read_count);
             counters.eval_scalar_read_count = counters
                 .eval_scalar_read_count
                 .saturating_add(probe_sample.eval_scalar_read_count);
             counters.state_summary_scalar_read_count = counters
                 .state_summary_scalar_read_count
                 .saturating_add(probe_sample.state_summary_scalar_read_count);
+            counters.window_summary_scalar_read_count = counters
+                .window_summary_scalar_read_count
+                .saturating_add(probe_sample.window_summary_scalar_read_count);
+            counters.sparse_value_summary_scalar_read_count = counters
+                .sparse_value_summary_scalar_read_count
+                .saturating_add(probe_sample.sparse_value_summary_scalar_read_count);
+            counters.assertion_scalar_read_count = counters
+                .assertion_scalar_read_count
+                .saturating_add(probe_sample.assertion_scalar_read_count);
+            counters.root_list_evaluation_scalar_read_count = counters
+                .root_list_evaluation_scalar_read_count
+                .saturating_add(probe_sample.root_list_evaluation_scalar_read_count);
+            counters.observed_projection_scalar_read_count = counters
+                .observed_projection_scalar_read_count
+                .saturating_add(probe_sample.observed_projection_scalar_read_count);
             counters.document_state_summary_scalar_read_count = counters
                 .document_state_summary_scalar_read_count
                 .saturating_add(probe_sample.document_state_summary_scalar_read_count);
@@ -2253,6 +2297,55 @@ impl RuntimeDirtyFrontierCauseAggregate {
             counters.derived_read_count = counters
                 .derived_read_count
                 .saturating_add(probe_sample.derived_read_count);
+            if counters.first_demand_context.is_none() {
+                counters.first_demand_context = probe_sample.first_demand_context.clone();
+                counters.first_demand_read_kind = probe_sample.first_demand_read_kind.clone();
+                counters.first_demand_path = probe_sample.first_demand_path.clone();
+                counters.first_demand_read_key = probe_sample.first_demand_read_key.clone();
+            }
+            counters.own_eager_materialization_read_excluded_count = counters
+                .own_eager_materialization_read_excluded_count
+                .saturating_add(probe_sample.own_eager_materialization_read_excluded_count);
+            counters.changed_read_key_count = counters
+                .changed_read_key_count
+                .max(probe_sample.changed_read_key_count);
+            counters
+                .changed_read_keys
+                .extend(probe_sample.changed_read_keys.iter().cloned());
+            for (kind, count) in &probe_sample.changed_read_key_kind_counts {
+                *counters
+                    .changed_read_key_kind_counts
+                    .entry(kind.clone())
+                    .or_default() += *count;
+            }
+            counters.hidden_semantic_delta_count = counters
+                .hidden_semantic_delta_count
+                .saturating_add(probe_sample.hidden_semantic_delta_count);
+            counters.visible_root_list_dependency_count = counters
+                .visible_root_list_dependency_count
+                .saturating_add(probe_sample.visible_root_list_dependency_count);
+            counters.visible_root_list_changed_dependency_count = counters
+                .visible_root_list_changed_dependency_count
+                .saturating_add(probe_sample.visible_root_list_changed_dependency_count);
+            counters.root_list_evaluation_dependency_count = counters
+                .root_list_evaluation_dependency_count
+                .saturating_add(probe_sample.root_list_evaluation_dependency_count);
+            counters
+                .visible_root_list_roots
+                .extend(probe_sample.visible_root_list_roots.iter().cloned());
+            if counters.classification.is_empty() {
+                counters.classification = if probe_sample.candidate_class.is_empty() {
+                    probe_sample.candidate_bucket.clone()
+                } else {
+                    probe_sample.candidate_class.clone()
+                };
+            }
+            counters
+                .candidate_classes
+                .extend(probe_sample.candidate_classes.iter().cloned());
+            if counters.classification_reason.is_empty() {
+                counters.classification_reason = probe_sample.classification_reason.clone();
+            }
         }
     }
 
@@ -2358,6 +2451,24 @@ impl RuntimeDirtyFrontierCauseAggregate {
             .candidate_defer_probe
             .iter()
             .map(|(root_path, counters)| {
+                let first_demand = match (
+                    counters.first_demand_context.as_ref(),
+                    counters.first_demand_read_kind.as_ref(),
+                    counters.first_demand_read_key.as_ref(),
+                ) {
+                    (Some(context), Some(read_kind), Some(read_key)) => json!({
+                        "context": context,
+                        "read_kind": read_kind,
+                        "path": counters.first_demand_path.as_ref(),
+                        "read_key": read_key
+                    }),
+                    _ => serde_json::Value::Null,
+                };
+                let classification = if counters.classification.is_empty() {
+                    "currentness_only"
+                } else {
+                    counters.classification.as_str()
+                };
                 json!({
                     "root_path": root_path,
                     "simulated_defer_enqueue_count": counters.simulated_defer_enqueue_count,
@@ -2365,12 +2476,42 @@ impl RuntimeDirtyFrontierCauseAggregate {
                     "changed_materialization_count": counters.changed_materialization_count,
                     "unchanged_materialization_count": counters.unchanged_materialization_count,
                     "demand_read_count": counters.demand_read_count,
+                    "later_demand_read_count": counters.demand_read_count,
                     "runtime_scalar_read_count": counters.runtime_scalar_read_count,
+                    "runtime_scalar_boon_value_read_count": counters.runtime_scalar_boon_value_read_count,
+                    "runtime_scalar_json_read_count": counters.runtime_scalar_json_read_count,
                     "eval_scalar_read_count": counters.eval_scalar_read_count,
                     "state_summary_scalar_read_count": counters.state_summary_scalar_read_count,
+                    "window_summary_scalar_read_count": counters.window_summary_scalar_read_count,
+                    "sparse_value_summary_scalar_read_count": counters.sparse_value_summary_scalar_read_count,
+                    "assertion_scalar_read_count": counters.assertion_scalar_read_count,
+                    "root_list_evaluation_scalar_read_count": counters.root_list_evaluation_scalar_read_count,
+                    "observed_projection_scalar_read_count": counters.observed_projection_scalar_read_count,
                     "document_state_summary_scalar_read_count": counters.document_state_summary_scalar_read_count,
                     "runtime_value_summary_scalar_read_count": counters.runtime_value_summary_scalar_read_count,
-                    "derived_read_count": counters.derived_read_count
+                    "derived_read_count": counters.derived_read_count,
+                    "first_demand": first_demand,
+                    "first_demand_context": counters.first_demand_context.as_ref(),
+                    "first_demand_read_kind": counters.first_demand_read_kind.as_ref(),
+                    "first_demand_path": counters.first_demand_path.as_ref(),
+                    "first_demand_read_key": counters.first_demand_read_key.as_ref(),
+                    "first_demand_after_eager_pop_excluded": counters.own_eager_materialization_read_excluded_count > 0,
+                    "own_eager_materialization_read_excluded_count": counters.own_eager_materialization_read_excluded_count,
+                    "changed_read_key_count": counters.changed_read_key_count.max(counters.changed_read_keys.len()),
+                    "changed_read_keys": counters.changed_read_keys.iter().take(24).cloned().collect::<Vec<_>>(),
+                    "changed_read_key_kind_counts": &counters.changed_read_key_kind_counts,
+                    "hidden_semantic_delta": counters.hidden_semantic_delta_count > 0,
+                    "would_hide_semantic_delta": counters.hidden_semantic_delta_count > 0,
+                    "hidden_semantic_delta_count": counters.hidden_semantic_delta_count,
+                    "visible_root_list_dependency": counters.visible_root_list_dependency_count > 0,
+                    "visible_root_list_dependency_count": counters.visible_root_list_dependency_count,
+                    "visible_root_list_changed_dependency_count": counters.visible_root_list_changed_dependency_count,
+                    "root_list_evaluation_dependency_count": counters.root_list_evaluation_dependency_count,
+                    "visible_root_list_roots": counters.visible_root_list_roots.iter().take(24).cloned().collect::<Vec<_>>(),
+                    "classification": classification,
+                    "candidate_class": classification,
+                    "candidate_classes": counters.candidate_classes.iter().cloned().collect::<Vec<_>>(),
+                    "classification_reason": &counters.classification_reason
                 })
             })
             .collect::<Vec<_>>();
@@ -2407,12 +2548,33 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 totals.runtime_scalar_read_count = totals
                     .runtime_scalar_read_count
                     .saturating_add(counters.runtime_scalar_read_count);
+                totals.runtime_scalar_boon_value_read_count = totals
+                    .runtime_scalar_boon_value_read_count
+                    .saturating_add(counters.runtime_scalar_boon_value_read_count);
+                totals.runtime_scalar_json_read_count = totals
+                    .runtime_scalar_json_read_count
+                    .saturating_add(counters.runtime_scalar_json_read_count);
                 totals.eval_scalar_read_count = totals
                     .eval_scalar_read_count
                     .saturating_add(counters.eval_scalar_read_count);
                 totals.state_summary_scalar_read_count = totals
                     .state_summary_scalar_read_count
                     .saturating_add(counters.state_summary_scalar_read_count);
+                totals.window_summary_scalar_read_count = totals
+                    .window_summary_scalar_read_count
+                    .saturating_add(counters.window_summary_scalar_read_count);
+                totals.sparse_value_summary_scalar_read_count = totals
+                    .sparse_value_summary_scalar_read_count
+                    .saturating_add(counters.sparse_value_summary_scalar_read_count);
+                totals.assertion_scalar_read_count = totals
+                    .assertion_scalar_read_count
+                    .saturating_add(counters.assertion_scalar_read_count);
+                totals.root_list_evaluation_scalar_read_count = totals
+                    .root_list_evaluation_scalar_read_count
+                    .saturating_add(counters.root_list_evaluation_scalar_read_count);
+                totals.observed_projection_scalar_read_count = totals
+                    .observed_projection_scalar_read_count
+                    .saturating_add(counters.observed_projection_scalar_read_count);
                 totals.document_state_summary_scalar_read_count = totals
                     .document_state_summary_scalar_read_count
                     .saturating_add(counters.document_state_summary_scalar_read_count);
@@ -2422,9 +2584,81 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 totals.derived_read_count = totals
                     .derived_read_count
                     .saturating_add(counters.derived_read_count);
+                totals.own_eager_materialization_read_excluded_count = totals
+                    .own_eager_materialization_read_excluded_count
+                    .saturating_add(counters.own_eager_materialization_read_excluded_count);
+                totals.hidden_semantic_delta_count = totals
+                    .hidden_semantic_delta_count
+                    .saturating_add(counters.hidden_semantic_delta_count);
+                totals.visible_root_list_dependency_count = totals
+                    .visible_root_list_dependency_count
+                    .saturating_add(counters.visible_root_list_dependency_count);
+                totals.visible_root_list_changed_dependency_count = totals
+                    .visible_root_list_changed_dependency_count
+                    .saturating_add(counters.visible_root_list_changed_dependency_count);
+                totals.root_list_evaluation_dependency_count = totals
+                    .root_list_evaluation_dependency_count
+                    .saturating_add(counters.root_list_evaluation_dependency_count);
                 totals
             },
         );
+        let candidate_classification_names = [
+            "currentness_only",
+            "must_publish_semantic_delta",
+            "bridge_identity",
+            "cursor_telemetry",
+            "visible_list_dependency",
+        ];
+        let mut classification_counts = serde_json::Map::new();
+        for classification in candidate_classification_names {
+            let mut class_counters = RuntimeCandidateDeferProbeCounters::default();
+            let mut root_count = 0usize;
+            for counters in self.candidate_defer_probe.values() {
+                let matches_class = if counters.candidate_classes.is_empty() {
+                    counters.classification == classification
+                } else {
+                    counters.candidate_classes.contains(classification)
+                };
+                if !matches_class {
+                    continue;
+                }
+                root_count = root_count.saturating_add(1);
+                class_counters.simulated_defer_enqueue_count = class_counters
+                    .simulated_defer_enqueue_count
+                    .saturating_add(counters.simulated_defer_enqueue_count);
+                class_counters.demand_read_count = class_counters
+                    .demand_read_count
+                    .saturating_add(counters.demand_read_count);
+                class_counters.changed_materialization_count = class_counters
+                    .changed_materialization_count
+                    .saturating_add(counters.changed_materialization_count);
+                class_counters.hidden_semantic_delta_count = class_counters
+                    .hidden_semantic_delta_count
+                    .saturating_add(counters.hidden_semantic_delta_count);
+                class_counters.visible_root_list_dependency_count = class_counters
+                    .visible_root_list_dependency_count
+                    .saturating_add(counters.visible_root_list_dependency_count);
+                class_counters.visible_root_list_changed_dependency_count = class_counters
+                    .visible_root_list_changed_dependency_count
+                    .saturating_add(counters.visible_root_list_changed_dependency_count);
+                class_counters.root_list_evaluation_dependency_count = class_counters
+                    .root_list_evaluation_dependency_count
+                    .saturating_add(counters.root_list_evaluation_dependency_count);
+            }
+            classification_counts.insert(
+                classification.to_owned(),
+                json!({
+                    "root_count": root_count,
+                    "simulated_defer_enqueue_count": class_counters.simulated_defer_enqueue_count,
+                    "later_demand_read_count": class_counters.demand_read_count,
+                    "changed_materialization_count": class_counters.changed_materialization_count,
+                    "hidden_semantic_delta_count": class_counters.hidden_semantic_delta_count,
+                    "visible_root_list_dependency_count": class_counters.visible_root_list_dependency_count,
+                    "visible_root_list_changed_dependency_count": class_counters.visible_root_list_changed_dependency_count,
+                    "root_list_evaluation_dependency_count": class_counters.root_list_evaluation_dependency_count
+                }),
+            );
+        }
 
         json!({
             "cause": if self.frontier.is_empty() && self.root_work.is_empty() {
@@ -2438,19 +2672,39 @@ impl RuntimeDirtyFrontierCauseAggregate {
             "top_frontier_edges": frontier,
             "top_root_work": root_work,
             "candidate_defer_probe": {
+                "enabled": !self.candidate_defer_probe.is_empty(),
                 "scope": "no_behavior_change_simulated_suppression_for_candidate_unobserved_source_free_pure",
+                "profiling_mode": {
+                    "root_demand": !self.candidate_defer_probe.is_empty(),
+                    "dirty_frontier": !self.frontier.is_empty() || !self.demand_classifications.is_empty(),
+                    "candidate_demand": !self.candidate_defer_probe.is_empty()
+                },
                 "root_count": self.candidate_defer_probe.len(),
                 "simulated_defer_enqueue_count": candidate_defer_totals.simulated_defer_enqueue_count,
                 "materialization_count": candidate_defer_totals.materialization_count,
                 "changed_materialization_count": candidate_defer_totals.changed_materialization_count,
                 "unchanged_materialization_count": candidate_defer_totals.unchanged_materialization_count,
                 "demand_read_count": candidate_defer_totals.demand_read_count,
+                "later_demand_read_count": candidate_defer_totals.demand_read_count,
                 "runtime_scalar_read_count": candidate_defer_totals.runtime_scalar_read_count,
+                "runtime_scalar_boon_value_read_count": candidate_defer_totals.runtime_scalar_boon_value_read_count,
+                "runtime_scalar_json_read_count": candidate_defer_totals.runtime_scalar_json_read_count,
                 "eval_scalar_read_count": candidate_defer_totals.eval_scalar_read_count,
                 "state_summary_scalar_read_count": candidate_defer_totals.state_summary_scalar_read_count,
+                "window_summary_scalar_read_count": candidate_defer_totals.window_summary_scalar_read_count,
+                "sparse_value_summary_scalar_read_count": candidate_defer_totals.sparse_value_summary_scalar_read_count,
+                "assertion_scalar_read_count": candidate_defer_totals.assertion_scalar_read_count,
+                "root_list_evaluation_scalar_read_count": candidate_defer_totals.root_list_evaluation_scalar_read_count,
+                "observed_projection_scalar_read_count": candidate_defer_totals.observed_projection_scalar_read_count,
                 "document_state_summary_scalar_read_count": candidate_defer_totals.document_state_summary_scalar_read_count,
                 "runtime_value_summary_scalar_read_count": candidate_defer_totals.runtime_value_summary_scalar_read_count,
                 "derived_read_count": candidate_defer_totals.derived_read_count,
+                "own_eager_materialization_read_excluded_count": candidate_defer_totals.own_eager_materialization_read_excluded_count,
+                "hidden_semantic_delta_count": candidate_defer_totals.hidden_semantic_delta_count,
+                "visible_root_list_dependency_count": candidate_defer_totals.visible_root_list_dependency_count,
+                "visible_root_list_changed_dependency_count": candidate_defer_totals.visible_root_list_changed_dependency_count,
+                "root_list_evaluation_dependency_count": candidate_defer_totals.root_list_evaluation_dependency_count,
+                "classification_counts": classification_counts,
                 "top_roots": candidate_defer_top_roots
             }
         })

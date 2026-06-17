@@ -562,17 +562,76 @@ pub struct LiveRuntimeCandidateDeferProbeSample {
     pub changed_materialization_count: usize,
     pub unchanged_materialization_count: usize,
     pub demand_read_count: usize,
+    #[serde(default)]
+    pub later_demand_read_count: usize,
     pub runtime_scalar_read_count: usize,
+    #[serde(default)]
+    pub runtime_scalar_boon_value_read_count: usize,
+    #[serde(default)]
+    pub runtime_scalar_json_read_count: usize,
     pub eval_scalar_read_count: usize,
     pub state_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub window_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub sparse_value_summary_scalar_read_count: usize,
+    #[serde(default)]
+    pub assertion_scalar_read_count: usize,
+    #[serde(default)]
+    pub root_list_evaluation_scalar_read_count: usize,
+    #[serde(default)]
+    pub observed_projection_scalar_read_count: usize,
     pub document_state_summary_scalar_read_count: usize,
     pub runtime_value_summary_scalar_read_count: usize,
     pub derived_read_count: usize,
+    #[serde(default)]
+    pub first_demand_context: Option<String>,
+    #[serde(default)]
+    pub first_demand_read_kind: Option<String>,
+    #[serde(default)]
+    pub first_demand_path: Option<String>,
+    #[serde(default)]
+    pub first_demand_read_key: Option<String>,
+    #[serde(default)]
+    pub first_demand_after_eager_pop_excluded: bool,
+    #[serde(default)]
+    pub own_eager_materialization_read_excluded_count: usize,
+    #[serde(default)]
+    pub changed_read_key_count: usize,
+    #[serde(default)]
+    pub changed_read_keys: Vec<String>,
+    #[serde(default)]
+    pub changed_read_key_kind_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub hidden_semantic_delta: bool,
+    #[serde(default)]
+    pub would_hide_semantic_delta: bool,
+    #[serde(default)]
+    pub hidden_semantic_delta_count: usize,
+    #[serde(default)]
+    pub visible_root_list_dependency: bool,
+    #[serde(default)]
+    pub visible_root_list_dependency_count: usize,
+    #[serde(default)]
+    pub visible_root_list_changed_dependency_count: usize,
+    #[serde(default)]
+    pub root_list_evaluation_dependency_count: usize,
+    #[serde(default)]
+    pub visible_root_list_roots: Vec<String>,
+    #[serde(default)]
+    pub candidate_bucket: String,
+    #[serde(default)]
+    pub candidate_class: String,
+    #[serde(default)]
+    pub candidate_classes: Vec<String>,
+    #[serde(default)]
+    pub classification_reason: String,
 }
 
 const LIVE_RUNTIME_DIRTY_FRONTIER_SAMPLE_LIMIT: usize = 64;
 const LIVE_RUNTIME_DIRTY_ROOT_WORK_SAMPLE_LIMIT: usize = 64;
 const LIVE_RUNTIME_CANDIDATE_DEFER_SAMPLE_LIMIT: usize = 64;
+const LIVE_RUNTIME_CANDIDATE_DEFER_DETAIL_LIMIT: usize = 24;
 const ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE: &str =
     "candidate_unobserved_source_free_pure";
 
@@ -4784,9 +4843,7 @@ impl LoadedRuntime {
         generic.generic_derived_state.clear_value_caches();
         let previous_context = generic
             .generic_derived_state
-            .set_candidate_defer_read_context(
-                RuntimeCandidateDeferReadContext::DocumentStateSummary,
-            );
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::DocumentSummary);
         let summary = generic.document_summary();
         generic
             .generic_derived_state
@@ -4831,9 +4888,7 @@ impl LoadedRuntime {
         generic.generic_derived_state.clear_value_caches();
         let previous_context = generic
             .generic_derived_state
-            .set_candidate_defer_read_context(
-                RuntimeCandidateDeferReadContext::DocumentStateSummary,
-            );
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::WindowSummary);
         let summary =
             generic.document_summary_for_window(row_start, row_count, column_start, column_count);
         generic
@@ -4855,9 +4910,7 @@ impl LoadedRuntime {
         generic.generic_derived_state.clear_value_caches();
         let previous_context = generic
             .generic_derived_state
-            .set_candidate_defer_read_context(
-                RuntimeCandidateDeferReadContext::RuntimeValueSummary,
-            );
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::SparseValueSummary);
         let summary = generic.runtime_value_summaries(paths, max_depth, max_fields, max_list_items);
         generic
             .generic_derived_state
@@ -19941,10 +19994,22 @@ impl GenericScheduledRuntime {
                         .saturating_add(1);
                 }
                 let materialize_started = Instant::now();
+                let previous_context = root_demand_classification_enabled.then(|| {
+                    self.generic_derived_state
+                        .set_candidate_defer_read_context_with_root(
+                            RuntimeCandidateDeferReadContext::RootListEvaluation,
+                            Some(path.clone()),
+                        )
+                });
                 let result = self.materialize_root_list_view_field_after_cache_invalidation(
                     &field,
                     &current_dirty_reads,
-                )?;
+                );
+                if let Some((previous_context, previous_root)) = previous_context {
+                    self.generic_derived_state
+                        .restore_candidate_defer_read_context(previous_context, previous_root);
+                }
+                let result = result?;
                 let elapsed_ms = runtime_elapsed_ms(materialize_started);
                 removed_root_value_cache.remove(&path);
                 let changed_reads = result.changed_reads;
@@ -20212,13 +20277,27 @@ impl GenericScheduledRuntime {
                     .saturating_add(1);
             }
             let materialize_started = Instant::now();
-            let materialization = self.materialize_root_derived_field_commit(&field)?;
+            let previous_materializing_root = root_demand_classification_enabled.then(|| {
+                self.generic_derived_state
+                    .set_candidate_defer_materializing_root(Some(path.clone()))
+            });
+            let materialization = self.materialize_root_derived_field_commit(&field);
+            if let Some(previous_materializing_root) = previous_materializing_root {
+                self.generic_derived_state
+                    .set_candidate_defer_materializing_root(previous_materializing_root);
+            }
+            let materialization = materialization?;
             let elapsed_ms = runtime_elapsed_ms(materialize_started);
             removed_root_value_cache.remove(&path);
             let changed = materialization.is_some();
             let emitted_mutation = materialization
                 .as_ref()
                 .and_then(|materialization| materialization.mutation.as_ref())
+                .is_some();
+            let hidden_semantic_delta = materialization
+                .as_ref()
+                .and_then(|materialization| materialization.mutation.as_ref())
+                .and_then(|mutation| mutation.semantic_delta())
                 .is_some();
             let changed_read_count = materialization
                 .as_ref()
@@ -20231,8 +20310,26 @@ impl GenericScheduledRuntime {
                     &mut root_demand_classification_cache,
                 );
                 if root_demand_classification == ROOT_DEMAND_CANDIDATE_UNOBSERVED_SOURCE_FREE_PURE {
+                    let changed_reads = materialization
+                        .as_ref()
+                        .map(|materialization| {
+                            materialization
+                                .changed_reads
+                                .iter()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    let visible_root_list_roots =
+                        self.visible_root_list_dependents_for_changed_reads(&changed_reads);
                     self.generic_derived_state
-                        .record_candidate_defer_materialization(&path, changed);
+                        .record_candidate_defer_materialization(
+                            &path,
+                            changed,
+                            &changed_reads,
+                            hidden_semantic_delta,
+                            visible_root_list_roots,
+                        );
                 }
             }
             if let Some(work) = dirty_root_work.as_mut()
@@ -20847,6 +20944,32 @@ impl GenericScheduledRuntime {
             }
         }
         false
+    }
+
+    fn root_list_view_field_is_visible(&self, field: &GenericDerivedRootField) -> bool {
+        matches!(field.kind, DerivedValueKind::ListView)
+            && (self.document_lowering.root_field_is_observed(&field.path)
+                || self.root_field_drives_observed_projection(&field.path)
+                || self.root_field_has_observed_downstream_closure(&field.path))
+    }
+
+    fn visible_root_list_dependents_for_changed_reads(
+        &self,
+        changed_reads: &BTreeSet<GenericReadKey>,
+    ) -> BTreeSet<String> {
+        let mut visible_roots = BTreeSet::new();
+        for dependent in self
+            .generic_derived_state
+            .root_dependents_for_reads(changed_reads.iter().cloned())
+        {
+            let Some(field) = self.generic_derived.root_field_plan(&dependent) else {
+                continue;
+            };
+            if matches!(field.kind, DerivedValueKind::ListView) {
+                visible_roots.insert(field.path.clone());
+            }
+        }
+        visible_roots
     }
 
     fn root_text_source_action_mutation<'a>(
@@ -29922,27 +30045,35 @@ impl GenericScheduledRuntime {
     }
 
     fn root_textlike_for_assertion(&mut self, path: &str) -> RuntimeResult<String> {
-        let candidates = if path.contains('.') {
-            vec![path.to_owned()]
-        } else {
-            vec![format!("store.{path}"), path.to_owned()]
-        };
-        for candidate in &candidates {
-            self.clear_summary_root_value_cache_for_path(candidate);
-            let mut frame = GenericEvalFrame::root();
-            if let Some(value) = self.root_pure_derived_boon_value(candidate, &mut frame)?
-                && !matches!(value, BoonValue::Error(_) | BoonValue::Empty)
-                && let Some(text) = value.as_text()
-            {
-                return Ok(text);
+        let previous_context = self
+            .generic_derived_state
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::Assertion);
+        let result = (|| {
+            let candidates = if path.contains('.') {
+                vec![path.to_owned()]
+            } else {
+                vec![format!("store.{path}"), path.to_owned()]
+            };
+            for candidate in &candidates {
+                self.clear_summary_root_value_cache_for_path(candidate);
+                let mut frame = GenericEvalFrame::root();
+                if let Some(value) = self.root_pure_derived_boon_value(candidate, &mut frame)?
+                    && !matches!(value, BoonValue::Error(_) | BoonValue::Empty)
+                    && let Some(text) = value.as_text()
+                {
+                    return Ok(text);
+                }
+                if let Some(value) = self.runtime_scalar_json(candidate)
+                    && let Some(text) = json_scalar_text(&value)
+                {
+                    return Ok(text);
+                }
             }
-            if let Some(value) = self.runtime_scalar_json(candidate)
-                && let Some(text) = json_scalar_text(&value)
-            {
-                return Ok(text);
-            }
-        }
-        self.root_textlike(path)
+            self.root_textlike(path)
+        })();
+        self.generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
+        result
     }
 
     fn generic_addressed_row(&self, address: &str) -> RuntimeResult<(String, usize)> {
@@ -30160,14 +30291,29 @@ impl GenericScheduledRuntime {
 
     fn runtime_scalar_json(&self, path: &str) -> Option<JsonValue> {
         if let Some(value) = self.storage.root.owned_value(path) {
+            self.generic_derived_state
+                .record_candidate_defer_runtime_read(
+                    path,
+                    RuntimeCandidateDeferReadKind::RuntimeScalarJson,
+                );
             return Some(field_value_json(value));
         }
-        if let Some(value) = self
+        if let Some((root_path, value)) = self
             .root_state_paths
             .iter()
             .find(|root_path| root_state_path_matches_runtime_path(root_path, path))
-            .and_then(|root_path| self.storage.root.owned_value(root_path))
+            .and_then(|root_path| {
+                self.storage
+                    .root
+                    .owned_value(root_path)
+                    .map(|value| (root_path, value))
+            })
         {
+            self.generic_derived_state
+                .record_candidate_defer_runtime_read(
+                    root_path,
+                    RuntimeCandidateDeferReadKind::RuntimeScalarJson,
+                );
             return Some(field_value_json(value));
         }
         for (list, target) in self.list_equations.count_targets() {
@@ -30205,7 +30351,10 @@ impl GenericScheduledRuntime {
         }
         if let Some(value) = self.storage.root.owned_value(path) {
             self.generic_derived_state
-                .record_candidate_defer_runtime_scalar_read(path);
+                .record_candidate_defer_runtime_read(
+                    path,
+                    RuntimeCandidateDeferReadKind::RuntimeScalarBoonValue,
+                );
             return Some(field_value_to_boon(value));
         }
         if let Some((root_path, value)) = self
@@ -30220,12 +30369,18 @@ impl GenericScheduledRuntime {
             })
         {
             self.generic_derived_state
-                .record_candidate_defer_runtime_scalar_read(root_path);
+                .record_candidate_defer_runtime_read(
+                    root_path,
+                    RuntimeCandidateDeferReadKind::RuntimeScalarBoonValue,
+                );
             return Some(field_value_to_boon(value));
         }
         if let Some(value) = self.structured_root_child_boon_value(path) {
             self.generic_derived_state
-                .record_candidate_defer_runtime_scalar_read(path);
+                .record_candidate_defer_runtime_read(
+                    path,
+                    RuntimeCandidateDeferReadKind::RuntimeScalarBoonValue,
+                );
             return Some(value);
         }
         None
@@ -38047,8 +38202,11 @@ struct GenericDerivedState {
         BTreeMap<String, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
     numeric_stability_guards_by_field:
         BTreeMap<GenericDerivedKey, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
+    profile_candidate_defer_probe_active: Cell<bool>,
     profile_candidate_defer_probe: RefCell<BTreeMap<String, RuntimeCandidateDeferProbeAccumulator>>,
     profile_candidate_defer_read_context: Cell<RuntimeCandidateDeferReadContext>,
+    profile_candidate_defer_read_context_root: RefCell<Option<String>>,
+    profile_candidate_defer_materializing_root: RefCell<Option<String>>,
     last_recomputed: Vec<GenericDerivedKey>,
     last_candidate_count: usize,
 }
@@ -38195,11 +38353,30 @@ struct RuntimeCandidateDeferProbeAccumulator {
     changed_materialization_count: usize,
     unchanged_materialization_count: usize,
     runtime_scalar_read_count: usize,
+    runtime_scalar_boon_value_read_count: usize,
+    runtime_scalar_json_read_count: usize,
     eval_scalar_read_count: usize,
     state_summary_scalar_read_count: usize,
+    window_summary_scalar_read_count: usize,
+    sparse_value_summary_scalar_read_count: usize,
+    assertion_scalar_read_count: usize,
+    root_list_evaluation_scalar_read_count: usize,
+    observed_projection_scalar_read_count: usize,
     document_state_summary_scalar_read_count: usize,
     runtime_value_summary_scalar_read_count: usize,
     derived_read_count: usize,
+    first_demand_context: Option<&'static str>,
+    first_demand_read_kind: Option<&'static str>,
+    first_demand_path: Option<String>,
+    first_demand_read_key: Option<String>,
+    own_eager_materialization_read_excluded_count: usize,
+    changed_read_keys: BTreeSet<String>,
+    changed_read_key_kind_counts: BTreeMap<String, usize>,
+    hidden_semantic_delta_count: usize,
+    visible_root_list_dependency_count: usize,
+    visible_root_list_changed_dependency_count: usize,
+    root_list_evaluation_dependency_count: usize,
+    visible_root_list_roots: BTreeSet<String>,
 }
 
 impl RuntimeCandidateDeferProbeAccumulator {
@@ -38212,10 +38389,158 @@ impl RuntimeCandidateDeferProbeAccumulator {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RuntimeCandidateDeferReadContext {
     #[default]
-    Eval,
+    Evaluator,
     StateSummary,
-    DocumentStateSummary,
+    DocumentSummary,
+    WindowSummary,
+    SparseValueSummary,
+    Assertion,
+    RootListEvaluation,
+    ObservedProjection,
     RuntimeValueSummary,
+}
+
+impl RuntimeCandidateDeferReadContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evaluator => "evaluator",
+            Self::StateSummary => "state_summary",
+            Self::DocumentSummary | Self::WindowSummary => "document_window_summary",
+            Self::SparseValueSummary => "sparse_value_summary",
+            Self::Assertion => "assertion",
+            Self::RootListEvaluation => "root_list_evaluation",
+            Self::ObservedProjection => "observed_projection",
+            Self::RuntimeValueSummary => "runtime_value_summary",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeCandidateDeferReadKind {
+    RuntimeScalarBoonValue,
+    RuntimeScalarJson,
+    RootDerivedBoonValue,
+}
+
+impl RuntimeCandidateDeferReadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeScalarBoonValue => "runtime_scalar_boon_value",
+            Self::RuntimeScalarJson => "runtime_scalar_json",
+            Self::RootDerivedBoonValue => "root_derived_boon_value",
+        }
+    }
+}
+
+fn candidate_defer_name_hint(root_path: &str, tokens: &[&str]) -> bool {
+    let root_path = root_path.to_ascii_lowercase();
+    tokens.iter().any(|token| root_path.contains(token))
+}
+
+fn candidate_defer_classes(
+    root_path: &str,
+    entry: &RuntimeCandidateDeferProbeAccumulator,
+) -> Vec<String> {
+    let mut classes = Vec::new();
+    if entry.hidden_semantic_delta_count > 0 {
+        classes.push("must_publish_semantic_delta".to_owned());
+    }
+    if entry.visible_root_list_dependency_count > 0 {
+        classes.push("visible_list_dependency".to_owned());
+    }
+    if candidate_defer_name_hint(
+        root_path,
+        &[
+            "bridge",
+            "page",
+            "request",
+            "response",
+            "fingerprint",
+            "digest",
+            "generation",
+            "artifact",
+            "blob",
+        ],
+    ) {
+        classes.push("bridge_identity".to_owned());
+    }
+    if candidate_defer_name_hint(
+        root_path,
+        &[
+            "cursor",
+            "pointer",
+            "hover",
+            "selection",
+            "selected",
+            "label",
+            "telemetry",
+        ],
+    ) {
+        classes.push("cursor_telemetry".to_owned());
+    }
+    if classes.is_empty() {
+        classes.push("currentness_only".to_owned());
+    }
+    classes
+}
+
+fn candidate_defer_primary_class(classes: &[String]) -> String {
+    classes
+        .iter()
+        .find(|class| class.as_str() == "must_publish_semantic_delta")
+        .or_else(|| {
+            classes
+                .iter()
+                .find(|class| class.as_str() == "visible_list_dependency")
+        })
+        .or_else(|| {
+            classes
+                .iter()
+                .find(|class| class.as_str() == "bridge_identity")
+        })
+        .or_else(|| {
+            classes
+                .iter()
+                .find(|class| class.as_str() == "cursor_telemetry")
+        })
+        .or_else(|| {
+            classes
+                .iter()
+                .find(|class| class.as_str() == "currentness_only")
+        })
+        .cloned()
+        .unwrap_or_else(|| "currentness_only".to_owned())
+}
+
+fn candidate_defer_classification_reason(
+    classes: &[String],
+    entry: &RuntimeCandidateDeferProbeAccumulator,
+) -> String {
+    let mut reasons = Vec::new();
+    if entry.hidden_semantic_delta_count > 0 {
+        reasons.push(format!(
+            "semantic_delta_count={}",
+            entry.hidden_semantic_delta_count
+        ));
+    }
+    if entry.visible_root_list_dependency_count > 0 {
+        reasons.push(format!(
+            "visible_root_list_dependency_count={}",
+            entry.visible_root_list_dependency_count
+        ));
+    }
+    if classes.iter().any(|class| class == "bridge_identity") {
+        reasons.push("name_hint=bridge/page/request/fingerprint/digest".to_owned());
+    }
+    if classes.iter().any(|class| class == "cursor_telemetry") {
+        reasons.push("name_hint=cursor/pointer/selection/label".to_owned());
+    }
+    if reasons.is_empty() {
+        reasons.push(
+            "no semantic delta, visible list dependency, or identity/telemetry hint".to_owned(),
+        );
+    }
+    reasons.join("; ")
 }
 
 impl RuntimeDirtyRootWorkAccumulator {
@@ -41365,23 +41690,65 @@ impl GenericDerivedState {
     }
 
     fn clear_candidate_defer_probe(&self) {
+        self.profile_candidate_defer_probe_active.set(false);
         self.profile_candidate_defer_probe.borrow_mut().clear();
+        self.profile_candidate_defer_read_context_root.replace(None);
+        self.profile_candidate_defer_materializing_root
+            .replace(None);
     }
 
     fn set_candidate_defer_read_context(
         &self,
         context: RuntimeCandidateDeferReadContext,
     ) -> RuntimeCandidateDeferReadContext {
+        self.profile_candidate_defer_read_context_root.replace(None);
         self.profile_candidate_defer_read_context.replace(context)
     }
 
+    fn set_candidate_defer_read_context_with_root(
+        &self,
+        context: RuntimeCandidateDeferReadContext,
+        root: Option<String>,
+    ) -> (RuntimeCandidateDeferReadContext, Option<String>) {
+        let previous_context = self.profile_candidate_defer_read_context.replace(context);
+        let previous_root = self.profile_candidate_defer_read_context_root.replace(root);
+        (previous_context, previous_root)
+    }
+
+    fn restore_candidate_defer_read_context(
+        &self,
+        previous_context: RuntimeCandidateDeferReadContext,
+        previous_root: Option<String>,
+    ) {
+        self.profile_candidate_defer_read_context
+            .replace(previous_context);
+        self.profile_candidate_defer_read_context_root
+            .replace(previous_root);
+    }
+
+    fn set_candidate_defer_materializing_root(&self, root: Option<String>) -> Option<String> {
+        self.profile_candidate_defer_materializing_root
+            .replace(root)
+    }
+
     fn record_candidate_defer_enqueue(&self, root: &str) {
+        self.profile_candidate_defer_probe_active.set(true);
         let mut probe = self.profile_candidate_defer_probe.borrow_mut();
         let entry = probe.entry(root.to_owned()).or_default();
         entry.simulated_defer_enqueue_count = entry.simulated_defer_enqueue_count.saturating_add(1);
     }
 
-    fn record_candidate_defer_materialization(&self, root: &str, changed: bool) {
+    fn record_candidate_defer_materialization(
+        &self,
+        root: &str,
+        changed: bool,
+        changed_reads: &BTreeSet<GenericReadKey>,
+        hidden_semantic_delta: bool,
+        visible_root_list_roots: BTreeSet<String>,
+    ) {
+        if !self.profile_candidate_defer_probe_active.get() {
+            return;
+        }
         let mut probe = self.profile_candidate_defer_probe.borrow_mut();
         let entry = probe.entry(root.to_owned()).or_default();
         entry.materialization_count = entry.materialization_count.saturating_add(1);
@@ -41392,26 +41759,120 @@ impl GenericDerivedState {
             entry.unchanged_materialization_count =
                 entry.unchanged_materialization_count.saturating_add(1);
         }
+        if hidden_semantic_delta {
+            entry.hidden_semantic_delta_count = entry.hidden_semantic_delta_count.saturating_add(1);
+        }
+        if !visible_root_list_roots.is_empty() {
+            entry.visible_root_list_dependency_count =
+                entry.visible_root_list_dependency_count.saturating_add(1);
+            entry.visible_root_list_changed_dependency_count = entry
+                .visible_root_list_changed_dependency_count
+                .saturating_add(1);
+            entry
+                .visible_root_list_roots
+                .extend(visible_root_list_roots);
+        }
+        for read in changed_reads {
+            entry.changed_read_keys.insert(generic_read_key_label(read));
+            let kind = generic_read_key_kind_label(read).to_owned();
+            *entry.changed_read_key_kind_counts.entry(kind).or_default() += 1;
+        }
     }
 
-    fn record_candidate_defer_runtime_scalar_read(&self, path: &str) {
+    fn record_candidate_defer_runtime_read(&self, path: &str, kind: RuntimeCandidateDeferReadKind) {
+        if !self.profile_candidate_defer_probe_active.get() {
+            return;
+        }
         let Some(root) = self.candidate_defer_probe_root_for_path(path) else {
             return;
         };
         let mut probe = self.profile_candidate_defer_probe.borrow_mut();
         if let Some(entry) = probe.get_mut(&root) {
+            if self
+                .profile_candidate_defer_materializing_root
+                .borrow()
+                .as_ref()
+                .is_some_and(|materializing_root| materializing_root == &root)
+            {
+                entry.own_eager_materialization_read_excluded_count = entry
+                    .own_eager_materialization_read_excluded_count
+                    .saturating_add(1);
+                return;
+            }
+            let context = self.profile_candidate_defer_read_context.get();
+            if context == RuntimeCandidateDeferReadContext::RootListEvaluation
+                && let Some(root) = self
+                    .profile_candidate_defer_read_context_root
+                    .borrow()
+                    .clone()
+            {
+                entry.visible_root_list_dependency_count =
+                    entry.visible_root_list_dependency_count.saturating_add(1);
+                entry.root_list_evaluation_dependency_count = entry
+                    .root_list_evaluation_dependency_count
+                    .saturating_add(1);
+                entry.visible_root_list_roots.insert(root);
+            }
+            if entry.first_demand_context.is_none() {
+                entry.first_demand_context = Some(context.as_str());
+                entry.first_demand_read_kind = Some(kind.as_str());
+                entry.first_demand_path = Some(path.to_owned());
+                entry.first_demand_read_key = root_read_keys_for_path(path)
+                    .first()
+                    .map(generic_read_key_label);
+            }
             entry.runtime_scalar_read_count = entry.runtime_scalar_read_count.saturating_add(1);
-            match self.profile_candidate_defer_read_context.get() {
-                RuntimeCandidateDeferReadContext::Eval => {
+            match kind {
+                RuntimeCandidateDeferReadKind::RuntimeScalarBoonValue => {
+                    entry.runtime_scalar_boon_value_read_count =
+                        entry.runtime_scalar_boon_value_read_count.saturating_add(1);
+                }
+                RuntimeCandidateDeferReadKind::RuntimeScalarJson => {
+                    entry.runtime_scalar_json_read_count =
+                        entry.runtime_scalar_json_read_count.saturating_add(1);
+                }
+                RuntimeCandidateDeferReadKind::RootDerivedBoonValue => {}
+            }
+            match context {
+                RuntimeCandidateDeferReadContext::Evaluator => {
                     entry.eval_scalar_read_count = entry.eval_scalar_read_count.saturating_add(1);
                 }
                 RuntimeCandidateDeferReadContext::StateSummary => {
                     entry.state_summary_scalar_read_count =
                         entry.state_summary_scalar_read_count.saturating_add(1);
                 }
-                RuntimeCandidateDeferReadContext::DocumentStateSummary => {
+                RuntimeCandidateDeferReadContext::DocumentSummary => {
                     entry.document_state_summary_scalar_read_count = entry
                         .document_state_summary_scalar_read_count
+                        .saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::WindowSummary => {
+                    entry.window_summary_scalar_read_count =
+                        entry.window_summary_scalar_read_count.saturating_add(1);
+                    entry.document_state_summary_scalar_read_count = entry
+                        .document_state_summary_scalar_read_count
+                        .saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::SparseValueSummary => {
+                    entry.sparse_value_summary_scalar_read_count = entry
+                        .sparse_value_summary_scalar_read_count
+                        .saturating_add(1);
+                    entry.runtime_value_summary_scalar_read_count = entry
+                        .runtime_value_summary_scalar_read_count
+                        .saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::Assertion => {
+                    entry.assertion_scalar_read_count =
+                        entry.assertion_scalar_read_count.saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::RootListEvaluation => {
+                    entry.root_list_evaluation_scalar_read_count = entry
+                        .root_list_evaluation_scalar_read_count
+                        .saturating_add(1);
+                }
+                RuntimeCandidateDeferReadContext::ObservedProjection => {
+                    entry.observed_projection_scalar_read_count = entry
+                        .observed_projection_scalar_read_count
                         .saturating_add(1);
                 }
                 RuntimeCandidateDeferReadContext::RuntimeValueSummary => {
@@ -41424,16 +41885,56 @@ impl GenericDerivedState {
     }
 
     fn record_candidate_defer_derived_read(&self, root: &str) {
+        if !self.profile_candidate_defer_probe_active.get() {
+            return;
+        }
         let Some(root) = self.candidate_defer_probe_root_for_path(root) else {
             return;
         };
         let mut probe = self.profile_candidate_defer_probe.borrow_mut();
         if let Some(entry) = probe.get_mut(&root) {
+            if self
+                .profile_candidate_defer_materializing_root
+                .borrow()
+                .as_ref()
+                .is_some_and(|materializing_root| materializing_root == &root)
+            {
+                entry.own_eager_materialization_read_excluded_count = entry
+                    .own_eager_materialization_read_excluded_count
+                    .saturating_add(1);
+                return;
+            }
+            let context = self.profile_candidate_defer_read_context.get();
+            if context == RuntimeCandidateDeferReadContext::RootListEvaluation
+                && let Some(root) = self
+                    .profile_candidate_defer_read_context_root
+                    .borrow()
+                    .clone()
+            {
+                entry.visible_root_list_dependency_count =
+                    entry.visible_root_list_dependency_count.saturating_add(1);
+                entry.root_list_evaluation_dependency_count = entry
+                    .root_list_evaluation_dependency_count
+                    .saturating_add(1);
+                entry.visible_root_list_roots.insert(root);
+            }
+            if entry.first_demand_context.is_none() {
+                entry.first_demand_context = Some(context.as_str());
+                entry.first_demand_read_kind =
+                    Some(RuntimeCandidateDeferReadKind::RootDerivedBoonValue.as_str());
+                entry.first_demand_path = Some(root.clone());
+                entry.first_demand_read_key = root_read_keys_for_path(&root)
+                    .first()
+                    .map(generic_read_key_label);
+            }
             entry.derived_read_count = entry.derived_read_count.saturating_add(1);
         }
     }
 
     fn candidate_defer_probe_root_for_path(&self, path: &str) -> Option<String> {
+        if !self.profile_candidate_defer_probe_active.get() {
+            return None;
+        }
         let probe = self.profile_candidate_defer_probe.borrow();
         if probe.is_empty() {
             return None;
@@ -41476,21 +41977,75 @@ impl GenericDerivedState {
             .profile_candidate_defer_probe
             .borrow()
             .iter()
-            .map(|(root_path, entry)| LiveRuntimeCandidateDeferProbeSample {
-                root_path: root_path.clone(),
-                simulated_defer_enqueue_count: entry.simulated_defer_enqueue_count,
-                materialization_count: entry.materialization_count,
-                changed_materialization_count: entry.changed_materialization_count,
-                unchanged_materialization_count: entry.unchanged_materialization_count,
-                demand_read_count: entry.demand_read_count(),
-                runtime_scalar_read_count: entry.runtime_scalar_read_count,
-                eval_scalar_read_count: entry.eval_scalar_read_count,
-                state_summary_scalar_read_count: entry.state_summary_scalar_read_count,
-                document_state_summary_scalar_read_count: entry
-                    .document_state_summary_scalar_read_count,
-                runtime_value_summary_scalar_read_count: entry
-                    .runtime_value_summary_scalar_read_count,
-                derived_read_count: entry.derived_read_count,
+            .map(|(root_path, entry)| {
+                let candidate_classes = candidate_defer_classes(root_path, entry);
+                let candidate_class = candidate_defer_primary_class(&candidate_classes);
+                let classification_reason =
+                    candidate_defer_classification_reason(&candidate_classes, entry);
+                LiveRuntimeCandidateDeferProbeSample {
+                    root_path: root_path.clone(),
+                    simulated_defer_enqueue_count: entry.simulated_defer_enqueue_count,
+                    materialization_count: entry.materialization_count,
+                    changed_materialization_count: entry.changed_materialization_count,
+                    unchanged_materialization_count: entry.unchanged_materialization_count,
+                    demand_read_count: entry.demand_read_count(),
+                    later_demand_read_count: entry.demand_read_count(),
+                    runtime_scalar_read_count: entry.runtime_scalar_read_count,
+                    runtime_scalar_boon_value_read_count: entry
+                        .runtime_scalar_boon_value_read_count,
+                    runtime_scalar_json_read_count: entry.runtime_scalar_json_read_count,
+                    eval_scalar_read_count: entry.eval_scalar_read_count,
+                    state_summary_scalar_read_count: entry.state_summary_scalar_read_count,
+                    window_summary_scalar_read_count: entry.window_summary_scalar_read_count,
+                    sparse_value_summary_scalar_read_count: entry
+                        .sparse_value_summary_scalar_read_count,
+                    assertion_scalar_read_count: entry.assertion_scalar_read_count,
+                    root_list_evaluation_scalar_read_count: entry
+                        .root_list_evaluation_scalar_read_count,
+                    observed_projection_scalar_read_count: entry
+                        .observed_projection_scalar_read_count,
+                    document_state_summary_scalar_read_count: entry
+                        .document_state_summary_scalar_read_count,
+                    runtime_value_summary_scalar_read_count: entry
+                        .runtime_value_summary_scalar_read_count,
+                    derived_read_count: entry.derived_read_count,
+                    first_demand_context: entry.first_demand_context.map(str::to_owned),
+                    first_demand_read_kind: entry.first_demand_read_kind.map(str::to_owned),
+                    first_demand_path: entry.first_demand_path.clone(),
+                    first_demand_read_key: entry.first_demand_read_key.clone(),
+                    first_demand_after_eager_pop_excluded: entry
+                        .own_eager_materialization_read_excluded_count
+                        > 0,
+                    own_eager_materialization_read_excluded_count: entry
+                        .own_eager_materialization_read_excluded_count,
+                    changed_read_key_count: entry.changed_read_keys.len(),
+                    changed_read_keys: entry
+                        .changed_read_keys
+                        .iter()
+                        .take(LIVE_RUNTIME_CANDIDATE_DEFER_DETAIL_LIMIT)
+                        .cloned()
+                        .collect(),
+                    changed_read_key_kind_counts: entry.changed_read_key_kind_counts.clone(),
+                    hidden_semantic_delta: entry.hidden_semantic_delta_count > 0,
+                    would_hide_semantic_delta: entry.hidden_semantic_delta_count > 0,
+                    hidden_semantic_delta_count: entry.hidden_semantic_delta_count,
+                    visible_root_list_dependency: entry.visible_root_list_dependency_count > 0,
+                    visible_root_list_dependency_count: entry.visible_root_list_dependency_count,
+                    visible_root_list_changed_dependency_count: entry
+                        .visible_root_list_changed_dependency_count,
+                    root_list_evaluation_dependency_count: entry
+                        .root_list_evaluation_dependency_count,
+                    visible_root_list_roots: entry
+                        .visible_root_list_roots
+                        .iter()
+                        .take(LIVE_RUNTIME_CANDIDATE_DEFER_DETAIL_LIMIT)
+                        .cloned()
+                        .collect(),
+                    candidate_bucket: candidate_class.clone(),
+                    candidate_class,
+                    candidate_classes,
+                    classification_reason,
+                }
             })
             .collect::<Vec<_>>();
         samples.sort_by(|left, right| {

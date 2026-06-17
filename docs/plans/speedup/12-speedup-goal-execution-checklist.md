@@ -2769,7 +2769,7 @@ Notes:
   click/input p95 do not move meaningfully.
 
 ### TASK-0804B Bridge/Page Identity And Demand Frontier Resumption
-Status: postponed
+Status: in_progress
 Type: implementation
 Priority: P1
 Depends on: TASK-0804, TASK-1001, TASK-1002, explicit user resume
@@ -2833,6 +2833,28 @@ Notes:
   `0804R-00` to `pending` or `in_progress`, leave later `0804R-*` tasks
   blocked until their dependencies are done, and append matching progress-log
   entries in both files.
+- 2026-06-17 TASK-0804B activation: explicit `/goal` objective resumed this
+  task. `TASK-0804A` remains postponed historical evidence. Plan 20 `0804R-00`
+  is the active slice; no runtime code changed before the baseline evidence
+  lock.
+- 2026-06-17 TASK-0804B `0804R-00` baseline/evidence lock completed. The
+  canonical report
+  `target/reports/native-gpu/novywave-interaction-speed.json` remains
+  `status=fail` with `click_to_cursor.p95=18.995379ms`,
+  `input_to_visible.p95=18.995379ms`, `runtime_apply.p95=11.735027ms`,
+  `runtime_step_apply.p95=9.513186ms`, and
+  `layout_rebuild.p95=4.709477ms`. Cause remains
+  `root_flush_dirty_scheduler_plus_root_list_materialization`; click graph
+  counts are `visits=3536`, `enqueues=600`, and `pops=792`. Root-demand
+  diagnostics report `24` candidate pure roots, `552` simulated defer
+  enqueues, `552` changed materializations, and `512` demand reads. Dirty
+  frontier diagnostics expose ranked frontier edges. Bridge proof
+  `target/reports/novywave-bridge-scenario.json` is `status=pass`.
+  Renderer post-interaction upload remains separated: `3360` bytes, `3`
+  dirty ranges, `3` queue writes, `0` staging wraps, and `0` quad-cache
+  evictions. Schema validation passed after refreshing the canonical report
+  once more because diagnostics rewrote the shared native role artifact.
+  Plan 20 `0804R-00` is `done`; `0804R-01` is now `in_progress`.
 
 ## Phase 9: Low-Level Rust Experiments
 

@@ -112,7 +112,7 @@ Activation protocol:
 
 ## 0804R-00 Baseline And Evidence Lock
 
-Status: blocked
+Status: done
 Depends on: `TASK-1001`, `TASK-1002`, explicit user resume of `TASK-0804B`
 
 Goal: capture a current, non-stale baseline before any implementation slice.
@@ -160,7 +160,7 @@ Kill criteria:
 
 ## 0804R-01 No-Behavior Candidate-Demand Simulation
 
-Status: blocked
+Status: in_progress
 Depends on: `0804R-00`
 
 Goal: measure whether candidate internal roots can be deferred safely before
@@ -538,3 +538,48 @@ Requirements:
 - 2026-06-17: Plan created from the latest `TASK-0804A`/`TASK-0804B`
   checklist evidence. No runtime code changed. Tasks remain inactive until the
   user explicitly resumes `TASK-0804B`.
+- 2026-06-17: `TASK-0804B` explicitly resumed by `/goal` objective. Activated
+  `0804R-00` baseline/evidence lock only; `TASK-0804A` remains postponed and
+  later `0804R-*` tasks remain blocked until dependencies are satisfied.
+- 2026-06-17: Completed `0804R-00` baseline/evidence lock. Commands:
+  `git status --short`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `BOON_PROFILE_ROOT_DEMAND=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-root-demand.json`;
+  `BOON_PROFILE_DIRTY_FRONTIER=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-dirty-frontier.json`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`;
+  `cargo xtask verify-report-schema`; and the two required diagnostic
+  `jq -e` checks. The first schema run caught a stale role-artifact hash after
+  diagnostics rewrote the shared artifact; rerunning the canonical speed report
+  before schema fixed the freshness mismatch.
+- 2026-06-17: `0804R-00` baseline evidence: canonical speed report
+  `target/reports/native-gpu/novywave-interaction-speed.json` remains
+  `status=fail` with `click_to_cursor.p95=18.995379ms`,
+  `input_to_visible.p95=18.995379ms`, `runtime_apply.p95=11.735027ms`,
+  `runtime_step_apply.p95=9.513186ms`, and
+  `layout_rebuild.p95=4.709477ms`. Cause remains
+  `root_flush_dirty_scheduler_plus_root_list_materialization`.
+  Click graph counts are `visits=3536`, `enqueues=600`, `pops=792`;
+  aggregate click root work is `root_flush_ms=124.119652`,
+  `dirty_scheduler_ms=46.682550`, and
+  `root_materialization_ms=73.578293`.
+- 2026-06-17: `0804R-00` diagnostics: root-demand report
+  `target/diagnostics/native-gpu/novywave-interaction-speed-root-demand.json`
+  exposes `candidate_unobserved_source_free_pure` with `24` candidate roots,
+  `552` simulated defer enqueues, `552` changed materializations, and `512`
+  demand reads. The largest candidate is
+  `store.bridge_cursor_values_page_ref` with `64` simulated enqueues and `64`
+  demand reads. Demand classes are
+  `candidate_unobserved_source_free_pure=3568 visits/576 enqueues`,
+  `blocked_observed_downstream=304/96`, `blocked_observed_root=240/80`, and
+  `blocked_list_view=704/64`. Dirty-frontier report
+  `target/diagnostics/native-gpu/novywave-interaction-speed-dirty-frontier.json`
+  exposes ranked frontier edges. Bridge proof
+  `target/reports/novywave-bridge-scenario.json` is `status=pass`,
+  `measurement_mode=proof`.
+- 2026-06-17: `0804R-00` renderer/list evidence: renderer remains separated
+  from the current slow path with post-interaction upload `3360` bytes, `3`
+  dirty ranges, `3` queue writes, `0` staging wraps, and `0` quad-cache
+  evictions. Dominant list remains `selected_signal_lane_rows` with
+  `eval_ms=20.513292`, `user_function_body_ms=12.373484`,
+  `full_eval_row_count=0`, and `row_materialize_ms=0.0`. Started `0804R-01`
+  after baseline acceptance passed; no runtime behavior changed yet.

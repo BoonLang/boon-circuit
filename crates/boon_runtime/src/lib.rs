@@ -20717,8 +20717,17 @@ impl GenericScheduledRuntime {
         field: &GenericDerivedRootField,
     ) -> RuntimeResult<Option<GenericRootDerivedMaterialization<'static>>> {
         if matches!(field.kind, DerivedValueKind::ListView) {
-            let _ = self.materialize_root_list_view_field(field, &BTreeSet::new())?;
-            return Ok(None);
+            let result = self.materialize_root_list_view_field(field, &BTreeSet::new())?;
+            if result.changed_reads.is_empty() {
+                return Ok(None);
+            }
+            let mut changed_reads = RootReadKeys::new();
+            changed_reads.extend(result.changed_reads);
+            return Ok(Some(GenericRootDerivedMaterialization {
+                target: field.path.clone(),
+                changed_reads,
+                mutation: None,
+            }));
         }
         if field.kind == DerivedValueKind::SourceEventTransform
             && field.has_sources
@@ -21030,8 +21039,10 @@ impl GenericScheduledRuntime {
         materialization_pass: u64,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
         field_cache_entries_prevalidated: bool,
+        ancestor_root_stack: &[String],
     ) -> GenericEvalFrame {
         let mut frame = GenericEvalFrame::root();
+        frame.root_stack = ancestor_root_stack.to_vec();
         frame.root_list_view_field_cache_context = Some(RootListViewFieldCacheContext {
             root_path,
             source_identity: None,
@@ -21506,6 +21517,7 @@ impl GenericScheduledRuntime {
         field_cache_hits_before: usize,
         field_cache_misses_before: usize,
         field_cache_stores_before: usize,
+        ancestor_root_stack: &[String],
     ) -> RuntimeResult<RootListViewFieldOnlyOutcome> {
         let Some(plan) = self.root_list_view_field_only_plan(&field.statement) else {
             return Ok(RootListViewFieldOnlyOutcome::NotApplicable);
@@ -21525,6 +21537,7 @@ impl GenericScheduledRuntime {
             materialization_pass,
             current_dirty_reads,
             field_cache_entries_prevalidated,
+            ancestor_root_stack,
         );
         frame.root_stack.push(field.path.clone());
         let mut value = self.eval_expr(plan.input_expr, &mut frame)?;
@@ -22195,7 +22208,26 @@ impl GenericScheduledRuntime {
         field: &GenericDerivedRootField,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
     ) -> RuntimeResult<RootListViewMaterializationResult> {
-        self.materialize_root_list_view_field_with_cache_state(field, current_dirty_reads, false)
+        self.materialize_root_list_view_field_with_cache_state(
+            field,
+            current_dirty_reads,
+            false,
+            &[],
+        )
+    }
+
+    fn materialize_root_list_view_field_for_derived_read(
+        &mut self,
+        field: &GenericDerivedRootField,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+        ancestor_root_stack: &[String],
+    ) -> RuntimeResult<RootListViewMaterializationResult> {
+        self.materialize_root_list_view_field_with_cache_state(
+            field,
+            current_dirty_reads,
+            false,
+            ancestor_root_stack,
+        )
     }
 
     fn materialize_root_list_view_field_after_cache_invalidation(
@@ -22203,7 +22235,12 @@ impl GenericScheduledRuntime {
         field: &GenericDerivedRootField,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
     ) -> RuntimeResult<RootListViewMaterializationResult> {
-        self.materialize_root_list_view_field_with_cache_state(field, current_dirty_reads, true)
+        self.materialize_root_list_view_field_with_cache_state(
+            field,
+            current_dirty_reads,
+            true,
+            &[],
+        )
     }
 
     fn materialize_root_list_view_field_with_cache_state(
@@ -22211,6 +22248,7 @@ impl GenericScheduledRuntime {
         field: &GenericDerivedRootField,
         current_dirty_reads: &BTreeSet<GenericReadKey>,
         field_cache_entries_prevalidated: bool,
+        ancestor_root_stack: &[String],
     ) -> RuntimeResult<RootListViewMaterializationResult> {
         let Some(list) = self
             .storage
@@ -22234,6 +22272,7 @@ impl GenericScheduledRuntime {
             field_cache_hits_before,
             field_cache_misses_before,
             field_cache_stores_before,
+            ancestor_root_stack,
         )? {
             RootListViewFieldOnlyOutcome::Applied(result) => return Ok(result),
             RootListViewFieldOnlyOutcome::Fallback(reason) => {
@@ -22246,6 +22285,7 @@ impl GenericScheduledRuntime {
             materialization_pass,
             current_dirty_reads,
             field_cache_entries_prevalidated,
+            ancestor_root_stack,
         );
         let eval_started = Instant::now();
         frame.root_stack.push(field.path.clone());
@@ -24960,10 +25000,7 @@ impl GenericScheduledRuntime {
                 index: row.index,
             });
         }
-        if self.storage.lists.memory(name).is_some() && !self.dynamic_list_view_lists.contains(name)
-        {
-            return Ok(BoonValue::ListRef(name.to_owned()));
-        }
+        let store_name = format!("store.{name}");
         if let Some(row) = frame.row.clone()
             && self
                 .storage
@@ -24971,6 +25008,26 @@ impl GenericScheduledRuntime {
                 .is_ok()
         {
             return self.read_list_field(&row.list, row.index, name, frame);
+        }
+        if self.storage.lists.memory(name).is_some() && !self.dynamic_list_view_lists.contains(name)
+        {
+            if root_stack_contains_runtime_path(&frame.root_stack, name)
+                || root_stack_contains_runtime_path(&frame.root_stack, &store_name)
+            {
+                return Ok(BoonValue::Error("cycle_error".to_owned()));
+            }
+            return Ok(BoonValue::ListRef(name.to_owned()));
+        }
+        if let Some(value) = self.root_list_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.root_list_derived_boon_value(&store_name, frame)? {
+            return Ok(value);
+        }
+        if root_stack_contains_runtime_path(&frame.root_stack, name)
+            || root_stack_contains_runtime_path(&frame.root_stack, &store_name)
+        {
+            return Ok(BoonValue::Error("cycle_error".to_owned()));
         }
         if frame.row.is_some()
             && let Some(value) = self.runtime_scalar_boon_value(name)
@@ -24982,7 +25039,6 @@ impl GenericScheduledRuntime {
             frame.reads.extend(root_dependency_read_keys_for_path(name));
             return Ok(value);
         }
-        let store_name = format!("store.{name}");
         if let Some(value) = self.runtime_scalar_boon_value(&store_name) {
             frame
                 .reads
@@ -25000,12 +25056,6 @@ impl GenericScheduledRuntime {
             return Ok(value);
         }
         if let Some(value) = self.root_non_list_derived_boon_value(&store_name, frame)? {
-            return Ok(value);
-        }
-        if let Some(value) = self.root_list_derived_boon_value(name, frame)? {
-            return Ok(value);
-        }
-        if let Some(value) = self.root_list_derived_boon_value(&store_name, frame)? {
             return Ok(value);
         }
         if let Some(value) = self.runtime_scalar_boon_value(name) {
@@ -25036,20 +25086,33 @@ impl GenericScheduledRuntime {
             return self.read_list_field(&row.list, row.index, &parts[1], frame);
         }
         let full_path = parts.join(".");
+        if let Some(value) = self.root_list_derived_boon_value(&full_path, frame)? {
+            return Ok(value);
+        }
+        if let Some(local_path) = full_path.strip_prefix("store.")
+            && let Some(value) = self.root_list_derived_boon_value(local_path, frame)?
+        {
+            return Ok(value);
+        }
         if let Some(list) = self
             .storage
             .list_name_for_path(&full_path)
             .filter(|list| !self.dynamic_list_view_lists.contains(*list))
             .map(str::to_owned)
         {
+            if root_stack_contains_runtime_path(&frame.root_stack, &full_path)
+                || root_stack_contains_runtime_path(&frame.root_stack, &list)
+            {
+                return Ok(BoonValue::Error("cycle_error".to_owned()));
+            }
             frame
                 .reads
                 .extend(root_dependency_read_keys_for_path(&full_path));
             frame.reads.insert(list_read_key(&list));
             return Ok(BoonValue::ListRef(list));
         }
-        if let Some(value) = self.root_list_derived_boon_value(&full_path, frame)? {
-            return Ok(value);
+        if root_stack_contains_runtime_path(&frame.root_stack, &full_path) {
+            return Ok(BoonValue::Error("cycle_error".to_owned()));
         }
         if frame.row.is_some()
             && let Some(value) = self.runtime_scalar_boon_value(&full_path)
@@ -26210,7 +26273,11 @@ impl GenericScheduledRuntime {
             .get(&cache_key)
             .cloned()
         {
-            if self.ensure_root_reads_current(
+            if Self::root_list_view_cache_entry_reads_root_stack(frame, &entry) {
+                self.generic_derived_state
+                    .root_list_view_field_cache
+                    .remove(&cache_key);
+            } else if self.ensure_root_reads_current(
                 &entry.reads,
                 RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
             )? {
@@ -26383,7 +26450,11 @@ impl GenericScheduledRuntime {
             .get(&cache_key)
             .cloned()
         {
-            if self.ensure_root_reads_current(
+            if Self::root_list_view_cache_entry_reads_root_stack(frame, &entry) {
+                self.generic_derived_state
+                    .root_list_view_field_cache
+                    .remove(&cache_key);
+            } else if self.ensure_root_reads_current(
                 &entry.reads,
                 RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
             )? {
@@ -26529,6 +26600,9 @@ impl GenericScheduledRuntime {
             if entry.materialization_pass == current_pass {
                 return None;
             }
+            if Self::root_list_view_cache_entry_reads_root_stack(frame, &entry) {
+                return None;
+            }
             if !field_cache_entries_prevalidated
                 && self.root_list_view_cache_entry_dirty_invalidated_read_count(frame, &entry) > 0
             {
@@ -26659,6 +26733,19 @@ impl GenericScheduledRuntime {
             &context.current_dirty_reads,
             &root_numbers,
         )
+    }
+
+    fn root_list_view_cache_entry_reads_root_stack(
+        frame: &GenericEvalFrame,
+        entry: &RootListViewFieldCacheEntry,
+    ) -> bool {
+        if frame.root_stack.is_empty() || entry.reads.is_empty() {
+            return false;
+        }
+        entry
+            .reads
+            .iter()
+            .any(|read| root_stack_contains_runtime_read_key(&frame.root_stack, read))
     }
 
     fn root_list_view_cache_entry_dirty_invalidated_read_count(
@@ -30646,6 +30733,9 @@ impl GenericScheduledRuntime {
                 .extend(root_dependency_read_keys_for_path(&plan.path));
             return Ok(Some(value));
         }
+        if root_stack_contains_runtime_path(&frame.root_stack, &plan.path) {
+            return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
+        }
         if let Some(value) = self
             .generic_derived_state
             .root_value_cache
@@ -30699,11 +30789,8 @@ impl GenericScheduledRuntime {
                 .remove_root_numeric_stability_guards(&plan.path);
             return Ok(Some(value));
         }
-        if frame.root_stack.contains(&plan.path) {
-            return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
-        }
         if matches!(plan.kind, DerivedValueKind::ListView) {
-            let _ = self.materialize_root_list_view_field(&plan, &BTreeSet::new())?;
+            self.ensure_root_list_view_materialized_for_read(&plan, &frame.root_stack)?;
             if let Some(reads) = self
                 .generic_derived_state
                 .root_reads_by_field
@@ -30804,6 +30891,17 @@ impl GenericScheduledRuntime {
             .list_name_for_path(&plan.path)
             .map(str::to_owned)
         {
+            if root_stack_contains_runtime_path(&frame.root_stack, &plan.path) {
+                return Ok(Some(BoonValue::Error("cycle_error".to_owned())));
+            }
+            self.ensure_root_list_view_materialized_for_read(&plan, &frame.root_stack)?;
+            if let Some(reads) = self
+                .generic_derived_state
+                .root_reads_by_field
+                .get(&plan.path)
+            {
+                frame.reads.extend(reads.iter().cloned());
+            }
             frame
                 .reads
                 .extend(root_dependency_read_keys_for_path(&plan.path));
@@ -30811,6 +30909,51 @@ impl GenericScheduledRuntime {
             return Ok(Some(BoonValue::ListRef(list)));
         }
         self.root_derived_boon_value(path, frame)
+    }
+
+    fn ensure_root_list_view_materialized_for_read(
+        &mut self,
+        field: &GenericDerivedRootField,
+        ancestor_root_stack: &[String],
+    ) -> RuntimeResult<()> {
+        self.ensure_root_current(&field.path, RuntimeRootCurrentnessReason::RootDerived)?;
+        let mut needs_materialization = !self
+            .generic_derived_state
+            .root_value_cache
+            .contains_key(&field.path)
+            || !self
+                .generic_derived_state
+                .root_reads_by_field
+                .contains_key(&field.path);
+        if !needs_materialization {
+            let reads = self
+                .generic_derived_state
+                .root_reads_by_field
+                .get(&field.path)
+                .cloned()
+                .unwrap_or_default();
+            if self.ensure_root_reads_current(&reads, RuntimeRootCurrentnessReason::RootDerived)? {
+                needs_materialization = true;
+            }
+        }
+        if !needs_materialization {
+            return Ok(());
+        }
+        let result = self.materialize_root_list_view_field_for_derived_read(
+            field,
+            &BTreeSet::new(),
+            ancestor_root_stack,
+        )?;
+        if !result.changed_reads.is_empty() {
+            let mut changed_reads = RootReadKeys::new();
+            changed_reads.extend(result.changed_reads);
+            self.invalidate_demand_refreshed_root_caches(&GenericRootDerivedMaterialization {
+                target: field.path.clone(),
+                changed_reads,
+                mutation: None,
+            });
+        }
+        Ok(())
     }
 
     fn direct_root_list_ref_for_statement(
@@ -35012,6 +35155,31 @@ fn runtime_path_matches_target(path: &str, target: &str) -> bool {
 
 fn root_state_path_matches_runtime_path(root_path: &str, path: &str) -> bool {
     root_path == path || root_path.strip_prefix("store.") == Some(path)
+}
+
+fn runtime_root_paths_match(left: &str, right: &str) -> bool {
+    left == right
+        || left.strip_prefix("store.") == Some(right)
+        || right.strip_prefix("store.") == Some(left)
+}
+
+fn root_stack_contains_runtime_path(root_stack: &[String], path: &str) -> bool {
+    root_stack
+        .iter()
+        .any(|stack_path| runtime_root_paths_match(stack_path, path))
+}
+
+fn root_stack_contains_runtime_read_key(root_stack: &[String], read: &GenericReadKey) -> bool {
+    match read {
+        GenericReadKey::Root { field } => root_stack_contains_runtime_path(root_stack, field),
+        GenericReadKey::RootChild { root, path } => {
+            root_stack_contains_runtime_path(root_stack, root)
+                || root_stack_contains_runtime_path(root_stack, &format!("{root}.{path}"))
+        }
+        GenericReadKey::List { .. }
+        | GenericReadKey::ListColumn { .. }
+        | GenericReadKey::ListField { .. } => false,
+    }
 }
 
 fn runtime_path_tail_for_target(path: &str, target: &str) -> Option<RuntimePathTail> {
@@ -49676,7 +49844,7 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
         let source = r#"
 store: [
     elements: [
-        noop: SOURCE
+        filter: SOURCE
     ]
     cursor:
         TEXT { top-cursor } |> HOLD cursor { LATEST {} }
@@ -51361,7 +51529,7 @@ FUNCTION signal_label(signal) {
         let source = r#"
 store: [
     elements: [
-        noop: SOURCE
+        filter: SOURCE
     ]
     selected:
         TEXT { clk } |> HOLD selected {
@@ -55160,6 +55328,424 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 || clean.profile.list_map_output_cache_hit_count >= clean.profile.row_count,
             "refreshed stable rows or fields should be reusable on a clean pass: {:?}",
             clean.profile
+        );
+    }
+
+    #[test]
+    fn root_list_view_dynamic_list_dependency_materializes_before_listref_read() {
+        let source = r#"
+store: [
+    elements: [
+        filter: SOURCE
+    ]
+    source_rows:
+        LIST {
+            [file: TEXT { wave.fst }, id: TEXT { clk }, item_kind: VariableRow]
+            [file: TEXT { wave.fst }, id: TEXT { group }, item_kind: GroupHeader]
+        }
+    lanes:
+        source_rows |> List/map(row, new: lane_row(row: row))
+    selected_file:
+        TEXT { wave.fst } |> HOLD selected_file {
+            LATEST {
+                elements.filter.text
+            }
+        }
+    selected_segments:
+        segments
+        |> List/filter_field_equal(field: "file", value: selected_file)
+        |> List/map(segment, new: selected_segment(segment: segment))
+    segments:
+        LIST {
+            [file: TEXT { wave.fst }, signal_id: TEXT { clk }, label: TEXT { low }]
+            [file: TEXT { wave.fst }, signal_id: TEXT { clk }, label: TEXT { high }]
+            [file: TEXT { other.fst }, signal_id: TEXT { clk }, label: TEXT { other }]
+        }
+]
+
+FUNCTION lane_row(row) {
+    [
+        id: row.id
+        file: row.file
+        item_kind: row.item_kind
+        segment_labels: lane_segment_labels(row: row)
+    ]
+}
+
+FUNCTION lane_segment_labels(row) {
+    store.selected_segments
+    |> List/filter_field_equal(field: "file", value: row.file)
+    |> List/filter_field_equal(field: "signal_id", value: row.id)
+    |> List/join_field(field: "label", separator: "|", empty: TEXT { none })
+}
+
+FUNCTION selected_segment(segment) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        label: segment.label
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-forward-list-dependency", source).unwrap();
+        let summary = runtime.state_summary();
+        let lanes = summary["store"]["lanes"]
+            .as_array()
+            .expect("lanes should be summarized as rows");
+        let clk_lane = lanes
+            .iter()
+            .find(|row| row["id"] == "clk")
+            .expect("clk lane should exist");
+        assert_eq!(
+            clk_lane["segment_labels"], "low|high",
+            "a root list-view field must materialize a later dynamic list dependency before exposing its ListRef"
+        );
+        let group_lane = lanes
+            .iter()
+            .find(|row| row["id"] == "group")
+            .expect("group lane should exist");
+        assert_eq!(
+            group_lane["segment_labels"], "none",
+            "the forward materialization barrier must still preserve row-local filters"
+        );
+        assert_eq!(
+            summary["store"]["selected_segments"]
+                .as_array()
+                .expect("selected_segments should be materialized")
+                .len(),
+            2,
+            "summary should observe the same materialized list-view root"
+        );
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.filter".to_owned(),
+                text: Some("other.fst".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("filter source should update selected segments");
+        let updated = runtime.state_summary();
+        let updated_lanes = updated["store"]["lanes"]
+            .as_array()
+            .expect("lanes should remain summarized as rows");
+        let updated_clk_lane = updated_lanes
+            .iter()
+            .find(|row| row["id"] == "clk")
+            .expect("updated clk lane should exist");
+        assert_eq!(
+            updated_clk_lane["segment_labels"], "none",
+            "a warmed parent list-view must not reuse stale field-cache data after its dynamic list dependency changes"
+        );
+        assert_eq!(
+            updated["store"]["selected_segments"]
+                .as_array()
+                .expect("selected_segments should remain materialized")
+                .len(),
+            1,
+            "the dynamic list dependency should refresh after the source update"
+        );
+    }
+
+    #[test]
+    fn root_list_view_unqualified_identifier_prefers_row_field_over_dynamic_root_list() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected:
+        TEXT { a } |> HOLD selected { LATEST {} }
+    rows:
+        LIST {
+            [id: TEXT { a }, selected_segments: TEXT { row-local }]
+        }
+    segment_rows:
+        LIST {
+            [id: TEXT { global }]
+        }
+    selected_segments:
+        segment_rows |> List/map(row, new: [label: TEXT { global-list-row }])
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-row-field-shadowing", source).unwrap();
+        let _ = runtime.state_summary();
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let mut row_frame = GenericEvalFrame::root();
+        row_frame.row = Some(GenericEvalRow {
+            list: "rows".to_owned(),
+            row_scope: "row".to_owned(),
+            index: 0,
+        });
+        assert_eq!(
+            generic
+                .eval_identifier("selected_segments", &mut row_frame)
+                .expect("row-scoped identifier should evaluate"),
+            BoonValue::Text("row-local".to_owned()),
+            "unqualified row fields must keep precedence over same-named dynamic root list-views"
+        );
+        let mut root_frame = GenericEvalFrame::root();
+        assert_eq!(
+            generic
+                .eval_path(
+                    &["store".to_owned(), "selected_segments".to_owned()],
+                    &mut root_frame,
+                )
+                .expect("explicit dynamic root list path should evaluate"),
+            BoonValue::ListRef("selected_segments".to_owned()),
+            "the colliding dynamic root list-view should still resolve when read explicitly"
+        );
+    }
+
+    #[test]
+    fn root_list_view_field_cache_rejects_root_child_reads_on_inherited_stack() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected:
+        TEXT { a } |> HOLD selected { LATEST {} }
+    record: [
+        child: TEXT { fresh }
+    ]
+    rows:
+        LIST {
+            [id: TEXT { a }]
+        }
+    projected:
+        rows |> List/map(row, new: projected_row(row: row))
+]
+
+FUNCTION projected_row(row) {
+    [
+        id: row.id
+        label: record.child
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-root-child-stack-cache", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][0]["label"],
+            "fresh",
+            "initial summary should prime a previous-pass field cache entry"
+        );
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        assert!(
+            generic
+                .generic_derived_state
+                .root_list_view_field_cache
+                .values()
+                .any(|entry| entry.reads.contains(&GenericReadKey::RootChild {
+                    root: "store.record".to_owned(),
+                    path: "child".to_owned(),
+                })),
+            "test must exercise a RootChild-backed list-view field-cache entry"
+        );
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.projected")
+            .expect("projected list-view root should have a plan")
+            .clone();
+        generic
+            .materialize_root_list_view_field_for_derived_read(
+                &field,
+                &BTreeSet::new(),
+                &["store.record.child".to_owned()],
+            )
+            .expect("inherited-stack materialization should terminate");
+        assert_eq!(
+            field_ref_to_boon(
+                generic
+                    .storage
+                    .list_row_field("projected", 0, "label")
+                    .unwrap()
+            ),
+            BoonValue::Text("cycle_error".to_owned()),
+            "RootChild field-cache entries must not bypass inherited root-stack cycle checks"
+        );
+    }
+
+    #[test]
+    fn root_list_view_mutual_dependency_returns_cycle_error_without_recursing() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    selected_file:
+        TEXT { wave.fst } |> HOLD selected_file { LATEST {} }
+    source_rows:
+        LIST {
+            [file: TEXT { wave.fst }, id: TEXT { clk }]
+        }
+    lanes:
+        source_rows |> List/map(row, new: dependent_row(row: row))
+    selected_segments:
+        segments
+        |> List/filter_field_equal(field: "file", value: selected_file)
+        |> List/map(segment, new: segment_row(segment: segment))
+    segments:
+        LIST {
+            [file: TEXT { wave.fst }, signal_id: TEXT { clk }, label: TEXT { low }]
+        }
+]
+
+FUNCTION segment_row(segment) {
+    [
+        signal_id: segment.signal_id
+        label: segment.label
+    ]
+}
+
+FUNCTION dependent_row(row) {
+    [
+        id: row.id
+        dependency: store.selected_segments
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-list-view-mutual-cycle", source).unwrap();
+        let warm = runtime.state_summary();
+        assert_eq!(
+            warm["store"]["lanes"][0]["dependency"], "selected_segments",
+            "the test must prime a reusable field-cache entry before the inherited-stack read"
+        );
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.lanes")
+            .expect("dependent list-view root should have a plan")
+            .clone();
+        let mut probe_frame = GenericEvalFrame::root();
+        probe_frame
+            .root_stack
+            .push("store.selected_segments".to_owned());
+        assert_eq!(
+            generic
+                .eval_path(
+                    &["store".to_owned(), "selected_segments".to_owned()],
+                    &mut probe_frame,
+                )
+                .expect("stack-protected path probe should evaluate"),
+            BoonValue::Error("cycle_error".to_owned()),
+            "path resolution must not bypass inherited root-stack cycle checks"
+        );
+        generic
+            .materialize_root_list_view_field_for_derived_read(
+                &field,
+                &BTreeSet::new(),
+                &["store.selected_segments".to_owned()],
+            )
+            .expect("inherited-stack materialization should terminate");
+        assert_eq!(
+            field_ref_to_boon(
+                generic
+                    .storage
+                    .list_row_field("lanes", 0, "dependency")
+                    .unwrap()
+            ),
+            BoonValue::Text("cycle_error".to_owned()),
+            "mutual root list-view reads must use the inherited root stack to stop recursion"
+        );
+    }
+
+    #[test]
+    fn root_list_view_prevalidated_clean_hit_still_refreshes_deferred_dirty_root() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    base:
+        TEXT { old } |> HOLD base { LATEST {} }
+    derived:
+        TEXT { value } |> Text/concat(with: base, separator: ":")
+    rows:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }]
+            [id: TEXT { b }, name: TEXT { B }]
+        }
+    projected:
+        rows |> List/map(row, new: projected_row(row: row))
+]
+
+FUNCTION projected_row(row) {
+    [
+        id: row.id
+        label: row.name |> Text/concat(with: store.derived, separator: "/")
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-deferred-clean-hit", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][0]["label"],
+            "A/value:old",
+            "initial summary should prime previous-pass field cache entries"
+        );
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        generic
+            .storage
+            .root
+            .insert_value("store.base".to_owned(), FieldValue::Text("new".to_owned()));
+        generic.storage.root.insert_value(
+            "store.derived".to_owned(),
+            FieldValue::Text("stale-derived".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.derived")
+            .expect("derived root should be markable as deferred dirty");
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.projected")
+            .expect("projected list-view root should have a plan")
+            .clone();
+        let materialization = generic
+            .materialize_root_list_view_field_with_cache_state(&field, &BTreeSet::new(), true, &[])
+            .expect("prevalidated list-view materialization should refresh deferred reads");
+        assert_eq!(
+            field_ref_to_boon(
+                generic
+                    .storage
+                    .list_row_field("projected", 0, "label")
+                    .unwrap()
+            ),
+            BoonValue::Text("A/value:new".to_owned()),
+            "prevalidated previous-pass hits must still demand deferred dirty roots before reuse"
+        );
+        assert!(
+            materialization.profile.field_cache_misses >= 2,
+            "both label fields should miss after deferred currentness refresh invalidates stale entries: {:?}",
+            materialization.profile
         );
     }
 

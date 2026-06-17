@@ -25,20 +25,27 @@ an explicit user resume activates `TASK-0804B` only.
   was postponed future resumption work until the explicit 2026-06-17 `/goal`
   activation. Current progress is tracked in this file and the master
   checklist progress log.
-- Latest canonical speed refresh still misses the strict `16.700ms`
-  click/input budget. After `0804R-03`, `click_to_cursor.p95` and
-  `input_to_visible.p95` are `17.701393ms`.
+- Audited canonical speed refresh still misses the strict `16.700ms`
+  click/input budget. After `0804R-05` correctness-only control and a
+  measurement-audit refresh, `click_to_cursor.p95` and
+  `input_to_visible.p95` are `18.020024ms`; two immediate canonical repeats
+  recorded `18.226649ms` and `18.070569ms`.
+- Measurement interpretation must stay precise: this gate measures deterministic
+  app-owned input through runtime/layout/shared render-state update. The current
+  `input_to_visible` field aliases the click-loop summary and is not
+  per-interaction WGPU present/readback proof.
 - The report still names
   `root_flush_dirty_scheduler_plus_root_list_materialization`.
 - Slow clicks are the cursor-class crossing path, not false-positive no-op
   cursor samples. Before `0804R-03`, slow samples were `194/32/38`; after
-  `0804R-03`, the slow class is `80/17/23`, with faster click classes
-  `21/4/10` and `23/5/11`.
+  `0804R-05` correctness-only control, p95 graph counts are `75/17/24`.
 - Root-list materialization is already field-only for the hot NovyWave rows:
   `full_eval_row_count=0` and `row_materialize_ms=0`.
 - Hot visible list work remains `selected_signal_lane_rows` and
   `selected_cursor_pair_rows`; this work is real and must not be blindly
-  skipped.
+  skipped. The killed `0804R-05` clean-prevalidated-hit micro-optimization
+  proved that local field-cache counter movement can regress final p95 and
+  shift work into worse root-list materialization.
 - Hot internal bridge/page roots originally included
   `bridge_request_descriptor`, `bridge_cursor_values_page_ref`,
   `bridge_cursor_values`, `bridge_cursor_values_label`,
@@ -436,7 +443,7 @@ Kill criteria:
 
 ## 0804R-05 Root List-View Field Frontier
 
-Status: pending
+Status: killed
 Depends on: one completed graph/identity slice: `0804R-03` or `0804R-04`;
 that slice must satisfy the strict p95 budget or the meaningful-movement
 threshold from the Resolution Strategy section.
@@ -495,7 +502,8 @@ Kill criteria:
 
 ## 0804R-06 Final Verification And Closeout
 
-Status: blocked
+Status: done; negative closeout because `0804R-05` was killed and
+`TASK-0804C` now owns the remaining blocker
 Depends on: `0804R-03`, `0804R-04`, `0804R-05` closeout matrix below
 
 Goal: prove the remaining speed task is genuinely resolved or document the
@@ -542,7 +550,7 @@ Kill criteria:
 
 ## 0804R-07 Replacement Diagnosis / TASK-0804C Draft
 
-Status: blocked
+Status: done; added `TASK-0804C` to the master checklist
 Depends on: `0804R-06` closeout matrix
 
 Goal: reserve a concrete follow-up path if the plan proves the current
@@ -557,6 +565,14 @@ Requirements:
   culprit.
 - The new task must say whether `TASK-0804B` is postponed, superseded, or
   blocked by the replacement task.
+
+Outcome:
+
+- `TASK-0804B` is superseded by `TASK-0804C`.
+- `TASK-0804C` is `pending` in the master checklist and owns the next
+  implementation attempt: a generic compiled row/field dependency frontier for
+  root list-view evaluation/currentness, not another NovyWave-specific
+  field-cache patch.
 
 ## Rules For Updating This File
 
@@ -805,3 +821,98 @@ Requirements:
   `in_progress` until current evidence existed and required expected failing
   speed gates to be recorded as failing budget gates, not as passed
   verification.
+- 2026-06-17: `0804R-05` was attempted and killed. The correctness fixes found
+  during the slice are kept: root list-view commits now publish changed reads;
+  list-view roots are materialized/currentness-checked before exposing a
+  `ListRef`; inherited `root_stack` is threaded through root list-view
+  materialization; row-field names keep precedence over same-named global list
+  roots; and field-cache entries whose `Root` or `RootChild` reads overlap the
+  active root stack are rejected. The extra clean-prevalidated-hit fast path
+  that skipped `ensure_root_reads_current` was reverted because the current
+  R05 repeat report
+  `target/diagnostics/native-gpu/novywave-interaction-speed-r05-repeat.json`
+  was current and non-diagnostic but regressed `click_to_cursor.p95` and
+  `input_to_visible.p95` to `24.929800ms`, `runtime_step_apply.p95` to
+  `15.958209ms`, root-flush p95 to `8.222271ms`, and click aggregate root-list
+  work to `eval_ms=99.689672`, `full_eval_row_count=94`, and
+  `row_materialize_ms=2.012348`. The fast path violates the R05 no-regression
+  and field-only invariants and must not be retried without a different proof.
+- 2026-06-17: `0804R-05` correctness-only control after reverting that fast path
+  passed focused verification: `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib
+  root_list_view_ -- --nocapture` (`24 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_
+  -- --nocapture` (`81 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib
+  user_function_cache_ -- --nocapture` (`3 passed`);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave
+  -- --nocapture` (`25 passed`);
+  `cargo check -p boon_runtime -p boon_bridge -p boon_native_playground
+  -p xtask`; `timeout 240 cargo xtask verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario.json`; canonical speed
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask
+  verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json`; and `cargo xtask
+  verify-report-schema` after moving the stale repeat artifact under
+  `target/diagnostics`.
+- 2026-06-17: `0804R-05` first correctness-only control speed report
+  `target/reports/native-gpu/novywave-interaction-speed.json` still exits
+  `status=fail`: `click_to_cursor.p95=18.365383ms`,
+  `input_to_visible.p95=18.365383ms`, `runtime_apply.p95=11.584193ms`,
+  `runtime_step_apply.p95=9.657368ms`, `runtime_state_summary.p95=0.897571ms`,
+  and `layout_rebuild.p95=4.659514ms`. Root p95s are
+  `source_action_root_flush=4.279103ms`,
+  `source_action_root_dirty_scheduler=1.389330ms`, and
+  `source_action_root_materialization=2.703999ms`; graph p95 is
+  `75/17/24`. The click aggregate stays field-only
+  (`full_eval_row_count=0`, `row_materialize_ms=0.0`) but does not move the
+  intended hot list buckets: `selected_signal_lane_rows eval_ms=33.297496` and
+  `diff_ms=29.203688`; `selected_cursor_pair_rows eval_ms=10.224008` and
+  `diff_ms=8.852834`. Bridge proof remains `status=pass`.
+- 2026-06-17: Measurement audit refreshed the canonical speed evidence after the
+  doc update. `target/reports/native-gpu/novywave-interaction-speed.json` is
+  current for `worktree_fingerprint=a3f1581db192b7b5ad28af13eabf5295b9ab5eb936daaf63a8ad2497b6637469`,
+  `binary_hash=075f458396be1587a7c5a15eddf073853a0c2e4f1fa069731f99c58e8d8ca09c`,
+  and `playground_binary_hash=b01b57ee05de6df734c618148452c09b2a578e16a703bb02124131a7e4643ba1`.
+  It still exits `status=fail` only on strict click/input latency:
+  `click_to_cursor.p95=18.020024ms`,
+  `input_to_visible.p95=18.020024ms`, `runtime_apply.p95=11.305099ms`,
+  `runtime_step_apply.p95=9.319520ms`, and graph p95 `75/17/24`.
+  Two immediate canonical repeats with
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER` wrote
+  `target/diagnostics/native-gpu/novywave-interaction-speed-measurement-audit-1.json`
+  and
+  `target/diagnostics/native-gpu/novywave-interaction-speed-measurement-audit-2.json`;
+  both matched the same worktree/xtask/release-playground hashes and measured
+  `click/input.p95=18.226649ms` and `18.070569ms`. This is enough to trust the
+  post-revert failed-latency class, but future decisions on small p95 deltas must
+  use repeats or stronger harness evidence.
+- 2026-06-17: Post-slice subagents agreed on the closeout. Correctness review
+  `019ed722-341c-7173-9d9d-377afe3fabd3` found no blocker to keeping the
+  correctness fixes, with the documented gap that inherited-stack list-view
+  currentness is covered by focused unit probes rather than a full production
+  end-to-end scenario. Performance review
+  `019ed722-35a9-7202-906b-f094692c536b` said R05 acceptance is not met and the
+  fast path must be recorded as killed. Plan/status review
+  `019ed722-3714-7821-9503-d18069a4d2df` required `0804R-05=killed`,
+  `0804R-06=done` as negative closeout, `0804R-07=done`, and
+  `TASK-0804B=superseded` by new `TASK-0804C`.
+- 2026-06-17: `0804R-06` and `0804R-07` are complete as negative closeout, not
+  as speed success. The plan proved insufficient after a real graph movement
+  slice and a killed list-view frontier slice. The replacement task is
+  `TASK-0804C` in the master checklist. It owns the measured residual blocker:
+  generic engine-level root-list currentness/materialization still routes click
+  updates through eager source-action root flush and repeated field-only
+  list-view evaluation. `TASK-0804B` is superseded, while `TASK-0804A` remains
+  postponed historical evidence.
+- 2026-06-17: Measurement-review subagents
+  `019ed72f-a3b6-7a80-8291-d4ce0543ad8b`,
+  `019ed72f-ba1e-7210-8a33-cf48785fe03a`, and
+  `019ed72f-d0cc-7ec1-bb37-d2576d337d76` agreed that the current report
+  freshness protections are meaningful, the R05 kill is defensible because the
+  regression was large and violated field-only invariants, and the current
+  verifier is an app hot-path oracle rather than live-present proof. Before
+  keeping or killing future optimizations on sub-millisecond or otherwise small
+  p95 movement, run repeat canonical reports or first harden the verifier with
+  more samples, ambient-load metadata, and per-interaction render/present timing
+  if the claim depends on visual presentation.

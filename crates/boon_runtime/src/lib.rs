@@ -20630,6 +20630,33 @@ impl GenericScheduledRuntime {
             .invalidate_root_list_map_output_cache_for_reads(&reads, &root_numbers);
     }
 
+    fn invalidate_demand_refreshed_root_caches(
+        &mut self,
+        materialization: &GenericRootDerivedMaterialization<'_>,
+    ) {
+        if materialization.changed_reads.is_empty() {
+            return;
+        }
+        let changed_reads = materialization
+            .changed_reads
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let root_numbers = self.root_numeric_values_for_reads(&changed_reads);
+        self.generic_derived_state
+            .invalidate_root_value_cache_for_reads_except(
+                &changed_reads,
+                &root_numbers,
+                &materialization.target,
+            );
+        self.generic_derived_state
+            .invalidate_function_value_cache_for_reads(&changed_reads, &root_numbers);
+        self.generic_derived_state
+            .invalidate_root_list_view_field_cache_for_reads(&changed_reads, &root_numbers);
+        self.generic_derived_state
+            .invalidate_root_list_map_output_cache_for_reads(&changed_reads, &root_numbers);
+    }
+
     fn root_numeric_values_for_reads(
         &mut self,
         reads: &BTreeSet<GenericReadKey>,
@@ -30375,13 +30402,24 @@ impl GenericScheduledRuntime {
         if !self.generic_derived_state.has_deferred_dirty_roots() {
             return None;
         }
-        let field = self.generic_derived.root_field_plan(path).or_else(|| {
-            self.generic_derived
-                .root_field_plan_for_source_read_path(path)
-        })?;
-        self.generic_derived_state
-            .deferred_dirty_root_contains(&field.path)
-            .then(|| field.clone())
+        let direct = self.generic_derived.root_field_plan(path);
+        if let Some(field) = direct
+            && self
+                .generic_derived_state
+                .deferred_dirty_root_contains(&field.path)
+        {
+            return Some(field.clone());
+        }
+        self.generic_derived
+            .root_fields
+            .iter()
+            .find(|field| {
+                root_derived_source_read_path_matches(&field.path, path)
+                    && self
+                        .generic_derived_state
+                        .deferred_dirty_root_contains(&field.path)
+            })
+            .cloned()
     }
 
     fn ensure_root_current(
@@ -30404,7 +30442,12 @@ impl GenericScheduledRuntime {
         self.generic_derived_state
             .remove_root_numeric_stability_guards(&field.path);
         match self.materialize_root_derived_field_commit(&field) {
-            Ok(_) => Ok(true),
+            Ok(materialization) => {
+                if let Some(materialization) = materialization.as_ref() {
+                    self.invalidate_demand_refreshed_root_caches(materialization);
+                }
+                Ok(true)
+            }
             Err(error) => {
                 self.generic_derived_state
                     .insert_deferred_dirty_root(field.path.clone());
@@ -30424,12 +30467,14 @@ impl GenericScheduledRuntime {
         let mut refreshed = false;
         let paths = reads
             .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::Root { field } => Some(field.clone()),
-                GenericReadKey::RootChild { root, .. } => Some(root.clone()),
+            .flat_map(|read| match read {
+                GenericReadKey::Root { field } => vec![field.clone()],
+                GenericReadKey::RootChild { root, path } => {
+                    vec![format!("{root}.{path}"), root.clone()]
+                }
                 GenericReadKey::List { .. }
                 | GenericReadKey::ListColumn { .. }
-                | GenericReadKey::ListField { .. } => None,
+                | GenericReadKey::ListField { .. } => Vec::new(),
             })
             .collect::<BTreeSet<_>>();
         for path in paths {
@@ -42380,6 +42425,48 @@ impl GenericDerivedState {
         self.function_value_cache.clear();
     }
 
+    fn invalidate_root_value_cache_for_reads_except(
+        &mut self,
+        reads: &BTreeSet<GenericReadKey>,
+        root_numbers: &BTreeMap<String, i64>,
+        keep_root: &str,
+    ) {
+        if reads.is_empty() || self.root_value_cache.is_empty() {
+            return;
+        }
+        let invalidated = self
+            .root_value_cache
+            .keys()
+            .filter(|field| field.as_str() != keep_root)
+            .filter(|field| {
+                let cached_reads = self
+                    .root_reads_by_field
+                    .get(*field)
+                    .cloned()
+                    .unwrap_or_default();
+                if cached_reads.is_empty() {
+                    return false;
+                }
+                let numeric_stability_guards = self
+                    .root_numeric_stability_guards_by_field
+                    .get(*field)
+                    .cloned()
+                    .unwrap_or_default();
+                cache_entry_invalidated_by_reads(
+                    &cached_reads,
+                    &numeric_stability_guards,
+                    reads,
+                    root_numbers,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for field in invalidated {
+            self.root_value_cache.remove(&field);
+            self.remove_root_numeric_stability_guards(&field);
+        }
+    }
+
     fn invalidate_function_value_cache_for_reads(
         &mut self,
         reads: &BTreeSet<GenericReadKey>,
@@ -49109,6 +49196,330 @@ document: Document/new(root: Element/label(element: [], label: store.label))
             1,
             "derived roots should still be materialized once when the scalar batch settles: {:?}",
             output.runtime_step_profile
+        );
+    }
+
+    #[test]
+    fn root_currentness_barrier_refreshes_deferred_scalar_before_cached_reads_and_summaries() {
+        let source = r#"
+store: [
+    elements: [
+        input: SOURCE
+    ]
+    base:
+        TEXT { old } |> HOLD base {
+            LATEST {
+                elements.input.text
+            }
+        }
+    derived:
+        TEXT { value } |> Text/concat(with: base, separator: ":")
+    consumer:
+        TEXT { consumer } |> Text/concat(with: derived, separator: ":")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.consumer))
+"#;
+        let mut runtime = LiveRuntime::from_source("root-currentness-scalar", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["consumer"],
+            "consumer:value:old"
+        );
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.input".to_owned(),
+                text: Some("new".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("input source should update derived roots");
+        assert_eq!(
+            runtime.state_summary()["store"]["consumer"],
+            "consumer:value:new"
+        );
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        generic.storage.root.insert_value(
+            "store.derived".to_owned(),
+            FieldValue::Text("stale-derived".to_owned()),
+        );
+        generic.generic_derived_state.root_value_cache.insert(
+            "store.consumer".to_owned(),
+            BoonValue::Text("stale-consumer-cache".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.derived")
+            .expect("derived root should be markable as deferred dirty");
+
+        let mut frame = GenericEvalFrame::root();
+        let demanded = generic
+            .root_pure_derived_boon_value("store.consumer", &mut frame)
+            .expect("consumer demand should refresh dirty dependency")
+            .expect("consumer should produce a value");
+        assert_eq!(demanded, BoonValue::Text("consumer:value:new".to_owned()));
+        assert_eq!(
+            generic.storage.root.owned_value("store.derived"),
+            Some(FieldValue::Text("value:new".to_owned())),
+            "demanding a cached dependent root must refresh deferred dirty dependency storage"
+        );
+
+        generic.storage.root.insert_value(
+            "store.derived".to_owned(),
+            FieldValue::Text("stale-derived-again".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.derived")
+            .expect("derived root should be markable as deferred dirty again");
+        assert_eq!(
+            generic
+                .root_textlike_for_assertion("store.derived")
+                .expect("assertion read should refresh deferred root"),
+            "value:new",
+            "assertion reads must not observe stale deferred root storage"
+        );
+
+        generic.storage.root.insert_value(
+            "store.derived".to_owned(),
+            FieldValue::Text("stale-derived-for-summary".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.derived")
+            .expect("derived root should be markable as deferred dirty for summary");
+        let summaries = generic.runtime_value_summaries(&["store.derived".to_owned()], 3, 8, 4);
+        assert_eq!(
+            summaries["store.derived"],
+            json!({"kind": "string", "value": "value:new"}),
+            "sparse runtime summaries must refresh deferred roots before reporting them"
+        );
+    }
+
+    #[test]
+    fn root_currentness_barrier_invalidates_other_cached_dependents_after_direct_refresh() {
+        let source = r#"
+store: [
+    elements: [
+        input: SOURCE
+    ]
+    base:
+        TEXT { old } |> HOLD base {
+            LATEST {
+                elements.input.text
+            }
+        }
+    derived:
+        TEXT { value } |> Text/concat(with: base, separator: ":")
+    consumer_a:
+        TEXT { A } |> Text/concat(with: derived, separator: ":")
+    consumer_b:
+        TEXT { B } |> Text/concat(with: derived, separator: ":")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.consumer_a))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-currentness-dependent-cache", source).unwrap();
+        let initial = runtime.state_summary();
+        assert_eq!(initial["store"]["consumer_a"], "A:value:old");
+        assert_eq!(initial["store"]["consumer_b"], "B:value:old");
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.input".to_owned(),
+                text: Some("new".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("input source should update derived roots");
+        let updated = runtime.state_summary();
+        assert_eq!(updated["store"]["consumer_a"], "A:value:new");
+        assert_eq!(updated["store"]["consumer_b"], "B:value:new");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        generic.storage.root.insert_value(
+            "store.derived".to_owned(),
+            FieldValue::Text("stale-derived".to_owned()),
+        );
+        generic.generic_derived_state.root_value_cache.insert(
+            "store.consumer_a".to_owned(),
+            BoonValue::Text("stale-A-cache".to_owned()),
+        );
+        generic.generic_derived_state.root_value_cache.insert(
+            "store.consumer_b".to_owned(),
+            BoonValue::Text("stale-B-cache".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.derived")
+            .expect("derived root should be markable as deferred dirty");
+
+        assert_eq!(
+            generic.runtime_scalar_boon_value("store.derived"),
+            Some(BoonValue::Text("value:new".to_owned())),
+            "direct scalar demand should refresh the deferred dirty root"
+        );
+        assert!(
+            !generic
+                .generic_derived_state
+                .root_value_cache
+                .contains_key("store.consumer_b"),
+            "demand refresh changed reads must invalidate sibling dependent root caches"
+        );
+
+        let mut frame = GenericEvalFrame::root();
+        let demanded = generic
+            .root_pure_derived_boon_value("store.consumer_b", &mut frame)
+            .expect("dependent demand should recompute after cache invalidation")
+            .expect("dependent should produce a value");
+        assert_eq!(demanded, BoonValue::Text("B:value:new".to_owned()));
+    }
+
+    #[test]
+    fn root_currentness_barrier_refreshes_deferred_structured_parent_before_child_read() {
+        let source = r#"
+store: [
+    elements: [
+        input: SOURCE
+    ]
+    base:
+        TEXT { old } |> HOLD base {
+            LATEST {
+                elements.input.text
+            }
+        }
+    record: [
+        child: base
+    ]
+    consumer:
+        TEXT { child } |> Text/concat(with: record.child, separator: ":")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.consumer))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-currentness-structured-parent", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.input".to_owned(),
+                text: Some("new".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("input source should update structured root");
+        assert_eq!(runtime.state_summary()["store"]["consumer"], "child:new");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        generic.storage.root.insert_value(
+            "store.record".to_owned(),
+            FieldValue::Json(json!({"child": "stale-child"})),
+        );
+        generic.generic_derived_state.root_value_cache.insert(
+            "store.consumer".to_owned(),
+            BoonValue::Text("stale-consumer-cache".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.record")
+            .expect("structured parent should be markable as deferred dirty");
+
+        let mut frame = GenericEvalFrame::root();
+        let demanded = generic
+            .root_pure_derived_boon_value("store.consumer", &mut frame)
+            .expect("consumer demand should refresh dirty structured parent")
+            .expect("consumer should produce a value");
+        assert_eq!(demanded, BoonValue::Text("child:new".to_owned()));
+        assert_eq!(
+            generic.storage.root.owned_value("store.record"),
+            Some(FieldValue::Json(json!({"child": "new"}))),
+            "child reads must refresh the deferred structured parent before reading nested JSON"
+        );
+    }
+
+    #[test]
+    fn root_currentness_barrier_checks_root_child_cache_dependencies() {
+        let source = r#"
+store: [
+    elements: [
+        input: SOURCE
+    ]
+    base:
+        TEXT { old } |> HOLD base {
+            LATEST {
+                elements.input.text
+            }
+        }
+    record: [
+        child: base
+    ]
+    consumer:
+        TEXT { child } |> Text/concat(with: record.child, separator: ":")
+]
+
+document: Document/new(root: Element/label(element: [], label: store.consumer))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-currentness-root-child-cache", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.input".to_owned(),
+                text: Some("new".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("input source should update structured child");
+        assert_eq!(runtime.state_summary()["store"]["consumer"], "child:new");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let consumer_reads = generic
+            .generic_derived_state
+            .root_reads_by_field
+            .get("store.consumer")
+            .expect("consumer should have recorded root reads");
+        assert!(
+            consumer_reads.contains(&GenericReadKey::RootChild {
+                root: "store.record".to_owned(),
+                path: "child".to_owned(),
+            }),
+            "test must exercise the RootChild cache dependency shape: {consumer_reads:#?}"
+        );
+        assert!(
+            !consumer_reads.contains(&GenericReadKey::Root {
+                field: "store.record".to_owned(),
+            }),
+            "the cache dependency should be child-specific, not a parent-root fallback: {consumer_reads:#?}"
+        );
+
+        generic.generic_derived_state.root_value_cache.insert(
+            "store.consumer".to_owned(),
+            BoonValue::Text("stale-child-cache".to_owned()),
+        );
+        generic
+            .mark_root_deferred_dirty_for_test("store.record.child")
+            .expect("structured child should be markable as deferred dirty");
+
+        let mut frame = GenericEvalFrame::root();
+        let demanded = generic
+            .root_pure_derived_boon_value("store.consumer", &mut frame)
+            .expect("consumer demand should refresh dirty child dependency")
+            .expect("consumer should produce a value");
+        assert_eq!(
+            demanded,
+            BoonValue::Text("child:new".to_owned()),
+            "RootChild cache dependencies must demand the child path, not only the parent root"
         );
     }
 

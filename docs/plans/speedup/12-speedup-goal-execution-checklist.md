@@ -2884,8 +2884,8 @@ Notes:
   `must_publish_semantic_delta=248`, and `visible_list_dependency=208`.
   Canonical p95s are `click_to_cursor=18.653014ms` and
   `input_to_visible=18.653014ms`, within the `0804R-01` no-regression limit
-  but still above the strict `16.700ms` budget. Plan 20 `0804R-01` is `done`;
-  `0804R-02` is now `in_progress`. The decision table rejects
+  but still above the strict `16.700ms` budget. At that checkpoint, plan 20
+  `0804R-01` was `done` and `0804R-02` was `in_progress`. The decision table rejects
   demand-deferral-first and points toward `0804R-03` bridge/page identity after
   the `0804R-02` currentness/stale-read contract.
 
@@ -7060,8 +7060,8 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 
 - Scope: explicit TASK-0804B continuation under plan `20`; this supersedes the
   earlier pre-activation checklist refresh. TASK-0804A remains postponed.
-- Current status: TASK-0804B is `in_progress`; plan `20` has `0804R-00=done`,
-  `0804R-01=done`, and `0804R-02=in_progress`.
+- Checkpoint status at this log entry: TASK-0804B is `in_progress`; plan `20`
+  has `0804R-00=done`, `0804R-01=done`, and `0804R-02=in_progress`.
 - Verification refreshed for the `0804R-01` diagnostic-only slice:
   `cargo fmt -p boon_runtime -p boon_native_playground -p xtask`;
   `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
@@ -7084,6 +7084,73 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   `must_publish_semantic_delta=248`, and `visible_list_dependency=208`.
 - Next: implement `0804R-02` currentness/stale-read contract first, then move
   to `0804R-03` bridge/page identity unless fresh evidence changes the plan.
+
+### 2026-06-17 TASK-0804B 0804R-02 Currentness Contract Completion
+
+- Scope: completed `0804R-02` from plan `20` as a correctness/stale-read
+  contract before any demand deferral. TASK-0804B remains `in_progress`;
+  `TASK-0804A` remains postponed historical evidence. Plan `20` now has
+  `0804R-00=done`, `0804R-01=done`, `0804R-02=done`, `0804R-03=pending`, and
+  `0804R-04` still blocked/not selected first by the `0804R-01` decision
+  table.
+- Result: `crates/boon_runtime/src/lib.rs` now has an audited
+  `ensure_root_current` barrier and `ensure_root_reads_current` read-set
+  wrapper for deferred dirty root reads. The barrier resolves child-path reads
+  to the actual deferred parent root, refreshes before returning scalar/root
+  values, and invalidates dependent root-value, function, root-list-view-field,
+  and root-list-map-output caches using the refreshed root's changed-read set.
+  This prevents a direct demand refresh from leaving sibling cached dependents
+  stale after the deferred marker is cleared. Post-slice review found that
+  cached `RootChild` dependencies also need to demand the child path, not only
+  the parent root; `ensure_root_reads_current` now checks both `root.child` and
+  the parent fallback.
+- Focused tests added:
+  `root_currentness_barrier_refreshes_deferred_scalar_before_cached_reads_and_summaries`,
+  `root_currentness_barrier_invalidates_other_cached_dependents_after_direct_refresh`,
+  `root_currentness_barrier_refreshes_deferred_structured_parent_before_child_read`,
+  and `root_currentness_barrier_checks_root_child_cache_dependencies`.
+  These deliberately corrupt stored/cache state, mark a root deferred-dirty,
+  and prove evaluator, assertion, sparse-summary, direct scalar, dependent
+  cache, structured-child, and `RootChild` cache-dependency reads cannot return
+  the stale value.
+- Verification passed: `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_currentness_barrier -- --nocapture`
+  (`4 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_derived_ -- --nocapture`
+  (`6 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib structured_root_ -- --nocapture`
+  (`3 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them -- --nocapture`
+  (`1 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`
+  (`19 passed`); and `cargo check -p boon_runtime`.
+- Subagent review effect: correctness reviewer `019ed6a1-88e1-7e41-ba9a-87f80e95cc12`
+  and performance reviewer `019ed6a1-e64e-7580-aaf4-2c0cf8b1ab0b` both found
+  that the first barrier checkpoint discarded demand-refresh changed reads and
+  could leave sibling caches stale; this was fixed before marking R02 done.
+  Docs reviewer `019ed6a2-3450-7192-be27-d033da2adf21` required the explicit
+  read-path audit table now recorded in plan `20`. Post-slice correctness
+  reviewer `019ed6ac-1811-7892-8bb2-e3cef2990f51` found the `RootChild`
+  cache-dependency hole; that was fixed and covered by the fourth focused test.
+  Post-slice docs reviewer `019ed6ac-4f7f-71b1-8a4b-6e35ba715269` found no
+  blocking docs issue. Post-slice performance reviewer
+  `019ed6ac-2a25-7431-95d4-76b52ecb9272` agreed `0804R-03` is the right next
+  slice and requested a canonical no-diagnostic post-R02 baseline.
+- Post-R02 canonical baseline: `env -u BOON_PROFILE_ROOT_DEMAND -u
+  BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report
+  target/reports/native-gpu/novywave-interaction-speed.json` exited with the
+  expected failing gate status because the known strict latency budgets remain;
+  `cargo xtask verify-report-schema` passed. The report has `status=fail`,
+  `candidate_defer_probe.enabled=false`, candidate root count `0`,
+  `click_to_cursor.p95=19.806244ms`, `input_to_visible.p95=19.806244ms`,
+  `runtime_apply.p95=12.656522ms`, `runtime_step_apply.p95=10.357947ms`,
+  `runtime_state_summary.p95=1.017862ms`, `layout_rebuild.p95=4.696317ms`,
+  root-flush p95 `6.113463ms`, dirty-scheduler p95 `2.649652ms`,
+  root-materialization p95 `3.324309ms`, and the slow graph remains
+  `194/32/38`. Renderer post-interaction upload remains separated at `3360`
+  bytes, `3` queue writes, `0` staging wraps, and `0` quad-cache evictions.
+- Read-path caveats carried forward: list-view roots are
+  eager-only/non-deferred in R02; source-route text/storage guard paths and
+  lower direct root text/bool helpers remain eager-only/non-deferred until they
+  have a mutable barrier-aware API. R02 is not a speed closeout and does not
+  claim the click/input p95 budget is solved. Next implementation slice is
+  `0804R-03` bridge/page identity split.
 
 ## File Maintenance Checklist
 

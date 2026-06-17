@@ -20,9 +20,11 @@ an explicit user resume activates `TASK-0804B` only.
 
 ## Current Evidence To Preserve
 
-- Latest checklist state: `TASK-1001` and `TASK-1002` are done; `TASK-0804A`
-  is postponed historical evidence; `TASK-0804B` is postponed future
-  resumption work.
+- Pre-activation checklist state to preserve: `TASK-1001` and `TASK-1002`
+  are done; `TASK-0804A` is postponed historical evidence; `TASK-0804B`
+  was postponed future resumption work until the explicit 2026-06-17 `/goal`
+  activation. Current progress is tracked in this file and the master
+  checklist progress log.
 - Latest canonical speed refresh still misses the strict `16.700ms`
   click/input budget, with `click_to_cursor.p95` and `input_to_visible.p95`
   around `18ms` in the latest recorded refresh.
@@ -220,7 +222,7 @@ Kill criteria:
 
 ## 0804R-02 Currentness And Stale-Read Contract
 
-Status: in_progress
+Status: done
 Depends on: `0804R-01`
 
 Goal: define and test the correctness contract required before any root can be
@@ -248,10 +250,36 @@ Implementation requirements:
   and visible row/list fields remain eager or are protected by an explicit
   currentness barrier.
 
+R02 read-path audit table:
+
+| Read path | Category | Contract |
+| --- | --- | --- |
+| `eval_identifier`, `eval_path` root reads | `ensure_root_current` barrier | They route through `runtime_scalar_boon_value`, `root_derived_boon_value`, or `structured_root_child_boon_value`; those helpers own the barrier. |
+| `runtime_scalar_json`, `runtime_scalar_boon_value` | `ensure_root_current` barrier | Direct scalar/json root reads call `ensure_root_current` before reading stored root values. |
+| `structured_root_child_boon_value` | `ensure_root_current` barrier | Child-path reads refresh the deferred matching parent or direct root before reading nested JSON. |
+| `root_derived_boon_value`, `root_pure_derived_boon_value`, `root_non_list_derived_boon_value` | `ensure_root_current` barrier | The root itself is refreshed first; root-value-cache hits validate dependency read sets through `ensure_root_reads_current`. Demand-refresh changed reads invalidate dependent root/function/list-view/list-map caches. |
+| `root_list_derived_boon_value` for list-view roots | `eager-only/non-deferred exemption` | List-view roots remain eager in R02. R04 must not put `DerivedValueKind::ListView` roots into `deferred_dirty_roots` without a separate list-view materialization contract and tests. |
+| Root `root_value_cache` hits | `ensure_root_current` barrier | Cache hits validate recorded root reads, including `RootChild` dependencies by demanding the child path before the parent fallback. A direct demand refresh invalidates other root caches whose reads overlap the refreshed root's changed reads. |
+| `function_value_cache` hits | `ensure_root_current` barrier | Cache hits validate recorded reads through `ensure_root_reads_current`; demand refresh changed reads invalidate overlapping function cache entries. |
+| `root_list_view_field_cache` hits and previous-pass field reuse | `ensure_root_current` barrier | Cache hits validate recorded reads through `ensure_root_reads_current`; normal dirty-read guards and demand-refresh invalidation keep overlapping entries from returning stale fields. |
+| `root_list_map_output_cache` hits | `ensure_root_current` barrier | Cache hits validate recorded reads through `ensure_root_reads_current`; demand-refresh changed reads invalidate overlapping map-output entries. |
+| `state_summary`, `runtime_value_summaries`, `document_state_summary`, `document_state_summary_for_window`, `generic_summary_with_limits` | `ensure_root_current` barrier | Sparse summaries demand requested paths through root-derived/scalar helpers. Full document/state summaries also refresh stored root paths before reporting them. This is a correctness guarantee, not a speed claim for future R04 summary behavior. |
+| Scenario assertions through `assert_generic_step_expectations` and `root_textlike_for_assertion` | `ensure_root_current` barrier | Assertion reads clear relevant summary root caches and demand through root-derived/scalar helpers. |
+| Root-list materialization evaluator reads | `ensure_root_current` barrier | Row/list field evaluation reaches root values through the same evaluator/scalar/root-derived helpers; list-view roots themselves stay eager-only in R02. |
+| `runtime_scalar_number_for_numeric_guard` | `ensure_root_current` barrier | Numeric guard reads refresh roots before checking stability intervals. |
+| Projection selector/storage reads | `ensure_root_current` barrier | `runtime_scalar_json` refreshes selector roots; `projection_storage_list_name` refreshes projection storage roots before reading stored list names or evaluating fallback statements. |
+| Boolean source-route context reads through `derived_bool_value` | `ensure_root_current` barrier | Bool route context refreshes roots before direct bool/count reads. |
+| Source-route text context reads, root-text transform current comparisons, lower `GenericCircuitRuntime` root text/bool helpers, raw mutation/current-comparison helpers | `eager-only/non-deferred exemption` | These paths still use direct storage and are not eligible for demand deferral in R04. Roots feeding these guards must remain eager until the source-route callback/storage APIs are made mutable and barrier-aware. |
+| Bridge proof queries through summaries/assertions | `ensure_root_current` barrier | Proof queries that use runtime summaries or assertion reads are barrier-protected. |
+| Bridge stale-response guard inputs that use direct source-route/storage helpers | `eager-only/non-deferred exemption` | These guards remain eager-only and must not be deferred by R04 until their inputs are read through barrier-aware APIs. |
+| Runtime initialization reads | `impossible/unreachable with test evidence` | They run before deferred dirty roots exist, so they cannot observe production deferred-dirty state. |
+| Test-only storage corruption helpers | `impossible/unreachable with test evidence` | They are not production demand-read paths; R02 uses them only to create stale storage/cache states that prove the barrier refreshes before returning values. |
+
 Verification commands:
 
 ```bash
 cargo fmt -p boon_runtime
+RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_currentness_barrier -- --nocapture
 RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_derived_ -- --nocapture
 RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib structured_root_ -- --nocapture
 RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them -- --nocapture
@@ -266,7 +294,9 @@ Acceptance:
 - The read-path table covers every direct root scalar/cache/summary read
   identified in implementation.
 - Tests fail if a deferred pure root can be read stale.
-- Tests fail if an observed root or semantic delta is hidden by deferral.
+- Existing observed-root and semantic-delta behavior remains eager in R02.
+  R04 must add deferral-specific tests before any observed or semantic-delta
+  root can be deferred.
 
 Kill criteria:
 
@@ -276,7 +306,7 @@ Kill criteria:
 
 ## 0804R-03 Bridge/Page Identity Split
 
-Status: blocked
+Status: pending
 Depends on: `0804R-01`, `0804R-02`
 
 Goal: separate stable bridge/page/blob/request identity from cursor-hot
@@ -640,3 +670,65 @@ Requirements:
   behavior changes; `0804R-03` bridge/page identity split remains the likely
   first behavior slice after the contract. `0804R-04` demand/currentness
   frontier is not selected first.
+- 2026-06-17: Completed `0804R-02` currentness/stale-read contract in
+  `crates/boon_runtime/src/lib.rs`. The runtime now has a single audited
+  `ensure_root_current` barrier plus `ensure_root_reads_current` for cached
+  read-set validation. The barrier resolves deferred structured child reads to
+  the deferred parent root when needed, clears the refreshed root cache/guards
+  before materialization, and uses the materialization changed-read set to
+  invalidate overlapping dependent root-value, function, root-list-view-field,
+  and root-list-map-output caches. No Boon syntax, NovyWave source, fixture,
+  hardcoded filename, report schema, or budget changed.
+- 2026-06-17: `0804R-02` focused regressions added:
+  `root_currentness_barrier_refreshes_deferred_scalar_before_cached_reads_and_summaries`
+  proves evaluator, assertion, and sparse-summary reads refresh a deliberately
+  stale deferred pure root; `root_currentness_barrier_invalidates_other_cached_dependents_after_direct_refresh`
+  proves a direct scalar demand refresh invalidates other cached dependents
+  before they can stale-hit; and
+  `root_currentness_barrier_refreshes_deferred_structured_parent_before_child_read`
+  proves nested child reads refresh the deferred structured parent before
+  reading JSON. Post-slice review then found a `RootChild` cache dependency
+  gap, so `root_currentness_barrier_checks_root_child_cache_dependencies` was
+  added to prove cached dependents demand `root.child`, not just the parent
+  root.
+- 2026-06-17: `0804R-02` verification passed: `cargo fmt -p boon_runtime`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_currentness_barrier -- --nocapture`
+  (`4 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_derived_ -- --nocapture`
+  (`6 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib structured_root_ -- --nocapture`
+  (`3 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_waveform_click_keeps_internal_pure_roots_queryable_without_patching_them -- --nocapture`
+  (`1 passed`); `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`
+  (`19 passed`); and `cargo check -p boon_runtime`.
+- 2026-06-17: `0804R-02` subagent review results: correctness reviewer
+  `019ed6a1-88e1-7e41-ba9a-87f80e95cc12` and performance reviewer
+  `019ed6a1-e64e-7580-aaf4-2c0cf8b1ab0b` both flagged the missing
+  demand-refresh changed-read invalidation; the implementation was extended
+  before R02 was marked done. They also flagged list-view-root deferral and
+  source-route text/storage reads as not barrier-safe yet, so the read-path
+  table marks those as eager-only/non-deferred exemptions. Docs reviewer
+  `019ed6a2-3450-7192-be27-d033da2adf21` required the explicit read-path
+  table and clarified that R02 is a correctness contract, not a speed closeout.
+  Post-slice correctness reviewer `019ed6ac-1811-7892-8bb2-e3cef2990f51`
+  then found that `RootChild` read-set validation checked only the parent root;
+  `ensure_root_reads_current` now checks both `root.child` and the parent
+  fallback, and the new `RootChild` regression passed. Docs reviewer
+  `019ed6ac-4f7f-71b1-8a4b-6e35ba715269` found no blocking docs issue.
+  Performance reviewer `019ed6ac-2a25-7431-95d4-76b52ecb9272` agreed R03 is
+  the right next slice but required a post-R02 canonical speed refresh before
+  behavior changes.
+- 2026-06-17: Post-R02 canonical no-diagnostic speed refresh completed with
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+  The command exited with the expected failing gate status because the known
+  strict latency budgets remain; `cargo xtask verify-report-schema` passed.
+  Report `target/reports/native-gpu/novywave-interaction-speed.json` has
+  `status=fail`, `candidate_defer_probe.enabled=false`, candidate root count
+  `0`, `click_to_cursor.p95=19.806244ms`,
+  `input_to_visible.p95=19.806244ms`, `runtime_apply.p95=12.656522ms`,
+  `runtime_step_apply.p95=10.357947ms`,
+  `runtime_state_summary.p95=1.017862ms`,
+  `layout_rebuild.p95=4.696317ms`, root-flush p95 `6.113463ms`,
+  dirty-scheduler p95 `2.649652ms`, root-materialization p95 `3.324309ms`,
+  and the slow graph remains `194/32/38`. Renderer post-interaction upload
+  remains separated at `3360` bytes, `3` queue writes, `0` staging wraps, and
+  `0` quad-cache evictions. Next task is `0804R-03` bridge/page identity
+  split; `0804R-04` remains blocked/not selected first by the `0804R-01`
+  decision table.

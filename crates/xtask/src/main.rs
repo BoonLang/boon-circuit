@@ -12715,6 +12715,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let source_file_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
     let source_hash = source_hash_for_report_source_files(&project_files, &source_text)?;
     let project_source_units = manifest_project_units_for_report(&entry)?;
+    let manifest_path = boon_runtime::example_manifest_path();
+    let manifest_hash = file_hash(manifest_path.to_string_lossy().as_ref());
     let manifest_scenario_path = PathBuf::from(&entry.scenario);
     let manifest_scenario_hash = file_hash(&entry.scenario);
     let scenario_labels = native_preview_e2e_scenario_labels(&entry);
@@ -12996,6 +12998,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "release_build": release_build,
         "scenario_hash": scenario_hash,
         "scenario_artifact": scenario_artifact,
+        "manifest_path": manifest_path,
+        "manifest_hash": manifest_hash,
+        "expected_manifest_hash": manifest_hash,
         "manifest_scenario_path": manifest_scenario_path,
         "manifest_scenario_hash": manifest_scenario_hash,
         "layout_probe_report": layout_probe_report,
@@ -21488,7 +21493,18 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
-        let formatted = boon_parser::format_source(entry.source.clone(), &source_text);
+        let formatted = if file_sources.len() <= 1 {
+            boon_parser::format_source(entry.source.clone(), &source_text)
+                .map(|formatted| (1usize, formatted.len()))
+        } else {
+            file_sources
+                .iter()
+                .try_fold(0usize, |formatted_bytes, (path, source)| {
+                    boon_parser::format_source_unit(path.clone(), source.clone())
+                        .map(|formatted| formatted_bytes + formatted.len())
+                })
+                .map(|formatted_bytes| (file_sources.len(), formatted_bytes))
+        };
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -21496,7 +21512,9 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
             formatted.is_ok(),
             formatted
                 .as_ref()
-                .map(|formatted| format!("formatted_bytes={}", formatted.len()))
+                .map(|(unit_count, formatted_bytes)| {
+                    format!("formatted_units={unit_count}, formatted_bytes={formatted_bytes}")
+                })
                 .unwrap_or_else(|error| error.to_string()),
             formatted.is_err().then(|| {
                 format!(
@@ -22061,6 +22079,8 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let entries = boon_runtime::example_manifest_entries()?;
+    let manifest_path = boon_runtime::example_manifest_path();
+    let manifest_hash = file_hash(manifest_path.to_string_lossy().as_ref());
     let mut scenario_coverage = Vec::new();
     for entry in &entries {
         let source_files = manifest_boon_source_files(entry);
@@ -22098,7 +22118,49 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 )
             }),
         );
-        let preview_report = read_optional_json(&native_preview_e2e_report_path(&entry.id))?;
+        let preview_report_path = native_preview_e2e_report_path(&entry.id);
+        let preview_report = read_optional_json(&preview_report_path)?;
+        let source_text = boon_runtime::source_text_for_entry(entry)?;
+        let project_source_files = manifest_source_files(entry);
+        let current_source_hash =
+            source_hash_for_report_source_files(&project_source_files, &source_text)?;
+        let current_scenario_hash = file_hash(&entry.scenario);
+        let staleness_reasons = preview_report
+            .as_ref()
+            .map(native_gpu_report_staleness_reasons)
+            .unwrap_or_else(|| vec!["missing native preview E2E report".to_owned()]);
+        let identity_reasons = preview_report
+            .as_ref()
+            .map(|report| {
+                native_example_preview_identity_reasons(
+                    report,
+                    &current_source_hash,
+                    &current_scenario_hash,
+                    &manifest_hash,
+                )
+            })
+            .unwrap_or_else(|| vec!["missing native preview E2E report".to_owned()]);
+        let report_fresh = staleness_reasons.is_empty() && identity_reasons.is_empty();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-examples:{}:fresh-preview-e2e-report", entry.id),
+            report_fresh,
+            format!(
+                "report={}, staleness_reasons={:?}, identity_reasons={:?}",
+                preview_report_path.display(),
+                staleness_reasons,
+                identity_reasons
+            ),
+            (!report_fresh).then(|| {
+                format!(
+                    "example `{}` has no fresh native E2E report bound to current source, scenario, manifest, worktree, and launched binary; rerun `cargo xtask verify-native-gpu-preview-e2e --example {} --report {}`",
+                    entry.id,
+                    entry.id,
+                    preview_report_path.display()
+                )
+            }),
+        );
         let exercised_scenarios = preview_report
             .as_ref()
             .and_then(|report| report.get("scenario_labels"))
@@ -22130,8 +22192,9 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
                 ),
                 (!exercised).then(|| {
                     format!(
-                        "example `{}` scenario `{label}` is declared but not exercised by the native E2E report",
-                        entry.id
+                        "example `{}` scenario `{label}` is declared but not exercised by the native E2E report `{}`",
+                        entry.id,
+                        preview_report_path.display()
                     )
                 }),
             );
@@ -22141,7 +22204,13 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
         }
         scenario_coverage.push(json!({
             "example": entry.id,
-            "report": native_preview_e2e_report_path(&entry.id),
+            "report": preview_report_path,
+            "report_fresh": report_fresh,
+            "staleness_reasons": staleness_reasons,
+            "identity_reasons": identity_reasons,
+            "current_source_hash": current_source_hash,
+            "current_manifest_scenario_hash": current_scenario_hash,
+            "current_manifest_hash": manifest_hash,
             "exercised_scenarios": exercised_scenarios,
             "missing_scenarios": missing_scenarios,
         }));
@@ -22174,13 +22243,83 @@ fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Err
         checks,
         blockers,
         json!({
-            "manifest_path": boon_runtime::example_manifest_path(),
+            "manifest_path": manifest_path,
+            "manifest_hash": manifest_hash,
+            "expected_manifest_hash": manifest_hash,
             "example_count": entries.len(),
             "scenario_coverage": scenario_coverage,
             "all_examples": true,
             "evidence_policy": "lower tiers do not satisfy higher tiers"
         }),
     )
+}
+
+fn native_example_preview_identity_reasons(
+    report: &serde_json::Value,
+    current_source_hash: &str,
+    current_scenario_hash: &str,
+    current_manifest_hash: &str,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let report_source_hash = report
+        .get("source_hash")
+        .and_then(serde_json::Value::as_str);
+    if report_source_hash != Some(current_source_hash) {
+        reasons.push(format!(
+            "source_hash is stale or missing: report={report_source_hash:?}, current={current_source_hash}"
+        ));
+    }
+    let report_expected_source_hash = report
+        .get("expected_source_hash")
+        .and_then(serde_json::Value::as_str);
+    if report_expected_source_hash != Some(current_source_hash) {
+        reasons.push(format!(
+            "expected_source_hash is stale or missing: report={report_expected_source_hash:?}, current={current_source_hash}"
+        ));
+    }
+    let report_scenario_hash = report
+        .get("manifest_scenario_hash")
+        .and_then(serde_json::Value::as_str);
+    if report_scenario_hash != Some(current_scenario_hash) {
+        reasons.push(format!(
+            "manifest_scenario_hash is stale or missing: report={report_scenario_hash:?}, current={current_scenario_hash}"
+        ));
+    }
+    let report_manifest_hash = report
+        .get("manifest_hash")
+        .and_then(serde_json::Value::as_str);
+    if report_manifest_hash != Some(current_manifest_hash) {
+        reasons.push(format!(
+            "manifest_hash is stale or missing: report={report_manifest_hash:?}, current={current_manifest_hash}"
+        ));
+    }
+    let report_expected_manifest_hash = report
+        .get("expected_manifest_hash")
+        .and_then(serde_json::Value::as_str);
+    if report_expected_manifest_hash != Some(current_manifest_hash) {
+        reasons.push(format!(
+            "expected_manifest_hash is stale or missing: report={report_expected_manifest_hash:?}, current={current_manifest_hash}"
+        ));
+    }
+    let launched_binary_path = report
+        .get("launched_binary_path")
+        .and_then(serde_json::Value::as_str);
+    let launched_binary_hash = report
+        .get("launched_binary_hash")
+        .and_then(serde_json::Value::as_str);
+    match launched_binary_path {
+        Some(path) if Path::new(path).exists() => {
+            let current_hash = file_hash(path);
+            if launched_binary_hash != Some(current_hash.as_str()) {
+                reasons.push(format!(
+                    "launched_binary_hash is stale or missing: report={launched_binary_hash:?}, current={current_hash}, path={path}"
+                ));
+            }
+        }
+        Some(path) => reasons.push(format!("launched_binary_path does not exist: {path}")),
+        None => reasons.push("launched_binary_path is missing".to_owned()),
+    }
+    reasons
 }
 
 fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

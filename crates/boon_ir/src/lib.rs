@@ -723,6 +723,10 @@ pub enum UpdateExpression {
         input: String,
         arms: Vec<UpdateValueMatchArm>,
     },
+    MatchTextIsEmptyConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
     MatchNumberInfixConst {
         left: String,
         op: String,
@@ -5046,7 +5050,8 @@ fn verify_scheduled_update_expression(
                 require_known_symbol("match input", input, known_symbols)
             }
         }
-        UpdateExpression::MatchValueConst { input, arms } => {
+        UpdateExpression::MatchValueConst { input, arms }
+        | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
             if !source_payload_input_matches(input, source) {
                 require_known_symbol("match value input", input, known_symbols)?;
             }
@@ -5516,7 +5521,8 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             }
             Ok(())
         }
-        UpdateExpression::MatchValueConst { input, arms } => {
+        UpdateExpression::MatchValueConst { input, arms }
+        | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
             reject_hidden_identity_identifier("match value input", input)?;
             for arm in arms {
                 reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
@@ -7749,6 +7755,15 @@ fn update_expression_for_routed_branch(
     {
         return expression;
     }
+    if let Some(expression) = branch_text_is_empty_match_value_update_expression(
+        field,
+        target,
+        fields,
+        branch_source,
+        &branch,
+    ) {
+        return expression;
+    }
     if let Some(expression) = branch.then_prefix_payload_concat_expression(&variants) {
         return expression;
     }
@@ -7803,6 +7818,142 @@ fn update_expression_for_routed_branch(
     }
     UpdateExpression::Unknown {
         summary: "source reaches target through derived local field".to_owned(),
+    }
+}
+
+fn branch_text_is_empty_match_value_update_expression(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    branch: &RoutedBranch,
+) -> Option<UpdateExpression> {
+    let (raw_input, text_is_empty_line) = branch_text_is_empty_input(branch)?;
+    let when_expr_id = branch
+        .ast_exprs
+        .iter()
+        .find(|expr| {
+            expr.line >= text_is_empty_line && matches!(expr.kind, AstExprKind::When { .. })
+        })
+        .map(|expr| expr.id)?;
+    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
+    let mut arms = match_value_arms_for_when(field, target, fields, when_expr_id, Some(source));
+    if arms.is_empty() {
+        arms = branch_inline_match_value_arms(
+            field,
+            target,
+            fields,
+            source,
+            branch,
+            text_is_empty_line,
+        );
+    }
+    (!arms.is_empty()).then_some(UpdateExpression::MatchTextIsEmptyConst { input, arms })
+}
+
+fn branch_text_is_empty_input(branch: &RoutedBranch) -> Option<(String, usize)> {
+    for (index, item) in branch.items.iter().enumerate() {
+        if !item
+            .operators
+            .iter()
+            .any(|operator| operator == "Text/is_empty")
+            && !item_has_symbol(item, "Text/is_empty")
+        {
+            continue;
+        }
+        let input = branch.items[..index]
+            .iter()
+            .rev()
+            .find_map(text_is_empty_item_input_path)?;
+        return Some((input, item.line));
+    }
+    None
+}
+
+fn text_is_empty_item_input_path(item: &AstItem) -> Option<String> {
+    if item.symbols.iter().any(|symbol| {
+        matches!(
+            symbol.as_str(),
+            "|>" | "THEN" | "WHEN" | "=>" | "," | "Text/is_empty"
+        )
+    }) {
+        return None;
+    }
+    let value = item_summary(item);
+    (!value.is_empty()
+        && value != "SKIP"
+        && value != "True"
+        && value != "False"
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+    .then_some(value)
+}
+
+fn branch_inline_match_value_arms(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    branch: &RoutedBranch,
+    after_line: usize,
+) -> Vec<UpdateValueMatchArm> {
+    branch
+        .items
+        .iter()
+        .filter(|item| {
+            item.line >= after_line && item.operators.iter().any(|operator| operator == "WHEN")
+        })
+        .flat_map(|item| {
+            inline_match_value_arms_from_symbols(field, target, fields, source, &item.symbols)
+        })
+        .collect()
+}
+
+fn inline_match_value_arms_from_symbols(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    symbols: &[String],
+) -> Vec<UpdateValueMatchArm> {
+    let mut arms = Vec::new();
+    for (index, symbol) in symbols.iter().enumerate() {
+        if symbol != "=>" || index == 0 {
+            continue;
+        }
+        let Some(pattern) = symbols
+            .get(index - 1)
+            .and_then(|value| match_const_pattern_label(std::slice::from_ref(value)))
+        else {
+            continue;
+        };
+        let Some(output) = symbols
+            .get(index + 1)
+            .filter(|value| !matches!(value.as_str(), "," | "}" | "{"))
+        else {
+            continue;
+        };
+        let output = inline_update_value_expression(field, target, fields, source, output);
+        arms.push(UpdateValueMatchArm { pattern, output });
+    }
+    arms
+}
+
+fn inline_update_value_expression(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    value: &str,
+) -> UpdateValueExpression {
+    let path = canonical_scalar_update_path_for_source(field, target, value, fields, source);
+    if path == target || fields.iter().any(|candidate| candidate.path == path) {
+        UpdateValueExpression::ReadPath { path }
+    } else {
+        UpdateValueExpression::Const {
+            value: value.to_owned(),
+        }
     }
 }
 
@@ -8427,6 +8578,11 @@ fn match_const_update_expression_from_expr(
             ) {
                 return Some(expression);
             }
+            if let Some(expression) = match_text_is_empty_const_update_expression_from_input(
+                field, target, fields, *input, expr.id, source,
+            ) {
+                return Some(expression);
+            }
             let raw_input = ast_argument_value(field, *input)?;
             let input = source.map_or_else(
                 || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
@@ -8458,6 +8614,23 @@ fn match_const_update_expression_from_expr(
     }
 }
 
+fn match_text_is_empty_const_update_expression_from_input(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    input: usize,
+    when_expr_id: usize,
+    source: Option<&str>,
+) -> Option<UpdateExpression> {
+    let raw_input = text_is_empty_input_path(field, input)?;
+    let input = source.map_or_else(
+        || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
+        |source| canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source),
+    );
+    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
+    (!arms.is_empty()).then_some(UpdateExpression::MatchValueConst { input, arms })
+}
+
 fn match_number_infix_const_update_expression_from_input(
     field: &FieldDef,
     target: &str,
@@ -8479,6 +8652,20 @@ fn match_number_infix_const_update_expression_from_input(
         right,
         arms,
     })
+}
+
+fn text_is_empty_input_path(field: &FieldDef, expr_id: usize) -> Option<String> {
+    let expr = field_expr(field, expr_id)?;
+    match &expr.kind {
+        AstExprKind::Pipe { input, op, .. } if op == "Text/is_empty" => {
+            ast_argument_value(field, *input)
+        }
+        AstExprKind::Call { function, args } if function == "Text/is_empty" => args
+            .iter()
+            .find(|arg| arg.name.is_none())
+            .and_then(|arg| ast_argument_value(field, arg.value)),
+        _ => None,
+    }
 }
 
 fn match_value_arms_for_when(
@@ -12555,8 +12742,22 @@ FUNCTION new_todo(todo) {
             branch.target == "todo.edited_title"
                 && branch.source == "todo.todo_elements.todo_title_element"
                 && branch.expression
-                    == UpdateExpression::ReadPath {
-                        path: "todo.edited_title.draft_title".to_owned(),
+                    == UpdateExpression::MatchTextIsEmptyConst {
+                        input: "todo.edited_title.draft_title".to_owned(),
+                        arms: vec![
+                            UpdateValueMatchArm {
+                                pattern: "True".to_owned(),
+                                output: UpdateValueExpression::ReadPath {
+                                    path: "todo.title".to_owned(),
+                                },
+                            },
+                            UpdateValueMatchArm {
+                                pattern: "False".to_owned(),
+                                output: UpdateValueExpression::Const {
+                                    value: "SKIP".to_owned(),
+                                },
+                            },
+                        ],
                     }
                 && branch.indexed
         }));
@@ -13142,6 +13343,62 @@ FUNCTION new_signal(signal) {
             UpdateExpression::ReadPath {
                 path: "signal.key".to_owned()
             }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn root_latest_initial_plus_row_source_list_latest_is_source_event_transform() {
+        let source = r#"
+HOLD
+store: [
+    todos:
+        LIST {
+            [title: TEXT { Ship physical TodoMVC }]
+        }
+        |> List/map(todo, new: new_todo(title: todo.title))
+    selected_todo_id: LATEST {
+        None
+        todos
+            |> List/map(old, new: LATEST {
+                old.todo_elements.todo_title_element.event.double_click
+                    |> THEN { old.id }
+            })
+            |> List/latest()
+    }
+]
+
+FUNCTION new_todo(title) {
+    [
+        todo_elements: [
+            todo_title_element: SOURCE
+        ]
+        id: TodoId[id: Ulid/generate()]
+        title: title
+    ]
+}
+"#;
+        let parsed =
+            boon_parser::parse_source("row-source-root-latest-initial.bn", source).unwrap();
+        assert!(
+            parsed
+                .source_ports
+                .iter()
+                .any(|source| source.path == "todo.todo_elements.todo_title_element"),
+            "parser should expose todo row source port, source_ports={:?}, row_scopes={:?}",
+            parsed.source_ports,
+            parsed.row_scope_functions
+        );
+        let ir = lower(&parsed).unwrap();
+        let selected = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.selected_todo_id")
+            .expect("selected_todo_id should be a derived root value");
+        assert_eq!(selected.kind, DerivedValueKind::SourceEventTransform);
+        assert_eq!(
+            selected.sources,
+            vec!["todo.todo_elements.todo_title_element".to_owned()]
         );
         assert!(ir.static_schedule_verified);
     }

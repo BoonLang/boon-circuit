@@ -1448,6 +1448,7 @@ fn ast_pipe_expr_kind(
         };
     }
     if op == "WHEN" {
+        push_inline_when_match_arms(&tokens[pipe + 1..], item, expressions, source);
         return AstExprKind::When { input };
     }
     if op == "THEN" {
@@ -1571,6 +1572,28 @@ fn ast_operator_block_expr(
     let open = tokens.iter().position(|token| token == "{")?;
     let close = matching_close(tokens, open)?;
     (close > open + 1).then(|| parse_ast_expr(&tokens[open + 1..close], item, expressions, source))
+}
+
+fn push_inline_when_match_arms(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) {
+    let Some(open) = tokens.iter().position(|token| token == "{") else {
+        return;
+    };
+    let Some(close) = matching_close(tokens, open) else {
+        return;
+    };
+    if close <= open + 1 {
+        return;
+    }
+    for part in split_top_level(&tokens[open + 1..close], ",") {
+        if part.iter().any(|token| token == "=>") {
+            parse_ast_expr(&part, item, expressions, source);
+        }
+    }
 }
 
 fn ast_call_arg(

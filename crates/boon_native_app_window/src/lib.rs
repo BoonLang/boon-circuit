@@ -15,6 +15,7 @@ use wgpu::SurfaceTargetUnsafe;
 
 const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -935,6 +936,7 @@ pub fn run_visible_surface_probe_with_hooks_and_wake<F>(
         let (render_done_sender, render_done_receiver) = mpsc::sync_channel::<()>(0);
         std::thread::Builder::new()
             .name(format!("boon-native-{}-render", options.role.as_str()))
+            .stack_size(NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES)
             .spawn({
                 let main_thread_id = main_thread_id.clone();
                 move || {

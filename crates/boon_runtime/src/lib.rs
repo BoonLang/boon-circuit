@@ -4997,7 +4997,11 @@ impl LoadedRuntime {
             root_changed_reads.extend(materialization.changed_reads.iter().cloned());
         }
         let root_materializations = generic
-            .materialize_root_derived_field_commits_for_changed_reads(root_changed_reads, None)?;
+            .materialize_root_derived_field_commits_for_changed_reads(
+                root_changed_reads,
+                None,
+                &BTreeSet::new(),
+            )?;
         semantic_delta_count = semantic_delta_count.saturating_add(
             root_materializations
                 .iter()
@@ -5227,7 +5231,11 @@ impl LoadedRuntime {
         runtime_step_profile.derived_lowering_ms = runtime_elapsed_ms(derived_lowering_started);
         let root_materialization_started = Instant::now();
         let root_materializations = generic
-            .materialize_root_derived_field_commits_for_changed_reads(root_changed_reads, None)?;
+            .materialize_root_derived_field_commits_for_changed_reads(
+                root_changed_reads,
+                None,
+                &BTreeSet::new(),
+            )?;
         runtime_step_profile.root_materialization_ms =
             runtime_elapsed_ms(root_materialization_started);
         let root_lowering_started = Instant::now();
@@ -5738,7 +5746,8 @@ impl RuntimeSymbols {
                         symbols.intern(&arm.output);
                     }
                 }
-                UpdateExpression::MatchValueConst { input, arms } => {
+                UpdateExpression::MatchValueConst { input, arms }
+                | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
                     symbols.intern(input);
                     for arm in arms {
                         symbols.intern(&arm.pattern);
@@ -9302,6 +9311,11 @@ fn scalar_update_expression_artifact(expression: &ScalarUpdateExpression) -> Jso
             "input": input,
             "arms": arms.iter().map(update_value_match_arm_artifact).collect::<Vec<_>>()
         }),
+        ScalarUpdateExpression::MatchTextIsEmptyConst { input, arms } => json!({
+            "kind": "match_text_is_empty_const",
+            "input": input,
+            "arms": arms.iter().map(update_value_match_arm_artifact).collect::<Vec<_>>()
+        }),
         ScalarUpdateExpression::Unsupported => json!({ "kind": "unsupported" }),
     }
 }
@@ -9428,6 +9442,13 @@ impl ScalarUpdateExpression {
                 )?,
             }),
             "match_value_const" => Ok(Self::MatchValueConst {
+                input: artifact_string_field(object, "input", context)?,
+                arms: update_value_match_arms_from_artifact(
+                    artifact_field(object, "arms", context)?,
+                    &format!("{context}.arms"),
+                )?,
+            }),
+            "match_text_is_empty_const" => Ok(Self::MatchTextIsEmptyConst {
                 input: artifact_string_field(object, "input", context)?,
                 arms: update_value_match_arms_from_artifact(
                     artifact_field(object, "arms", context)?,
@@ -18587,6 +18608,7 @@ impl GenericScheduledRuntime {
             runtime_elapsed_ms(route_setup_started);
         let mut materialize_root_derived_after_actions = false;
         let mut root_derived_changed_reads = BTreeSet::new();
+        let mut protected_source_event_root_targets = BTreeSet::new();
         let action_loop_started = Instant::now();
         for action in actions.iter() {
             match action {
@@ -18612,6 +18634,7 @@ impl GenericScheduledRuntime {
                                 &mut root_derived_changed_reads,
                                 mode,
                                 SourceActionRootFlushKind::Dependency,
+                                &protected_source_event_root_targets,
                                 &mut observe,
                                 &mut source_action_profile,
                             )?;
@@ -18654,6 +18677,7 @@ impl GenericScheduledRuntime {
                             &mut root_derived_changed_reads,
                             mode,
                             SourceActionRootFlushKind::Settle,
+                            &protected_source_event_root_targets,
                             &mut observe,
                             &mut source_action_profile,
                         )?;
@@ -18686,6 +18710,16 @@ impl GenericScheduledRuntime {
                                 .root
                                 .insert_value(target.clone(), FieldValue::Text(value.to_string()));
                             root_derived_changed_reads.extend(root_read_keys_for_path(target));
+                            if self
+                                .generic_derived
+                                .root_field_plan(target)
+                                .is_some_and(|field| {
+                                    field.kind == DerivedValueKind::SourceEventTransform
+                                        && field.has_sources
+                                })
+                            {
+                                protected_source_event_root_targets.insert(target.clone());
+                            }
                             let mutation =
                                 self.root_text_source_action_mutation(GenericRootTextCommit {
                                     target: target.clone(),
@@ -18698,6 +18732,7 @@ impl GenericScheduledRuntime {
                                     &mut root_derived_changed_reads,
                                     mode,
                                     SourceActionRootFlushKind::Immediate,
+                                    &protected_source_event_root_targets,
                                     &mut observe,
                                     &mut source_action_profile,
                                 )?;
@@ -18712,6 +18747,7 @@ impl GenericScheduledRuntime {
                             .root
                             .insert_value(target.clone(), value.clone());
                         root_derived_changed_reads.extend(root_read_keys_for_path(target));
+                        protected_source_event_root_targets.insert(target.clone());
                         match value {
                             FieldValue::Bool(value) => {
                                 let mutation =
@@ -18737,6 +18773,7 @@ impl GenericScheduledRuntime {
                                 &mut root_derived_changed_reads,
                                 mode,
                                 SourceActionRootFlushKind::Immediate,
+                                &protected_source_event_root_targets,
                                 &mut observe,
                                 &mut source_action_profile,
                             )?;
@@ -18755,6 +18792,7 @@ impl GenericScheduledRuntime {
                                 &mut root_derived_changed_reads,
                                 mode,
                                 SourceActionRootFlushKind::Immediate,
+                                &protected_source_event_root_targets,
                                 &mut observe,
                                 &mut source_action_profile,
                             )?;
@@ -18919,6 +18957,12 @@ impl GenericScheduledRuntime {
                     {
                         continue;
                     }
+                    if *kind == SourceRouteTextAction::ReadPath
+                        && (input.text.is_some()
+                            || (input.key == Some("Escape") && input.text.is_none()))
+                    {
+                        continue;
+                    }
                     let target_list = self.indexed_target_list(target)?.to_owned();
                     let list = input.list.as_deref().unwrap_or(target_list.as_str());
                     if list != target_list {
@@ -18943,8 +18987,24 @@ impl GenericScheduledRuntime {
                                 index,
                                 row_field_name(target),
                             );
+                            let row_key = commit.key;
+                            let row_generation = commit.generation;
+                            let field = commit.field.clone();
                             observe(GenericSourceMutation::TextFieldIdentity(commit))?;
+                            let root_transform_changed = self.apply_indexed_row_commit_followups(
+                                &input,
+                                list,
+                                row_key,
+                                row_generation,
+                                &field,
+                                &mut root_derived_changed_reads,
+                                &mut protected_source_event_root_targets,
+                                &mut observe,
+                            )?;
                             if mode.materializes_derived() {
+                                materialize_root_derived_after_actions = true;
+                            }
+                            if root_transform_changed && mode.materializes_derived() {
                                 materialize_root_derived_after_actions = true;
                             }
                         } else if let Some(commit) = self.storage.commit_indexed_text_source(
@@ -18953,7 +19013,10 @@ impl GenericScheduledRuntime {
                             index,
                             target,
                             input.source,
+                            input.key,
                             input.text,
+                            input.address,
+                            &input.payload,
                         )? {
                             insert_changed_list_field_read_keys(
                                 &mut root_derived_changed_reads,
@@ -18961,8 +19024,24 @@ impl GenericScheduledRuntime {
                                 index,
                                 row_field_name(target),
                             );
+                            let row_key = commit.key;
+                            let row_generation = commit.generation;
+                            let field = commit.field.clone();
                             observe(GenericSourceMutation::TextField(commit))?;
+                            let root_transform_changed = self.apply_indexed_row_commit_followups(
+                                &input,
+                                list,
+                                row_key,
+                                row_generation,
+                                &field,
+                                &mut root_derived_changed_reads,
+                                &mut protected_source_event_root_targets,
+                                &mut observe,
+                            )?;
                             if mode.materializes_derived() {
+                                materialize_root_derived_after_actions = true;
+                            }
+                            if root_transform_changed && mode.materializes_derived() {
                                 materialize_root_derived_after_actions = true;
                             }
                         }
@@ -19019,7 +19098,10 @@ impl GenericScheduledRuntime {
                                 index,
                                 target,
                                 input.source,
+                                input.key,
                                 input.text,
+                                input.address,
+                                &input.payload,
                             )? {
                                 rows_touched = rows_touched.saturating_add(1);
                                 insert_changed_list_field_read_keys(
@@ -19143,6 +19225,7 @@ impl GenericScheduledRuntime {
             for materialization in self.materialize_root_derived_field_commits_for_changed_reads(
                 root_derived_changed_reads,
                 Some(&mut source_action_profile),
+                &protected_source_event_root_targets,
             )? {
                 let Some(mutation) = materialization.mutation else {
                     continue;
@@ -19174,6 +19257,7 @@ impl GenericScheduledRuntime {
         root_derived_changed_reads: &mut BTreeSet<GenericReadKey>,
         mode: SourceActionApplyMode,
         kind: SourceActionRootFlushKind,
+        protected_source_event_root_targets: &BTreeSet<String>,
         observe: &mut impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
         source_action_profile: &mut LiveRuntimeStepProfile,
     ) -> RuntimeResult<()> {
@@ -19210,6 +19294,7 @@ impl GenericScheduledRuntime {
         for materialization in self.materialize_root_derived_field_commits_for_changed_reads(
             changed_reads,
             Some(source_action_profile),
+            protected_source_event_root_targets,
         )? {
             let Some(mutation) = materialization.mutation else {
                 continue;
@@ -19306,6 +19391,166 @@ impl GenericScheduledRuntime {
             }
         }
         self.storage.root_textlike(path).ok()
+    }
+
+    fn apply_row_field_root_source_event_transforms<'a>(
+        &mut self,
+        input: &GenericSourceActionInput<'a>,
+        changed_field: &str,
+        root_derived_changed_reads: &mut BTreeSet<GenericReadKey>,
+        protected_source_event_root_targets: &mut BTreeSet<String>,
+        observe: &mut impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<bool> {
+        let targets = self
+            .source_routes
+            .for_source_id(input.source_id)
+            .map(|route| {
+                route
+                    .derived_text_targets
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if targets.is_empty() {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        for target in targets {
+            let Some(field) = self.generic_derived.root_field_plan(&target).cloned() else {
+                continue;
+            };
+            if field.kind != DerivedValueKind::SourceEventTransform || !field.has_sources {
+                continue;
+            }
+            let exprs = statement_ast_exprs(&field.statement, &self.generic_derived.expressions);
+            let Some(value) = row_field_then_value(&exprs, changed_field) else {
+                continue;
+            };
+            let current = self.storage.root.owned_value(&field.path);
+            if current.as_ref() == Some(&value) {
+                continue;
+            }
+
+            self.storage
+                .root
+                .insert_value(field.path.clone(), value.clone());
+            root_derived_changed_reads.extend(root_read_keys_for_path(&field.path));
+            protected_source_event_root_targets.insert(field.path.clone());
+            match value {
+                FieldValue::Bool(value) => {
+                    observe(
+                        self.root_bool_source_action_mutation(GenericRootBoolCommit {
+                            target: field.path.clone(),
+                            value,
+                        }),
+                    )?;
+                }
+                FieldValue::Text(value) | FieldValue::Enum(value) => {
+                    observe(
+                        self.root_text_source_action_mutation(GenericRootTextCommit {
+                            target: field.path.clone(),
+                            value: Cow::Owned(value),
+                        }),
+                    )?;
+                }
+                FieldValue::Bytes(_) | FieldValue::Json(_) => {}
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn apply_indexed_row_commit_followups<'a>(
+        &mut self,
+        input: &GenericSourceActionInput<'a>,
+        list: &str,
+        key: u64,
+        generation: u64,
+        changed_field: &str,
+        root_derived_changed_reads: &mut BTreeSet<GenericReadKey>,
+        protected_source_event_root_targets: &mut BTreeSet<String>,
+        observe: &mut impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<bool> {
+        let mut changed = self.apply_row_field_root_source_event_transforms(
+            input,
+            changed_field,
+            root_derived_changed_reads,
+            protected_source_event_root_targets,
+            observe,
+        )?;
+        changed |= self.apply_triggered_indexed_source_event_root_transforms(
+            input,
+            list,
+            key,
+            generation,
+            root_derived_changed_reads,
+            protected_source_event_root_targets,
+            observe,
+        )?;
+        for materialization in self.recompute_generic_derived_for_row(list, key, generation)? {
+            root_derived_changed_reads.extend(materialization.changed_reads.iter().cloned());
+            let field = materialization.field.clone();
+            if let Some(commit) = materialization.mutation {
+                observe(GenericSourceMutation::ValueField(commit))?;
+            }
+            changed |= self.apply_row_field_root_source_event_transforms(
+                input,
+                &field,
+                root_derived_changed_reads,
+                protected_source_event_root_targets,
+                observe,
+            )?;
+        }
+        Ok(changed)
+    }
+
+    fn apply_triggered_indexed_source_event_root_transforms<'a>(
+        &mut self,
+        input: &GenericSourceActionInput<'a>,
+        list: &str,
+        key: u64,
+        generation: u64,
+        root_derived_changed_reads: &mut BTreeSet<GenericReadKey>,
+        protected_source_event_root_targets: &mut BTreeSet<String>,
+        observe: &mut impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<bool> {
+        let Some(index) = self.storage.bound_index(list, key, generation)? else {
+            return Ok(false);
+        };
+        let fields = self
+            .generic_derived
+            .indexed_fields
+            .iter()
+            .filter(|field| {
+                field.list == list && field.kind == DerivedValueKind::SourceEventTransform
+            })
+            .map(|field| (field.field.clone(), field.statement.clone()))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (field, statement) in fields {
+            let exprs = statement_ast_exprs(&statement, &self.generic_derived.expressions);
+            if !source_event_transform_triggered_by_input(
+                &exprs,
+                input.source,
+                input.key,
+                input.text,
+                input.address,
+                &input.payload,
+            ) {
+                continue;
+            }
+            insert_changed_list_field_read_keys(root_derived_changed_reads, list, index, &field);
+            changed |= self.apply_row_field_root_source_event_transforms(
+                input,
+                &field,
+                root_derived_changed_reads,
+                protected_source_event_root_targets,
+                observe,
+            )?;
+        }
+        Ok(changed)
     }
 
     fn recompute_generic_derived_for_row(
@@ -19663,8 +19908,11 @@ impl GenericScheduledRuntime {
             }
             indexed_dependency_changed_read_count = changed_reads.len();
             let changed_root_started = Instant::now();
-            let _ =
-                self.materialize_root_derived_field_commits_for_changed_reads(changed_reads, None)?;
+            let _ = self.materialize_root_derived_field_commits_for_changed_reads(
+                changed_reads,
+                None,
+                &BTreeSet::new(),
+            )?;
             changed_root_recompute_ms = runtime_elapsed_ms(changed_root_started);
         }
         self.generic_derived_state.clear_value_caches();
@@ -19718,8 +19966,11 @@ impl GenericScheduledRuntime {
         let mut changed_recompute_materialization_count = 0usize;
         if !changed_reads.is_empty() {
             let changed_recompute_started = Instant::now();
-            let materializations =
-                self.materialize_root_derived_field_commits_for_changed_reads(changed_reads, None)?;
+            let materializations = self.materialize_root_derived_field_commits_for_changed_reads(
+                changed_reads,
+                None,
+                &BTreeSet::new(),
+            )?;
             changed_recompute_materialization_count = materializations.len();
             changed_recompute_ms = runtime_elapsed_ms(changed_recompute_started);
         }
@@ -19749,7 +20000,7 @@ impl GenericScheduledRuntime {
                 profile.list_view_count = profile.list_view_count.saturating_add(1);
             }
             let started = Instant::now();
-            let materialization = self.materialize_root_derived_field_commit(&field)?;
+            let materialization = self.materialize_root_derived_field_commit(&field, false)?;
             let elapsed_ms = runtime_elapsed_ms(started);
             profile.total_ms += elapsed_ms;
             let changed_read_count = materialization
@@ -19780,6 +20031,7 @@ impl GenericScheduledRuntime {
         &mut self,
         changed_reads: BTreeSet<GenericReadKey>,
         mut source_action_profile: Option<&mut LiveRuntimeStepProfile>,
+        protected_source_event_root_targets: &BTreeSet<String>,
     ) -> RuntimeResult<Vec<GenericRootDerivedMaterialization<'static>>> {
         let profile_total_started = source_action_profile.as_ref().map(|_| Instant::now());
         let root_materialization_ms_before = self.root_materialization_stats.total_ms;
@@ -19902,6 +20154,16 @@ impl GenericScheduledRuntime {
             .generic_derived_state
             .root_ready_dirty_fields(&dirty, &dirty_root_read_key_counts);
         self.remove_structured_child_ready_roots(&dirty, &mut ready_dirty);
+        for protected in protected_source_event_root_targets {
+            dirty.remove(protected);
+            ready_dirty.remove(protected);
+            removed_root_value_cache.remove(protected);
+            self.generic_derived_state
+                .root_value_cache
+                .remove(protected);
+            self.generic_derived_state
+                .remove_root_numeric_stability_guards(protected);
+        }
         if let Some(profile) = source_action_profile.as_deref_mut() {
             if let Some(started) = dirty_ready_started {
                 profile.source_action_root_dirty_ready_ms += runtime_elapsed_ms(started);
@@ -20282,7 +20544,7 @@ impl GenericScheduledRuntime {
                 self.generic_derived_state
                     .set_candidate_defer_materializing_root(Some(path.clone()))
             });
-            let materialization = self.materialize_root_derived_field_commit(&field);
+            let materialization = self.materialize_root_derived_field_commit(&field, true);
             if let Some(previous_materializing_root) = previous_materializing_root {
                 self.generic_derived_state
                     .set_candidate_defer_materializing_root(previous_materializing_root);
@@ -20715,6 +20977,7 @@ impl GenericScheduledRuntime {
     fn materialize_root_derived_field_commit(
         &mut self,
         field: &GenericDerivedRootField,
+        recompute_source_event_transforms: bool,
     ) -> RuntimeResult<Option<GenericRootDerivedMaterialization<'static>>> {
         if matches!(field.kind, DerivedValueKind::ListView) {
             let result = self.materialize_root_list_view_field(field, &BTreeSet::new())?;
@@ -20732,6 +20995,7 @@ impl GenericScheduledRuntime {
         if field.kind == DerivedValueKind::SourceEventTransform
             && field.has_sources
             && self.storage.root.owned_value(&field.path).is_some()
+            && !recompute_source_event_transforms
         {
             return Ok(None);
         }
@@ -30528,7 +30792,7 @@ impl GenericScheduledRuntime {
             .remove(&field.path);
         self.generic_derived_state
             .remove_root_numeric_stability_guards(&field.path);
-        match self.materialize_root_derived_field_commit(&field) {
+        match self.materialize_root_derived_field_commit(&field, false) {
             Ok(materialization) => {
                 if let Some(materialization) = materialization.as_ref() {
                     self.invalidate_demand_refreshed_root_caches(materialization);
@@ -33621,7 +33885,10 @@ impl GenericCircuitRuntime {
         index: usize,
         target: &str,
         source: &str,
+        payload_key: Option<&str>,
         payload_text: Option<&'a str>,
+        payload_address: Option<&str>,
+        payload: &BTreeMap<String, &'a str>,
     ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
         let value = match self.eval_indexed_text_source(
             equations,
@@ -33629,7 +33896,10 @@ impl GenericCircuitRuntime {
             index,
             target,
             source,
+            payload_key,
             payload_text,
+            payload_address,
+            payload,
         )? {
             IndexedTextCandidate::SourceText(value) | IndexedTextCandidate::PreviousText(value) => {
                 value
@@ -33722,22 +33992,31 @@ impl GenericCircuitRuntime {
         target: &str,
         source: &str,
     ) -> RuntimeResult<GenericTextFieldIdentity> {
-        let previous =
-            match self.eval_indexed_text_source(equations, list, index, target, source, None)? {
-                IndexedTextCandidate::PreviousField(path) => path,
-                IndexedTextCandidate::SourceText(_) | IndexedTextCandidate::PreviousText(_) => {
-                    return Err(format!(
-                        "text update `{target}` from `{source}` is not a previous-field update"
-                    )
-                    .into());
-                }
-                IndexedTextCandidate::TrimmedOrSkip(_) => {
-                    return Err(format!(
-                        "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
-                    )
-                    .into());
-                }
-            };
+        let previous = match self.eval_indexed_text_source(
+            equations,
+            list,
+            index,
+            target,
+            source,
+            None,
+            None,
+            None,
+            &BTreeMap::new(),
+        )? {
+            IndexedTextCandidate::PreviousField(path) => path,
+            IndexedTextCandidate::SourceText(_) | IndexedTextCandidate::PreviousText(_) => {
+                return Err(format!(
+                    "text update `{target}` from `{source}` is not a previous-field update"
+                )
+                .into());
+            }
+            IndexedTextCandidate::TrimmedOrSkip(_) => {
+                return Err(format!(
+                    "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
+                )
+                .into());
+            }
+        };
         let field = row_field_name(target);
         self.copy_list_row_textlike_field(list, index, &previous, field)?;
         let value = self.list_row_textlike(list, index, field)?.to_owned();
@@ -33798,7 +34077,10 @@ impl GenericCircuitRuntime {
         index: usize,
         target: &str,
         source: &str,
+        payload_key: Option<&str>,
         payload_text: Option<&'a str>,
+        payload_address: Option<&str>,
+        payload: &BTreeMap<String, &'a str>,
     ) -> RuntimeResult<IndexedTextCandidate<'a>> {
         let Some(branch) = equations
             .branches
@@ -33888,14 +34170,13 @@ impl GenericCircuitRuntime {
                 payload_path,
                 separator,
             } => {
-                let empty_payload = BTreeMap::new();
                 let Some(payload) = source_payload_match_input(
                     payload_path,
                     source,
-                    None,
+                    payload_key,
                     payload_text,
-                    None,
-                    &empty_payload,
+                    payload_address,
+                    payload,
                 )
                 else {
                     return Err(format!(
@@ -33928,15 +34209,15 @@ impl GenericCircuitRuntime {
             }
             ScalarUpdateExpression::MatchConst { .. }
             | ScalarUpdateExpression::MatchValueConst { .. }
+            | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
             | ScalarUpdateExpression::MatchNumberInfixConst { .. } => {
-                let empty_payload = BTreeMap::new();
                 let Some(value) = equations.eval_text(
                     target,
                     source,
-                    None,
+                    payload_key,
                     payload_text,
-                    None,
-                    &empty_payload,
+                    payload_address,
+                    payload,
                     None,
                     None,
                     None,
@@ -36040,6 +36321,10 @@ enum ScalarUpdateExpression {
         input: String,
         arms: Vec<UpdateValueMatchArm>,
     },
+    MatchTextIsEmptyConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
     Unsupported,
 }
 
@@ -36062,6 +36347,7 @@ impl ScalarUpdateExpression {
                 | Self::PrefixRootConcat { .. }
                 | Self::MatchConst { .. }
                 | Self::MatchValueConst { .. }
+                | Self::MatchTextIsEmptyConst { .. }
         )
     }
 
@@ -36078,6 +36364,7 @@ impl ScalarUpdateExpression {
                 | Self::PrefixRootConcat { .. }
                 | Self::MatchConst { .. }
                 | Self::MatchValueConst { .. }
+                | Self::MatchTextIsEmptyConst { .. }
                 | Self::MatchNumberInfixConst { .. }
         ) || matches!(self, Self::Const(value) if value != "True" && value != "False")
     }
@@ -36093,7 +36380,9 @@ impl ScalarUpdateExpression {
                 matches!(arm.output.as_str(), "True" | "False" | "SKIP")
                     || !arm.output.contains('.')
             }),
-            Self::MatchValueConst { arms, .. } | Self::MatchNumberInfixConst { arms, .. } => arms
+            Self::MatchValueConst { arms, .. }
+            | Self::MatchTextIsEmptyConst { arms, .. }
+            | Self::MatchNumberInfixConst { arms, .. } => arms
                 .iter()
                 .all(|arm| update_value_expression_is_bool_compatible(&arm.output)),
             _ => false,
@@ -36114,6 +36403,7 @@ impl ScalarUpdateExpression {
                 | Self::BoolNot(_)
                 | Self::MatchConst { .. }
                 | Self::MatchValueConst { .. }
+                | Self::MatchTextIsEmptyConst { .. }
         )
     }
 
@@ -36158,7 +36448,7 @@ impl ScalarUpdateExpression {
             | Self::ReadPath(path)
             | Self::BoolNot(path)
             | Self::MatchConst { input: path, .. } => reads.push(path.as_str()),
-            Self::MatchValueConst { input, arms } => {
+            Self::MatchValueConst { input, arms } | Self::MatchTextIsEmptyConst { input, arms } => {
                 reads.push(input.as_str());
                 for arm in arms {
                     update_value_expression_root_read_paths(&arm.output, &mut reads);
@@ -36350,6 +36640,9 @@ impl ScalarBytecodeProgram {
             ScalarUpdateExpression::MatchValueConst { .. } => {
                 return Err("match_value_const_not_compiled_yet".to_owned());
             }
+            ScalarUpdateExpression::MatchTextIsEmptyConst { .. } => {
+                return Err("match_text_is_empty_const_not_compiled_yet".to_owned());
+            }
             ScalarUpdateExpression::ListFindValue { .. } => {
                 return Err("list_find_value_requires_list_lookup_op".to_owned());
             }
@@ -36391,6 +36684,7 @@ impl ScalarBytecodeProgram {
             | ScalarUpdateExpression::PrefixPayloadConcat { .. }
             | ScalarUpdateExpression::PrefixRootConcat { .. }
             | ScalarUpdateExpression::MatchValueConst { .. }
+            | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
             | ScalarUpdateExpression::MatchNumberInfixConst { .. }
             | ScalarUpdateExpression::ListFindValue { .. } => {
                 return Err(format!(
@@ -36845,7 +37139,8 @@ impl ScalarBytecodeSampleContext {
                     self.seed_match_input(source, input, &pattern);
                 }
             }
-            ScalarUpdateExpression::MatchValueConst { input, arms } => {
+            ScalarUpdateExpression::MatchValueConst { input, arms }
+            | ScalarUpdateExpression::MatchTextIsEmptyConst { input, arms } => {
                 let pattern = arms
                     .iter()
                     .find(|arm| arm.pattern != "__")
@@ -37259,6 +37554,7 @@ fn scalar_expression_kind_label(expression: &ScalarUpdateExpression) -> &'static
         ScalarUpdateExpression::BoolNot(_) => "bool_not",
         ScalarUpdateExpression::MatchConst { .. } => "match_const",
         ScalarUpdateExpression::MatchValueConst { .. } => "match_value_const",
+        ScalarUpdateExpression::MatchTextIsEmptyConst { .. } => "match_text_is_empty_const",
         ScalarUpdateExpression::Unsupported => "unsupported",
     }
 }
@@ -40103,7 +40399,10 @@ fn source_payload_when_match_const_expression(
         let AstExprKind::When { input } = expr.kind else {
             return None;
         };
-        let input = ast_argument_value_in_exprs(exprs, input)?;
+        let input = ast_argument_value_in_exprs(exprs, input)
+            .filter(|input| !input.is_empty())
+            .or_else(|| source_payload_path_in_expr_subtree(exprs, input, source))
+            .or_else(|| source_payload_path_before_line(exprs, expr.line, source))?;
         if source_payload_field_from_input(&input, source).is_none() {
             return None;
         }
@@ -40214,6 +40513,33 @@ fn source_direct_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
         source_payload_field_from_input(&path, source)?;
         Some(path)
     })
+}
+
+fn source_payload_path_in_expr_subtree(
+    exprs: &[AstExpr],
+    expr_id: usize,
+    source: &str,
+) -> Option<String> {
+    let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_expr_tree(expr_id, exprs, &mut seen, &mut ids);
+    ids.into_iter().find_map(|id| {
+        let path = ast_argument_value_in_exprs(exprs, id)?;
+        source_payload_field_from_input(&path, source)?;
+        Some(path)
+    })
+}
+
+fn source_payload_path_before_line(exprs: &[AstExpr], line: usize, source: &str) -> Option<String> {
+    exprs
+        .iter()
+        .filter(|expr| expr.line < line)
+        .rev()
+        .find_map(|expr| {
+            let path = ast_argument_value_in_exprs(exprs, expr.id)?;
+            source_payload_field_from_input(&path, source)?;
+            Some(path)
+        })
 }
 
 fn prefix_root_concat_expression_after_line(
@@ -40379,7 +40705,7 @@ fn runtime_match_const_arms_after_when(exprs: &[AstExpr], when_line: usize) -> V
         .unwrap_or(usize::MAX);
     exprs
         .iter()
-        .filter(|expr| expr.line > when_line && expr.line < end_line)
+        .filter(|expr| expr.line >= when_line && expr.line < end_line)
         .filter_map(|expr| {
             let AstExprKind::MatchArm {
                 pattern,
@@ -40424,9 +40750,24 @@ fn statement_ast_exprs(statement: &AstStatement, expressions: &[AstExpr]) -> Vec
     let mut ids = Vec::new();
     let mut seen = BTreeSet::new();
     collect_statement_expr_ids(statement, expressions, &mut seen, &mut ids);
-    ids.into_iter()
-        .filter_map(|id| expressions.get(id).cloned())
+    for expr in expressions {
+        if statement_tree_contains_expr(statement, expr) {
+            seen.insert(expr.id);
+        }
+    }
+    expressions
+        .iter()
+        .filter(|expr| seen.contains(&expr.id))
+        .cloned()
         .collect()
+}
+
+fn statement_tree_contains_expr(statement: &AstStatement, expr: &AstExpr) -> bool {
+    (expr.start >= statement.start && expr.end <= statement.end)
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_tree_contains_expr(child, expr))
 }
 
 fn collect_statement_expr_ids(
@@ -41008,6 +41349,12 @@ impl ScalarEquationPlan {
                             arms: arms.clone(),
                         }
                     }
+                    UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+                        ScalarUpdateExpression::MatchTextIsEmptyConst {
+                            input: input.clone(),
+                            arms: arms.clone(),
+                        }
+                    }
                     _ => ScalarUpdateExpression::Unsupported,
                 },
             })
@@ -41319,6 +41666,42 @@ impl ScalarEquationPlan {
                 };
                 Ok(Some(ScalarTextValue::Text(value)))
             }
+            ScalarUpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+                let current = match source_payload_match_input(
+                    input,
+                    source,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                    payload,
+                ) {
+                    Some(value) => {
+                        if value.is_empty() {
+                            "True"
+                        } else {
+                            "False"
+                        }
+                    }
+                    None if self.input_is_declared_source_payload(input) => return Ok(None),
+                    None => {
+                        let Some(value) = read_textlike(input) else {
+                            return Ok(None);
+                        };
+                        if value.is_empty() { "True" } else { "False" }
+                    }
+                };
+                let Some(value) = arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                    .map(|arm| scalar_update_value_to_text(&arm.output, read_textlike))
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ScalarTextValue::Text(value)))
+            }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::ReadPath(path) => {
                 if let Some(value) = read_textlike(path) {
@@ -41448,6 +41831,42 @@ impl ScalarEquationPlan {
                             "source `{source}` for bool target `{target}` cannot read match input `{input}`"
                         )
                     })?),
+                };
+                let Some(arm) = arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .or_else(|| arms.iter().find(|arm| arm.pattern == "__"))
+                else {
+                    return Ok(None);
+                };
+                scalar_update_value_to_bool(&arm.output, &read_textlike, &read_bool)
+            }
+            ScalarUpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+                let empty_payload = BTreeMap::new();
+                let current = match source_payload_match_input(
+                    input,
+                    source,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                    &empty_payload,
+                ) {
+                    Some(value) => {
+                        if value.is_empty() {
+                            "True"
+                        } else {
+                            "False"
+                        }
+                    }
+                    None if self.input_is_declared_source_payload(input) => return Ok(None),
+                    None => {
+                        let value = read_textlike(input).ok_or_else(|| {
+                            format!(
+                                "source `{source}` for bool target `{target}` cannot read match input `{input}`"
+                            )
+                        })?;
+                        if value.is_empty() { "True" } else { "False" }
+                    }
                 };
                 let Some(arm) = arms
                     .iter()
@@ -41763,6 +42182,9 @@ impl DerivedEquationPlan {
             RuntimeDerivedTextExpression::MatchConst { input, arms } => {
                 let current = match source_payload_match_input(input, source, key, text, address, payload) {
                     Some(value) => Cow::Borrowed(value),
+                    None if source_payload_field_from_input(input, source).is_some() => {
+                        return Ok(None);
+                    }
                     None => Cow::Owned(read_root_text(input).ok_or_else(|| {
                         format!(
                             "derived text transform `{target}` from `{source}` requires match input `{input}`"
@@ -43197,9 +43619,8 @@ fn source_payload_value<'a>(
 }
 
 fn source_payload_field_from_input(input: &str, source: &str) -> Option<String> {
-    [source.to_owned()]
+    source_event_ref_variants(source)
         .into_iter()
-        .chain(source.strip_prefix("store.").map(str::to_owned))
         .find_map(|variant| {
             let suffix = source_payload_suffix_from_variant(input, &variant)?;
             Some(match suffix {
@@ -43219,10 +43640,7 @@ fn source_payload_field_from_input(input: &str, source: &str) -> Option<String> 
 }
 
 fn source_payload_suffix_from_variant<'a>(input: &'a str, variant: &str) -> Option<&'a str> {
-    if let Some(suffix) = input
-        .strip_prefix(variant)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-    {
+    if let Some(suffix) = source_suffix_after_variant(input, variant) {
         return Some(suffix);
     }
     let (base, event) = variant.rsplit_once('.')?;
@@ -43230,14 +43648,30 @@ fn source_payload_suffix_from_variant<'a>(input: &'a str, variant: &str) -> Opti
         format!("{base}.event.{event}"),
         format!("{base}.events.{event}"),
     ] {
-        if let Some(suffix) = input
-            .strip_prefix(&event_prefix)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-        {
+        if let Some(suffix) = source_suffix_after_variant(input, &event_prefix) {
             return Some(suffix);
         }
     }
     None
+}
+
+fn source_suffix_after_variant<'a>(input: &'a str, variant: &str) -> Option<&'a str> {
+    if input == variant {
+        return Some("");
+    }
+    if let Some(suffix) = input
+        .strip_prefix(variant)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+    {
+        return Some(suffix);
+    }
+    let dotted_variant = format!(".{variant}");
+    let start = input.find(&dotted_variant)?;
+    let suffix = &input[start + dotted_variant.len()..];
+    if suffix.is_empty() {
+        return Some("");
+    }
+    suffix.strip_prefix('.')
 }
 
 fn ir_read_path_is_bool_for_target(ir: &TypedProgram, target: &str, path: &str) -> bool {
@@ -43853,6 +44287,225 @@ fn source_then_field_value(exprs: &[AstExpr], source: &str) -> Option<FieldValue
     })
 }
 
+fn row_field_then_value(exprs: &[AstExpr], changed_field: &str) -> Option<FieldValue> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        if !row_field_then_input_matches(exprs, input, expr.line, changed_field) {
+            return None;
+        }
+        if let Some(output) = output {
+            return ast_simple_field_value_in_exprs(exprs, output)
+                .or_else(|| simple_field_value_in_expr_subtree(exprs, output))
+                .or_else(|| ast_simple_text_value_in_exprs(exprs, output).map(FieldValue::Text))
+                .or_else(|| simple_value_in_expr_subtree(exprs, output).map(FieldValue::Text));
+        }
+        simple_field_value_after_line(exprs, expr.line)
+            .or_else(|| simple_value_after_line(exprs, expr.line).map(FieldValue::Text))
+    })
+}
+
+fn row_field_then_input_matches(
+    exprs: &[AstExpr],
+    input: usize,
+    line: usize,
+    changed_field: &str,
+) -> bool {
+    ast_argument_value_in_exprs(exprs, input)
+        .filter(|path| !path.is_empty())
+        .or_else(|| simple_value_in_expr_subtree(exprs, input).filter(|path| !path.is_empty()))
+        .or_else(|| row_field_path_before_line(exprs, line, changed_field))
+        .filter(|path| !path.contains(".event."))
+        .is_some_and(|path| row_field_name(&path) == changed_field)
+}
+
+fn row_field_path_before_line(
+    exprs: &[AstExpr],
+    line: usize,
+    changed_field: &str,
+) -> Option<String> {
+    exprs
+        .iter()
+        .filter(|expr| expr.line < line)
+        .rev()
+        .find_map(|expr| match &expr.kind {
+            AstExprKind::Path(parts) => Some(parts.join(".")),
+            _ => None,
+        })
+        .filter(|path| !path.contains(".event.") && row_field_name(path) == changed_field)
+}
+
+fn source_event_transform_triggered_by_input(
+    exprs: &[AstExpr],
+    source: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+    payload: &BTreeMap<String, &str>,
+) -> bool {
+    exprs.iter().any(|expr| match expr.kind {
+        AstExprKind::When { input } => source_when_branch_triggers(
+            exprs, input, expr.line, source, key, text, address, payload,
+        ),
+        AstExprKind::Then { input, output } => {
+            source_then_event_input_matches(exprs, input, expr.line, source, key, text, address)
+                && !output.is_some_and(|output| expr_output_is_skip(exprs, output))
+        }
+        _ => false,
+    })
+}
+
+fn source_when_branch_triggers(
+    exprs: &[AstExpr],
+    input: usize,
+    line: usize,
+    source: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+    payload: &BTreeMap<String, &str>,
+) -> bool {
+    let Some(input_path) = ast_argument_value_in_exprs(exprs, input)
+        .filter(|path| !path.is_empty())
+        .or_else(|| source_payload_path_before_line(exprs, line, source))
+    else {
+        return false;
+    };
+    let Some(current) =
+        source_payload_match_input(&input_path, source, key, text, address, payload)
+    else {
+        return false;
+    };
+    let Some(output) = source_when_matching_arm_output(exprs, line, current) else {
+        return false;
+    };
+    !output.is_some_and(|output| expr_output_is_skip(exprs, output))
+}
+
+fn source_when_matching_arm_output(
+    exprs: &[AstExpr],
+    when_line: usize,
+    current: &str,
+) -> Option<Option<usize>> {
+    let end_line = exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    let mut fallback = None;
+    for expr in exprs
+        .iter()
+        .filter(|expr| expr.line >= when_line && expr.line < end_line)
+    {
+        let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
+            continue;
+        };
+        let Some(pattern) = runtime_match_const_pattern_label(pattern) else {
+            continue;
+        };
+        if pattern == current {
+            return Some(*output);
+        }
+        if pattern == "__" {
+            fallback = Some(*output);
+        }
+    }
+    fallback
+}
+
+fn source_then_event_input_matches(
+    exprs: &[AstExpr],
+    input: usize,
+    line: usize,
+    source: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+) -> bool {
+    ast_argument_value_in_exprs(exprs, input)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| source_event_path_matches_input_kind(&path, source, key, text, address))
+        || source_event_path_immediately_before_line_matches(
+            exprs, line, source, key, text, address,
+        )
+}
+
+fn source_event_path_immediately_before_line_matches(
+    exprs: &[AstExpr],
+    line: usize,
+    source: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+) -> bool {
+    for expr in exprs.iter().filter(|expr| expr.line < line).rev() {
+        match &expr.kind {
+            AstExprKind::Path(parts) => {
+                return source_event_path_matches_input_kind(
+                    &parts.join("."),
+                    source,
+                    key,
+                    text,
+                    address,
+                );
+            }
+            AstExprKind::When { .. } | AstExprKind::Then { .. } | AstExprKind::MatchArm { .. } => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn source_event_path_matches_input_kind(
+    path: &str,
+    source: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+) -> bool {
+    source_event_ref_variants(source).iter().any(|variant| {
+        source_suffix_after_variant(path, variant).is_some_and(|suffix| {
+            source_event_suffix_matches_input_kind(suffix, key, text, address)
+        })
+    }) || source
+        .strip_prefix("store.")
+        .and_then(|suffix| suffix.split_once('.').map(|(_, tail)| tail))
+        .filter(|tail| !tail.is_empty())
+        .and_then(|tail| source_suffix_after_variant(path, tail))
+        .is_some_and(|suffix| source_event_suffix_matches_input_kind(suffix, key, text, address))
+}
+
+fn source_event_suffix_matches_input_kind(
+    suffix: &str,
+    key: Option<&str>,
+    text: Option<&str>,
+    address: Option<&str>,
+) -> bool {
+    match suffix {
+        "change.text" | "event.change.text" | "events.change.text" => text.is_some(),
+        "key_down.key" | "event.key_down.key" | "events.key_down.key" => key.is_some(),
+        "event.address" | "events.address" => address.is_some(),
+        "blur" | "event.blur" | "events.blur" => {
+            key.is_none() && text.is_none() && address.is_none()
+        }
+        _ => true,
+    }
+}
+
+fn expr_output_is_skip(exprs: &[AstExpr], output: usize) -> bool {
+    ast_simple_text_value_in_exprs(exprs, output).as_deref() == Some("SKIP")
+}
+
 fn source_then_list_find_value_expression(
     target: &str,
     exprs: &[AstExpr],
@@ -44098,23 +44751,14 @@ fn source_is_scoped(ir: &TypedProgram, source: &str) -> bool {
 }
 
 fn source_event_path_matches(path: &str, source: &str) -> bool {
-    source_event_ref_variants(source).iter().any(|variant| {
-        path == variant
-            || path
-                .strip_prefix(variant)
-                .is_some_and(|rest| rest.starts_with('.'))
-    }) || source
-        .strip_prefix("store.")
-        .and_then(|suffix| suffix.split_once('.').map(|(_, tail)| tail))
-        .filter(|tail| !tail.is_empty())
-        .is_some_and(|tail| {
-            path == tail
-                || path
-                    .strip_prefix(tail)
-                    .is_some_and(|rest| rest.starts_with('.'))
-                || path.ends_with(&format!(".{tail}"))
-                || path.contains(&format!(".{tail}."))
-        })
+    source_event_ref_variants(source)
+        .iter()
+        .any(|variant| source_suffix_after_variant(path, variant).is_some())
+        || source
+            .strip_prefix("store.")
+            .and_then(|suffix| suffix.split_once('.').map(|(_, tail)| tail))
+            .filter(|tail| !tail.is_empty())
+            .is_some_and(|tail| source_suffix_after_variant(path, tail).is_some())
 }
 
 fn source_event_ref_variants(source: &str) -> Vec<String> {
@@ -44285,6 +44929,7 @@ impl SourceRoute {
                     }
                     ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::MatchValueConst { .. }
+                    | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. }
                     | ScalarUpdateExpression::ListFindValue { .. } => {
                         SourceRouteTextAction::Computed
@@ -44315,6 +44960,7 @@ impl SourceRoute {
                     ScalarUpdateExpression::SourcePayload(_) => SourceRouteBoolAction::SourcePulse,
                     ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::MatchValueConst { .. }
+                    | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
                     | ScalarUpdateExpression::MatchNumberInfixConst { .. } => {
                         SourceRouteBoolAction::Match
                     }
@@ -49895,7 +50541,11 @@ document: Document/new(root: Element/label(element: [], label: store.page_label)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let materializations = generic
-            .materialize_root_derived_field_commits_for_changed_reads(dirty_reads, None)
+            .materialize_root_derived_field_commits_for_changed_reads(
+                dirty_reads,
+                None,
+                &BTreeSet::new(),
+            )
             .expect("synthetic nested-child dirty wave should materialize");
         let materialized_paths = generic.root_materialization_stats.samples[sample_start..]
             .iter()
@@ -50668,6 +51318,316 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
             .collect::<Vec<_>>();
         assert_eq!(editing.len(), 1);
         assert_eq!(editing[0]["title"], "Finish TodoMVC renderer");
+    }
+
+    #[test]
+    fn live_runtime_routes_physical_todomvc_row_edit_events_by_target_text() {
+        let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/todo_mvc_physical/RUN.bn");
+        let scenario = parse_scenario(Path::new("../../examples/todo_mvc_physical.scn"))
+            .expect("physical TodoMVC scenario should parse");
+        let units =
+            source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
+        let mut runtime = LiveRuntime::from_project("physical-todomvc-live-row-routing", &units)
+            .expect("physical TodoMVC runtime should initialize from manifest units");
+        {
+            let generic = runtime
+                .runtime
+                .generic
+                .as_ref()
+                .expect("physical TodoMVC should use generic runtime");
+            let title_route = generic
+                .source_routes
+                .for_source("todo.todo_elements.todo_title_element")
+                .expect("physical TodoMVC row title source route should be compiled");
+            let editing_route = generic
+                .source_routes
+                .for_source("todo.todo_elements.editing_todo_title_element")
+                .expect("physical TodoMVC editing source route should be compiled");
+            let selected_todo_branches = generic
+                .scalar_equations
+                .branches
+                .iter()
+                .filter(|branch| branch.target == "store.selected_todo_id")
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_todo_transforms = generic
+                .derived_equations
+                .text_transforms
+                .iter()
+                .filter(|transform| transform.target == "store.selected_todo_id")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(
+                title_route
+                    .root_scalar_targets
+                    .iter()
+                    .any(|target| target.target == "store.selected_todo_id")
+                    || title_route
+                        .derived_text_targets
+                        .iter()
+                        .any(|target| target == "store.selected_todo_id"),
+                "row title route should update selected_todo_id, root_targets={:?}, derived_targets={:?}, actions={:?}, selected_branches={:?}, selected_transforms={:?}",
+                title_route.root_scalar_targets,
+                title_route.derived_text_targets,
+                title_route.actions,
+                selected_todo_branches,
+                selected_todo_transforms
+            );
+            assert!(
+                editing_route
+                    .derived_text_targets
+                    .iter()
+                    .any(|target| target == "store.selected_todo_id"),
+                "editing route should update selected_todo_id on Escape/title commit, derived_targets={:?}, actions={:?}, selected_transforms={:?}",
+                editing_route.derived_text_targets,
+                editing_route.actions,
+                selected_todo_transforms
+            );
+            assert!(
+                selected_todo_transforms.iter().any(|transform| {
+                    transform.source == "todo.todo_elements.editing_todo_title_element"
+                        && matches!(
+                            transform.expression,
+                            RuntimeDerivedTextExpression::MatchConst { .. }
+                        )
+                }),
+                "editing selected_todo_id transform should be a key match, selected_transforms={:?}",
+                selected_todo_transforms
+            );
+            let selected_root = generic
+                .generic_derived
+                .root_field_plan("store.selected_todo_id")
+                .expect("selected_todo_id should have a generic root plan");
+            let selected_exprs = statement_ast_exprs(
+                &selected_root.statement,
+                &generic.generic_derived.expressions,
+            );
+            assert_eq!(
+                row_field_then_value(&selected_exprs, "title_to_update"),
+                Some(FieldValue::Text("None".to_owned())),
+                "selected_todo_id should expose the row-field commit branch, editing_route_actions={:?}, exprs={selected_exprs:?}",
+                editing_route.actions
+            );
+        }
+
+        let mut edit_commit_seen = false;
+        for step in &scenario.step {
+            let Some(_) = step.expected_source_event.as_ref() else {
+                continue;
+            };
+            let output = runtime
+                .apply_source_event_for_document_window(live_event_from_step(step), 0, 16, 0, 16)
+                .unwrap_or_else(|error| {
+                    panic!("{} should apply through LiveRuntime: {error}", step.id)
+                });
+            if step.id == "edit-todo" {
+                assert!(
+                    !output.semantic_deltas.is_empty(),
+                    "edit-todo should produce public-runtime semantic deltas"
+                );
+                assert_eq!(
+                    output.state_summary["todos"][4]["edited_title"],
+                    "Ship physical TodoMVC"
+                );
+                let target_id = output.state_summary["todos"][4]["id"]
+                    .as_str()
+                    .expect("target row should expose an id");
+                assert_eq!(
+                    output.state_summary["selected_todo_id"], target_id,
+                    "edit-todo should select the row so the editing input renders"
+                );
+            }
+            if step.id == "cancel-edit" {
+                assert!(
+                    !output.semantic_deltas.is_empty(),
+                    "cancel-edit should produce public-runtime semantic deltas"
+                );
+                assert_eq!(
+                    output.state_summary["selected_todo_id"], "None",
+                    "Escape should clear the selected row so the title view renders again"
+                );
+            }
+            if step.id == "edit-todo-commit-open" {
+                assert!(
+                    !output.semantic_deltas.is_empty(),
+                    "edit-todo-commit-open should produce public-runtime semantic deltas"
+                );
+                assert_eq!(
+                    output.state_summary["todos"][4]["edited_title"],
+                    "Ship physical TodoMVC"
+                );
+                let target_id = output.state_summary["todos"][4]["id"]
+                    .as_str()
+                    .expect("target row should expose an id");
+                assert_eq!(
+                    output.state_summary["selected_todo_id"], target_id,
+                    "edit-todo-commit-open should reselect the row after Escape"
+                );
+            }
+            if step.id == "edit-todo-change" {
+                assert!(
+                    !output.semantic_deltas.is_empty(),
+                    "edit-todo-change should produce public-runtime semantic deltas"
+                );
+                let target_id = output.state_summary["todos"][4]["id"]
+                    .as_str()
+                    .expect("target row should expose an id");
+                assert_eq!(
+                    output.state_summary["selected_todo_id"], target_id,
+                    "typing should keep the editor open until a commit/cancel event"
+                );
+                assert_eq!(
+                    output.state_summary["todos"][4]["edited_title"],
+                    "Ship physical TodoMVC edited"
+                );
+                assert_eq!(
+                    output.state_summary["todos"][4]["title"], "Ship physical TodoMVC",
+                    "typing should update the draft, not commit the title"
+                );
+            }
+            if step.id == "edit-todo-commit" {
+                assert!(
+                    !output.semantic_deltas.is_empty(),
+                    "edit-todo-commit should produce public-runtime semantic deltas"
+                );
+                assert_eq!(
+                    output.state_summary["todos"][4]["title"],
+                    "Ship physical TodoMVC edited"
+                );
+                assert_eq!(
+                    output.state_summary["selected_todo_id"], "None",
+                    "Enter should clear selected_todo_id after committing the edited title; row={:?}, deltas={:?}",
+                    output.state_summary["todos"][4], output.semantic_deltas
+                );
+                edit_commit_seen = true;
+                break;
+            }
+        }
+
+        assert!(edit_commit_seen, "scenario should include edit-todo-commit");
+        let generic = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .expect("physical TodoMVC should use generic runtime");
+        assert_eq!(
+            generic
+                .list_row_textlike("todos", 4, "title")
+                .expect("target row should commit its edited title"),
+            "Ship physical TodoMVC edited"
+        );
+    }
+
+    #[test]
+    fn live_runtime_applies_physical_todomvc_theme_source_events() {
+        let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/todo_mvc_physical/RUN.bn");
+        let units =
+            source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
+        let mut runtime = LiveRuntime::from_project("physical-todomvc-live-theme-events", &units)
+            .expect("physical TodoMVC runtime should initialize from manifest units");
+
+        assert_eq!(
+            runtime.document_state_summary()["theme_options"]["name"],
+            "Classic"
+        );
+        for (source, expected_name) in [
+            ("store.elements.theme_switcher.professional", "Professional"),
+            (
+                "store.elements.theme_switcher.glassmorphism",
+                "Glassmorphism",
+            ),
+            ("store.elements.theme_switcher.neobrutalism", "Neobrutalism"),
+            ("store.elements.theme_switcher.neumorphism", "Neumorphism"),
+        ] {
+            let output = runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: source.to_owned(),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap_or_else(|error| {
+                    panic!("{source} should apply through LiveRuntime: {error}")
+                });
+            assert_eq!(
+                output.state_summary["theme_options"]["name"], expected_name,
+                "{source} should update the physical TodoMVC theme name, deltas={:?}",
+                output.semantic_deltas
+            );
+            assert!(output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("theme_options.name")
+            }));
+        }
+    }
+
+    #[test]
+    fn derived_text_transform_recognizes_row_alias_inline_key_match() {
+        let source = r#"
+HOLD
+store: [
+    todos:
+        LIST {
+            [title: TEXT { Ship physical TodoMVC }]
+        }
+        |> List/map(todo, new: new_todo(title: todo.title))
+    selected_todo_id: LATEST {
+        None
+        todos
+            |> List/map(old, new: LATEST {
+                old.todo_elements.editing_todo_title_element.event.key_down.key
+                    |> WHEN { Escape => None, __ => SKIP }
+                old.todo_elements.todo_title_element.event.double_click
+                    |> THEN { old.id }
+            })
+            |> List/latest()
+    }
+]
+
+FUNCTION new_todo(title) {
+    [
+        todo_elements: [
+            editing_todo_title_element: SOURCE
+            todo_title_element: SOURCE
+        ]
+        id: TodoId[id: Ulid/generate()]
+        title: title
+    ]
+}
+"#;
+        let parsed =
+            boon_parser::parse_source("runtime-row-alias-inline-key-match.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let selected = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.selected_todo_id")
+            .expect("selected_todo_id should lower as a derived value");
+        let exprs = statement_ast_exprs(&selected.statement, &ir.expressions);
+        let expression = source_event_transform_text_expression(
+            selected,
+            "todo.todo_elements.editing_todo_title_element",
+            &ir.expressions,
+            &ir.functions,
+        );
+        assert_eq!(
+            expression,
+            RuntimeDerivedTextExpression::MatchConst {
+                input: "old.todo_elements.editing_todo_title_element.event.key_down.key".to_owned(),
+                arms: vec![
+                    UpdateMatchArm {
+                        pattern: "Escape".to_owned(),
+                        output: "None".to_owned(),
+                    },
+                    UpdateMatchArm {
+                        pattern: "__".to_owned(),
+                        output: "SKIP".to_owned(),
+                    },
+                ],
+            },
+            "runtime transform should compile the row-alias inline key match, exprs={exprs:?}, statement={:?}",
+            selected.statement
+        );
     }
 
     #[test]
@@ -56109,7 +57069,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             );
             let reads = generic.list_structure_changed_read_keys(&list);
             generic
-                .materialize_root_derived_field_commits_for_changed_reads(reads, None)
+                .materialize_root_derived_field_commits_for_changed_reads(
+                    reads,
+                    None,
+                    &BTreeSet::new(),
+                )
                 .expect("same-count remove/append should rematerialize projected root list");
             generic
                 .root_materialization_stats
@@ -58642,11 +59606,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             zoomed["store"]["viewport_window_key"],
             "simple.vcd|Close|Center"
         );
-        assert_eq!(zoomed["store"]["viewport_label"], "100 s - 250 s");
-        assert_eq!(zoomed["store"]["keyboard_viewport_label"], "100 s - 250 s");
-        assert_eq!(waveform_value_labels(&zoomed, "clk"), ["0xc", "0x0"]);
-        assert_eq!(waveform_value_width(&zoomed, "clk", "0xc"), 120);
-        assert_eq!(waveform_value_width(&zoomed, "clk", "0x0"), 240);
+        assert_eq!(zoomed["store"]["viewport_label"], "0 s - 150 s");
+        assert_eq!(zoomed["store"]["keyboard_viewport_label"], "0 s - 150 s");
+        assert_eq!(waveform_value_labels(&zoomed, "clk"), ["0xa", "0xc"]);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0xa"), 120);
+        assert_eq!(waveform_value_width(&zoomed, "clk", "0xc"), 240);
 
         let closer = runtime
             .apply_source_event(LiveSourceEvent {
@@ -58657,9 +59621,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .expect("second zoom-in should apply")
             .state_summary;
         assert_eq!(closer["store"]["zoom_level"], "Closer");
-        assert_eq!(closer["store"]["viewport_label"], "180 s - 220 s");
-        assert_eq!(waveform_value_labels(&closer, "clk"), ["0x0"]);
-        assert_eq!(waveform_value_width(&closer, "clk", "0x0"), 360);
+        assert_eq!(closer["store"]["viewport_label"], "30 s - 70 s");
+        assert_eq!(waveform_value_labels(&closer, "clk"), ["0xa", "0xc"]);
+        assert_eq!(waveform_value_width(&closer, "clk", "0xa"), 180);
+        assert_eq!(waveform_value_width(&closer, "clk", "0xc"), 180);
 
         let zoom_center_origin = runtime
             .apply_source_event(LiveSourceEvent {
@@ -58959,6 +59924,83 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn novywave_hover_zoom_center_tracks_current_viewport_without_reanchoring() {
+        let handle = std::thread::Builder::new()
+            .name("novywave-hover-zoom-current-viewport".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(novywave_hover_zoom_center_tracks_current_viewport_without_reanchoring_impl)
+            .expect("NovyWave hover zoom test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn novywave_hover_zoom_center_tracks_current_viewport_without_reanchoring_impl() {
+        let source_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
+        let mut runtime = LiveRuntime::from_project("novywave-hover-zoom-current-viewport", &units)
+            .expect("NovyWave runtime should initialize from manifest units");
+
+        let zoomed = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.zoom_in".to_owned(),
+                target_text: Some("Zoom+".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("zoom-in should apply")
+            .state_summary;
+        assert_eq!(zoomed["store"]["zoom_level"], "Close");
+        assert_eq!(zoomed["store"]["viewport_label"], "0 s - 150 s");
+
+        let hover_two_thirds = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.waveform_hover".to_owned(),
+                pointer_x: Some("240".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform hover should update zoom center from the current viewport")
+            .state_summary;
+        assert_eq!(hover_two_thirds["store"]["zoom_center_label"], "100 s");
+        assert_eq!(
+            hover_two_thirds["store"]["viewport_label"], "0 s - 150 s",
+            "hover must move only the zoom-center guide, not re-anchor the viewport"
+        );
+        assert_eq!(
+            hover_two_thirds["store"]["waveform_zoom_center_offset"], 240,
+            "zoom-center guide should remain under the hovered x position"
+        );
+
+        let further_zoom = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.zoom_in".to_owned(),
+                target_text: Some("Zoom+".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("second zoom-in should keep using the committed anchor")
+            .state_summary;
+        assert_eq!(further_zoom["store"]["zoom_level"], "Closer");
+        assert_eq!(
+            further_zoom["store"]["viewport_label"], "30 s - 70 s",
+            "hover-only presentation state must not silently become the viewport anchor"
+        );
+
+        let hover_middle = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.elements.waveform_hover".to_owned(),
+                pointer_x: Some("180".to_owned()),
+                pointer_width: Some("360".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("waveform hover should keep using the committed current viewport")
+            .state_summary;
+        assert_eq!(hover_middle["store"]["zoom_center_label"], "50 s");
+        assert_eq!(hover_middle["store"]["viewport_label"], "30 s - 70 s");
+        assert_eq!(hover_middle["store"]["waveform_zoom_center_offset"], 180);
+    }
+
+    #[test]
     fn novywave_sparse_timeline_replay_preserves_row_local_format() {
         fn timeline_step(
             id: &str,
@@ -59094,7 +60136,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
     }
 
-    fn novywave_event_from_step(step: &ScenarioStep) -> LiveSourceEvent {
+    fn live_event_from_step(step: &ScenarioStep) -> LiveSourceEvent {
         fn string_field(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<String> {
             table
                 .get(key)
@@ -59138,6 +60180,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             source_id: u64_field(expected, "source_id"),
             ..LiveSourceEvent::default()
         }
+    }
+
+    fn novywave_event_from_step(step: &ScenarioStep) -> LiveSourceEvent {
+        live_event_from_step(step)
     }
 
     fn apply_novywave_scenario_until(

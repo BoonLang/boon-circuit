@@ -104,6 +104,7 @@ const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
 const DEFAULT_PREVIEW_HEIGHT: f32 = 720.0;
 const PHYSICAL_TODOMVC_PREVIEW_WIDTH: f32 = 962.0;
 const PHYSICAL_TODOMVC_PREVIEW_HEIGHT: f32 = 1017.0;
+const PREVIEW_DEEP_WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = run() {
@@ -3899,6 +3900,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
+    let operator_host_input_source_event_limit =
+        numeric_arg(args, "--operator-host-input-source-event-limit")
+            .map(|limit| limit as usize)
+            .unwrap_or(DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT);
     let skip_operator_host_input_probe = args
         .iter()
         .any(|arg| arg == "--skip-operator-host-input-probe");
@@ -4150,6 +4155,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 replace_code_file.as_deref(),
                                 replace_code_expected_hash.as_deref(),
                                 skip_operator_host_input_probe,
+                                operator_host_input_source_event_limit,
                                 Duration::from_millis(ipc_probe_timeout_ms),
                             )
                             .map_err(|error| error.to_string())
@@ -4164,14 +4170,16 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "preview_mutation_allowed": false
                             }))
                         };
-                        if let Err(error) = &ipc_probe {
-                            return write_role_failure_report(
-                                report,
-                                "dev",
-                                &role_args,
-                                format!("dev IPC probe failed: {error}"),
-                            );
-                        }
+                        let ipc_probe = ipc_probe.unwrap_or_else(|error| {
+                            json!({
+                                "status": "fail",
+                                "diagnostic": format!("dev IPC probe failed: {error}"),
+                                "dev_connected_to_preview": false,
+                                "connect": connect,
+                                "preview_mutation_allowed": false,
+                                "surface_proof_preserved_after_ipc_failure": true
+                            })
+                        });
                         let dev_shell_interaction_probe = report_shell
                             .lock()
                             .map(|shell| {
@@ -4198,12 +4206,12 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "editor_code_file": editor_code_file,
                                 "replace_code_file": replace_code_file,
                                 "replace_code_expected_hash": replace_code_expected_hash,
-                                "ipc_probe": ipc_probe.unwrap(),
+                                "ipc_probe": ipc_probe,
                                 "verification_probe_enabled": probe,
                                 "dev_shell_interaction_probe": dev_shell_interaction_probe,
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
-                                "note": "dev role created an app_window Wayland window, presented one wgpu frame, and completed a bounded live IPC stress exchange with preview"
+                                "note": "dev role created an app_window Wayland window, presented one wgpu frame, and recorded bounded live IPC probe evidence separately"
                             }),
                         )
                     })
@@ -4403,6 +4411,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "256".to_owned(),
         "--ipc-probe-timeout-ms".to_owned(),
         dev_ipc_probe_timeout_ms.to_string(),
+        "--operator-host-input-source-event-limit".to_owned(),
+        if example == "novywave" {
+            DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT.to_string()
+        } else {
+            "0".to_owned()
+        },
         "--title-token".to_owned(),
         title_token.clone(),
         "--input-sample-delay-ms".to_owned(),
@@ -15466,6 +15480,7 @@ impl DevWindowShell {
         let (tx, rx) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("boon-native-dev-preview-replace".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
             .spawn(move || {
                 let worker_started = Instant::now();
                 let payload_started = Instant::now();
@@ -19841,6 +19856,7 @@ fn lower_canonical_document_element(
             boon_document_model::StyleValue::Text(scope_key.to_owned()),
         );
     }
+    apply_context_row_identity_to_document_node(context, &mut node);
 
     lower_canonical_element_style(statement, expressions, context, &mut node);
     lower_canonical_element_text(statement, expressions, context, &mut node);
@@ -20302,6 +20318,11 @@ fn lower_mapped_document_children(
             item_context.local_origins.insert(
                 mapped.item_binding_name.clone(),
                 BTreeSet::from([list_path]),
+            );
+        } else if let Some(row_origin) = document_row_origin_for_item(item) {
+            item_context.local_origins.insert(
+                mapped.item_binding_name.clone(),
+                BTreeSet::from([row_origin]),
             );
         }
         let scoped = if !mapped.template_args.is_empty() {
@@ -20812,6 +20833,10 @@ fn lower_canonical_list_map_children(
             scoped
                 .local_origins
                 .insert(item_name.to_owned(), BTreeSet::from([list_path]));
+        } else if let Some(row_origin) = document_row_origin_for_item(item) {
+            scoped
+                .local_origins
+                .insert(item_name.to_owned(), BTreeSet::from([row_origin]));
         }
         let child_scope = if scope_key.is_empty() {
             format!("{item_name}-{index}")
@@ -24580,6 +24605,13 @@ fn lower_document_element(
     let mut node =
         boon_document_model::DocumentNode::new(node_id, document_node_kind_from_name(&kind_name));
     node.parent = Some(parent.clone());
+    if !scope_key.is_empty() {
+        node.style.insert(
+            "__scope_key".to_owned(),
+            boon_document_model::StyleValue::Text(scope_key.to_owned()),
+        );
+    }
+    apply_context_row_identity_to_document_node(context, &mut node);
 
     for child in &statement.children {
         let Some(field) = document_field_name(child) else {
@@ -24954,14 +24986,77 @@ fn normalized_document_data_path(path: &str) -> String {
 }
 
 fn document_list_origin_for_item(list_path: &str, item: &Value) -> Option<String> {
-    let boon = item.as_object()?.get("$boon")?.as_object()?;
-    let key = boon.get("row_key")?.as_u64()?;
-    let generation = boon.get("generation")?.as_u64()?;
+    let identity = document_row_identity_for_item(item)?;
     let list = normalized_document_data_path(list_path);
     if list.is_empty() {
         return None;
     }
-    Some(format!("@list:{list}:{key}:{generation}"))
+    Some(format!(
+        "@list:{list}:{}:{}",
+        identity.key, identity.generation
+    ))
+}
+
+fn document_row_origin_for_item(item: &Value) -> Option<String> {
+    let identity = document_row_identity_for_item(item)?;
+    Some(format!("@row:{}:{}", identity.key, identity.generation))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DocumentRowIdentity {
+    key: u64,
+    generation: u64,
+}
+
+fn document_row_identity_for_item(item: &Value) -> Option<DocumentRowIdentity> {
+    let boon = item.as_object()?.get("$boon")?.as_object()?;
+    let key = boon.get("row_key")?.as_u64()?;
+    let generation = boon.get("generation")?.as_u64()?;
+    Some(DocumentRowIdentity { key, generation })
+}
+
+fn document_row_identity_from_origin(origin: &str) -> Option<DocumentRowIdentity> {
+    let (key, generation) = if let Some(rest) = origin.strip_prefix("@list:") {
+        let mut parts = rest.split(':');
+        let _list = parts.next()?.trim();
+        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)
+    } else if let Some(rest) = origin.strip_prefix("@row:") {
+        let mut parts = rest.split(':');
+        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?)
+    } else {
+        return None;
+    };
+    Some(DocumentRowIdentity { key, generation })
+}
+
+fn document_context_unique_row_identity(
+    context: &DocumentEvalContext<'_>,
+) -> Option<DocumentRowIdentity> {
+    let identities = context
+        .local_origins
+        .merged()
+        .values()
+        .flat_map(|origins| origins.iter())
+        .filter_map(|origin| document_row_identity_from_origin(origin))
+        .collect::<BTreeSet<_>>();
+    (identities.len() == 1)
+        .then(|| identities.into_iter().next())
+        .flatten()
+}
+
+fn apply_context_row_identity_to_document_node(
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(identity) = document_context_unique_row_identity(context) else {
+        return;
+    };
+    node.style
+        .entry("row_key".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(identity.key as f64));
+    node.style.entry("row_generation".to_owned()).or_insert(
+        boon_document_model::StyleValue::Number(identity.generation as f64),
+    );
 }
 
 fn document_data_read_key_for_list_field(
@@ -25255,6 +25350,10 @@ fn lower_document_for_each(
             scoped
                 .local_origins
                 .insert(item_name.clone(), BTreeSet::from([origin]));
+        } else if let Some(row_origin) = document_row_origin_for_item(item) {
+            scoped
+                .local_origins
+                .insert(item_name.clone(), BTreeSet::from([row_origin]));
         }
         let child_scope = if scope_key.is_empty() {
             format!("{item_name}-{index}")
@@ -29105,6 +29204,8 @@ struct PreviewHoveredClickCandidate {
     target_text: Option<String>,
     address: Option<String>,
     target_occurrence: Option<usize>,
+    target_key: Option<u64>,
+    target_generation: Option<u64>,
     accepts_key_focus: bool,
     text_change: bool,
     link: bool,
@@ -29116,6 +29217,8 @@ struct PreviewActiveDrag {
     address: Option<String>,
     target_text: Option<String>,
     target_occurrence: Option<usize>,
+    target_key: Option<u64>,
+    target_generation: Option<u64>,
     last_x: f64,
     last_y: f64,
 }
@@ -29391,6 +29494,8 @@ fn preview_take_drag_events_from_input(
                 address: route_table.address(&source_node),
                 target_text: route_table.target_text(&source_node),
                 target_occurrence: route_table.target_occurrence_for_source(&source_node, &source),
+                target_key: route_table.target_key(&source_node),
+                target_generation: route_table.target_generation(&source_node),
                 source,
                 last_x: position.x,
                 last_y: position.y,
@@ -29416,6 +29521,8 @@ fn preview_take_drag_events_from_input(
                 &source_node,
                 &source,
             ),
+            target_key: layout_row_key_for_node(layout_proof, &source_node),
+            target_generation: layout_row_generation_for_node(layout_proof, &source_node),
             source,
             last_x: position.x,
             last_y: position.y,
@@ -29480,6 +29587,8 @@ fn preview_drag_live_event(
         address: active_drag.address.clone(),
         target_text: active_drag.target_text.clone(),
         target_occurrence: active_drag.target_occurrence,
+        target_key: active_drag.target_key,
+        target_generation: active_drag.target_generation,
         ..boon_runtime::LiveSourceEvent::default()
     }
 }
@@ -29521,6 +29630,11 @@ fn source_hit_center_for_target(
         source_intents_from_snapshot = snapshot.source_intents.clone();
         &source_intents_from_snapshot
     };
+    let hit_regions = layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let target_node = source_intents
         .iter()
         .find_map(|intent| {
@@ -29549,7 +29663,12 @@ fn source_hit_center_for_target(
                     .get("source_path")
                     .and_then(serde_json::Value::as_str)
                     == Some(source_event)
-                    && source_intent_matches_event_target(intent, source_intents, &target_event)
+                    && source_intent_matches_event_target_with_regions(
+                        intent,
+                        source_intents,
+                        hit_regions,
+                        &target_event,
+                    )
                 {
                     intent
                         .get("node")
@@ -29945,7 +30064,7 @@ fn preview_apply_repeatable_text_input_key(
             }
             preview_reset_caret_blink(input_state);
             if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
-                let change = boon_runtime::LiveSourceEvent {
+                let mut change = boon_runtime::LiveSourceEvent {
                     source,
                     text: Some(input_state.focused_text.clone()),
                     key: None,
@@ -29960,6 +30079,7 @@ fn preview_apply_repeatable_text_input_key(
                     target_occurrence: None,
                     ..boon_runtime::LiveSourceEvent::default()
                 };
+                apply_layout_row_identity_to_event(layout, focused_node, None, &mut change);
                 return preview_apply_live_event(
                     source_path,
                     source_text,
@@ -29978,7 +30098,7 @@ fn preview_apply_repeatable_text_input_key(
                 preview_insert_char_at_caret(input_state, character);
                 preview_reset_caret_blink(input_state);
                 if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
-                    let change = boon_runtime::LiveSourceEvent {
+                    let mut change = boon_runtime::LiveSourceEvent {
                         source,
                         text: Some(input_state.focused_text.clone()),
                         key: None,
@@ -29993,6 +30113,7 @@ fn preview_apply_repeatable_text_input_key(
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    apply_layout_row_identity_to_event(layout, focused_node, None, &mut change);
                     return preview_apply_live_event(
                         source_path,
                         source_text,
@@ -30178,6 +30299,8 @@ fn preview_try_apply_simple_source_click_input(
                     pointer_height,
                     target_text: candidate.target_text.clone(),
                     target_occurrence: candidate.target_occurrence,
+                    target_key: candidate.target_key,
+                    target_generation: candidate.target_generation,
                     ..boon_runtime::LiveSourceEvent::default()
                 };
                 (
@@ -30247,11 +30370,13 @@ fn preview_try_apply_simple_source_click_input(
                         target_text: target_text.clone(),
                         address: route_table.address(node),
                         target_occurrence,
+                        target_key: route_table.target_key(node),
+                        target_generation: route_table.target_generation(node),
                         accepts_key_focus: route_table.accepts_key_focus(node),
                         text_change: false,
                         link: false,
                     };
-                    let event = boon_runtime::LiveSourceEvent {
+                    let mut event = boon_runtime::LiveSourceEvent {
                         source,
                         text: target_text.clone(),
                         key: None,
@@ -30264,6 +30389,7 @@ fn preview_try_apply_simple_source_click_input(
                         target_occurrence,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    route_table.apply_row_identity_to_event(node, &mut event);
                     let mut events = Vec::new();
                     if !preserve_focus
                         && let Some(blur) = preview_focused_blur_event_for_route_table(
@@ -30495,6 +30621,8 @@ fn preview_try_apply_simple_pointer_move_input(
                         target_text: target_text.clone(),
                         address: route_table.address(&node),
                         target_occurrence,
+                        target_key: route_table.target_key(&node),
+                        target_generation: route_table.target_generation(&node),
                         accepts_key_focus: route_table.accepts_key_focus(&node),
                         text_change: route_table
                             .source_for_node_intent(&node, "change")
@@ -30695,7 +30823,7 @@ fn preview_handle_mouse_release_for_route_hit(
             route_table.text_input_should_replace_on_type(&node);
         preview_reset_caret_blink(input_state);
         if !was_already_focused && let Some(source) = route_table.focus_source(&node) {
-            pending_mouse_events.push(boon_runtime::LiveSourceEvent {
+            let mut focus_event = boon_runtime::LiveSourceEvent {
                 source,
                 text: None,
                 key: None,
@@ -30709,7 +30837,9 @@ fn preview_handle_mouse_release_for_route_hit(
                     .or_else(|| route_table.target_text(&node)),
                 target_occurrence: None,
                 ..boon_runtime::LiveSourceEvent::default()
-            });
+            };
+            route_table.apply_row_identity_to_event(&node, &mut focus_event);
+            pending_mouse_events.push(focus_event);
         }
         if let Some(mut event) = route_table.live_source_event_for_hit(hit, position, double_click)
         {
@@ -31066,7 +31196,7 @@ fn preview_apply_real_window_input_with_units(
                 if !was_already_focused
                     && let Some(source) = live_source_for_node_intent(layout, &node, "focus")
                 {
-                    pending_mouse_events.push(boon_runtime::LiveSourceEvent {
+                    let mut focus_event = boon_runtime::LiveSourceEvent {
                         source,
                         text: None,
                         key: None,
@@ -31080,7 +31210,14 @@ fn preview_apply_real_window_input_with_units(
                             .or_else(|| focused_target_text(layout, &node)),
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
-                    });
+                    };
+                    apply_layout_row_identity_to_event(
+                        layout,
+                        &node,
+                        Some(&hit_region),
+                        &mut focus_event,
+                    );
+                    pending_mouse_events.push(focus_event);
                 }
                 if let Some(mut event) =
                     live_source_event_for_hit_region(layout, &hit_region, position, double_click)
@@ -31235,7 +31372,7 @@ fn preview_apply_real_window_input_with_units(
                         .lock()
                         .map(|runtime| runtime.source_payload_has_text(&source))
                         .unwrap_or(false);
-                    let submit = boon_runtime::LiveSourceEvent {
+                    let mut submit = boon_runtime::LiveSourceEvent {
                         source,
                         text: carries_text.then_some(submitted_text.clone()),
                         key: Some("Enter".to_owned()),
@@ -31250,6 +31387,7 @@ fn preview_apply_real_window_input_with_units(
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    apply_layout_row_identity_to_event(layout, &focused_node, None, &mut submit);
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
@@ -31278,7 +31416,7 @@ fn preview_apply_real_window_input_with_units(
                 if let Some(source) = live_source_for_node_intent(layout, &focused_node, "escape")
                     .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
                 {
-                    let escape = boon_runtime::LiveSourceEvent {
+                    let mut escape = boon_runtime::LiveSourceEvent {
                         source,
                         text: None,
                         key: Some("Escape".to_owned()),
@@ -31293,6 +31431,7 @@ fn preview_apply_real_window_input_with_units(
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    apply_layout_row_identity_to_event(layout, &focused_node, None, &mut escape);
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
@@ -31326,7 +31465,7 @@ fn preview_apply_real_window_input_with_units(
                         now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
                 } else if let Some(source) = preview_key_down_source_for_node(layout, &focused_node)
                 {
-                    let key_down = boon_runtime::LiveSourceEvent {
+                    let mut key_down = boon_runtime::LiveSourceEvent {
                         source,
                         text: None,
                         key: Some(normalized_repeat_key(key)),
@@ -31341,6 +31480,7 @@ fn preview_apply_real_window_input_with_units(
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    apply_layout_row_identity_to_event(layout, &focused_node, None, &mut key_down);
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
@@ -31357,7 +31497,7 @@ fn preview_apply_real_window_input_with_units(
             }
             _ => {
                 if let Some(source) = preview_key_down_source_for_node(layout, &focused_node) {
-                    let key_down = boon_runtime::LiveSourceEvent {
+                    let mut key_down = boon_runtime::LiveSourceEvent {
                         source,
                         text: None,
                         key: Some(normalized_repeat_key(event.key.as_str())),
@@ -31372,6 +31512,7 @@ fn preview_apply_real_window_input_with_units(
                         target_occurrence: None,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
+                    apply_layout_row_identity_to_event(layout, &focused_node, None, &mut key_down);
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
@@ -31429,7 +31570,7 @@ fn preview_apply_real_window_input_with_units(
                     } else if let Some(source) =
                         preview_key_down_source_for_node(layout, &focused_node)
                     {
-                        let key_down = boon_runtime::LiveSourceEvent {
+                        let mut key_down = boon_runtime::LiveSourceEvent {
                             source,
                             text: None,
                             key: Some(normalized_repeat_key(&key)),
@@ -31444,6 +31585,12 @@ fn preview_apply_real_window_input_with_units(
                             target_occurrence: None,
                             ..boon_runtime::LiveSourceEvent::default()
                         };
+                        apply_layout_row_identity_to_event(
+                            layout,
+                            &focused_node,
+                            None,
+                            &mut key_down,
+                        );
                         latest_layout = Some(preview_apply_live_event(
                             source_path,
                             source_text,
@@ -33449,6 +33596,57 @@ fn document_hit_region_for_node(layout_proof: &Value, node: &str) -> Option<Valu
         .cloned()
 }
 
+fn layout_row_key_for_node(layout_proof: &Value, node: &str) -> Option<u64> {
+    document_hit_region_for_node(layout_proof, node)
+        .as_ref()
+        .and_then(layout_row_key_for_hit_region)
+}
+
+fn layout_row_generation_for_node(layout_proof: &Value, node: &str) -> Option<u64> {
+    document_hit_region_for_node(layout_proof, node)
+        .as_ref()
+        .and_then(layout_row_generation_for_hit_region)
+}
+
+fn layout_row_key_for_hit_region(hit_region: &Value) -> Option<u64> {
+    hit_region
+        .get("row_key")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            hit_region
+                .get("target_key")
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+fn layout_row_generation_for_hit_region(hit_region: &Value) -> Option<u64> {
+    hit_region
+        .get("row_generation")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            hit_region
+                .get("target_generation")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| layout_row_key_for_hit_region(hit_region).map(|_| 1))
+}
+
+fn apply_layout_row_identity_to_event(
+    layout_proof: &Value,
+    node: &str,
+    fallback_hit_region: Option<&Value>,
+    event: &mut boon_runtime::LiveSourceEvent,
+) {
+    let hit_region = document_hit_region_for_node(layout_proof, node);
+    let hit_region = hit_region.as_ref().or(fallback_hit_region);
+    if event.target_key.is_none() {
+        event.target_key = hit_region.and_then(layout_row_key_for_hit_region);
+    }
+    if event.target_generation.is_none() {
+        event.target_generation = hit_region.and_then(layout_row_generation_for_hit_region);
+    }
+}
+
 fn document_link_url_for_hit_region(layout_proof: &Value, hit_region: &Value) -> Option<String> {
     let node = hit_region.get("node")?.as_str()?;
     document_link_url_for_node(layout_proof, node)
@@ -33584,7 +33782,7 @@ fn live_source_event_for_hit_region(
         focused_target_occurrence_for_source(layout_proof, &source_node, &source);
     let (pointer_x, pointer_y, pointer_width, pointer_height) =
         pointer_payload_for_source_node(layout_proof, hit_region, &source_node, position);
-    Some(boon_runtime::LiveSourceEvent {
+    let mut event = boon_runtime::LiveSourceEvent {
         source,
         text: if prefer_double_click {
             Some(document_value_for_hit_region(layout_proof, hit_region).unwrap_or_default())
@@ -33600,7 +33798,9 @@ fn live_source_event_for_hit_region(
         target_text,
         target_occurrence,
         ..boon_runtime::LiveSourceEvent::default()
-    })
+    };
+    apply_layout_row_identity_to_event(layout_proof, &source_node, Some(hit_region), &mut event);
+    Some(event)
 }
 
 fn pointer_move_live_source_event_for_hit_region(
@@ -33618,7 +33818,7 @@ fn pointer_move_live_source_event_for_hit_region(
         focused_target_occurrence_for_source(layout_proof, &source_node, &source);
     let (pointer_x, pointer_y, pointer_width, pointer_height) =
         pointer_payload_for_source_node(layout_proof, hit_region, &source_node, position);
-    Some(boon_runtime::LiveSourceEvent {
+    let mut event = boon_runtime::LiveSourceEvent {
         source,
         text: target_text.clone(),
         key: None,
@@ -33630,7 +33830,9 @@ fn pointer_move_live_source_event_for_hit_region(
         target_text,
         target_occurrence,
         ..boon_runtime::LiveSourceEvent::default()
-    })
+    };
+    apply_layout_row_identity_to_event(layout_proof, &source_node, Some(hit_region), &mut event);
+    Some(event)
 }
 
 fn pointer_payload_for_hit_region(
@@ -33855,7 +34057,7 @@ fn preview_focused_blur_event(
         .map(|runtime| runtime.source_payload_has_text(&source))
         .unwrap_or(false)
         .then(|| input_state.focused_text.clone());
-    Some(boon_runtime::LiveSourceEvent {
+    let mut event = boon_runtime::LiveSourceEvent {
         source,
         text,
         key: None,
@@ -33869,7 +34071,9 @@ fn preview_focused_blur_event(
             .or_else(|| focused_target_text(layout_proof, focused_node)),
         target_occurrence: None,
         ..boon_runtime::LiveSourceEvent::default()
-    })
+    };
+    apply_layout_row_identity_to_event(layout_proof, focused_node, None, &mut event);
+    Some(event)
 }
 
 fn preview_focused_blur_event_for_route_table(
@@ -33885,7 +34089,7 @@ fn preview_focused_blur_event_for_route_table(
         .map(|runtime| runtime.source_payload_has_text(&source))
         .unwrap_or(false)
         .then(|| input_state.focused_text.clone());
-    Some(boon_runtime::LiveSourceEvent {
+    let mut event = boon_runtime::LiveSourceEvent {
         source,
         text,
         key: None,
@@ -33899,7 +34103,9 @@ fn preview_focused_blur_event_for_route_table(
             .or_else(|| route_table.target_text(focused_node)),
         target_occurrence: None,
         ..boon_runtime::LiveSourceEvent::default()
-    })
+    };
+    route_table.apply_row_identity_to_event(focused_node, &mut event);
+    Some(event)
 }
 
 fn source_intent_indexes(assertions: &[Value]) -> (Value, Value) {
@@ -34601,7 +34807,7 @@ impl PreviewHitRouteTable {
         let target_occurrence = self.target_occurrence_for_source(&source_node, &source);
         let (pointer_x, pointer_y, pointer_width, pointer_height) =
             self.pointer_payload_for_source_node(hit, &source_node, position);
-        Some(boon_runtime::LiveSourceEvent {
+        let mut event = boon_runtime::LiveSourceEvent {
             source,
             text: target_text.clone(),
             key: None,
@@ -34613,7 +34819,9 @@ impl PreviewHitRouteTable {
             target_text,
             target_occurrence,
             ..boon_runtime::LiveSourceEvent::default()
-        })
+        };
+        self.apply_row_identity_to_event(&source_node, &mut event);
+        Some(event)
     }
 
     fn click_candidate_for_hit(
@@ -34648,6 +34856,8 @@ impl PreviewHitRouteTable {
             target_text,
             address: self.address(&source_node),
             target_occurrence: self.target_occurrence_for_source(&source_node, &source),
+            target_key: self.target_key(&source_node),
+            target_generation: self.target_generation(&source_node),
             accepts_key_focus: self.accepts_key_focus(&source_node),
             text_change,
             link: self.link_url(&source_node).is_some(),
@@ -34667,7 +34877,7 @@ impl PreviewHitRouteTable {
         let target_occurrence = self.target_occurrence_for_source(&source_node, &source);
         let (pointer_x, pointer_y, pointer_width, pointer_height) =
             self.pointer_payload_for_source_node(hit, &source_node, position);
-        Some(boon_runtime::LiveSourceEvent {
+        let mut event = boon_runtime::LiveSourceEvent {
             source,
             text: target_text.clone(),
             key: None,
@@ -34679,7 +34889,9 @@ impl PreviewHitRouteTable {
             target_text,
             target_occurrence,
             ..boon_runtime::LiveSourceEvent::default()
-        })
+        };
+        self.apply_row_identity_to_event(&source_node, &mut event);
+        Some(event)
     }
 
     fn target_text(&self, node: &str) -> Option<String> {
@@ -34689,6 +34901,24 @@ impl PreviewHitRouteTable {
 
     fn address(&self, node: &str) -> Option<String> {
         self.source_for_node_intent(node, "address")
+    }
+
+    fn target_key(&self, node: &str) -> Option<u64> {
+        self.hit_for_node(node).and_then(|hit| hit.row_key)
+    }
+
+    fn target_generation(&self, node: &str) -> Option<u64> {
+        self.hit_for_node(node)
+            .and_then(|hit| hit.row_generation.or_else(|| hit.row_key.map(|_| 1)))
+    }
+
+    fn apply_row_identity_to_event(&self, node: &str, event: &mut boon_runtime::LiveSourceEvent) {
+        if event.target_key.is_none() {
+            event.target_key = self.target_key(node);
+        }
+        if event.target_generation.is_none() {
+            event.target_generation = self.target_generation(node);
+        }
     }
 
     fn key_down_source(&self, node: &str) -> Option<String> {
@@ -35098,6 +35328,7 @@ impl PreviewPrewarmWorkerQueue {
         let queue = self.clone();
         std::thread::Builder::new()
             .name("boon-native-preview-prewarm-source".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
             .spawn(move || {
                 loop {
                     let payload = queue.wait_for_latest_payload();
@@ -35170,6 +35401,7 @@ impl PreviewReplaceWorkerQueue {
         let queue = self.clone();
         std::thread::Builder::new()
             .name("boon-native-preview-replace-source".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
             .spawn(move || {
                 loop {
                     let payload = queue.wait_for_latest_payload();
@@ -37761,6 +37993,7 @@ fn start_preview_ipc_server(
     let path = path.to_path_buf();
     std::thread::Builder::new()
         .name("boon-native-preview-ipc".to_owned())
+        .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -39361,7 +39594,12 @@ fn preview_operator_host_input_response(
             .map(|index| index as usize)
             .unwrap_or(index);
         let input_started = Instant::now();
-        let event_json = input_json.get("source_event").unwrap_or(input_json);
+        let raw_event_json = input_json.get("source_event").unwrap_or(input_json);
+        let event_json = preview_event_json_with_layout_row_identity(
+            raw_event_json,
+            current_layout_proof.as_ref(),
+        );
+        let event_json = &event_json;
         let runtime = if let Some(runtime) = runtime_guard.as_mut() {
             &mut **runtime
         } else {
@@ -39799,7 +40037,12 @@ fn preview_host_input_route_proof(
                 && requested_node.is_none_or(|node| {
                     intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
                 })
-                && source_intent_matches_event_target(intent, &source_intents, event_json)
+                && source_intent_matches_event_target_and_occurrence_with_regions(
+                    intent,
+                    &source_intents,
+                    &hit_regions,
+                    event_json,
+                )
         })
         .or_else(|| {
             dynamic_layout.then(|| {
@@ -39833,7 +40076,7 @@ fn preview_host_input_route_proof(
             .unwrap_or_else(|| json!([])),
         matched_hit_region.cloned(),
     );
-    json!({
+    let mut proof = json!({
         "pass": pass,
         "source_path": source_path,
         "target_node": matched_node,
@@ -39845,12 +40088,103 @@ fn preview_host_input_route_proof(
         "dynamic_layout_after_previous_event": dynamic_layout,
         "ipc_only_state_mutation": false,
         "injection_boundary": "HostInputEvent boundary after app_window normalization and before document routing"
+    });
+    if !pass {
+        proof["route_debug"] =
+            preview_host_route_debug(source_path, event_json, &source_intents, &hit_regions);
+    }
+    proof
+}
+
+fn preview_host_route_debug(
+    source_path: &str,
+    event_json: &serde_json::Value,
+    source_intents: &[serde_json::Value],
+    hit_regions: &[serde_json::Value],
+) -> serde_json::Value {
+    let target_text = event_json
+        .get("target_text")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event_json
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+        });
+    let source_nodes = source_intents
+        .iter()
+        .filter(|intent| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_path)
+        })
+        .filter_map(source_intent_debug_sample)
+        .take(16)
+        .collect::<Vec<_>>();
+    let target_nodes = target_text
+        .map(|target| {
+            source_intents
+                .iter()
+                .filter(|intent| {
+                    matches!(
+                        intent.get("intent").and_then(serde_json::Value::as_str),
+                        Some("target" | "address")
+                    ) && intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(target)
+                })
+                .filter_map(source_intent_debug_sample)
+                .take(16)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let hit_node_sample = hit_regions
+        .iter()
+        .filter_map(|region| {
+            let node = region.get("node").and_then(serde_json::Value::as_str)?;
+            Some(json!({
+                "node": node,
+                "scope_key": materialized_node_scope_key(node),
+                "row_key": region.get("row_key").cloned().unwrap_or_else(|| json!(null)),
+                "row_generation": region.get("row_generation").cloned().unwrap_or_else(|| json!(null)),
+                "bounds": region.get("bounds").cloned().unwrap_or_else(|| json!(null))
+            }))
+        })
+        .take(24)
+        .collect::<Vec<_>>();
+    json!({
+        "target_text": target_text,
+        "same_source_intents": source_nodes,
+        "target_text_intents": target_nodes,
+        "hit_region_sample": hit_node_sample,
+        "source_intent_count": source_intents.len(),
+        "hit_region_count": hit_regions.len()
     })
+}
+
+fn source_intent_debug_sample(intent: &serde_json::Value) -> Option<serde_json::Value> {
+    let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+    Some(json!({
+        "node": node,
+        "scope_key": materialized_node_scope_key(node),
+        "intent": intent.get("intent").cloned().unwrap_or_else(|| json!(null)),
+        "source_path": intent.get("source_path").cloned().unwrap_or_else(|| json!(null))
+    }))
 }
 
 fn source_intent_matches_event_target(
     intent: &serde_json::Value,
     source_intents: &[serde_json::Value],
+    event_json: &serde_json::Value,
+) -> bool {
+    source_intent_matches_event_target_with_regions(intent, source_intents, &[], event_json)
+}
+
+fn source_intent_matches_event_target_with_regions(
+    intent: &serde_json::Value,
+    source_intents: &[serde_json::Value],
+    hit_regions: &[serde_json::Value],
     event_json: &serde_json::Value,
 ) -> bool {
     let Some(target_text) = event_json
@@ -39867,7 +40201,7 @@ fn source_intent_matches_event_target(
     let Some(node) = intent.get("node").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    source_intents.iter().any(|candidate| {
+    if source_intents.iter().any(|candidate| {
         candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
             && matches!(
                 candidate.get("intent").and_then(serde_json::Value::as_str),
@@ -39877,7 +40211,209 @@ fn source_intent_matches_event_target(
                 .get("source_path")
                 .and_then(serde_json::Value::as_str)
                 == Some(target_text)
+    }) {
+        return true;
+    }
+
+    if let Some((row_key, row_generation)) =
+        json_hit_region_row_identity_for_node(hit_regions, node)
+    {
+        return source_intents.iter().any(|candidate| {
+            matches!(
+                candidate.get("intent").and_then(serde_json::Value::as_str),
+                Some("target" | "address")
+            ) && candidate
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(target_text)
+                && candidate
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|candidate_node| {
+                        json_hit_region_row_identity_for_node(hit_regions, candidate_node)
+                    })
+                    == Some((row_key, row_generation))
+        });
+    }
+
+    let Some(scope_key) = materialized_node_scope_key(node) else {
+        return false;
+    };
+    source_intents.iter().any(|candidate| {
+        matches!(
+            candidate.get("intent").and_then(serde_json::Value::as_str),
+            Some("target" | "address")
+        ) && candidate
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            == Some(target_text)
+            && candidate
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .and_then(materialized_node_scope_key)
+                == Some(scope_key)
     })
+}
+
+fn source_intent_matches_event_target_and_occurrence_with_regions(
+    intent: &serde_json::Value,
+    source_intents: &[serde_json::Value],
+    hit_regions: &[serde_json::Value],
+    event_json: &serde_json::Value,
+) -> bool {
+    if !source_intent_matches_event_target_with_regions(
+        intent,
+        source_intents,
+        hit_regions,
+        event_json,
+    ) {
+        return false;
+    }
+    let Some(expected_occurrence) = event_json
+        .get("target_occurrence")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.max(1) as usize)
+    else {
+        return true;
+    };
+    let Some(source_path) = event_json
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+        })
+    else {
+        return true;
+    };
+    let Some(target_node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let mut occurrence = 0usize;
+    let mut seen_nodes = BTreeSet::new();
+    for candidate in source_intents {
+        if candidate
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_path)
+            || !source_intent_kind_routes_event(
+                candidate.get("intent").and_then(serde_json::Value::as_str),
+            )
+            || !source_intent_matches_event_target_with_regions(
+                candidate,
+                source_intents,
+                hit_regions,
+                event_json,
+            )
+        {
+            continue;
+        }
+        let Some(candidate_node) = candidate.get("node").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !seen_nodes.insert(candidate_node) {
+            continue;
+        }
+        occurrence = occurrence.saturating_add(1);
+        if candidate_node == target_node {
+            return occurrence == expected_occurrence;
+        }
+    }
+    false
+}
+
+fn json_hit_region_row_identity_for_node(
+    hit_regions: &[serde_json::Value],
+    node: &str,
+) -> Option<(u64, u64)> {
+    hit_regions
+        .iter()
+        .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+        .and_then(|region| {
+            let key = layout_row_key_for_hit_region(region)?;
+            let generation = layout_row_generation_for_hit_region(region)?;
+            Some((key, generation))
+        })
+}
+
+fn materialized_node_scope_key(node: &str) -> Option<&str> {
+    let rest = node.strip_prefix("doc-node-")?;
+    let (_, scope_key) = rest.split_once('-')?;
+    (!scope_key.is_empty()).then_some(scope_key)
+}
+
+fn preview_event_json_with_layout_row_identity(
+    event_json: &serde_json::Value,
+    layout_proof: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut event = event_json.clone();
+    if event
+        .get("target_key")
+        .and_then(serde_json::Value::as_u64)
+        .is_some()
+        && event
+            .get("target_generation")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+    {
+        return event;
+    }
+    let Some(layout_proof) = layout_proof else {
+        return event;
+    };
+    let Some(node) = layout_source_node_for_event(layout_proof, &event) else {
+        return event;
+    };
+    if event
+        .get("target_key")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        && let Some(key) = layout_row_key_for_node(layout_proof, &node)
+    {
+        event["target_key"] = json!(key);
+    }
+    if event
+        .get("target_generation")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        && let Some(generation) = layout_row_generation_for_node(layout_proof, &node)
+    {
+        event["target_generation"] = json!(generation);
+    }
+    event
+}
+
+fn layout_source_node_for_event(
+    layout_proof: &serde_json::Value,
+    event_json: &serde_json::Value,
+) -> Option<String> {
+    let source_path = event_json
+        .get("source")
+        .and_then(serde_json::Value::as_str)?;
+    let source_intents = layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    source_intents
+        .iter()
+        .find(|intent| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_path)
+                && source_intent_matches_event_target_and_occurrence_with_regions(
+                    intent,
+                    source_intents,
+                    layout_proof
+                        .get("hit_target_assertions")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    event_json,
+                )
+        })
+        .and_then(|intent| intent.get("node").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
 }
 
 fn normalize_host_route_events(
@@ -39932,7 +40468,12 @@ fn live_source_event_report(event: &boon_runtime::LiveSourceEvent) -> serde_json
         "pointer_width": event.pointer_width,
         "pointer_height": event.pointer_height,
         "target_text": event.target_text,
-        "target_occurrence": event.target_occurrence
+        "target_occurrence": event.target_occurrence,
+        "target_key": event.target_key,
+        "target_generation": event.target_generation,
+        "bind_epoch": event.bind_epoch,
+        "source_epoch": event.source_epoch,
+        "source_id": event.source_id
     })
 }
 
@@ -39984,6 +40525,7 @@ fn run_dev_ipc_probe(
     replace_code_file: Option<&Path>,
     replace_code_expected_hash: Option<&str>,
     skip_operator_host_input_probe: bool,
+    operator_host_input_source_event_limit: usize,
     request_timeout: Duration,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
@@ -40004,7 +40546,10 @@ fn run_dev_ipc_probe(
             Duration::from_secs(5),
             request_timeout,
             Duration::from_secs(10),
-        )?;
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            format!("replace-code request failed: {error}").into()
+        })?;
         Some(response)
     } else {
         None
@@ -40012,22 +40557,29 @@ fn run_dev_ipc_probe(
     let operator_host_input_response = if !skip_operator_host_input_probe {
         if let Some(path) = replace_code_file {
             let code = boon_runtime::source_text_for_path(path)?;
-            let responses = operator_host_input_smoke_probe_requests(path, &code)
-                .map(|requests| {
-                    requests
-                        .into_iter()
-                        .map(|request| {
-                            send_preview_ipc_request_with_timeouts(
-                                connect,
-                                request,
-                                Duration::from_secs(5),
-                                request_timeout,
-                                Duration::from_secs(10),
-                            )
+            let responses = operator_host_input_smoke_probe_requests_with_limit(
+                path,
+                &code,
+                operator_host_input_source_event_limit,
+            )
+            .map(|requests| {
+                requests
+                    .into_iter()
+                    .map(|request| {
+                        send_preview_ipc_request_with_timeouts(
+                            connect,
+                            request,
+                            Duration::from_secs(5),
+                            request_timeout,
+                            Duration::from_secs(10),
+                        )
+                        .map_err(|error| -> Box<dyn std::error::Error> {
+                            format!("operator-host-input request failed: {error}").into()
                         })
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()?;
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
             responses.map(aggregate_operator_host_input_responses)
         } else {
             None
@@ -40042,7 +40594,10 @@ fn run_dev_ipc_probe(
         Duration::from_secs(5),
         request_timeout,
         Duration::from_secs(10),
-    )?;
+    )
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        format!("runtime-summary request failed: {error}").into()
+    })?;
     let mut value = send_preview_ipc_request_with_timeouts(
         connect,
         json!({
@@ -40054,7 +40609,10 @@ fn run_dev_ipc_probe(
         Duration::from_secs(5),
         request_timeout,
         Duration::from_secs(10),
-    )?;
+    )
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        format!("bounded-ipc-stress request failed: {error}").into()
+    })?;
     let debug_query_byte_samples = vec![ipc_exchange_bytes(&runtime_summary_response)];
     let debug_subscription_byte_samples = vec![ipc_exchange_bytes(&value)];
     let dev_request_round_trip_samples = vec![
@@ -40262,23 +40820,43 @@ fn operator_host_input_smoke_probe_requests(
     path: &Path,
     code: &str,
 ) -> Option<Vec<serde_json::Value>> {
+    operator_host_input_smoke_probe_requests_with_limit(
+        path,
+        code,
+        DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT,
+    )
+}
+
+fn operator_host_input_smoke_probe_requests_with_limit(
+    path: &Path,
+    code: &str,
+    source_event_limit: usize,
+) -> Option<Vec<serde_json::Value>> {
     let source_events = operator_host_input_source_events(path)?;
     let original_source_event_count = source_events.len();
-    let sampled_source_events = sample_operator_host_input_source_events(
-        source_events,
-        DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT,
-    );
+    let sampled_source_events =
+        sample_operator_host_input_source_events(source_events, source_event_limit);
     let sampled_source_event_count = sampled_source_events.len();
+    let full_coverage =
+        source_event_limit == 0 || sampled_source_event_count == original_source_event_count;
     operator_host_input_probe_requests_from_events(
         path,
         code,
         sampled_source_events,
         Some(json!({
-            "mode": "bounded-native-ipc-smoke",
+            "mode": if full_coverage {
+                "full-native-ipc-coverage"
+            } else {
+                "bounded-native-ipc-smoke"
+            },
             "original_source_event_count": original_source_event_count,
             "sampled_source_event_count": sampled_source_event_count,
-            "source_event_limit": DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT,
-            "selection": "evenly-spaced-first-last"
+            "source_event_limit": source_event_limit,
+            "selection": if full_coverage {
+                "all"
+            } else {
+                "evenly-spaced-first-last"
+            }
         })),
     )
 }
@@ -40501,6 +41079,7 @@ fn host_events_for_source_event(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let mut events = Vec::new();
+    let is_key_event = event.get("key").is_some_and(|value| !value.is_null());
     if source.ends_with(".change") {
         events.push(json!({
             "kind": "TextInput",
@@ -40509,9 +41088,9 @@ fn host_events_for_source_event(
         }));
     } else {
         events.push(json!({
-            "kind": if source.ends_with(".key_down") { "Key" } else { "Pointer" },
+            "kind": if is_key_event { "Key" } else { "Pointer" },
             "phase": "Press",
-            "button": if source.ends_with(".key_down") { serde_json::Value::Null } else { json!("Primary") },
+            "button": if is_key_event { serde_json::Value::Null } else { json!("Primary") },
             "key": event.get("key").cloned().unwrap_or_else(|| json!(null)),
             "target_region": target_hit_region.cloned().unwrap_or_else(|| json!(null)),
             "source": "operator_host_event_harness"
@@ -55327,6 +55906,145 @@ label:
     }
 
     #[test]
+    fn novywave_waveform_hover_zoom_center_tracks_mouse_after_zoom() {
+        let handle = std::thread::Builder::new()
+            .name("novywave-hover-after-zoom".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(novywave_waveform_hover_zoom_center_tracks_mouse_after_zoom_impl)
+            .expect("NovyWave hover-after-zoom test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn novywave_waveform_hover_zoom_center_tracks_mouse_after_zoom_impl() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let source =
+            boon_runtime::source_text_for_path(&source_path).expect("NovyWave source should load");
+        let units = boon_runtime::source_units_for_path(&source_path)
+            .expect("NovyWave manifest source units should load");
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_project("novywave-hover-after-zoom", &units)
+                .expect("NovyWave runtime should initialize"),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) =
+            native_document_layout_proof_with_project_state_embedded(
+                &source_path,
+                &units,
+                Some(&state_summary),
+            )
+            .expect("NovyWave initial layout should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let zoom_state = apply_preview_click_source(
+            &source_path,
+            &source,
+            &units,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            "store.elements.zoom_in",
+            1,
+            "NovyWave zoom-in button",
+        );
+        assert_eq!(
+            zoom_state.pointer("/store/keyboard_viewport_label"),
+            Some(&json!("0 s - 150 s"))
+        );
+
+        let zoom_layout = shared_render_state
+            .lock()
+            .expect("zoomed shared render state should lock")
+            .layout_proof
+            .clone();
+        let (wave_center_x, wave_y, wave_node) =
+            source_hit_center(&zoom_layout, "store.elements.waveform_click")
+                .expect("zoomed NovyWave waveform should expose a canvas click source");
+        let wave_width = hit_width_for_node(&zoom_layout, &wave_node);
+        let wave_left = wave_center_x - (wave_width / 2.0);
+        let hover_x = wave_left + (wave_width * 2.0 / 3.0);
+        let mut hover_motion = deterministic_click_input_from_index(2, hover_x, wave_y);
+        hover_motion.mouse_button_events.clear();
+        hover_motion.mouse_button_event_count = input_state.last_mouse_button_event_count;
+        hover_motion.mouse_motion_event_count =
+            input_state.last_mouse_motion_event_count.saturating_add(1);
+        hover_motion.mouse_total_event_count = hover_motion
+            .mouse_button_event_count
+            .saturating_add(hover_motion.mouse_motion_event_count);
+        preview_apply_real_window_input(
+            &hover_motion,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("zoomed waveform hover should dispatch zoom-center pointer payloads");
+
+        let hover_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            hover_summary.pointer("/store/zoom_center_label"),
+            Some(&json!("100 s")),
+            "zoomed hover should project against the current 0 s - 150 s viewport"
+        );
+        assert_eq!(
+            hover_summary.pointer("/store/keyboard_viewport_label"),
+            Some(&json!("0 s - 150 s")),
+            "hover should not re-anchor the zoomed viewport"
+        );
+        let zoom_center_offset =
+            summary_number(&hover_summary, "/store/waveform_zoom_center_offset");
+        let expected_hover_x = hover_x - wave_left;
+        assert!(
+            (zoom_center_offset - expected_hover_x).abs() <= 2.0,
+            "zoom-center offset should remain under the zoomed hover x: offset={zoom_center_offset}, expected={expected_hover_x}"
+        );
+
+        let hover_frame = latest_preview_frame(&shared_render_state);
+        let mut zoom_center_lines = hover_frame
+            .display_list
+            .iter()
+            .filter(|item| {
+                display_item_paint_color(item) == Some("#43D97388")
+                    && item.text.is_none()
+                    && item.bounds.x > wave_left as f32
+                    && item.bounds.y > 340.0
+                    && item.bounds.width >= 1.0
+                    && item.bounds.width <= 3.5
+                    && item.bounds.height >= 18.0
+            })
+            .collect::<Vec<_>>();
+        zoom_center_lines.sort_by(|left, right| left.bounds.y.total_cmp(&right.bounds.y));
+        assert!(
+            !zoom_center_lines.is_empty(),
+            "zoomed hover should render the zoom-center guide; hover={hover_x}, lines={:?}",
+            hover_frame
+                .display_list
+                .iter()
+                .filter(|item| item.text.is_none() && item.bounds.y > 340.0)
+                .map(|item| item.bounds)
+                .collect::<Vec<_>>()
+        );
+        let zoom_center_line_x = zoom_center_lines[0].bounds.x;
+        assert!(
+            (zoom_center_line_x - hover_x as f32).abs() <= 2.0,
+            "zoom-center guide should render under the hover x after zoom: line={zoom_center_line_x}, hover={hover_x}, width={wave_width}"
+        );
+    }
+
+    #[test]
     fn novywave_selected_visible_items_align_name_value_and_wave_columns() {
         let source_path = repo_path("examples/novywave/RUN.bn");
         let units = boon_runtime::source_units_for_path(&source_path)
@@ -56434,6 +57152,17 @@ document:
 
     #[test]
     fn novywave_dark_light_material_readbacks_cover_visual_regions() {
+        let handle = std::thread::Builder::new()
+            .name("novywave-visual-readback".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(novywave_dark_light_material_readbacks_cover_visual_regions_impl)
+            .expect("NovyWave visual readback test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn novywave_dark_light_material_readbacks_cover_visual_regions_impl() {
         futures::executor::block_on(async {
             let instance =
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -57965,6 +58694,17 @@ document:
 
     #[test]
     fn physical_operator_host_input_batches_execute_in_preview_runtime() {
+        let handle = std::thread::Builder::new()
+            .name("physical-operator-host-input".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
+            .spawn(physical_operator_host_input_batches_execute_in_preview_runtime_impl)
+            .expect("physical operator host input test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn physical_operator_host_input_batches_execute_in_preview_runtime_impl() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
         let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
@@ -58014,6 +58754,17 @@ document:
 
     #[test]
     fn novywave_operator_host_input_batches_execute_in_preview_runtime() {
+        let handle = std::thread::Builder::new()
+            .name("novywave-operator-host-input".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
+            .spawn(novywave_operator_host_input_batches_execute_in_preview_runtime_impl)
+            .expect("NovyWave operator host input test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn novywave_operator_host_input_batches_execute_in_preview_runtime_impl() {
         let source_path = repo_path("examples/novywave/RUN.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
         let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
@@ -58465,6 +59216,82 @@ document:
         .expect("first duplicate delete control should resolve an event");
         assert_eq!(row_1_delete_event.source, "row.delete");
         assert_eq!(row_1_delete_event.target_occurrence, Some(1));
+
+        let row_split_target_layout = json!({
+            "source_intent_assertions": [
+                { "node": "row-checkbox", "intent": "click", "source_path": "row.checkbox" },
+                { "node": "row-label", "intent": "target", "source_path": "Edited title" }
+            ],
+            "hit_target_assertions": [
+                {
+                    "node": "row-checkbox",
+                    "row_key": 42,
+                    "row_generation": 7,
+                    "bounds": { "x": 10.0, "y": 20.0, "width": 20.0, "height": 20.0 }
+                },
+                {
+                    "node": "row-label",
+                    "row_key": 42,
+                    "row_generation": 7,
+                    "bounds": { "x": 40.0, "y": 20.0, "width": 160.0, "height": 20.0 }
+                }
+            ]
+        });
+        assert_eq!(
+            source_hit_center_for_target(
+                &row_split_target_layout,
+                "row.checkbox",
+                Some("Edited title")
+            )
+            .expect("row checkbox should match a target on another node in the same row")
+            .2,
+            "row-checkbox"
+        );
+        let split_target_event = json!({
+            "source": "row.checkbox",
+            "target_text": "Edited title"
+        });
+        assert_eq!(
+            layout_source_node_for_event(&row_split_target_layout, &split_target_event).as_deref(),
+            Some("row-checkbox")
+        );
+        let route = preview_host_input_route_proof(
+            &json!({
+                "requires_dynamic_layout_after_previous_event": true,
+                "host_events": [
+                    {"kind": "Pointer", "phase": "Press", "source": "operator_host_event_harness"}
+                ]
+            }),
+            &split_target_event,
+            Some(&row_split_target_layout),
+        );
+        assert_eq!(
+            route.get("pass").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "row-aware source proof should resolve split target/source nodes: {route}"
+        );
+
+        let row_split_scope_layout = json!({
+            "source_intent_assertions": [
+                { "node": "doc-node-10-old-4", "intent": "click", "source_path": "row.checkbox" },
+                { "node": "doc-node-11-old-4", "intent": "target", "source_path": "Edited title" }
+            ],
+            "hit_target_assertions": [
+                {
+                    "node": "doc-node-10-old-4",
+                    "bounds": { "x": 10.0, "y": 20.0, "width": 20.0, "height": 20.0 }
+                },
+                {
+                    "node": "doc-node-11-old-4",
+                    "bounds": { "x": 40.0, "y": 20.0, "width": 160.0, "height": 20.0 }
+                }
+            ]
+        });
+        assert_eq!(
+            layout_source_node_for_event(&row_split_scope_layout, &split_target_event).as_deref(),
+            Some("doc-node-10-old-4"),
+            "generated materialization scope should connect row controls when row keys are absent"
+        );
     }
 
     fn first_scroll_region_center(layout: &serde_json::Value) -> (f64, f64) {

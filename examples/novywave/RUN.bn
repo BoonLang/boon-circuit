@@ -1743,7 +1743,6 @@ store: [
     selected_timeline_zoom_center_value:
         selected_timeline_zoom_center_default |> HOLD selected_timeline_zoom_center_value {
             LATEST {
-                elements.waveform_hover.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_hover.pointer_x, pointer_width: elements.waveform_hover.pointer_width, viewport_start: selected_timeline_range_start, viewport_end: selected_timeline_range_end, fallback: selected_timeline_zoom_center_value) }
                 elements.keyboard_capture.key |> WHEN {
                     Z => zoom_center_keyboard_value
                     R => zoom_center_keyboard_value
@@ -1761,6 +1760,25 @@ store: [
 
     selected_timeline_zoom_center_number:
         selected_timeline_zoom_center_value |> Text/to_number()
+
+    waveform_hover_zoom_center_value:
+        selected_timeline_zoom_center_default |> HOLD waveform_hover_zoom_center_value {
+            LATEST {
+                elements.waveform_hover.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_hover.pointer_x, pointer_width: elements.waveform_hover.pointer_width, viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_zoom_center_value) }
+                elements.keyboard_capture.key |> WHEN {
+                    Z => zoom_center_keyboard_value
+                    R => zoom_center_keyboard_value
+                    __ => SKIP
+                }
+                elements.zoom_reset.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.select_counter_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.select_uart_compare_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.select_ghw_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                file_tree_selected_file |> THEN { selected_timeline_zoom_center_default }
+                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
+            }
+        }
 
     selected_timeline_tick_0:
         viewport_label_start
@@ -2477,13 +2495,13 @@ store: [
         selected_timeline_cursor_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
     zoom_center_label:
-        selected_timeline_zoom_center_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
+        waveform_hover_zoom_center_value |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
     waveform_cursor_offset:
         Number/project_offset(time: selected_timeline_cursor_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
 
     waveform_zoom_center_offset:
-        Number/project_offset(time: selected_timeline_zoom_center_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
+        Number/project_offset(time: waveform_hover_zoom_center_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
 
     active_signal_label:
         TEXT { simple_tb.s.A[3:0] } |> HOLD active_signal_label {

@@ -71,6 +71,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-idle-wake",
     "verify-native-real-window-input-environment",
     "verify-native-gpu-preview-e2e",
+    "verify-native-gpu-headed-scenario",
     "verify-native-visible-launch",
     "verify-native-examples",
     "verify-native-dev-window-editor",
@@ -168,6 +169,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verify_native_real_window_input_environment(&args)
         }
         "verify-native-gpu-preview-e2e" => verify_native_gpu_preview_e2e(&args),
+        "verify-native-gpu-headed-scenario" => verify_native_gpu_headed_scenario(&args),
         "verify-native-visible-launch" => verify_native_visible_launch(&args),
         "verify-native-examples" => verify_native_examples(&args),
         "verify-native-dev-window-editor" => verify_native_dev_window_editor(&args),
@@ -13893,6 +13895,242 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         blockers,
         extra,
     )
+}
+
+fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let scenario_id = value_arg(args, "--scenario").unwrap_or_else(|| "counter".to_owned());
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/native-gpu/headed-scenario-counter.json"));
+    let role_report =
+        PathBuf::from("target/reports/native-gpu/roles/preview-headed-scenario-counter.json");
+    let loop_report =
+        PathBuf::from("target/reports/native-gpu/roles/preview-loop-headed-scenario-counter.json");
+    let scenario_report =
+        PathBuf::from("target/reports/native-gpu/headed-scenario-counter-basic-headed.json");
+    if let Some(parent) = report.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = role_report.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(&role_report);
+    let _ = fs::remove_file(&loop_report);
+    let _ = fs::remove_file(&scenario_report);
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let build = Command::new("cargo")
+        .args(["build", "-p", "boon_native_playground"])
+        .status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:playground-build",
+        build.success(),
+        format!("cargo build -p boon_native_playground status={build}"),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+    );
+
+    let run_output = if build.success() {
+        Some(
+            Command::new("timeout")
+                .args([
+                    "24s",
+                    "target/debug/boon_native_playground",
+                    "--role",
+                    "preview",
+                    "--code-file",
+                    "examples/counter.bn",
+                    "--hold-ms",
+                    "4200",
+                    "--demand-driven-loop",
+                    "--auto-headed-scenario",
+                    &scenario_id,
+                    "--frame-readback",
+                    "--report",
+                    role_report.to_string_lossy().as_ref(),
+                    "--render-loop-report",
+                    loop_report.to_string_lossy().as_ref(),
+                ])
+                .output()?,
+        )
+    } else {
+        None
+    };
+    let run_success = run_output
+        .as_ref()
+        .is_some_and(|output| output.status.success());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:headed-preview-run",
+        run_success,
+        run_output
+            .as_ref()
+            .map(|output| format!("headed preview status={}", output.status))
+            .unwrap_or_else(|| "headed preview not run because build failed".to_owned()),
+        (!run_success).then(|| {
+            run_output
+                .as_ref()
+                .map(|output| {
+                    format!(
+                        "headed preview failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                            .lines()
+                            .last()
+                            .unwrap_or("no stderr")
+                    )
+                })
+                .unwrap_or_else(|| "headed preview not run".to_owned())
+        }),
+    );
+
+    let scenario_json = read_json(&scenario_report).unwrap_or_else(|error| {
+        json!({
+            "status": "missing",
+            "diagnostic": error.to_string()
+        })
+    });
+    let role_json = read_json(&role_report).unwrap_or_else(|error| {
+        json!({
+            "status": "missing",
+            "diagnostic": error.to_string()
+        })
+    });
+    let scenario_pass = scenario_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let overlay_contract = scenario_json
+        .pointer("/overlay/rendered_by")
+        .and_then(serde_json::Value::as_str)
+        == Some("preview LayoutFrame -> boon_native_gpu WGPU render scene");
+    let direct_runtime_state_mutation = scenario_json
+        .get("direct_runtime_state_mutation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let role_pass = role_json.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let role_overlay_visible = role_json
+        .pointer("/details/app_window_surface_proof/external_render_proof/headed_scenario_overlay_visible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let role_overlay_readback = role_json
+        .pointer(
+            "/details/app_window_surface_proof/external_render_proof/proof/artifact/capture_method",
+        )
+        .and_then(serde_json::Value::as_str)
+        == Some("wgpu-generated-shader-app-owned-readback");
+    let role_overlay_dirty_chunk = role_json
+        .pointer("/details/app_window_surface_proof/external_render_proof/proof/metrics/dirty_upload_chunk_ids")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|chunks| {
+            chunks.iter().any(|chunk| {
+                chunk
+                    .as_str()
+                    .is_some_and(|chunk| chunk.contains("headed-scenario-cursor-marker"))
+            })
+        });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:scenario-report-pass",
+        scenario_pass,
+        format!(
+            "scenario_report={} status={:?}",
+            scenario_report.display(),
+            scenario_json.get("status")
+        ),
+        (!scenario_pass)
+            .then(|| "headed Counter scenario did not finish with status pass".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:wgpu-overlay-contract",
+        overlay_contract && !direct_runtime_state_mutation,
+        format!(
+            "overlay_contract={overlay_contract}, direct_runtime_state_mutation={direct_runtime_state_mutation}"
+        ),
+        (!(overlay_contract && !direct_runtime_state_mutation)).then(|| {
+            "headed scenario report did not prove WGPU overlay and non-mutating input route"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:app-owned-wgpu-overlay-proof",
+        role_pass && role_overlay_visible && role_overlay_readback && role_overlay_dirty_chunk,
+        format!(
+            "role_pass={role_pass}, overlay_visible={role_overlay_visible}, readback={role_overlay_readback}, overlay_dirty_chunk={role_overlay_dirty_chunk}"
+        ),
+        (!(role_pass && role_overlay_visible && role_overlay_readback && role_overlay_dirty_chunk))
+            .then(|| {
+                "headed scenario preview role report did not prove app-owned WGPU overlay readback"
+                    .to_owned()
+            }),
+    );
+
+    let stdout_tail = run_output
+        .as_ref()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .rev()
+                .take(12)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stderr_tail = run_output
+        .as_ref()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .take(12)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let role_report_label = role_report.display().to_string();
+    let scenario_report_label = scenario_report.display().to_string();
+    let value = json!({
+        "status": status,
+        "command": "verify-native-gpu-headed-scenario",
+        "scenario": scenario_id,
+        "example": "counter",
+        "checks": checks,
+        "blockers": blockers,
+        "role_report": role_report_label,
+        "role_report_json": role_json,
+        "scenario_report": scenario_report_label,
+        "scenario_report_sha256": if scenario_report.exists() {
+            serde_json::Value::String(file_hash(scenario_report.to_string_lossy().as_ref()))
+        } else {
+            serde_json::Value::Null
+        },
+        "scenario_report_json": scenario_json,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail
+    });
+    write_json(&report, &value)?;
+    if status == "pass" {
+        Ok(())
+    } else {
+        Err(format!(
+            "native GPU headed scenario failed; wrote {}",
+            report.display()
+        )
+        .into())
+    }
 }
 
 fn native_preview_e2e_scenario_labels(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {

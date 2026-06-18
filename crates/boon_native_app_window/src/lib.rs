@@ -433,7 +433,7 @@ impl NativeRenderLoopState {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             }
         }
-        if poll_result.wants_animation_frame {
+        if poll_result.wants_animation_frame && !poll_result.dirty {
             self.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
         }
     }
@@ -517,7 +517,11 @@ impl NativeRenderHookResult {
         let scheduler_only_input_repaint = role_dirty_reason.is_none()
             && matches!(
                 scheduler_reason,
-                Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
+                Some(
+                    NativeSchedulerReason::HostInput
+                        | NativeSchedulerReason::Timer
+                        | NativeSchedulerReason::RequestedAnimation
+                )
             );
         let scheduler_idle_same_content_repaint =
             scheduler_reason.is_none() && role_dirty_reason.is_none() && !self.content_changed;
@@ -549,7 +553,11 @@ impl NativeRenderHookResult {
             ) || (role_dirty_reason.is_none()
                 && matches!(
                     scheduler_reason,
-                    Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
+                    Some(
+                        NativeSchedulerReason::HostInput
+                            | NativeSchedulerReason::Timer
+                            | NativeSchedulerReason::RequestedAnimation
+                    )
                 ))
                 || (scheduler_reason.is_none()
                     && role_dirty_reason.is_none()
@@ -3021,6 +3029,70 @@ mod tests {
             }
             .validate_for_presented_revision(state.dirty_revision)
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn animation_request_on_dirty_role_revision_does_not_invent_unrenderable_revision() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let poll = NativePollResult {
+            dirty: true,
+            role_revision: 2,
+            scheduler_reason: Some(NativeSchedulerReason::Timer),
+            role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            next_wake_after_ms: Some(16),
+            cursor_icon: NativeCursorIcon::Default,
+            wants_animation_frame: true,
+        };
+
+        state.apply_poll_result(&poll, false);
+
+        assert_eq!(state.dirty_revision, 2);
+        assert!(
+            (NativeRenderHookResult {
+                proof: serde_json::json!({}),
+                content_revision: 2,
+                rendered: true,
+                content_changed: true,
+                role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            })
+            .validate_for_presented_revision_with_scheduler(
+                state.dirty_revision,
+                state.current_scheduler_reason,
+                state.current_role_dirty_reason,
+            )
+            .is_ok(),
+            "animation scheduling must not demand a content revision the role never produced"
+        );
+    }
+
+    #[test]
+    fn requested_animation_can_repaint_existing_scheduler_only_content() {
+        let render = NativeRenderHookResult {
+            proof: serde_json::json!({}),
+            content_revision: 2,
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: None,
+        };
+
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(
+                    3,
+                    Some(NativeSchedulerReason::RequestedAnimation),
+                    None,
+                )
+                .is_ok(),
+            "requested animation frames are scheduler-owned repaints"
+        );
+        assert_eq!(
+            render.presented_content_revision(
+                3,
+                Some(NativeSchedulerReason::RequestedAnimation),
+                None
+            ),
+            3
         );
     }
 

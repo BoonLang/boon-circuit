@@ -77,6 +77,8 @@ const DEV_FILE_TAB_HEIGHT: u32 = 24;
 const DEV_TOOLBAR_PADDING: u32 = 8;
 const DEV_TOOLBAR_GAP: u32 = 10;
 const DEV_TOOLBAR_ROW_HEIGHT: u32 = 32;
+const PREVIEW_HEADED_SCENARIO_FRAME_MS: u64 = 16;
+const PREVIEW_HEADED_SCENARIO_TIMEOUT_MS: u64 = 12_000;
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
 const DEV_FOOTER_SCROLL_PADDING: u32 = 6;
@@ -3470,6 +3472,298 @@ fn deterministic_motion_input_from_counts(
     input
 }
 
+fn preview_advance_headed_scenario(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    input_context: &PreviewInputRuntimeContext,
+    width: u32,
+    height: u32,
+    now: Instant,
+) -> Result<PreviewHeadedScenarioPollResult, Box<dyn std::error::Error>> {
+    let mut state = preview_headed_scenario_state()
+        .lock()
+        .map_err(|_| "preview headed scenario mutex poisoned")?;
+    let Some(run) = state.as_mut() else {
+        return Ok(PreviewHeadedScenarioPollResult::default());
+    };
+    if !run.active() {
+        return Ok(PreviewHeadedScenarioPollResult {
+            dirty: false,
+            active: false,
+        });
+    }
+    if now.duration_since(run.started_at).as_millis()
+        > u128::from(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS)
+    {
+        run.fail(
+            "timeout",
+            format!(
+                "headed scenario exceeded {} ms",
+                PREVIEW_HEADED_SCENARIO_TIMEOUT_MS
+            ),
+        );
+        write_preview_headed_scenario_report(run);
+        preview_mark_headed_scenario_dirty(shared_render_state)?;
+        return Ok(PreviewHeadedScenarioPollResult {
+            dirty: true,
+            active: false,
+        });
+    }
+
+    let Some(step) = run.definition.steps.get(run.step_index).cloned() else {
+        run.finish_pass_if_done();
+        write_preview_headed_scenario_report(run);
+        preview_mark_headed_scenario_dirty(shared_render_state)?;
+        return Ok(PreviewHeadedScenarioPollResult {
+            dirty: true,
+            active: false,
+        });
+    };
+
+    let dirty = true;
+    match step {
+        PreviewHeadedScenarioStep::MoveToSource {
+            source,
+            target_text,
+            duration_ms,
+        } => {
+            let (target_x, target_y, _) =
+                preview_headed_source_target(shared_render_state, &source, target_text.as_deref())?;
+            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
+            let t = if duration_ms == 0 {
+                1.0
+            } else {
+                (elapsed_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
+            };
+            let eased = t * t * (3.0 - 2.0 * t);
+            run.cursor = (
+                run.step_start_cursor.0 + (target_x - run.step_start_cursor.0) * eased,
+                run.step_start_cursor.1 + (target_y - run.step_start_cursor.1) * eased,
+            );
+            run.overlay.cursor_x = run.cursor.0;
+            run.overlay.cursor_y = run.cursor.1;
+            run.overlay.status_text = "Running".to_owned();
+            run.overlay.step_text = format!(
+                "Move to {}",
+                target_text
+                    .as_deref()
+                    .map(|target| format!("`{target}`"))
+                    .unwrap_or_else(|| source.clone())
+            );
+            run.overlay.pressed_keys.clear();
+            run.overlay.mouse_down = false;
+            if t >= 1.0 {
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "move_mouse",
+                        "status": "pass",
+                        "source": source,
+                        "target_text": target_text,
+                        "cursor": {"x": target_x, "y": target_y},
+                        "duration_ms": duration_ms,
+                        "input_route": "layout source intent hit center"
+                    }),
+                );
+            }
+        }
+        PreviewHeadedScenarioStep::ClickSource {
+            source,
+            target_text,
+        } => {
+            let (target_x, target_y, route) =
+                preview_headed_source_target(shared_render_state, &source, target_text.as_deref())?;
+            run.cursor = (target_x, target_y);
+            run.overlay.cursor_x = target_x;
+            run.overlay.cursor_y = target_y;
+            run.overlay.mouse_down = true;
+            run.overlay.pressed_keys = vec!["Mouse Left".to_owned()];
+            run.overlay.click_pulse_started_at_ms = Some(unix_now_ms());
+            run.overlay.step_text = format!(
+                "Click {}",
+                target_text
+                    .as_deref()
+                    .map(|target| format!("`{target}`"))
+                    .unwrap_or_else(|| source.clone())
+            );
+            let start_index = input_state.last_mouse_button_event_count / 2;
+            let mut input =
+                deterministic_click_input_from_start_index(start_index, 1, target_x, target_y);
+            input.capture_scope = "headed_scenario_mouse_click".to_owned();
+            input.input_injection_method =
+                "preview_headed_scenario_app_owned_native_input_adapter".to_owned();
+            input.mouse_motion_event_count =
+                input_state.last_mouse_motion_event_count.saturating_add(1);
+            input.mouse_total_event_count = input
+                .mouse_button_event_count
+                .saturating_add(input.mouse_motion_event_count);
+            set_input_window_size(&mut input, (width as f32, height as f32));
+            if let Some(live_runtime) = input_context.live_runtime.as_ref() {
+                if let Err(error) = preview_apply_real_window_input_with_units(
+                    &input,
+                    &input_context.source_path,
+                    &input_context.source_text,
+                    &input_context.runtime_units,
+                    Some(live_runtime),
+                    shared_render_state,
+                    input_state,
+                ) {
+                    run.fail("event_routing", error.to_string());
+                } else {
+                    run.advance_step(
+                        now,
+                        json!({
+                            "kind": "click",
+                            "status": "pass",
+                            "source": source,
+                            "target_text": target_text,
+                            "cursor": {"x": target_x, "y": target_y},
+                            "route": route,
+                            "input_route_contract": "NativeInputAdapterProof -> preview_apply_real_window_input_with_units",
+                            "direct_runtime_state_mutation": false
+                        }),
+                    );
+                }
+            } else {
+                run.fail(
+                    "event_routing",
+                    "preview live runtime is not available for headed scenario input".to_owned(),
+                );
+            }
+        }
+        PreviewHeadedScenarioStep::KeyOverlay { keys, duration_ms } => {
+            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
+            run.overlay.pressed_keys = keys.clone();
+            run.overlay.mouse_down = keys.iter().any(|key| key == "Mouse Left");
+            run.overlay.status_text = "Running".to_owned();
+            run.overlay.step_text = format!("Show keys: {}", keys.join(" + "));
+            if elapsed_ms >= duration_ms {
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "key_overlay",
+                        "status": "pass",
+                        "keys": keys,
+                        "duration_ms": duration_ms,
+                        "rendered_by": "preview WGPU overlay HUD"
+                    }),
+                );
+            }
+        }
+        PreviewHeadedScenarioStep::Wait { duration_ms } => {
+            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
+            run.overlay.pressed_keys.clear();
+            run.overlay.mouse_down = false;
+            run.overlay.status_text = "Running".to_owned();
+            run.overlay.step_text = format!("Wait {duration_ms} ms");
+            if elapsed_ms >= duration_ms {
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "wait",
+                        "status": "pass",
+                        "duration_ms": duration_ms
+                    }),
+                );
+            }
+        }
+        PreviewHeadedScenarioStep::AssertRuntimeText {
+            json_pointer,
+            expected,
+        } => {
+            let Some(live_runtime) = input_context.live_runtime.as_ref() else {
+                run.fail(
+                    "runtime_assertion",
+                    "preview live runtime is not available for headed scenario assertion"
+                        .to_owned(),
+                );
+                write_preview_headed_scenario_report(run);
+                preview_mark_headed_scenario_dirty(shared_render_state)?;
+                return Ok(PreviewHeadedScenarioPollResult {
+                    dirty: true,
+                    active: run.active(),
+                });
+            };
+            let actual = {
+                let mut runtime = live_runtime
+                    .lock()
+                    .map_err(|_| "preview live runtime mutex poisoned")?;
+                let summary = runtime.state_summary();
+                summary
+                    .pointer(&json_pointer)
+                    .map(json_scalar_display_text)
+                    .unwrap_or_else(|| "<missing>".to_owned())
+            };
+            if actual == expected {
+                run.overlay.pressed_keys.clear();
+                run.overlay.mouse_down = false;
+                run.overlay.status_text = "Running".to_owned();
+                run.overlay.step_text = format!("Assert {json_pointer} == {expected}");
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "assert_runtime_text",
+                        "status": "pass",
+                        "json_pointer": json_pointer,
+                        "expected": expected,
+                        "actual": actual,
+                        "failure_category": "runtime_assertion"
+                    }),
+                );
+            } else {
+                run.fail(
+                    "runtime_assertion",
+                    format!(
+                        "runtime value at {json_pointer} expected `{expected}` but was `{actual}`"
+                    ),
+                );
+            }
+        }
+    }
+    write_preview_headed_scenario_report(run);
+    preview_mark_headed_scenario_dirty(shared_render_state)?;
+    Ok(PreviewHeadedScenarioPollResult {
+        dirty,
+        active: run.active(),
+    })
+}
+
+fn preview_mark_headed_scenario_dirty(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    shared.update_count = shared.update_count.saturating_add(1);
+    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
+    Ok(())
+}
+
+fn preview_headed_source_target(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    source: &str,
+    target_text: Option<&str>,
+) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+    let layout_proof = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?
+        .layout_proof
+        .clone();
+    source_hit_center_for_target(&layout_proof, source, target_text)
+}
+
+fn json_scalar_display_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_owned(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_default()
+        }
+    }
+}
+
 fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if value_arg(args, "--example").is_some() {
         return Err(
@@ -3599,6 +3893,24 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(path, Arc::clone(&preview_ipc_state), wake_handle.clone())?;
     }
+    if let Some(scenario_id) = value_arg(args, "--auto-headed-scenario") {
+        let response = preview_start_headed_scenario_response(
+            &preview_ipc_state,
+            &json!({
+                "kind": "headed-scenario-start",
+                "scenario_id": scenario_id,
+                "trigger": "preview-role-auto-start"
+            }),
+        )?;
+        if response.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            let diagnostic = json_diagnostic(&response).unwrap_or_else(|| {
+                "auto headed scenario failed before preview loop start".to_owned()
+            });
+            preview_note_render_error(&shared_render_state, diagnostic)?;
+        } else {
+            wake_handle.wake();
+        }
+    }
     let role_args = args[1..].to_vec();
     let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
@@ -3688,6 +4000,19 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            let headed_scenario_poll = preview_advance_headed_scenario(
+                &poll_shared_render_state,
+                &mut input_state,
+                &input_context,
+                context.width,
+                context.height,
+                context.now,
+            )
+            .map_err(|error| error.to_string())?;
+            if headed_scenario_poll.dirty && role_dirty_reason.is_none() {
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
+            }
             let focus_changed = preview_apply_focus_overlay(
                 &poll_shared_render_state,
                 &input_state,
@@ -3714,12 +4039,15 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let dirty = after_update_count != before_update_count
                 || after_content_revision != last_poll_revision
-                || context.forced_frame;
+                || context.forced_frame
+                || headed_scenario_poll.dirty;
             last_poll_revision = last_poll_revision.max(after_content_revision);
             let scheduler_reason = if context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
             } else if context.input_delta.real_os_events_observed {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
+            } else if headed_scenario_poll.dirty {
+                Some(boon_native_app_window::NativeSchedulerReason::Timer)
             } else if dirty
                 && role_dirty_reason
                     == Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged)
@@ -3750,8 +4078,16 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_revision: last_poll_revision,
                 scheduler_reason,
                 role_dirty_reason,
-                next_wake_after_ms: preview_text_input_caret_active.then_some(500),
-                wants_animation_frame: false,
+                next_wake_after_ms: [
+                    preview_text_input_caret_active.then_some(500),
+                    headed_scenario_poll
+                        .active
+                        .then_some(PREVIEW_HEADED_SCENARIO_FRAME_MS),
+                ]
+                .into_iter()
+                .flatten()
+                .min(),
+                wants_animation_frame: headed_scenario_poll.active,
                 cursor_icon,
             })
         });
@@ -3762,6 +4098,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_error,
                 render_status_overlay,
                 render_hover_overlay,
+                render_headed_scenario_overlay,
                 content_revision,
             ) = {
                 let shared = shared_render_state
@@ -3777,6 +4114,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     shared.last_error.clone(),
                     shared.status_overlay.clone(),
                     hover_overlay,
+                    preview_headed_scenario_overlay(),
                     preview_content_revision(shared.update_count),
                 )
             };
@@ -3787,6 +4125,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_error.as_deref(),
                 render_status_overlay.as_ref(),
                 &render_hover_overlay,
+                render_headed_scenario_overlay.as_ref(),
                 &mut visible_renderer,
                 &mut app_owned_proof,
                 &mut layout_frame_cache,
@@ -6902,6 +7241,7 @@ fn native_gpu_app_owned_render_hook(
     last_error: Option<&str>,
     status_overlay: Option<&PreviewStatusOverlay>,
     hover_overlay: &PreviewHoverOverlayState,
+    headed_scenario_overlay: Option<&PreviewHeadedScenarioOverlayState>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
@@ -6958,6 +7298,7 @@ fn native_gpu_app_owned_render_hook(
         last_error: last_error.map(str::to_owned),
         status_overlay: status_overlay.map(|overlay| (overlay.kind, overlay.message.clone())),
         hover_overlay: hover_overlay.clone(),
+        headed_scenario_overlay: headed_scenario_overlay.cloned(),
     };
     if render_frame_cache
         .as_ref()
@@ -6983,6 +7324,14 @@ fn native_gpu_app_owned_render_hook(
             layout_frame.clone()
         };
         preview_apply_hover_overlay_to_render_frame(&mut render_frame, hover_overlay);
+        if let Some(overlay) = headed_scenario_overlay {
+            preview_apply_headed_scenario_overlay_to_render_frame(
+                &mut render_frame,
+                overlay,
+                context.width as f32,
+                context.height as f32,
+            );
+        }
         let render_frame = preview_frame_with_viewport_background(
             &render_frame,
             context.width as f32,
@@ -7085,6 +7434,10 @@ fn native_gpu_app_owned_render_hook(
             PreviewStatusOverlayKind::Pending => "pending",
             PreviewStatusOverlayKind::Error => "error",
         }),
+        "headed_scenario_overlay_visible": headed_scenario_overlay.is_some(),
+        "headed_scenario_overlay": headed_scenario_overlay
+            .map(preview_headed_scenario_overlay_report)
+            .unwrap_or_else(|| json!(null)),
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
@@ -7098,7 +7451,7 @@ fn native_gpu_render_cache_stale(cached_layout_key: Option<&str>, layout_cache_k
     cached_layout_key != Some(layout_cache_key)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PreviewRenderFrameCacheKey {
     layout_cache_key: String,
     width: u32,
@@ -7106,6 +7459,7 @@ struct PreviewRenderFrameCacheKey {
     last_error: Option<String>,
     status_overlay: Option<(PreviewStatusOverlayKind, String)>,
     hover_overlay: PreviewHoverOverlayState,
+    headed_scenario_overlay: Option<PreviewHeadedScenarioOverlayState>,
 }
 
 fn preview_apply_hover_overlay_to_render_frame(
@@ -7144,6 +7498,198 @@ fn preview_apply_hover_overlay_to_render_frame(
             remove_display_style_key(&mut item.style, "__hover_paint");
         }
     }
+}
+
+fn preview_apply_headed_scenario_overlay_to_render_frame(
+    frame: &mut boon_document::LayoutFrame,
+    overlay: &PreviewHeadedScenarioOverlayState,
+    width: f32,
+    height: f32,
+) {
+    let x = overlay.cursor_x as f32;
+    let y = overlay.cursor_y as f32;
+    if let Some(started_at) = overlay.click_pulse_started_at_ms {
+        let age_ms = unix_now_ms().saturating_sub(started_at);
+        if age_ms <= 420 {
+            push_preview_overlay_rect(
+                frame,
+                "headed-scenario-click-pulse",
+                (x - 20.0).max(0.0),
+                (y - 20.0).max(0.0),
+                44.0,
+                44.0,
+                "#dbeafe",
+                "#2563eb",
+            );
+        }
+    }
+    push_preview_overlay_rect(
+        frame,
+        "headed-scenario-cursor-marker",
+        x.max(0.0),
+        y.max(0.0),
+        14.0,
+        20.0,
+        if overlay.mouse_down {
+            "#1d4ed8"
+        } else {
+            "#111827"
+        },
+        "#bfdbfe",
+    );
+    push_preview_overlay_rect(
+        frame,
+        "headed-scenario-cursor-hotspot",
+        (x - 2.0).max(0.0),
+        (y - 2.0).max(0.0),
+        5.0,
+        5.0,
+        "#f8fafc",
+        "#111827",
+    );
+    push_preview_overlay_text(
+        frame,
+        "headed-scenario-cursor-label",
+        (x + 18.0).min((width - 92.0).max(0.0)),
+        (y + 2.0).min((height - 26.0).max(0.0)),
+        88.0,
+        24.0,
+        &overlay.label,
+        "#2563eb",
+        "#eff6ff",
+        13.0,
+    );
+
+    let keys_text = if overlay.pressed_keys.is_empty() {
+        "Keys: none".to_owned()
+    } else {
+        format!("Keys: {}", overlay.pressed_keys.join(" + "))
+    };
+    let hud_width = 300.0_f32.min((width - 24.0).max(1.0));
+    let hud_x = (width - hud_width - 16.0).max(0.0);
+    let hud_y = (height - 72.0).max(0.0);
+    push_preview_overlay_rect(
+        frame,
+        "headed-scenario-key-hud-bg",
+        hud_x,
+        hud_y,
+        hud_width,
+        56.0,
+        "#111827",
+        "#60a5fa",
+    );
+    push_preview_overlay_text(
+        frame,
+        "headed-scenario-key-hud-keys",
+        hud_x + 10.0,
+        hud_y + 8.0,
+        (hud_width - 20.0).max(1.0),
+        20.0,
+        &keys_text,
+        "#111827",
+        "#f8fafc",
+        13.0,
+    );
+    push_preview_overlay_text(
+        frame,
+        "headed-scenario-key-hud-status",
+        hud_x + 10.0,
+        hud_y + 30.0,
+        (hud_width - 20.0).max(1.0),
+        18.0,
+        &format!("{}: {}", overlay.status_text, overlay.step_text),
+        "#111827",
+        "#bfdbfe",
+        12.0,
+    );
+    frame.metrics.display_item_count = frame.display_list.len();
+}
+
+fn push_preview_overlay_rect(
+    frame: &mut boon_document::LayoutFrame,
+    id: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    bg: &str,
+    border: &str,
+) {
+    let mut style = BTreeMap::new();
+    style.insert(
+        "bg".to_owned(),
+        boon_document_model::StyleValue::Text(bg.to_owned()),
+    );
+    style.insert(
+        "border".to_owned(),
+        boon_document_model::StyleValue::Text(border.to_owned()),
+    );
+    let style_identity = boon_document::ComputedStyleIdentity::from_style(&style);
+    frame.display_list.push(boon_document::DisplayItem {
+        node: boon_document_model::DocumentNodeId(id.to_owned()),
+        kind: boon_document_model::DocumentNodeKind::Text,
+        bounds: boon_document::Rect {
+            x,
+            y,
+            width,
+            height,
+        },
+        text: Some(String::new()),
+        style_identity,
+        style,
+        focused: false,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_preview_overlay_text(
+    frame: &mut boon_document::LayoutFrame,
+    id: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    text: &str,
+    bg: &str,
+    color: &str,
+    size: f64,
+) {
+    let mut style = BTreeMap::new();
+    style.insert(
+        "bg".to_owned(),
+        boon_document_model::StyleValue::Text(bg.to_owned()),
+    );
+    style.insert(
+        "color".to_owned(),
+        boon_document_model::StyleValue::Text(color.to_owned()),
+    );
+    style.insert(
+        "size".to_owned(),
+        boon_document_model::StyleValue::Number(size),
+    );
+    style.insert(
+        "font".to_owned(),
+        boon_document_model::StyleValue::Text(BOON_EDITOR_FONT_FAMILY.to_owned()),
+    );
+    style.insert(
+        "padding".to_owned(),
+        boon_document_model::StyleValue::Number(4.0),
+    );
+    let style_identity = boon_document::ComputedStyleIdentity::from_style(&style);
+    frame.display_list.push(boon_document::DisplayItem {
+        node: boon_document_model::DocumentNodeId(id.to_owned()),
+        kind: boon_document_model::DocumentNodeKind::Text,
+        bounds: boon_document::Rect {
+            x,
+            y,
+            width,
+            height,
+        },
+        text: Some(text.to_owned()),
+        style_identity,
+        style,
+        focused: false,
+    });
 }
 
 fn preview_frame_with_viewport_background(
@@ -7439,7 +7985,7 @@ fn native_gpu_dev_visible_render_hook(
         "example_catalog_entry_count": shell.catalog.entries.len(),
         "dev_window_tabs_visible": true,
         "dev_window_toolbar_visible": true,
-        "dev_window_controls": ["Run", "Format", "Reset"],
+        "dev_window_controls": ["Run", "Test", "Format", "Reset"],
         "code_editor_model": code_editor_model_report,
         "code_editor_visible_style": dev_code_editor_visible_style_report(layout_frame),
         "dev_hot_path_counters": {
@@ -14211,6 +14757,44 @@ impl PreviewTransport {
             }),
         }
     }
+
+    fn start_headed_scenario(
+        &self,
+        scenario_id: &str,
+        selected_example_id: &str,
+    ) -> serde_json::Value {
+        let Some(connect) = &self.connect else {
+            return json!({
+                "status": "not-bound",
+                "kind": "headed-scenario-start-ack",
+                "transport_bound": false,
+                "scenario_id": scenario_id,
+                "selected_example_id": selected_example_id
+            });
+        };
+        match send_preview_ipc_request_with_timeouts(
+            connect,
+            json!({
+                "kind": "headed-scenario-start",
+                "scenario_id": scenario_id,
+                "selected_example_id": selected_example_id,
+                "dev_pid": std::process::id()
+            }),
+            Duration::ZERO,
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+        ) {
+            Ok(value) => value,
+            Err(error) => json!({
+                "status": "unavailable",
+                "kind": "headed-scenario-start-ack",
+                "transport_bound": true,
+                "scenario_id": scenario_id,
+                "selected_example_id": selected_example_id,
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
 }
 
 struct DevWindowShell {
@@ -15175,6 +15759,10 @@ impl DevWindowShell {
 
         let mut value = match source_path {
             "dev.commands.run" => self.workspace.run_selected(&self.catalog),
+            "dev.commands.test" => {
+                self.hovered_editor_position = None;
+                self.start_selected_headed_scenario()
+            }
             "dev.commands.format" => {
                 self.hovered_editor_position = None;
                 self.workspace.format_selected(&self.catalog)
@@ -15223,10 +15811,12 @@ impl DevWindowShell {
             self.last_dev_command_detail = json_diagnostic(&value);
         }
         if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            if matches!(
-                value.get("command").and_then(serde_json::Value::as_str),
-                Some("EditorTextInput" | "Format")
-            ) {
+            let command = value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("DevCommand")
+                .to_owned();
+            if matches!(command.as_str(), "EditorTextInput" | "Format") {
                 value["custom_source_persistence"] = self.persist_selected_custom_source(
                     value
                         .get("command")
@@ -15234,16 +15824,48 @@ impl DevWindowShell {
                         .unwrap_or("DevCommand"),
                 );
             }
-            value["preview_transport"] = self.queue_selected_preview(
-                value
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("DevCommand"),
-            );
+            if command != "HeadedScenarioTest" {
+                value["preview_transport"] = self.queue_selected_preview(&command);
+            }
         }
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
         value
+    }
+
+    fn start_selected_headed_scenario(&mut self) -> serde_json::Value {
+        let selected_example_id = self.workspace.selected_example_id.clone();
+        let scenario_id = if selected_example_id == "counter" {
+            "counter"
+        } else {
+            "counter"
+        };
+        let response = self
+            .preview_transport
+            .start_headed_scenario(scenario_id, &selected_example_id);
+        let status = response
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("fail")
+            .to_owned();
+        self.last_dev_command = "HeadedScenarioTest".to_owned();
+        self.last_dev_command_status = status.clone();
+        self.last_dev_command_detail = json_diagnostic(&response).or_else(|| {
+            response
+                .get("report_path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| format!("report {path}"))
+        });
+        json!({
+            "status": status,
+            "command": "HeadedScenarioTest",
+            "scenario_id": scenario_id,
+            "selected_example_id": selected_example_id,
+            "preview_transport": response,
+            "dispatched_source_path": "dev.commands.test",
+            "dispatch_boundary": "Document SourceBinding -> DevWindowShell -> PreviewTransport -> preview headed scenario runner",
+            "direct_runtime_state_mutation": false
+        })
     }
 
     fn create_blank_custom_tab(&mut self) -> serde_json::Value {
@@ -16425,7 +17047,7 @@ fn dev_shell_document(
     } else {
         0
     };
-    let command_specs = ["run", "format", "reset", "remove_custom"];
+    let command_specs = ["run", "test", "format", "reset", "remove_custom"];
     let command_widths = command_specs
         .iter()
         .map(|command| if *command == "remove_custom" { 116 } else { 96 })
@@ -16745,6 +17367,7 @@ fn dev_shell_document(
         .any(|entry| entry.id == shell.workspace.selected_example_id && entry.custom);
     for (command_index, command) in command_specs.iter().copied().enumerate() {
         let label = match command {
+            "test" => "TEST".to_owned(),
             "remove_custom" => "REMOVE".to_owned(),
             other => other.to_ascii_uppercase(),
         };
@@ -16759,6 +17382,8 @@ fn dev_shell_document(
                         "#172031"
                     } else if command == "run" {
                         DEV_ACCENT
+                    } else if command == "test" {
+                        DEV_PASS
                     } else if command == "remove_custom" {
                         DEV_FAIL
                     } else {
@@ -16769,7 +17394,7 @@ fn dev_shell_document(
                     "color",
                     if remove_disabled {
                         "#64748b"
-                    } else if command == "run" {
+                    } else if command == "run" || command == "test" {
                         "#061528"
                     } else {
                         DEV_TEXT
@@ -16779,7 +17404,7 @@ fn dev_shell_document(
                     "border",
                     if remove_disabled {
                         DEV_BORDER_MUTED
-                    } else if command == "run" {
+                    } else if command == "run" || command == "test" {
                         DEV_ACCENT
                     } else {
                         DEV_BORDER
@@ -29223,6 +29848,361 @@ struct PreviewActiveDrag {
     last_y: f64,
 }
 
+#[derive(Clone, Debug)]
+struct PreviewHeadedScenarioDefinition {
+    id: String,
+    label: String,
+    steps: Vec<PreviewHeadedScenarioStep>,
+}
+
+#[derive(Clone, Debug)]
+enum PreviewHeadedScenarioStep {
+    MoveToSource {
+        source: String,
+        target_text: Option<String>,
+        duration_ms: u64,
+    },
+    ClickSource {
+        source: String,
+        target_text: Option<String>,
+    },
+    KeyOverlay {
+        keys: Vec<String>,
+        duration_ms: u64,
+    },
+    Wait {
+        duration_ms: u64,
+    },
+    AssertRuntimeText {
+        json_pointer: String,
+        expected: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PreviewHeadedScenarioRun {
+    definition: PreviewHeadedScenarioDefinition,
+    status: PreviewHeadedScenarioStatus,
+    step_index: usize,
+    started_at: Instant,
+    step_started_at: Instant,
+    step_start_cursor: (f64, f64),
+    cursor: (f64, f64),
+    overlay: PreviewHeadedScenarioOverlayState,
+    report_steps: Vec<serde_json::Value>,
+    failures: Vec<serde_json::Value>,
+    completed_at_unix_ms: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewHeadedScenarioStatus {
+    Running,
+    Pass,
+    Fail,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreviewHeadedScenarioOverlayState {
+    scenario_id: String,
+    cursor_x: f64,
+    cursor_y: f64,
+    label: String,
+    pressed_keys: Vec<String>,
+    mouse_down: bool,
+    click_pulse_started_at_ms: Option<u128>,
+    status_text: String,
+    step_text: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PreviewHeadedScenarioPollResult {
+    dirty: bool,
+    active: bool,
+}
+
+fn preview_headed_scenario_state() -> &'static Mutex<Option<PreviewHeadedScenarioRun>> {
+    static STATE: OnceLock<Mutex<Option<PreviewHeadedScenarioRun>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefinition {
+    PreviewHeadedScenarioDefinition {
+        id: "counter-basic-headed".to_owned(),
+        label: "Counter headed smoke".to_owned(),
+        steps: vec![
+            PreviewHeadedScenarioStep::MoveToSource {
+                source: "store.sources.increment_button.press".to_owned(),
+                target_text: Some("+".to_owned()),
+                duration_ms: 520,
+            },
+            PreviewHeadedScenarioStep::ClickSource {
+                source: "store.sources.increment_button.press".to_owned(),
+                target_text: Some("+".to_owned()),
+            },
+            PreviewHeadedScenarioStep::KeyOverlay {
+                keys: vec!["Mouse Left".to_owned()],
+                duration_ms: 180,
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/count".to_owned(),
+                expected: "1".to_owned(),
+            },
+            PreviewHeadedScenarioStep::MoveToSource {
+                source: "store.sources.decrement_button.press".to_owned(),
+                target_text: Some("-".to_owned()),
+                duration_ms: 520,
+            },
+            PreviewHeadedScenarioStep::ClickSource {
+                source: "store.sources.decrement_button.press".to_owned(),
+                target_text: Some("-".to_owned()),
+            },
+            PreviewHeadedScenarioStep::KeyOverlay {
+                keys: vec!["Mouse Left".to_owned()],
+                duration_ms: 180,
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/count".to_owned(),
+                expected: "0".to_owned(),
+            },
+            PreviewHeadedScenarioStep::Wait { duration_ms: 320 },
+        ],
+    }
+}
+
+fn preview_headed_scenario_definition(id: &str) -> Option<PreviewHeadedScenarioDefinition> {
+    match id {
+        "counter" | "counter-basic-headed" => Some(preview_headed_counter_scenario_definition()),
+        _ => None,
+    }
+}
+
+impl PreviewHeadedScenarioRun {
+    fn new(definition: PreviewHeadedScenarioDefinition) -> Self {
+        let now = Instant::now();
+        let started_at_unix_ms = unix_now_ms();
+        let cursor = (96.0, 96.0);
+        Self {
+            overlay: PreviewHeadedScenarioOverlayState {
+                scenario_id: definition.id.clone(),
+                cursor_x: cursor.0,
+                cursor_y: cursor.1,
+                label: "Test".to_owned(),
+                pressed_keys: Vec::new(),
+                mouse_down: false,
+                click_pulse_started_at_ms: None,
+                status_text: "Running".to_owned(),
+                step_text: "Starting".to_owned(),
+            },
+            report_steps: vec![json!({
+                "id": "start",
+                "status": "pass",
+                "started_at_unix_ms": started_at_unix_ms,
+                "runner": "preview-headed-scenario-runner",
+                "scenario_api": "Rust enum steps: move mouse, click, key overlay, wait, assert runtime text"
+            })],
+            definition,
+            status: PreviewHeadedScenarioStatus::Running,
+            step_index: 0,
+            started_at: now,
+            step_started_at: now,
+            step_start_cursor: cursor,
+            cursor,
+            failures: Vec::new(),
+            completed_at_unix_ms: None,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.status == PreviewHeadedScenarioStatus::Running
+    }
+
+    fn report(&self) -> serde_json::Value {
+        json!({
+            "kind": "headed-scenario-report",
+            "status": match self.status {
+                PreviewHeadedScenarioStatus::Running => "running",
+                PreviewHeadedScenarioStatus::Pass => "pass",
+                PreviewHeadedScenarioStatus::Fail => "fail",
+            },
+            "scenario_id": self.definition.id,
+            "scenario_label": self.definition.label,
+            "step_index": self.step_index,
+            "step_count": self.definition.steps.len(),
+            "steps": self.report_steps,
+            "failures": self.failures,
+            "failure_categories": [
+                "runtime_assertion",
+                "visual_readback",
+                "event_routing",
+                "timeout",
+                "cancellation"
+            ],
+            "overlay": {
+                "rendered_by": "preview LayoutFrame -> boon_native_gpu WGPU render scene",
+                "cursor_visible": true,
+                "click_feedback_visible": true,
+                "key_hud_visible": true,
+                "current": preview_headed_scenario_overlay_report(&self.overlay)
+            },
+            "input_route_contract": "headed scenario step -> app-owned NativeInputAdapterProof -> preview_apply_real_window_input_with_units -> document hit region -> LiveRuntime",
+            "direct_runtime_state_mutation": false,
+            "completed_at_unix_ms": self.completed_at_unix_ms
+        })
+    }
+
+    fn finish_pass_if_done(&mut self) {
+        if self.step_index >= self.definition.steps.len()
+            && self.status == PreviewHeadedScenarioStatus::Running
+        {
+            self.status = PreviewHeadedScenarioStatus::Pass;
+            self.completed_at_unix_ms = Some(unix_now_ms());
+            self.overlay.status_text = "Pass".to_owned();
+            self.overlay.step_text = "Counter scenario completed".to_owned();
+            self.report_steps.push(json!({
+                "id": "finish",
+                "status": "pass",
+                "completed_at_unix_ms": self.completed_at_unix_ms
+            }));
+        }
+    }
+
+    fn fail(&mut self, category: &str, detail: String) {
+        self.status = PreviewHeadedScenarioStatus::Fail;
+        self.completed_at_unix_ms = Some(unix_now_ms());
+        self.overlay.status_text = "Fail".to_owned();
+        self.overlay.step_text = detail.clone();
+        self.failures.push(json!({
+            "category": category,
+            "step_index": self.step_index,
+            "detail": detail
+        }));
+    }
+
+    fn advance_step(&mut self, now: Instant, report: serde_json::Value) {
+        self.report_steps.push(report);
+        self.step_index = self.step_index.saturating_add(1);
+        self.step_started_at = now;
+        self.step_start_cursor = self.cursor;
+        self.overlay.pressed_keys.clear();
+        self.overlay.mouse_down = false;
+        self.finish_pass_if_done();
+    }
+}
+
+fn preview_headed_scenario_overlay_report(
+    overlay: &PreviewHeadedScenarioOverlayState,
+) -> serde_json::Value {
+    json!({
+        "scenario_id": overlay.scenario_id,
+        "cursor_x": overlay.cursor_x,
+        "cursor_y": overlay.cursor_y,
+        "label": overlay.label,
+        "pressed_keys": overlay.pressed_keys,
+        "mouse_down": overlay.mouse_down,
+        "click_pulse_visible": overlay.click_pulse_started_at_ms.is_some(),
+        "status_text": overlay.status_text,
+        "step_text": overlay.step_text
+    })
+}
+
+fn preview_headed_scenario_overlay() -> Option<PreviewHeadedScenarioOverlayState> {
+    preview_headed_scenario_state()
+        .lock()
+        .ok()
+        .and_then(|state| state.as_ref().map(|run| run.overlay.clone()))
+}
+
+fn preview_headed_scenario_report_path(scenario_id: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "target/reports/native-gpu/headed-scenario-{scenario_id}.json"
+    ))
+}
+
+fn write_preview_headed_scenario_report(run: &PreviewHeadedScenarioRun) {
+    let path = preview_headed_scenario_report_path(&run.definition.id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&run.report()).unwrap_or_default(),
+    );
+}
+
+fn preview_start_headed_scenario_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let scenario_id = request
+        .get("scenario_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("counter");
+    let definition = preview_headed_scenario_definition(scenario_id)
+        .ok_or_else(|| format!("unknown headed scenario `{scenario_id}`"))?;
+    let source_path = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?
+        .source_path
+        .clone();
+    if definition.id == "counter-basic-headed" && !source_path.ends_with("counter.bn") {
+        return Ok(json!({
+            "kind": "headed-scenario-start-ack",
+            "status": "fail",
+            "scenario_id": definition.id,
+            "failure_category": "event_routing",
+            "diagnostic": format!(
+                "Counter headed scenario requires the preview to be running examples/counter.bn, current source is {}",
+                source_path.display()
+            ),
+            "preview_pid": std::process::id()
+        }));
+    }
+    let run = PreviewHeadedScenarioRun::new(definition);
+    let report_path = preview_headed_scenario_report_path(&run.definition.id);
+    write_preview_headed_scenario_report(&run);
+    *preview_headed_scenario_state()
+        .lock()
+        .map_err(|_| "preview headed scenario mutex poisoned")? = Some(run.clone());
+    Ok(json!({
+        "kind": "headed-scenario-start-ack",
+        "status": "pass",
+        "scenario_id": run.definition.id,
+        "scenario_label": run.definition.label,
+        "report_path": report_path,
+        "overlay_rendered_by": "preview LayoutFrame -> boon_native_gpu WGPU render scene",
+        "direct_runtime_state_mutation": false,
+        "preview_pid": std::process::id()
+    }))
+}
+
+fn preview_headed_scenario_status_response() -> serde_json::Value {
+    match preview_headed_scenario_state().lock() {
+        Ok(state) => state
+            .as_ref()
+            .map(PreviewHeadedScenarioRun::report)
+            .unwrap_or_else(|| {
+                json!({
+                    "kind": "headed-scenario-report",
+                    "status": "idle",
+                    "scenario_id": null
+                })
+            }),
+        Err(_) => json!({
+            "kind": "headed-scenario-report",
+            "status": "fail",
+            "failure_category": "runtime_assertion",
+            "diagnostic": "preview headed scenario mutex poisoned"
+        }),
+    }
+}
+
 const PREVIEW_DRAG_STEP_PX: f64 = 18.0;
 const PREVIEW_DRAG_MAX_EVENTS_PER_INPUT: usize = 8;
 
@@ -38217,6 +39197,40 @@ fn handle_preview_ipc_client(
         )?;
         return Ok(());
     }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-start") {
+        let response =
+            preview_start_headed_scenario_response(&state, &request).unwrap_or_else(|error| {
+                json!({
+                    "kind": "headed-scenario-start-ack",
+                    "status": "fail",
+                    "failure_category": "event_routing",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
+        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            wake_handle.wake();
+        }
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-status") {
+        let response = preview_headed_scenario_status_response();
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("shutdown") {
         let reason = request
             .get("reason")
@@ -41782,6 +42796,103 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    #[test]
+    fn headed_counter_scenario_definition_is_generic_rust_steps() {
+        let definition = preview_headed_counter_scenario_definition();
+        assert_eq!(definition.id, "counter-basic-headed");
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::MoveToSource { .. })),
+            "scenario should expose a generic move step"
+        );
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::ClickSource { .. })),
+            "scenario should expose a generic click step"
+        );
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::AssertRuntimeText { .. })),
+            "scenario should expose a generic runtime assertion step"
+        );
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
+            "scenario should expose key/click overlay timing as a step"
+        );
+    }
+
+    #[test]
+    fn headed_scenario_overlay_appends_wgpu_rendered_display_items() {
+        let mut frame = boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let overlay = PreviewHeadedScenarioOverlayState {
+            scenario_id: "counter-basic-headed".to_owned(),
+            cursor_x: 120.0,
+            cursor_y: 140.0,
+            label: "Test".to_owned(),
+            pressed_keys: vec!["Mouse Left".to_owned()],
+            mouse_down: true,
+            click_pulse_started_at_ms: Some(unix_now_ms()),
+            status_text: "Running".to_owned(),
+            step_text: "Click `+`".to_owned(),
+        };
+        preview_apply_headed_scenario_overlay_to_render_frame(&mut frame, &overlay, 920.0, 720.0);
+        let nodes = frame
+            .display_list
+            .iter()
+            .map(|item| item.node.0.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(nodes.contains("headed-scenario-cursor-marker"));
+        assert!(nodes.contains("headed-scenario-click-pulse"));
+        assert!(nodes.contains("headed-scenario-key-hud-keys"));
+        assert_eq!(frame.metrics.display_item_count, frame.display_list.len());
+    }
+
+    #[test]
+    fn dev_window_exposes_test_button_source_binding() {
+        let source = boon_runtime::source_text_for_path(&repo_path("examples/counter.bn")).unwrap();
+        let shell = DevWindowShell::new(
+            "examples/counter.bn",
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        let document = shell.document();
+        let button = document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-command-test".to_owned(),
+            ))
+            .expect("dev toolbar should expose a Test button");
+        assert_eq!(
+            button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("dev.commands.test")
+        );
+        assert_eq!(
+            button.text.as_ref().map(|text| text.text.as_str()),
+            Some("TEST")
+        );
     }
 
     fn test_root_field_patch(path: &str) -> boon_runtime::RenderPatch<'static> {

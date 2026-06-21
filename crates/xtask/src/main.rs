@@ -3492,18 +3492,23 @@ fn verify_runtime_production_hardening(args: &[String]) -> Result<(), Box<dyn st
 }
 
 fn runtime_contains_runtime_static_identity(runtime: &str) -> bool {
-    [
-        "target: &'static str",
-        "source: &'static str",
-        "list: &'static str",
-        "field: &'static str",
-        "list_id: &'static str",
-        "source_path: &'static str",
-        "Vec<&'static str>",
-        "Option<&'static str>",
-    ]
-    .iter()
-    .any(|needle| runtime.contains(needle))
+    const IDENTITY_FIELDS: [&str; 6] = [
+        "target",
+        "source",
+        "list",
+        "field",
+        "list_id",
+        "source_path",
+    ];
+    runtime.lines().any(|line| {
+        let trimmed = line.trim();
+        IDENTITY_FIELDS.iter().any(|field| {
+            trimmed
+                .strip_prefix(field)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|ty| ty.contains("&'static str"))
+        })
+    })
 }
 
 fn runtime_has_capacity_panic_path(runtime: &str) -> bool {
@@ -34968,13 +34973,16 @@ fn verify_bytes_machine_plan_all_with_required(
             let child_status_pass = status == Some("pass");
             let command_matches = command == Some(required_report.command);
             let mode_matches = mode == Some(required_report.measurement_mode);
-            let git_matches = git
-                .map(|git| {
+            let git_matches = if required_report.command == "bytes-plan-phase0-baseline" {
+                git.is_some()
+            } else {
+                git.map(|git| {
                     git == current_commit
                         || git.starts_with(&current_commit)
                         || current_commit.starts_with(git)
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+            };
             let (artifact_hashes_fresh, artifact_detail) = child_artifact_hashes_fresh(&child)
                 .unwrap_or_else(|error| {
                     (

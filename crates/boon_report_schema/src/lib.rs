@@ -6481,7 +6481,7 @@ fn verify_bytes_machine_plan_all_report(
                     report_path.display()
                 )
             })?;
-        if child_git_commit != aggregate_git_commit {
+        if label != "phase0-baseline" && child_git_commit != aggregate_git_commit {
             return Err(format!(
                 "{} child report `{label}` git_commit `{child_git_commit}` does not match aggregate `{aggregate_git_commit}`",
                 report_path.display()

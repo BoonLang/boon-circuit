@@ -3206,11 +3206,21 @@ pub fn run_plan_source_route(
     let report_status = if legacy_passed { "pass" } else { "fail" };
     let (source_event, source_event_artifacts) =
         source_event_report(&event, source_route, output.source_id.0 as u64, report_path)?;
+    let command_argv = run_plan_source_route_command_argv(
+        source_path,
+        target_profile,
+        source_route,
+        target_state,
+        &event,
+        &source_event,
+        compare_legacy,
+        report_path,
+    );
     let report = json!({
         "status": report_status,
         "report_version": 1,
         "command": "run-plan-route",
-        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "command_argv": command_argv,
         "measurement_mode": "proof",
         "exit_status": if legacy_passed { 0 } else { 1 },
         "generated_at_utc": now_string(),
@@ -12534,6 +12544,84 @@ fn source_event_report(
         }),
         artifacts,
     ))
+}
+
+fn run_plan_source_route_command_argv(
+    source_path: &Path,
+    target_profile: TargetProfile,
+    source_route: &str,
+    target_state: &str,
+    event: &LiveSourceEvent,
+    source_event: &JsonValue,
+    compare_legacy: bool,
+    report_path: Option<&Path>,
+) -> Vec<String> {
+    let current_args = std::env::args().collect::<Vec<_>>();
+    if current_args.iter().any(|arg| arg == "run-plan-route") {
+        return current_args;
+    }
+
+    let mut argv = vec![
+        "target/debug/boon_cli".to_owned(),
+        "run-plan-route".to_owned(),
+        source_path.display().to_string(),
+        "--source".to_owned(),
+        source_route.to_owned(),
+        "--target-state".to_owned(),
+        target_state.to_owned(),
+    ];
+    if let Some(text) = &event.text {
+        argv.push("--text".to_owned());
+        argv.push(text.clone());
+    }
+    if let Some(key) = &event.key {
+        argv.push("--key".to_owned());
+        argv.push(key.clone());
+    }
+    if let Some(address) = &event.address {
+        argv.push("--address".to_owned());
+        argv.push(address.clone());
+    }
+    for (name, value) in &event.payload {
+        argv.push("--payload".to_owned());
+        argv.push(format!("{name}={value}"));
+    }
+    for (name, bytes) in &event.payload_bytes {
+        let artifact_path = source_event
+            .get("payload_bytes")
+            .and_then(|payload| payload.get(name))
+            .and_then(|payload| payload.get("artifact_path"))
+            .and_then(JsonValue::as_str);
+        if let Some(path) = artifact_path {
+            argv.push("--payload-bytes-file".to_owned());
+            argv.push(format!("{name}={path}"));
+        } else {
+            argv.push("--payload-bytes-hex".to_owned());
+            argv.push(format!("{name}={}", bytes_hex_argument(bytes)));
+        }
+    }
+    if compare_legacy {
+        argv.push("--compare-legacy".to_owned());
+    }
+    if target_profile != TargetProfile::SoftwareDefault {
+        argv.push("--target".to_owned());
+        argv.push(target_profile.as_str().to_owned());
+    }
+    if let Some(report_path) = report_path {
+        argv.push("--report".to_owned());
+        argv.push(report_path.display().to_string());
+    }
+    argv
+}
+
+fn bytes_hex_argument(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn source_event_payload_bytes_report(

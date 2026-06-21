@@ -1787,7 +1787,11 @@ fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> RenderTextAlign {
 }
 
 fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> RenderTextVerticalAlign {
-    match style_text(style, "vertical_align").unwrap_or("") {
+    match style_text(style, "vertical_align")
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "top" => RenderTextVerticalAlign::Top,
         "bottom" => RenderTextVerticalAlign::Bottom,
         "center" => RenderTextVerticalAlign::Center,

@@ -97,7 +97,7 @@ store: [
         active_count == 0 |> Bool/and(completed_count > 0)
 
     new_todo_focused:
-        False |> HOLD state {
+        True |> HOLD state {
             LATEST {
                 sources.new_todo_input.events.focus |> THEN { True }
                 sources.new_todo_input.events.blur |> THEN { False }
@@ -311,7 +311,7 @@ FUNCTION todo_new_entry() {
             border_width: 1
             outline:
                 PASSED.store.new_todo_focused |> WHILE {
-                    True => [side: Inner, color: Oklch[lightness:0.585,chroma:0.172,hue:24.1]]
+                    True => [side: Inner, color: TEXT { #d79797 }]
                     False => NoOutline
                 }
         ]
@@ -431,6 +431,7 @@ FUNCTION todo_row(todo) {
                     height: 42
                     background: [color: Oklch[lightness:1]]
                     text_align: Left
+                    vertical_align: Center
                     text_inset: 0
                     font: [
                         family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }

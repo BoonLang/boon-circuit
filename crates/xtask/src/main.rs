@@ -19038,7 +19038,12 @@ fn todomvc_pixel_reference_evidence(
         reference_metadata,
         layout_evidence,
     )?;
-    let red_title = count_region_pixels(&image, 0, 0, width, height / 4, |r, g, b, _| {
+    let title_search_y_end = layout_evidence
+        .get("title_bounds")
+        .and_then(parse_json_bounds)
+        .map(|bounds| (bounds.y + bounds.height).ceil().clamp(1.0, height as f64) as u32)
+        .unwrap_or(height / 4);
+    let red_title = count_region_pixels(&image, 0, 0, width, title_search_y_end, |r, g, b, _| {
         r > 150 && g < 100 && b < 120
     });
     let dark_text = count_region_pixels(&image, 0, height / 5, width, height, |r, g, b, _| {
@@ -19050,9 +19055,10 @@ fn todomvc_pixel_reference_evidence(
     let teal_check = count_region_pixels(&image, 0, height / 5, width / 2, height, |r, g, b, _| {
         r < 130 && g > 150 && b > 130
     });
-    let title_pixel_bounds = color_pixel_bounds(&image, 0, 0, width, height / 4, |r, g, b, a| {
-        a > 180 && r > 150 && g < 120 && b < 140
-    });
+    let title_pixel_bounds =
+        color_pixel_bounds(&image, 0, 0, width, title_search_y_end, |r, g, b, a| {
+            a > 180 && r > 150 && g < 120 && b < 140
+        });
     let title_pixel_bounds_pass = title_pixel_bounds.as_ref().is_some_and(|bounds| {
         let center_ratio = bounds.center_x() / width.max(1) as f64;
         let title_width = bounds.width();
@@ -19121,6 +19127,7 @@ fn todomvc_pixel_reference_evidence(
         "pass": missing.is_empty(),
         "missing": missing,
         "dimensions": [width, height],
+        "title_search_y_end": title_search_y_end,
         "red_title_pixels": red_title,
         "dark_text_pixels": dark_text,
         "white_panel_pixels": white_panel,

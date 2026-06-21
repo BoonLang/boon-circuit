@@ -1,0 +1,14 @@
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    byte_len:
+        0 |> HOLD byte_len {
+            LATEST {
+                store.measure |> THEN { payload |> Bytes/length }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

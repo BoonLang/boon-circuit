@@ -187,6 +187,11 @@ pub enum AstExprKind {
     StringLiteral(String),
     TextLiteral(String),
     Number(String),
+    ByteLiteral {
+        radix: u8,
+        digits: String,
+        value: u8,
+    },
     Bool(bool),
     Enum(String),
     Tag(String),
@@ -232,8 +237,20 @@ pub enum AstExprKind {
         #[serde(default)]
         items: Vec<usize>,
     },
+    BytesLiteral {
+        size: BytesSizeSyntax,
+        #[serde(default)]
+        items: Vec<usize>,
+    },
     Delimiter,
     Unknown(Vec<String>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BytesSizeSyntax {
+    Dynamic,
+    Infer,
+    Fixed(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -869,7 +886,8 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
         .collect::<Vec<_>>();
     let text_body_line_ranges = text_literal_body_line_ranges(&tokens);
     let lines = parser_lines(&tokens);
-    let items = parser_items(&lines, &text_body_line_ranges);
+    let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
+    let items = parser_items(&item_lines, &text_body_line_ranges);
     let mut expressions = Vec::new();
     let statements = ast_statement_tree(&items, &mut expressions, source);
     Ok(AstProgram {
@@ -1039,6 +1057,66 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
         });
     }
     lines
+}
+
+fn merge_multiline_bytes_lines(
+    lines: &[ParserLine],
+    text_body_line_ranges: &[(usize, usize)],
+) -> Vec<ParserLine> {
+    let mut merged = Vec::new();
+    let mut index = 0usize;
+    while let Some(line) = lines.get(index) {
+        if line_is_in_ranges(line.line, text_body_line_ranges) {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        }
+        let Some(body_open) = unclosed_bytes_body_open(&line.symbols) else {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        };
+        let mut current = line.clone();
+        index += 1;
+        while matching_close(&current.symbols, body_open).is_none() {
+            let Some(next) = lines.get(index) else {
+                break;
+            };
+            if line_is_in_ranges(next.line, text_body_line_ranges) {
+                break;
+            }
+            current.end = next.end;
+            current.symbols.extend(next.symbols.iter().cloned());
+            current
+                .symbol_spans
+                .extend(next.symbol_spans.iter().copied());
+            index += 1;
+        }
+        merged.push(current);
+    }
+    merged
+}
+
+fn line_is_in_ranges(line: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| line >= *start && line <= *end)
+}
+
+fn unclosed_bytes_body_open(symbols: &[String]) -> Option<usize> {
+    let bytes = symbols.iter().position(|symbol| symbol == "BYTES")?;
+    let body_open = match symbols.get(bytes + 1).map(String::as_str) {
+        Some("{") => bytes + 1,
+        Some("[") => {
+            let size_close = matching_close(symbols, bytes + 1)?;
+            (symbols.get(size_close + 1).map(String::as_str) == Some("{"))
+                .then_some(size_close + 1)?
+        }
+        _ => return None,
+    };
+    matching_close(symbols, body_open)
+        .is_none()
+        .then_some(body_open)
 }
 
 fn parser_items(lines: &[ParserLine], text_body_line_ranges: &[(usize, usize)]) -> Vec<ParserItem> {
@@ -1278,6 +1356,13 @@ fn ast_expr_kind(
     if let Some(number) = ast_number_literal(tokens) {
         return AstExprKind::Number(number);
     }
+    if let Some((radix, digits, value)) = ast_byte_literal(tokens, item, source) {
+        return AstExprKind::ByteLiteral {
+            radix,
+            digits,
+            value,
+        };
+    }
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
         return AstExprKind::MatchArm {
             pattern: tokens[..arrow].to_vec(),
@@ -1313,6 +1398,9 @@ fn ast_expr_kind(
             capacity: ast_list_capacity(tokens),
             items: ast_list_items(tokens, item, expressions, source),
         };
+    }
+    if let Some((size, items)) = ast_bytes_literal(tokens, item, expressions, source) {
+        return AstExprKind::BytesLiteral { size, items };
     }
     if tokens.first().map(String::as_str) == Some("[")
         && tokens.last().map(String::as_str) == Some("]")
@@ -1423,6 +1511,56 @@ fn ast_number_literal(tokens: &[String]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn ast_byte_literal(
+    tokens: &[String],
+    item: &ParserItem,
+    source: &str,
+) -> Option<(u8, String, u8)> {
+    let [base, suffix] = tokens else {
+        return None;
+    };
+    let adjacent_text = format!("{base}{suffix}");
+    let adjacent_in_source = source
+        .get(item.start..item.end)
+        .is_some_and(|item_source| item_source.contains(&adjacent_text));
+    if !adjacent_in_source {
+        return None;
+    }
+    parse_byte_literal_parts(base, suffix).ok()
+}
+
+fn parse_byte_literal_parts(base: &str, suffix: &str) -> Result<(u8, String, u8), String> {
+    let radix = match base {
+        "2" => 2,
+        "8" => 8,
+        "10" => 10,
+        "16" => 16,
+        _ => {
+            return Err("byte literal base must be one of `2`, `8`, `10`, or `16`".to_owned());
+        }
+    };
+    let Some(digits) = suffix.strip_prefix('u') else {
+        return Err("byte literal must use explicit base notation such as `16uFF`".to_owned());
+    };
+    if digits.is_empty() {
+        return Err("byte literal must include digits after `u`".to_owned());
+    }
+    if !digits.chars().all(|ch| ch.is_digit(radix as u32)) {
+        return Err(format!(
+            "byte literal `{base}u{digits}` contains digits outside base {radix}"
+        ));
+    }
+    let value = u16::from_str_radix(digits, radix as u32).map_err(|_| {
+        format!("byte literal `{base}u{digits}` could not be parsed in base {radix}")
+    })?;
+    if value > u8::MAX as u16 {
+        return Err(format!(
+            "byte literal `{base}u{digits}` evaluates to {value}, but bytes must be 0..255"
+        ));
+    }
+    Ok((radix, digits.to_owned(), value as u8))
 }
 
 fn ast_pipe_expr_kind(
@@ -1960,6 +2098,48 @@ fn ast_list_items(
         .collect()
 }
 
+fn ast_bytes_literal(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Option<(BytesSizeSyntax, Vec<usize>)> {
+    if tokens.first().map(String::as_str) != Some("BYTES") {
+        return None;
+    }
+    let (size, body_open) = match tokens.get(1).map(String::as_str) {
+        Some("{") => (BytesSizeSyntax::Dynamic, 1),
+        Some("[") => {
+            let close = matching_close(tokens, 1)?;
+            let size_tokens = &tokens[2..close];
+            let size = match size_tokens {
+                [value] if value == "__" => BytesSizeSyntax::Infer,
+                [value] => BytesSizeSyntax::Fixed(value.parse().ok()?),
+                _ => return None,
+            };
+            if tokens.get(close + 1).map(String::as_str) != Some("{") {
+                return None;
+            }
+            (size, close + 1)
+        }
+        _ => return None,
+    };
+    let body_close = matching_close(tokens, body_open)?;
+    if body_close + 1 != tokens.len() {
+        return None;
+    }
+    let items = if body_close <= body_open + 1 {
+        Vec::new()
+    } else {
+        split_top_level(&tokens[body_open + 1..body_close], ",")
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .map(|part| parse_ast_expr(&part, item, expressions, source))
+            .collect()
+    };
+    Some((size, items))
+}
+
 fn ast_map_new_function(symbols: &[String]) -> Option<&str> {
     let map = symbols.iter().position(|lexeme| lexeme == "List/map")?;
     let new = symbols[map..].iter().position(|lexeme| lexeme == "new")? + map;
@@ -2077,7 +2257,145 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
             }
         }
     }
+    validate_bytes_syntax(path, ast, &text_literal_spans)?;
     Ok(())
+}
+
+fn validate_bytes_syntax(
+    path: &str,
+    ast: &AstProgram,
+    text_literal_spans: &[(usize, usize)],
+) -> Result<(), ParseError> {
+    for window in ast.tokens.windows(2) {
+        let [base_token, suffix_token] = window else {
+            continue;
+        };
+        if base_token.line != suffix_token.line
+            || base_token.end != suffix_token.start
+            || matches!(
+                base_token.kind,
+                AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
+            )
+            || matches!(
+                suffix_token.kind,
+                AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
+            )
+            || text_literal_spans
+                .iter()
+                .any(|(start, end)| base_token.start >= *start && base_token.end <= *end)
+            || text_literal_spans
+                .iter()
+                .any(|(start, end)| suffix_token.start >= *start && suffix_token.end <= *end)
+        {
+            continue;
+        }
+        if !matches!(base_token.kind, AstTokenKind::Number) || !suffix_token.lexeme.starts_with('u')
+        {
+            continue;
+        }
+        parse_byte_literal_parts(&base_token.lexeme, &suffix_token.lexeme)
+            .map_err(|message| error(path, base_token.line, base_token.column, message.as_str()))?;
+    }
+    for item in &ast.items {
+        validate_bytes_item_syntax(path, ast, item, text_literal_spans)?;
+    }
+    Ok(())
+}
+
+fn validate_bytes_item_syntax(
+    path: &str,
+    _ast: &AstProgram,
+    item: &ParserItem,
+    text_literal_spans: &[(usize, usize)],
+) -> Result<(), ParseError> {
+    for bytes_index in item
+        .symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| (symbol == "BYTES").then_some(index))
+    {
+        let token_start = item
+            .symbol_spans
+            .get(bytes_index)
+            .map(|(start, _)| *start)
+            .unwrap_or(item.start);
+        if text_literal_spans
+            .iter()
+            .any(|(start, end)| token_start >= *start && token_start <= *end)
+        {
+            continue;
+        }
+        match item.symbols.get(bytes_index + 1).map(String::as_str) {
+            Some("{") => {
+                validate_bytes_body_consumption(path, item, bytes_index + 1)?;
+            }
+            Some("[") => {
+                let Some(close) = matching_close(&item.symbols, bytes_index + 1) else {
+                    return Err(error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BYTES size is missing closing `]`",
+                    ));
+                };
+                let size_tokens = &item.symbols[bytes_index + 2..close];
+                let valid_size = matches!(size_tokens, [value] if value == "__" || value.parse::<usize>().is_ok());
+                if !valid_size {
+                    return Err(error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BYTES size must be `__` or a non-negative decimal integer in v1",
+                    ));
+                }
+                if item.symbols.get(close + 1).map(String::as_str) != Some("{") {
+                    return Err(error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BYTES constructor requires a `{ ... }` body",
+                    ));
+                }
+                validate_bytes_body_consumption(path, item, close + 1)?;
+            }
+            _ => {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BYTES constructor requires a `{ ... }` body",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bytes_body_consumption(
+    path: &str,
+    item: &ParserItem,
+    body_open: usize,
+) -> Result<(), ParseError> {
+    let Some(body_close) = matching_close(&item.symbols, body_open) else {
+        return Err(error(
+            path,
+            item.line,
+            item.indent + 1,
+            "BYTES constructor is missing closing `}`",
+        ));
+    };
+    let Some(next) = item.symbols.get(body_close + 1) else {
+        return Ok(());
+    };
+    if matches!(next.as_str(), "," | ")" | "]" | "}" | "|>") {
+        return Ok(());
+    }
+    Err(error(
+        path,
+        item.line,
+        item.indent + 1,
+        format!("BYTES constructor has unexpected trailing token `{next}`").as_str(),
+    ))
 }
 
 fn text_literal_token_spans(tokens: &[AstToken]) -> Vec<(usize, usize)> {
@@ -2391,8 +2709,34 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/starts_with"
             | "Text/all_chars_in"
             | "Text/to_number"
+            | "Text/to_bytes"
             | "Text/is_empty"
             | "Text/is_not_empty"
+            | "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/concat"
+            | "Bytes/equal"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/zeros"
+            | "Bytes/to_text"
+            | "Bytes/from_hex"
+            | "Bytes/to_hex"
+            | "Bytes/from_base64"
+            | "Bytes/to_base64"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
+            | "File/read_bytes"
+            | "File/read_text"
+            | "File/write_bytes"
             | "Number/bit_width"
             | "Number/to_text"
             | "Number/to_codepoint_text"
@@ -2482,10 +2826,8 @@ fn add_inferred_list_memories(
     published_list_names: &BTreeSet<String>,
 ) {
     for name in candidate_names {
-        if matches!(
-            name.as_str(),
-            "store" | "document" | "scene" | "items" | "children"
-        ) || tables.list_memories.iter().any(|list| &list.name == name)
+        if matches!(name.as_str(), "store" | "document" | "scene")
+            || tables.list_memories.iter().any(|list| &list.name == name)
         {
             continue;
         }
@@ -2649,7 +2991,7 @@ fn collect_list_memory_name_statements(
             }
             AstStatementKind::List { field: None, .. } => {
                 if let Some(name) = scope.last()
-                    && !matches!(name.as_str(), "items" | "children")
+                    && !scope_names_nested_render_slot(scope)
                 {
                     names.insert(name.clone());
                 }
@@ -2657,7 +2999,7 @@ fn collect_list_memory_name_statements(
             }
             AstStatementKind::Field { name } => {
                 if name != "document"
-                    && !matches!(name.as_str(), "items" | "children")
+                    && !field_name_is_nested_render_slot(name, scope)
                     && (statement
                         .expr
                         .is_some_and(|expr_id| expr_returns_list_collection(expr_id, ast, names))
@@ -2682,6 +3024,17 @@ fn collect_list_memory_name_statements(
             }
         }
     }
+}
+
+fn field_name_is_nested_render_slot(name: &str, scope: &[String]) -> bool {
+    matches!(name, "items" | "children") && !scope.is_empty()
+}
+
+fn scope_names_nested_render_slot(scope: &[String]) -> bool {
+    scope
+        .last()
+        .is_some_and(|name| matches!(name.as_str(), "items" | "children"))
+        && scope.len() > 1
 }
 
 fn derive_structure_from_statements(
@@ -2744,6 +3097,17 @@ fn derive_structure_from_statements(
             AstStatementKind::Field { name } => {
                 if name == "document" {
                     continue;
+                }
+                if scope.is_empty()
+                    && matches!(name.as_str(), "items" | "children")
+                    && field_statement_contains_list_literal(statement, expressions)
+                    && !tables.list_memories.iter().any(|list| list.name == *name)
+                {
+                    tables.list_memories.push(ParsedListMemory {
+                        name: name.clone(),
+                        line: statement.line,
+                        capacity: None,
+                    });
                 }
                 if scope_is_indexed(scope, row_scopes)
                     && statement_direct_stateful_operator(statement, expressions)
@@ -2885,6 +3249,38 @@ fn derive_structure_from_statements(
                 );
             }
         }
+    }
+}
+
+fn field_statement_contains_list_literal(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    statement
+        .expr
+        .is_some_and(|expr_id| expr_id_contains_list_literal(expr_id, expressions))
+        || statement
+            .children
+            .iter()
+            .any(|child| field_statement_contains_list_literal(child, expressions))
+}
+
+fn expr_id_contains_list_literal(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::ListLiteral { .. } => true,
+        AstExprKind::Pipe { input, args, .. } => {
+            expr_id_contains_list_literal(*input, expressions)
+                || args
+                    .iter()
+                    .any(|arg| expr_id_contains_list_literal(arg.value, expressions))
+        }
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| expr_id_contains_list_literal(arg.value, expressions)),
+        _ => false,
     }
 }
 
@@ -3204,11 +3600,17 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
                 collect_called_functions(*item, expressions, calls);
             }
         }
+        AstExprKind::BytesLiteral { items, .. } => {
+            for item in items {
+                collect_called_functions(*item, expressions, calls);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Bool(_)
         | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
@@ -4564,6 +4966,185 @@ FUNCTION new_waveform_segment(segment) {
                 .iter()
                 .any(|expr| matches!(expr.kind, AstExprKind::Unknown(_)))
         );
+    }
+
+    #[test]
+    fn parses_bytes_literals_and_explicit_base_byte_literals() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+empty_dynamic: BYTES {}
+png_magic: BYTES[__] { 16u89, 16u50, 16u4E, 16u47 }
+header: BYTES[4] { 16u89, 16u50, 16u4E, 16u47 }
+scratch: BYTES[64] {}
+frame: BYTES[__] { header, BYTES[1] { 16u00 } }
+patched: Bytes/set(input: header, index: 0, value: 16uFF)
+"#;
+        let program = parse_source("bytes-parser.bn", source).unwrap();
+        let byte_values = program
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::ByteLiteral {
+                    radix,
+                    digits,
+                    value,
+                } => Some((*radix, digits.clone(), *value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(byte_values.contains(&(16, "89".to_owned(), 0x89)));
+        assert!(byte_values.contains(&(16, "FF".to_owned(), 0xFF)));
+
+        let bytes_literals = program
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::BytesLiteral { size, items } => Some((size.clone(), items.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Dynamic, 0)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Infer, 4)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(4), 4)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(64), 0)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(1), 1)));
+    }
+
+    #[test]
+    fn parses_multiline_bytes_literals_with_comments() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+header: BYTES[4] {
+    -- PNG magic prefix
+    16u89,
+    16u50,
+    16u4E,
+    16u47
+}
+frame: BYTES[__] {
+    header,
+    -- nested constructor is flattened by later semantic phases
+    BYTES[2] {
+        16u00,
+        16uFF
+    }
+}
+trailing_comment: BYTES[1] { 16u2A } -- comment after inline constructor
+"#;
+        let program = parse_source("bytes-multiline-parser.bn", source).unwrap();
+        let bytes_literals = program
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::BytesLiteral { size, items } => Some((size.clone(), items.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(4), 4)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Infer, 2)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(2), 2)));
+        assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(1), 1)));
+        assert!(
+            !program
+                .expressions
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::Unknown(_)))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_bytes_syntax_with_targeted_diagnostics() {
+        let invalid_hex = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16uGG }\n",
+        )
+        .unwrap_err();
+        assert!(invalid_hex.message.contains("outside base 16"));
+
+        let overflow = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u100 }\n",
+        )
+        .unwrap_err();
+        assert!(overflow.message.contains("bytes must be 0..255"));
+
+        let bad_size =
+            parse_source("bad-bytes.bn", "SOURCE\nHOLD\nLATEST\nbad: BYTES[foo] {}\n").unwrap_err();
+        assert!(bad_size.message.contains("BYTES size must be `__`"));
+
+        let negative_size =
+            parse_source("bad-bytes.bn", "SOURCE\nHOLD\nLATEST\nbad: BYTES[-1] {}\n").unwrap_err();
+        assert!(
+            negative_size
+                .message
+                .contains("non-negative decimal integer")
+        );
+
+        let missing_body =
+            parse_source("bad-bytes.bn", "SOURCE\nHOLD\nLATEST\nbad: BYTES[4]\n").unwrap_err();
+        assert!(
+            missing_body
+                .message
+                .contains("BYTES constructor requires a `{ ... }` body")
+        );
+
+        let trailing = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u00 } trailing\n",
+        )
+        .unwrap_err();
+        assert!(
+            trailing
+                .message
+                .contains("BYTES constructor has unexpected trailing token `trailing`")
+        );
+
+        let multiline_invalid_hex = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16uGG\n}\n",
+        )
+        .unwrap_err();
+        assert!(multiline_invalid_hex.message.contains("outside base 16"));
+
+        let multiline_trailing = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16u00\n} trailing\n",
+        )
+        .unwrap_err();
+        assert!(
+            multiline_trailing
+                .message
+                .contains("BYTES constructor has unexpected trailing token `trailing`")
+        );
+    }
+
+    #[test]
+    fn byte_literal_validation_does_not_cross_lines() {
+        let parsed = parse_source(
+            "bytes-line-boundary.bn",
+            "SOURCE\nHOLD\nLATEST\na: 16\nupdated: 1\nspaced: 16 uFF\ndocument: []\n",
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .expressions
+                .iter()
+                .any(|expr| matches!(&expr.kind, AstExprKind::Number(value) if value == "16"))
+        );
+        assert!(!parsed.expressions.iter().any(|expr| {
+            matches!(
+                &expr.kind,
+                AstExprKind::ByteLiteral {
+                    radix: 16,
+                    digits,
+                    value: 0xFF
+                } if digits == "FF"
+            )
+        }));
     }
 
     #[test]

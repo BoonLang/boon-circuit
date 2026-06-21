@@ -1,0 +1,26 @@
+store: [
+    toggle: SOURCE
+    input: [change: SOURCE]
+    source_text:
+        TEXT { Seed } |> HOLD source_text { LATEST {} }
+    flag:
+        False |> HOLD flag {
+            LATEST {
+                store.toggle |> THEN { store.flag |> Bool/not() }
+            }
+        }
+    mirrored:
+        TEXT { old } |> HOLD mirrored {
+            LATEST {
+                store.toggle |> THEN { store.source_text }
+            }
+        }
+    copied:
+        TEXT { old } |> HOLD copied {
+            LATEST {
+                store.input.change.text |> THEN { store.input.change.text }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Root }))

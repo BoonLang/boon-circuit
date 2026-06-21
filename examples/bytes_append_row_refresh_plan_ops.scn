@@ -1,0 +1,6 @@
+name = "bytes append row refresh plan ops"
+source = "examples/bytes_append_row_refresh_plan_ops.bn"
+
+[[step]]
+id = "append-row"
+expected_source_event = { source = "store.add_row", key = "Enter", text = "beta" }

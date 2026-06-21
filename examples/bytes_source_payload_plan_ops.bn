@@ -1,0 +1,24 @@
+store: [
+    receive: SOURCE
+    inspect: SOURCE
+    received:
+        BYTES {} |> HOLD received {
+            LATEST {
+                store.receive.bytes |> THEN { store.receive.bytes }
+            }
+        }
+    received_len:
+        0 |> HOLD received_len {
+            LATEST {
+                store.inspect |> THEN { store.received |> Bytes/length }
+            }
+        }
+    received_byte:
+        16u00 |> HOLD received_byte {
+            LATEST {
+                store.inspect |> THEN { store.received |> Bytes/get(index: 1) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))

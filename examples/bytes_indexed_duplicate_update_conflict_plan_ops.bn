@@ -1,0 +1,23 @@
+store: [
+    rows:
+        LIST {
+            [name: TEXT { beta }, payload: BYTES[3] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                    receive.bytes |> THEN { BYTES[3] { 16u01, 16u02, 16u03 } }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed duplicate update conflict }))

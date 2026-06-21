@@ -1,0 +1,4 @@
+source: SOURCE
+
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }

@@ -7413,6 +7413,33 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
   gate to be recorded as a failing strict budget gate with meaningful movement,
   not as a passed speed gate.
 
+### 2026-06-21 TASK-0804A Cells Benchmark Reprise Under BYTES Goal
+
+- Scope: While implementing the BYTES/MachinePlan Phase 9 release-benchmark
+  evidence, Cells release benchmarking re-entered the same source-action root
+  materialization problem family. This does not unpostpone the historical
+  NovyWave `TASK-0804A`; it records a related Cells benchmark slice under the
+  active BYTES goal.
+- Detailed ledger: `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`, section
+  `TASK-0804A Cells Release Benchmark Debugging Loop`.
+- Kept changes: scoped bool-context collection by source route, field-scoped
+  lookup-index invalidation for ordinary text/enum/json field writes, and a
+  direct compiled `List/find` root-list materialization path using
+  `ListProjectionPlan`.
+- Current Cells evidence: the latest
+  `target/reports/bytes-plan/cells-release-benchmark-speed.json` still fails
+  `latency_max_budget` and `latency_p95_budget`. The wrapper
+  `target/reports/bytes-plan/cells-release-benchmark.json` is still missing
+  because `bench-example cells` exits before writing it.
+- Current cause: broad bool context and whole-list scans are no longer the
+  cause. The residual high samples are single-row `store.selected_input`
+  source-action flushes where direct `List/find` materialization still spends
+  several ms in selector/currentness/index/snapshot work. Next work must add
+  sub-timers before changing behavior again.
+- Result: Cells release benchmark evidence remains open for BYTES Phase 9.
+  Do not add the missing Cells benchmark wrapper to aggregate requirements
+  until a passing, schema-valid wrapper exists.
+
 ## File Maintenance Checklist
 
 After editing this file, run:

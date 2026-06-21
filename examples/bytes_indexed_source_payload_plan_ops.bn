@@ -1,0 +1,36 @@
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[3] {}]
+            [name: TEXT { beta }, payload: BYTES[3] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        inspect: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                }
+            }
+        payload_len:
+            0 |> HOLD payload_len {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/length }
+                }
+            }
+        payload_second:
+            16u00 |> HOLD payload_second {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/get(index: 1) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed BYTES source payload }))

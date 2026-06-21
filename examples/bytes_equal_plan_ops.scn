@@ -1,0 +1,6 @@
+name = "bytes equal plan ops"
+source = "examples/bytes_equal_plan_ops.bn"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = { source = "store.measure" }

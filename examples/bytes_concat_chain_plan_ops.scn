@@ -1,0 +1,10 @@
+name = "bytes concat chain plan ops"
+source = "examples/bytes_concat_chain_plan_ops.bn"
+
+[[step]]
+id = "join-bytes"
+expected_source_event = { source = "store.join" }
+
+[[step]]
+id = "inspect-joined"
+expected_source_event = { source = "store.inspect" }

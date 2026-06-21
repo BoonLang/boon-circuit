@@ -1,0 +1,6 @@
+name = "bytes indexed duplicate update conflict plan ops"
+source = "examples/bytes_indexed_duplicate_update_conflict_plan_ops.bn"
+
+[[step]]
+id = "receive-beta-bytes"
+expected_source_event = { source = "row.receive", target_key = 1, target_generation = 1, bytes_hex = "01fe04" }

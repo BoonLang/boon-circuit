@@ -1,0 +1,10 @@
+name = "bytes text conversion plan ops"
+source = "examples/bytes_text_conversion_plan_ops.bn"
+
+[[step]]
+id = "encode-text"
+expected_source_event = { source = "store.encode" }
+
+[[step]]
+id = "decode-bytes"
+expected_source_event = { source = "store.decode" }

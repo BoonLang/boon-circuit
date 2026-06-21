@@ -173,6 +173,15 @@ Current implementation note: numeric literals, A0 references, single binary
 dependency-edge replacement, `parse_error`, `cycle_error`, and `div_by_zero` are
 covered by runtime tests.
 
+The user-facing formula state remains `TEXT`: `formula_text`, edit drafts,
+semantic deltas, and visible editor values must not become `BYTES`. The current
+source helper converts only the trimmed formula expression through
+`Text/to_bytes(encoding: Ascii)` before grammar scanning. Operator, comma,
+colon, and function-prefix searches use `Bytes/find` / `Bytes/starts_with`, and
+the resulting byte offsets are reused for `Text/substring` only because the
+strict ASCII boundary rejects non-ASCII formula syntax first. Ordinary literal
+cell text still stays TEXT and must not be encoded merely to exercise BYTES.
+
 `CellExpression/parse(text)` returns a small formula AST or a deterministic error.
 `CellExpression/dependencies(ast)` returns a set of domain cell addresses. `CellExpression/eval`
 reads values by domain address through the runtime's dependency-aware reader and

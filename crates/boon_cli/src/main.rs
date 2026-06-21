@@ -1,19 +1,28 @@
 #![recursion_limit = "256"]
 
+use boon_plan::{TargetProfile, compile_typed_program, verify_plan};
 use boon_runtime::{
-    VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report, run_scenario,
-    write_json,
+    VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report,
+    run_plan_initial_state, run_plan_root_scalar_scenario, run_plan_scenario_events,
+    run_plan_source_route, run_scenario, write_json,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const CLI_HELP: &str = "\
 usage:
-  boon_cli run <source> [--scenario <path>] [--report <path>]
+  boon_cli run <source> [--scenario <path>] [--engine <legacy|plan|compare>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
+  boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run-plan-root-scalar-scenario <source> --scenario <path> --steps <id[,id...]> [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli compile <source> --out <path.boonc> [--report <path>]
   boon_cli inspect-artifact <path.boonc> [--report <path>]
   boon_cli dump-ir <source>
+  boon_cli dump-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--target <software_bounded|fpga_todomvc>] [--report <path>]
 
 Bundled examples default to target/reports/<example>-cli-run.json when --report is omitted.
@@ -39,9 +48,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "run" => run_program(&args),
         "scenario" => run_program(&args),
+        "run-plan" => run_plan(&args),
+        "run-plan-route" => run_plan_route(&args),
+        "run-plan-root-scalar-scenario" => run_plan_root_scalar_scenario_cmd(&args),
         "compile" => compile_program(&args),
         "inspect-artifact" => inspect_artifact(&args),
         "dump-ir" => dump_ir(&args),
+        "dump-plan" => dump_plan(&args),
         "explain-hardware" => explain_hardware(&args),
         command => Err(format!("unknown command `{command}`").into()),
     }
@@ -50,12 +63,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("missing source path")?;
     let mut scenario = None;
+    let mut engine = "legacy".to_owned();
+    let mut target = "software_default".to_owned();
     let mut report = None;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
             "--scenario" => {
                 scenario = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--engine" => {
+                engine = args
+                    .get(index + 1)
+                    .ok_or("missing value for --engine")?
+                    .clone();
+                index += 2;
+            }
+            "--target" | "--profile" => {
+                target = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target")?
+                    .to_owned();
                 index += 2;
             }
             "--report" => {
@@ -74,13 +103,288 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => default_scenario(source)?,
     };
     let report = report.or_else(|| default_cli_report(source, &scenario));
-    let output = run_scenario(
+    match engine.as_str() {
+        "legacy" | "semantic" => {
+            let output = run_scenario(
+                Path::new(source),
+                Path::new(&scenario),
+                VerificationLayer::Semantic,
+                report.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
+        }
+        "plan" | "compare" => {
+            let target_profile = TargetProfile::from_name(&target)?;
+            let output = run_plan_scenario_events(
+                Path::new(source),
+                Path::new(&scenario),
+                target_profile,
+                engine == "compare",
+                report.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&output.report)?);
+            if output
+                .report
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                return Err(format!(
+                    "run --engine {engine} report status is `{}`",
+                    output
+                        .report
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                )
+                .into());
+            }
+        }
+        other => return Err(format!("unknown run engine `{other}`").into()),
+    }
+    Ok(())
+}
+
+fn run_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = args.first().ok_or("missing source path")?;
+    let mut target = "software_default".to_owned();
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--target" | "--profile" => {
+                target = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target")?
+                    .to_owned();
+                index += 2;
+            }
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => return Err(format!("unknown run-plan argument `{other}`").into()),
+        }
+    }
+    let target_profile = TargetProfile::from_name(&target)?;
+    let output = run_plan_initial_state(Path::new(source), target_profile, report.as_deref())?;
+    println!("{}", serde_json::to_string_pretty(&output.report)?);
+    Ok(())
+}
+
+fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = args.first().ok_or("missing source path")?;
+    let mut target_profile = "software_default".to_owned();
+    let mut source_route = None;
+    let mut target_state = None;
+    let mut text = None;
+    let mut key = None;
+    let mut address = None;
+    let mut payload = BTreeMap::new();
+    let mut payload_bytes = BTreeMap::new();
+    let mut compare_legacy = false;
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" | "--route" => {
+                source_route = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--target-state" | "--state" | "--summary-path" => {
+                target_state = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--text" => {
+                text = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--key" => {
+                key = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--address" => {
+                address = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--payload" => {
+                let value = args.get(index + 1).ok_or("missing value for --payload")?;
+                let (name, value) = value
+                    .split_once('=')
+                    .ok_or("--payload expects <name=value>")?;
+                payload.insert(name.to_owned(), value.to_owned());
+                index += 2;
+            }
+            "--payload-bytes-hex" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --payload-bytes-hex")?;
+                let (name, value) = value
+                    .split_once('=')
+                    .ok_or("--payload-bytes-hex expects <name=hex>")?;
+                if name != "bytes" {
+                    return Err(format!(
+                        "--payload-bytes-hex supports only the reserved BYTES payload key `bytes` in v1, got `{name}`"
+                    )
+                    .into());
+                }
+                payload_bytes.insert(
+                    name.to_owned(),
+                    decode_hex_bytes(value)
+                        .map_err(|error| format!("--payload-bytes-hex {name}: {error}"))?,
+                );
+                index += 2;
+            }
+            "--payload-bytes-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --payload-bytes-file")?;
+                let (name, path) = value
+                    .split_once('=')
+                    .ok_or("--payload-bytes-file expects <name=path>")?;
+                if name != "bytes" {
+                    return Err(format!(
+                        "--payload-bytes-file supports only the reserved BYTES payload key `bytes` in v1, got `{name}`"
+                    )
+                    .into());
+                }
+                payload_bytes.insert(
+                    name.to_owned(),
+                    fs::read(path)
+                        .map_err(|error| format!("--payload-bytes-file {name}: {error}"))?,
+                );
+                index += 2;
+            }
+            "--compare-legacy" => {
+                compare_legacy = true;
+                index += 1;
+            }
+            "--target" | "--profile" => {
+                target_profile = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target")?
+                    .to_owned();
+                index += 2;
+            }
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => return Err(format!("unknown run-plan-route argument `{other}`").into()),
+        }
+    }
+    let source_route = source_route.ok_or("missing --source <source-route>")?;
+    let target_state = target_state.ok_or("missing --target-state <state-path>")?;
+    let target_profile = TargetProfile::from_name(&target_profile)?;
+    let event = boon_runtime::LiveSourceEvent {
+        source: source_route.clone(),
+        text,
+        key,
+        address,
+        payload,
+        payload_bytes,
+        ..Default::default()
+    };
+    let output = run_plan_source_route(
         Path::new(source),
-        Path::new(&scenario),
-        VerificationLayer::Semantic,
+        target_profile,
+        &source_route,
+        &target_state,
+        event,
+        compare_legacy,
         report.as_deref(),
     )?;
-    println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
+    println!("{}", serde_json::to_string_pretty(&output.report)?);
+    Ok(())
+}
+
+fn decode_hex_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let compact = value.trim();
+    if !compact.len().is_multiple_of(2) {
+        return Err("hex payload must contain an even number of digits".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(compact.len() / 2);
+    for index in (0..compact.len()).step_by(2) {
+        let pair = &compact[index..index + 2];
+        let byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| format!("invalid hex byte `{pair}` at byte {}", index / 2))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn run_plan_root_scalar_scenario_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = args.first().ok_or("missing source path")?;
+    let mut target_profile = "software_default".to_owned();
+    let mut scenario = None;
+    let mut selected_steps = Vec::new();
+    let mut compare_legacy = false;
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--scenario" => {
+                scenario = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--steps" => {
+                let value = args.get(index + 1).ok_or("missing value for --steps")?;
+                selected_steps.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|step| !step.is_empty())
+                        .map(str::to_owned),
+                );
+                index += 2;
+            }
+            "--step" => {
+                selected_steps.push(
+                    args.get(index + 1)
+                        .ok_or("missing value for --step")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--compare-legacy" => {
+                compare_legacy = true;
+                index += 1;
+            }
+            "--target" | "--profile" => {
+                target_profile = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target")?
+                    .to_owned();
+                index += 2;
+            }
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => {
+                return Err(
+                    format!("unknown run-plan-root-scalar-scenario argument `{other}`").into(),
+                );
+            }
+        }
+    }
+    let scenario = match scenario {
+        Some(scenario) => scenario,
+        None => default_scenario(source)?,
+    };
+    if selected_steps.is_empty() {
+        return Err("run-plan-root-scalar-scenario requires --steps <id[,id...]>".into());
+    }
+    let target_profile = TargetProfile::from_name(&target_profile)?;
+    let output = run_plan_root_scalar_scenario(
+        Path::new(source),
+        Path::new(&scenario),
+        target_profile,
+        &selected_steps,
+        compare_legacy,
+        report.as_deref(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&output.report)?);
     Ok(())
 }
 
@@ -133,6 +437,116 @@ fn dump_ir(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = args.first().ok_or("missing source path")?;
+    let mut target = "software_default".to_owned();
+    let mut report = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--target" | "--profile" => {
+                target = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target")?
+                    .to_owned();
+                index += 2;
+            }
+            "--report" => {
+                report = args.get(index + 1).map(PathBuf::from);
+                index += 2;
+            }
+            other => return Err(format!("unknown dump-plan argument `{other}`").into()),
+        }
+    }
+    let target_profile = TargetProfile::from_name(&target)?;
+    let (parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
+    let plan = compile_typed_program(&ir, target_profile)?;
+    let verification = verify_plan(&plan)?;
+    let program_hash = parsed_program_hash(&parsed);
+    let source_hash = parsed_source_hash(&parsed);
+    let source_files = parsed_source_files_report(&parsed);
+    let budget_hash = boon_runtime::sha256_file(&Path::new(source).with_extension("budget.toml"))
+        .unwrap_or_else(|_| "missing-budget".to_owned());
+    let command_argv = std::env::args().collect::<Vec<_>>();
+    let typed_lowering_executable = plan.capability_summary.typed_lowering_executable;
+    let report_status = if verification.error_count == 0 && typed_lowering_executable {
+        "pass"
+    } else {
+        "fail"
+    };
+    let verification_error_count = verification.error_count;
+    let plan_hash = verification.plan_hash.clone();
+    let plan_version = plan.version;
+    let capability_summary = plan.capability_summary.clone();
+    let report_value = json!({
+        "status": report_status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "dump-plan",
+        "command_argv": command_argv,
+        "measurement_mode": "diagnostic",
+        "exit_status": if verification_error_count == 0 { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_path": source,
+        "source_hash": source_hash.clone(),
+        "source_files": source_files,
+        "scenario_hash": "n/a",
+        "program_hash": program_hash,
+        "budget_hash": budget_hash,
+        "graph_node_count": ir.graph_node_count,
+        "target_profile": target_profile.as_str(),
+        "plan_version": plan_version,
+        "plan_hash": plan_hash,
+        "capability_summary": capability_summary,
+        "verification": verification.clone(),
+        "typecheck_report": {
+            "resolved_constant_table": &ir.typecheck_report.resolved_constant_table
+        },
+        "per_step_pass_fail": [
+            {
+                "id": "machine-plan-constructed",
+                "pass": true,
+                "detail": "semantic TypedProgram compiled into Phase 1 MachinePlan scaffold"
+            },
+            {
+                "id": "machine-plan-verified",
+                "pass": verification_error_count == 0,
+                "detail": format!("{} structural verification error(s)", verification_error_count)
+            },
+            {
+                "id": "machine-plan-typed-lowering-executable",
+                "pass": typed_lowering_executable,
+                "detail": if typed_lowering_executable {
+                    format!(
+                        "plan has no unresolved typed executable refs; whole-plan CPU executor complete={}",
+                        capability_summary.cpu_plan_executor_complete
+                    )
+                } else {
+                    format!(
+                        "plan is structural only: {} unresolved executable ref(s), {} executable string path(s)",
+                        capability_summary.unresolved_executable_ref_count,
+                        capability_summary.executable_string_path_count
+                    )
+                }
+            },
+            {
+                "id": "legacy-runtime-default-preserved",
+                "pass": true,
+                "detail": "dump-plan is a developer command and does not switch default execution"
+            }
+        ],
+        "artifact_sha256s": [],
+        "machine_plan": plan,
+    });
+    if let Some(report) = report {
+        write_json(&report, &report_value)?;
+    }
+    println!("{}", serde_json::to_string_pretty(&report_value)?);
+    Ok(())
+}
+
 fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("missing source path")?;
     let profile = args
@@ -159,9 +573,11 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "explain-hardware",
         "command_argv": command_argv,
+        "measurement_mode": "diagnostic",
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
         "source_path": source,
         "source_hash": source_hash,
         "scenario_hash": "n/a",
@@ -406,6 +822,30 @@ impl HardwareProfile {
         ir: &boon_ir::TypedProgram,
         runtime_profile: &str,
     ) -> serde_json::Value {
+        let bytes = ir
+            .state_cells
+            .iter()
+            .filter_map(|cell| match &cell.initial_value {
+                boon_ir::InitialValue::Bytes { fixed_len, .. } => Some(json!({
+                    "name": cell.path,
+                    "scope": if cell.indexed { "indexed" } else { "root" },
+                    "fixed_len": fixed_len,
+                    "effective_capacity": fixed_len,
+                    "capacity_source": if fixed_len.is_some() {
+                        "BYTES[N] fixed length"
+                    } else {
+                        "dynamic BYTES"
+                    },
+                    "dynamic_growth_allowed": false,
+                    "overflow_behavior": if fixed_len.is_some() {
+                        self.overflow_policy
+                    } else {
+                        "not_hardware_bounded"
+                    }
+                })),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         json!({
             "profile": runtime_profile,
             "all_lists_bounded": true,
@@ -424,7 +864,12 @@ impl HardwareProfile {
                     "dynamic_growth_allowed": false,
                     "overflow_behavior": self.overflow_policy
                 })
-            }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>(),
+            "all_bytes_bounded": ir.state_cells.iter().all(|cell| match &cell.initial_value {
+                boon_ir::InitialValue::Bytes { fixed_len, .. } => fixed_len.is_some(),
+                _ => true,
+            }),
+            "bytes": bytes,
         })
     }
 }
@@ -455,19 +900,46 @@ fn indexed_row_source_ports(ir: &boon_ir::TypedProgram) -> Vec<String> {
 
 fn default_scenario(source: &str) -> Result<String, Box<dyn std::error::Error>> {
     let source_path = Path::new(source);
-    if let Some(entry) = boon_runtime::example_manifest_entries()?
-        .into_iter()
-        .find(|entry| {
-            let entry_source = Path::new(&entry.source);
-            entry_source == source_path || entry_source.file_name() == source_path.file_name()
-        })
+    let entries = boon_runtime::example_manifest_entries()?;
+    if let Some(entry) = entries.iter().into_iter().find(|entry| {
+        let entry_source = Path::new(&entry.source);
+        entry_source == source_path || entry_source.file_name() == source_path.file_name()
+    }) {
+        return Ok(entry.scenario.clone());
+    }
+    if let Ok(source_text) = fs::read_to_string(source_path)
+        && let Ok(program) = boon_parser::parse_source(source, &source_text)
+        && let Some(example_id) = parsed_default_example_id(&program)
+        && let Some(entry) = entries.iter().find(|entry| entry.id == example_id)
     {
-        return Ok(entry.scenario);
+        return Ok(entry.scenario.clone());
     }
     Err(format!(
         "no default scenario for `{source}`; add it to examples/manifest.toml or pass --scenario"
     )
     .into())
+}
+
+fn parsed_default_example_id(program: &boon_parser::ParsedProgram) -> Option<&'static str> {
+    if program
+        .list_memories
+        .iter()
+        .any(|list| list.name == "todos")
+    {
+        return Some("todomvc");
+    }
+    if program
+        .functions
+        .iter()
+        .any(|function| function == "cells_app")
+        || program
+            .list_memories
+            .iter()
+            .any(|list| list.name == "cells")
+    {
+        return Some("cells");
+    }
+    None
 }
 
 fn default_cli_report(source: &str, scenario: &str) -> Option<PathBuf> {
@@ -516,6 +988,76 @@ fn current_binary_hash() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn current_binary_path() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn parsed_program_hash(program: &boon_parser::ParsedProgram) -> String {
+    let mut hasher = Sha256::new();
+    let mut files = program.files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.module.cmp(&right.module))
+    });
+    for file in files {
+        hasher.update(file.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.module.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(file.start_line.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(file.source.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn parsed_source_hash(program: &boon_parser::ParsedProgram) -> String {
+    let mut files = program.files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.module.cmp(&right.module))
+    });
+    if let [file] = files.as_slice() {
+        return boon_runtime::sha256_bytes(file.source.as_bytes());
+    }
+    let mut canonical = String::new();
+    for file in files {
+        canonical.push_str(&file.path);
+        canonical.push('\0');
+        canonical.push_str(&boon_runtime::sha256_bytes(file.source.as_bytes()));
+        canonical.push('\0');
+    }
+    boon_runtime::sha256_bytes(canonical.as_bytes())
+}
+
+fn parsed_source_files_report(program: &boon_parser::ParsedProgram) -> Vec<serde_json::Value> {
+    let mut files = program.files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.module.cmp(&right.module))
+    });
+    files
+        .into_iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "module": file.module,
+                "start_line": file.start_line,
+                "source_hash": boon_runtime::sha256_bytes(file.source.as_bytes())
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CLI_HELP, default_scenario};
@@ -524,7 +1066,16 @@ mod tests {
 
     #[test]
     fn help_advertises_supported_commands() {
-        for command in ["run", "scenario", "dump-ir", "explain-hardware"] {
+        for command in [
+            "run",
+            "run-plan",
+            "run-plan-route",
+            "run-plan-root-scalar-scenario",
+            "scenario",
+            "dump-ir",
+            "dump-plan",
+            "explain-hardware",
+        ] {
             assert!(
                 CLI_HELP.contains(&format!("boon_cli {command}")),
                 "help should advertise {command}"

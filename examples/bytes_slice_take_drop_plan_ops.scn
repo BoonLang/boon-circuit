@@ -1,0 +1,10 @@
+name = "bytes slice take drop plan ops"
+source = "examples/bytes_slice_take_drop_plan_ops.bn"
+
+[[step]]
+id = "split-bytes"
+expected_source_event = { source = "store.split" }
+
+[[step]]
+id = "inspect-splits"
+expected_source_event = { source = "store.inspect" }

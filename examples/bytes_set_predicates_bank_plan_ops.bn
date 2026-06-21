@@ -1,0 +1,60 @@
+left_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }
+
+patched_expected:
+    BYTES[4] { 16u01, 16u02, 16uAA, 16u04 } |> HOLD patched_expected { LATEST {} }
+
+found_needle:
+    BYTES[2] { 16uAA, 16u04 } |> HOLD found_needle { LATEST {} }
+
+missing_needle:
+    BYTES[2] { 16uFE, 16uFF } |> HOLD missing_needle { LATEST {} }
+
+prefix:
+    BYTES[2] { 16u01, 16u02 } |> HOLD prefix { LATEST {} }
+
+suffix:
+    BYTES[2] { 16uAA, 16u04 } |> HOLD suffix { LATEST {} }
+
+store: [
+    patch: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[4] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }
+            }
+        }
+    same:
+        False |> HOLD same {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/equal(with: patched_expected) }
+            }
+        }
+    found_index:
+        0 |> HOLD found_index {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/find(needle: found_needle) }
+            }
+        }
+    missing_index:
+        0 |> HOLD missing_index {
+            LATEST {
+                store.inspect |> THEN { Bytes/find(input: store.patched, needle: missing_needle) }
+            }
+        }
+    starts:
+        False |> HOLD starts {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/starts_with(prefix: prefix) }
+            }
+        }
+    ends:
+        False |> HOLD ends {
+            LATEST {
+                store.inspect |> THEN { Bytes/ends_with(input: store.patched, suffix: suffix) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

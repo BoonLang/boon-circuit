@@ -1,0 +1,6 @@
+name = "bytes is empty plan ops"
+source = "examples/bytes_is_empty_plan_ops.bn"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = { source = "store.measure" }

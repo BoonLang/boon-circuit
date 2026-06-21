@@ -1,0 +1,36 @@
+left_payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16uFE, 16u04 } |> HOLD right_payload { LATEST {} }
+
+store: [
+    join: SOURCE
+    inspect: SOURCE
+    joined:
+        BYTES[5] {} |> HOLD joined {
+            LATEST {
+                store.join |> THEN { left_payload |> Bytes/concat(with: right_payload) }
+            }
+        }
+    joined_len:
+        0 |> HOLD joined_len {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/length }
+            }
+        }
+    joined_byte:
+        16u00 |> HOLD joined_byte {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/get(index: 3) }
+            }
+        }
+    joined_again:
+        BYTES[7] {} |> HOLD joined_again {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/concat(with: right_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

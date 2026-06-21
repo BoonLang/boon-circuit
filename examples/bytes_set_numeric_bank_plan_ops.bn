@@ -1,0 +1,33 @@
+left_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }
+
+store: [
+    patch: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[4] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16uFE) }
+            }
+        }
+    read_u16_be:
+        0 |> HOLD read_u16_be {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Big) }
+            }
+        }
+    read_u16_le:
+        0 |> HOLD read_u16_le {
+            LATEST {
+                store.inspect |> THEN { Bytes/read_unsigned(input: store.patched, offset: 0, byte_count: 2, endian: Little) }
+            }
+        }
+    read_i8:
+        0 |> HOLD read_i8 {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/read_signed(offset: 1, byte_count: 1, endian: Little) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes numeric }))

@@ -1,0 +1,14 @@
+name = "bytes numeric plan ops"
+source = "examples/bytes_numeric_plan_ops.bn"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = { source = "store.measure" }
+
+[[step]]
+id = "write-bytes"
+expected_source_event = { source = "store.write" }
+
+[[step]]
+id = "inspect-written"
+expected_source_event = { source = "store.inspect" }

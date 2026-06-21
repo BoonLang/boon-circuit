@@ -1,0 +1,10 @@
+name = "bytes file read plan ops"
+source = "examples/bytes_file_read_plan_ops.bn"
+
+[[step]]
+id = "read-file-bytes"
+expected_source_event = { source = "store.load" }
+
+[[step]]
+id = "inspect-file-bytes"
+expected_source_event = { source = "store.inspect" }

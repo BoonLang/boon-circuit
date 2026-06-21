@@ -49,16 +49,27 @@ FUNCTION sum_range(start_address, end_address) {
     }
 }
 
-FUNCTION add_value(text) {
+FUNCTION formula_ascii_bytes(text) {
+    BLOCK {
+        encoded: text |> Text/to_bytes(encoding: Ascii)
+        error_text: Error/text(encoded)
+        error_text |> Text/is_empty() |> WHILE {
+            True => encoded
+            False => Error/new(code: TEXT { parse_error })
+        }
+    }
+}
+
+FUNCTION add_value(text, bytes) {
     BLOCK {
         text_length: text |> Text/length()
         inner_length: text_length - 5
         inner: text |> Text/substring(start: 4, length: inner_length)
-        comma: inner |> Text/find(needle: TEXT { , })
+        inner_bytes: bytes |> Bytes/slice(offset: 4, byte_count: inner_length)
+        comma: inner_bytes |> Bytes/find(needle: BYTES[1] { 16u2C })
         comma |> WHILE {
             NaN => Error/new(code: TEXT { parse_error })
             index => BLOCK {
-                inner_length: inner |> Text/length()
                 right_start: index + 1
                 right_length: inner_length - right_start
                 left: inner |> Text/substring(start: 0, length: index)
@@ -69,16 +80,16 @@ FUNCTION add_value(text) {
     }
 }
 
-FUNCTION sum_value(text) {
+FUNCTION sum_value(text, bytes) {
     BLOCK {
         text_length: text |> Text/length()
         inner_length: text_length - 5
         inner: text |> Text/substring(start: 4, length: inner_length)
-        colon: inner |> Text/find(needle: TEXT { : })
+        inner_bytes: bytes |> Bytes/slice(offset: 4, byte_count: inner_length)
+        colon: inner_bytes |> Bytes/find(needle: BYTES[1] { 16u3A })
         colon |> WHILE {
             NaN => Error/new(code: TEXT { parse_error })
             index => BLOCK {
-                inner_length: inner |> Text/length()
                 right_start: index + 1
                 right_length: inner_length - right_start
                 start_address: inner |> Text/substring(start: 0, length: index)
@@ -118,40 +129,47 @@ FUNCTION reference_or_number(text) {
 FUNCTION expression_value(text) {
     BLOCK {
         trimmed: text |> Text/trim()
-        plus_index: trimmed |> Text/find(needle: TEXT { + })
-        plus_index |> WHILE {
-            NaN => BLOCK {
-                minus_index: trimmed |> Text/find(needle: TEXT { - })
-                minus_index |> WHILE {
+        bytes: formula_ascii_bytes(text: trimmed)
+        bytes_error: Error/text(bytes)
+        bytes_error |> Text/is_empty() |> WHILE {
+            False => Error/new(code: TEXT { parse_error })
+            True => BLOCK {
+                plus_index: bytes |> Bytes/find(needle: BYTES[1] { 16u2B })
+                plus_index |> WHILE {
                     NaN => BLOCK {
-                        multiply_index: trimmed |> Text/find(needle: TEXT { * })
-                        multiply_index |> WHILE {
+                        minus_index: bytes |> Bytes/find(needle: BYTES[1] { 16u2D })
+                        minus_index |> WHILE {
                             NaN => BLOCK {
-                                divide_index: trimmed |> Text/find(needle: TEXT { / })
-                                divide_index |> WHILE {
+                                multiply_index: bytes |> Bytes/find(needle: BYTES[1] { 16u2A })
+                                multiply_index |> WHILE {
                                     NaN => BLOCK {
-                                        add_call: trimmed |> Text/starts_with(prefix: "add(")
-                                        add_call |> WHILE {
-                                            True => add_value(text: trimmed)
-                                            False => BLOCK {
-                                                sum_call: trimmed |> Text/starts_with(prefix: "sum(")
-                                                sum_call |> WHILE {
-                                                    True => sum_value(text: trimmed)
-                                                    False => reference_or_number(text: trimmed)
+                                        divide_index: bytes |> Bytes/find(needle: BYTES[1] { 16u2F })
+                                        divide_index |> WHILE {
+                                            NaN => BLOCK {
+                                                add_call: bytes |> Bytes/starts_with(prefix: BYTES[4] { 16u61, 16u64, 16u64, 16u28 })
+                                                add_call |> WHILE {
+                                                    True => add_value(text: trimmed, bytes: bytes)
+                                                    False => BLOCK {
+                                                        sum_call: bytes |> Bytes/starts_with(prefix: BYTES[4] { 16u73, 16u75, 16u6D, 16u28 })
+                                                        sum_call |> WHILE {
+                                                            True => sum_value(text: trimmed, bytes: bytes)
+                                                            False => reference_or_number(text: trimmed)
+                                                        }
+                                                    }
                                                 }
                                             }
+                                            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { / })
                                         }
                                     }
-                                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { / })
+                                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { * })
                                 }
                             }
-                            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { * })
+                            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { - })
                         }
                     }
-                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { - })
+                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { + })
                 }
             }
-            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { + })
         }
     }
 }

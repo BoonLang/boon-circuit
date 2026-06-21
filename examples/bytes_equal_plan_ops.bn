@@ -1,0 +1,26 @@
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
+
+same_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD same_payload { LATEST {} }
+
+different_payload:
+    BYTES[4] { 16u01, 16u02, 16uFE, 16u04 } |> HOLD different_payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    same:
+        False |> HOLD same {
+            LATEST {
+                store.measure |> THEN { payload |> Bytes/equal(with: same_payload) }
+            }
+        }
+    different:
+        True |> HOLD different {
+            LATEST {
+                store.measure |> THEN { Bytes/equal(left: payload, right: different_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

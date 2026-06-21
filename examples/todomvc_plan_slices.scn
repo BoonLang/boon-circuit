@@ -1,0 +1,31 @@
+name = "todomvc_plan_slices"
+source = "examples/todomvc.bn"
+
+[[step]]
+id = "add-test-todo-type"
+user_action = { kind = "type_text", target = "new todo input", text = "Test todo" }
+expected_source_event = { source = "store.sources.new_todo_input.change", text = "Test todo" }
+expect_new_text = "Test todo"
+expect_semantic_delta_contains = ["FieldSet:store.new_todo_text"]
+expect_render_delta_contains = ["InvalidateDocument"]
+
+[[step]]
+id = "add-test-todo-submit"
+user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
+expected_source_event = { source = "store.sources.new_todo_input.key_down", key = "Enter" }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
+expect_active_count = 4
+expect_completed_count = 1
+expect_new_text = ""
+expect_semantic_delta_contains = ["ListInsert", "SourceBind", "FieldSet:store.new_todo_text"]
+expect_render_delta_contains = ["InvalidateDocument"]
+
+[[step]]
+id = "delete-dynamic-test-todo"
+user_action = { kind = "click", target = "remove todo button", target_text = "Test todo delete" }
+expected_source_event = { source = "todo.sources.remove_todo_button.press", target_text = "Test todo", target_key = 5, target_generation = 1, bind_epoch = 25 }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries"]
+expect_active_count = 3
+expect_completed_count = 1
+expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
+expect_render_delta_contains = ["InvalidateDocument"]

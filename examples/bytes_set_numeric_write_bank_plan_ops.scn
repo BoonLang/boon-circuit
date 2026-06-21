@@ -1,0 +1,18 @@
+name = "bytes set numeric write bank plan ops"
+source = "examples/bytes_set_numeric_write_bank_plan_ops.bn"
+
+[[step]]
+id = "patch-bytes"
+expected_source_event = { source = "store.patch" }
+
+[[step]]
+id = "write-unsigned"
+expected_source_event = { source = "store.write_unsigned" }
+
+[[step]]
+id = "write-signed"
+expected_source_event = { source = "store.write_signed" }
+
+[[step]]
+id = "inspect-written"
+expected_source_event = { source = "store.inspect" }

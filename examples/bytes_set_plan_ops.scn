@@ -1,0 +1,10 @@
+name = "bytes set plan ops"
+source = "examples/bytes_set_plan_ops.bn"
+
+[[step]]
+id = "patch-bytes"
+expected_source_event = { source = "store.patch" }
+
+[[step]]
+id = "inspect-patched"
+expected_source_event = { source = "store.inspect" }

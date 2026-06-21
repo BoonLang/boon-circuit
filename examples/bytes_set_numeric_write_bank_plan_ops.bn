@@ -1,0 +1,37 @@
+left_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }
+
+store: [
+    patch: SOURCE
+    write_unsigned: SOURCE
+    write_signed: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[4] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16uFE) }
+                store.write_unsigned |> THEN { store.patched |> Bytes/write_unsigned(offset: 2, byte_count: 2, endian: Big, value: 4660) }
+                store.write_signed |> THEN { store.patched |> Bytes/write_signed(offset: 0, byte_count: 2, endian: Little, value: -2) }
+            }
+        }
+    hex:
+        TEXT { old } |> HOLD hex {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/to_hex }
+            }
+        }
+    read_u16_be:
+        0 |> HOLD read_u16_be {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(offset: 2, byte_count: 2, endian: Big) }
+            }
+        }
+    read_i16_le:
+        0 |> HOLD read_i16_le {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/read_signed(offset: 0, byte_count: 2, endian: Little) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes numeric write bank }))

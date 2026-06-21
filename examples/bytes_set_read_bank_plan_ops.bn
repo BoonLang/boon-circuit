@@ -1,0 +1,27 @@
+left_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }
+
+store: [
+    patch: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[4] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }
+            }
+        }
+    patched_byte:
+        16u00 |> HOLD patched_byte {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/get(index: 2) }
+            }
+        }
+    patched_len:
+        0 |> HOLD patched_len {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/length }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

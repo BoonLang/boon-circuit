@@ -54,9 +54,9 @@ generation_error_handling: generation_result |> WHEN {
 
 FUNCTION icon_code(item) {
     item.path
-    |> File/read_text()
+    |> File/read_bytes()
     |> WHEN {
-        Ok[text] => text
+        Ok[bytes] => bytes |> Bytes/to_text(encoding: Utf8)
         error => FLUSH { error }
     }
     |> Url/encode()

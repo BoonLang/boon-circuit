@@ -1,0 +1,10 @@
+name = "bytes set numeric bank plan ops"
+source = "examples/bytes_set_numeric_bank_plan_ops.bn"
+
+[[step]]
+id = "patch-bytes"
+expected_source_event = { source = "store.patch" }
+
+[[step]]
+id = "inspect-numeric"
+expected_source_event = { source = "store.inspect" }

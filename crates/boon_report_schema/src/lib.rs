@@ -2,14 +2,20 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type ReportSchemaResult<T> = Result<T, Box<dyn std::error::Error>>;
 type RuntimeResult<T> = ReportSchemaResult<T>;
+const SOURCE_EVENT_INLINE_BYTES_LIMIT: usize = 1024;
+
+static REPORT_BINARY_HASH_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct Scenario {
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     step: Vec<ScenarioStep>,
 }
@@ -28,6 +34,20 @@ fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
 
 fn toml_string_ref<'a>(table: &'a BTreeMap<String, toml::Value>, key: &str) -> Option<&'a str> {
     table.get(key).and_then(toml::Value::as_str)
+}
+
+fn toml_usize_ref(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<usize> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn toml_u64_ref(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<u64> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
 }
 
 fn git_commit() -> String {
@@ -126,6 +146,24 @@ pub fn sha256_file(path: &Path) -> RuntimeResult<String> {
     Ok(sha256_bytes(&fs::read(path)?))
 }
 
+fn cached_report_binary_hash(path: &Path) -> RuntimeResult<String> {
+    let cache = REPORT_BINARY_HASH_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(hash) = cache
+        .lock()
+        .map_err(|error| format!("report binary hash cache is poisoned: {error}"))?
+        .get(path)
+        .cloned()
+    {
+        return Ok(hash);
+    }
+    let hash = sha256_file(path)?;
+    cache
+        .lock()
+        .map_err(|error| format!("report binary hash cache is poisoned: {error}"))?
+        .insert(path.to_path_buf(), hash.clone());
+    Ok(hash)
+}
+
 pub fn report_schema_hash() -> String {
     sha256_bytes(include_str!("lib.rs").as_bytes())
 }
@@ -172,6 +210,174 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
             return Err(format!("{} missing required report field `{key}`", path.display()).into());
         }
     }
+    if report_command_is(&report, "dump-plan") {
+        verify_machine_plan_report(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_dump_plan_source_files(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "run-plan") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!("{} run-plan report did not pass", path.display()).into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_run_plan_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "run-plan-route") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!("{} run-plan-route report did not pass", path.display()).into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_run_plan_route_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "run-plan-root-scalar-scenario") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
+        verify_run_plan_root_scalar_scenario_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "run-plan-scenario-events") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} run-plan-scenario-events report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
+        verify_run_plan_scenario_events_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-file-read-plan") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-file-read-plan report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
+        verify_bytes_file_read_plan_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-file-write-plan") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
+        verify_bytes_file_write_plan_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-negative") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-negative report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_negative_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-machine-plan-adversarial") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-machine-plan-adversarial report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_machine_plan_adversarial_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-release-benchmark-reproduction")
+        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
+    {
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_release_benchmark_reproduction_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-storage-profile") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-storage-profile report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_storage_profile_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-byte-bank-layout") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_byte_bank_layout_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-machine-plan-all")
+        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
+    {
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_machine_plan_all_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
     let status = report.get("status").and_then(JsonValue::as_str);
     if status != Some("pass") {
         if status == Some("fail") && report_is_blocker_audit(&report) {
@@ -213,6 +419,630 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     }
     if report_command_is(&report, "verify-cells-visible-reality") {
         verify_cells_visible_reality_report(&report, path)?;
+    }
+    Ok(())
+}
+
+pub fn verify_report_schema_negative_probe(path: &Path) -> RuntimeResult<()> {
+    let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
+    if !report_command_is(&report, "verify-bytes-file-write-plan") {
+        return verify_report_schema(path);
+    }
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan report did not pass",
+            path.display()
+        )
+        .into());
+    }
+    for key in [
+        "report_version",
+        "generated_at_utc",
+        "command",
+        "command_argv",
+        "measurement_mode",
+        "exit_status",
+        "git_commit",
+        "binary_hash",
+        "source_hash",
+        "scenario_hash",
+        "program_hash",
+        "budget_hash",
+        "graph_node_count",
+        "per_step_pass_fail",
+        "artifact_sha256s",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!("{} missing required report field `{key}`", path.display()).into());
+        }
+    }
+    verify_common_report_shape(&report, path)?;
+    verify_measurement_mode(&report, path)?;
+    verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+    verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
+    verify_bytes_file_write_plan_report_inner(&report, path, false)?;
+    verify_artifact_hashes(&report, path)?;
+    Ok(())
+}
+
+pub fn verify_bytes_file_write_negative_artifact(path: &Path, id: &str) -> RuntimeResult<()> {
+    let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
+    verify_bytes_file_write_negative_artifact_value(&report, path, id)
+}
+
+fn expected_bytes_negative_case_ids() -> &'static [&'static str] {
+    &[
+        "parser-invalid-hex-byte",
+        "parser-multiline-invalid-hex-byte",
+        "parser-byte-overflow",
+        "parser-bad-size-expression",
+        "parser-missing-body",
+        "parser-multiline-trailing-token",
+        "typecheck-fixed-size-mismatch",
+        "typecheck-implicit-text-rejected",
+        "typecheck-invalid-numeric-byte-count",
+        "typecheck-invalid-numeric-endian",
+        "typecheck-bytes-call-input-type",
+        "typecheck-missing-bytes-call-input",
+        "typecheck-missing-bytes-required-arg",
+        "typecheck-invalid-bytes-to-text-encoding",
+        "typecheck-missing-bytes-to-text-encoding",
+        "typecheck-invalid-text-to-bytes-encoding",
+        "typecheck-missing-text-to-bytes-encoding",
+        "typecheck-unknown-bytes-builtin-argument",
+        "ir-lowering-rejects-typecheck-failing-bytes-source",
+        "plan-static-out-of-bounds-slice",
+        "plan-bytes-get-out-of-bounds",
+        "plan-bytes-set-out-of-bounds",
+        "plan-invalid-utf8-bytes-to-text",
+        "plan-write-unsigned-overflow",
+        "plan-read-unsigned-number-overflow",
+        "plan-bytes-source-payload-guard-rejected",
+        "plan-row-initial-bool-rejects-source-payload-text",
+        "plan-indexed-duplicate-update-branch-rejected",
+        "source-payload-named-bytes-scenario-key",
+        "source-payload-named-bytes-direct-api-key",
+        "source-payload-bytes-to-text-output",
+        "source-payload-fixed-length-mismatch",
+        "bytes-positive-report-schema-valid",
+        "forged-update-digest",
+        "public-inline-payload-leak",
+        "forged-update-constant",
+        "forged-state-byte-len",
+        "bytes-source-payload-positive-route-schema-valid",
+        "source-payload-missing-bytes-artifact",
+        "source-payload-forged-digest",
+        "source-payload-forged-byte-len",
+        "source-payload-missing-inline-bytes",
+        "source-payload-inline-byte-out-of-range",
+        "source-payload-forged-route-field",
+        "source-payload-forged-executor-field",
+        "source-payload-forged-update-field",
+        "bytes-source-payload-large-artifact-route-schema-valid",
+        "source-payload-large-missing-artifact-listing",
+        "source-payload-large-forged-artifact-sha256",
+        "source-payload-large-inline-over-limit",
+        "source-payload-large-artifact-inline-leak",
+        "aggregate-missing-child-report-rejected",
+        "aggregate-stale-child-artifact-hash-rejected",
+        "aggregate-edited-child-success-flag-rejected",
+        "aggregate-runtime-ast-fallback-rejected",
+        "aggregate-executable-string-path-rejected",
+        "aggregate-unknown-plan-op-rejected",
+        "aggregate-storage-profile-indexed-private-bytes-tamper-rejected",
+        "hardware-bounded-unbounded-bytes-rejected",
+        "fake-benchmark-profile-rejected",
+    ]
+}
+
+fn verify_bytes_negative_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let binary_path = report
+        .get("binary_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative report missing binary_path",
+                report_path.display()
+            )
+        })?;
+    if binary_path.trim().is_empty() {
+        return Err(format!(
+            "{} verify-bytes-negative report has empty binary_path",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let expected = expected_bytes_negative_case_ids();
+    if report
+        .get("negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-negative negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let required_ids = report
+        .get("required_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative required_negative_cases is missing",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-negative required_negative_cases contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if required_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-negative required_negative_cases do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let negative_cases = report
+        .get("negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative negative_cases is missing",
+                report_path.display()
+            )
+        })?;
+    let mut negative_ids = Vec::with_capacity(negative_cases.len());
+    for (index, case) in negative_cases.iter().enumerate() {
+        let object = case.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative negative_cases[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-negative negative_cases[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        let category = object
+            .get("category")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-negative negative case `{id}` missing category",
+                    report_path.display()
+                )
+            })?;
+        if category.trim().is_empty() {
+            return Err(format!(
+                "{} verify-bytes-negative negative case `{id}` has empty category",
+                report_path.display()
+            )
+            .into());
+        }
+        if object.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-negative negative case `{id}` is not proven rejected",
+                report_path.display()
+            )
+            .into());
+        }
+        let detail = object
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-negative negative case `{id}` missing detail",
+                    report_path.display()
+                )
+            })?;
+        if detail.trim().is_empty() {
+            return Err(format!(
+                "{} verify-bytes-negative negative case `{id}` has empty detail",
+                report_path.display()
+            )
+            .into());
+        }
+        if matches!(
+            id,
+            "plan-static-out-of-bounds-slice"
+                | "plan-bytes-get-out-of-bounds"
+                | "plan-bytes-set-out-of-bounds"
+        ) {
+            if object.get("panic_free").and_then(JsonValue::as_bool) != Some(true) {
+                return Err(format!(
+                    "{} verify-bytes-negative OOB case `{id}` did not prove panic_free=true",
+                    report_path.display()
+                )
+                .into());
+            }
+            if object.get("failure_kind").and_then(JsonValue::as_str) != Some("structured_error") {
+                return Err(format!(
+                    "{} verify-bytes-negative OOB case `{id}` did not report a structured_error",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        negative_ids.push(id);
+    }
+    if negative_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-negative negative_cases ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative per_step_pass_fail is missing",
+                report_path.display()
+            )
+        })?;
+    let mut check_ids = Vec::with_capacity(checks.len());
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-negative per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-negative per_step_pass_fail[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-negative per_step_pass_fail `{id}` is not passing",
+                report_path.display()
+            )
+            .into());
+        }
+        check_ids.push(id);
+    }
+    if check_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-negative per_step_pass_fail ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn expected_bytes_machine_plan_adversarial_case_ids() -> &'static [&'static str] {
+    &[
+        "aggregate-missing-child-report-rejected",
+        "aggregate-stale-child-artifact-hash-rejected",
+        "aggregate-edited-child-success-flag-rejected",
+        "aggregate-runtime-ast-fallback-rejected",
+        "aggregate-executable-string-path-rejected",
+        "aggregate-unknown-plan-op-rejected",
+        "aggregate-storage-profile-indexed-private-bytes-tamper-rejected",
+        "hardware-bounded-unbounded-bytes-rejected",
+        "fake-benchmark-profile-rejected",
+    ]
+}
+
+fn verify_bytes_machine_plan_adversarial_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    if report.get("adversarial_scope").and_then(JsonValue::as_str)
+        != Some("bytes-machine-plan-aggregate-and-report-schema")
+    {
+        return Err(format!(
+            "{} verify-bytes-machine-plan-adversarial has invalid adversarial_scope",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected = expected_bytes_machine_plan_adversarial_case_ids();
+    if report
+        .get("adversarial_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-machine-plan-adversarial adversarial_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let required_ids = report
+        .get("required_adversarial_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-machine-plan-adversarial missing required_adversarial_cases",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-machine-plan-adversarial required_adversarial_cases contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if required_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-machine-plan-adversarial required_adversarial_cases do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+    let adversarial_cases = report
+        .get("adversarial_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-machine-plan-adversarial missing adversarial_cases",
+                report_path.display()
+            )
+        })?;
+    let mut case_ids = Vec::with_capacity(adversarial_cases.len());
+    for (index, case) in adversarial_cases.iter().enumerate() {
+        let object = case.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-machine-plan-adversarial adversarial_cases[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-machine-plan-adversarial adversarial_cases[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        if object
+            .get("category")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "{} verify-bytes-machine-plan-adversarial case `{id}` missing category",
+                report_path.display()
+            )
+            .into());
+        }
+        if object.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-machine-plan-adversarial case `{id}` is not proven rejected",
+                report_path.display()
+            )
+            .into());
+        }
+        if object
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "{} verify-bytes-machine-plan-adversarial case `{id}` missing detail",
+                report_path.display()
+            )
+            .into());
+        }
+        case_ids.push(id);
+    }
+    if case_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-machine-plan-adversarial adversarial_cases ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-machine-plan-adversarial missing per_step_pass_fail",
+                report_path.display()
+            )
+        })?;
+    let mut check_ids = Vec::with_capacity(checks.len());
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-machine-plan-adversarial per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-machine-plan-adversarial per_step_pass_fail[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-machine-plan-adversarial check `{id}` is not passing",
+                report_path.display()
+            )
+            .into());
+        }
+        check_ids.push(id);
+    }
+    if check_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-machine-plan-adversarial per_step_pass_fail ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_release_benchmark_reproduction_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("proof") {
+        return Err(format!(
+            "{} verify-bytes-release-benchmark-reproduction must use measurement_mode=proof",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("reproduction_scope").and_then(JsonValue::as_str)
+        != Some("todomvc-release-benchmark-current-slices")
+    {
+        return Err(format!("{} has invalid reproduction_scope", report_path.display()).into());
+    }
+    let count = report
+        .get("benchmark_report_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing benchmark_report_count", report_path.display()))?;
+    if count < 2 {
+        return Err(format!(
+            "{} benchmark_report_count must be at least 2",
+            report_path.display()
+        )
+        .into());
+    }
+    let reports = report
+        .get("benchmark_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing benchmark_reports", report_path.display()))?;
+    if reports.len() != count as usize {
+        return Err(format!(
+            "{} benchmark_reports length does not match benchmark_report_count",
+            report_path.display()
+        )
+        .into());
+    }
+    for (index, child) in reports.iter().enumerate() {
+        let object = child.as_object().ok_or_else(|| {
+            format!(
+                "{} benchmark_reports[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        for key in ["path", "example", "speed_report_path"] {
+            if object
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!(
+                    "{} benchmark_reports[{index}] missing string `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        let command = object
+            .get("command")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        if !matches!(command, "bench-todomvc" | "bench-example") {
+            return Err(format!(
+                "{} benchmark_reports[{index}] has invalid command `{command}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if object.get("build_profile").and_then(JsonValue::as_str) != Some("release") {
+            return Err(format!(
+                "{} benchmark_reports[{index}] was not release evidence",
+                report_path.display()
+            )
+            .into());
+        }
+        for key in [
+            "interaction_latency_ms_p95",
+            "runtime_tick_ms_p95",
+            "average_ms_per_iteration",
+        ] {
+            let value = object.get(key).and_then(JsonValue::as_f64);
+            if value.is_none_or(|value| !value.is_finite() || value <= 0.0) {
+                return Err(format!(
+                    "{} benchmark_reports[{index}] missing positive numeric `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    let max_allowed_ratio = report
+        .get("max_allowed_ratio")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{} missing max_allowed_ratio", report_path.display()))?;
+    if !max_allowed_ratio.is_finite() || max_allowed_ratio < 1.0 {
+        return Err(format!(
+            "{} max_allowed_ratio must be finite and >= 1.0",
+            report_path.display()
+        )
+        .into());
+    }
+    let ratios = report
+        .get("metric_ratios")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing metric_ratios", report_path.display()))?;
+    for key in [
+        "interaction_latency_ms_p95",
+        "runtime_tick_ms_p95",
+        "average_ms_per_iteration",
+    ] {
+        let value = ratios.get(key).and_then(JsonValue::as_f64);
+        if value.is_none_or(|value| !value.is_finite() || value < 1.0 || value > max_allowed_ratio)
+        {
+            return Err(format!(
+                "{} metric_ratios.{key} must be within [1.0, max_allowed_ratio]",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if report.get("speedup_claim").and_then(JsonValue::as_str) != Some("not_claimed") {
+        return Err(format!(
+            "{} reproduction report must not claim speedups",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("claim_policy")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!("{} missing claim_policy", report_path.display()).into());
     }
     Ok(())
 }
@@ -629,6 +1459,7 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "source_payload_text_field_count",
         "source_payload_key_field_count",
         "source_payload_address_field_count",
+        "source_payload_bytes_field_count",
         "source_payload_pointer_field_count",
     ] {
         if source_route_counts
@@ -1096,6 +1927,11 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-boon-source-syntax"
                 | "verify-scenario-manifest-integrity"
                 | "verify-metamorphic-hidden-fixtures"
+                | "verify-bytes-storage-profile"
+                | "verify-bytes-byte-bank-layout"
+                | "verify-bytes-machine-plan-adversarial"
+                | "verify-bytes-release-benchmark-reproduction"
+                | "verify-bytes-machine-plan-all"
                 | "verify-native-visible-launch"
                 | "verify-native-examples"
                 | "verify-native-dev-window-editor"
@@ -1224,6 +2060,18549 @@ fn verify_failing_blocker_report_shape(
     Ok(())
 }
 
+fn verify_machine_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("diagnostic") {
+        return Err(format!(
+            "{} dump-plan diagnostics must use measurement_mode=diagnostic",
+            report_path.display()
+        )
+        .into());
+    }
+    let generated = report
+        .get("generated_at_utc")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} generated_at_utc is not a Unix-seconds string",
+                report_path.display()
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!(
+                "{} generated_at_utc is not parseable Unix seconds: {error}",
+                report_path.display()
+            )
+        })?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if generated > now.saturating_add(5) {
+        return Err(format!("{} is future-dated", report_path.display()).into());
+    }
+    let argv = report
+        .get("command_argv")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} command_argv is not an array", report_path.display()))?;
+    if argv.is_empty()
+        || argv
+            .iter()
+            .any(|arg| arg.as_str().is_none_or(|arg| arg.trim().is_empty()))
+    {
+        return Err(format!(
+            "{} command_argv is empty or malformed",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_report_binary_hash_matches_command(report, report_path, argv)?;
+    let exit_status = report
+        .get("exit_status")
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| format!("{} exit_status is not a number", report_path.display()))?;
+    if exit_status < 0 {
+        return Err(format!("{} exit_status is not a number", report_path.display()).into());
+    }
+    for key in [
+        "machine_plan",
+        "capability_summary",
+        "verification",
+        "typecheck_report",
+        "plan_hash",
+    ] {
+        if report.get(key).is_none() {
+            return Err(
+                format!("{} dump-plan report missing `{key}`", report_path.display()).into(),
+            );
+        }
+    }
+    verify_machine_plan_payload(report, report_path)?;
+    let plan_hash = report
+        .get("plan_hash")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} plan_hash is not a string", report_path.display()))?;
+    if !is_sha256_hex(plan_hash) {
+        return Err(format!(
+            "{} plan_hash must be a 64-character SHA-256 hex digest",
+            report_path.display()
+        )
+        .into());
+    }
+    let machine_plan: boon_plan::MachinePlan = serde_json::from_value(
+        report
+            .get("machine_plan")
+            .cloned()
+            .ok_or_else(|| format!("{} missing machine_plan", report_path.display()))?,
+    )
+    .map_err(|error| {
+        format!(
+            "{} machine_plan does not deserialize as boon_plan::MachinePlan: {error}",
+            report_path.display()
+        )
+    })?;
+    let canonical_machine_plan = serde_json::to_value(&machine_plan).map_err(|error| {
+        format!(
+            "{} could not serialize typed machine_plan projection: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("machine_plan") != Some(&canonical_machine_plan) {
+        return Err(format!(
+            "{} machine_plan contains unknown or non-canonical fields",
+            report_path.display()
+        )
+        .into());
+    }
+    let actual_plan_hash = boon_plan::plan_sha256(&machine_plan).map_err(|error| {
+        format!(
+            "{} could not recompute machine_plan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if actual_plan_hash != plan_hash {
+        return Err(format!(
+            "{} plan_hash does not match embedded machine_plan",
+            report_path.display()
+        )
+        .into());
+    }
+    let actual_verification = boon_plan::verify_plan(&machine_plan).map_err(|error| {
+        format!(
+            "{} embedded machine_plan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    let canonical_verification = serde_json::to_value(&actual_verification).map_err(|error| {
+        format!(
+            "{} could not serialize recomputed MachinePlan verification: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("verification") != Some(&canonical_verification) {
+        return Err(format!(
+            "{} verification does not match recomputed MachinePlan verification",
+            report_path.display()
+        )
+        .into());
+    }
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    if source_plan != machine_plan {
+        return Err(format!(
+            "{} machine_plan does not match report source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_dump_plan_typecheck_report(report, report_path)?;
+    let program_hash = report
+        .get("program_hash")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} program_hash is not a string", report_path.display()))?;
+    if !is_sha256_hex(program_hash) {
+        return Err(format!(
+            "{} dump-plan program_hash must be a 64-character SHA-256 hex digest",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .pointer("/verification/plan_hash")
+        .and_then(JsonValue::as_str)
+        != Some(plan_hash)
+    {
+        return Err(format!(
+            "{} verification.plan_hash does not match top-level plan_hash",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary") != report.pointer("/machine_plan/capability_summary") {
+        return Err(format!(
+            "{} top-level capability_summary does not match machine_plan.capability_summary",
+            report_path.display()
+        )
+        .into());
+    }
+    let executable = report
+        .pointer("/capability_summary/executable")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} capability_summary.executable is not a boolean",
+                report_path.display()
+            )
+        })?;
+    let typed_lowering_executable = report
+        .pointer("/capability_summary/typed_lowering_executable")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} capability_summary.typed_lowering_executable is not a boolean",
+                report_path.display()
+            )
+        })?;
+    let cpu_plan_executor_complete = report
+        .pointer("/capability_summary/cpu_plan_executor_complete")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} capability_summary.cpu_plan_executor_complete is not a boolean",
+                report_path.display()
+            )
+        })?;
+    if executable != cpu_plan_executor_complete {
+        return Err(format!(
+            "{} capability_summary.executable must match cpu_plan_executor_complete until the legacy field is removed",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification_error_count = report
+        .pointer("/verification/error_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} verification.error_count is not a number",
+                report_path.display()
+            )
+        })?;
+    if verification_error_count != actual_verification.error_count as u64 {
+        return Err(format!(
+            "{} verification.error_count does not match recomputed MachinePlan verification",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .pointer("/verification/status")
+        .and_then(JsonValue::as_str)
+        != Some(actual_verification.status.as_str())
+    {
+        return Err(format!(
+            "{} verification.status does not match recomputed MachinePlan verification",
+            report_path.display()
+        )
+        .into());
+    }
+    let status = report
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing status", report_path.display()))?;
+    if !matches!(status, "pass" | "fail") {
+        return Err(format!(
+            "{} dump-plan status must be pass or fail",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == "pass" && exit_status != 0 {
+        return Err(format!(
+            "{} pass dump-plan report requires exit_status=0",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail is not an array",
+                report_path.display()
+            )
+        })?;
+    let mut saw_failing_typed_lowering_step = false;
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing string id",
+                    report_path.display()
+                )
+            })?;
+        if id.trim().is_empty() {
+            return Err(format!(
+                "{} per_step_pass_fail[{index}] has empty id",
+                report_path.display()
+            )
+            .into());
+        }
+        let pass = object
+            .get("pass")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing boolean pass",
+                    report_path.display()
+                )
+            })?;
+        if status == "pass" && !pass {
+            return Err(format!(
+                "{} pass dump-plan report contains failing check `{id}`",
+                report_path.display()
+            )
+            .into());
+        }
+        saw_failing_typed_lowering_step |= id == "machine-plan-typed-lowering-executable" && !pass;
+        if id == "machine-plan-typed-lowering-executable" && pass != typed_lowering_executable {
+            return Err(format!(
+                "{} machine-plan-typed-lowering-executable step does not match capability_summary.typed_lowering_executable",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if status == "pass" && (!typed_lowering_executable || verification_error_count != 0) {
+        return Err(format!(
+            "{} pass dump-plan report requires typed_lowering_executable=true and verification.error_count=0",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == "fail" && typed_lowering_executable && verification_error_count == 0 {
+        return Err(format!(
+            "{} fail dump-plan report has typed_lowering_executable=true and zero verification errors",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == "fail" && !typed_lowering_executable && !saw_failing_typed_lowering_step {
+        return Err(format!(
+            "{} failing dump-plan report must include a failing machine-plan-typed-lowering-executable step",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_dump_plan_typecheck_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let reported = report.get("typecheck_report").ok_or_else(|| {
+        format!(
+            "{} dump-plan report missing `typecheck_report`",
+            report_path.display()
+        )
+    })?;
+    let expected_resolved_constants = compile_report_resolved_constant_table(report, report_path)?;
+    let expected = json!({
+        "resolved_constant_table": expected_resolved_constants
+    });
+    if reported != &expected {
+        return Err(format!(
+            "{} typecheck_report.resolved_constant_table does not match report source files",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_machine_plan_payload(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let machine_plan = report
+        .get("machine_plan")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} machine_plan is not an object", report_path.display()))?;
+    let required = [
+        ("version", "object"),
+        ("target_profile", "string"),
+        ("constants", "array"),
+        ("source_routes", "array"),
+        ("storage_layout", "object"),
+        ("regions", "array"),
+        ("dirty_plan", "object"),
+        ("commit_plan", "object"),
+        ("delta_plan", "object"),
+        ("debug_map", "object"),
+        ("capability_summary", "object"),
+    ];
+    for (key, expected) in required {
+        let Some(value) = machine_plan.get(key) else {
+            return Err(format!(
+                "{} machine_plan missing required `{key}`",
+                report_path.display()
+            )
+            .into());
+        };
+        let matches_expected = match expected {
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "string" => value.is_string(),
+            _ => false,
+        };
+        if !matches_expected {
+            return Err(format!(
+                "{} machine_plan.{key} must be a {expected}",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_dump_plan_source_files(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let source_files = report
+        .get("source_files")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} dump-plan report missing source_files",
+                report_path.display()
+            )
+        })?;
+    if source_files.is_empty() {
+        return Err(format!("{} dump-plan source_files is empty", report_path.display()).into());
+    }
+    let mut hasher = Sha256::new();
+    for (index, file) in source_files.iter().enumerate() {
+        let path = file
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} source_files[{index}].path is not a string",
+                    report_path.display()
+                )
+            })?;
+        let start_line = file
+            .get("start_line")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} source_files[{index}].start_line is not a number",
+                    report_path.display()
+                )
+            })?;
+        let source_hash = file
+            .get("source_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} source_files[{index}].source_hash is not a string",
+                    report_path.display()
+                )
+            })?;
+        if !is_sha256_hex(source_hash) {
+            return Err(format!(
+                "{} source_files[{index}].source_hash must be a SHA-256 hex digest",
+                report_path.display()
+            )
+            .into());
+        }
+        let source = fs::read(path)?;
+        let actual_hash = sha256_bytes(&source);
+        if actual_hash != source_hash {
+            return Err(format!(
+                "{} source_files[{index}] hash mismatch for `{path}`",
+                report_path.display()
+            )
+            .into());
+        }
+        let module = file.get("module").and_then(JsonValue::as_str).unwrap_or("");
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(module.as_bytes());
+        hasher.update([0]);
+        hasher.update((start_line as usize).to_le_bytes());
+        hasher.update([0]);
+        hasher.update(source);
+        hasher.update([0]);
+    }
+    let actual_program_hash = format!("{:x}", hasher.finalize());
+    let expected_program_hash = report
+        .get("program_hash")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if actual_program_hash != expected_program_hash {
+        return Err(format!(
+            "{} program_hash does not match source_files content",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_run_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "state_summary",
+        "plan_executor",
+    ] {
+        if report.get(key).is_none() {
+            return Err(
+                format!("{} run-plan report missing `{key}`", report_path.display()).into(),
+            );
+        }
+    }
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} run-plan plan_hash does not match report source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} run-plan plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} run-plan capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.cpu_plan_executor_complete {
+        return Err(format!(
+            "{} run-plan requires a verified whole-plan CPU-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let expected_state_summary = expected_initial_state_summary(&source_plan, report_path)?;
+    if report.get("state_summary") != Some(&expected_state_summary) {
+        return Err(format!(
+            "{} run-plan state_summary does not match source-derived initial state",
+            report_path.display()
+        )
+        .into());
+    }
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} plan_executor is not an object", report_path.display()))?;
+    if executor.get("executor").and_then(JsonValue::as_str) != Some("cpu-plan-initial-state-v1") {
+        return Err(format!(
+            "{} run-plan executor is not cpu-plan-initial-state-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} run-plan plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if executor
+        .get("initialized_state_count")
+        .and_then(JsonValue::as_u64)
+        != Some(source_plan.storage_layout.scalar_slots.len() as u64)
+    {
+        return Err(format!(
+            "{} run-plan initialized_state_count does not match scalar storage count",
+            report_path.display()
+        )
+        .into());
+    }
+    if executor
+        .get("source_route_metadata_count")
+        .and_then(JsonValue::as_u64)
+        != Some(source_plan.source_routes.len() as u64)
+    {
+        return Err(format!(
+            "{} run-plan source_route_metadata_count does not match source route count",
+            report_path.display()
+        )
+        .into());
+    }
+    if executor.get("list_slot_count").and_then(JsonValue::as_u64)
+        != Some(source_plan.storage_layout.list_slots.len() as u64)
+    {
+        return Err(format!(
+            "{} run-plan list_slot_count does not match MachinePlan storage layout",
+            report_path.display()
+        )
+        .into());
+    }
+    if executor.get("state_summary") != Some(&expected_state_summary) {
+        return Err(format!(
+            "{} run-plan plan_executor.state_summary does not match source-derived initial state",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_list_state = expected_initial_list_state(&source_plan, report_path)?;
+    let expected_list_summary = expected_list_summary(&source_plan, &expected_list_state);
+    if executor.get("list_summary") != Some(&expected_list_summary) {
+        let detail = executor
+            .get("list_summary")
+            .map(|actual| list_summary_mismatch_detail(actual, &expected_list_summary))
+            .unwrap_or_else(|| "actual list_summary is missing".to_owned());
+        return Err(format!(
+            "{} run-plan plan_executor.list_summary does not match source-derived initial list state: {detail}",
+            report_path.display(),
+        )
+        .into());
+    }
+    let expected_root_state = expected_state_summary.as_object().ok_or_else(|| {
+        format!(
+            "{} source-derived initial state summary is not an object",
+            report_path.display()
+        )
+    })?;
+    let expected_retain_execution = expected_materialize_plan_list_retains(
+        &source_plan,
+        expected_root_state,
+        &expected_list_state,
+        report_path,
+    )?;
+    if executor
+        .get("executed_list_retain_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected_retain_execution.executed_count as u64)
+        || executor
+            .get("executed_list_view_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_retain_execution.view_count as u64)
+        || executor
+            .get("retained_list_row_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_retain_execution.retained_row_count as u64)
+        || executor.get("list_view_summary")
+            != Some(&JsonValue::Object(expected_retain_execution.summary))
+        || executor.get("list_retains")
+            != Some(&JsonValue::Array(expected_retain_execution.reports))
+    {
+        return Err(format!(
+            "{} run-plan plan_executor retain/list-view evidence does not match source-derived initial state",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "route_surface",
+        "source_event",
+        "state_summary",
+        "semantic_delta_signatures",
+        "semantic_deltas",
+        "legacy_comparison",
+        "plan_executor",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} run-plan-route report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} run-plan-route plan_hash does not match report source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} run-plan-route plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} run-plan-route capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} run-plan-route requires a verified typed-lowering-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let route_surface = report
+        .get("route_surface")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} route_surface is not an object", report_path.display()))?;
+    let source = route_surface
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} route_surface.source is missing", report_path.display()))?;
+    let target_state = route_surface
+        .get("target_state")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} route_surface.target_state is missing",
+                report_path.display()
+            )
+        })?;
+    let source_event = report
+        .get("source_event")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} source_event is not an object", report_path.display()))?;
+    verify_source_event_payload_byte_artifacts_listed(report, source_event, report_path)?;
+    let expected = expected_route_execution(
+        &source_plan,
+        source,
+        target_state,
+        source_event,
+        report_path,
+    )?;
+
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+        "selected_op_unresolved_executable_ref_count",
+    ] {
+        if route_surface.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} run-plan-route route_surface.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if route_surface
+        .get("selected_op_indexed")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+    {
+        return Err(format!(
+            "{} run-plan-route selected_op_indexed must be false",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface
+        .get("global_plan_executable")
+        .and_then(JsonValue::as_bool)
+        != Some(source_plan.capability_summary.executable)
+        || route_surface
+            .get("global_typed_lowering_executable")
+            .and_then(JsonValue::as_bool)
+            != Some(source_plan.capability_summary.typed_lowering_executable)
+        || route_surface
+            .get("global_cpu_plan_executor_complete")
+            .and_then(JsonValue::as_bool)
+            != Some(source_plan.capability_summary.cpu_plan_executor_complete)
+    {
+        return Err(format!(
+            "{} run-plan-route global capability flags do not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface.get("source_id").and_then(JsonValue::as_u64) != Some(expected.source_id as u64)
+        || route_surface
+            .get("target_state_id")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.target_state_id as u64)
+        || route_surface
+            .get("update_op_id")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.update_op_id as u64)
+    {
+        return Err(format!(
+            "{} run-plan-route route_surface IDs do not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface
+        .get("expression_kind")
+        .and_then(JsonValue::as_str)
+        != Some(expected.expression_kind)
+    {
+        return Err(format!(
+            "{} run-plan-route expression_kind does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface.get("source_payload_field") != Some(&expected.source_payload_field) {
+        return Err(format!(
+            "{} run-plan-route source_payload_field does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface.get("update_constant_id") != Some(&expected.update_constant_id) {
+        return Err(format!(
+            "{} run-plan-route update_constant_id does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface.get("update_constant_value") != Some(&expected.update_constant_value) {
+        return Err(format!(
+            "{} run-plan-route update_constant_value does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if route_surface.get("payload_schema") != Some(&expected.payload_schema) {
+        return Err(format!(
+            "{} run-plan-route payload_schema does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+
+    if source_event.get("source").and_then(JsonValue::as_str) != Some(source)
+        || source_event.get("source_id").and_then(JsonValue::as_u64)
+            != Some(expected.source_id as u64)
+    {
+        return Err(format!(
+            "{} run-plan-route source_event route metadata does not match route_surface",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_value = expected.expected_value.clone();
+    let expected_state_summary = json!({ target_state: expected_value.clone() });
+    if report.get("state_summary") != Some(&expected_state_summary) {
+        return Err(format!(
+            "{} run-plan-route state_summary does not match source-derived route execution",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_signatures = expected.semantic_delta_signatures.clone();
+    if report.get("semantic_delta_signatures") != Some(&expected_signatures) {
+        return Err(format!(
+            "{} run-plan-route semantic_delta_signatures do not match route output",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_deltas = expected.semantic_deltas.clone();
+    if report.get("semantic_deltas") != Some(&expected_deltas) {
+        return Err(format!(
+            "{} run-plan-route semantic_deltas do not match route output",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} plan_executor is not an object", report_path.display()))?;
+    if executor.get("executor").and_then(JsonValue::as_str) != Some("cpu-plan-source-route-v1") {
+        return Err(format!(
+            "{} run-plan-route executor is not cpu-plan-source-route-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} run-plan-route plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let actual_per_step = normalized_plan_executor_per_step_for_semantic_compare(
+        executor.get("per_step").unwrap_or(&JsonValue::Null),
+    );
+    let expected_per_step =
+        normalized_plan_executor_per_step_for_semantic_compare(&expected.per_step);
+    if executor.get("source_id").and_then(JsonValue::as_u64) != Some(expected.source_id as u64)
+        || executor.get("target_state_id").and_then(JsonValue::as_u64)
+            != Some(expected.target_state_id as u64)
+        || executor.get("update_op_id").and_then(JsonValue::as_u64)
+            != Some(expected.update_op_id as u64)
+        || executor.get("expression_kind").and_then(JsonValue::as_str)
+            != Some(expected.expression_kind)
+        || executor.get("source_payload_field") != Some(&expected.source_payload_field)
+        || executor.get("update_constant_id") != Some(&expected.update_constant_id)
+        || executor.get("update_constant_value") != Some(&expected.update_constant_value)
+        || executor.get("state_summary") != Some(&expected_state_summary)
+        || executor.get("full_state_summary") != Some(&expected.full_state_summary)
+        || executor.get("semantic_delta_signatures") != Some(&expected_signatures)
+        || executor.get("semantic_deltas") != Some(&expected_deltas)
+        || actual_per_step != expected_per_step
+    {
+        return Err(format!(
+            "{} run-plan-route plan_executor route output does not match source-derived route",
+            report_path.display()
+        )
+        .into());
+    }
+    for (key, expected_value) in [
+        (
+            "executed_update_branch_count",
+            expected.executed_update_branch_count,
+        ),
+        (
+            "executed_derived_value_count",
+            expected.executed_derived_value_count,
+        ),
+        (
+            "executed_list_append_count",
+            expected.executed_list_append_count,
+        ),
+        (
+            "executed_list_remove_count",
+            expected.executed_list_remove_count,
+        ),
+        (
+            "executed_indexed_update_count",
+            expected.executed_indexed_update_count,
+        ),
+        (
+            "emitted_source_bind_count",
+            expected.emitted_source_bind_count,
+        ),
+        (
+            "emitted_source_unbind_count",
+            expected.emitted_source_unbind_count,
+        ),
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(expected_value as u64) {
+            return Err(format!(
+                "{} run-plan-route plan_executor.{key} does not match source-derived route execution",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} legacy_comparison is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
+        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} run-plan-route legacy_comparison.{key} must be true",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if legacy.get("plan_value") != Some(&expected_value)
+        || legacy.get("legacy_value") != Some(&expected_value)
+        || legacy.get("legacy_semantic_delta_signatures") != Some(&expected_signatures)
+        || legacy.get("plan_semantic_delta_signatures") != Some(&expected_signatures)
+        || legacy.get("legacy_semantic_deltas") != Some(&expected_deltas)
+        || legacy.get("plan_semantic_deltas") != Some(&expected_deltas)
+    {
+        return Err(format!(
+            "{} run-plan-route legacy comparison values do not match plan output",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_check_ids = [
+        "machine-plan-verified",
+        "cpu-plan-route-surface-executable",
+        "cpu-plan-source-route-executed",
+        "legacy-route-parity",
+    ];
+    let actual_check_ids = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail is not an array",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|check| check.get("id").and_then(JsonValue::as_str).unwrap_or(""))
+        .collect::<Vec<_>>();
+    if actual_check_ids != expected_check_ids {
+        return Err(format!(
+            "{} run-plan-route per_step_pass_fail ids do not match the route proof contract",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_run_plan_root_scalar_scenario_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "selected_step_ids",
+        "state_summary",
+        "semantic_delta_signatures",
+        "semantic_deltas",
+        "legacy_comparison",
+        "plan_executor",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario plan_hash does not match report source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario requires a verified typed-lowering-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let scenario_path = report
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing scenario_path", report_path.display()))?;
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    let selected_step_ids = report
+        .get("selected_step_ids")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} selected_step_ids is not an array",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "{} selected_step_ids contains a non-string value",
+                    report_path.display()
+                )
+                .into()
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    if selected_step_ids.is_empty() {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario selected_step_ids must not be empty",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected = expected_root_scalar_scenario_execution(
+        &source_plan,
+        &scenario,
+        &selected_step_ids,
+        report_path,
+    )?;
+
+    if report.get("state_summary") != Some(&expected.state_summary) {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario state_summary does not match source-derived replay",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("semantic_delta_signatures") != Some(&expected.semantic_delta_signatures) {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario semantic_delta_signatures do not match source-derived replay",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("semantic_deltas") != Some(&expected.semantic_deltas) {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario semantic_deltas do not match source-derived replay",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} plan_executor is not an object", report_path.display()))?;
+    if executor.get("executor").and_then(JsonValue::as_str)
+        != Some("cpu-plan-root-list-scenario-v1")
+    {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario executor is not cpu-plan-root-list-scenario-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if executor
+        .get("selected_step_count")
+        .and_then(JsonValue::as_u64)
+        != Some(selected_step_ids.len() as u64)
+        || executor
+            .get("initialized_root_state_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.initialized_root_state_count as u64)
+        || executor
+            .get("executed_update_branch_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_update_branch_count as u64)
+        || executor
+            .get("executed_derived_value_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_derived_value_count as u64)
+        || executor
+            .get("executed_list_append_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_list_append_count as u64)
+        || executor
+            .get("executed_list_remove_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_list_remove_count as u64)
+        || executor
+            .get("executed_indexed_update_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_indexed_update_count as u64)
+        || executor
+            .get("emitted_source_bind_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.emitted_source_bind_count as u64)
+        || executor
+            .get("emitted_source_unbind_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.emitted_source_unbind_count as u64)
+        || executor
+            .get("executed_list_retain_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_list_retain_count as u64)
+        || executor
+            .get("executed_list_view_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.executed_list_view_count as u64)
+        || executor
+            .get("retained_list_row_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected.retained_list_row_count as u64)
+        || executor.get("list_slot_count").and_then(JsonValue::as_u64)
+            != Some(source_plan.storage_layout.list_slots.len() as u64)
+        || executor.get("state_summary") != Some(&expected.state_summary)
+        || executor.get("list_summary") != Some(&expected.list_summary)
+        || executor.get("list_view_summary") != Some(&expected.list_view_summary)
+        || executor.get("list_retains") != Some(&expected.list_retains)
+        || executor.get("semantic_delta_signatures") != Some(&expected.semantic_delta_signatures)
+        || normalized_plan_executor_per_step_for_semantic_compare(
+            executor.get("per_step").unwrap_or(&JsonValue::Null),
+        ) != normalized_plan_executor_per_step_for_semantic_compare(&expected.per_step)
+    {
+        let mut mismatches = Vec::new();
+        let normalized_expected_per_step =
+            normalized_plan_executor_per_step_for_semantic_compare(&expected.per_step);
+        for (key, expected_value) in [
+            ("state_summary", expected.state_summary.clone()),
+            ("list_summary", expected.list_summary.clone()),
+            ("list_view_summary", expected.list_view_summary.clone()),
+            ("list_retains", expected.list_retains.clone()),
+            (
+                "semantic_delta_signatures",
+                expected.semantic_delta_signatures.clone(),
+            ),
+            ("per_step", normalized_expected_per_step),
+        ] {
+            let actual_value = if key == "per_step" {
+                normalized_plan_executor_per_step_for_semantic_compare(
+                    executor.get("per_step").unwrap_or(&JsonValue::Null),
+                )
+            } else {
+                executor.get(key).cloned().unwrap_or(JsonValue::Null)
+            };
+            if actual_value != expected_value {
+                mismatches.push(key);
+            }
+        }
+        let mut mismatch_details = Vec::new();
+        if executor.get("list_summary") != Some(&expected.list_summary) {
+            mismatch_details.push(format!(
+                "list_summary: {}",
+                executor
+                    .get("list_summary")
+                    .map(|actual| list_summary_mismatch_detail(actual, &expected.list_summary))
+                    .unwrap_or_else(|| "missing".to_owned())
+            ));
+        }
+        let normalized_actual_per_step = normalized_plan_executor_per_step_for_semantic_compare(
+            executor.get("per_step").unwrap_or(&JsonValue::Null),
+        );
+        let normalized_expected_per_step =
+            normalized_plan_executor_per_step_for_semantic_compare(&expected.per_step);
+        if normalized_actual_per_step != normalized_expected_per_step {
+            mismatch_details.push(format!(
+                "per_step: {}",
+                first_array_mismatch_detail(
+                    Some(&normalized_actual_per_step),
+                    &normalized_expected_per_step
+                )
+            ));
+        }
+        for (key, expected_value) in [
+            ("selected_step_count", selected_step_ids.len()),
+            (
+                "initialized_root_state_count",
+                expected.initialized_root_state_count,
+            ),
+            (
+                "executed_update_branch_count",
+                expected.executed_update_branch_count,
+            ),
+            (
+                "executed_derived_value_count",
+                expected.executed_derived_value_count,
+            ),
+            (
+                "executed_list_append_count",
+                expected.executed_list_append_count,
+            ),
+            (
+                "executed_list_remove_count",
+                expected.executed_list_remove_count,
+            ),
+            (
+                "executed_indexed_update_count",
+                expected.executed_indexed_update_count,
+            ),
+            (
+                "emitted_source_bind_count",
+                expected.emitted_source_bind_count,
+            ),
+            (
+                "emitted_source_unbind_count",
+                expected.emitted_source_unbind_count,
+            ),
+            (
+                "executed_list_retain_count",
+                expected.executed_list_retain_count,
+            ),
+            (
+                "executed_list_view_count",
+                expected.executed_list_view_count,
+            ),
+            ("retained_list_row_count", expected.retained_list_row_count),
+            (
+                "list_slot_count",
+                source_plan.storage_layout.list_slots.len(),
+            ),
+        ] {
+            if executor.get(key).and_then(JsonValue::as_u64) != Some(expected_value as u64) {
+                mismatches.push(key);
+            }
+        }
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario plan_executor does not match source-derived replay; mismatched keys: {}; details: {}",
+            report_path.display(),
+            mismatches.join(", "),
+            mismatch_details.join("; ")
+        )
+        .into());
+    }
+
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-root-scalar-scenario legacy_comparison is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
+        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario legacy_comparison.{key} must be true",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if legacy.get("plan_state_summary") != Some(&expected.state_summary)
+        || legacy.get("legacy_state_summary") != Some(&expected.state_summary)
+    {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario legacy state projection does not match plan replay",
+            report_path.display()
+        )
+        .into());
+    }
+    let legacy_steps = legacy
+        .get("step_comparisons")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-root-scalar-scenario legacy step_comparisons is not an array",
+                report_path.display()
+            )
+        })?;
+    let expected_steps = expected
+        .per_step
+        .as_array()
+        .ok_or("expected per_step is not an array")?;
+    if legacy_steps.len() != expected_steps.len() {
+        return Err(format!(
+            "{} run-plan-root-scalar-scenario legacy step count does not match selected steps",
+            report_path.display()
+        )
+        .into());
+    }
+    for (legacy_step, expected_step) in legacy_steps.iter().zip(expected_steps) {
+        if legacy_step.get("state_match").and_then(JsonValue::as_bool) != Some(true)
+            || legacy_step
+                .get("semantic_delta_match")
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+            || legacy_step.get("step_id") != expected_step.get("step_id")
+            || legacy_step.get("touched_state_summary")
+                != expected_step.get("touched_state_summary")
+            || legacy_step.get("legacy_semantic_delta_signatures")
+                != expected_step.get("semantic_delta_signatures")
+            || legacy_step.get("plan_semantic_delta_signatures")
+                != expected_step.get("semantic_delta_signatures")
+            || legacy_step.get("legacy_semantic_deltas") != expected_step.get("semantic_deltas")
+            || legacy_step.get("plan_semantic_deltas") != expected_step.get("semantic_deltas")
+        {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario legacy step comparison does not match source-derived replay",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_run_plan_scenario_events_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "selected_step_ids",
+        "state_summary",
+        "semantic_delta_signatures",
+        "semantic_deltas",
+        "legacy_comparison",
+        "plan_executor_coverage",
+        "plan_executor",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} run-plan-scenario-events report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} run-plan-scenario-events plan_hash does not match report source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} run-plan-scenario-events plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} run-plan-scenario-events requires a verified typed-lowering-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let scenario_path = report
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing scenario_path", report_path.display()))?;
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    let expected_event_step_ids = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_some())
+        .map(|step| JsonValue::String(step.id.clone()))
+        .collect::<Vec<_>>();
+    let expected_assertion_only_step_ids = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_none())
+        .map(|step| JsonValue::String(step.id.clone()))
+        .collect::<Vec<_>>();
+    if expected_event_step_ids.is_empty() {
+        return Err(format!(
+            "{} run-plan-scenario-events scenario has no expected_source_event steps",
+            report_path.display()
+        )
+        .into());
+    }
+    let selected_step_ids = JsonValue::Array(expected_event_step_ids.clone());
+    if report.get("selected_step_ids") != Some(&selected_step_ids) {
+        return Err(format!(
+            "{} run-plan-scenario-events selected_step_ids do not match scenario event steps",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let coverage = report
+        .get("plan_executor_coverage")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events plan_executor_coverage is not an object",
+                report_path.display()
+            )
+        })?;
+    if coverage.get("surface").and_then(JsonValue::as_str)
+        != Some("scenario-expected-source-event-replay")
+        || coverage
+            .get("scenario_step_count")
+            .and_then(JsonValue::as_u64)
+            != Some(scenario.step.len() as u64)
+        || coverage.get("event_step_count").and_then(JsonValue::as_u64)
+            != Some(expected_event_step_ids.len() as u64)
+        || coverage.get("selected_step_ids") != Some(&selected_step_ids)
+        || coverage.get("assertion_only_step_ids")
+            != Some(&JsonValue::Array(expected_assertion_only_step_ids.clone()))
+        || coverage
+            .get("covers_all_source_events")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || coverage
+            .get("covers_assertion_only_steps")
+            .and_then(JsonValue::as_bool)
+            != Some(expected_assertion_only_step_ids.is_empty())
+        || coverage
+            .get("full_scenario_parity")
+            .and_then(JsonValue::as_bool)
+            != Some(expected_assertion_only_step_ids.is_empty())
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events coverage does not match scenario event/assertion split",
+            report_path.display()
+        )
+        .into());
+    }
+    if !expected_assertion_only_step_ids.is_empty()
+        && coverage
+            .get("full_scenario_parity_blocker")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events must explain uncovered assertion-only steps",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events plan_executor is not an object",
+                report_path.display()
+            )
+        })?;
+    if executor.get("executor").and_then(JsonValue::as_str)
+        != Some("cpu-plan-root-list-scenario-v1")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events executor is not cpu-plan-root-list-scenario-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} run-plan-scenario-events plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if executor
+        .get("selected_step_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected_event_step_ids.len() as u64)
+        || executor.get("list_slot_count").and_then(JsonValue::as_u64)
+            != Some(source_plan.storage_layout.list_slots.len() as u64)
+        || executor.get("state_summary") != report.get("state_summary")
+        || executor.get("semantic_delta_signatures") != report.get("semantic_delta_signatures")
+        || executor.get("semantic_deltas") != report.get("semantic_deltas")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events executor summary does not match report",
+            report_path.display()
+        )
+        .into());
+    }
+    let executor_steps = executor
+        .get("per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events plan_executor.per_step is not an array",
+                report_path.display()
+            )
+        })?;
+    if executor_steps.len() != expected_event_step_ids.len() {
+        return Err(format!(
+            "{} run-plan-scenario-events executor step count does not match selected event steps",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events legacy_comparison is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
+        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} run-plan-scenario-events legacy_comparison.{key} must be true",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if legacy.get("plan_state_summary") != report.get("state_summary")
+        || legacy.get("legacy_state_summary") != report.get("state_summary")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events legacy state projection does not match report state",
+            report_path.display()
+        )
+        .into());
+    }
+    let legacy_steps = legacy
+        .get("step_comparisons")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events legacy step_comparisons is not an array",
+                report_path.display()
+            )
+        })?;
+    if legacy_steps.len() != executor_steps.len() {
+        return Err(format!(
+            "{} run-plan-scenario-events legacy step count does not match executor steps",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut concatenated_signatures = Vec::new();
+    let mut concatenated_deltas = Vec::new();
+    for ((legacy_step, executor_step), expected_step_id) in legacy_steps
+        .iter()
+        .zip(executor_steps)
+        .zip(expected_event_step_ids.iter())
+    {
+        if legacy_step.get("state_match").and_then(JsonValue::as_bool) != Some(true)
+            || legacy_step
+                .get("semantic_delta_match")
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+            || legacy_step.get("step_id") != Some(expected_step_id)
+            || executor_step.get("step_id") != Some(expected_step_id)
+            || legacy_step.get("touched_state_summary")
+                != executor_step.get("touched_state_summary")
+            || legacy_step.get("legacy_semantic_delta_signatures")
+                != executor_step.get("semantic_delta_signatures")
+            || legacy_step.get("plan_semantic_delta_signatures")
+                != executor_step.get("semantic_delta_signatures")
+            || legacy_step.get("legacy_semantic_deltas") != executor_step.get("semantic_deltas")
+            || legacy_step.get("plan_semantic_deltas") != executor_step.get("semantic_deltas")
+        {
+            return Err(format!(
+                "{} run-plan-scenario-events legacy step comparison does not match executor step",
+                report_path.display()
+            )
+            .into());
+        }
+        if let Some(values) = executor_step
+            .get("semantic_delta_signatures")
+            .and_then(JsonValue::as_array)
+        {
+            concatenated_signatures.extend(values.iter().cloned());
+        }
+        if let Some(values) = executor_step
+            .get("semantic_deltas")
+            .and_then(JsonValue::as_array)
+        {
+            concatenated_deltas.extend(values.iter().cloned());
+        }
+    }
+    if report.get("semantic_delta_signatures") != Some(&JsonValue::Array(concatenated_signatures))
+        || report.get("semantic_deltas") != Some(&JsonValue::Array(concatenated_deltas))
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events top-level semantic deltas are not the concatenated executor steps",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_write_plan_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    verify_bytes_file_write_plan_report_inner(report, report_path, true)
+}
+
+struct ExpectedBytesMachinePlanChildReport {
+    label: &'static str,
+    path: &'static str,
+    command: &'static str,
+    measurement_mode: &'static str,
+}
+
+fn verify_bytes_storage_profile_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    verify_report_mode(report, report_path, "proof")?;
+    let profile = report
+        .get("bytes_storage_profile")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-storage-profile missing bytes_storage_profile object",
+                report_path.display()
+            )
+        })?;
+    if profile.get("status").and_then(JsonValue::as_str) != Some("measured") {
+        return Err(format!(
+            "{} verify-bytes-storage-profile status is not measured",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile
+        .get("fixed_read_only_zero_copy_required")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-storage-profile does not require fixed read-only zero-copy proof",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile
+        .get("slice_take_drop_zero_copy_required")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-storage-profile does not require slice/take/drop zero-copy proof",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile
+        .get("fixed_set_zero_copy_required")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-storage-profile does not require fixed Bytes/set zero-copy proof",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile
+        .get("dynamic_mutating_operations_must_report_copy_cost")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-storage-profile does not require dynamic mutating copy-cost proof",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = profile
+        .get("cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-storage-profile cases is missing",
+                report_path.display()
+            )
+        })?;
+    if profile.get("case_count").and_then(JsonValue::as_u64) != Some(cases.len() as u64) {
+        return Err(format!(
+            "{} verify-bytes-storage-profile case_count does not match cases length",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut no_copy_seen = BTreeSet::new();
+    let mut measured_copy_seen = BTreeSet::new();
+    let expected_no_copy = [
+        "fixed-read-only-no-copy",
+        "slice-take-drop-no-copy",
+        "set-fixed-bank-no-copy",
+        "fixed-bank-read-after-set-no-copy",
+        "fixed-bank-predicates-after-set-no-copy",
+        "fixed-bank-numeric-read-after-set-no-copy",
+        "fixed-bank-conversions-after-set-no-copy",
+        "fixed-bank-numeric-write-after-set-no-copy",
+        "fixed-bank-file-write-after-set-no-copy",
+        "dynamic-file-write-source-payload-no-copy",
+        "indexed-file-write-source-payload-no-copy",
+        "indexed-file-read-row-field-path-no-copy",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let expected_measured_copy = ["concat-measured-copy"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for case in cases {
+        let id = case.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+            format!(
+                "{} verify-bytes-storage-profile case missing id",
+                report_path.display()
+            )
+        })?;
+        let expectation = case
+            .get("expectation")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing expectation",
+                    report_path.display()
+                )
+            })?;
+        if case.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-storage-profile case `{id}` did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+        let host_boundary_case = matches!(
+            id,
+            "fixed-bank-file-write-after-set-no-copy"
+                | "dynamic-file-write-source-payload-no-copy"
+                | "indexed-file-write-source-payload-no-copy"
+                | "indexed-file-read-row-field-path-no-copy"
+        );
+        if !host_boundary_case
+            && case
+                .get("legacy_comparison_enabled")
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+        {
+            return Err(format!(
+                "{} verify-bytes-storage-profile case `{id}` must keep legacy comparison enabled",
+                report_path.display()
+            )
+            .into());
+        }
+        let counters = case
+            .get("bytes_storage_counters")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing counters",
+                    report_path.display()
+                )
+            })?;
+        for key in [
+            "inline_value_count",
+            "inline_value_bytes",
+            "copy_from_slice_count",
+            "copy_from_slice_bytes",
+            "vec_clone_count",
+            "vec_clone_bytes",
+            "vec_alloc_count",
+            "vec_alloc_bytes",
+            "zero_fill_count",
+            "zero_fill_bytes",
+        ] {
+            if counters.get(key).and_then(JsonValue::as_u64).is_none() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` counter `{key}` is missing",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        let no_copy = case
+            .get("bytes_storage_no_copy")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let measured_copy_bytes = case
+            .get("measured_copy_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing measured_copy_bytes",
+                    report_path.display()
+                )
+            })?;
+        match expectation {
+            "no-runtime-copy" => {
+                if !no_copy || measured_copy_bytes != 0 {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` failed no-copy proof",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                no_copy_seen.insert(id.to_owned());
+            }
+            "measured-copy" => {
+                if no_copy || measured_copy_bytes == 0 {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` failed measured-copy proof",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                measured_copy_seen.insert(id.to_owned());
+            }
+            other => {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` has unknown expectation `{other}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-read-after-set-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "borrowed_reads",
+                "values_match",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` borrowed evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str) != Some("inspect-bank")
+                || evidence
+                    .get("read_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(2)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` borrowed read evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` borrowed evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let mut seen_kinds = BTreeSet::new();
+            for update in updates {
+                let kind = update
+                    .get("expression_kind")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` borrowed update missing expression_kind",
+                            report_path.display()
+                        )
+                    })?;
+                seen_kinds.insert(kind.to_owned());
+                if update
+                    .pointer("/bytes_access/access_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("root_fixed_byte_bank")
+                    || update
+                        .pointer("/bytes_access/cow_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("borrowed")
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` update `{kind}` was not a borrowed fixed-bank read",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_kinds
+                != ["bytes_get".to_owned(), "bytes_length".to_owned()]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` borrowed update kinds were {seen_kinds:?}",
+                    report_path.display()
+                )
+                    .into());
+            }
+        }
+        if id == "slice-take-drop-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "targets_match",
+                "values_match",
+                "output_slice_views",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` slice/take/drop evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str) != Some("split-bytes")
+                || evidence
+                    .get("slice_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || evidence
+                    .get("expected_target_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` slice/take/drop evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` slice/take/drop evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected = BTreeMap::from([
+                ("store.sliced", ("bytes_slice", 1u64, 3u64, 3u64)),
+                ("store.taken", ("bytes_take", 0u64, 4u64, 4u64)),
+                ("store.dropped", ("bytes_drop", 2u64, 4u64, 4u64)),
+            ]);
+            let mut seen_targets = BTreeSet::new();
+            for update in updates {
+                let target = update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` slice/take/drop update missing target_state",
+                            report_path.display()
+                        )
+                    })?;
+                seen_targets.insert(target.to_owned());
+                let (expected_kind, expected_offset, expected_byte_count, expected_output_len) =
+                    expected.get(target).copied().ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` has unexpected slice/take/drop target `{target}`",
+                            report_path.display()
+                        )
+                    })?;
+                if update.get("expression_kind").and_then(JsonValue::as_str) != Some(expected_kind)
+                    || update
+                        .get("value")
+                        .and_then(|value| value.get("byte_len"))
+                        .and_then(JsonValue::as_u64)
+                        != Some(expected_output_len)
+                    || update
+                        .pointer("/bytes_access/read_only")
+                        .and_then(JsonValue::as_bool)
+                        != Some(false)
+                    || update
+                        .pointer("/bytes_access/output_storage_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("bytes_slice_view")
+                    || update
+                        .pointer("/bytes_access/output_cow_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("borrowed_view")
+                    || update
+                        .pointer("/bytes_access/offset")
+                        .and_then(JsonValue::as_u64)
+                        != Some(expected_offset)
+                    || update
+                        .pointer("/bytes_access/byte_count")
+                        .and_then(JsonValue::as_u64)
+                        != Some(expected_byte_count)
+                    || update
+                        .pointer("/bytes_access/output_byte_len")
+                        .and_then(JsonValue::as_u64)
+                        != Some(expected_output_len)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` slice/take/drop update `{target}` did not prove expected bytes_slice_view output",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_targets != expected.keys().map(|key| key.to_string()).collect() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` slice/take/drop targets were {seen_targets:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-predicates-after-set-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "targets_match",
+                "values_match",
+                "borrowed_predicate_reads",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` predicate evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str) != Some("inspect-predicates")
+                || evidence
+                    .get("predicate_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(5)
+                || evidence
+                    .get("expected_target_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(5)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` predicate borrowed read evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` predicate evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected_values = BTreeMap::from([
+                ("store.same", json!(true)),
+                ("store.found_index", json!(2)),
+                ("store.missing_index", JsonValue::Null),
+                ("store.starts", json!(true)),
+                ("store.ends", json!(true)),
+            ]);
+            let expected_kinds = BTreeMap::from([
+                ("store.same", "bytes_equal"),
+                ("store.found_index", "bytes_find"),
+                ("store.missing_index", "bytes_find"),
+                ("store.starts", "bytes_starts_with"),
+                ("store.ends", "bytes_ends_with"),
+            ]);
+            let mut seen_targets = BTreeSet::new();
+            for update in updates {
+                let target = update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` predicate update missing target_state",
+                            report_path.display()
+                        )
+                    })?;
+                seen_targets.insert(target.to_owned());
+                let expected_kind = expected_kinds.get(target).ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` has unexpected predicate target `{target}`",
+                        report_path.display()
+                    )
+                })?;
+                if update.get("expression_kind").and_then(JsonValue::as_str) != Some(*expected_kind)
+                    || update.get("value") != expected_values.get(target)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` predicate update `{target}` did not match expected kind/value",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                if update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` predicate update `{target}` is not marked read_only",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                let inputs = update
+                    .pointer("/bytes_access/inputs")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` predicate update `{target}` missing bytes_access.inputs",
+                            report_path.display()
+                        )
+                    })?;
+                if !inputs.iter().any(|input| {
+                    input.get("access_source").and_then(JsonValue::as_str)
+                        == Some("root_fixed_byte_bank")
+                        && input.get("cow_kind").and_then(JsonValue::as_str) == Some("borrowed")
+                }) || !inputs.iter().all(|input| {
+                    input.get("cow_kind").and_then(JsonValue::as_str) == Some("borrowed")
+                }) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` predicate update `{target}` did not prove borrowed fixed-bank input access",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_targets != expected_values.keys().map(|key| key.to_string()).collect() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` predicate targets were {seen_targets:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-numeric-read-after-set-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "targets_match",
+                "values_match",
+                "borrowed_numeric_reads",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str) != Some("inspect-numeric")
+                || evidence
+                    .get("numeric_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || evidence
+                    .get("expected_target_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` numeric borrowed read evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected_values = BTreeMap::from([
+                ("store.read_u16_be", json!(510)),
+                ("store.read_u16_le", json!(65025)),
+                ("store.read_i8", json!(-2)),
+            ]);
+            let expected_kinds = BTreeMap::from([
+                ("store.read_u16_be", "bytes_read_unsigned"),
+                ("store.read_u16_le", "bytes_read_unsigned"),
+                ("store.read_i8", "bytes_read_signed"),
+            ]);
+            let mut seen_targets = BTreeSet::new();
+            for update in updates {
+                let target = update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` numeric update missing target_state",
+                            report_path.display()
+                        )
+                    })?;
+                seen_targets.insert(target.to_owned());
+                let expected_kind = expected_kinds.get(target).ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` has unexpected numeric target `{target}`",
+                        report_path.display()
+                    )
+                })?;
+                if update.get("expression_kind").and_then(JsonValue::as_str) != Some(*expected_kind)
+                    || update.get("value") != expected_values.get(target)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric update `{target}` did not match expected kind/value",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                if update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                    || update
+                        .pointer("/bytes_access/access_source")
+                        .and_then(JsonValue::as_str)
+                        != Some("root_fixed_byte_bank")
+                    || update
+                        .pointer("/bytes_access/cow_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("borrowed")
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric update `{target}` did not prove borrowed fixed-bank input access",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_targets != expected_values.keys().map(|key| key.to_string()).collect() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` numeric targets were {seen_targets:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-conversions-after-set-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "targets_match",
+                "values_match",
+                "borrowed_conversion_reads",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` conversion evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str)
+                    != Some("inspect-conversions")
+                || evidence
+                    .get("conversion_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || evidence
+                    .get("expected_target_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` conversion borrowed read evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` conversion evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected_values = BTreeMap::from([
+                ("store.text", json!("AZC")),
+                ("store.hex", json!("415a43")),
+                ("store.base64", json!("QVpD")),
+            ]);
+            let expected_kinds = BTreeMap::from([
+                ("store.text", "bytes_to_text"),
+                ("store.hex", "bytes_to_hex"),
+                ("store.base64", "bytes_to_base64"),
+            ]);
+            let mut seen_targets = BTreeSet::new();
+            for update in updates {
+                let target = update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` conversion update missing target_state",
+                            report_path.display()
+                        )
+                    })?;
+                seen_targets.insert(target.to_owned());
+                let expected_kind = expected_kinds.get(target).ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` has unexpected conversion target `{target}`",
+                        report_path.display()
+                    )
+                })?;
+                if update.get("expression_kind").and_then(JsonValue::as_str) != Some(*expected_kind)
+                    || update.get("value") != expected_values.get(target)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` conversion update `{target}` did not match expected kind/value",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                if update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                    || update
+                        .pointer("/bytes_access/access_source")
+                        .and_then(JsonValue::as_str)
+                        != Some("root_fixed_byte_bank")
+                    || update
+                        .pointer("/bytes_access/cow_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("borrowed")
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` conversion update `{target}` did not prove borrowed fixed-bank input access",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_targets != expected_values.keys().map(|key| key.to_string()).collect() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` conversion targets were {seen_targets:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-numeric-write-after-set-no-copy" {
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "write_kinds_match",
+                "inspect_targets_match",
+                "values_match",
+                "borrowed_numeric_writes",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric write evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("unsigned_step_id").and_then(JsonValue::as_str)
+                    != Some("write-unsigned")
+                || evidence.get("signed_step_id").and_then(JsonValue::as_str)
+                    != Some("write-signed")
+                || evidence.get("inspect_step_id").and_then(JsonValue::as_str)
+                    != Some("inspect-written")
+                || evidence
+                    .get("write_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(2)
+                || evidence
+                    .get("expected_write_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(2)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` numeric write evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let write_updates = evidence
+                .get("write_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric write evidence missing write_updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected_patch_counts =
+                BTreeMap::from([("bytes_write_unsigned", 2u64), ("bytes_write_signed", 2u64)]);
+            let mut seen_write_kinds = BTreeSet::new();
+            for update in write_updates {
+                let kind = update
+                    .get("expression_kind")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} verify-bytes-storage-profile case `{id}` numeric write update missing expression_kind",
+                            report_path.display()
+                        )
+                    })?;
+                seen_write_kinds.insert(kind.to_owned());
+                let expected_patch_count = expected_patch_counts.get(kind).ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` has unexpected numeric write kind `{kind}`",
+                        report_path.display()
+                    )
+                })?;
+                if update.get("target_state").and_then(JsonValue::as_str) != Some("store.patched")
+                    || update
+                        .get("value")
+                        .and_then(|value| value.get("byte_len"))
+                        .and_then(JsonValue::as_u64)
+                        != Some(4)
+                    || update
+                        .pointer("/bytes_access/read_only")
+                        .and_then(JsonValue::as_bool)
+                        != Some(false)
+                    || update
+                        .pointer("/bytes_access/access_source")
+                        .and_then(JsonValue::as_str)
+                        != Some("root_fixed_byte_bank")
+                    || update
+                        .pointer("/bytes_access/cow_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("borrowed")
+                    || update
+                        .pointer("/bytes_access/mutation_kind")
+                        .and_then(JsonValue::as_str)
+                        != Some("fixed_byte_bank_patches")
+                    || update
+                        .pointer("/bytes_access/patch_count")
+                        .and_then(JsonValue::as_u64)
+                        != Some(*expected_patch_count)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric write `{kind}` did not prove borrowed fixed-bank patch mutation",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_write_kinds
+                != expected_patch_counts
+                    .keys()
+                    .map(|key| key.to_string())
+                    .collect()
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` numeric write kinds were {seen_write_kinds:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+            let inspect_updates = evidence
+                .get("inspect_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` numeric write evidence missing inspect_updates",
+                        report_path.display()
+                    )
+                })?;
+            let expected_values = BTreeMap::from([
+                ("store.hex", json!("feff1234")),
+                ("store.read_u16_be", json!(4660)),
+                ("store.read_i16_le", json!(-2)),
+            ]);
+            let expected_kinds = BTreeMap::from([
+                ("store.hex", "bytes_to_hex"),
+                ("store.read_u16_be", "bytes_read_unsigned"),
+                ("store.read_i16_le", "bytes_read_signed"),
+            ]);
+            let mut seen_targets = BTreeSet::new();
+            for update in inspect_updates {
+                let Some(target) = update.get("target_state").and_then(JsonValue::as_str) else {
+                    continue;
+                };
+                let Some(expected_value) = expected_values.get(target) else {
+                    continue;
+                };
+                seen_targets.insert(target.to_owned());
+                let expected_kind = expected_kinds.get(target).copied().ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing expected kind for `{target}`",
+                        report_path.display()
+                    )
+                })?;
+                if update.get("expression_kind").and_then(JsonValue::as_str) != Some(expected_kind)
+                    || update.get("value") != Some(expected_value)
+                {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` inspect update `{target}` did not match expected kind/value",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if seen_targets != expected_values.keys().map(|key| key.to_string()).collect() {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` inspect targets were {seen_targets:?}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "fixed-bank-file-write-after-set-no-copy" {
+            if case
+                .get("legacy_comparison_enabled")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
+                    report_path.display()
+                )
+                .into());
+            }
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "update_matches",
+                "borrowed_file_write",
+                "host_effect_matches",
+                "artifact_matches",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` file-write evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("step_id").and_then(JsonValue::as_str) != Some("write-patched-file")
+                || evidence
+                    .get("file_write_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+                || evidence
+                    .get("expected_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` file-write evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let expected_bytes = [0x01, 0x02, 0xAA, 0x04];
+            let expected_sha256 = sha256_bytes(&expected_bytes);
+            if evidence.get("expected_sha256").and_then(JsonValue::as_str)
+                != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` expected_sha256 changed",
+                    report_path.display()
+                )
+                .into());
+            }
+            let artifact_path = evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing artifact_path",
+                        report_path.display()
+                    )
+                })?;
+            let artifact_bytes = fs::read(artifact_path)?;
+            if artifact_bytes != expected_bytes {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` artifact bytes did not match patched fixed bank",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` file-write evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let update = updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` file-write evidence missing update",
+                    report_path.display()
+                )
+            })?;
+            if update.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || update.get("target_state").and_then(JsonValue::as_str)
+                    != Some("store.write_status")
+                || update.get("value").and_then(JsonValue::as_str) != Some("outputs/patched.bin")
+                || update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || update
+                    .pointer("/bytes_access/access_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("root_fixed_byte_bank")
+                || update
+                    .pointer("/bytes_access/cow_kind")
+                    .and_then(JsonValue::as_str)
+                    != Some("borrowed")
+                || update
+                    .pointer("/bytes_access/host_boundary")
+                    .and_then(JsonValue::as_str)
+                    != Some("file_write_bytes")
+                || update
+                    .pointer("/bytes_access/byte_len")
+                    .and_then(JsonValue::as_u64)
+                    != Some(4)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` file-write update did not prove borrowed fixed-bank host-boundary access",
+                    report_path.display()
+                )
+                .into());
+            }
+            let host_effect = evidence
+                .get("host_effect")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing host_effect",
+                        report_path.display()
+                    )
+                })?;
+            if host_effect.get("kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || host_effect.get("byte_len").and_then(JsonValue::as_u64) != Some(4)
+                || host_effect.get("sha256").and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+                || host_effect
+                    .get("public_inline_bytes_absent")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` host_effect did not match patched artifact",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "dynamic-file-write-source-payload-no-copy" {
+            if case
+                .get("legacy_comparison_enabled")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
+                    report_path.display()
+                )
+                .into());
+            }
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "receive_matches",
+                "update_matches",
+                "borrowed_file_write",
+                "host_effect_matches",
+                "artifact_matches",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` dynamic file-write evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("receive_step_id").and_then(JsonValue::as_str)
+                    != Some("receive-dynamic-bytes")
+                || evidence.get("write_step_id").and_then(JsonValue::as_str)
+                    != Some("write-dynamic-file")
+                || evidence
+                    .get("file_write_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+                || evidence
+                    .get("expected_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` dynamic file-write evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let expected_bytes = [0x01, 0xFE, 0x04];
+            let expected_sha256 = sha256_bytes(&expected_bytes);
+            if evidence.get("expected_sha256").and_then(JsonValue::as_str)
+                != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` expected_sha256 changed",
+                    report_path.display()
+                )
+                .into());
+            }
+            let artifact_path = evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing artifact_path",
+                        report_path.display()
+                    )
+                })?;
+            let artifact_bytes = fs::read(artifact_path)?;
+            if artifact_bytes != expected_bytes {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` artifact bytes did not match dynamic source payload",
+                    report_path.display()
+                )
+                .into());
+            }
+            let receive_updates = evidence
+                .get("receive_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing receive_updates",
+                        report_path.display()
+                    )
+                })?;
+            let receive_update = receive_updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing receive update",
+                    report_path.display()
+                )
+            })?;
+            if receive_update
+                .get("expression_kind")
+                .and_then(JsonValue::as_str)
+                != Some("source_payload")
+                || receive_update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    != Some("store.received")
+                || receive_update
+                    .get("source_payload_field")
+                    .and_then(JsonValue::as_str)
+                    != Some("Bytes")
+                || receive_update
+                    .get("value")
+                    .and_then(|value| value.get("byte_len"))
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || receive_update
+                    .get("value")
+                    .and_then(|value| value.get("digest"))
+                    .and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` receive update did not prove dynamic BYTES source payload",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` dynamic file-write evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let update = updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` dynamic file-write evidence missing update",
+                    report_path.display()
+                )
+            })?;
+            if update.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || update.get("target_state").and_then(JsonValue::as_str)
+                    != Some("store.write_status")
+                || update.get("value").and_then(JsonValue::as_str) != Some("outputs/dynamic.bin")
+                || update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || update
+                    .pointer("/bytes_access/access_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("root_bytes_state")
+                || update
+                    .pointer("/bytes_access/cow_kind")
+                    .and_then(JsonValue::as_str)
+                    != Some("borrowed")
+                || update
+                    .pointer("/bytes_access/host_boundary")
+                    .and_then(JsonValue::as_str)
+                    != Some("file_write_bytes")
+                || update
+                    .pointer("/bytes_access/byte_len")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` dynamic file-write update did not prove borrowed root-bytes host-boundary access",
+                    report_path.display()
+                )
+                .into());
+            }
+            let host_effect = evidence
+                .get("host_effect")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing host_effect",
+                        report_path.display()
+                    )
+                })?;
+            if host_effect.get("kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || host_effect.get("byte_len").and_then(JsonValue::as_u64) != Some(3)
+                || host_effect.get("sha256").and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+                || host_effect
+                    .get("public_inline_bytes_absent")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` host_effect did not match dynamic artifact",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "indexed-file-write-source-payload-no-copy" {
+            if case
+                .get("legacy_comparison_enabled")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
+                    report_path.display()
+                )
+                .into());
+            }
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "receive_matches",
+                "update_matches",
+                "borrowed_file_write",
+                "dynamic_path_matches",
+                "host_effect_matches",
+                "artifact_matches",
+                "step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` indexed file-write evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("receive_step_id").and_then(JsonValue::as_str)
+                    != Some("receive-indexed-bytes")
+                || evidence.get("write_step_id").and_then(JsonValue::as_str)
+                    != Some("write-indexed-file")
+                || evidence
+                    .get("file_write_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+                || evidence
+                    .get("expected_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` indexed file-write evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let expected_bytes = [0x01, 0xFE, 0x04];
+            let expected_sha256 = sha256_bytes(&expected_bytes);
+            if evidence.get("expected_sha256").and_then(JsonValue::as_str)
+                != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` expected_sha256 changed",
+                    report_path.display()
+                )
+                .into());
+            }
+            let artifact_path = evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing artifact_path",
+                        report_path.display()
+                    )
+                })?;
+            let artifact_bytes = fs::read(artifact_path)?;
+            if artifact_bytes != expected_bytes {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` artifact bytes did not match indexed source payload",
+                    report_path.display()
+                )
+                .into());
+            }
+            let receive_updates = evidence
+                .get("receive_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing receive_updates",
+                        report_path.display()
+                    )
+                })?;
+            let receive_update = receive_updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing receive update",
+                    report_path.display()
+                )
+            })?;
+            if receive_update
+                .get("expression_kind")
+                .and_then(JsonValue::as_str)
+                != Some("source_payload")
+                || receive_update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    != Some("row.payload")
+                || receive_update.get("field_path").and_then(JsonValue::as_str) != Some("payload")
+                || receive_update.get("key").and_then(JsonValue::as_u64) != Some(2)
+                || receive_update
+                    .get("source_payload_field")
+                    .and_then(JsonValue::as_str)
+                    != Some("Bytes")
+                || receive_update
+                    .get("value")
+                    .and_then(|value| value.get("byte_len"))
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || receive_update
+                    .get("value")
+                    .and_then(|value| value.get("digest"))
+                    .and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` receive update did not prove indexed BYTES source payload",
+                    report_path.display()
+                )
+                .into());
+            }
+            let updates = evidence
+                .get("updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` indexed file-write evidence missing updates",
+                        report_path.display()
+                    )
+                })?;
+            let update = updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` indexed file-write evidence missing update",
+                    report_path.display()
+                )
+            })?;
+            if update.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || update.get("target_state").and_then(JsonValue::as_str)
+                    != Some("row.write_status")
+                || update.get("field_path").and_then(JsonValue::as_str) != Some("write_status")
+                || update.get("key").and_then(JsonValue::as_u64) != Some(2)
+                || update.get("value").and_then(JsonValue::as_str) != Some("outputs/indexed.bin")
+                || update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || update
+                    .pointer("/bytes_access/access_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("indexed_fixed_byte_bank")
+                || update
+                    .pointer("/bytes_access/cow_kind")
+                    .and_then(JsonValue::as_str)
+                    != Some("borrowed")
+                || update
+                    .pointer("/bytes_access/host_boundary")
+                    .and_then(JsonValue::as_str)
+                    != Some("file_write_bytes")
+                || update
+                    .pointer("/bytes_access/byte_len")
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || update
+                    .pointer("/bytes_access/byte_bank_declared")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || update
+                    .pointer("/bytes_access/byte_bank_used")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || update
+                    .pointer("/bytes_access/path_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("row_field")
+                || !update
+                    .get("update_constant_id")
+                    .is_none_or(JsonValue::is_null)
+                || update
+                    .pointer("/update_constant_value/path")
+                    .and_then(JsonValue::as_str)
+                    != Some("outputs/indexed.bin")
+                || update
+                    .pointer("/update_constant_value/path_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("row_field")
+                || update
+                    .pointer("/update_constant_value/path_field")
+                    .and_then(JsonValue::as_str)
+                    != Some("row.path_state")
+                || update
+                    .pointer("/update_constant_value/path_field_id")
+                    .and_then(JsonValue::as_u64)
+                    .is_none()
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` indexed file-write update did not prove dynamic-path borrowed indexed row host-boundary access",
+                    report_path.display()
+                )
+                .into());
+            }
+            verify_storage_profile_indexed_row_bytes_summary(
+                report_path,
+                id,
+                update,
+                "payload",
+                expected_sha256.as_str(),
+                "update row_fields.payload",
+            )?;
+            let host_effect = evidence
+                .get("host_effect")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing host_effect",
+                        report_path.display()
+                    )
+                })?;
+            if host_effect.get("kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+                || host_effect.get("byte_len").and_then(JsonValue::as_u64) != Some(3)
+                || host_effect.get("sha256").and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+                || host_effect
+                    .get("public_inline_bytes_absent")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` host_effect did not match indexed artifact",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if id == "indexed-file-read-row-field-path-no-copy" {
+            if case
+                .get("legacy_comparison_enabled")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/read_bytes proof",
+                    report_path.display()
+                )
+                .into());
+            }
+            let evidence = case
+                .get("borrowed_read_evidence")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing borrowed_read_evidence",
+                        report_path.display()
+                    )
+                })?;
+            for key in [
+                "read_matches",
+                "dynamic_path_matches",
+                "borrowed_indexed_read",
+                "read_step_bytes_storage_no_copy",
+                "inspect_step_bytes_storage_no_copy",
+                "step_zero_byte_counters",
+            ] {
+                if evidence.get(key).and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(format!(
+                        "{} verify-bytes-storage-profile case `{id}` indexed file-read evidence `{key}` is not true",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if evidence.get("status").and_then(JsonValue::as_str) != Some("pass")
+                || evidence.get("read_step_id").and_then(JsonValue::as_str)
+                    != Some("read-indexed-file")
+                || evidence.get("inspect_step_id").and_then(JsonValue::as_str)
+                    != Some("inspect-indexed-read")
+                || evidence
+                    .get("file_read_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+                || evidence
+                    .get("bytes_get_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+                || evidence
+                    .get("expected_update_count")
+                    .and_then(JsonValue::as_u64)
+                    != Some(1)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` indexed file-read evidence has wrong shape",
+                    report_path.display()
+                )
+                .into());
+            }
+            let expected_bytes = [0x01, 0xFE, 0x04];
+            let expected_sha256 = sha256_bytes(&expected_bytes);
+            if evidence.get("expected_sha256").and_then(JsonValue::as_str)
+                != Some(expected_sha256.as_str())
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` expected_sha256 changed",
+                    report_path.display()
+                )
+                .into());
+            }
+            let read_updates = evidence
+                .get("read_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing read_updates",
+                        report_path.display()
+                    )
+                })?;
+            let read_update = read_updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing read update",
+                    report_path.display()
+                )
+            })?;
+            if read_update
+                .get("expression_kind")
+                .and_then(JsonValue::as_str)
+                != Some("file_read_bytes")
+                || read_update.get("target_state").and_then(JsonValue::as_str)
+                    != Some("row.file_bytes")
+                || read_update.get("field_path").and_then(JsonValue::as_str) != Some("file_bytes")
+                || read_update.get("key").and_then(JsonValue::as_u64) != Some(2)
+                || read_update
+                    .get("value")
+                    .and_then(|value| value.get("byte_len"))
+                    .and_then(JsonValue::as_u64)
+                    != Some(3)
+                || read_update
+                    .get("value")
+                    .and_then(|value| value.get("digest"))
+                    .and_then(JsonValue::as_str)
+                    != Some(expected_sha256.as_str())
+                || !read_update
+                    .get("update_constant_id")
+                    .is_none_or(JsonValue::is_null)
+                || read_update
+                    .pointer("/update_constant_value/path")
+                    .and_then(JsonValue::as_str)
+                    != Some("inputs/indexed-read.bin")
+                || read_update
+                    .pointer("/update_constant_value/path_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("row_field")
+                || read_update
+                    .pointer("/update_constant_value/path_field")
+                    .and_then(JsonValue::as_str)
+                    != Some("row.path_state")
+                || read_update
+                    .pointer("/update_constant_value/path_field_id")
+                    .and_then(JsonValue::as_u64)
+                    .is_none()
+                || read_update
+                    .pointer("/bytes_access/host_boundary")
+                    .and_then(JsonValue::as_str)
+                    != Some("file_read_bytes")
+                || read_update
+                    .pointer("/bytes_access/path_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("row_field")
+                || read_update
+                    .pointer("/bytes_access/byte_bank_declared")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` indexed file-read update did not prove dynamic row-field host-boundary read",
+                    report_path.display()
+                )
+                .into());
+            }
+            let inspect_updates = evidence
+                .get("inspect_updates")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-storage-profile case `{id}` missing inspect_updates",
+                        report_path.display()
+                    )
+                })?;
+            let inspect_update = inspect_updates.first().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-storage-profile case `{id}` missing inspect update",
+                    report_path.display()
+                )
+            })?;
+            if inspect_update
+                .get("expression_kind")
+                .and_then(JsonValue::as_str)
+                != Some("bytes_get")
+                || inspect_update
+                    .get("target_state")
+                    .and_then(JsonValue::as_str)
+                    != Some("row.first_byte")
+                || inspect_update.get("field_path").and_then(JsonValue::as_str)
+                    != Some("first_byte")
+                || inspect_update.get("key").and_then(JsonValue::as_u64) != Some(2)
+                || inspect_update.get("value").and_then(JsonValue::as_i64) != Some(1)
+                || inspect_update
+                    .pointer("/bytes_access/read_only")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || inspect_update
+                    .pointer("/bytes_access/access_source")
+                    .and_then(JsonValue::as_str)
+                    != Some("indexed_fixed_byte_bank")
+                || inspect_update
+                    .pointer("/bytes_access/cow_kind")
+                    .and_then(JsonValue::as_str)
+                    != Some("borrowed")
+                || inspect_update
+                    .pointer("/bytes_access/byte_bank_declared")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+                || inspect_update
+                    .pointer("/bytes_access/byte_bank_used")
+                    .and_then(JsonValue::as_bool)
+                    != Some(true)
+            {
+                return Err(format!(
+                    "{} verify-bytes-storage-profile case `{id}` inspect update did not prove borrowed indexed byte-bank read",
+                    report_path.display()
+                )
+                .into());
+            }
+            verify_storage_profile_indexed_row_bytes_summary(
+                report_path,
+                id,
+                inspect_update,
+                "file_bytes",
+                expected_sha256.as_str(),
+                "inspect update row_fields.file_bytes",
+            )?;
+        }
+    }
+    if no_copy_seen != expected_no_copy || measured_copy_seen != expected_measured_copy {
+        return Err(format!(
+            "{} verify-bytes-storage-profile expected no-copy cases {:?} and measured-copy cases {:?}, got no-copy {:?} and measured-copy {:?}",
+            report_path.display(),
+            expected_no_copy,
+            expected_measured_copy,
+            no_copy_seen,
+            measured_copy_seen
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_storage_profile_indexed_row_bytes_summary(
+    report_path: &Path,
+    id: &str,
+    update: &JsonValue,
+    field_name: &str,
+    expected_sha256: &str,
+    context: &str,
+) -> RuntimeResult<()> {
+    let row_field = update
+        .get("row_fields")
+        .and_then(JsonValue::as_object)
+        .and_then(|fields| fields.get(field_name))
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-storage-profile case `{id}` {context} missing BYTES summary",
+                report_path.display()
+            )
+        })?;
+    if row_field.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES")
+        || row_field.get("byte_len").and_then(JsonValue::as_u64) != Some(3)
+        || row_field.get("digest").and_then(JsonValue::as_str) != Some(expected_sha256)
+        || row_field.get("storage").and_then(JsonValue::as_str) != Some("inline")
+    {
+        return Err(format!(
+            "{} verify-bytes-storage-profile case `{id}` {context} public summary does not match indexed private BYTES state",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_byte_bank_layout_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    verify_report_mode(report, report_path, "proof")?;
+    let layout = report
+        .get("bytes_byte_bank_layout")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-byte-bank-layout missing bytes_byte_bank_layout object",
+                report_path.display()
+            )
+        })?;
+    if layout.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!(
+            "{} verify-bytes-byte-bank-layout status is not pass",
+            report_path.display()
+        )
+        .into());
+    }
+    if layout
+        .get("fixed_bytes_scalars_require_byte_banks")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-byte-bank-layout does not require fixed BYTES byte banks",
+            report_path.display()
+        )
+        .into());
+    }
+    if layout
+        .get("dynamic_bytes_scalars_must_not_declare_fixed_banks")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-byte-bank-layout does not reject dynamic BYTES fixed banks",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = layout
+        .get("cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-byte-bank-layout cases is missing",
+                report_path.display()
+            )
+        })?;
+    if layout.get("case_count").and_then(JsonValue::as_u64) != Some(cases.len() as u64) {
+        return Err(format!(
+            "{} verify-bytes-byte-bank-layout case_count does not match cases length",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_cases = [
+        "root-fixed-bytes-bank",
+        "dynamic-bytes-no-fixed-bank",
+        "indexed-fixed-bytes-bank",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    let mut seen_cases = BTreeSet::new();
+    for case in cases {
+        let id = case.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+            format!(
+                "{} verify-bytes-byte-bank-layout case missing id",
+                report_path.display()
+            )
+        })?;
+        seen_cases.insert(id.to_owned());
+        let expected_source = match id {
+            "root-fixed-bytes-bank" => "examples/bytes_set_plan_ops.bn",
+            "dynamic-bytes-no-fixed-bank" => "examples/bytes_source_payload_plan_ops.bn",
+            "indexed-fixed-bytes-bank" => "examples/bytes_indexed_source_payload_plan_ops.bn",
+            other => {
+                return Err(format!(
+                    "{} verify-bytes-byte-bank-layout unexpected case `{other}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        };
+        if case.get("source_path").and_then(JsonValue::as_str) != Some(expected_source) {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` has unexpected source_path",
+                report_path.display()
+            )
+            .into());
+        }
+        let plan_hash = case
+            .get("plan_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing plan_hash",
+                    report_path.display()
+                )
+            })?;
+        if plan_hash.len() != 64 || !plan_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` has invalid plan_hash",
+                report_path.display()
+            )
+            .into());
+        }
+        if case.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+        if case.get("verification_status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` plan verification did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+        let fixed = case
+            .get("fixed_bytes_scalar_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing fixed count",
+                    report_path.display()
+                )
+            })?;
+        let dynamic = case
+            .get("dynamic_bytes_scalar_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing dynamic count",
+                    report_path.display()
+                )
+            })?;
+        let banks = case
+            .get("byte_bank_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing bank count",
+                    report_path.display()
+                )
+            })?;
+        let root_count = case
+            .get("root_byte_bank_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing root bank count",
+                    report_path.display()
+                )
+            })?;
+        let indexed_count = case
+            .get("indexed_byte_bank_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing indexed bank count",
+                    report_path.display()
+                )
+            })?;
+        let bank_payload = case
+            .get("byte_banks")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` missing byte_banks payload",
+                    report_path.display()
+                )
+            })?;
+        if banks != bank_payload.len() as u64 {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` byte_bank_count does not match payload length",
+                report_path.display()
+            )
+            .into());
+        }
+        let mut actual_root_count = 0u64;
+        let mut actual_indexed_count = 0u64;
+        let mut actual_fixed_lens = Vec::new();
+        for bank in bank_payload {
+            for required_key in ["id", "state_storage_id", "state_id", "fixed_len", "indexed"] {
+                if bank.get(required_key).is_none() {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout case `{id}` bank missing `{required_key}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            let fixed_len = bank
+                .get("fixed_len")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-byte-bank-layout case `{id}` bank has invalid fixed_len",
+                        report_path.display()
+                    )
+                })?;
+            if fixed_len == 0 {
+                return Err(format!(
+                    "{} verify-bytes-byte-bank-layout case `{id}` bank has zero fixed_len",
+                    report_path.display()
+                )
+                .into());
+            }
+            for numeric_key in ["id", "state_storage_id", "state_id"] {
+                if bank.get(numeric_key).and_then(JsonValue::as_u64).is_none() {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout case `{id}` bank has invalid `{numeric_key}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            let indexed = bank
+                .get("indexed")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "{} verify-bytes-byte-bank-layout case `{id}` bank has invalid indexed flag",
+                        report_path.display()
+                    )
+                })?;
+            if indexed {
+                actual_indexed_count += 1;
+            } else {
+                actual_root_count += 1;
+            }
+            actual_fixed_lens.push(fixed_len);
+        }
+        if actual_root_count != root_count || actual_indexed_count != indexed_count {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` root/indexed counts do not match bank payload",
+                report_path.display()
+            )
+            .into());
+        }
+        actual_fixed_lens.sort_unstable();
+        if case.get("fixed_bank_coverage").and_then(JsonValue::as_bool) != Some(true)
+            || fixed != banks
+        {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` fixed byte bank coverage failed",
+                report_path.display()
+            )
+            .into());
+        }
+        if case.get("no_dynamic_banks").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-byte-bank-layout case `{id}` includes a dynamic BYTES bank",
+                report_path.display()
+            )
+            .into());
+        }
+        match id {
+            "root-fixed-bytes-bank" => {
+                if fixed != 4
+                    || dynamic != 0
+                    || banks != 4
+                    || root_count != 4
+                    || indexed_count != 0
+                    || actual_fixed_lens != [2, 4, 4, 6]
+                {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout root case payload does not match expected fixed-byte banks",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                for bank in bank_payload {
+                    if bank.get("capacity").and_then(JsonValue::as_u64) != Some(1) {
+                        return Err(format!(
+                            "{} verify-bytes-byte-bank-layout root case bank does not have capacity=1",
+                            report_path.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+            "dynamic-bytes-no-fixed-bank" => {
+                if fixed != 0 || dynamic != 1 || banks != 0 || root_count != 0 || indexed_count != 0
+                {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout dynamic case should have dynamic BYTES and zero fixed banks",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            "indexed-fixed-bytes-bank" => {
+                if fixed != 1
+                    || dynamic != 0
+                    || banks != 1
+                    || root_count != 0
+                    || indexed_count != 1
+                    || actual_fixed_lens != [3]
+                {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout indexed case payload does not match expected fixed-byte bank",
+                        report_path.display()
+                    )
+                    .into());
+                }
+                let bank = &bank_payload[0];
+                if bank.get("scope_id").and_then(JsonValue::as_u64).is_none() {
+                    return Err(format!(
+                        "{} verify-bytes-byte-bank-layout indexed case bank is missing scope_id",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            _ => unreachable!("unexpected byte-bank layout case already rejected"),
+        }
+    }
+    if seen_cases != expected_cases {
+        return Err(format!(
+            "{} verify-bytes-byte-bank-layout expected cases {:?}, got {:?}",
+            report_path.display(),
+            expected_cases,
+            seen_cases
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachinePlanChildReport] {
+    &[
+        ExpectedBytesMachinePlanChildReport {
+            label: "phase0-baseline",
+            path: "target/reports/bytes-plan/phase0-baseline.json",
+            command: "bytes-plan-phase0-baseline",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-initial-dump-plan",
+            path: "target/reports/bytes-plan/bytes-initial-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-initial-run-plan",
+            path: "target/reports/bytes-plan/bytes-initial-run-plan.json",
+            command: "run-plan",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "root-scalar-plan-ops-dump-plan",
+            path: "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "root-scalar-plan-ops-scenario",
+            path: "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-length-scenario",
+            path: "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-is-empty-scenario",
+            path: "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-get-scenario",
+            path: "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-equal-scenario",
+            path: "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-concat-scenario",
+            path: "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-concat-chain-scenario",
+            path: "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-set-scenario",
+            path: "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-text-conversion-scenario",
+            path: "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-slice-take-drop-scenario",
+            path: "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-search-scenario",
+            path: "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-encoding-scenario",
+            path: "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-numeric-scenario",
+            path: "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-source-payload-dump-plan",
+            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-source-payload-route",
+            path: "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-source-payload-large-route",
+            path: "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-source-payload-scenario",
+            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-indexed-source-payload-dump-plan",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-indexed-source-payload-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-negative",
+            path: "target/reports/bytes-plan/bytes-negative.json",
+            command: "verify-bytes-negative",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-machine-plan-adversarial",
+            path: "target/reports/bytes-plan/bytes-machine-plan-adversarial.json",
+            command: "verify-bytes-machine-plan-adversarial",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-release-benchmark-reproduction",
+            path: "target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json",
+            command: "verify-bytes-release-benchmark-reproduction",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-file-read-plan",
+            path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            command: "verify-bytes-file-read-plan",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-file-write-plan",
+            path: "target/reports/bytes-plan/bytes-file-write-plan.json",
+            command: "verify-bytes-file-write-plan",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-storage-profile",
+            path: "target/reports/bytes-plan/bytes-storage-profile.json",
+            command: "verify-bytes-storage-profile",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-byte-bank-layout",
+            path: "target/reports/bytes-plan/bytes-byte-bank-layout.json",
+            command: "verify-bytes-byte-bank-layout",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "build-bytes-boundary",
+            path: "target/reports/bytes-plan/build-bytes-boundary.json",
+            command: "verify-build-bytes-boundary",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-dump-plan",
+            path: "target/reports/bytes-plan/todomvc-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-submit",
+            path: "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-toggle",
+            path: "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-toggle-all",
+            path: "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-dynamic-delete",
+            path: "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-clear-completed",
+            path: "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-edit-commit",
+            path: "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-edit-cancel",
+            path: "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-edit-blur",
+            path: "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-new-text-route",
+            path: "target/reports/bytes-plan/todomvc-new-text-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-filter-active-route",
+            path: "target/reports/bytes-plan/todomvc-filter-active-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-root-scalar",
+            path: "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "todomvc-full-engine-compare",
+            path: "target/reports/bytes-plan/todomvc-full-engine-compare.json",
+            command: "run-plan-scenario-events",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "cells-dump-plan",
+            path: "target/reports/bytes-plan/cells-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "cells-full-engine-compare",
+            path: "target/reports/bytes-plan/cells-plan-compare.json",
+            command: "run-plan-scenario-events",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "cells-ascii-formula",
+            path: "target/reports/bytes-plan/cells-ascii-formula-run.json",
+            command: "semantic",
+            measurement_mode: "proof",
+        },
+    ]
+}
+
+fn verify_bytes_machine_plan_all_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    if report.get("aggregate_scope").and_then(JsonValue::as_str)
+        != Some("bytes-machine-plan-current-slices")
+    {
+        return Err(format!(
+            "{} has invalid aggregate_scope for BYTES/MachinePlan aggregate",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("check_existing").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} BYTES/MachinePlan aggregate did not run with --check-existing",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("aggregate_checks_pass")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} BYTES/MachinePlan aggregate did not record passing checks",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_children = expected_bytes_machine_plan_child_reports();
+    let aggregate_git_commit = report
+        .get("git_commit")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing git_commit", report_path.display()))?;
+    let required_count = report
+        .get("required_report_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing required_report_count", report_path.display()))?;
+    let checked_count = report
+        .get("checked_report_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing checked_report_count", report_path.display()))?;
+    if required_count != expected_children.len() as u64 || checked_count != required_count {
+        return Err(format!(
+            "{} checked_report_count {checked_count} does not match required_report_count {required_count}",
+            report_path.display()
+        )
+        .into());
+    }
+    let child_reports = report
+        .get("child_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing child_reports", report_path.display()))?;
+    if child_reports.len() as u64 != required_count {
+        return Err(format!(
+            "{} child_reports length {} does not match required_report_count {required_count}",
+            report_path.display(),
+            child_reports.len()
+        )
+        .into());
+    }
+    let artifacts = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing artifact_sha256s", report_path.display()))?;
+    let mut artifact_hashes_by_path = BTreeMap::new();
+    for artifact in artifacts {
+        let path = artifact
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} aggregate artifact entry missing path",
+                    report_path.display()
+                )
+            })?;
+        let sha256 = artifact
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} aggregate artifact entry `{path}` missing sha256",
+                    report_path.display()
+                )
+            })?;
+        artifact_hashes_by_path.insert(path, sha256);
+    }
+    let mut labels = BTreeSet::new();
+    let mut proof_count = 0u64;
+    let mut diagnostic_count = 0u64;
+    for (index, child) in child_reports.iter().enumerate() {
+        let label = child
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child_reports[{index}] missing label",
+                    report_path.display()
+                )
+            })?;
+        if !labels.insert(label.to_owned()) {
+            return Err(format!(
+                "{} duplicate child report label `{label}`",
+                report_path.display()
+            )
+            .into());
+        }
+        let expected_child = expected_children
+            .iter()
+            .find(|expected| expected.label == label)
+            .ok_or_else(|| {
+                format!(
+                    "{} unexpected child report label `{label}`",
+                    report_path.display()
+                )
+            })?;
+        let path = child
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child_reports[{index}] missing path",
+                    report_path.display()
+                )
+            })?;
+        if path != expected_child.path {
+            return Err(format!(
+                "{} child report `{label}` path `{path}` does not match expected `{}`",
+                report_path.display(),
+                expected_child.path
+            )
+            .into());
+        }
+        let sha256 = child
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child_reports[{index}] missing sha256",
+                    report_path.display()
+                )
+            })?;
+        if !is_sha256_hex(sha256) {
+            return Err(format!(
+                "{} child report `{label}` has non-SHA256 hash `{sha256}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if child.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} child report `{label}` did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+        if child.get("command").and_then(JsonValue::as_str) != Some(expected_child.command) {
+            return Err(format!(
+                "{} child report `{label}` command does not match expected `{}`",
+                report_path.display(),
+                expected_child.command
+            )
+            .into());
+        }
+        let mode = child
+            .get("measurement_mode")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child report `{label}` missing measurement_mode",
+                    report_path.display()
+                )
+            })?;
+        if mode != expected_child.measurement_mode {
+            return Err(format!(
+                "{} child report `{label}` measurement_mode `{mode}` does not match expected `{}`",
+                report_path.display(),
+                expected_child.measurement_mode
+            )
+            .into());
+        }
+        match mode {
+            "proof" => proof_count += 1,
+            "diagnostic" => diagnostic_count += 1,
+            other => {
+                return Err(format!(
+                    "{} child report `{label}` has invalid measurement_mode `{other}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        let child_git_commit = child
+            .get("git_commit")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child report `{label}` missing `git_commit`",
+                    report_path.display()
+                )
+            })?;
+        if child_git_commit != aggregate_git_commit {
+            return Err(format!(
+                "{} child report `{label}` git_commit `{child_git_commit}` does not match aggregate `{aggregate_git_commit}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if child.get("schema_valid").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} child report `{label}` was not schema-valid",
+                report_path.display()
+            )
+            .into());
+        }
+        if child
+            .get("artifact_hashes_fresh")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "{} child report `{label}` had stale artifact hashes",
+                report_path.display()
+            )
+            .into());
+        }
+        let Some(bound_sha256) = artifact_hashes_by_path.get(path) else {
+            return Err(format!(
+                "{} child report `{label}` is not bound in aggregate artifact hashes",
+                report_path.display()
+            )
+            .into());
+        };
+        if *bound_sha256 != sha256 {
+            return Err(format!(
+                "{} child report `{label}` sha256 does not match aggregate artifact binding",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let expected_labels = expected_children
+        .iter()
+        .map(|expected| expected.label.to_owned())
+        .collect::<BTreeSet<_>>();
+    if labels != expected_labels {
+        return Err(format!(
+            "{} child report labels do not match exact expected set",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("proof_report_count").and_then(JsonValue::as_u64) != Some(proof_count) {
+        return Err(format!(
+            "{} proof_report_count does not match child reports",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("diagnostic_report_count")
+        .and_then(JsonValue::as_u64)
+        != Some(diagnostic_count)
+    {
+        return Err(format!(
+            "{} diagnostic_report_count does not match child reports",
+            report_path.display()
+        )
+        .into());
+    }
+    let plan_executor_count = report
+        .get("plan_executor_report_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing plan_executor_report_count",
+                report_path.display()
+            )
+        })?;
+    let no_fallback_count = report
+        .get("no_fallback_plan_executor_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing no_fallback_plan_executor_count",
+                report_path.display()
+            )
+        })?;
+    if plan_executor_count == 0 || no_fallback_count != plan_executor_count {
+        return Err(format!(
+            "{} no-fallback plan executor count {no_fallback_count} does not match plan executor report count {plan_executor_count}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_write_plan_report_inner(
+    report: &JsonValue,
+    report_path: &Path,
+    verify_negative_artifacts: bool,
+) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "selected_step_ids",
+        "state_summary",
+        "semantic_delta_signatures",
+        "semantic_deltas",
+        "legacy_comparison",
+        "file_write_summary",
+        "dynamic_path_file_write_summary",
+        "plan_executor",
+        "binary_path",
+        "live_negative_case_count",
+        "live_negative_cases",
+        "fabricated_plan_negative_case_count",
+        "fabricated_plan_negative_cases",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan plan_hash does not match source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("program_hash") != report.get("source_hash") {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan program_hash must match source_hash",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_graph_node_count = compile_report_ir_graph_node_count(report, report_path)?;
+    if report.get("graph_node_count").and_then(JsonValue::as_u64)
+        != Some(expected_graph_node_count as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan graph_node_count does not match source-derived IR",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan requires a verified typed-lowering-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_write_ops = source_plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let file_write_op_count = file_write_ops.len();
+    if file_write_op_count != 1 {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan expected exactly one FileWriteBytes op, found {file_write_op_count}",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_write_op = file_write_ops[0];
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &file_write_op.kind else {
+        unreachable!("file_write_op filter only returns update branches");
+    };
+    let [
+        boon_plan::ValueRef::State(bytes_input_state),
+        boon_plan::ValueRef::Constant(path_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan source FileWriteBytes op does not have bytes-state plus path-constant operands",
+            report_path.display()
+        )
+        .into());
+    };
+    let plan_rel_path = source_plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *path_constant_id)
+        .and_then(|constant| match &constant.value {
+            boon_plan::PlanConstantValue::Text { value } => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan source FileWriteBytes path constant is missing or non-TEXT",
+                report_path.display()
+            )
+        })?;
+    if !file_read_path_is_safe_relative(plan_rel_path) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan source FileWriteBytes path is not safe relative",
+            report_path.display()
+        )
+        .into());
+    }
+    let input_slot = source_plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == *bytes_input_state)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan input bytes state has no storage slot",
+                report_path.display()
+            )
+        })?;
+    if !matches!(
+        input_slot.value_type,
+        boon_plan::PlanValueType::Bytes { .. }
+    ) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan input operand is not BYTES storage",
+            report_path.display()
+        )
+        .into());
+    }
+    let Some(boon_plan::ValueRef::State(file_write_output_state)) = file_write_op.output else {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan source FileWriteBytes op has no state output",
+            report_path.display()
+        )
+        .into());
+    };
+    let output_slot = source_plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == file_write_output_state)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan output state has no storage slot",
+                report_path.display()
+            )
+        })?;
+    if !matches!(output_slot.value_type, boon_plan::PlanValueType::Text) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan output state is not TEXT storage",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let scenario_path = report
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing scenario_path", report_path.display()))?;
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    let source_path = report
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing source_path", report_path.display()))?;
+    if scenario.source.as_deref() != Some(source_path) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan scenario source does not match report source_path",
+            report_path.display()
+        )
+        .into());
+    }
+    let selected_step_ids = report
+        .get("selected_step_ids")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} selected_step_ids is not an array",
+                report_path.display()
+            )
+        })?;
+    let selected_step_ids = selected_step_ids
+        .iter()
+        .map(|step| {
+            step.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "{} selected_step_ids contains a non-string value",
+                    report_path.display()
+                )
+                .into()
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    if selected_step_ids != ["write-file-bytes".to_owned()] {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan selected_step_ids changed",
+            report_path.display()
+        )
+        .into());
+    }
+    let Some(step) = scenario
+        .step
+        .iter()
+        .find(|step| step.id == "write-file-bytes")
+    else {
+        return Err(format!(
+            "{} scenario is missing selected write step",
+            report_path.display()
+        )
+        .into());
+    };
+    if step.expected_source_event.is_none() {
+        return Err(format!(
+            "{} selected write step has no expected_source_event",
+            report_path.display()
+        )
+        .into());
+    }
+    if step
+        .expected_source_event
+        .as_ref()
+        .and_then(|event| toml_string_ref(event, "source"))
+        != Some("store.write")
+    {
+        return Err(format!(
+            "{} selected write step expected_source_event.source is not store.write",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let summary = report
+        .get("file_write_summary")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} file_write_summary is not an object",
+                report_path.display()
+            )
+        })?;
+    let rel_path = summary
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_write_summary.path is not a string",
+                report_path.display()
+            )
+        })?;
+    if !file_read_path_is_safe_relative(rel_path) || rel_path != plan_rel_path {
+        return Err(format!(
+            "{} file_write_summary.path does not match source-derived safe FileWriteBytes path",
+            report_path.display()
+        )
+        .into());
+    }
+    let host_root = summary
+        .get("host_root")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_write_summary.host_root missing",
+                report_path.display()
+            )
+        })?;
+    let expected_host_root = Path::new(source_path)
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if host_root != expected_host_root {
+        return Err(format!(
+            "{} file_write_summary.host_root does not match source parent directory",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifact_path = summary
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_write_summary.artifact_path missing",
+                report_path.display()
+            )
+        })?;
+    let expected_artifact_path = Path::new(host_root).join(rel_path);
+    if expected_artifact_path != Path::new(artifact_path) {
+        return Err(format!(
+            "{} file_write_summary artifact_path does not match host_root/path",
+            report_path.display()
+        )
+        .into());
+    }
+    let bytes = fs::read(artifact_path)?;
+    let expected_len = bytes.len() as u64;
+    let expected_sha = sha256_bytes(&bytes);
+    let expected_first = bytes.first().copied().unwrap_or_default() as u64;
+    let expected_last = bytes.last().copied().unwrap_or_default() as u64;
+    if summary.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || summary.get("sha256").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || summary.get("first_byte").and_then(JsonValue::as_u64) != Some(expected_first)
+        || summary.get("last_byte").and_then(JsonValue::as_u64) != Some(expected_last)
+        || summary.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || summary.get("mode").and_then(JsonValue::as_str)
+            != Some("typed-machine-plan-host-file-write-v1")
+        || summary.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+        || summary.get("write_mode").and_then(JsonValue::as_str) != Some("create_or_truncate")
+        || summary
+            .get("verified_after_write")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || summary
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{} file_write_summary does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+
+    verify_dynamic_path_file_write_summary(report, report_path)?;
+
+    if json_contains_key(report, "inline_bytes") {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan must not expose inline byte payloads",
+            report_path.display()
+        )
+        .into());
+    }
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} legacy_comparison is not an object",
+                report_path.display()
+            )
+        })?;
+    if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
+        || legacy.get("passed").and_then(JsonValue::as_bool) != Some(false)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan must keep legacy comparison disabled for this host-boundary proof",
+            report_path.display()
+        )
+        .into());
+    }
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} plan_executor is not an object", report_path.display()))?;
+    if executor.get("executor").and_then(JsonValue::as_str)
+        != Some("cpu-plan-root-list-scenario-v1")
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan executor is not cpu-plan-root-list-scenario-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if executor
+        .get("selected_step_count")
+        .and_then(JsonValue::as_u64)
+        != Some(1)
+        || executor
+            .get("executed_update_branch_count")
+            .and_then(JsonValue::as_u64)
+            != Some(1)
+        || executor.get("state_summary") != report.get("state_summary")
+        || executor.get("semantic_delta_signatures") != report.get("semantic_delta_signatures")
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan executor summary does not match report",
+            report_path.display()
+        )
+        .into());
+    }
+    let per_step = executor
+        .get("per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} plan_executor.per_step is not an array",
+                report_path.display()
+            )
+        })?;
+    if per_step.len() != 1 {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan expected one executor step",
+            report_path.display()
+        )
+        .into());
+    }
+    let write_update = report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or_else(|| format!("{} missing file-write update", report_path.display()))?;
+    let host_effect = write_update
+        .get("host_effect")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing file-write host_effect", report_path.display()))?;
+    let output_label = plan_state_label(&source_plan, file_write_output_state.0);
+    if write_update
+        .get("expression_kind")
+        .and_then(JsonValue::as_str)
+        != Some("file_write_bytes")
+        || per_step[0].get("step_id").and_then(JsonValue::as_str) != Some("write-file-bytes")
+        || per_step[0].get("source").and_then(JsonValue::as_str) != Some("store.write")
+        || per_step[0].get("source_id").and_then(JsonValue::as_u64)
+            != plan_source_id_for_label(&source_plan, "store.write").map(|id| id as u64)
+        || write_update.get("source_id").and_then(JsonValue::as_u64)
+            != plan_source_id_for_label(&source_plan, "store.write").map(|id| id as u64)
+        || write_update.get("update_op_id").and_then(JsonValue::as_u64)
+            != Some(file_write_op.id.0 as u64)
+        || write_update
+            .get("candidate_update_op_ids")
+            .and_then(JsonValue::as_array)
+            != Some(&vec![json!(file_write_op.id.0)])
+        || write_update.get("target_state").and_then(JsonValue::as_str)
+            != Some(output_label.as_str())
+        || write_update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            != Some(rel_path)
+        || write_update.get("value").and_then(JsonValue::as_str) != Some(rel_path)
+        || report
+            .pointer(&format!(
+                "/state_summary/{}",
+                output_label.replace('~', "~0").replace('/', "~1")
+            ))
+            .and_then(JsonValue::as_str)
+            != Some(rel_path)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan file-write update does not match source plan",
+            report_path.display()
+        )
+        .into());
+    }
+    if write_update
+        .pointer("/bytes_access/read_only")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+        || write_update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            != Some("root_bytes_state")
+        || write_update
+            .pointer("/bytes_access/cow_kind")
+            .and_then(JsonValue::as_str)
+            != Some("borrowed")
+        || write_update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            != Some("file_write_bytes")
+        || write_update
+            .pointer("/bytes_access/byte_len")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_len)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan file-write update did not prove explicit BYTES access for host boundary",
+            report_path.display()
+        )
+        .into());
+    }
+    if executor
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+        || [
+            "copy_from_slice_bytes",
+            "vec_clone_bytes",
+            "vec_alloc_bytes",
+            "zero_fill_bytes",
+        ]
+        .iter()
+        .any(|key| {
+            executor
+                .get("bytes_storage_counters")
+                .and_then(|counters| counters.get(*key))
+                .and_then(JsonValue::as_u64)
+                != Some(0)
+        })
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan file-write path did not prove zero runtime BYTES storage copy counters",
+            report_path.display()
+        )
+        .into());
+    }
+    let host_artifact_path = host_effect
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} host_effect.artifact_path missing",
+                report_path.display()
+            )
+        })?;
+    let canonical_artifact = Path::new(artifact_path).canonicalize()?;
+    let canonical_host_artifact = Path::new(host_artifact_path).canonicalize()?;
+    if host_effect.get("kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+        || host_effect.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || host_effect.get("mode").and_then(JsonValue::as_str)
+            != Some("typed-machine-plan-host-file-write-v1")
+        || host_effect.get("path").and_then(JsonValue::as_str) != Some(rel_path)
+        || canonical_host_artifact != canonical_artifact
+        || host_effect.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || host_effect.get("sha256").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || host_effect.get("first_byte").and_then(JsonValue::as_u64) != Some(expected_first)
+        || host_effect.get("last_byte").and_then(JsonValue::as_u64) != Some(expected_last)
+        || host_effect.get("write_mode").and_then(JsonValue::as_str) != Some("create_or_truncate")
+        || host_effect
+            .get("verified_after_write")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan host_effect does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    let flattened_semantic_deltas = per_step
+        .iter()
+        .flat_map(|step| {
+            step.get("semantic_deltas")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if report.get("semantic_deltas") != Some(&JsonValue::Array(flattened_semantic_deltas)) {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan semantic_deltas do not match executor per-step deltas",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan per_step_pass_fail is missing",
+                report_path.display()
+            )
+        })?;
+    verify_bytes_file_write_live_negative_evidence(report, report_path, checks)?;
+    verify_bytes_file_write_fabricated_plan_negative_evidence(
+        report,
+        report_path,
+        checks,
+        &source_plan,
+    )?;
+    verify_bytes_file_write_negative_evidence(report, report_path, verify_negative_artifacts)?;
+    Ok(())
+}
+
+struct ExpectedBytesFileWriteLiveNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    expected_error_contains: &'static str,
+    target_kind: Option<&'static str>,
+}
+
+fn verify_dynamic_path_file_write_summary(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let summary = report
+        .get("dynamic_path_file_write_summary")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_write_summary is not an object",
+                report_path.display()
+            )
+        })?;
+    let source_path = summary
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_write_summary.source_path missing",
+                report_path.display()
+            )
+        })?;
+    let scenario_path = summary
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_write_summary.scenario_path missing",
+                report_path.display()
+            )
+        })?;
+    let source = fs::read_to_string(source_path)?;
+    let parsed = boon_parser::parse_source(source_path.to_owned(), source)?;
+    let ir = boon_ir::lower(&parsed).map_err(|error| {
+        format!(
+            "{} could not lower dynamic-path File/write_bytes source: {error}",
+            report_path.display()
+        )
+    })?;
+    boon_ir::verify_hidden_identity(&ir)?;
+    boon_ir::verify_static_schedule(&ir)?;
+    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan_hash = boon_plan::plan_sha256(&plan)?;
+    if summary.get("plan_hash").and_then(JsonValue::as_str) != Some(plan_hash.as_str()) {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes plan_hash does not match source",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&plan)?;
+    if verification.status != "pass" || !plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes MachinePlan is not verified typed executable",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_write_ops = plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    if file_write_ops.len() != 1 {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes expected exactly one op, found {}",
+            report_path.display(),
+            file_write_ops.len()
+        )
+        .into());
+    }
+    let op = file_write_ops[0];
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        unreachable!("FileWriteBytes op filter only returns update branches");
+    };
+    let [
+        boon_plan::ValueRef::State(bytes_state_id),
+        boon_plan::ValueRef::State(path_state_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes op does not use [State(bytes), State(path)] operands",
+            report_path.display()
+        )
+        .into());
+    };
+    let bytes_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == *bytes_state_id)
+        .ok_or_else(|| "dynamic-path File/write_bytes missing bytes input slot".to_owned())?;
+    let path_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == *path_state_id)
+        .ok_or_else(|| "dynamic-path File/write_bytes missing path input slot".to_owned())?;
+    if !matches!(
+        bytes_slot.value_type,
+        boon_plan::PlanValueType::Bytes { .. }
+    ) || !matches!(path_slot.value_type, boon_plan::PlanValueType::Text)
+    {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes operands are not BYTES plus TEXT state",
+            report_path.display()
+        )
+        .into());
+    }
+    let path_state_label = plan_state_label(&plan, path_state_id.0);
+    if summary.get("path_operand").and_then(JsonValue::as_str) != Some("state")
+        || summary.get("path_state").and_then(JsonValue::as_str) != Some(path_state_label.as_str())
+    {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes summary does not identify the path state",
+            report_path.display()
+        )
+        .into());
+    }
+    let rel_path = summary
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "dynamic-path File/write_bytes summary missing path".to_owned())?;
+    if !file_read_path_is_safe_relative(rel_path) {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes path is not safe relative",
+            report_path.display()
+        )
+        .into());
+    }
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    if scenario.source.as_deref() != Some(source_path) {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes scenario source mismatch",
+            report_path.display()
+        )
+        .into());
+    }
+    if summary
+        .get("selected_step_ids")
+        .and_then(JsonValue::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+        })
+        != Some(vec!["write-file-bytes-dynamic-path"])
+    {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes selected_step_ids changed",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifact_path = summary
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "dynamic-path File/write_bytes summary missing artifact_path".to_owned())?;
+    let bytes = fs::read(artifact_path)?;
+    let expected_len = bytes.len() as u64;
+    let expected_sha = sha256_bytes(&bytes);
+    if summary.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || summary.get("sha256").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || summary.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || summary.get("mode").and_then(JsonValue::as_str)
+            != Some("typed-machine-plan-host-file-write-v1")
+        || summary.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+        || summary.get("write_mode").and_then(JsonValue::as_str) != Some("create_or_truncate")
+        || summary
+            .get("verified_after_write")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || summary
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes summary does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    let executor = summary
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic-path File/write_bytes plan_executor is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} dynamic-path File/write_bytes plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let update = summary
+        .get("plan_executor")
+        .unwrap_or(&JsonValue::Null)
+        .pointer("/per_step/0/updates/0")
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic-path File/write_bytes missing executor update",
+                report_path.display()
+            )
+        })?;
+    if update.get("expression_kind").and_then(JsonValue::as_str) != Some("file_write_bytes")
+        || update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            != Some(rel_path)
+        || update
+            .pointer("/update_constant_value/path_state")
+            .and_then(JsonValue::as_str)
+            != Some(path_state_label.as_str())
+        || update
+            .pointer("/bytes_access/path_source")
+            .and_then(JsonValue::as_str)
+            != Some("state")
+        || update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            != Some("file_write_bytes")
+        || update
+            .pointer("/host_effect/sha256")
+            .and_then(JsonValue::as_str)
+            != Some(expected_sha.as_str())
+        || update
+            .pointer("/host_effect/byte_len")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_len)
+    {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes executor update does not prove state-sourced host write",
+            report_path.display()
+        )
+        .into());
+    }
+    if json_contains_key(
+        summary.get("plan_executor").unwrap_or(&JsonValue::Null),
+        "inline_bytes",
+    ) {
+        return Err(format!(
+            "{} dynamic-path File/write_bytes proof leaked inline byte payloads",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn expected_bytes_file_write_live_negative_cases() -> Vec<ExpectedBytesFileWriteLiveNegativeCase> {
+    let mut cases = vec![
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "source-empty-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "source-absolute-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "source-parent-directory-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "source-missing-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "unsupported update expression",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "typecheck-non-bytes-input",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            expected_error_contains: "File/write_bytes",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "typecheck-wrong-path-type",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            expected_error_contains: "File/write_bytes",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-dynamic-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "may not contain parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "may not contain parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-parent",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "cannot write `missing-parent/out.bin`",
+            target_kind: Some("missing_parent"),
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "typecheck-indexed-row-field-non-text-path",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            expected_error_contains: "File/write_bytes",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-target-row",
+            category: "indexed-row-dispatch-policy",
+            stage: "plan-executor",
+            expected_error_contains: "target key/generation 999/1 not found",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "typecheck-indexed-row-field-unknown-path-field",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            expected_error_contains: "missing_path",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
+            category: "indexed-row-shape-policy",
+            stage: "plan-executor",
+            expected_error_contains: "is not in the static schedule symbol table",
+            target_kind: None,
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-missing-parent",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "cannot write `missing-parent/out.bin`",
+            target_kind: Some("missing_parent"),
+        },
+        ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-directory-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "targets a directory",
+            target_kind: Some("directory"),
+        },
+    ];
+
+    #[cfg(unix)]
+    {
+        cases.push(ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-symlink-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "may not target a symlink",
+            target_kind: Some("symlink"),
+        });
+        cases.push(ExpectedBytesFileWriteLiveNegativeCase {
+            id: "runtime-symlink-parent-escape",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "escapes source root",
+            target_kind: Some("symlink_parent_escape"),
+        });
+    }
+
+    cases
+}
+
+fn verify_bytes_file_write_live_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+) -> RuntimeResult<()> {
+    let expected = expected_bytes_file_write_live_negative_cases();
+    if report
+        .get("live_negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan live_negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("live_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan live_negative_cases is not an array",
+                report_path.display()
+            )
+        })?;
+    let artifact_paths = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    let mut seen_ids = BTreeSet::new();
+    for expected_case in &expected {
+        let case = cases
+            .iter()
+            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
+            .ok_or_else(|| {
+                format!(
+                    "{} missing live File/write_bytes negative case `{}`",
+                    report_path.display(),
+                    expected_case.id
+                )
+            })?;
+        seen_ids.insert(expected_case.id.to_owned());
+        verify_bytes_file_write_live_negative_case(
+            case,
+            expected_case,
+            report_path,
+            checks,
+            &artifact_paths,
+        )?;
+    }
+    let expected_ids = expected
+        .iter()
+        .map(|case| case.id.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ids = cases
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "{} live File/write_bytes negative case missing id",
+                        report_path.display()
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if seen_ids != expected_ids || actual_ids != expected_ids {
+        return Err(format!(
+            "{} live File/write_bytes negative case ids do not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_write_live_negative_case(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileWriteLiveNegativeCase,
+    report_path: &Path,
+    checks: &[JsonValue],
+    artifact_paths: &BTreeSet<String>,
+) -> RuntimeResult<()> {
+    for (key, value) in [
+        ("category", expected.category),
+        ("stage", expected.stage),
+        ("target_profile", "software_default"),
+        ("expected_error_contains", expected.expected_error_contains),
+    ] {
+        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
+            return Err(format!(
+                "{} live File/write_bytes negative case `{}` has wrong `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} live File/write_bytes negative case `{}` was not rejected",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    if case.get("selected_step_ids") != Some(&json!(["write"])) {
+        return Err(format!(
+            "{} live File/write_bytes negative case `{}` has wrong selected steps",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let source_path = case
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/write_bytes negative case `{}` missing source_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    let scenario_path = case
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/write_bytes negative case `{}` missing scenario_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    if case.get("source_sha256").and_then(JsonValue::as_str)
+        != Some(sha256_file(Path::new(source_path))?.as_str())
+        || case.get("scenario_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_file(Path::new(scenario_path))?.as_str())
+    {
+        return Err(format!(
+            "{} live File/write_bytes negative case `{}` has stale source/scenario hash",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    for path in [source_path, scenario_path] {
+        if !artifact_paths.contains(path) {
+            return Err(format!(
+                "{} live File/write_bytes negative case `{}` missing artifact hash for `{path}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    let detail = case
+        .get("detail")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/write_bytes negative case `{}` missing detail",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    if !detail.contains(expected.expected_error_contains)
+        || case.get("detail_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_bytes(detail.as_bytes()).as_str())
+    {
+        return Err(format!(
+            "{} live File/write_bytes negative case `{}` has forged error evidence",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let check_id = format!("live-negative-{}-rejected", expected.id);
+    if !checks.iter().any(|check| {
+        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+    }) {
+        return Err(format!(
+            "{} missing passing live negative check `{check_id}`",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_bytes_file_write_live_negative_target(case, expected, report_path, source_path)
+}
+
+fn verify_bytes_file_write_live_negative_target(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileWriteLiveNegativeCase,
+    report_path: &Path,
+    source_path: &str,
+) -> RuntimeResult<()> {
+    let Some(expected_kind) = expected.target_kind else {
+        if case.get("target_kind").is_some() || case.get("target_path").is_some() {
+            return Err(format!(
+                "{} live File/write_bytes negative case `{}` unexpectedly has target metadata",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+        return Ok(());
+    };
+    if case.get("target_kind").and_then(JsonValue::as_str) != Some(expected_kind) {
+        return Err(format!(
+            "{} live File/write_bytes negative case `{}` has wrong target_kind",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let target_path = case
+        .get("target_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/write_bytes negative case `{}` missing target_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    let target = Path::new(target_path);
+    match expected_kind {
+        "missing_parent" => {
+            if target.exists() || target.parent().is_some_and(|parent| parent.exists()) {
+                return Err(format!(
+                    "{} live File/write_bytes negative case `{}` target or parent should be missing",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "directory" => {
+            if !target.is_dir() {
+                return Err(format!(
+                    "{} live File/write_bytes negative case `{}` target should be a directory",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "symlink" => {
+            let metadata = fs::symlink_metadata(target)?;
+            if !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "{} live File/write_bytes negative case `{}` target should be a symlink",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "symlink_parent_escape" => {
+            let metadata = fs::symlink_metadata(target)?;
+            if !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "{} live File/write_bytes negative case `{}` target parent should be a symlink",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+            let source_root = Path::new(source_path)
+                .parent()
+                .ok_or_else(|| {
+                    format!(
+                        "{} live File/write_bytes negative case `{}` source has no parent",
+                        report_path.display(),
+                        expected.id
+                    )
+                })?
+                .canonicalize()?;
+            let target_canonical = target.canonicalize()?;
+            if target_canonical.starts_with(source_root) {
+                return Err(format!(
+                    "{} live File/write_bytes negative case `{}` symlink parent should escape source root",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "{} live File/write_bytes negative case `{}` has unsupported target kind `{other}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedBytesFileWriteFabricatedPlanMutation {
+    MissingBytesOperand,
+    ExtraPathOperand,
+    RowFieldPathOpNotIndexed,
+    RowFieldPathInputMissing,
+    RowFieldPathForeignList,
+    MissingPathConstant,
+    NonTextPathConstant,
+    NonStaticParentPath,
+    MissingSourceInput,
+    ExtraSourceInput,
+    SourcePayloadInputDeclared,
+    UpdateConstantPresent,
+    SourcePayloadFieldPresent,
+    InputNotBytes,
+    OutputNotText,
+}
+
+struct ExpectedBytesFileWriteFabricatedPlanCase {
+    id: &'static str,
+    category: &'static str,
+    mutation: ExpectedBytesFileWriteFabricatedPlanMutation,
+}
+
+fn expected_bytes_file_write_fabricated_plan_cases() -> Vec<ExpectedBytesFileWriteFabricatedPlanCase>
+{
+    use ExpectedBytesFileWriteFabricatedPlanMutation::*;
+    vec![
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-bytes-operand",
+            category: "operand-shape",
+            mutation: MissingBytesOperand,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-extra-path-operand",
+            category: "operand-shape",
+            mutation: ExtraPathOperand,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-op-not-indexed",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathOpNotIndexed,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-input-missing",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathInputMissing,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-foreign-list",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathForeignList,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-path-constant",
+            category: "constant-binding",
+            mutation: MissingPathConstant,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-non-text-path-constant",
+            category: "constant-binding",
+            mutation: NonTextPathConstant,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-non-static-parent-path",
+            category: "path-policy",
+            mutation: NonStaticParentPath,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-source-input",
+            category: "operand-shape",
+            mutation: MissingSourceInput,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-extra-source-input",
+            category: "operand-shape",
+            mutation: ExtraSourceInput,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-source-payload-input-declared",
+            category: "operand-shape",
+            mutation: SourcePayloadInputDeclared,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-update-constant-present",
+            category: "operand-shape",
+            mutation: UpdateConstantPresent,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-source-payload-field-present",
+            category: "operand-shape",
+            mutation: SourcePayloadFieldPresent,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-input-not-bytes",
+            category: "type-policy",
+            mutation: InputNotBytes,
+        },
+        ExpectedBytesFileWriteFabricatedPlanCase {
+            id: "fabricated-output-not-text",
+            category: "type-policy",
+            mutation: OutputNotText,
+        },
+    ]
+}
+
+fn verify_bytes_file_write_fabricated_plan_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+    source_plan: &boon_plan::MachinePlan,
+) -> RuntimeResult<()> {
+    let expected = expected_bytes_file_write_fabricated_plan_cases();
+    if report
+        .get("fabricated_plan_negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan fabricated_plan_negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("fabricated_plan_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} fabricated_plan_negative_cases is not an array",
+                report_path.display()
+            )
+        })?;
+    if cases.len() != expected.len() {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case array length does not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_ids = expected
+        .iter()
+        .map(|case| case.id.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ids = cases
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "{} fabricated File/write_bytes negative case missing id",
+                        report_path.display()
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case ids do not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let base_plan_hash = boon_plan::plan_sha256(source_plan).map_err(|error| {
+        format!(
+            "{} cannot hash source plan while checking fabricated File/write_bytes negatives: {error}",
+            report_path.display()
+        )
+    })?;
+    for expected_case in &expected {
+        let case = cases
+            .iter()
+            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
+            .ok_or_else(|| {
+                format!(
+                    "{} missing fabricated File/write_bytes negative case `{}`",
+                    report_path.display(),
+                    expected_case.id
+                )
+            })?;
+        verify_bytes_file_write_fabricated_plan_negative_case(
+            case,
+            expected_case,
+            source_plan,
+            &base_plan_hash,
+            report_path,
+            checks,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_write_fabricated_plan_negative_case(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileWriteFabricatedPlanCase,
+    source_plan: &boon_plan::MachinePlan,
+    base_plan_hash: &str,
+    report_path: &Path,
+    checks: &[JsonValue],
+) -> RuntimeResult<()> {
+    let allowed_keys = [
+        "id",
+        "category",
+        "stage",
+        "mutation",
+        "target_profile",
+        "evidence_level",
+        "runtime_executed",
+        "runtime_non_execution_reason",
+        "base_plan_hash",
+        "fabricated_plan_hash",
+        "mutated_plan_hash",
+        "expected_verification_status",
+        "actual_verification_status",
+        "expected_failed_check_ids",
+        "actual_failed_check_ids",
+        "failed_check_ids",
+        "error_count",
+        "boon_plan_verification",
+        "rejected",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let object = case.as_object().ok_or_else(|| {
+        format!(
+            "{} fabricated File/write_bytes negative case `{}` is not an object",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    for key in object.keys() {
+        if !allowed_keys.contains(key.as_str()) {
+            return Err(format!(
+                "{} fabricated File/write_bytes negative case `{}` has unsupported key `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    for (key, value) in [
+        ("category", expected.category),
+        ("stage", "machine-plan-verifier"),
+        ("mutation", expected.mutation.as_str()),
+        ("target_profile", "software_default"),
+        ("evidence_level", "verifier-only"),
+        (
+            "runtime_non_execution_reason",
+            "fabricated MachinePlan is checked with boon_plan::verify_plan only",
+        ),
+        ("base_plan_hash", base_plan_hash),
+        ("expected_verification_status", "fail"),
+    ] {
+        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
+            return Err(format!(
+                "{} fabricated File/write_bytes negative case `{}` has wrong `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    if case.get("runtime_executed").and_then(JsonValue::as_bool) != Some(false)
+        || case.get("rejected").and_then(JsonValue::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case `{}` has wrong execution/rejection boundary",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+
+    let mut mutated_plan = source_plan.clone();
+    mutate_expected_bytes_file_write_plan(&mut mutated_plan, expected.mutation)?;
+    let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan).map_err(|error| {
+        format!(
+            "{} cannot hash fabricated File/write_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    for hash_key in ["mutated_plan_hash", "fabricated_plan_hash"] {
+        if case.get(hash_key).and_then(JsonValue::as_str) != Some(mutated_plan_hash.as_str()) {
+            return Err(format!(
+                "{} fabricated File/write_bytes negative case `{}` has wrong `{hash_key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+
+    let verification = boon_plan::verify_plan(&mutated_plan).map_err(|error| {
+        format!(
+            "{} cannot verify fabricated File/write_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    if verification.status != "fail" {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case `{}` unexpectedly verifies",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let expected_verification_json = serde_json::to_value(&verification).map_err(|error| {
+        format!(
+            "{} cannot serialize verification for fabricated File/write_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    if case.get("boon_plan_verification") != Some(&expected_verification_json) {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case `{}` has stale or forged verification",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    if case
+        .get("actual_verification_status")
+        .and_then(JsonValue::as_str)
+        != Some(verification.status.as_str())
+        || case.get("error_count").and_then(JsonValue::as_u64)
+            != Some(verification.error_count as u64)
+    {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case `{}` has wrong verification summary",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let failed_check_ids = verification
+        .checks
+        .iter()
+        .filter(|check| !check.pass)
+        .map(|check| check.id.clone())
+        .collect::<Vec<_>>();
+    if !failed_check_ids
+        .iter()
+        .any(|id| id == "file-write-bytes-ops-well-formed")
+    {
+        return Err(format!(
+            "{} fabricated File/write_bytes negative case `{}` was not rejected by the FileWriteBytes verifier check",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let failed_check_ids_json = json!(failed_check_ids);
+    for ids_key in [
+        "expected_failed_check_ids",
+        "actual_failed_check_ids",
+        "failed_check_ids",
+    ] {
+        if case.get(ids_key) != Some(&failed_check_ids_json) {
+            return Err(format!(
+                "{} fabricated File/write_bytes negative case `{}` has wrong `{ids_key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    let check_id = format!("fabricated-plan-negative-{}-rejected", expected.id);
+    if !checks.iter().any(|check| {
+        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+    }) {
+        return Err(format!(
+            "{} missing passing fabricated File/write_bytes negative check `{check_id}`",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+impl ExpectedBytesFileWriteFabricatedPlanMutation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingBytesOperand => "missing_bytes_operand",
+            Self::ExtraPathOperand => "extra_path_operand",
+            Self::RowFieldPathOpNotIndexed => "row_field_path_op_not_indexed",
+            Self::RowFieldPathInputMissing => "row_field_path_input_missing",
+            Self::RowFieldPathForeignList => "row_field_path_foreign_list",
+            Self::MissingPathConstant => "missing_path_constant",
+            Self::NonTextPathConstant => "non_text_path_constant",
+            Self::NonStaticParentPath => "non_static_parent_path",
+            Self::MissingSourceInput => "missing_source_input",
+            Self::ExtraSourceInput => "extra_source_input",
+            Self::SourcePayloadInputDeclared => "source_payload_input_declared",
+            Self::UpdateConstantPresent => "update_constant_present",
+            Self::SourcePayloadFieldPresent => "source_payload_field_present",
+            Self::InputNotBytes => "input_not_bytes",
+            Self::OutputNotText => "output_not_text",
+        }
+    }
+}
+
+fn mutate_expected_bytes_file_write_plan(
+    plan: &mut boon_plan::MachinePlan,
+    mutation: ExpectedBytesFileWriteFabricatedPlanMutation,
+) -> RuntimeResult<()> {
+    let (region_index, op_index) = expected_bytes_file_write_plan_op_location(plan)?;
+    let path_constant_id =
+        expected_bytes_file_write_path_constant_id(plan, region_index, op_index)?;
+    let bytes_input_state_id =
+        expected_bytes_file_write_input_state_id(plan, region_index, op_index)?;
+    let output_state_id = expected_bytes_file_write_output_state_id(plan, region_index, op_index)?;
+    let source_id = plan
+        .source_routes
+        .first()
+        .map(|route| route.source_id)
+        .ok_or_else(|| {
+            "source plan has no source routes for fabricated FileWriteBytes mutation".to_owned()
+        })?;
+    match mutation {
+        ExpectedBytesFileWriteFabricatedPlanMutation::MissingBytesOperand => {
+            expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::ExtraPathOperand => {
+            expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?
+                .push(boon_plan::ValueRef::Constant(path_constant_id));
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = false;
+            op.inputs.push(field_ref.clone());
+            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathInputMissing => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            plan.regions[region_index].ops[op_index].indexed = true;
+            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathForeignList => {
+            let path_field_id = install_expected_foreign_row_field_path_scope(
+                plan,
+                output_state_id,
+                boon_plan::PlanValueType::Text,
+            )?;
+            let field_ref = boon_plan::ValueRef::Field(path_field_id);
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = true;
+            if !op.inputs.contains(&field_ref) {
+                op.inputs.push(field_ref.clone());
+            }
+            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::MissingPathConstant => {
+            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? = vec![
+                boon_plan::ValueRef::State(bytes_input_state_id),
+                boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(999_999)),
+            ];
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::NonTextPathConstant => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or_else(|| "source plan missing FileWriteBytes path constant".to_owned())?;
+            constant.value = boon_plan::PlanConstantValue::Number { value: 7 };
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::NonStaticParentPath => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or_else(|| "source plan missing FileWriteBytes path constant".to_owned())?;
+            constant.value = boon_plan::PlanConstantValue::Text {
+                value: "../payload.bin".to_owned(),
+            };
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::MissingSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .retain(|input| !matches!(input, boon_plan::ValueRef::Source(_)));
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::ExtraSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                    source_id.0.saturating_add(999_999),
+                )));
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::SourcePayloadInputDeclared => {
+            plan.regions[region_index].ops[op_index].inputs.push(
+                boon_plan::ValueRef::SourcePayload {
+                    source_id,
+                    field: boon_ir::SourcePayloadField::Text,
+                },
+            );
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::UpdateConstantPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                update_constant_id, ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *update_constant_id = Some(path_constant_id);
+            }
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::SourcePayloadFieldPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                source_payload_field,
+                ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+            }
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::InputNotBytes => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == bytes_input_state_id)
+                .ok_or_else(|| {
+                    "source plan missing FileWriteBytes input storage slot".to_owned()
+                })?;
+            slot.value_type = boon_plan::PlanValueType::Text;
+        }
+        ExpectedBytesFileWriteFabricatedPlanMutation::OutputNotText => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    "source plan missing FileWriteBytes output storage slot".to_owned()
+                })?;
+            slot.value_type = boon_plan::PlanValueType::Bytes { fixed_len: None };
+        }
+    }
+    Ok(())
+}
+
+fn install_expected_foreign_row_field_path_scope(
+    plan: &mut boon_plan::MachinePlan,
+    output_state_id: boon_ir::StateId,
+    output_value_type: boon_plan::PlanValueType,
+) -> RuntimeResult<boon_ir::FieldId> {
+    let output_scope_id = boon_ir::ScopeId(900_001);
+    let foreign_scope_id = boon_ir::ScopeId(900_002);
+    let output_field_id = boon_ir::FieldId(900_003);
+    let foreign_path_field_id = boon_ir::FieldId(900_004);
+    let output_list_id = boon_ir::ListId(900_005);
+    let foreign_list_id = boon_ir::ListId(900_006);
+
+    let output_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter_mut()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or_else(|| {
+            "fabricated foreign row-field path mutation missing output storage slot".to_owned()
+        })?;
+    output_slot.indexed = true;
+    output_slot.scope_id = Some(output_scope_id);
+
+    plan.storage_layout.list_slots.retain(|slot| {
+        slot.scope_id != Some(output_scope_id) && slot.scope_id != Some(foreign_scope_id)
+    });
+    plan.storage_layout
+        .list_slots
+        .push(boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(900_007),
+            list_id: output_list_id,
+            scope_id: Some(output_scope_id),
+            row_field_ids: vec![output_field_id],
+            capacity: None,
+            hidden_key_type: "RowKey".to_owned(),
+            has_generation: true,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![boon_plan::PlanInitialListField {
+                    name: "output".to_owned(),
+                    field_id: Some(output_field_id),
+                    value: plan_constant_value_for_expected_type(&output_value_type),
+                }],
+            }],
+        });
+    plan.storage_layout
+        .list_slots
+        .push(boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(900_008),
+            list_id: foreign_list_id,
+            scope_id: Some(foreign_scope_id),
+            row_field_ids: vec![foreign_path_field_id],
+            capacity: None,
+            hidden_key_type: "RowKey".to_owned(),
+            has_generation: true,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![boon_plan::PlanInitialListField {
+                    name: "foreign_path".to_owned(),
+                    field_id: Some(foreign_path_field_id),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "foreign-list.bin".to_owned(),
+                    },
+                }],
+            }],
+        });
+
+    Ok(foreign_path_field_id)
+}
+
+fn plan_constant_value_for_expected_type(
+    value_type: &boon_plan::PlanValueType,
+) -> boon_plan::PlanConstantValue {
+    match value_type {
+        boon_plan::PlanValueType::Text => boon_plan::PlanConstantValue::Text {
+            value: "pending".to_owned(),
+        },
+        boon_plan::PlanValueType::Bytes { .. } => boon_plan::PlanConstantValue::Bytes {
+            byte_len: 0,
+            sha256: sha256_bytes(&[]),
+            inline_bytes: Some(Vec::new()),
+        },
+        boon_plan::PlanValueType::Byte => boon_plan::PlanConstantValue::Byte { value: 0 },
+        boon_plan::PlanValueType::Number => boon_plan::PlanConstantValue::Number { value: 0 },
+        boon_plan::PlanValueType::Bool => boon_plan::PlanConstantValue::Bool { value: false },
+        boon_plan::PlanValueType::Enum => boon_plan::PlanConstantValue::Enum {
+            value: "unknown".to_owned(),
+        },
+        boon_plan::PlanValueType::RootInitialField
+        | boon_plan::PlanValueType::RowInitialField
+        | boon_plan::PlanValueType::Unknown => boon_plan::PlanConstantValue::Text {
+            value: "unsupported".to_owned(),
+        },
+    }
+}
+
+fn expected_bytes_file_write_plan_op_location(
+    plan: &boon_plan::MachinePlan,
+) -> RuntimeResult<(usize, usize)> {
+    plan.regions
+        .iter()
+        .enumerate()
+        .find_map(|(region_index, region)| {
+            region
+                .ops
+                .iter()
+                .enumerate()
+                .find(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        boon_plan::PlanOpKind::UpdateBranch {
+                            expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                            ..
+                        }
+                    )
+                })
+                .map(|(op_index, _)| (region_index, op_index))
+        })
+        .ok_or_else(|| "source plan has no FileWriteBytes op".into())
+}
+
+fn expected_bytes_file_write_path_constant_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<boon_plan::PlanConstantId> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    let [_, boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
+        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
+    };
+    Ok(*path_constant_id)
+}
+
+fn expected_bytes_file_write_input_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<boon_ir::StateId> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    let [boon_plan::ValueRef::State(state_id), _] = ordered_inputs.as_slice() else {
+        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
+    };
+    Ok(*state_id)
+}
+
+fn expected_bytes_file_write_output_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<boon_ir::StateId> {
+    let Some(boon_plan::ValueRef::State(state_id)) =
+        plan.regions[region_index].ops[op_index].output.as_ref()
+    else {
+        return Err("FileWriteBytes op does not have a state output".into());
+    };
+    Ok(*state_id)
+}
+
+fn expected_bytes_file_write_ordered_inputs_mut(
+    plan: &mut boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<&mut Vec<boon_plan::ValueRef>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &mut plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    Ok(ordered_inputs)
+}
+
+fn verify_bytes_file_write_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    verify_negative_artifacts: bool,
+) -> RuntimeResult<()> {
+    let expected = [
+        "forged-summary-digest",
+        "forged-host-effect-digest",
+        "forged-byte-length",
+        "forged-last-byte",
+        "public-inline-bytes-leak",
+        "expression-kind-downgrade",
+        "missing-file-write-update",
+        "nonzero-runtime-ast-eval",
+        "forged-plan-hash",
+        "forged-binary-hash",
+        "missing-live-negative-evidence",
+        "forged-live-negative-detail",
+        "missing-fabricated-plan-negative-evidence",
+        "forged-fabricated-plan-negative-hash",
+        "forged-fabricated-plan-negative-check",
+        "forged-fabricated-plan-runtime-executed",
+        "fabricated-plan-extra-runtime-claim",
+        "fabricated-plan-duplicate-case",
+        "missing-negative-evidence",
+    ];
+    if report
+        .get("negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan negative_cases is missing",
+                report_path.display()
+            )
+        })?;
+    if cases.len() != expected.len() {
+        return Err(format!(
+            "{} verify-bytes-file-write-plan negative_cases length is wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut seen = BTreeSet::new();
+    for case in cases {
+        let id = case.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-write-plan negative case missing id",
+                report_path.display()
+            )
+        })?;
+        if !expected.contains(&id) || !seen.insert(id.to_owned()) {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan unexpected or duplicate negative case `{id}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if case.get("rejected").and_then(JsonValue::as_bool) != Some(true)
+            || case.get("category").and_then(JsonValue::as_str).is_none()
+        {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan negative case `{id}` is not proven rejected",
+                report_path.display()
+            )
+            .into());
+        }
+        let path = case
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-file-write-plan negative case `{id}` missing path",
+                    report_path.display()
+                )
+            })?;
+        let expected_sha = case
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-file-write-plan negative case `{id}` missing sha256",
+                    report_path.display()
+                )
+            })?;
+        let bytes = fs::read(path).map_err(|error| {
+            format!(
+                "{} verify-bytes-file-write-plan negative case `{id}` artifact `{path}` is missing: {error}",
+                report_path.display()
+            )
+        })?;
+        let actual_sha = sha256_bytes(&bytes);
+        if actual_sha != expected_sha {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan negative case `{id}` artifact hash changed",
+                report_path.display()
+            )
+            .into());
+        }
+        if verify_negative_artifacts {
+            verify_bytes_file_write_negative_artifact(Path::new(path), id).map_err(|error| {
+                format!(
+                    "{} verify-bytes-file-write-plan negative case `{id}` artifact does not prove the expected mutation: {error}",
+                    report_path.display()
+                )
+            })?;
+        }
+    }
+    for id in expected {
+        let check_id = format!("negative-{id}-rejected");
+        if !bytes_file_write_report_check_passed(report, &check_id) {
+            return Err(format!(
+                "{} verify-bytes-file-write-plan missing passing check `{check_id}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_write_negative_artifact_value(
+    report: &JsonValue,
+    report_path: &Path,
+    id: &str,
+) -> RuntimeResult<()> {
+    let summary = report
+        .get("file_write_summary")
+        .and_then(JsonValue::as_object);
+    let artifact_bytes = summary
+        .and_then(|summary| summary.get("artifact_path"))
+        .and_then(JsonValue::as_str)
+        .and_then(|path| fs::read(path).ok());
+    let host_effect = report
+        .pointer("/plan_executor/per_step/0/updates/0/host_effect")
+        .and_then(JsonValue::as_object);
+    match id {
+        "forged-summary-digest" => {
+            let Some(bytes) = artifact_bytes else {
+                return Err(format!("{} missing artifact bytes", report_path.display()).into());
+            };
+            let expected = sha256_bytes(&bytes);
+            if summary
+                .and_then(|summary| summary.get("sha256"))
+                .and_then(JsonValue::as_str)
+                == Some(expected.as_str())
+            {
+                return Err(
+                    format!("{} summary digest is not forged", report_path.display()).into(),
+                );
+            }
+        }
+        "forged-host-effect-digest" => {
+            let Some(bytes) = artifact_bytes else {
+                return Err(format!("{} missing artifact bytes", report_path.display()).into());
+            };
+            let expected = sha256_bytes(&bytes);
+            if host_effect
+                .and_then(|host_effect| host_effect.get("sha256"))
+                .and_then(JsonValue::as_str)
+                == Some(expected.as_str())
+            {
+                return Err(
+                    format!("{} host effect digest is not forged", report_path.display()).into(),
+                );
+            }
+        }
+        "forged-byte-length" => {
+            let Some(bytes) = artifact_bytes else {
+                return Err(format!("{} missing artifact bytes", report_path.display()).into());
+            };
+            if summary
+                .and_then(|summary| summary.get("byte_len"))
+                .and_then(JsonValue::as_u64)
+                == Some(bytes.len() as u64)
+            {
+                return Err(format!("{} byte length is not forged", report_path.display()).into());
+            }
+        }
+        "forged-last-byte" => {
+            let Some(bytes) = artifact_bytes else {
+                return Err(format!("{} missing artifact bytes", report_path.display()).into());
+            };
+            if summary
+                .and_then(|summary| summary.get("last_byte"))
+                .and_then(JsonValue::as_u64)
+                == bytes.last().copied().map(u64::from)
+            {
+                return Err(format!("{} last byte is not forged", report_path.display()).into());
+            }
+        }
+        "public-inline-bytes-leak" => {
+            if !json_contains_key(report, "inline_bytes") {
+                return Err(format!("{} has no inline_bytes leak", report_path.display()).into());
+            }
+        }
+        "expression-kind-downgrade" => {
+            if report
+                .pointer("/plan_executor/per_step/0/updates/0/expression_kind")
+                .and_then(JsonValue::as_str)
+                == Some("file_write_bytes")
+            {
+                return Err(format!(
+                    "{} expression kind is not downgraded",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "missing-file-write-update" => {
+            if !matches!(
+                report
+                    .pointer("/plan_executor/per_step/0/updates")
+                    .and_then(JsonValue::as_array),
+                Some(updates) if updates.is_empty()
+            ) {
+                return Err(
+                    format!("{} write update is not missing", report_path.display()).into(),
+                );
+            }
+        }
+        "nonzero-runtime-ast-eval" => {
+            if report
+                .pointer("/plan_executor/runtime_ast_eval_count")
+                .and_then(JsonValue::as_u64)
+                == Some(0)
+            {
+                return Err(
+                    format!("{} runtime_ast_eval_count is zero", report_path.display()).into(),
+                );
+            }
+        }
+        "forged-plan-hash" => {
+            if report.get("plan_hash").and_then(JsonValue::as_str)
+                != Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            {
+                return Err(format!("{} plan hash is not forged", report_path.display()).into());
+            }
+        }
+        "forged-binary-hash" => {
+            let binary_path = report
+                .get("binary_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("{} missing binary_path", report_path.display()))?;
+            let actual = sha256_file(Path::new(binary_path))?;
+            if report.get("binary_hash").and_then(JsonValue::as_str) == Some(actual.as_str()) {
+                return Err(format!("{} binary hash is not forged", report_path.display()).into());
+            }
+        }
+        "missing-live-negative-evidence" => {
+            if report.get("live_negative_cases").is_some()
+                || report.get("live_negative_case_count").is_some()
+            {
+                return Err(format!(
+                    "{} live negative evidence is present",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "forged-live-negative-detail" => {
+            let Some(case) = report
+                .get("live_negative_cases")
+                .and_then(JsonValue::as_array)
+                .and_then(|cases| cases.first())
+            else {
+                return Err(format!("{} missing live negative case", report_path.display()).into());
+            };
+            let detail = case.get("detail").and_then(JsonValue::as_str).unwrap_or("");
+            let expected = case
+                .get("expected_error_contains")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let detail_hash = case.get("detail_sha256").and_then(JsonValue::as_str);
+            if detail.contains(expected)
+                && detail_hash == Some(sha256_bytes(detail.as_bytes()).as_str())
+            {
+                return Err(format!(
+                    "{} live negative detail is not forged",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "missing-fabricated-plan-negative-evidence" => {
+            if report.get("fabricated_plan_negative_cases").is_some()
+                || report.get("fabricated_plan_negative_case_count").is_some()
+            {
+                return Err(format!(
+                    "{} fabricated plan negative evidence is present",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "forged-fabricated-plan-negative-hash" => {
+            let Some(case) = report
+                .get("fabricated_plan_negative_cases")
+                .and_then(JsonValue::as_array)
+                .and_then(|cases| cases.first())
+            else {
+                return Err(format!(
+                    "{} missing fabricated plan negative case",
+                    report_path.display()
+                )
+                .into());
+            };
+            if case.get("mutated_plan_hash").and_then(JsonValue::as_str)
+                != Some("0000000000000000000000000000000000000000000000000000000000000000")
+            {
+                return Err(format!(
+                    "{} fabricated plan negative hash is not forged",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "forged-fabricated-plan-negative-check" => {
+            let Some(case) = report
+                .get("fabricated_plan_negative_cases")
+                .and_then(JsonValue::as_array)
+                .and_then(|cases| cases.first())
+            else {
+                return Err(format!(
+                    "{} missing fabricated plan negative case",
+                    report_path.display()
+                )
+                .into());
+            };
+            if case.get("expected_failed_check_ids")
+                != Some(&json!(["capability-summary-derived-counts"]))
+            {
+                return Err(format!(
+                    "{} fabricated plan negative failed-check ids are not forged",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "forged-fabricated-plan-runtime-executed" => {
+            let Some(case) = report
+                .get("fabricated_plan_negative_cases")
+                .and_then(JsonValue::as_array)
+                .and_then(|cases| cases.first())
+            else {
+                return Err(format!(
+                    "{} missing fabricated plan negative case",
+                    report_path.display()
+                )
+                .into());
+            };
+            if case.get("runtime_executed").and_then(JsonValue::as_bool) != Some(true) {
+                return Err(format!(
+                    "{} fabricated plan negative runtime_executed is not forged",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "fabricated-plan-extra-runtime-claim" => {
+            let Some(case) = report
+                .get("fabricated_plan_negative_cases")
+                .and_then(JsonValue::as_array)
+                .and_then(|cases| cases.first())
+            else {
+                return Err(format!(
+                    "{} missing fabricated plan negative case",
+                    report_path.display()
+                )
+                .into());
+            };
+            if case.get("plan_executor").is_none() || case.get("selected_step_ids").is_none() {
+                return Err(format!(
+                    "{} fabricated plan negative has no extra runtime claim",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "fabricated-plan-duplicate-case" => {
+            let Some(cases) = report
+                .get("fabricated_plan_negative_cases")
+                .and_then(JsonValue::as_array)
+            else {
+                return Err(format!(
+                    "{} missing fabricated plan negative cases",
+                    report_path.display()
+                )
+                .into());
+            };
+            let ids = cases
+                .iter()
+                .filter_map(|case| case.get("id").and_then(JsonValue::as_str))
+                .collect::<Vec<_>>();
+            let unique = ids.iter().copied().collect::<BTreeSet<_>>();
+            if ids.len() == unique.len() {
+                return Err(format!(
+                    "{} fabricated plan negative cases are not duplicated",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "missing-negative-evidence" => {
+            if report.get("negative_cases").is_some() || report.get("negative_case_count").is_some()
+            {
+                return Err(
+                    format!("{} negative evidence is present", report_path.display()).into(),
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "{} unknown File/write_bytes negative artifact id `{other}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn bytes_file_write_report_check_passed(report: &JsonValue, id: &str) -> bool {
+    report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .any(|check| {
+            check.get("id").and_then(JsonValue::as_str) == Some(id)
+                && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+        })
+}
+
+fn verify_bytes_file_read_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "target_profile",
+        "plan_hash",
+        "plan_version",
+        "capability_summary",
+        "selected_step_ids",
+        "state_summary",
+        "semantic_delta_signatures",
+        "semantic_deltas",
+        "legacy_comparison",
+        "file_read_summary",
+        "dynamic_path_file_read_summary",
+        "plan_executor",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} verify-bytes-file-read-plan report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let source_plan = compile_report_machine_plan(report, report_path)?;
+    let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
+        format!(
+            "{} could not recompute source-derived MachinePlan hash: {error}",
+            report_path.display()
+        )
+    })?;
+    if report.get("plan_hash").and_then(JsonValue::as_str) != Some(actual_plan_hash.as_str()) {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan plan_hash does not match source files and target_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("program_hash") != report.get("source_hash") {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan program_hash must match source_hash",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_graph_node_count = compile_report_ir_graph_node_count(report, report_path)?;
+    if report.get("graph_node_count").and_then(JsonValue::as_u64)
+        != Some(expected_graph_node_count as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan graph_node_count does not match source-derived IR",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("plan_version") != Some(&serde_json::to_value(source_plan.version)?) {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan plan_version does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("capability_summary")
+        != Some(&serde_json::to_value(&source_plan.capability_summary)?)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan capability_summary does not match source-derived MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&source_plan).map_err(|error| {
+        format!(
+            "{} source-derived MachinePlan verification failed to run: {error}",
+            report_path.display()
+        )
+    })?;
+    if verification.status != "pass" || !source_plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan requires a verified typed-lowering-executable MachinePlan",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_read_ops = source_plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let file_read_op_count = file_read_ops.len();
+    if file_read_op_count != 1 {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan expected exactly one FileReadBytes op, found {file_read_op_count}",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_read_op = file_read_ops[0];
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &file_read_op.kind else {
+        unreachable!("file_read_op filter only returns update branches");
+    };
+    let [boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan source FileReadBytes op does not have one path constant",
+            report_path.display()
+        )
+        .into());
+    };
+    let plan_rel_path = source_plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *path_constant_id)
+        .and_then(|constant| match &constant.value {
+            boon_plan::PlanConstantValue::Text { value } => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-file-read-plan source FileReadBytes path constant is missing or non-TEXT",
+                report_path.display()
+            )
+        })?;
+    let Some(boon_plan::ValueRef::State(file_read_output_state)) = file_read_op.output else {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan source FileReadBytes op has no state output",
+            report_path.display()
+        )
+        .into());
+    };
+
+    let scenario_path = report
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing scenario_path", report_path.display()))?;
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    let selected_step_ids = report
+        .get("selected_step_ids")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} selected_step_ids is not an array",
+                report_path.display()
+            )
+        })?;
+    let selected_step_ids = selected_step_ids
+        .iter()
+        .map(|step| {
+            step.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "{} selected_step_ids contains a non-string value",
+                    report_path.display()
+                )
+                .into()
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    if selected_step_ids
+        != [
+            "read-file-bytes".to_owned(),
+            "inspect-file-bytes".to_owned(),
+        ]
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan selected_step_ids changed",
+            report_path.display()
+        )
+        .into());
+    }
+    for step_id in &selected_step_ids {
+        let Some(step) = scenario.step.iter().find(|step| &step.id == step_id) else {
+            return Err(format!(
+                "{} scenario is missing selected step `{step_id}`",
+                report_path.display()
+            )
+            .into());
+        };
+        if step.expected_source_event.is_none() {
+            return Err(format!(
+                "{} selected step `{step_id}` has no expected_source_event",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let summary = report
+        .get("file_read_summary")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} file_read_summary is not an object",
+                report_path.display()
+            )
+        })?;
+    let rel_path = summary
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_read_summary.path is not a string",
+                report_path.display()
+            )
+        })?;
+    if !file_read_path_is_safe_relative(rel_path) {
+        return Err(format!(
+            "{} file_read_summary.path is not a safe relative path",
+            report_path.display()
+        )
+        .into());
+    }
+    if rel_path != plan_rel_path {
+        return Err(format!(
+            "{} file_read_summary.path does not match source-derived FileReadBytes path",
+            report_path.display()
+        )
+        .into());
+    }
+    let host_root = summary
+        .get("host_root")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_read_summary.host_root missing",
+                report_path.display()
+            )
+        })?;
+    let source_path = report
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing source_path", report_path.display()))?;
+    let expected_host_root = Path::new(source_path)
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if host_root != expected_host_root {
+        return Err(format!(
+            "{} file_read_summary.host_root does not match source parent directory",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifact_path = summary
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} file_read_summary.artifact_path missing",
+                report_path.display()
+            )
+        })?;
+    let expected_artifact_path = Path::new(host_root).join(rel_path);
+    if expected_artifact_path != Path::new(artifact_path) {
+        return Err(format!(
+            "{} file_read_summary artifact_path does not match host_root/path",
+            report_path.display()
+        )
+        .into());
+    }
+    let bytes = fs::read(artifact_path)?;
+    let expected_len = bytes.len() as u64;
+    let expected_sha = sha256_bytes(&bytes);
+    let expected_first = bytes.first().copied().unwrap_or_default() as u64;
+    if summary.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || summary.get("sha256").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || summary.get("first_byte").and_then(JsonValue::as_u64) != Some(expected_first)
+        || summary.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || summary.get("mode").and_then(JsonValue::as_str)
+            != Some("typed-machine-plan-host-file-read-v1")
+        || summary.get("expression_kind").and_then(JsonValue::as_str) != Some("file_read_bytes")
+        || summary
+            .get("report_value_digest_matches_file")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || summary
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{} file_read_summary does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+
+    verify_dynamic_path_file_read_summary(report, report_path)?;
+
+    if json_contains_key(report, "inline_bytes") {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan must not expose inline byte payloads",
+            report_path.display()
+        )
+        .into());
+    }
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} legacy_comparison is not an object",
+                report_path.display()
+            )
+        })?;
+    if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
+        || legacy.get("passed").and_then(JsonValue::as_bool) != Some(false)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan must keep legacy comparison disabled for this host-boundary proof",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let executor = report
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} plan_executor is not an object", report_path.display()))?;
+    if executor.get("executor").and_then(JsonValue::as_str)
+        != Some("cpu-plan-root-list-scenario-v1")
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan executor is not cpu-plan-root-list-scenario-v1",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} verify-bytes-file-read-plan plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if executor
+        .get("selected_step_count")
+        .and_then(JsonValue::as_u64)
+        != Some(2)
+        || executor
+            .get("executed_update_branch_count")
+            .and_then(JsonValue::as_u64)
+            != Some(3)
+        || executor.get("state_summary") != report.get("state_summary")
+        || executor.get("semantic_delta_signatures") != report.get("semantic_delta_signatures")
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan executor summary does not match report",
+            report_path.display()
+        )
+        .into());
+    }
+    let per_step = executor
+        .get("per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} plan_executor.per_step is not an array",
+                report_path.display()
+            )
+        })?;
+    if per_step.len() != 2 {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan expected two executor steps",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let read_update = report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or_else(|| format!("{} missing file-read update", report_path.display()))?;
+    let read_value = read_update
+        .get("value")
+        .ok_or_else(|| format!("{} missing file-read value", report_path.display()))?;
+    let state_bytes = report
+        .pointer("/state_summary/store.file_bytes")
+        .ok_or_else(|| format!("{} missing store.file_bytes", report_path.display()))?;
+    if read_update
+        .get("expression_kind")
+        .and_then(JsonValue::as_str)
+        != Some("file_read_bytes")
+        || per_step[0].get("step_id").and_then(JsonValue::as_str) != Some("read-file-bytes")
+        || per_step[0].get("source").and_then(JsonValue::as_str) != Some("store.load")
+        || per_step[0].get("source_id").and_then(JsonValue::as_u64)
+            != plan_source_id_for_label(&source_plan, "store.load").map(|id| id as u64)
+        || read_update.get("source_id").and_then(JsonValue::as_u64)
+            != plan_source_id_for_label(&source_plan, "store.load").map(|id| id as u64)
+        || read_update.get("update_op_id").and_then(JsonValue::as_u64)
+            != Some(file_read_op.id.0 as u64)
+        || read_update
+            .get("candidate_update_op_ids")
+            .and_then(JsonValue::as_array)
+            != Some(&vec![json!(file_read_op.id.0)])
+        || read_update.get("target_state").and_then(JsonValue::as_str)
+            != Some(plan_state_label(&source_plan, file_read_output_state.0).as_str())
+        || read_update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            != Some(rel_path)
+        || read_value.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES")
+        || read_value.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || read_value.get("digest").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || state_bytes.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || state_bytes.get("digest").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan file-read update does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    let flattened_semantic_deltas = per_step
+        .iter()
+        .flat_map(|step| {
+            step.get("semantic_deltas")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    if report.get("semantic_deltas") != Some(&JsonValue::Array(flattened_semantic_deltas)) {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan semantic_deltas do not match executor per-step deltas",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .pointer("/state_summary/store.file_len")
+        .and_then(JsonValue::as_u64)
+        != Some(expected_len)
+        || report
+            .pointer("/state_summary/store.first_byte")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_first)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan follow-up BYTES operations did not consume file bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_bytes_file_read_negative_evidence(report, report_path, &source_plan)?;
+    Ok(())
+}
+
+fn verify_dynamic_path_file_read_summary(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let summary = report
+        .get("dynamic_path_file_read_summary")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_read_summary is not an object",
+                report_path.display()
+            )
+        })?;
+    let source_path = summary
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_read_summary.source_path missing",
+                report_path.display()
+            )
+        })?;
+    let scenario_path = summary
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic_path_file_read_summary.scenario_path missing",
+                report_path.display()
+            )
+        })?;
+    let source = fs::read_to_string(source_path)?;
+    let parsed = boon_parser::parse_source(source_path.to_owned(), source)?;
+    let ir = boon_ir::lower(&parsed).map_err(|error| {
+        format!(
+            "{} could not lower dynamic-path File/read_bytes source: {error}",
+            report_path.display()
+        )
+    })?;
+    boon_ir::verify_hidden_identity(&ir)?;
+    boon_ir::verify_static_schedule(&ir)?;
+    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan_hash = boon_plan::plan_sha256(&plan)?;
+    if summary.get("plan_hash").and_then(JsonValue::as_str) != Some(plan_hash.as_str()) {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes plan_hash does not match source",
+            report_path.display()
+        )
+        .into());
+    }
+    let verification = boon_plan::verify_plan(&plan)?;
+    if verification.status != "pass" || !plan.capability_summary.typed_lowering_executable {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes MachinePlan is not verified typed executable",
+            report_path.display()
+        )
+        .into());
+    }
+    let file_read_ops = plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    if file_read_ops.len() != 1 {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes expected exactly one op, found {}",
+            report_path.display(),
+            file_read_ops.len()
+        )
+        .into());
+    }
+    let op = file_read_ops[0];
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        unreachable!("FileReadBytes op filter only returns update branches");
+    };
+    let [boon_plan::ValueRef::State(path_state_id)] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes op does not use [State(path)] operand",
+            report_path.display()
+        )
+        .into());
+    };
+    let path_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == *path_state_id)
+        .ok_or_else(|| "dynamic-path File/read_bytes missing path input slot".to_owned())?;
+    if !matches!(path_slot.value_type, boon_plan::PlanValueType::Text) {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes path operand is not TEXT state",
+            report_path.display()
+        )
+        .into());
+    }
+    let path_state_label = plan_state_label(&plan, path_state_id.0);
+    if summary.get("path_operand").and_then(JsonValue::as_str) != Some("state")
+        || summary.get("path_state").and_then(JsonValue::as_str) != Some(path_state_label.as_str())
+    {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes summary does not identify the path state",
+            report_path.display()
+        )
+        .into());
+    }
+    let rel_path = summary
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "dynamic-path File/read_bytes summary missing path".to_owned())?;
+    if !file_read_path_is_safe_relative(rel_path) {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes path is not safe relative",
+            report_path.display()
+        )
+        .into());
+    }
+    let scenario = parse_scenario(Path::new(scenario_path))?;
+    if scenario.source.as_deref() != Some(source_path) {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes scenario source mismatch",
+            report_path.display()
+        )
+        .into());
+    }
+    if summary
+        .get("selected_step_ids")
+        .and_then(JsonValue::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<Vec<_>>()
+        })
+        != Some(vec![
+            "read-file-bytes-dynamic-path",
+            "inspect-file-bytes-dynamic-path",
+        ])
+    {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes selected_step_ids changed",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifact_path = summary
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "dynamic-path File/read_bytes summary missing artifact_path".to_owned())?;
+    let bytes = fs::read(artifact_path)?;
+    let expected_len = bytes.len() as u64;
+    let expected_sha = sha256_bytes(&bytes);
+    let expected_first = bytes.first().copied().unwrap_or_default() as u64;
+    if summary.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || summary.get("sha256").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+        || summary.get("first_byte").and_then(JsonValue::as_u64) != Some(expected_first)
+        || summary.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || summary.get("mode").and_then(JsonValue::as_str)
+            != Some("typed-machine-plan-host-file-read-v1")
+        || summary.get("expression_kind").and_then(JsonValue::as_str) != Some("file_read_bytes")
+        || summary
+            .get("report_value_digest_matches_file")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || summary
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes summary does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    let executor = summary
+        .get("plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic-path File/read_bytes plan_executor is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!(
+                "{} dynamic-path File/read_bytes plan_executor.{key} must be zero",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let update = summary
+        .get("plan_executor")
+        .unwrap_or(&JsonValue::Null)
+        .pointer("/per_step/0/updates/0")
+        .ok_or_else(|| {
+            format!(
+                "{} dynamic-path File/read_bytes missing executor update",
+                report_path.display()
+            )
+        })?;
+    let value = update
+        .get("value")
+        .ok_or_else(|| "dynamic-path File/read_bytes update missing value".to_owned())?;
+    if update.get("expression_kind").and_then(JsonValue::as_str) != Some("file_read_bytes")
+        || update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            != Some(rel_path)
+        || update
+            .pointer("/update_constant_value/path_state")
+            .and_then(JsonValue::as_str)
+            != Some(path_state_label.as_str())
+        || update
+            .pointer("/update_constant_value/path_source")
+            .and_then(JsonValue::as_str)
+            != Some("state")
+        || value.get("byte_len").and_then(JsonValue::as_u64) != Some(expected_len)
+        || value.get("digest").and_then(JsonValue::as_str) != Some(expected_sha.as_str())
+    {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes executor update does not prove state-sourced read",
+            report_path.display()
+        )
+        .into());
+    }
+    let state_summary = summary.get("state_summary").unwrap_or(&JsonValue::Null);
+    if state_summary
+        .pointer("/store.file_len")
+        .and_then(JsonValue::as_u64)
+        != Some(expected_len)
+        || state_summary
+            .pointer("/store.first_byte")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_first)
+    {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes follow-up BYTES ops did not consume read bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    if json_contains_key(
+        summary.get("plan_executor").unwrap_or(&JsonValue::Null),
+        "inline_bytes",
+    ) {
+        return Err(format!(
+            "{} dynamic-path File/read_bytes proof leaked inline byte payloads",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_read_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    source_plan: &boon_plan::MachinePlan,
+) -> RuntimeResult<()> {
+    let expected = [
+        "forged-summary-digest",
+        "forged-update-digest",
+        "forged-state-digest",
+        "forged-byte-length",
+        "forged-first-byte",
+        "forged-followup-bytes-length",
+        "forged-followup-bytes-get",
+        "public-inline-bytes-leak",
+        "expression-kind-downgrade",
+        "path-parent-escape",
+        "missing-artifact",
+        "missing-file-read-update",
+        "nonzero-runtime-ast-eval",
+        "forged-plan-hash",
+        "missing-negative-evidence",
+        "forged-semantic-delta-digest",
+        "forged-executor-step-id",
+        "forged-file-read-update-op-id",
+        "host-root-path-rebind",
+        "forged-program-hash",
+        "forged-graph-node-count",
+        "forged-summary-mode",
+        "missing-live-negative-evidence",
+        "forged-live-negative-expected-error",
+        "forged-live-negative-target-kind",
+        "missing-fabricated-plan-negative-evidence",
+        "forged-fabricated-plan-negative-hash",
+        "forged-fabricated-plan-negative-check",
+        "forged-fabricated-plan-runtime-executed",
+        "fabricated-plan-extra-runtime-claim",
+        "fabricated-plan-duplicate-case",
+    ];
+    if report
+        .get("negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} negative_cases is not an array", report_path.display()))?;
+    let case_ids = cases
+        .iter()
+        .map(|case| {
+            let id = case
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("{} negative case missing id", report_path.display()))?;
+            if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+                return Err(format!(
+                    "{} negative case `{id}` was not rejected",
+                    report_path.display()
+                )
+                .into());
+            }
+            Ok(id.to_owned())
+        })
+        .collect::<RuntimeResult<BTreeSet<_>>>()?;
+    let expected_ids = expected
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect::<BTreeSet<_>>();
+    if case_ids != expected_ids {
+        return Err(format!(
+            "{} negative case ids do not match expected file-read matrix",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail is not an array",
+                report_path.display()
+            )
+        })?;
+    for id in expected {
+        let check_id = format!("negative-{id}-rejected");
+        if !checks.iter().any(|check| {
+            check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+                && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+        }) {
+            return Err(format!(
+                "{} missing passing negative check `{check_id}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    verify_bytes_file_read_live_negative_evidence(report, report_path, checks)?;
+    verify_bytes_file_read_fabricated_plan_negative_evidence(
+        report,
+        report_path,
+        checks,
+        source_plan,
+    )?;
+    Ok(())
+}
+
+struct ExpectedBytesFileReadLiveNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    expected_error_contains: &'static str,
+    target_kind: Option<&'static str>,
+}
+
+fn expected_bytes_file_read_live_negative_cases() -> Vec<ExpectedBytesFileReadLiveNegativeCase> {
+    let mut cases = vec![
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "source-empty-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "source-absolute-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "source-parent-directory-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-dynamic-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "may not contain parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "may not contain parent-directory segments",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-file",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "cannot read `missing.bin`",
+            target_kind: Some("missing"),
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-fixed-output-length-mismatch",
+            category: "runtime-type-policy",
+            stage: "plan-executor",
+            expected_error_contains: "fixed length 1 does not match produced length 4",
+            target_kind: Some("file"),
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "typecheck-indexed-row-field-non-text-path",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            expected_error_contains: "File/read_bytes",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-target-row",
+            category: "indexed-row-dispatch-policy",
+            stage: "plan-executor",
+            expected_error_contains: "target key/generation 999/1 not found",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "typecheck-indexed-row-field-unknown-path-field",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            expected_error_contains: "missing_path",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
+            category: "indexed-row-shape-policy",
+            stage: "plan-executor",
+            expected_error_contains: "is not in the static schedule symbol table",
+            target_kind: None,
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-missing-file",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "cannot read `missing.bin`",
+            target_kind: Some("missing"),
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-directory-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            expected_error_contains: "cannot read `directory-target`",
+            target_kind: Some("directory"),
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "runtime-fixed-output-length-mismatch",
+            category: "runtime-type-policy",
+            stage: "plan-executor",
+            expected_error_contains: "fixed length 1 does not match produced length 4",
+            target_kind: Some("file"),
+        },
+        ExpectedBytesFileReadLiveNegativeCase {
+            id: "plan-wrong-output-type",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            expected_error_contains: "`HOLD` update must match the held value type",
+            target_kind: Some("file"),
+        },
+    ];
+
+    #[cfg(unix)]
+    cases.push(ExpectedBytesFileReadLiveNegativeCase {
+        id: "runtime-symlink-escape",
+        category: "runtime-path-policy",
+        stage: "plan-executor",
+        expected_error_contains: "escapes source root",
+        target_kind: Some("symlink_escape"),
+    });
+
+    cases
+}
+
+fn verify_bytes_file_read_live_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+) -> RuntimeResult<()> {
+    let expected = expected_bytes_file_read_live_negative_cases();
+    if report
+        .get("live_negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan live_negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("live_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} live_negative_cases is not an array",
+                report_path.display()
+            )
+        })?;
+    let artifact_paths = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    let mut seen_ids = BTreeSet::new();
+    for expected_case in &expected {
+        let case = cases
+            .iter()
+            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
+            .ok_or_else(|| {
+                format!(
+                    "{} missing live File/read_bytes negative case `{}`",
+                    report_path.display(),
+                    expected_case.id
+                )
+            })?;
+        seen_ids.insert(expected_case.id.to_owned());
+        verify_bytes_file_read_live_negative_case(
+            case,
+            expected_case,
+            report_path,
+            checks,
+            &artifact_paths,
+        )?;
+    }
+    let expected_ids = expected
+        .iter()
+        .map(|case| case.id.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ids = cases
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{} live negative case missing id", report_path.display()))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if seen_ids != expected_ids || actual_ids != expected_ids {
+        return Err(format!(
+            "{} live File/read_bytes negative case ids do not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_read_live_negative_case(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileReadLiveNegativeCase,
+    report_path: &Path,
+    checks: &[JsonValue],
+    artifact_paths: &BTreeSet<String>,
+) -> RuntimeResult<()> {
+    for (key, value) in [
+        ("category", expected.category),
+        ("stage", expected.stage),
+        ("target_profile", "software_default"),
+        ("expected_error_contains", expected.expected_error_contains),
+    ] {
+        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
+            return Err(format!(
+                "{} live File/read_bytes negative case `{}` has wrong `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} live File/read_bytes negative case `{}` was not rejected",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    if case.get("selected_step_ids") != Some(&json!(["load"])) {
+        return Err(format!(
+            "{} live File/read_bytes negative case `{}` has wrong selected steps",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let source_path = case
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/read_bytes negative case `{}` missing source_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    let scenario_path = case
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/read_bytes negative case `{}` missing scenario_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    if case.get("source_sha256").and_then(JsonValue::as_str)
+        != Some(sha256_file(Path::new(source_path))?.as_str())
+        || case.get("scenario_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_file(Path::new(scenario_path))?.as_str())
+    {
+        return Err(format!(
+            "{} live File/read_bytes negative case `{}` has stale source/scenario hash",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    for path in [source_path, scenario_path] {
+        if !artifact_paths.contains(path) {
+            return Err(format!(
+                "{} live File/read_bytes negative case `{}` missing artifact hash for `{path}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    let detail = case
+        .get("detail")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/read_bytes negative case `{}` missing detail",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    if !detail.contains(expected.expected_error_contains)
+        || case.get("detail_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_bytes(detail.as_bytes()).as_str())
+    {
+        return Err(format!(
+            "{} live File/read_bytes negative case `{}` has forged error evidence",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let check_id = format!("live-negative-{}-rejected", expected.id);
+    if !checks.iter().any(|check| {
+        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+    }) {
+        return Err(format!(
+            "{} missing passing live negative check `{check_id}`",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_bytes_file_read_live_negative_target(
+        case,
+        expected,
+        report_path,
+        artifact_paths,
+        source_path,
+    )
+}
+
+fn verify_bytes_file_read_live_negative_target(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileReadLiveNegativeCase,
+    report_path: &Path,
+    artifact_paths: &BTreeSet<String>,
+    source_path: &str,
+) -> RuntimeResult<()> {
+    let Some(expected_kind) = expected.target_kind else {
+        if case.get("target_kind").is_some() || case.get("target_path").is_some() {
+            return Err(format!(
+                "{} live File/read_bytes negative case `{}` unexpectedly has target metadata",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+        return Ok(());
+    };
+    if case.get("target_kind").and_then(JsonValue::as_str) != Some(expected_kind) {
+        return Err(format!(
+            "{} live File/read_bytes negative case `{}` has wrong target_kind",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let target_path = case
+        .get("target_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live File/read_bytes negative case `{}` missing target_path",
+                report_path.display(),
+                expected.id
+            )
+        })?;
+    let target = Path::new(target_path);
+    match expected_kind {
+        "missing" => {
+            if target.exists() {
+                return Err(format!(
+                    "{} live File/read_bytes negative case `{}` target should be missing",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "directory" => {
+            if !target.is_dir() {
+                return Err(format!(
+                    "{} live File/read_bytes negative case `{}` target should be a directory",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "file" => {
+            if !target.is_file() || !artifact_paths.contains(target_path) {
+                return Err(format!(
+                    "{} live File/read_bytes negative case `{}` target file is missing or unhashed",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        "symlink_escape" => {
+            let metadata = fs::symlink_metadata(target)?;
+            if !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "{} live File/read_bytes negative case `{}` target should be a symlink",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+            let source_root = Path::new(source_path)
+                .parent()
+                .ok_or_else(|| {
+                    format!(
+                        "{} live File/read_bytes negative case `{}` source has no parent",
+                        report_path.display(),
+                        expected.id
+                    )
+                })?
+                .canonicalize()?;
+            let target_canonical = target.canonicalize()?;
+            if target_canonical.starts_with(source_root) {
+                return Err(format!(
+                    "{} live File/read_bytes negative case `{}` symlink target does not escape source root",
+                    report_path.display(),
+                    expected.id
+                )
+                .into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "{} live File/read_bytes negative case `{}` has unsupported target kind `{other}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedBytesFileReadFabricatedPlanMutation {
+    MissingPathOperand,
+    ExtraPathOperand,
+    RowFieldPathOpNotIndexed,
+    RowFieldPathInputMissing,
+    RowFieldPathForeignList,
+    MissingPathConstant,
+    NonTextPathConstant,
+    NonStaticParentPath,
+    MissingSourceInput,
+    ExtraSourceInput,
+    StateInputDeclared,
+    SourcePayloadInputDeclared,
+    UpdateConstantPresent,
+    SourcePayloadFieldPresent,
+    OutputNotBytes,
+}
+
+struct ExpectedBytesFileReadFabricatedPlanCase {
+    id: &'static str,
+    category: &'static str,
+    mutation: ExpectedBytesFileReadFabricatedPlanMutation,
+}
+
+fn expected_bytes_file_read_fabricated_plan_cases() -> Vec<ExpectedBytesFileReadFabricatedPlanCase>
+{
+    use ExpectedBytesFileReadFabricatedPlanMutation::*;
+    vec![
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-path-operand",
+            category: "operand-shape",
+            mutation: MissingPathOperand,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-extra-path-operand",
+            category: "operand-shape",
+            mutation: ExtraPathOperand,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-op-not-indexed",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathOpNotIndexed,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-input-missing",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathInputMissing,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-foreign-list",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathForeignList,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-path-constant",
+            category: "constant-binding",
+            mutation: MissingPathConstant,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-non-text-path-constant",
+            category: "constant-binding",
+            mutation: NonTextPathConstant,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-non-static-parent-path",
+            category: "path-policy",
+            mutation: NonStaticParentPath,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-source-input",
+            category: "operand-shape",
+            mutation: MissingSourceInput,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-extra-source-input",
+            category: "operand-shape",
+            mutation: ExtraSourceInput,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-state-input-declared",
+            category: "operand-shape",
+            mutation: StateInputDeclared,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-source-payload-input-declared",
+            category: "operand-shape",
+            mutation: SourcePayloadInputDeclared,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-update-constant-present",
+            category: "operand-shape",
+            mutation: UpdateConstantPresent,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-source-payload-field-present",
+            category: "operand-shape",
+            mutation: SourcePayloadFieldPresent,
+        },
+        ExpectedBytesFileReadFabricatedPlanCase {
+            id: "fabricated-output-not-bytes",
+            category: "type-policy",
+            mutation: OutputNotBytes,
+        },
+    ]
+}
+
+fn verify_bytes_file_read_fabricated_plan_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+    source_plan: &boon_plan::MachinePlan,
+) -> RuntimeResult<()> {
+    let expected = expected_bytes_file_read_fabricated_plan_cases();
+    if report
+        .get("fabricated_plan_negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(expected.len() as u64)
+    {
+        return Err(format!(
+            "{} verify-bytes-file-read-plan fabricated_plan_negative_case_count is missing or wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    let cases = report
+        .get("fabricated_plan_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} fabricated_plan_negative_cases is not an array",
+                report_path.display()
+            )
+        })?;
+    if cases.len() != expected.len() {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case array length does not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_ids = expected
+        .iter()
+        .map(|case| case.id.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ids = cases
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "{} fabricated File/read_bytes negative case missing id",
+                        report_path.display()
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case ids do not match expected matrix",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let base_plan_hash = boon_plan::plan_sha256(source_plan).map_err(|error| {
+        format!(
+            "{} cannot hash source plan while checking fabricated negatives: {error}",
+            report_path.display()
+        )
+    })?;
+    for expected_case in &expected {
+        let case = cases
+            .iter()
+            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
+            .ok_or_else(|| {
+                format!(
+                    "{} missing fabricated File/read_bytes negative case `{}`",
+                    report_path.display(),
+                    expected_case.id
+                )
+            })?;
+        verify_bytes_file_read_fabricated_plan_negative_case(
+            case,
+            expected_case,
+            source_plan,
+            &base_plan_hash,
+            report_path,
+            checks,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_read_fabricated_plan_negative_case(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileReadFabricatedPlanCase,
+    source_plan: &boon_plan::MachinePlan,
+    base_plan_hash: &str,
+    report_path: &Path,
+    checks: &[JsonValue],
+) -> RuntimeResult<()> {
+    let allowed_keys = [
+        "id",
+        "category",
+        "stage",
+        "mutation",
+        "target_profile",
+        "evidence_level",
+        "runtime_executed",
+        "runtime_non_execution_reason",
+        "base_plan_hash",
+        "fabricated_plan_hash",
+        "mutated_plan_hash",
+        "expected_verification_status",
+        "actual_verification_status",
+        "expected_failed_check_ids",
+        "actual_failed_check_ids",
+        "failed_check_ids",
+        "error_count",
+        "boon_plan_verification",
+        "rejected",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let object = case.as_object().ok_or_else(|| {
+        format!(
+            "{} fabricated File/read_bytes negative case `{}` is not an object",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    for key in object.keys() {
+        if !allowed_keys.contains(key.as_str()) {
+            return Err(format!(
+                "{} fabricated File/read_bytes negative case `{}` has unsupported key `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    for (key, value) in [
+        ("category", expected.category),
+        ("stage", "machine-plan-verifier"),
+        ("mutation", expected.mutation.as_str()),
+        ("target_profile", "software_default"),
+        ("evidence_level", "verifier-only"),
+        (
+            "runtime_non_execution_reason",
+            "fabricated MachinePlan is checked with boon_plan::verify_plan only",
+        ),
+        ("base_plan_hash", base_plan_hash),
+        ("expected_verification_status", "fail"),
+    ] {
+        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
+            return Err(format!(
+                "{} fabricated File/read_bytes negative case `{}` has wrong `{key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    if case.get("runtime_executed").and_then(JsonValue::as_bool) != Some(false)
+        || case.get("rejected").and_then(JsonValue::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case `{}` has wrong execution/rejection boundary",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+
+    let mut mutated_plan = source_plan.clone();
+    mutate_expected_bytes_file_read_plan(&mut mutated_plan, expected.mutation)?;
+    let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan).map_err(|error| {
+        format!(
+            "{} cannot hash fabricated File/read_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    for hash_key in ["mutated_plan_hash", "fabricated_plan_hash"] {
+        if case.get(hash_key).and_then(JsonValue::as_str) != Some(mutated_plan_hash.as_str()) {
+            return Err(format!(
+                "{} fabricated File/read_bytes negative case `{}` has wrong `{hash_key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+
+    let verification = boon_plan::verify_plan(&mutated_plan).map_err(|error| {
+        format!(
+            "{} cannot verify fabricated File/read_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    if verification.status != "fail" {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case `{}` unexpectedly verifies",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let expected_verification_json = serde_json::to_value(&verification).map_err(|error| {
+        format!(
+            "{} cannot serialize verification for fabricated File/read_bytes negative `{}`: {error}",
+            report_path.display(),
+            expected.id
+        )
+    })?;
+    if case.get("boon_plan_verification") != Some(&expected_verification_json) {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case `{}` has stale or forged verification",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    if case
+        .get("actual_verification_status")
+        .and_then(JsonValue::as_str)
+        != Some(verification.status.as_str())
+        || case.get("error_count").and_then(JsonValue::as_u64)
+            != Some(verification.error_count as u64)
+    {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case `{}` has wrong verification summary",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let failed_check_ids = verification
+        .checks
+        .iter()
+        .filter(|check| !check.pass)
+        .map(|check| check.id.clone())
+        .collect::<Vec<_>>();
+    if !failed_check_ids
+        .iter()
+        .any(|id| id == "file-read-bytes-ops-well-formed")
+    {
+        return Err(format!(
+            "{} fabricated File/read_bytes negative case `{}` was not rejected by the FileReadBytes verifier check",
+            report_path.display(),
+            expected.id
+        )
+        .into());
+    }
+    let failed_check_ids_json = json!(failed_check_ids);
+    for ids_key in [
+        "expected_failed_check_ids",
+        "actual_failed_check_ids",
+        "failed_check_ids",
+    ] {
+        if case.get(ids_key) != Some(&failed_check_ids_json) {
+            return Err(format!(
+                "{} fabricated File/read_bytes negative case `{}` has wrong `{ids_key}`",
+                report_path.display(),
+                expected.id
+            )
+            .into());
+        }
+    }
+    let check_id = format!("fabricated-plan-negative-{}-rejected", expected.id);
+    if !checks.iter().any(|check| {
+        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+    }) {
+        return Err(format!(
+            "{} missing passing fabricated negative check `{check_id}`",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+impl ExpectedBytesFileReadFabricatedPlanMutation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingPathOperand => "missing_path_operand",
+            Self::ExtraPathOperand => "extra_path_operand",
+            Self::RowFieldPathOpNotIndexed => "row_field_path_op_not_indexed",
+            Self::RowFieldPathInputMissing => "row_field_path_input_missing",
+            Self::RowFieldPathForeignList => "row_field_path_foreign_list",
+            Self::MissingPathConstant => "missing_path_constant",
+            Self::NonTextPathConstant => "non_text_path_constant",
+            Self::NonStaticParentPath => "non_static_parent_path",
+            Self::MissingSourceInput => "missing_source_input",
+            Self::ExtraSourceInput => "extra_source_input",
+            Self::StateInputDeclared => "state_input_declared",
+            Self::SourcePayloadInputDeclared => "source_payload_input_declared",
+            Self::UpdateConstantPresent => "update_constant_present",
+            Self::SourcePayloadFieldPresent => "source_payload_field_present",
+            Self::OutputNotBytes => "output_not_bytes",
+        }
+    }
+}
+
+fn mutate_expected_bytes_file_read_plan(
+    plan: &mut boon_plan::MachinePlan,
+    mutation: ExpectedBytesFileReadFabricatedPlanMutation,
+) -> RuntimeResult<()> {
+    let (region_index, op_index) = expected_bytes_file_read_plan_op_location(plan)?;
+    let path_constant_id = expected_bytes_file_read_path_constant_id(plan, region_index, op_index)?;
+    let output_state_id = expected_bytes_file_read_output_state_id(plan, region_index, op_index)?;
+    let source_id = plan
+        .source_routes
+        .first()
+        .map(|route| route.source_id)
+        .ok_or_else(|| {
+            "source plan has no source routes for fabricated FileReadBytes mutation".to_owned()
+        })?;
+    match mutation {
+        ExpectedBytesFileReadFabricatedPlanMutation::MissingPathOperand => {
+            expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::ExtraPathOperand => {
+            expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?
+                .push(boon_plan::ValueRef::Constant(path_constant_id));
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = false;
+            op.inputs.push(field_ref.clone());
+            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![field_ref];
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathInputMissing => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            plan.regions[region_index].ops[op_index].indexed = true;
+            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![field_ref];
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathForeignList => {
+            let path_field_id = install_expected_foreign_row_field_path_scope(
+                plan,
+                output_state_id,
+                boon_plan::PlanValueType::Bytes { fixed_len: None },
+            )?;
+            let field_ref = boon_plan::ValueRef::Field(path_field_id);
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = true;
+            if !op.inputs.contains(&field_ref) {
+                op.inputs.push(field_ref.clone());
+            }
+            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![field_ref];
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::MissingPathConstant => {
+            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(
+                    999_999,
+                ))];
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::NonTextPathConstant => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or_else(|| "source plan missing FileReadBytes path constant".to_owned())?;
+            constant.value = boon_plan::PlanConstantValue::Number { value: 7 };
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::NonStaticParentPath => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or_else(|| "source plan missing FileReadBytes path constant".to_owned())?;
+            constant.value = boon_plan::PlanConstantValue::Text {
+                value: "../small.bin".to_owned(),
+            };
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::MissingSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .retain(|input| !matches!(input, boon_plan::ValueRef::Source(_)));
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::ExtraSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                    source_id.0.saturating_add(999_999),
+                )));
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::StateInputDeclared => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::State(output_state_id));
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::SourcePayloadInputDeclared => {
+            plan.regions[region_index].ops[op_index].inputs.push(
+                boon_plan::ValueRef::SourcePayload {
+                    source_id,
+                    field: boon_ir::SourcePayloadField::Text,
+                },
+            );
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::UpdateConstantPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                update_constant_id, ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *update_constant_id = Some(path_constant_id);
+            }
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::SourcePayloadFieldPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                source_payload_field,
+                ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+            }
+        }
+        ExpectedBytesFileReadFabricatedPlanMutation::OutputNotBytes => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    "source plan missing FileReadBytes output storage slot".to_owned()
+                })?;
+            slot.value_type = boon_plan::PlanValueType::Text;
+        }
+    }
+    Ok(())
+}
+
+fn expected_bytes_file_read_plan_op_location(
+    plan: &boon_plan::MachinePlan,
+) -> RuntimeResult<(usize, usize)> {
+    plan.regions
+        .iter()
+        .enumerate()
+        .find_map(|(region_index, region)| {
+            region
+                .ops
+                .iter()
+                .enumerate()
+                .find(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        boon_plan::PlanOpKind::UpdateBranch {
+                            expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                            ..
+                        }
+                    )
+                })
+                .map(|(op_index, _)| (region_index, op_index))
+        })
+        .ok_or_else(|| "source plan has no FileReadBytes op".into())
+}
+
+fn expected_bytes_file_read_path_constant_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<boon_plan::PlanConstantId> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileReadBytes op is not an update branch".into());
+    };
+    let [boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
+        return Err("FileReadBytes op does not have one path constant input".into());
+    };
+    Ok(*path_constant_id)
+}
+
+fn expected_bytes_file_read_output_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<boon_ir::StateId> {
+    let Some(boon_plan::ValueRef::State(state_id)) =
+        plan.regions[region_index].ops[op_index].output.as_ref()
+    else {
+        return Err("FileReadBytes op does not have a state output".into());
+    };
+    Ok(*state_id)
+}
+
+fn expected_bytes_file_read_ordered_inputs_mut(
+    plan: &mut boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> RuntimeResult<&mut Vec<boon_plan::ValueRef>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &mut plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileReadBytes op is not an update branch".into());
+    };
+    Ok(ordered_inputs)
+}
+
+fn file_read_path_is_safe_relative(value: &str) -> bool {
+    if value.is_empty() || Path::new(value).is_absolute() {
+        return false;
+    }
+    Path::new(value)
+        .components()
+        .all(|component| matches!(component, Component::CurDir | Component::Normal(_)))
+}
+
+fn json_contains_key(value: &JsonValue, key: &str) -> bool {
+    match value {
+        JsonValue::Object(map) => {
+            map.contains_key(key) || map.values().any(|value| json_contains_key(value, key))
+        }
+        JsonValue::Array(values) => values.iter().any(|value| json_contains_key(value, key)),
+        _ => false,
+    }
+}
+
+struct ExpectedRootScalarScenario {
+    state_summary: JsonValue,
+    list_summary: JsonValue,
+    semantic_delta_signatures: JsonValue,
+    semantic_deltas: JsonValue,
+    per_step: JsonValue,
+    initialized_root_state_count: usize,
+    executed_update_branch_count: usize,
+    executed_derived_value_count: usize,
+    executed_list_append_count: usize,
+    executed_list_remove_count: usize,
+    executed_indexed_update_count: usize,
+    emitted_source_bind_count: usize,
+    emitted_source_unbind_count: usize,
+    executed_list_retain_count: usize,
+    executed_list_view_count: usize,
+    retained_list_row_count: usize,
+    list_view_summary: JsonValue,
+    list_retains: JsonValue,
+}
+
+type ExpectedRootBytesState = BTreeMap<usize, Vec<u8>>;
+
+fn expected_root_scalar_scenario_execution(
+    plan: &boon_plan::MachinePlan,
+    scenario: &Scenario,
+    selected_step_ids: &[String],
+    report_path: &Path,
+) -> RuntimeResult<ExpectedRootScalarScenario> {
+    let (mut state, mut bytes_state, initialized_root_state_count) =
+        expected_root_scalar_initial_state(plan, report_path)?;
+    let mut list_state = expected_initial_list_state(plan, report_path)?;
+    let mut per_step = Vec::new();
+    let mut signatures = Vec::new();
+    let mut semantic_deltas = Vec::new();
+    let mut executed_update_branch_count = 0usize;
+    let mut executed_derived_value_count = 0usize;
+    let mut executed_list_append_count = 0usize;
+    let mut executed_list_remove_count = 0usize;
+    let mut executed_indexed_update_count = 0usize;
+    let mut emitted_source_bind_count = 0usize;
+    let mut emitted_source_unbind_count = 0usize;
+    let mut executed_list_retain_count = 0usize;
+    let mut executed_list_view_count = 0usize;
+    let mut retained_list_row_count = 0usize;
+    for step_id in selected_step_ids {
+        let step = scenario
+            .step
+            .iter()
+            .find(|step| step.id == *step_id)
+            .ok_or_else(|| {
+                format!(
+                    "{} scenario has no selected step `{step_id}`",
+                    report_path.display()
+                )
+            })?;
+        let source_event = scenario_source_event_json(step, report_path)?;
+        let source = source_event
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{} source_event.source is missing", report_path.display()))?;
+        let source_id = plan_source_id_for_label(plan, source).ok_or_else(|| {
+            format!(
+                "{} MachinePlan has no source route `{source}`",
+                report_path.display()
+            )
+        })?;
+        let source_route_slot = plan
+            .source_routes
+            .iter()
+            .find(|route| route.source_id.0 == source_id)
+            .ok_or_else(|| {
+                format!(
+                    "{} source route `{source}` has no route slot",
+                    report_path.display()
+                )
+            })?;
+        let source_event_object = source_event
+            .as_object()
+            .ok_or("source event JSON is not an object")?;
+        let derived_values = expected_derived_values_for_source(
+            plan,
+            source_id,
+            source_event_object,
+            &state,
+            report_path,
+        )?;
+        let root_update_key_gate = source_key_gate_for_root_updates(plan, source_id);
+        let root_update_key_matches = root_update_key_gate.as_ref().is_none_or(|required| {
+            source_event_object.get("key").and_then(JsonValue::as_str) == Some(required.as_str())
+        });
+        let route_ops = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == boon_plan::RegionKind::UpdateBranches)
+            .flat_map(|region| region.ops.iter())
+            .filter(|op| {
+                op.inputs.iter().any(
+                    |input| matches!(input, boon_plan::ValueRef::Source(id) if id.0 == source_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let route_has_list_remove = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+            .flat_map(|region| region.ops.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    boon_plan::PlanOpKind::ListOperation {
+                        operation_kind: boon_plan::PlanListOperationKind::Remove,
+                        remove: Some(remove),
+                        ..
+                    } if remove.source == boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)),
+                )
+            });
+        if route_ops.is_empty() && derived_values.is_empty() && !route_has_list_remove {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario source route `{source}` has no executable selected-surface work",
+                report_path.display()
+            )
+            .into());
+        }
+        let mut touched = serde_json::Map::new();
+        let mut touched_updates: BTreeMap<usize, (ExpectedRootScalarUpdate, Vec<usize>)> =
+            BTreeMap::new();
+        let mut step_signatures = Vec::new();
+        let mut step_deltas = Vec::new();
+        let mut updates = Vec::new();
+        let mut derived = Vec::new();
+        let mut indexed_updates = Vec::new();
+        let mut list_removes = Vec::new();
+        let root_derived_values_before_updates =
+            expected_root_pure_number_compare_values(plan, &list_state)?;
+        for (field_id, value) in &derived_values {
+            let field_label = plan_derived_field_label(plan, field_id.0);
+            let signature = format!("FieldSet:{field_label}");
+            step_signatures.push(json!(signature.clone()));
+            signatures.push(json!(signature));
+            let delta = json!({
+                "kind": "FieldSet",
+                "list_id": null,
+                "key": null,
+                "generation": null,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": field_label,
+                "value": value,
+            });
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+            derived.push(json!({
+                "field_id": field_id.0,
+                "field_path": plan_derived_field_label(plan, field_id.0),
+                "value": value,
+            }));
+            executed_derived_value_count += 1;
+        }
+
+        let append_result =
+            expected_append_list_rows(plan, &mut list_state, &derived_values, report_path)?;
+        for delta in &append_result.semantic_deltas {
+            let signature = plan_json_delta_signature(delta, report_path)?;
+            step_signatures.push(json!(signature.clone()));
+            signatures.push(json!(signature));
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        executed_list_append_count += append_result.appended_row_count;
+        emitted_source_bind_count += append_result.source_bind_count;
+
+        let remove_result = expected_remove_list_rows_for_source(
+            plan,
+            source_id,
+            source_route_slot,
+            source_event_object,
+            &mut list_state,
+            report_path,
+        )?;
+        for delta in &remove_result.semantic_deltas {
+            let signature = plan_json_delta_signature(delta, report_path)?;
+            step_signatures.push(json!(signature.clone()));
+            signatures.push(json!(signature));
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        executed_list_remove_count += remove_result.removed_row_count;
+        emitted_source_unbind_count += remove_result.source_unbind_count;
+        executed_derived_value_count += remove_result.derived_count;
+        derived.extend(remove_result.report_derived);
+        list_removes.extend(remove_result.report_rows);
+
+        let mut row_resolution_cache = BTreeMap::new();
+        for op in route_ops {
+            if !root_update_key_matches {
+                continue;
+            }
+            if op.indexed {
+                let mut indexed_executions = Vec::new();
+                let mut bulk_indexed_update = false;
+                if let Some((list_label, targets)) = expected_unscoped_indexed_update_targets(
+                    plan,
+                    op,
+                    source_route_slot,
+                    source_event_object,
+                    &list_state,
+                    report_path,
+                )? {
+                    bulk_indexed_update = true;
+                    for (key, generation) in targets {
+                        let mut row_event = source_event_object.clone();
+                        row_event.insert("list_id".to_owned(), json!(list_label));
+                        row_event.insert("target_key".to_owned(), json!(key));
+                        row_event.insert("target_generation".to_owned(), json!(generation));
+                        let mut per_row_resolution_cache = BTreeMap::new();
+                        indexed_executions.push(expected_indexed_update_branch(
+                            plan,
+                            op,
+                            source_id,
+                            source_route_slot,
+                            &row_event,
+                            &mut list_state,
+                            &mut per_row_resolution_cache,
+                            &root_derived_values_before_updates,
+                            report_path,
+                        )?);
+                    }
+                } else {
+                    indexed_executions.push(expected_indexed_update_branch(
+                        plan,
+                        op,
+                        source_id,
+                        source_route_slot,
+                        source_event_object,
+                        &mut list_state,
+                        &mut row_resolution_cache,
+                        &root_derived_values_before_updates,
+                        report_path,
+                    )?);
+                }
+                let ordered_indexed_deltas = if bulk_indexed_update {
+                    let mut primary = Vec::new();
+                    let mut derived = Vec::new();
+                    for indexed in &indexed_executions {
+                        let output_field = indexed
+                            .report_rows
+                            .first()
+                            .and_then(|row| row.get("field_path"))
+                            .and_then(JsonValue::as_str);
+                        for delta in &indexed.semantic_deltas {
+                            if delta.get("field_path").and_then(JsonValue::as_str) == output_field {
+                                primary.push(delta.clone());
+                            } else {
+                                derived.push(delta.clone());
+                            }
+                        }
+                    }
+                    primary.extend(derived);
+                    primary
+                } else {
+                    indexed_executions
+                        .iter()
+                        .flat_map(|indexed| indexed.semantic_deltas.iter().cloned())
+                        .collect()
+                };
+                for delta in &ordered_indexed_deltas {
+                    let signature = plan_json_delta_signature(delta, report_path)?;
+                    step_signatures.push(json!(signature.clone()));
+                    signatures.push(json!(signature));
+                    semantic_deltas.push(delta.clone());
+                    step_deltas.push(delta.clone());
+                }
+                for indexed in indexed_executions {
+                    executed_update_branch_count += indexed.updated_row_count;
+                    executed_indexed_update_count += indexed.updated_row_count;
+                    indexed_updates.extend(indexed.report_rows);
+                }
+                continue;
+            }
+            if op.unresolved_executable_ref_count != 0 {
+                return Err(format!(
+                    "{} run-plan-root-scalar-scenario selected op {} is unresolved",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            }
+            let Some(boon_plan::ValueRef::State(state_id)) = op.output else {
+                return Err(format!(
+                    "{} run-plan-root-scalar-scenario selected op {} does not target state",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            };
+            if !plan_state_is_root_scalar(plan, state_id.0) {
+                return Err(format!(
+                    "{} run-plan-root-scalar-scenario selected op {} targets non-root state {}",
+                    report_path.display(),
+                    op.id.0,
+                    state_id.0
+                )
+                .into());
+            }
+            let expected_update = expected_root_scalar_update(
+                plan,
+                op,
+                source_id,
+                source_route_slot,
+                source_event_object,
+                &state,
+                &bytes_state,
+                report_path,
+            )?;
+            let Some(expected_update) = expected_update else {
+                continue;
+            };
+            match touched_updates.get_mut(&state_id.0) {
+                Some((existing, op_ids))
+                    if existing.value == expected_update.value
+                        && existing.private_bytes == expected_update.private_bytes =>
+                {
+                    op_ids.push(op.id.0);
+                    continue;
+                }
+                Some((existing, _)) => {
+                    return Err(format!(
+                        "{} run-plan-root-scalar-scenario has conflicting candidate state {} for source `{source}`: {:?} vs {:?}",
+                        report_path.display(),
+                        state_id.0,
+                        existing.value,
+                        expected_update.value
+                    )
+                    .into());
+                }
+                None => {
+                    touched_updates.insert(state_id.0, (expected_update, vec![op.id.0]));
+                }
+            }
+        }
+        for (state_id, (expected_update, op_ids)) in touched_updates {
+            let target = plan_state_label(plan, state_id);
+            let changed = state.get(&target) != Some(&expected_update.value);
+            state.insert(target.clone(), expected_update.value.clone());
+            if let Some(bytes) = expected_update.private_bytes.clone() {
+                bytes_state.insert(state_id, bytes);
+            } else {
+                bytes_state.remove(&state_id);
+            }
+            if changed {
+                touched.insert(target.clone(), expected_update.value.clone());
+                let signature = format!("FieldSet:{target}");
+                step_signatures.push(json!(signature.clone()));
+                signatures.push(json!(signature));
+                let delta_value = expected_root_semantic_delta_value(&expected_update.value);
+                let delta = json!({
+                    "kind": "FieldSet",
+                    "list_id": null,
+                    "key": null,
+                    "generation": null,
+                    "source_id": null,
+                    "bind_epoch": null,
+                    "field_path": target.clone(),
+                    "value": delta_value,
+                });
+                semantic_deltas.push(delta.clone());
+                step_deltas.push(delta);
+            }
+            updates.push(json!({
+                "source_id": source_id,
+                "target_state": target,
+                "target_state_id": state_id,
+                "update_op_id": op_ids[0],
+                "candidate_update_op_ids": op_ids,
+                "expression_kind": expected_update.expression_kind,
+                "source_payload_field": expected_update.source_payload_field,
+                "update_constant_id": expected_update.update_constant_id,
+                "update_constant_value": expected_update.update_constant_value,
+                "host_effect": null,
+                "selected_op_indexed": false,
+                "selected_op_unresolved_executable_ref_count": 0,
+                "value": expected_update.value,
+                "changed": changed,
+            }));
+            executed_update_branch_count += 1;
+        }
+        let boundary_indexed_deltas =
+            expected_refresh_all_indexed_derived_fields(plan, &mut list_state, report_path)?;
+        for delta in &boundary_indexed_deltas {
+            let signature = plan_json_delta_signature(delta, report_path)?;
+            step_signatures.push(json!(signature.clone()));
+            signatures.push(json!(signature));
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        let retain_execution =
+            expected_materialize_plan_list_retains(plan, &state, &list_state, report_path)?;
+        executed_list_retain_count += retain_execution.executed_count;
+        executed_list_view_count += retain_execution.view_count;
+        retained_list_row_count += retain_execution.retained_row_count;
+        per_step.push(json!({
+            "step_id": step.id,
+            "source": source,
+            "source_id": source_id,
+            "executed_update_branch_count": touched.len() + indexed_updates.len(),
+            "executed_derived_value_count": derived.len(),
+            "executed_list_append_count": append_result.appended_row_count,
+            "executed_list_remove_count": list_removes.len(),
+            "executed_indexed_update_count": indexed_updates.len(),
+            "executed_list_retain_count": retain_execution.executed_count,
+            "executed_list_view_count": retain_execution.view_count,
+            "retained_list_row_count": retain_execution.retained_row_count,
+            "emitted_source_bind_count": append_result.source_bind_count,
+            "emitted_source_unbind_count": remove_result.source_unbind_count,
+            "derived": derived,
+            "list_appends": append_result.report_rows,
+            "list_removes": list_removes,
+            "list_retains": retain_execution.reports,
+            "list_view_summary": JsonValue::Object(retain_execution.summary),
+            "indexed_updates": indexed_updates,
+            "updates": updates,
+            "touched_state_summary": JsonValue::Object(touched),
+            "semantic_delta_signatures": JsonValue::Array(step_signatures),
+            "semantic_deltas": JsonValue::Array(step_deltas),
+        }));
+    }
+    let final_retain_execution =
+        expected_materialize_plan_list_retains(plan, &state, &list_state, report_path)?;
+    Ok(ExpectedRootScalarScenario {
+        state_summary: JsonValue::Object(state),
+        list_summary: expected_list_summary(plan, &list_state),
+        semantic_delta_signatures: JsonValue::Array(signatures),
+        semantic_deltas: JsonValue::Array(semantic_deltas),
+        per_step: JsonValue::Array(per_step),
+        initialized_root_state_count,
+        executed_update_branch_count,
+        executed_derived_value_count,
+        executed_list_append_count,
+        executed_list_remove_count,
+        executed_indexed_update_count,
+        emitted_source_bind_count,
+        emitted_source_unbind_count,
+        executed_list_retain_count,
+        executed_list_view_count,
+        retained_list_row_count,
+        list_view_summary: JsonValue::Object(final_retain_execution.summary),
+        list_retains: JsonValue::Array(final_retain_execution.reports),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedPlanListRowState {
+    key: u64,
+    generation: u64,
+    fields: BTreeMap<String, JsonValue>,
+    private_bytes: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpectedPlanRowEvalKey {
+    list_id: usize,
+    row_key: u64,
+    field_id: usize,
+}
+
+struct ExpectedListAppendExecution {
+    semantic_deltas: Vec<JsonValue>,
+    report_rows: Vec<JsonValue>,
+    appended_row_count: usize,
+    source_bind_count: usize,
+}
+
+struct ExpectedListRemoveExecution {
+    semantic_deltas: Vec<JsonValue>,
+    report_rows: Vec<JsonValue>,
+    report_derived: Vec<JsonValue>,
+    removed_row_count: usize,
+    source_unbind_count: usize,
+    derived_count: usize,
+}
+
+#[derive(Default)]
+struct ExpectedListRetainExecution {
+    summary: serde_json::Map<String, JsonValue>,
+    reports: Vec<JsonValue>,
+    executed_count: usize,
+    view_count: usize,
+    retained_row_count: usize,
+}
+
+struct ExpectedListRemoveTarget {
+    row_index: usize,
+    row: ExpectedPlanListRowState,
+    row_resolution: JsonValue,
+    source_binding_id: Option<u64>,
+    bind_epoch: Option<u64>,
+}
+
+struct ExpectedIndexedUpdateExecution {
+    semantic_deltas: Vec<JsonValue>,
+    report_rows: Vec<JsonValue>,
+    updated_row_count: usize,
+}
+
+fn expected_derived_values_for_source(
+    plan: &boon_plan::MachinePlan,
+    source_id: usize,
+    source_event: &serde_json::Map<String, JsonValue>,
+    root_state: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<BTreeMap<boon_ir::FieldId, JsonValue>> {
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            op.inputs
+                .iter()
+                .any(|input| matches!(input, boon_plan::ValueRef::Source(id) if id.0 == source_id))
+        })
+    {
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            return Err(format!(
+                "{} derived op {} does not output a typed field",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        match &op.kind {
+            boon_plan::PlanOpKind::DerivedValue {
+                expression:
+                    Some(boon_plan::PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
+                        source_id: expression_source_id,
+                        key_field,
+                        required_key,
+                        state,
+                        skip_empty,
+                    }),
+                ..
+            } if expression_source_id.0 == source_id => {
+                let key = expected_source_payload_json_value(source_event, key_field, report_path)?;
+                if key.as_str() != Some(required_key) {
+                    continue;
+                }
+                let text = match state {
+                    boon_plan::ValueRef::State(state_id) => {
+                        let state_label = plan_state_label(plan, state_id.0);
+                        root_state
+                            .get(&state_label)
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| {
+                                format!(
+                                    "{} derived op {} root state `{state_label}` is not text",
+                                    report_path.display(),
+                                    op.id.0
+                                )
+                            })?
+                            .to_owned()
+                    }
+                    boon_plan::ValueRef::SourcePayload {
+                        source_id: payload_source_id,
+                        field: boon_ir::SourcePayloadField::Text,
+                    } if payload_source_id.0 == source_id => {
+                        let payload = expected_source_payload_json_value(
+                            source_event,
+                            &boon_ir::SourcePayloadField::Text,
+                            report_path,
+                        )?;
+                        payload
+                            .as_str()
+                            .ok_or_else(|| {
+                                format!(
+                                    "{} derived op {} source text payload is not text",
+                                    report_path.display(),
+                                    op.id.0
+                                )
+                            })?
+                            .to_owned()
+                    }
+                    other => {
+                        return Err(format!(
+                            "{} derived op {} trim input is not supported: {other:?}",
+                            report_path.display(),
+                            op.id.0
+                        )
+                        .into());
+                    }
+                };
+                let trimmed = text.trim().to_owned();
+                if *skip_empty && trimmed.is_empty() {
+                    continue;
+                }
+                values.insert(output_id, JsonValue::String(trimmed));
+            }
+            _ => {
+                return Err(format!(
+                    "{} run-plan-root-scalar-scenario does not support derived op {} for source {}",
+                    report_path.display(),
+                    op.id.0,
+                    source_id
+                )
+                .into());
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn source_key_gate_for_root_updates(
+    plan: &boon_plan::MachinePlan,
+    source_id: usize,
+) -> Option<String> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .find_map(|op| match &op.kind {
+            boon_plan::PlanOpKind::DerivedValue {
+                expression:
+                    Some(boon_plan::PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
+                        source_id: expression_source_id,
+                        required_key,
+                        ..
+                    }),
+                ..
+            } if expression_source_id.0 == source_id => Some(required_key.clone()),
+            _ => None,
+        })
+}
+
+fn expected_root_semantic_delta_value(value: &JsonValue) -> JsonValue {
+    value.clone()
+}
+
+fn expected_append_list_rows(
+    plan: &boon_plan::MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    derived_values: &BTreeMap<boon_ir::FieldId, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedListAppendExecution> {
+    let mut semantic_deltas = Vec::new();
+    let mut report_rows = Vec::new();
+    let mut appended_row_count = 0usize;
+    let mut source_bind_count = 0usize;
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+    {
+        let boon_plan::PlanOpKind::ListOperation {
+            operation_kind: boon_plan::PlanListOperationKind::Append,
+            append: Some(append),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(trigger_value) =
+            expected_value_for_plan_ref(plan, &append.trigger, derived_values, None, report_path)?
+        else {
+            continue;
+        };
+        if trigger_value.is_null() {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::List(list_id)) = op.output else {
+            return Err(format!(
+                "{} append op {} does not output a list",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        let list_slot = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == list_id)
+            .ok_or_else(|| {
+                format!(
+                    "{} append op {} references missing list {}",
+                    report_path.display(),
+                    op.id.0,
+                    list_id.0
+                )
+            })?;
+        let list_label = plan_list_label(plan, list_id.0);
+        let existing_rows = list_state.get(&list_id.0).ok_or_else(|| {
+            format!(
+                "{} list state missing list {}",
+                report_path.display(),
+                list_id.0
+            )
+        })?;
+        let key = existing_rows.len() as u64 + 1;
+        let generation = 1u64;
+        let (mut fields, mut private_bytes) =
+            expected_row_default_fields(plan, list_slot, report_path)?;
+        for field in &append.fields {
+            let field_id = field.field_id.ok_or_else(|| {
+                format!(
+                    "{} append op {} field `{}` has no typed field id",
+                    report_path.display(),
+                    op.id.0,
+                    field.name
+                )
+            })?;
+            let field_label = plan_semantic_field_label(plan, field_id.0);
+            let field_name = local_field_name(&field_label);
+            let (value, bytes_value) = match (&field.value_ref, field.constant_id) {
+                (Some(value_ref), None) => {
+                    let value = expected_value_for_plan_ref(
+                        plan,
+                        value_ref,
+                        derived_values,
+                        Some(&fields),
+                        report_path,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "{} append op {} field `{}` value ref was not produced",
+                            report_path.display(),
+                            op.id.0,
+                            field.name
+                        )
+                    })?;
+                    (value, None)
+                }
+                (None, Some(constant_id)) => {
+                    let constant = plan
+                        .constants
+                        .iter()
+                        .find(|constant| constant.id == constant_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "{} append op {} missing constant {}",
+                                report_path.display(),
+                                op.id.0,
+                                constant_id.0
+                            )
+                        })?;
+                    (
+                        plan_constant_json_value(constant, report_path)?,
+                        expected_private_bytes_from_plan_constant_value(
+                            &constant.value,
+                            &format!(
+                                "{} append op {} field `{}`",
+                                report_path.display(),
+                                op.id.0,
+                                field.name
+                            ),
+                        )?,
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "{} append op {} field `{}` has invalid value source",
+                        report_path.display(),
+                        op.id.0,
+                        field.name
+                    )
+                    .into());
+                }
+            };
+            fields.insert(field_name.clone(), value);
+            if let Some(bytes) = bytes_value {
+                private_bytes.insert(field_name, bytes);
+            } else {
+                private_bytes.remove(&field_name);
+            }
+        }
+        let fields_before_refresh = fields.clone();
+        let mut row = ExpectedPlanListRowState {
+            key,
+            generation,
+            fields,
+            private_bytes,
+        };
+        let mut refresh_state = list_state.clone();
+        let mut projected_rows = existing_rows.clone();
+        projected_rows.push(row.clone());
+        refresh_state.insert(list_id.0, projected_rows);
+        expected_refresh_row_expression_fields(
+            plan,
+            list_slot,
+            &refresh_state,
+            &mut row,
+            report_path,
+        )?;
+        expected_refresh_row_initial_state_fields(plan, list_slot, &mut row);
+
+        semantic_deltas.push(json!({
+            "kind": "ListInsert",
+            "list_id": list_label,
+            "key": key,
+            "generation": generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": null,
+            "value": trigger_value,
+        }));
+
+        let scoped_routes = row_scoped_source_routes(plan, list_slot);
+        for (route_index, route) in scoped_routes.iter().enumerate() {
+            let source_binding_id = (key - 1) * scoped_routes.len() as u64 + route_index as u64 + 1;
+            semantic_deltas.push(json!({
+                "kind": "SourceBind",
+                "list_id": list_label,
+                "key": key,
+                "generation": generation,
+                "source_id": source_binding_id,
+                "bind_epoch": source_binding_id,
+                "field_path": route.path,
+                "value": route.path,
+            }));
+            source_bind_count += 1;
+        }
+
+        let row_bool_deltas = expected_row_bool_not_deltas(
+            plan,
+            list_slot,
+            &list_label,
+            key,
+            generation,
+            &mut row.fields,
+            report_path,
+        )?;
+        semantic_deltas.extend(expected_row_refresh_field_deltas(
+            plan,
+            list_slot,
+            &list_label,
+            key,
+            generation,
+            &fields_before_refresh,
+            &row.fields,
+        ));
+        semantic_deltas.extend(row_bool_deltas);
+        let fields = row.fields.clone();
+        list_state
+            .get_mut(&list_id.0)
+            .ok_or_else(|| {
+                format!(
+                    "{} list state missing list {}",
+                    report_path.display(),
+                    list_id.0
+                )
+            })?
+            .push(row);
+        report_rows.push(json!({
+            "list_id": list_id.0,
+            "list": list_label,
+            "append_op_id": op.id.0,
+            "key": key,
+            "generation": generation,
+            "trigger": trigger_value,
+            "fields": fields,
+        }));
+        appended_row_count += 1;
+    }
+    Ok(ExpectedListAppendExecution {
+        semantic_deltas,
+        report_rows,
+        appended_row_count,
+        source_bind_count,
+    })
+}
+
+fn expected_remove_list_rows_for_source(
+    plan: &boon_plan::MachinePlan,
+    source_id: usize,
+    source_route_slot: &boon_plan::SourceRoute,
+    source_event: &serde_json::Map<String, JsonValue>,
+    list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedListRemoveExecution> {
+    let mut semantic_deltas = Vec::new();
+    let mut report_rows = Vec::new();
+    let mut report_derived = Vec::new();
+    let mut removed_row_count = 0usize;
+    let mut source_unbind_count = 0usize;
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+    {
+        let boon_plan::PlanOpKind::ListOperation {
+            operation_kind: boon_plan::PlanListOperationKind::Remove,
+            remove: Some(remove),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if remove.source != boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)) {
+            continue;
+        }
+        if op.unresolved_executable_ref_count != 0 {
+            return Err(format!(
+                "{} selected list remove op {} has unresolved executable refs",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        let Some(boon_plan::ValueRef::List(list_id)) = op.output else {
+            return Err(format!(
+                "{} list remove op {} does not output a list",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        let list_slot = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == list_id)
+            .ok_or_else(|| {
+                format!(
+                    "{} list remove op {} references missing list {}",
+                    report_path.display(),
+                    op.id.0,
+                    list_id.0
+                )
+            })?;
+        if source_route_slot.scoped && source_route_slot.scope_id != list_slot.scope_id {
+            return Err(format!(
+                "{} list remove op {} source scope {:?} does not match list scope {:?}",
+                report_path.display(),
+                op.id.0,
+                source_route_slot.scope_id,
+                list_slot.scope_id
+            )
+            .into());
+        }
+        let list_label = plan_list_label(plan, list_id.0);
+        if let Some(event_list) = expected_event_str(source_event, "list_id")
+            && event_list != list_label
+        {
+            return Err(format!(
+                "{} scoped source targeted list `{event_list}`, expected `{list_label}`",
+                report_path.display()
+            )
+            .into());
+        }
+        let before_derived = expected_root_pure_number_compare_values(plan, list_state)?;
+        let rows_snapshot = list_state.get(&list_id.0).ok_or_else(|| {
+            format!(
+                "{} list state missing list {}",
+                report_path.display(),
+                list_id.0
+            )
+        })?;
+        let target_rows = if source_route_slot.scoped {
+            let row_index = expected_resolve_plan_row_index(
+                plan,
+                source_route_slot,
+                source_event,
+                list_slot,
+                list_state,
+                report_path,
+            )?;
+            let row = rows_snapshot.get(row_index).cloned().ok_or_else(|| {
+                format!(
+                    "{} row index {row_index} missing in `{list_label}`",
+                    report_path.display()
+                )
+            })?;
+            if !expected_list_remove_predicate_matches(plan, &remove.predicate, &row)? {
+                Vec::new()
+            } else {
+                let source_binding_id =
+                    expected_plan_row_source_binding_id(plan, list_slot, row.key, source_id);
+                let row_resolution = expected_row_resolution_report(
+                    source_event,
+                    row_index,
+                    &row,
+                    source_binding_id,
+                );
+                vec![ExpectedListRemoveTarget {
+                    row_index,
+                    row,
+                    row_resolution,
+                    source_binding_id,
+                    bind_epoch: source_binding_id,
+                }]
+            }
+        } else {
+            let mut targets = Vec::new();
+            for (row_index, row) in rows_snapshot.iter().cloned().enumerate() {
+                if expected_list_remove_predicate_matches(plan, &remove.predicate, &row)? {
+                    targets.push(ExpectedListRemoveTarget {
+                        row_index,
+                        row: row.clone(),
+                        row_resolution: expected_predicate_row_resolution_report(
+                            plan,
+                            &remove.predicate,
+                            row_index,
+                            &row,
+                        )?,
+                        source_binding_id: None,
+                        bind_epoch: None,
+                    });
+                }
+            }
+            targets
+        };
+        let scoped_routes = row_scoped_source_routes(plan, list_slot);
+        for target in &target_rows {
+            let mut source_unbinds = Vec::new();
+            for (route_index, route) in scoped_routes.iter().enumerate() {
+                let source_unbind_id =
+                    (target.row.key - 1) * scoped_routes.len() as u64 + route_index as u64 + 1;
+                let delta = json!({
+                    "kind": "SourceUnbind",
+                    "list_id": list_label,
+                    "key": target.row.key,
+                    "generation": target.row.generation,
+                    "source_id": source_unbind_id,
+                    "bind_epoch": source_unbind_id,
+                    "field_path": route.path,
+                    "value": null,
+                });
+                semantic_deltas.push(delta.clone());
+                source_unbinds.push(delta);
+                source_unbind_count += 1;
+            }
+            let remove_delta = json!({
+                "kind": "ListRemove",
+                "list_id": list_label,
+                "key": target.row.key,
+                "generation": target.row.generation,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": null,
+                "value": null,
+            });
+            semantic_deltas.push(remove_delta);
+            report_rows.push(json!({
+                "list_id": list_id.0,
+                "list": list_label,
+                "remove_op_id": op.id.0,
+                "source_id": source_id,
+                "source": expected_event_str(source_event, "source"),
+                "row_index": target.row_index,
+                "key": target.row.key,
+                "generation": target.row.generation,
+                "source_binding_id": target.source_binding_id,
+                "bind_epoch": target.bind_epoch,
+                "row_resolution": target.row_resolution,
+                "source_unbinds": source_unbinds,
+                "row_fields": target.row.fields.clone(),
+            }));
+            removed_row_count += 1;
+        }
+        let rows = list_state.get_mut(&list_id.0).ok_or_else(|| {
+            format!(
+                "{} list state missing list {}",
+                report_path.display(),
+                list_id.0
+            )
+        })?;
+        for target in target_rows.iter().rev() {
+            rows.remove(target.row_index);
+        }
+        let after_derived = expected_root_pure_number_compare_values(plan, list_state)?;
+        for (delta, report) in
+            expected_changed_root_derived_deltas(plan, &before_derived, &after_derived)
+        {
+            semantic_deltas.push(delta);
+            report_derived.push(report);
+        }
+    }
+    let derived_count = report_derived.len();
+    Ok(ExpectedListRemoveExecution {
+        semantic_deltas,
+        report_rows,
+        report_derived,
+        removed_row_count,
+        source_unbind_count,
+        derived_count,
+    })
+}
+
+fn expected_list_remove_predicate_matches(
+    plan: &boon_plan::MachinePlan,
+    predicate: &boon_plan::PlanListRemovePredicate,
+    row: &ExpectedPlanListRowState,
+) -> RuntimeResult<bool> {
+    match predicate {
+        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(true),
+        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
+            let (_, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(value)
+        }
+        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
+            let (_, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(!value)
+        }
+        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility { .. } => Err(
+            "schema replay does not support selected-filter visibility predicates in remove/count execution yet".into(),
+        ),
+        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
+            "schema replay does not support unknown list remove predicate `{summary}`"
+        )
+        .into()),
+    }
+}
+
+fn expected_list_remove_predicate_field_value(
+    plan: &boon_plan::MachinePlan,
+    input: &boon_plan::ValueRef,
+    row: &ExpectedPlanListRowState,
+) -> RuntimeResult<(String, bool)> {
+    let boon_plan::ValueRef::State(state_id) = input else {
+        return Err(format!("list remove predicate input is not a state ref: {input:?}").into());
+    };
+    let field_name = local_field_name(&plan_state_label(plan, state_id.0));
+    let value = row.fields.get(&field_name).ok_or_else(|| {
+        format!(
+            "list remove predicate field `{field_name}` missing on row key {} generation {}",
+            row.key, row.generation
+        )
+    })?;
+    let bool_value = value.as_bool().ok_or_else(|| {
+        format!(
+            "list remove predicate field `{field_name}` is not bool on row key {} generation {}",
+            row.key, row.generation
+        )
+    })?;
+    Ok((field_name, bool_value))
+}
+
+fn expected_predicate_row_resolution_report(
+    plan: &boon_plan::MachinePlan,
+    predicate: &boon_plan::PlanListRemovePredicate,
+    row_index: usize,
+    row: &ExpectedPlanListRowState,
+) -> RuntimeResult<JsonValue> {
+    match predicate {
+        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({
+            "method": "predicate",
+            "predicate": "always_true",
+            "predicate_field": null,
+            "predicate_value": true,
+            "row_index": row_index,
+            "key": row.key,
+            "generation": row.generation,
+            "source_binding_id": null,
+        })),
+        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
+            let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(json!({
+                "method": "predicate",
+                "predicate": "row_field_bool",
+                "predicate_field": field_name,
+                "predicate_value": value,
+                "row_index": row_index,
+                "key": row.key,
+                "generation": row.generation,
+                "source_binding_id": null,
+            }))
+        }
+        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
+            let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(json!({
+                "method": "predicate",
+                "predicate": "row_field_bool_not",
+                "predicate_field": field_name,
+                "predicate_value": value,
+                "row_index": row_index,
+                "key": row.key,
+                "generation": row.generation,
+                "source_binding_id": null,
+            }))
+        }
+        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility { .. } => Err(
+            "schema replay does not report selected-filter visibility predicates in remove/count execution yet".into(),
+        ),
+        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
+            "schema replay does not support unknown list remove predicate `{summary}`"
+        )
+        .into()),
+    }
+}
+
+fn expected_root_pure_number_compare_values(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
+    let aggregate_counts = expected_aggregate_count_values(plan, list_state)?;
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(expression),
+        } = &op.kind
+        else {
+            continue;
+        };
+        if let Some(value) =
+            expected_eval_root_bool_derived_expression(op.id.0, expression, &aggregate_counts)?
+        {
+            values.insert(output_id.0, json!(value));
+        }
+    }
+    Ok(values)
+}
+
+fn expected_eval_root_bool_derived_expression(
+    op_id: usize,
+    expression: &boon_plan::PlanDerivedExpression,
+    aggregate_counts: &BTreeMap<usize, i64>,
+) -> RuntimeResult<Option<bool>> {
+    match expression {
+        boon_plan::PlanDerivedExpression::NumberCompareConst {
+            left,
+            op: compare_op,
+            right,
+        } => {
+            let boon_plan::ValueRef::Field(left_id) = left else {
+                return Err(format!(
+                    "number-compare derived op {op_id} left input is not a field ref"
+                )
+                .into());
+            };
+            let Some(left_value) = aggregate_counts.get(&left_id.0) else {
+                return Ok(None);
+            };
+            let value = match compare_op.as_str() {
+                ">" => *left_value > *right,
+                ">=" => *left_value >= *right,
+                "<" => *left_value < *right,
+                "<=" => *left_value <= *right,
+                "==" => *left_value == *right,
+                "!=" => *left_value != *right,
+                other => {
+                    return Err(format!(
+                        "number-compare derived op {op_id} has unsupported operator `{other}`"
+                    )
+                    .into());
+                }
+            };
+            Ok(Some(value))
+        }
+        boon_plan::PlanDerivedExpression::BoolAnd { left, right } => {
+            let Some(left) =
+                expected_eval_root_bool_derived_expression(op_id, left, aggregate_counts)?
+            else {
+                return Ok(None);
+            };
+            let Some(right) =
+                expected_eval_root_bool_derived_expression(op_id, right, aggregate_counts)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(left && right))
+        }
+        boon_plan::PlanDerivedExpression::BoolNotExpression { input } => {
+            let Some(value) =
+                expected_eval_root_bool_derived_expression(op_id, input, aggregate_counts)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(!value))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn expected_aggregate_count_values(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+) -> RuntimeResult<BTreeMap<usize, i64>> {
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+    {
+        let boon_plan::PlanOpKind::ListOperation {
+            operation_kind: boon_plan::PlanListOperationKind::Count,
+            count: Some(count),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(boon_plan::ValueRef::List(list_id)) = op.output else {
+            return Err(format!("list count op {} does not output a list", op.id.0).into());
+        };
+        let rows = list_state
+            .get(&list_id.0)
+            .ok_or_else(|| format!("list state missing list {}", list_id.0))?;
+        let boon_plan::ValueRef::Field(target_id) = count.target else {
+            return Err(format!("list count op {} target is not a field ref", op.id.0).into());
+        };
+        let mut count_value = 0i64;
+        for row in rows {
+            if expected_list_remove_predicate_matches(plan, &count.predicate, row)? {
+                count_value += 1;
+            }
+        }
+        values.insert(target_id.0, count_value);
+    }
+    Ok(values)
+}
+
+fn expected_changed_root_derived_deltas(
+    plan: &boon_plan::MachinePlan,
+    before: &BTreeMap<usize, JsonValue>,
+    after: &BTreeMap<usize, JsonValue>,
+) -> Vec<(JsonValue, JsonValue)> {
+    let mut changes = Vec::new();
+    for (field_id, value) in after {
+        if before.get(field_id) == Some(value) {
+            continue;
+        }
+        let field_path = plan_derived_field_label(plan, *field_id);
+        changes.push((
+            json!({
+                "kind": "FieldSet",
+                "list_id": null,
+                "key": null,
+                "generation": null,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": field_path,
+                "value": value,
+            }),
+            json!({
+                "field_id": field_id,
+                "field_path": field_path,
+                "expression_kind": "number_compare_const",
+                "value": value,
+            }),
+        ));
+    }
+    changes
+}
+
+fn expected_indexed_update_branch(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    source_id: usize,
+    source_route_slot: &boon_plan::SourceRoute,
+    source_event: &serde_json::Map<String, JsonValue>,
+    list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
+    root_derived_values: &BTreeMap<usize, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedIndexedUpdateExecution> {
+    if op.unresolved_executable_ref_count != 0 {
+        return Err(format!(
+            "{} selected indexed update branch {} has unresolved executable refs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let source_guard = match &op.kind {
+        boon_plan::PlanOpKind::UpdateBranch { source_guard, .. } => source_guard,
+        _ => {
+            return Err(format!(
+                "{} indexed update branch {} is not an update branch",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+    };
+    if !expected_plan_source_guard_matches(source_guard, source_id, source_event, report_path)? {
+        return Ok(ExpectedIndexedUpdateExecution {
+            semantic_deltas: Vec::new(),
+            report_rows: Vec::new(),
+            updated_row_count: 0,
+        });
+    }
+    let Some(boon_plan::ValueRef::State(output_state_id)) = op.output else {
+        return Err(format!(
+            "{} indexed update branch {} does not output a state slot",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let output_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or_else(|| {
+            format!(
+                "{} indexed update branch {} output state is missing",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+    if !output_slot.indexed {
+        return Err(format!(
+            "{} indexed update branch {} targets non-indexed state {}",
+            report_path.display(),
+            op.id.0,
+            output_state_id.0
+        )
+        .into());
+    }
+    let scope_id = output_slot.scope_id.ok_or_else(|| {
+        format!(
+            "{} indexed update branch {} has no row scope",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if source_route_slot.scoped && source_route_slot.scope_id != Some(scope_id) {
+        return Err(format!(
+            "{} indexed update branch {} source scope {:?} does not match output scope {:?}",
+            report_path.display(),
+            op.id.0,
+            source_route_slot.scope_id,
+            output_slot.scope_id
+        )
+        .into());
+    }
+    let list_slot = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.scope_id == Some(scope_id))
+        .ok_or_else(|| {
+            format!(
+                "{} indexed update branch {} has no list slot for scope",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+    let list_label = plan_list_label(plan, list_slot.list_id.0);
+    if let Some(event_list) = expected_event_str(source_event, "list_id")
+        && event_list != list_label
+    {
+        return Err(format!(
+            "{} scoped source targeted list `{event_list}`, expected `{list_label}`",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let cache_key = (list_slot.list_id.0, source_id);
+    let row_index = if let Some(row_index) = row_resolution_cache.get(&cache_key) {
+        *row_index
+    } else {
+        let row_index = expected_resolve_plan_row_index(
+            plan,
+            source_route_slot,
+            source_event,
+            list_slot,
+            list_state,
+            report_path,
+        )?;
+        row_resolution_cache.insert(cache_key, row_index);
+        row_index
+    };
+    let rows = list_state.get_mut(&list_slot.list_id.0).ok_or_else(|| {
+        format!(
+            "{} list state missing list {}",
+            report_path.display(),
+            list_slot.list_id.0
+        )
+    })?;
+    let row = rows.get_mut(row_index).ok_or_else(|| {
+        format!(
+            "{} row index {row_index} missing in `{list_label}`",
+            report_path.display()
+        )
+    })?;
+    let report_source_payload_field = match &op.kind {
+        boon_plan::PlanOpKind::UpdateBranch {
+            source_payload_field,
+            ..
+        } => source_payload_field
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or(JsonValue::Null),
+        _ => JsonValue::Null,
+    };
+    let mut bytes_access = JsonValue::Null;
+
+    let (value, private_bytes, expression_kind) = match &op.kind {
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::SourcePayload,
+            source_payload_field: Some(field),
+            update_constant_id: None,
+            ..
+        } => {
+            if !source_route_slot.payload_schema.fields.contains(field) {
+                return Err(format!(
+                    "{} indexed SourcePayload update branch {} reads a field missing from route schema",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            }
+            let has_payload_ref = op.inputs.iter().any(|input| {
+                matches!(
+                    input,
+                    boon_plan::ValueRef::SourcePayload {
+                        source_id: input_source_id,
+                        field: input_field
+                    } if input_source_id.0 == source_id && input_field == field
+                )
+            });
+            if !has_payload_ref {
+                return Err(format!(
+                    "{} indexed SourcePayload update branch {} is missing typed source-payload input",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            }
+            let (value, private_bytes) = expected_source_payload_value_for_output(
+                plan,
+                output_state_id,
+                source_event,
+                field,
+                report_path,
+            )?;
+            (value, private_bytes, "source_payload")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::Const,
+            source_payload_field: None,
+            update_constant_id: Some(constant_id),
+            ..
+        } => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed Const update branch {} references missing constant {}",
+                        report_path.display(),
+                        op.id.0,
+                        constant_id.0
+                    )
+                })?;
+            (
+                plan_constant_json_value(constant, report_path)?,
+                expected_constant_private_bytes_for_output(
+                    plan,
+                    output_state_id,
+                    constant,
+                    report_path,
+                )?,
+                "const",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BoolNot,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_value = expected_indexed_bool_not_input_value(
+                plan,
+                op,
+                row,
+                root_derived_values,
+                report_path,
+            )?;
+            (JsonValue::Bool(!input_value), None, "bool_not")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesLength,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            let byte_len = i64::try_from(bytes.len() as u64).map_err(|_| {
+                format!(
+                    "{} indexed Bytes/length update branch {} byte_len exceeds Boon NUMBER",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            (json!(byte_len), None, "bytes_length")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesGet,
+            source_payload_field: None,
+            update_constant_id: Some(update_constant_id),
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let index_constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *update_constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed Bytes/get update branch {} references missing index constant {}",
+                        report_path.display(),
+                        op.id.0,
+                        update_constant_id.0
+                    )
+                })?;
+            let boon_plan::PlanConstantValue::Number { value: index } = &index_constant.value
+            else {
+                return Err(format!(
+                    "{} indexed Bytes/get update branch {} index constant {} is not a number",
+                    report_path.display(),
+                    op.id.0,
+                    update_constant_id.0
+                )
+                .into());
+            };
+            let index = usize::try_from(*index).map_err(|_| {
+                format!(
+                    "{} indexed Bytes/get update branch {} index constant {} is negative or too large",
+                    report_path.display(),
+                    op.id.0,
+                    update_constant_id.0
+                )
+            })?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access = expected_indexed_bytes_access_report(
+                plan,
+                input_state_id,
+                bytes.len(),
+                Some(index),
+            );
+            let byte = bytes.get(index).ok_or_else(|| {
+                format!(
+                    "{} indexed Bytes/get update branch {} index {index} is out of bounds for `{input_name}`",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            (json!(i64::from(*byte)), None, "bytes_get")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::ReadPath,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
+                format!(
+                    "{} indexed ReadPath update branch {} input field `{input_name}` is missing",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            (value, None, "read_path")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::PreviousValue,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
+                format!(
+                    "{} indexed PreviousValue update branch {} input field `{input_name}` is missing",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            (value, None, "previous_value")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::TextTrimOrPrevious,
+            source_payload_field,
+            update_constant_id: None,
+            ..
+        } => {
+            let output_name = local_field_name(&plan_state_label(plan, output_state_id.0));
+            let raw = if let Some(payload_field) = source_payload_field {
+                let has_payload_ref = op.inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        boon_plan::ValueRef::SourcePayload {
+                            source_id: input_source_id,
+                            field
+                        } if input_source_id.0 == source_id && field == payload_field
+                    )
+                });
+                if !has_payload_ref {
+                    return Err(format!(
+                        "{} indexed TextTrimOrPrevious update branch {} is missing typed source-payload input",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+                expected_source_payload_json_value(source_event, payload_field, report_path)?
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} indexed TextTrimOrPrevious update branch {} payload is not text",
+                            report_path.display(),
+                            op.id.0
+                        )
+                    })?
+                    .to_owned()
+            } else {
+                let input_state_id = op
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        boon_plan::ValueRef::State(state_id) if *state_id != output_state_id => {
+                            Some(*state_id)
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .unwrap_or(output_state_id);
+                let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+                row.fields
+                    .get(&input_name)
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} indexed TextTrimOrPrevious update branch {} input field `{input_name}` is not text",
+                            report_path.display(),
+                            op.id.0
+                        )
+                    })?
+                    .to_owned()
+            };
+            let current = row
+                .fields
+                .get(&output_name)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed TextTrimOrPrevious update branch {} output field `{output_name}` is not text",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let trimmed = raw.trim();
+            let value = if trimmed.is_empty() {
+                current.to_owned()
+            } else {
+                trimmed.to_owned()
+            };
+            (JsonValue::String(value), None, "text_trim_or_previous")
+        }
+        _ => {
+            return Err(format!(
+                "{} does not support indexed update branch {} kind {:?}",
+                report_path.display(),
+                op.id.0,
+                op.kind
+            )
+            .into());
+        }
+    };
+    let output_name = local_field_name(&plan_state_label(plan, output_state_id.0));
+    let changed = row.fields.get(&output_name) != Some(&value);
+    row.fields.insert(output_name.clone(), value.clone());
+    if let Some(bytes) = private_bytes {
+        row.private_bytes.insert(output_name.clone(), bytes);
+    } else {
+        row.private_bytes.remove(&output_name);
+    }
+    let mut semantic_deltas = Vec::new();
+    let emit_semantic_delta =
+        changed || expression_kind == "read_path" || !source_route_slot.scoped || op.indexed;
+    if emit_semantic_delta {
+        semantic_deltas.push(json!({
+            "kind": "FieldSet",
+            "list_id": list_label,
+            "key": row.key,
+            "generation": row.generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": output_name,
+            "value": value,
+        }));
+    }
+    let _ = row;
+    if expected_indexed_state_feeds_indexed_derived_expression(plan, output_state_id) {
+        semantic_deltas.extend(expected_refresh_indexed_derived_fields_for_row(
+            plan,
+            list_slot,
+            &plan_list_label(plan, list_slot.list_id.0),
+            list_state,
+            row_index,
+            report_path,
+            false,
+        )?);
+    } else if changed
+        && expected_source_has_later_indexed_state_feeding_derived(plan, source_id, op.id.0)
+    {
+        semantic_deltas.extend(expected_stale_empty_text_indexed_derived_deltas(
+            plan,
+            list_slot,
+            &plan_list_label(plan, list_slot.list_id.0),
+            list_state,
+            row_index,
+            source_id,
+            op.id.0,
+            report_path,
+        )?);
+    }
+    let row = list_state
+        .get(&list_slot.list_id.0)
+        .and_then(|rows| rows.get(row_index))
+        .ok_or_else(|| {
+            format!(
+                "{} row index {row_index} missing in `{list_label}` after refresh",
+                report_path.display()
+            )
+        })?;
+    let source_binding_id =
+        expected_plan_row_source_binding_id(plan, list_slot, row.key, source_id);
+    Ok(ExpectedIndexedUpdateExecution {
+        semantic_deltas,
+        report_rows: vec![json!({
+            "source_id": source_id,
+            "source": expected_event_str(source_event, "source"),
+            "target_state": plan_state_label(plan, output_state_id.0),
+            "target_state_id": output_state_id.0,
+            "update_op_id": op.id.0,
+            "candidate_update_op_ids": [op.id.0],
+            "expression_kind": expression_kind,
+            "source_payload_field": report_source_payload_field,
+            "update_constant_id": null,
+            "update_constant_value": null,
+            "bytes_access": bytes_access,
+            "host_effect": null,
+            "selected_op_indexed": true,
+            "selected_op_unresolved_executable_ref_count": 0,
+            "list_id": list_slot.list_id.0,
+            "list": plan_list_label(plan, list_slot.list_id.0),
+            "row_index": row_index,
+            "key": row.key,
+            "generation": row.generation,
+            "source_binding_id": source_binding_id,
+            "bind_epoch": source_binding_id,
+            "row_resolution": expected_row_resolution_report(source_event, row_index, row, source_binding_id),
+            "field_path": local_field_name(&plan_state_label(plan, output_state_id.0)),
+            "value": value,
+            "changed": changed,
+            "row_fields": row.fields.clone(),
+        })],
+        updated_row_count: 1,
+    })
+}
+
+fn expected_indexed_bytes_access_report(
+    plan: &boon_plan::MachinePlan,
+    state_id: boon_ir::StateId,
+    byte_len: usize,
+    index: Option<usize>,
+) -> JsonValue {
+    let byte_bank_declared = expected_indexed_state_has_fixed_byte_bank(plan, state_id);
+    let mut access = json!({
+        "read_only": true,
+        "input_state_id": state_id.0,
+        "access_source": if byte_bank_declared {
+            "indexed_fixed_byte_bank"
+        } else {
+            "indexed_row_private_bytes"
+        },
+        "cow_kind": "borrowed",
+        "byte_len": byte_len,
+        "byte_bank_declared": byte_bank_declared,
+        "byte_bank_used": byte_bank_declared,
+    });
+    if let Some(index) = index {
+        access["index"] = json!(index);
+    }
+    access
+}
+
+fn expected_indexed_state_has_fixed_byte_bank(
+    plan: &boon_plan::MachinePlan,
+    state_id: boon_ir::StateId,
+) -> bool {
+    plan.storage_layout
+        .byte_banks
+        .iter()
+        .any(|bank| bank.indexed && bank.state_id == state_id)
+}
+
+fn expected_unscoped_indexed_update_targets(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    source_route_slot: &boon_plan::SourceRoute,
+    source_event: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    report_path: &Path,
+) -> RuntimeResult<Option<(String, Vec<(u64, u64)>)>> {
+    if source_route_slot.scoped
+        || expected_event_u64(source_event, "target_key").is_some()
+        || expected_event_str(source_event, "target_text").is_some()
+        || expected_event_str(source_event, "address").is_some()
+    {
+        return Ok(None);
+    }
+    let Some(boon_plan::ValueRef::State(output_state_id)) = op.output else {
+        return Ok(None);
+    };
+    let Some(output_slot) = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+    else {
+        return Ok(None);
+    };
+    if !output_slot.indexed {
+        return Ok(None);
+    }
+    let Some(scope_id) = output_slot.scope_id else {
+        return Ok(None);
+    };
+    let Some(list_slot) = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.scope_id == Some(scope_id))
+    else {
+        return Ok(None);
+    };
+    let list_label = plan_list_label(plan, list_slot.list_id.0);
+    if let Some(event_list) = expected_event_str(source_event, "list_id")
+        && event_list != list_label
+    {
+        return Err(format!(
+            "{} unscoped indexed source targeted list `{event_list}`, expected `{list_label}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let rows = list_state.get(&list_slot.list_id.0).ok_or_else(|| {
+        format!(
+            "{} list state missing list {}",
+            report_path.display(),
+            list_slot.list_id.0
+        )
+    })?;
+    Ok(Some((
+        list_label,
+        rows.iter()
+            .map(|row| (row.key, row.generation))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn expected_indexed_bool_not_input_value(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    row: &ExpectedPlanListRowState,
+    root_derived_values: &BTreeMap<usize, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<bool> {
+    for input in &op.inputs {
+        match input {
+            boon_plan::ValueRef::State(state_id) => {
+                let input_name = local_field_name(&plan_state_label(plan, state_id.0));
+                let Some(value) = row.fields.get(&input_name).and_then(JsonValue::as_bool) else {
+                    return Err(format!(
+                        "{} indexed Bool/not update branch {} input field `{input_name}` is not bool",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                };
+                return Ok(value);
+            }
+            boon_plan::ValueRef::Field(field_id) => {
+                let field_label = plan_derived_field_label(plan, field_id.0);
+                let Some(value) = root_derived_values
+                    .get(&field_id.0)
+                    .and_then(JsonValue::as_bool)
+                else {
+                    return Err(format!(
+                        "{} indexed Bool/not update branch {} root derived input `{field_label}` is not bool",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                };
+                return Ok(value);
+            }
+            _ => {}
+        }
+    }
+    Err(format!(
+        "{} indexed Bool/not update branch {} has no typed state or field input",
+        report_path.display(),
+        op.id.0
+    )
+    .into())
+}
+
+fn expected_plan_source_guard_matches(
+    guard: &Option<boon_plan::PlanSourceGuard>,
+    active_source_id: usize,
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<bool> {
+    let Some(guard) = guard else {
+        return Ok(true);
+    };
+    match guard {
+        boon_plan::PlanSourceGuard::SourcePayloadOneOf {
+            source_id,
+            field,
+            values,
+        } => {
+            if matches!(field, boon_ir::SourcePayloadField::Bytes) {
+                return Err(format!(
+                    "{} BYTES source payload guards are not supported in v1",
+                    report_path.display()
+                )
+                .into());
+            }
+            if source_id.0 != active_source_id {
+                return Err(format!(
+                    "{} source guard targets source {}, but active source is {}",
+                    report_path.display(),
+                    source_id.0,
+                    active_source_id
+                )
+                .into());
+            }
+            let value = expected_source_payload_json_value(source_event, field, report_path)?;
+            Ok(value
+                .as_str()
+                .is_some_and(|payload| values.iter().any(|expected| expected == payload)))
+        }
+    }
+}
+
+fn expected_indexed_single_state_input(
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_ir::StateId,
+    report_path: &Path,
+) -> RuntimeResult<boon_ir::StateId> {
+    let inputs = op
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            boon_plan::ValueRef::State(state_id) if *state_id != output_state_id => Some(*state_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed update branch {} expected one non-output state input, found {}",
+            report_path.display(),
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok(*input)
+}
+
+fn expected_indexed_row_inline_bytes(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    state_id: boon_ir::StateId,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let field_name = local_field_name(&plan_state_label(plan, state_id.0));
+    let public_value = row.fields.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed update branch {} row field `{field_name}` is missing",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if public_value.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES") {
+        return Err(format!(
+            "{} indexed update branch {} input row field `{field_name}` is not BYTES",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed update branch {} input row field `{field_name}` has no private BYTES state",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if expected_inline_bytes_summary(bytes) != *public_value {
+        return Err(format!(
+            "{} indexed update branch {} bytes row field `{field_name}` public summary does not match private byte state",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    Ok(bytes.clone())
+}
+
+fn expected_root_single_state_input(
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<boon_ir::StateId> {
+    let mut inputs = Vec::new();
+    for input in &op.inputs {
+        if let boon_plan::ValueRef::State(state_id) = input
+            && !inputs.contains(state_id)
+        {
+            inputs.push(*state_id);
+        }
+    }
+    let [input] = inputs.as_slice() else {
+        return Err(format!(
+            "{} root update branch {} expected one state input, found {}",
+            report_path.display(),
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok(*input)
+}
+
+fn expected_root_bytes_equal_state_inputs(
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+    let mut inputs = Vec::new();
+    for input in &op.inputs {
+        if let boon_plan::ValueRef::State(state_id) = input
+            && !inputs.contains(state_id)
+        {
+            inputs.push(*state_id);
+        }
+    }
+    let [left, right] = inputs.as_slice() else {
+        return Err(format!(
+            "{} root Bytes/equal update branch {} expected two distinct state inputs, found {}",
+            report_path.display(),
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok((*left, *right))
+}
+
+fn expected_root_bytes_concat_state_inputs(
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root Bytes/concat update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(left),
+        boon_plan::ValueRef::State(right),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root Bytes/concat update branch {} expected two ordered state inputs, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if left == right {
+        return Err(format!(
+            "{} root Bytes/concat update branch {} expected distinct state inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*left))
+        || !op.inputs.contains(&boon_plan::ValueRef::State(*right))
+    {
+        return Err(format!(
+            "{} root Bytes/concat update branch {} ordered inputs are not declared op inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    Ok((*left, *right))
+}
+
+fn expected_root_bytes_ordered_state_inputs(
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(left),
+        boon_plan::ValueRef::State(right),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root {operation} update branch {} expected two ordered state inputs, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*left))
+        || !op.inputs.contains(&boon_plan::ValueRef::State(*right))
+    {
+        return Err(format!(
+            "{} root {operation} update branch {} ordered inputs are not declared op inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    Ok((*left, *right))
+}
+
+fn expected_root_bytes_set_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(
+    boon_ir::StateId,
+    usize,
+    u8,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root Bytes/set update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(index_constant_id),
+        boon_plan::ValueRef::Constant(value_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root Bytes/set update branch {} expected state, index constant, and value constant operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root Bytes/set update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let index_constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *index_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root Bytes/set update branch {} references missing index constant {}",
+                report_path.display(),
+                op.id.0,
+                index_constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Number { value: index } = &index_constant.value else {
+        return Err(format!(
+            "{} root Bytes/set update branch {} index constant {} is not a number",
+            report_path.display(),
+            op.id.0,
+            index_constant_id.0
+        )
+        .into());
+    };
+    let index = usize::try_from(*index).map_err(|_| {
+        format!(
+            "{} root Bytes/set update branch {} index constant {} is negative or too large",
+            report_path.display(),
+            op.id.0,
+            index_constant_id.0
+        )
+    })?;
+    let value_constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *value_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root Bytes/set update branch {} references missing value constant {}",
+                report_path.display(),
+                op.id.0,
+                value_constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Byte { value } = value_constant.value else {
+        return Err(format!(
+            "{} root Bytes/set update branch {} value constant {} is not a BYTE",
+            report_path.display(),
+            op.id.0,
+            value_constant_id.0
+        )
+        .into());
+    };
+    Ok((*input, index, value, *index_constant_id, *value_constant_id))
+}
+
+fn expected_root_bytes_slice_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(
+    boon_ir::StateId,
+    usize,
+    usize,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root Bytes/slice update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(offset_constant_id),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root Bytes/slice update branch {} expected state, offset constant, and byte_count constant operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root Bytes/slice update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let offset = expected_root_usize_number_constant(
+        plan,
+        *offset_constant_id,
+        "Bytes/slice",
+        "offset",
+        op,
+        report_path,
+    )?;
+    let byte_count = expected_root_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        "Bytes/slice",
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((
+        *input,
+        offset,
+        byte_count,
+        *offset_constant_id,
+        *byte_count_constant_id,
+    ))
+}
+
+fn expected_root_bytes_count_operand(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(boon_ir::StateId, usize, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root {operation} update branch {} expected state and byte_count constant operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root {operation} update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let byte_count = expected_root_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        operation,
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((*input, byte_count, *byte_count_constant_id))
+}
+
+fn expected_root_bytes_zeros_operand(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(usize, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root Bytes/zeros update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [boon_plan::ValueRef::Constant(byte_count_constant_id)] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} root Bytes/zeros update branch {} expected byte_count constant operand, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if op
+        .inputs
+        .iter()
+        .any(|input| matches!(input, boon_plan::ValueRef::State(_)))
+    {
+        return Err(format!(
+            "{} root Bytes/zeros update branch {} must not declare state inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let byte_count = expected_root_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        "Bytes/zeros",
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((byte_count, *byte_count_constant_id))
+}
+
+fn expected_root_bytes_numeric_read_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(
+    boon_ir::StateId,
+    usize,
+    usize,
+    ExpectedBytesEndian,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(offset_constant_id),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+        boon_plan::ValueRef::Constant(endian_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root {operation} update branch {} expected state, offset, byte_count, and endian operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root {operation} update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let offset = expected_root_usize_number_constant(
+        plan,
+        *offset_constant_id,
+        operation,
+        "offset",
+        op,
+        report_path,
+    )?;
+    let byte_count = expected_root_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        operation,
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    if !matches!(byte_count, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "{} root {operation} update branch {} byte_count {byte_count} is not supported",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let endian =
+        expected_root_endian_constant(plan, *endian_constant_id, operation, op, report_path)?;
+    Ok((
+        *input,
+        offset,
+        byte_count,
+        endian,
+        *offset_constant_id,
+        *byte_count_constant_id,
+        *endian_constant_id,
+    ))
+}
+
+fn expected_root_bytes_numeric_write_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(
+    boon_ir::StateId,
+    usize,
+    usize,
+    ExpectedBytesEndian,
+    i64,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(offset_constant_id),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+        boon_plan::ValueRef::Constant(endian_constant_id),
+        boon_plan::ValueRef::Constant(value_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root {operation} update branch {} expected state, offset, byte_count, endian, and value operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root {operation} update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let offset = expected_root_usize_number_constant(
+        plan,
+        *offset_constant_id,
+        operation,
+        "offset",
+        op,
+        report_path,
+    )?;
+    let byte_count = expected_root_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        operation,
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    if !matches!(byte_count, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "{} root {operation} update branch {} byte_count {byte_count} is not supported",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let endian =
+        expected_root_endian_constant(plan, *endian_constant_id, operation, op, report_path)?;
+    let value = expected_root_i64_number_constant(
+        plan,
+        *value_constant_id,
+        operation,
+        "value",
+        op,
+        report_path,
+    )?;
+    Ok((
+        *input,
+        offset,
+        byte_count,
+        endian,
+        value,
+        *offset_constant_id,
+        *byte_count_constant_id,
+        *endian_constant_id,
+        *value_constant_id,
+    ))
+}
+
+fn expected_root_usize_number_constant(
+    plan: &boon_plan::MachinePlan,
+    constant_id: boon_plan::PlanConstantId,
+    operation: &str,
+    label: &str,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<usize> {
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root {operation} update branch {} references missing {label} constant {}",
+                report_path.display(),
+                op.id.0,
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Number { value } = &constant.value else {
+        return Err(format!(
+            "{} root {operation} update branch {} {label} constant {} is not a number",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into());
+    };
+    usize::try_from(*value).map_err(|_| {
+        format!(
+            "{} root {operation} update branch {} {label} constant {} is negative or too large",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into()
+    })
+}
+
+fn expected_root_i64_number_constant(
+    plan: &boon_plan::MachinePlan,
+    constant_id: boon_plan::PlanConstantId,
+    operation: &str,
+    label: &str,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<i64> {
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root {operation} update branch {} references missing {label} constant {}",
+                report_path.display(),
+                op.id.0,
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Number { value } = &constant.value else {
+        return Err(format!(
+            "{} root {operation} update branch {} {label} constant {} is not a number",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into());
+    };
+    Ok(*value)
+}
+
+fn expected_root_endian_constant(
+    plan: &boon_plan::MachinePlan,
+    constant_id: boon_plan::PlanConstantId,
+    operation: &str,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedBytesEndian> {
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root {operation} update branch {} references missing endian constant {}",
+                report_path.display(),
+                op.id.0,
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Text { value } = &constant.value else {
+        return Err(format!(
+            "{} root {operation} update branch {} endian constant {} is not TEXT",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into());
+    };
+    match value.as_str() {
+        "Little" => Ok(ExpectedBytesEndian::Little),
+        "Big" => Ok(ExpectedBytesEndian::Big),
+        _ => Err(format!(
+            "{} root {operation} update branch {} endian constant {} is unsupported: `{value}`",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into()),
+    }
+}
+
+fn expected_checked_bytes_slice(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    operation: &str,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let end = offset.checked_add(byte_count).ok_or_else(|| {
+        format!(
+            "{} root {operation} update branch {} byte range overflows for `{input_label}`",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        format!(
+            "{} root {operation} update branch {} byte range {offset}..{end} is out of bounds for `{input_label}`",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    Ok(slice.to_vec())
+}
+
+fn expected_validate_bytes_output_len(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_ir::StateId,
+    actual_len: usize,
+    operation: &str,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let output_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root {operation} update branch {} has no output storage slot",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+    if let boon_plan::PlanValueType::Bytes {
+        fixed_len: Some(fixed_len),
+    } = &output_slot.value_type
+        && *fixed_len != actual_len as u64
+    {
+        return Err(format!(
+            "{} root {operation} update branch {} output fixed length {} does not match produced length {}",
+            report_path.display(),
+            op.id.0,
+            fixed_len,
+            actual_len
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn expected_root_text_bytes_conversion_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(boon_ir::StateId, String, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} root {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(encoding_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} root {operation} update branch {} expected state and encoding constant operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} root {operation} update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let encoding_constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *encoding_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root {operation} update branch {} references missing encoding constant {}",
+                report_path.display(),
+                op.id.0,
+                encoding_constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Text { value: encoding } = &encoding_constant.value else {
+        return Err(format!(
+            "{} root {operation} update branch {} encoding constant {} is not TEXT",
+            report_path.display(),
+            op.id.0,
+            encoding_constant_id.0
+        )
+        .into());
+    };
+    if !expected_encoding_is_utf8(encoding) {
+        return Err(format!(
+            "{} root {operation} update branch {} encoding constant {} is unsupported: `{encoding}`",
+            report_path.display(),
+            op.id.0,
+            encoding_constant_id.0
+        )
+        .into());
+    }
+    Ok((*input, "utf8".to_owned(), *encoding_constant_id))
+}
+
+fn expected_encoding_is_utf8(value: &str) -> bool {
+    value
+        .trim()
+        .trim_matches('"')
+        .replace(['-', '_'], "")
+        .eq_ignore_ascii_case("utf8")
+}
+
+fn expected_root_single_source_payload_input(
+    op: &boon_plan::PlanOp,
+    active_source_id: usize,
+    report_path: &Path,
+) -> RuntimeResult<Option<boon_ir::SourcePayloadField>> {
+    let mut inputs = Vec::new();
+    for input in &op.inputs {
+        if let boon_plan::ValueRef::SourcePayload { source_id, field } = input
+            && source_id.0 == active_source_id
+            && !inputs.contains(field)
+        {
+            inputs.push(field.clone());
+        }
+    }
+    match inputs.as_slice() {
+        [] => Ok(None),
+        [field] => Ok(Some(field.clone())),
+        _ => Err(format!(
+            "{} root update branch {} has ambiguous source-payload inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into()),
+    }
+}
+
+fn expected_root_text_trim_input(
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_ir::StateId,
+    report_path: &Path,
+) -> RuntimeResult<boon_ir::StateId> {
+    let mut non_output_inputs = Vec::new();
+    let mut output_present = false;
+    for input in &op.inputs {
+        let boon_plan::ValueRef::State(state_id) = input else {
+            continue;
+        };
+        if *state_id == output_state_id {
+            output_present = true;
+        } else if !non_output_inputs.contains(state_id) {
+            non_output_inputs.push(*state_id);
+        }
+    }
+    match non_output_inputs.as_slice() {
+        [input] => Ok(*input),
+        [] if output_present => Ok(output_state_id),
+        [] => Err(format!(
+            "{} root TextTrimOrPrevious update branch {} has no typed state input",
+            report_path.display(),
+            op.id.0
+        )
+        .into()),
+        _ => Err(format!(
+            "{} root TextTrimOrPrevious update branch {} has ambiguous non-output state inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into()),
+    }
+}
+
+fn expected_root_state_value<'a>(
+    plan: &boon_plan::MachinePlan,
+    state: &'a serde_json::Map<String, JsonValue>,
+    state_id: boon_ir::StateId,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<&'a JsonValue> {
+    let label = plan_state_label(plan, state_id.0);
+    state.get(&label).ok_or_else(|| {
+        format!(
+            "{} root update branch {} input state `{label}` is missing",
+            report_path.display(),
+            op.id.0
+        )
+        .into()
+    })
+}
+
+fn expected_root_state_inline_bytes(
+    plan: &boon_plan::MachinePlan,
+    state: &serde_json::Map<String, JsonValue>,
+    bytes_state: &ExpectedRootBytesState,
+    state_id: boon_ir::StateId,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let label = plan_state_label(plan, state_id.0);
+    let public_value = expected_root_state_value(plan, state, state_id, op, report_path)?;
+    if public_value.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES") {
+        return Err(format!(
+            "{} root update branch {} input state `{label}` is not BYTES",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let public_digest = public_value.get("digest").and_then(JsonValue::as_str);
+    let public_byte_len = public_value.get("byte_len").and_then(JsonValue::as_u64);
+    if let Some(bytes) = bytes_state.get(&state_id.0) {
+        let expected_summary = expected_inline_bytes_summary(bytes);
+        if &expected_summary != public_value {
+            return Err(format!(
+                "{} root update branch {} bytes state `{label}` public summary does not match private byte state",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        return Ok(bytes.clone());
+    }
+    let slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == state_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root update branch {} has no scalar slot for `{label}`",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+    let constant_id = slot.initial_constant_id.ok_or_else(|| {
+        format!(
+            "{} root update branch {} bytes state `{label}` has no typed initial constant",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} root update branch {} bytes state `{label}` references missing constant {}",
+                report_path.display(),
+                op.id.0,
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Bytes {
+        byte_len,
+        sha256,
+        inline_bytes: Some(bytes),
+    } = &constant.value
+    else {
+        return Err(format!(
+            "{} root update branch {} bytes state `{label}` is not backed by an inline byte constant",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    if public_byte_len != Some(*byte_len) || public_digest != Some(sha256.as_str()) {
+        return Err(format!(
+            "{} root update branch {} bytes state `{label}` public summary does not match typed byte constant",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    Ok(bytes.clone())
+}
+
+fn expected_inline_bytes_summary(bytes: &[u8]) -> JsonValue {
+    json!({
+        "$boon_type": "BYTES",
+        "storage": "inline",
+        "digest": sha256_bytes(bytes),
+        "byte_len": bytes.len() as u64,
+    })
+}
+
+fn expected_bytes_encode_hex(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(data.len().saturating_mul(2));
+    for byte in data {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn expected_bytes_decode_hex(
+    text: &str,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<Vec<u8>> {
+    let digits = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if digits.len() % 2 != 0 {
+        return Err(format!(
+            "{} root Bytes/from_hex update branch {} input `{input_label}` has odd hex digit count",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let mut output = Vec::with_capacity(digits.len() / 2);
+    for chunk in digits.chunks_exact(2) {
+        let high = expected_bytes_hex_value(chunk[0]).ok_or_else(|| {
+            format!(
+                "{} root Bytes/from_hex update branch {} input `{input_label}` has invalid hex digit",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+        let low = expected_bytes_hex_value(chunk[1]).ok_or_else(|| {
+            format!(
+                "{} root Bytes/from_hex update branch {} input `{input_label}` has invalid hex digit",
+                report_path.display(),
+                op.id.0
+            )
+        })?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn expected_bytes_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn expected_bytes_encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(data.len().div_ceil(3).saturating_mul(4));
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn expected_bytes_decode_base64(
+    text: &str,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<Vec<u8>> {
+    let input = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.len() % 4 != 0 {
+        return Err(expected_base64_error(report_path, op, input_label));
+    }
+    let mut output = Vec::with_capacity((input.len() / 4).saturating_mul(3));
+    for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+        let final_chunk = chunk_index == input.len() / 4 - 1;
+        if chunk[0] == b'=' || chunk[1] == b'=' {
+            return Err(expected_base64_error(report_path, op, input_label));
+        }
+        let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
+        if padding > 2 || (!final_chunk && padding > 0) {
+            return Err(expected_base64_error(report_path, op, input_label));
+        }
+        if padding == 1 && chunk[2] == b'=' {
+            return Err(expected_base64_error(report_path, op, input_label));
+        }
+        let a = expected_bytes_base64_value(chunk[0], report_path, op, input_label)?;
+        let b = expected_bytes_base64_value(chunk[1], report_path, op, input_label)?;
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            expected_bytes_base64_value(chunk[2], report_path, op, input_label)?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            expected_bytes_base64_value(chunk[3], report_path, op, input_label)?
+        };
+        let packed = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
+        output.push(((packed >> 16) & 0xff) as u8);
+        if padding < 2 {
+            output.push(((packed >> 8) & 0xff) as u8);
+        }
+        if padding < 1 {
+            output.push((packed & 0xff) as u8);
+        }
+    }
+    Ok(output)
+}
+
+fn expected_bytes_base64_value(
+    byte: u8,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<u8> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(expected_base64_error(report_path, op, input_label)),
+    }
+}
+
+fn expected_base64_error(
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "{} root Bytes/from_base64 update branch {} input `{input_label}` is invalid base64",
+        report_path.display(),
+        op.id.0
+    )
+    .into()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedBytesEndian {
+    Little,
+    Big,
+}
+
+fn expected_bytes_endian_label(value: ExpectedBytesEndian) -> &'static str {
+    match value {
+        ExpectedBytesEndian::Little => "Little",
+        ExpectedBytesEndian::Big => "Big",
+    }
+}
+
+fn expected_checked_numeric_range<'a>(
+    data: &'a [u8],
+    offset: usize,
+    byte_count: usize,
+    operation: &str,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<&'a [u8]> {
+    if !matches!(byte_count, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "{} root {operation} update branch {} byte_count {byte_count} is not supported",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let end = offset.checked_add(byte_count).ok_or_else(|| {
+        format!(
+            "{} root {operation} update branch {} byte range overflows for `{input_label}`",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    data.get(offset..end).ok_or_else(|| {
+        format!(
+            "{} root {operation} update branch {} byte range {offset}..{end} is out of bounds for `{input_label}`",
+            report_path.display(),
+            op.id.0
+        )
+        .into()
+    })
+}
+
+fn expected_bytes_read_unsigned(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<i64> {
+    let slice = expected_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/read_unsigned",
+        report_path,
+        op,
+        input_label,
+    )?;
+    let mut bytes = [0u8; 8];
+    let value = match endian {
+        ExpectedBytesEndian::Little => {
+            bytes[..byte_count].copy_from_slice(slice);
+            u64::from_le_bytes(bytes)
+        }
+        ExpectedBytesEndian::Big => {
+            bytes[8 - byte_count..].copy_from_slice(slice);
+            u64::from_be_bytes(bytes)
+        }
+    };
+    if value > i64::MAX as u64 {
+        return Err(format!(
+            "{} root Bytes/read_unsigned update branch {} overflows Boon NUMBER",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    Ok(value as i64)
+}
+
+fn expected_bytes_read_signed(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<i64> {
+    let slice = expected_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/read_signed",
+        report_path,
+        op,
+        input_label,
+    )?;
+    Ok(match (byte_count, endian) {
+        (1, _) => i8::from_ne_bytes([slice[0]]) as i64,
+        (2, ExpectedBytesEndian::Little) => i16::from_le_bytes([slice[0], slice[1]]) as i64,
+        (2, ExpectedBytesEndian::Big) => i16::from_be_bytes([slice[0], slice[1]]) as i64,
+        (4, ExpectedBytesEndian::Little) => {
+            i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
+        }
+        (4, ExpectedBytesEndian::Big) => {
+            i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
+        }
+        (8, ExpectedBytesEndian::Little) => i64::from_le_bytes([
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ]),
+        (8, ExpectedBytesEndian::Big) => i64::from_be_bytes([
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ]),
+        _ => unreachable!("validated numeric byte count"),
+    })
+}
+
+fn expected_bytes_write_unsigned(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<Vec<u8>> {
+    expected_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/write_unsigned",
+        report_path,
+        op,
+        input_label,
+    )?;
+    if value < 0 {
+        return Err(format!(
+            "{} root Bytes/write_unsigned update branch {} value {value} is negative",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let max = if byte_count == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (byte_count * 8)) - 1
+    };
+    let value = value as u64;
+    if value > max {
+        return Err(format!(
+            "{} root Bytes/write_unsigned update branch {} value overflows byte_count {byte_count}",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let mut output = data.to_vec();
+    let bytes = match endian {
+        ExpectedBytesEndian::Little => value.to_le_bytes()[..byte_count].to_vec(),
+        ExpectedBytesEndian::Big => value.to_be_bytes()[8 - byte_count..].to_vec(),
+    };
+    output[offset..offset + byte_count].copy_from_slice(&bytes);
+    Ok(output)
+}
+
+fn expected_bytes_write_signed(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    report_path: &Path,
+    op: &boon_plan::PlanOp,
+    input_label: &str,
+) -> RuntimeResult<Vec<u8>> {
+    expected_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/write_signed",
+        report_path,
+        op,
+        input_label,
+    )?;
+    match byte_count {
+        1 if !(i8::MIN as i64..=i8::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} root Bytes/write_signed update branch {} value overflows i8",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        2 if !(i16::MIN as i64..=i16::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} root Bytes/write_signed update branch {} value overflows i16",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        4 if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} root Bytes/write_signed update branch {} value overflows i32",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        1 | 2 | 4 | 8 => {}
+        _ => unreachable!("validated numeric byte count"),
+    }
+    let mut output = data.to_vec();
+    let bytes = match (byte_count, endian) {
+        (1, _) => vec![value as i8 as u8],
+        (2, ExpectedBytesEndian::Little) => (value as i16).to_le_bytes().to_vec(),
+        (2, ExpectedBytesEndian::Big) => (value as i16).to_be_bytes().to_vec(),
+        (4, ExpectedBytesEndian::Little) => (value as i32).to_le_bytes().to_vec(),
+        (4, ExpectedBytesEndian::Big) => (value as i32).to_be_bytes().to_vec(),
+        (8, ExpectedBytesEndian::Little) => value.to_le_bytes().to_vec(),
+        (8, ExpectedBytesEndian::Big) => value.to_be_bytes().to_vec(),
+        _ => unreachable!("validated numeric byte count"),
+    };
+    output[offset..offset + byte_count].copy_from_slice(&bytes);
+    Ok(output)
+}
+
+fn expected_resolve_plan_row_index(
+    plan: &boon_plan::MachinePlan,
+    source_route_slot: &boon_plan::SourceRoute,
+    source_event: &serde_json::Map<String, JsonValue>,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    report_path: &Path,
+) -> RuntimeResult<usize> {
+    let list_label = plan_list_label(plan, list_slot.list_id.0);
+    let rows = list_state.get(&list_slot.list_id.0).ok_or_else(|| {
+        format!(
+            "{} list state missing list {}",
+            report_path.display(),
+            list_slot.list_id.0
+        )
+    })?;
+    if let Some(target_key) = expected_event_u64(source_event, "target_key") {
+        let target_generation =
+            expected_event_u64(source_event, "target_generation").ok_or_else(|| {
+                format!(
+                    "{} scoped source supplied target_key without target_generation",
+                    report_path.display()
+                )
+            })?;
+        let index = rows
+            .iter()
+            .position(|row| row.key == target_key && row.generation == target_generation)
+            .ok_or_else(|| {
+                format!(
+                    "{} scoped source target key/generation {target_key}/{target_generation} not found in `{list_label}`",
+                    report_path.display()
+                )
+            })?;
+        expected_validate_plan_row_binding_epoch(
+            plan,
+            source_route_slot,
+            list_slot,
+            &rows[index],
+            source_event,
+            report_path,
+        )?;
+        return Ok(index);
+    }
+    if let Some(address) = expected_event_str(source_event, "address")
+        && let Some(lookup_field) = source_route_slot
+            .payload_schema
+            .address_lookup_field
+            .as_ref()
+        && let Some(index) = rows.iter().position(|row| {
+            row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(address)
+        })
+    {
+        expected_validate_plan_row_binding_epoch(
+            plan,
+            source_route_slot,
+            list_slot,
+            &rows[index],
+            source_event,
+            report_path,
+        )?;
+        return Ok(index);
+    }
+    let Some(target_text) = expected_event_str(source_event, "target_text") else {
+        return Err(format!(
+            "{} scoped source needs target_key, address, or target_text to resolve a row",
+            report_path.display()
+        )
+        .into());
+    };
+    let occurrence = expected_event_u64(source_event, "target_occurrence")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1)
+        .max(1);
+    let mut seen = 0usize;
+    for (index, row) in rows.iter().enumerate() {
+        if row
+            .fields
+            .values()
+            .any(|value| value.as_str() == Some(target_text))
+        {
+            seen += 1;
+            if seen == occurrence {
+                expected_validate_plan_row_binding_epoch(
+                    plan,
+                    source_route_slot,
+                    list_slot,
+                    row,
+                    source_event,
+                    report_path,
+                )?;
+                return Ok(index);
+            }
+        }
+    }
+    Err(format!(
+        "{} scoped source target_text `{target_text}` occurrence {occurrence} not found in `{list_label}`",
+        report_path.display()
+    )
+    .into())
+}
+
+fn expected_validate_plan_row_binding_epoch(
+    plan: &boon_plan::MachinePlan,
+    source_route_slot: &boon_plan::SourceRoute,
+    list_slot: &boon_plan::ListStorageSlot,
+    row: &ExpectedPlanListRowState,
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let Some(source_binding_id) = expected_plan_row_source_binding_id(
+        plan,
+        list_slot,
+        row.key,
+        source_route_slot.source_id.0,
+    ) else {
+        return Ok(());
+    };
+    let expected_epoch = expected_event_u64(source_event, "bind_epoch")
+        .or_else(|| expected_event_u64(source_event, "source_epoch"));
+    if expected_epoch.is_some_and(|epoch| epoch != source_binding_id) {
+        return Err(format!(
+            "{} scoped source bind_epoch/source_epoch does not match row binding id {source_binding_id}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn expected_plan_row_source_binding_id(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    key: u64,
+    source_id: usize,
+) -> Option<u64> {
+    let routes = row_scoped_source_routes(plan, list_slot);
+    routes
+        .iter()
+        .position(|route| route.source_id.0 == source_id)
+        .map(|route_index| (key - 1) * routes.len() as u64 + route_index as u64 + 1)
+}
+
+fn expected_row_resolution_report(
+    source_event: &serde_json::Map<String, JsonValue>,
+    row_index: usize,
+    row: &ExpectedPlanListRowState,
+    source_binding_id: Option<u64>,
+) -> JsonValue {
+    json!({
+        "method": if expected_event_u64(source_event, "target_key").is_some() {
+            "key_generation"
+        } else if expected_event_str(source_event, "address").is_some() {
+            "address"
+        } else {
+            "target_text"
+        },
+        "target_text": source_event.get("target_text").cloned().unwrap_or(JsonValue::Null),
+        "target_occurrence": source_event.get("target_occurrence").cloned().unwrap_or(JsonValue::Null),
+        "target_key": source_event.get("target_key").cloned().unwrap_or(JsonValue::Null),
+        "target_generation": source_event.get("target_generation").cloned().unwrap_or(JsonValue::Null),
+        "address": source_event.get("address").cloned().unwrap_or(JsonValue::Null),
+        "row_index": row_index,
+        "key": row.key,
+        "generation": row.generation,
+        "source_binding_id": source_binding_id,
+    })
+}
+
+fn expected_refresh_row_bool_not_fields(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    key: u64,
+    generation: u64,
+    fields: &mut BTreeMap<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = Vec::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(boon_plan::PlanDerivedExpression::BoolNot { input }),
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(input_state_id) = (match input {
+            boon_plan::ValueRef::State(state_id) => Some(state_id),
+            _ => None,
+        }) else {
+            return Err(format!(
+                "{} indexed Bool/not op {} input is not a state ref",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        let Some(input_slot) = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id == *input_state_id)
+        else {
+            return Err(format!(
+                "{} indexed Bool/not op {} input state is missing",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        if input_slot.scope_id != list_slot.scope_id {
+            continue;
+        }
+        let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+        let Some(input_value) = fields.get(&input_name).and_then(JsonValue::as_bool) else {
+            continue;
+        };
+        let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        let value = JsonValue::Bool(!input_value);
+        let changed = fields.get(&output_name) != Some(&value);
+        fields.insert(output_name.clone(), value.clone());
+        if changed {
+            deltas.push(json!({
+                "kind": "FieldSet",
+                "list_id": list_label,
+                "key": key,
+                "generation": generation,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": output_name,
+                "value": value,
+            }));
+        }
+    }
+    Ok(deltas)
+}
+
+fn expected_refresh_indexed_derived_fields_for_row(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row_index: usize,
+    report_path: &Path,
+    suppress_recursive_cycle_values: bool,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut row_eval = list_state
+        .get(&list_slot.list_id.0)
+        .and_then(|rows| rows.get(row_index))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{} row index {row_index} missing in `{list_label}`",
+                report_path.display()
+            )
+        })?;
+    let mut changed_fields = Vec::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let Some(value) = expected_eval_indexed_derived_row_value(
+            plan,
+            list_slot,
+            list_state,
+            &row_eval,
+            op,
+            output_id,
+            report_path,
+        )?
+        else {
+            continue;
+        };
+        if suppress_recursive_cycle_values
+            && expected_row_value_is_cycle_error(&value)
+            && !expected_plan_op_is_error_text_row_expression(op)
+        {
+            continue;
+        }
+        let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        if row_eval.fields.get(&output_name) == Some(&value) {
+            continue;
+        }
+        row_eval.fields.insert(output_name.clone(), value.clone());
+        changed_fields.push((output_name, value));
+    }
+    if changed_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    if suppress_recursive_cycle_values {
+        changed_fields.sort_by_key(|(field_name, _)| {
+            if field_name == "error" {
+                0
+            } else if field_name == "value" {
+                1
+            } else {
+                2
+            }
+        });
+    }
+    let row = list_state
+        .get_mut(&list_slot.list_id.0)
+        .and_then(|rows| rows.get_mut(row_index))
+        .ok_or_else(|| {
+            format!(
+                "{} row index {row_index} missing in `{list_label}`",
+                report_path.display()
+            )
+        })?;
+    let mut deltas = Vec::new();
+    for (field_name, value) in changed_fields {
+        row.fields.insert(field_name.clone(), value.clone());
+        deltas.push(json!({
+            "kind": "FieldSet",
+            "list_id": list_label,
+            "key": row.key,
+            "generation": row.generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": field_name,
+            "value": value,
+        }));
+    }
+    Ok(deltas)
+}
+
+fn expected_stale_empty_text_indexed_derived_deltas(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row_index: usize,
+    source_id: usize,
+    current_op_id: usize,
+    report_path: &Path,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let later_states =
+        expected_later_indexed_derived_feeding_states_for_source(plan, source_id, current_op_id);
+    if later_states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let row = list_state
+        .get(&list_slot.list_id.0)
+        .and_then(|rows| rows.get(row_index))
+        .ok_or_else(|| {
+            format!(
+                "{} row index {row_index} missing in `{list_label}`",
+                report_path.display()
+            )
+        })?;
+    let mut deltas = Vec::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed || expected_plan_op_is_error_text_row_expression(op) {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+        } = &op.kind
+        else {
+            continue;
+        };
+        if !expected_row_expression_applies_to_list(plan, list_slot, output_id)
+            || !later_states
+                .iter()
+                .any(|state_id| expected_plan_row_expression_contains_state(expression, *state_id))
+        {
+            continue;
+        }
+        let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        let value =
+            expected_eval_plan_row_expression(plan, list_state, row, expression, report_path)?;
+        if value.as_str() != Some("") || row.fields.get(&output_name) != Some(&value) {
+            continue;
+        }
+        deltas.push(json!({
+            "kind": "FieldSet",
+            "list_id": list_label,
+            "key": row.key,
+            "generation": row.generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": output_name,
+            "value": value,
+        }));
+    }
+    Ok(deltas)
+}
+
+fn expected_refresh_all_indexed_derived_fields(
+    plan: &boon_plan::MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    report_path: &Path,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = Vec::new();
+    for list_slot in &plan.storage_layout.list_slots {
+        let row_count = list_state
+            .get(&list_slot.list_id.0)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let list_label = plan_list_label(plan, list_slot.list_id.0);
+        for row_index in 0..row_count {
+            deltas.extend(expected_refresh_indexed_derived_fields_for_row(
+                plan,
+                list_slot,
+                &list_label,
+                list_state,
+                row_index,
+                report_path,
+                true,
+            )?);
+        }
+    }
+    Ok(deltas)
+}
+
+fn expected_plan_op_is_error_text_row_expression(op: &boon_plan::PlanOp) -> bool {
+    matches!(
+        &op.kind,
+        boon_plan::PlanOpKind::DerivedValue {
+            expression: Some(boon_plan::PlanDerivedExpression::RowExpression {
+                expression: boon_plan::PlanRowExpression::BuiltinCall { function, .. },
+            }),
+            ..
+        } if function == "Error/text"
+    )
+}
+
+fn expected_source_has_later_indexed_state_feeding_derived(
+    plan: &boon_plan::MachinePlan,
+    source_id: usize,
+    current_op_id: usize,
+) -> bool {
+    !expected_later_indexed_derived_feeding_states_for_source(plan, source_id, current_op_id)
+        .is_empty()
+}
+
+fn expected_later_indexed_derived_feeding_states_for_source(
+    plan: &boon_plan::MachinePlan,
+    source_id: usize,
+    current_op_id: usize,
+) -> Vec<boon_ir::StateId> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::UpdateBranches)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            if !op.indexed
+                || op.id.0 <= current_op_id
+                || !op
+                    .inputs
+                    .contains(&boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)))
+            {
+                return None;
+            }
+            let Some(boon_plan::ValueRef::State(state_id)) = op.output else {
+                return None;
+            };
+            expected_indexed_state_feeds_indexed_derived_expression(plan, state_id)
+                .then_some(state_id)
+        })
+        .collect()
+}
+
+fn expected_indexed_state_feeds_indexed_derived_expression(
+    plan: &boon_plan::MachinePlan,
+    state_id: boon_ir::StateId,
+) -> bool {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .any(|op| {
+            if !op.indexed {
+                return false;
+            }
+            let boon_plan::PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            expected_plan_derived_expression_contains_state(expression, state_id)
+        })
+}
+
+fn expected_plan_derived_expression_contains_state(
+    expression: &boon_plan::PlanDerivedExpression,
+    state_id: boon_ir::StateId,
+) -> bool {
+    match expression {
+        boon_plan::PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state, .. } => {
+            *state == boon_plan::ValueRef::State(state_id)
+        }
+        boon_plan::PlanDerivedExpression::BoolNot { input } => {
+            *input == boon_plan::ValueRef::State(state_id)
+        }
+        boon_plan::PlanDerivedExpression::BoolAnd { left, right } => {
+            expected_plan_derived_expression_contains_state(left, state_id)
+                || expected_plan_derived_expression_contains_state(right, state_id)
+        }
+        boon_plan::PlanDerivedExpression::BoolNotExpression { input } => {
+            expected_plan_derived_expression_contains_state(input, state_id)
+        }
+        boon_plan::PlanDerivedExpression::RowExpression { expression } => {
+            expected_plan_row_expression_contains_state(expression, state_id)
+        }
+        boon_plan::PlanDerivedExpression::NumberCompareConst { left, .. } => {
+            *left == boon_plan::ValueRef::State(state_id)
+        }
+    }
+}
+
+fn expected_plan_row_expression_contains_state(
+    expression: &boon_plan::PlanRowExpression,
+    state_id: boon_ir::StateId,
+) -> bool {
+    match expression {
+        boon_plan::PlanRowExpression::Field { input } => {
+            *input == boon_plan::ValueRef::State(state_id)
+        }
+        boon_plan::PlanRowExpression::Object { fields } => fields
+            .iter()
+            .any(|field| expected_plan_row_expression_contains_state(&field.value, state_id)),
+        boon_plan::PlanRowExpression::TextTrim { input }
+        | boon_plan::PlanRowExpression::TextIsEmpty { input }
+        | boon_plan::PlanRowExpression::TextLength { input }
+        | boon_plan::PlanRowExpression::TextToNumber { input }
+        | boon_plan::PlanRowExpression::ObjectField { object: input, .. }
+        | boon_plan::PlanRowExpression::ListSum { input } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+        }
+        boon_plan::PlanRowExpression::TextStartsWith { input, prefix } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(prefix, state_id)
+        }
+        boon_plan::PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(start, state_id)
+                || expected_plan_row_expression_contains_state(length, state_id)
+        }
+        boon_plan::PlanRowExpression::NumberInfix { left, right, .. } => {
+            expected_plan_row_expression_contains_state(left, state_id)
+                || expected_plan_row_expression_contains_state(right, state_id)
+        }
+        boon_plan::PlanRowExpression::TextConcat { parts } => parts
+            .iter()
+            .any(|part| expected_plan_row_expression_contains_state(part, state_id)),
+        boon_plan::PlanRowExpression::ListGetField { index, .. } => {
+            expected_plan_row_expression_contains_state(index, state_id)
+        }
+        boon_plan::PlanRowExpression::ListFindValue {
+            value, fallback, ..
+        } => {
+            expected_plan_row_expression_contains_state(value, state_id)
+                || fallback.as_deref().is_some_and(|fallback| {
+                    expected_plan_row_expression_contains_state(fallback, state_id)
+                })
+        }
+        boon_plan::PlanRowExpression::ListRange { from, to } => {
+            expected_plan_row_expression_contains_state(from, state_id)
+                || expected_plan_row_expression_contains_state(to, state_id)
+        }
+        boon_plan::PlanRowExpression::ListMap { input, value, .. } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(value, state_id)
+        }
+        boon_plan::PlanRowExpression::BuiltinCall { input, args, .. } => {
+            input
+                .as_deref()
+                .is_some_and(|input| expected_plan_row_expression_contains_state(input, state_id))
+                || args
+                    .iter()
+                    .any(|arg| expected_plan_row_expression_contains_state(&arg.value, state_id))
+        }
+        boon_plan::PlanRowExpression::Select { input, arms } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || arms
+                    .iter()
+                    .any(|arm| expected_plan_row_expression_contains_state(&arm.value, state_id))
+        }
+        boon_plan::PlanRowExpression::Constant { .. }
+        | boon_plan::PlanRowExpression::ListRef { .. }
+        | boon_plan::PlanRowExpression::ListMapItem { .. } => false,
+    }
+}
+
+fn expected_eval_indexed_derived_row_value(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    output_id: boon_ir::FieldId,
+    report_path: &Path,
+) -> RuntimeResult<Option<JsonValue>> {
+    let boon_plan::PlanOpKind::DerivedValue {
+        derived_kind: boon_plan::PlanDerivedKind::Pure,
+        expression: Some(expression),
+    } = &op.kind
+    else {
+        return Ok(None);
+    };
+    match expression {
+        boon_plan::PlanDerivedExpression::BoolNot { input } => {
+            let Some(input_state_id) = (match input {
+                boon_plan::ValueRef::State(state_id) => Some(state_id),
+                _ => None,
+            }) else {
+                return Err(format!(
+                    "{} indexed Bool/not op {} input is not a state ref",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            };
+            let Some(input_slot) = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == *input_state_id)
+            else {
+                return Err(format!(
+                    "{} indexed Bool/not op {} input state is missing",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            };
+            if input_slot.scope_id != list_slot.scope_id {
+                return Ok(None);
+            }
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let Some(input_value) = row.fields.get(&input_name).and_then(JsonValue::as_bool) else {
+                return Ok(None);
+            };
+            Ok(Some(JsonValue::Bool(!input_value)))
+        }
+        boon_plan::PlanDerivedExpression::RowExpression { expression } => {
+            if !expected_row_expression_applies_to_list(plan, list_slot, output_id) {
+                return Ok(None);
+            }
+            Ok(Some(expected_eval_plan_row_expression(
+                plan,
+                list_state,
+                row,
+                expression,
+                report_path,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn expected_event_str<'a>(
+    source_event: &'a serde_json::Map<String, JsonValue>,
+    key: &str,
+) -> Option<&'a str> {
+    source_event.get(key).and_then(JsonValue::as_str)
+}
+
+fn expected_event_u64(source_event: &serde_json::Map<String, JsonValue>, key: &str) -> Option<u64> {
+    source_event.get(key).and_then(JsonValue::as_u64)
+}
+
+fn expected_row_bool_not_deltas(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    key: u64,
+    generation: u64,
+    fields: &mut BTreeMap<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = Vec::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(boon_plan::PlanDerivedExpression::BoolNot { input }),
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(input_state_id) = (match input {
+            boon_plan::ValueRef::State(state_id) => Some(state_id),
+            _ => None,
+        }) else {
+            return Err(format!(
+                "{} indexed Bool/not op {} input is not a state ref",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        let Some(input_slot) = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id == *input_state_id)
+        else {
+            return Err(format!(
+                "{} indexed Bool/not op {} input state is missing",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        if input_slot.scope_id != list_slot.scope_id {
+            continue;
+        }
+        let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+        let input_value = fields
+            .get(&input_name)
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "{} indexed Bool/not op {} input field `{input_name}` is not available as bool",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+        let output_label = plan_semantic_field_label(plan, output_id.0);
+        let output_name = local_field_name(&output_label);
+        let value = JsonValue::Bool(!input_value);
+        fields.insert(output_name.clone(), value.clone());
+        deltas.push(json!({
+            "kind": "FieldSet",
+            "list_id": list_label,
+            "key": key,
+            "generation": generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": output_name,
+            "value": value,
+        }));
+    }
+    Ok(deltas)
+}
+
+fn expected_value_for_plan_ref(
+    plan: &boon_plan::MachinePlan,
+    value_ref: &boon_plan::ValueRef,
+    derived_values: &BTreeMap<boon_ir::FieldId, JsonValue>,
+    row_fields: Option<&BTreeMap<String, JsonValue>>,
+    report_path: &Path,
+) -> RuntimeResult<Option<JsonValue>> {
+    match value_ref {
+        boon_plan::ValueRef::Field(field_id) => Ok(derived_values.get(field_id).cloned()),
+        boon_plan::ValueRef::State(state_id) => {
+            let field_name = local_field_name(&plan_state_label(plan, state_id.0));
+            Ok(row_fields.and_then(|fields| fields.get(&field_name).cloned()))
+        }
+        _ => Err(format!(
+            "{} unsupported list append value ref `{value_ref:?}`",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+struct ExpectedRootScalarUpdate {
+    value: JsonValue,
+    private_bytes: Option<Vec<u8>>,
+    expression_kind: &'static str,
+    source_payload_field: JsonValue,
+    update_constant_id: JsonValue,
+    update_constant_value: JsonValue,
+}
+
+fn expected_root_scalar_update(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    source_id: usize,
+    source_route_slot: &boon_plan::SourceRoute,
+    source_event: &serde_json::Map<String, JsonValue>,
+    state: &serde_json::Map<String, JsonValue>,
+    bytes_state: &ExpectedRootBytesState,
+    report_path: &Path,
+) -> RuntimeResult<Option<ExpectedRootScalarUpdate>> {
+    let source_guard = match &op.kind {
+        boon_plan::PlanOpKind::UpdateBranch { source_guard, .. } => source_guard,
+        _ => {
+            return Err(format!(
+                "{} root-scalar op {} is not an update branch",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+    };
+    if !expected_plan_source_guard_matches(source_guard, source_id, source_event, report_path)? {
+        return Ok(None);
+    }
+    let Some(boon_plan::ValueRef::State(output_state_id)) = op.output else {
+        return Err(format!(
+            "{} root-scalar op {} does not output a state slot",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    match &op.kind {
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::SourcePayload,
+            source_payload_field: Some(field),
+            update_constant_id: None,
+            ..
+        } => {
+            if !source_route_slot.payload_schema.fields.contains(field) {
+                return Err(format!(
+                    "{} selected root-scalar op reads a field missing from the route schema",
+                    report_path.display()
+                )
+                .into());
+            }
+            let has_payload_ref = op.inputs.iter().any(|input| {
+                matches!(
+                    input,
+                    boon_plan::ValueRef::SourcePayload {
+                        source_id: input_source_id,
+                        field: input_field
+                    } if input_source_id.0 == source_id && input_field == field
+                )
+            });
+            if !has_payload_ref {
+                return Err(format!(
+                    "{} selected root-scalar op is missing typed source-payload input",
+                    report_path.display()
+                )
+                .into());
+            }
+            let (value, private_bytes) = expected_source_payload_value_for_output(
+                plan,
+                output_state_id,
+                source_event,
+                field,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value,
+                private_bytes,
+                expression_kind: "source_payload",
+                source_payload_field: serde_json::to_value(field)?,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::Const,
+            source_payload_field: None,
+            update_constant_id: Some(constant_id),
+            ..
+        } => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} selected root-scalar op references missing update constant {}",
+                        report_path.display(),
+                        constant_id.0
+                    )
+                })?;
+            let value = plan_constant_json_value(constant, report_path)?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: value.clone(),
+                private_bytes: expected_constant_private_bytes_for_output(
+                    plan,
+                    output_state_id,
+                    constant,
+                    report_path,
+                )?,
+                expression_kind: "const",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(constant_id.0),
+                update_constant_value: value,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BoolNot,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let input_value = expected_root_state_value(
+                plan,
+                state,
+                input_state_id,
+                op,
+                report_path,
+            )?
+            .as_bool()
+            .ok_or_else(|| {
+                format!(
+                    "{} root Bool/not update branch {} input state `{input_label}` is not bool",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::Bool(!input_value),
+                private_bytes: None,
+                expression_kind: "bool_not",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesLength,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let byte_len = bytes.len() as u64;
+            let byte_len = i64::try_from(byte_len).map_err(|_| {
+                format!(
+                    "{} root Bytes/length update branch {} byte_len exceeds Boon NUMBER",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: json!(byte_len),
+                private_bytes: None,
+                expression_kind: "bytes_length",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesIsEmpty,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::Bool(bytes.is_empty()),
+                private_bytes: None,
+                expression_kind: "bytes_is_empty",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesGet,
+            source_payload_field: None,
+            update_constant_id: Some(update_constant_id),
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let index_constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *update_constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Bytes/get update branch {} references missing index constant {}",
+                        report_path.display(),
+                        op.id.0,
+                        update_constant_id.0
+                    )
+                })?;
+            let boon_plan::PlanConstantValue::Number { value: index } = &index_constant.value
+            else {
+                return Err(format!(
+                    "{} root Bytes/get update branch {} index constant {} is not a number",
+                    report_path.display(),
+                    op.id.0,
+                    update_constant_id.0
+                )
+                .into());
+            };
+            let index = usize::try_from(*index).map_err(|_| {
+                format!(
+                    "{} root Bytes/get update branch {} index constant {} is negative or too large",
+                    report_path.display(),
+                    op.id.0,
+                    update_constant_id.0
+                )
+            })?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let byte = bytes.get(index).ok_or_else(|| {
+                format!(
+                    "{} root Bytes/get update branch {} index {index} is out of bounds for `{input_label}`",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: json!(i64::from(*byte)),
+                private_bytes: None,
+                expression_kind: "bytes_get",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(update_constant_id.0),
+                update_constant_value: json!(index),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesSet,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, index, byte_value, index_constant_id, value_constant_id) =
+                expected_root_bytes_set_operands(plan, op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/set update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            let output_slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Bytes/set update branch {} has no output storage slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            if let boon_plan::PlanValueType::Bytes {
+                fixed_len: Some(fixed_len),
+            } = &output_slot.value_type
+                && *fixed_len != bytes.len() as u64
+            {
+                return Err(format!(
+                    "{} root Bytes/set update branch {} output fixed length {} does not match input length {}",
+                    report_path.display(),
+                    op.id.0,
+                    fixed_len,
+                    bytes.len()
+                )
+                .into());
+            }
+            let mut output = bytes.to_vec();
+            let Some(slot) = output.get_mut(index) else {
+                return Err(format!(
+                    "{} root Bytes/set update branch {} index {index} is out of bounds for `{input_label}`",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            };
+            *slot = byte_value;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_set",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([index_constant_id.0, value_constant_id.0]),
+                update_constant_value: json!({"index": index, "value": byte_value}),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesSlice,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, offset, byte_count, offset_constant_id, byte_count_constant_id) =
+                expected_root_bytes_slice_operands(plan, op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                offset,
+                byte_count,
+                "Bytes/slice",
+                op,
+                &input_label,
+                report_path,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/slice update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/slice",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_slice",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([offset_constant_id.0, byte_count_constant_id.0]),
+                update_constant_value: json!({"offset": offset, "byte_count": byte_count}),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesTake,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, byte_count, byte_count_constant_id) =
+                expected_root_bytes_count_operand(plan, op, report_path, "Bytes/take")?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                0,
+                byte_count,
+                "Bytes/take",
+                op,
+                &input_label,
+                report_path,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/take update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/take",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_take",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(byte_count_constant_id.0),
+                update_constant_value: json!(byte_count),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesDrop,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, byte_count, byte_count_constant_id) =
+                expected_root_bytes_count_operand(plan, op, report_path, "Bytes/drop")?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            if byte_count > bytes.len() {
+                return Err(format!(
+                    "{} root Bytes/drop update branch {} byte_count {byte_count} is out of bounds for `{input_label}`",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            }
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                byte_count,
+                bytes.len() - byte_count,
+                "Bytes/drop",
+                op,
+                &input_label,
+                report_path,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/drop update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/drop",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_drop",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(byte_count_constant_id.0),
+                update_constant_value: json!(byte_count),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesZeros,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (byte_count, byte_count_constant_id) =
+                expected_root_bytes_zeros_operand(plan, op, report_path)?;
+            let mut output = Vec::new();
+            output.try_reserve_exact(byte_count).map_err(|_| {
+                format!(
+                    "{} root Bytes/zeros update branch {} could not allocate {byte_count} bytes",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            output.resize(byte_count, 0);
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/zeros update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/zeros",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_zeros",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(byte_count_constant_id.0),
+                update_constant_value: json!(byte_count),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToHex,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::String(expected_bytes_encode_hex(&bytes)),
+                private_bytes: None,
+                expression_kind: "bytes_to_hex",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFromHex,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let text = expected_root_state_value(plan, state, input_state_id, op, report_path)?
+                .as_str()
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Bytes/from_hex update branch {} input state `{input_label}` is not TEXT",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let output = expected_bytes_decode_hex(text, report_path, op, &input_label)?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/from_hex update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/from_hex",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_from_hex",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToBase64,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::String(expected_bytes_encode_base64(&bytes)),
+                private_bytes: None,
+                expression_kind: "bytes_to_base64",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFromBase64,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let text = expected_root_state_value(plan, state, input_state_id, op, report_path)?
+                .as_str()
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Bytes/from_base64 update branch {} input state `{input_label}` is not TEXT",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let output = expected_bytes_decode_base64(text, report_path, op, &input_label)?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/from_base64 update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/from_base64",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_from_base64",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesReadUnsigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+            ) = expected_root_bytes_numeric_read_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/read_unsigned",
+            )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let value = expected_bytes_read_unsigned(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                report_path,
+                op,
+                &input_label,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: json!(value),
+                private_bytes: None,
+                expression_kind: "bytes_read_unsigned",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([
+                    offset_constant_id.0,
+                    byte_count_constant_id.0,
+                    endian_constant_id.0
+                ]),
+                update_constant_value: json!({
+                    "offset": offset,
+                    "byte_count": byte_count,
+                    "endian": expected_bytes_endian_label(endian)
+                }),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesReadSigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+            ) = expected_root_bytes_numeric_read_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/read_signed",
+            )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let value = expected_bytes_read_signed(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                report_path,
+                op,
+                &input_label,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: json!(value),
+                private_bytes: None,
+                expression_kind: "bytes_read_signed",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([
+                    offset_constant_id.0,
+                    byte_count_constant_id.0,
+                    endian_constant_id.0
+                ]),
+                update_constant_value: json!({
+                    "offset": offset,
+                    "byte_count": byte_count,
+                    "endian": expected_bytes_endian_label(endian)
+                }),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesWriteUnsigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                value,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+                value_constant_id,
+            ) = expected_root_bytes_numeric_write_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/write_unsigned",
+            )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let output = expected_bytes_write_unsigned(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                value,
+                report_path,
+                op,
+                &input_label,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/write_unsigned update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/write_unsigned",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_write_unsigned",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([
+                    offset_constant_id.0,
+                    byte_count_constant_id.0,
+                    endian_constant_id.0,
+                    value_constant_id.0
+                ]),
+                update_constant_value: json!({
+                    "offset": offset,
+                    "byte_count": byte_count,
+                    "endian": expected_bytes_endian_label(endian),
+                    "value": value
+                }),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesWriteSigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                value,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+                value_constant_id,
+            ) = expected_root_bytes_numeric_write_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/write_signed",
+            )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let output = expected_bytes_write_signed(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                value,
+                report_path,
+                op,
+                &input_label,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/write_signed update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/write_signed",
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "bytes_write_signed",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!([
+                    offset_constant_id.0,
+                    byte_count_constant_id.0,
+                    endian_constant_id.0,
+                    value_constant_id.0
+                ]),
+                update_constant_value: json!({
+                    "offset": offset,
+                    "byte_count": byte_count,
+                    "endian": expected_bytes_endian_label(endian),
+                    "value": value
+                }),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::TextToBytes,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, encoding, encoding_constant_id) =
+                expected_root_text_bytes_conversion_operands(
+                    plan,
+                    op,
+                    report_path,
+                    "Text/to_bytes",
+                )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let text = expected_root_state_value(plan, state, input_state_id, op, report_path)?
+                .as_str()
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Text/to_bytes update branch {} input state `{input_label}` is not TEXT",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let output = text.as_bytes().to_vec();
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Text/to_bytes update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            let output_slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Text/to_bytes update branch {} has no output storage slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            if let boon_plan::PlanValueType::Bytes {
+                fixed_len: Some(fixed_len),
+            } = &output_slot.value_type
+                && *fixed_len != output.len() as u64
+            {
+                return Err(format!(
+                    "{} root Text/to_bytes update branch {} output fixed length {} does not match encoded length {}",
+                    report_path.display(),
+                    op.id.0,
+                    fixed_len,
+                    output.len()
+                )
+                .into());
+            }
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&output),
+                private_bytes: Some(output),
+                expression_kind: "text_to_bytes",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(encoding_constant_id.0),
+                update_constant_value: json!(encoding),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToText,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, encoding, encoding_constant_id) =
+                expected_root_text_bytes_conversion_operands(
+                    plan,
+                    op,
+                    report_path,
+                    "Bytes/to_text",
+                )?;
+            let input_label = plan_state_label(plan, input_state_id.0);
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                input_state_id,
+                op,
+                report_path,
+            )?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "{} root Bytes/to_text update branch {} input state `{input_label}` is not valid UTF-8",
+                    report_path.display(),
+                    op.id.0
+                )
+            })?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::String(text),
+                private_bytes: None,
+                expression_kind: "bytes_to_text",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: json!(encoding_constant_id.0),
+                update_constant_value: json!(encoding),
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesEqual,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (left_state_id, right_state_id) =
+                expected_root_bytes_equal_state_inputs(op, report_path)?;
+            let left_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                left_state_id,
+                op,
+                report_path,
+            )?;
+            let right_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                right_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::Bool(left_bytes == right_bytes),
+                private_bytes: None,
+                expression_kind: "bytes_equal",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFind,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (haystack_state_id, needle_state_id) =
+                expected_root_bytes_ordered_state_inputs(op, report_path, "Bytes/find")?;
+            let haystack_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                haystack_state_id,
+                op,
+                report_path,
+            )?;
+            let needle_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                needle_state_id,
+                op,
+                report_path,
+            )?;
+            let found = if needle_bytes.is_empty() {
+                Some(0)
+            } else {
+                haystack_bytes
+                    .windows(needle_bytes.len())
+                    .position(|window| window == needle_bytes)
+            };
+            let value = match found {
+                Some(index) => json!(i64::try_from(index).map_err(|_| {
+                    format!(
+                        "{} root Bytes/find update branch {} found index exceeds Boon NUMBER",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?),
+                None => JsonValue::Null,
+            };
+            Ok(Some(ExpectedRootScalarUpdate {
+                value,
+                private_bytes: None,
+                expression_kind: "bytes_find",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesStartsWith,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (bytes_state_id, prefix_state_id) =
+                expected_root_bytes_ordered_state_inputs(op, report_path, "Bytes/starts_with")?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                bytes_state_id,
+                op,
+                report_path,
+            )?;
+            let prefix = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                prefix_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::Bool(bytes.starts_with(&prefix)),
+                private_bytes: None,
+                expression_kind: "bytes_starts_with",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesEndsWith,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (bytes_state_id, suffix_state_id) =
+                expected_root_bytes_ordered_state_inputs(op, report_path, "Bytes/ends_with")?;
+            let bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                bytes_state_id,
+                op,
+                report_path,
+            )?;
+            let suffix = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                suffix_state_id,
+                op,
+                report_path,
+            )?;
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::Bool(bytes.ends_with(&suffix)),
+                private_bytes: None,
+                expression_kind: "bytes_ends_with",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesConcat,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (left_state_id, right_state_id) =
+                expected_root_bytes_concat_state_inputs(op, report_path)?;
+            let left_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                left_state_id,
+                op,
+                report_path,
+            )?;
+            let right_bytes = expected_root_state_inline_bytes(
+                plan,
+                state,
+                bytes_state,
+                right_state_id,
+                op,
+                report_path,
+            )?;
+            let output_state_id = match op.output {
+                Some(boon_plan::ValueRef::State(state_id)) => state_id,
+                _ => {
+                    return Err(format!(
+                        "{} root Bytes/concat update branch {} does not target a state slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+            };
+            let output_slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} root Bytes/concat update branch {} has no output storage slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let output_len = left_bytes.len().saturating_add(right_bytes.len());
+            if let boon_plan::PlanValueType::Bytes {
+                fixed_len: Some(fixed_len),
+            } = &output_slot.value_type
+                && *fixed_len != output_len as u64
+            {
+                return Err(format!(
+                    "{} root Bytes/concat update branch {} output fixed length {} does not match concat length {}",
+                    report_path.display(),
+                    op.id.0,
+                    fixed_len,
+                    output_len
+                )
+                .into());
+            }
+            let mut bytes = Vec::with_capacity(output_len);
+            bytes.extend_from_slice(&left_bytes);
+            bytes.extend_from_slice(&right_bytes);
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: expected_inline_bytes_summary(&bytes),
+                private_bytes: Some(bytes),
+                expression_kind: "bytes_concat",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::ReadPath,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            if let Some(payload_field) =
+                expected_root_single_source_payload_input(op, source_id, report_path)?
+            {
+                let has_payload_ref = op.inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        boon_plan::ValueRef::SourcePayload {
+                            source_id: input_source_id,
+                            field
+                        } if input_source_id.0 == source_id && *field == payload_field
+                    )
+                });
+                if !has_payload_ref {
+                    return Err(format!(
+                        "{} root ReadPath update branch {} is missing typed source-payload input",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+                Ok(Some(ExpectedRootScalarUpdate {
+                    value: expected_source_payload_json_value(
+                        source_event,
+                        &payload_field,
+                        report_path,
+                    )?,
+                    private_bytes: None,
+                    expression_kind: "read_path",
+                    source_payload_field: serde_json::to_value(&payload_field)?,
+                    update_constant_id: JsonValue::Null,
+                    update_constant_value: JsonValue::Null,
+                }))
+            } else {
+                let input_state_id = expected_root_single_state_input(op, report_path)?;
+                let value =
+                    expected_root_state_value(plan, state, input_state_id, op, report_path)?
+                        .clone();
+                let private_bytes =
+                    if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                        bytes_state.get(&input_state_id.0).cloned()
+                    } else {
+                        None
+                    };
+                Ok(Some(ExpectedRootScalarUpdate {
+                    value,
+                    private_bytes,
+                    expression_kind: "read_path",
+                    source_payload_field: JsonValue::Null,
+                    update_constant_id: JsonValue::Null,
+                    update_constant_value: JsonValue::Null,
+                }))
+            }
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::PreviousValue,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id = expected_root_single_state_input(op, report_path)?;
+            let value =
+                expected_root_state_value(plan, state, input_state_id, op, report_path)?.clone();
+            let private_bytes =
+                if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                    bytes_state.get(&input_state_id.0).cloned()
+                } else {
+                    None
+                };
+            Ok(Some(ExpectedRootScalarUpdate {
+                value,
+                private_bytes,
+                expression_kind: "previous_value",
+                source_payload_field: JsonValue::Null,
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::TextTrimOrPrevious,
+            source_payload_field,
+            update_constant_id: None,
+            ..
+        } => {
+            let raw = if let Some(payload_field) = source_payload_field {
+                let has_payload_ref = op.inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        boon_plan::ValueRef::SourcePayload {
+                            source_id: input_source_id,
+                            field
+                        } if input_source_id.0 == source_id && field == payload_field
+                    )
+                });
+                if !has_payload_ref {
+                    return Err(format!(
+                        "{} root TextTrimOrPrevious update branch {} is missing typed source-payload input",
+                        report_path.display(),
+                        op.id.0
+                    )
+                    .into());
+                }
+                expected_source_payload_json_value(source_event, payload_field, report_path)?
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} root TextTrimOrPrevious update branch {} payload is not text",
+                            report_path.display(),
+                            op.id.0
+                        )
+                    })?
+                    .to_owned()
+            } else {
+                let input_state_id =
+                    expected_root_text_trim_input(op, output_state_id, report_path)?;
+                let input_label = plan_state_label(plan, input_state_id.0);
+                expected_root_state_value(plan, state, input_state_id, op, report_path)?
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} root TextTrimOrPrevious update branch {} input state `{input_label}` is not text",
+                            report_path.display(),
+                            op.id.0
+                        )
+                    })?
+                    .to_owned()
+            };
+            let output_label = plan_state_label(plan, output_state_id.0);
+            let current = state
+                .get(&output_label)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} root TextTrimOrPrevious update branch {} output state `{output_label}` is not text",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            let trimmed = raw.trim();
+            let value = if trimmed.is_empty() {
+                current.to_owned()
+            } else {
+                trimmed.to_owned()
+            };
+            Ok(Some(ExpectedRootScalarUpdate {
+                value: JsonValue::String(value),
+                private_bytes: None,
+                expression_kind: "text_trim_or_previous",
+                source_payload_field: source_payload_field
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?
+                    .unwrap_or(JsonValue::Null),
+                update_constant_id: JsonValue::Null,
+                update_constant_value: JsonValue::Null,
+            }))
+        }
+        _ => Err(format!(
+            "{} selected root-scalar op {} has unsupported expression kind {:?}",
+            report_path.display(),
+            op.id.0,
+            op.kind
+        )
+        .into()),
+    }
+}
+
+fn expected_source_payload_value_for_output(
+    plan: &boon_plan::MachinePlan,
+    output_state_id: boon_ir::StateId,
+    source_event: &serde_json::Map<String, JsonValue>,
+    field: &boon_ir::SourcePayloadField,
+    report_path: &Path,
+) -> RuntimeResult<(JsonValue, Option<Vec<u8>>)> {
+    let slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or_else(|| {
+            format!(
+                "{} source-payload update targets missing state {}",
+                report_path.display(),
+                output_state_id.0
+            )
+        })?;
+    match field {
+        boon_ir::SourcePayloadField::Bytes => {
+            let boon_plan::PlanValueType::Bytes { fixed_len } = &slot.value_type else {
+                return Err(format!(
+                    "{} source-payload BYTES update targets non-BYTES state `{}`",
+                    report_path.display(),
+                    plan_state_label(plan, output_state_id.0)
+                )
+                .into());
+            };
+            let bytes = source_event_payload_bytes(source_event, report_path)?;
+            if let Some(expected_len) = *fixed_len
+                && expected_len != bytes.len() as u64
+            {
+                return Err(format!(
+                    "{} source-payload BYTES update length {} does not match fixed_len {expected_len}",
+                    report_path.display(),
+                    bytes.len()
+                )
+                .into());
+            }
+            Ok((expected_inline_bytes_summary(&bytes), Some(bytes)))
+        }
+        boon_ir::SourcePayloadField::Address
+        | boon_ir::SourcePayloadField::Key
+        | boon_ir::SourcePayloadField::Named(_)
+        | boon_ir::SourcePayloadField::Text => {
+            if slot.value_type != boon_plan::PlanValueType::Text {
+                return Err(format!(
+                    "{} source-payload text update targets non-TEXT state `{}`",
+                    report_path.display(),
+                    plan_state_label(plan, output_state_id.0)
+                )
+                .into());
+            }
+            Ok((
+                source_event_payload_value(
+                    source_event,
+                    &serde_json::to_value(field)?,
+                    report_path,
+                )?,
+                None,
+            ))
+        }
+    }
+}
+
+fn expected_root_scalar_initial_state(
+    plan: &boon_plan::MachinePlan,
+    report_path: &Path,
+) -> RuntimeResult<(
+    serde_json::Map<String, JsonValue>,
+    ExpectedRootBytesState,
+    usize,
+)> {
+    let mut state = serde_json::Map::new();
+    let mut bytes_state = ExpectedRootBytesState::new();
+    let mut initialized = 0usize;
+    for slot in &plan.storage_layout.scalar_slots {
+        if slot.indexed {
+            continue;
+        }
+        let value = expected_initial_value(
+            plan,
+            slot.initial_constant_id,
+            &slot.value_type,
+            slot.initial_value_kind,
+            report_path,
+        )?;
+        if matches!(slot.value_type, boon_plan::PlanValueType::Bytes { .. }) {
+            let bytes = expected_initial_inline_bytes(plan, slot, report_path)?;
+            if expected_inline_bytes_summary(&bytes) != value {
+                return Err(format!(
+                    "{} initial bytes state `{}` public summary does not match private byte payload",
+                    report_path.display(),
+                    plan_state_label(plan, slot.state_id.0)
+                )
+                .into());
+            }
+            bytes_state.insert(slot.state_id.0, bytes);
+        }
+        state.insert(plan_state_label(plan, slot.state_id.0), value);
+        initialized += 1;
+    }
+    Ok((state, bytes_state, initialized))
+}
+
+fn expected_initial_list_state(
+    plan: &boon_plan::MachinePlan,
+    report_path: &Path,
+) -> RuntimeResult<BTreeMap<usize, Vec<ExpectedPlanListRowState>>> {
+    let mut lists = BTreeMap::new();
+    for slot in &plan.storage_layout.list_slots {
+        let mut rows = Vec::new();
+        for (index, initial_row) in slot.initial_rows.iter().enumerate() {
+            let mut fields = BTreeMap::new();
+            let mut private_bytes = BTreeMap::new();
+            for field in &initial_row.fields {
+                let field_id = field.field_id.ok_or_else(|| {
+                    format!(
+                        "{} initial row field `{}` for list {} has no typed field id",
+                        report_path.display(),
+                        field.name,
+                        slot.list_id.0
+                    )
+                })?;
+                let field_name = local_field_name(&plan_semantic_field_label(plan, field_id.0));
+                fields.insert(
+                    field_name.clone(),
+                    plan_constant_value_json_value(&field.value, report_path)?,
+                );
+                if let Some(bytes) = expected_private_bytes_from_plan_constant_value(
+                    &field.value,
+                    &format!(
+                        "{} initial row field `{}` for list {}",
+                        report_path.display(),
+                        field.name,
+                        slot.list_id.0
+                    ),
+                )? {
+                    private_bytes.insert(field_name, bytes);
+                }
+            }
+            let key = index as u64 + 1;
+            let generation = 1;
+            let _ = expected_refresh_row_bool_not_fields(
+                plan,
+                slot,
+                &plan_list_label(plan, slot.list_id.0),
+                key,
+                generation,
+                &mut fields,
+                report_path,
+            )?;
+            rows.push(ExpectedPlanListRowState {
+                key,
+                generation,
+                fields,
+                private_bytes,
+            });
+        }
+        if matches!(slot.initializer_kind, boon_plan::ListInitializerKind::Range) {
+            let range = slot.range.ok_or_else(|| {
+                format!(
+                    "{} range list `{}` has no typed range bounds",
+                    report_path.display(),
+                    plan_list_label(plan, slot.list_id.0)
+                )
+            })?;
+            let count = if range.from <= range.to {
+                usize::try_from(range.to.saturating_sub(range.from).saturating_add(1))
+                    .map_err(|_| "List/range row count is out of range")?
+            } else {
+                0
+            };
+            for (offset, value) in (range.from..=range.to).take(count).enumerate() {
+                let mut fields = BTreeMap::new();
+                let text = value.to_string();
+                fields.insert("index".to_owned(), JsonValue::String(text.clone()));
+                fields.insert("value".to_owned(), JsonValue::String(text));
+                let (defaults, default_bytes) =
+                    expected_row_default_fields(plan, slot, report_path)?;
+                for (field, value) in defaults {
+                    fields.entry(field).or_insert(value);
+                }
+                let private_bytes = default_bytes;
+                let key = offset as u64 + 1;
+                let generation = 1;
+                let _ = expected_refresh_row_bool_not_fields(
+                    plan,
+                    slot,
+                    &plan_list_label(plan, slot.list_id.0),
+                    key,
+                    generation,
+                    &mut fields,
+                    report_path,
+                )?;
+                rows.push(ExpectedPlanListRowState {
+                    key,
+                    generation,
+                    fields,
+                    private_bytes,
+                });
+            }
+        }
+        lists.insert(slot.list_id.0, rows);
+    }
+    let list_slots = plan.storage_layout.list_slots.clone();
+    for slot in &list_slots {
+        let list_id = slot.list_id.0;
+        let Some(mut rows) = lists.remove(&list_id) else {
+            continue;
+        };
+        let mut row_expression_list_state = lists.clone();
+        row_expression_list_state.insert(list_id, rows.clone());
+        for row in &mut rows {
+            expected_refresh_row_expression_fields_best_effort(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                report_path,
+            );
+            expected_refresh_row_initial_state_fields(plan, slot, row);
+            if let Some(current_rows) = row_expression_list_state.get_mut(&list_id)
+                && let Some(current_row) = current_rows
+                    .iter_mut()
+                    .find(|current_row| current_row.key == row.key)
+            {
+                *current_row = row.clone();
+            }
+        }
+        let mut row_expression_list_state = lists.clone();
+        row_expression_list_state.insert(list_id, rows.clone());
+        for row in &mut rows {
+            expected_refresh_row_expression_fields(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                report_path,
+            )?;
+            expected_refresh_row_initial_state_fields(plan, slot, row);
+            let _ = expected_refresh_row_bool_not_fields(
+                plan,
+                slot,
+                &plan_list_label(plan, slot.list_id.0),
+                row.key,
+                row.generation,
+                &mut row.fields,
+                report_path,
+            )?;
+        }
+        lists.insert(list_id, rows);
+    }
+    Ok(lists)
+}
+
+fn expected_refresh_row_initial_state_fields(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    row: &mut ExpectedPlanListRowState,
+) {
+    for slot in &plan.storage_layout.scalar_slots {
+        if slot.scope_id != list_slot.scope_id {
+            continue;
+        }
+        let Some(source_path) = slot.initial_row_field_path.as_deref() else {
+            continue;
+        };
+        let source_name = local_field_name(source_path);
+        let Some(value) = row.fields.get(&source_name).cloned() else {
+            continue;
+        };
+        let field_name = local_field_name(&plan_state_label(plan, slot.state_id.0));
+        row.fields.entry(field_name).or_insert(value);
+    }
+}
+
+fn expected_refresh_row_expression_fields_best_effort(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &mut ExpectedPlanListRowState,
+    report_path: &Path,
+) {
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+        } = &op.kind
+        else {
+            continue;
+        };
+        if !expected_row_expression_applies_to_list(plan, list_slot, output_id) {
+            continue;
+        }
+        let Ok(value) =
+            expected_eval_plan_row_expression(plan, list_state, row, expression, report_path)
+        else {
+            continue;
+        };
+        let field_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        row.fields.insert(field_name, value);
+    }
+}
+
+fn expected_refresh_row_expression_fields(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &mut ExpectedPlanListRowState,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let boon_plan::PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+        } = &op.kind
+        else {
+            continue;
+        };
+        if !expected_row_expression_applies_to_list(plan, list_slot, output_id) {
+            continue;
+        }
+        let value =
+            expected_eval_plan_row_expression(plan, list_state, row, expression, report_path)?;
+        let field_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        row.fields.insert(field_name, value);
+    }
+    Ok(())
+}
+
+fn expected_row_refresh_field_deltas(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    key: u64,
+    generation: u64,
+    before: &BTreeMap<String, JsonValue>,
+    after: &BTreeMap<String, JsonValue>,
+) -> Vec<JsonValue> {
+    let row_expression_fields = expected_row_expression_output_field_names(plan, list_slot);
+    after
+        .iter()
+        .filter(|(field, _)| row_expression_fields.contains(*field))
+        .filter(|(field, value)| before.get(*field) != Some(*value))
+        .map(|(field, value)| {
+            json!({
+                "kind": "FieldSet",
+                "list_id": list_label,
+                "key": key,
+                "generation": generation,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": field,
+                "value": value,
+            })
+        })
+        .collect()
+}
+
+fn expected_row_expression_output_field_names(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+) -> BTreeSet<String> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            if !op.indexed {
+                return None;
+            }
+            let Some(boon_plan::ValueRef::Field(output_id)) = op.output else {
+                return None;
+            };
+            let boon_plan::PlanOpKind::DerivedValue {
+                derived_kind: boon_plan::PlanDerivedKind::Pure,
+                expression: Some(boon_plan::PlanDerivedExpression::RowExpression { .. }),
+            } = &op.kind
+            else {
+                return None;
+            };
+            expected_row_expression_applies_to_list(plan, list_slot, output_id)
+                .then(|| local_field_name(&plan_semantic_field_label(plan, output_id.0)))
+        })
+        .collect()
+}
+
+fn expected_row_expression_applies_to_list(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    output_id: boon_ir::FieldId,
+) -> bool {
+    plan.debug_map
+        .fields
+        .iter()
+        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(output_id.0))
+        .and_then(|entry| {
+            entry
+                .label
+                .rsplit_once('.')
+                .map(|(scope_name, _)| scope_name.to_owned())
+        })
+        .is_some_and(|scope_name| {
+            let has_row_source_route = plan.source_routes.iter().any(|route| {
+                route.scope_id == list_slot.scope_id
+                    && route.path.starts_with(&format!("{scope_name}."))
+            });
+            let has_row_state_slot = plan.storage_layout.scalar_slots.iter().any(|slot| {
+                slot.scope_id == list_slot.scope_id
+                    && plan_state_label(plan, slot.state_id.0)
+                        .starts_with(&format!("{scope_name}."))
+            });
+            let has_append_row_field = plan
+                .regions
+                .iter()
+                .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+                .flat_map(|region| region.ops.iter())
+                .any(|op| {
+                    op.output == Some(boon_plan::ValueRef::List(list_slot.list_id))
+                        && matches!(
+                            &op.kind,
+                            boon_plan::PlanOpKind::ListOperation {
+                                append: Some(append),
+                                ..
+                            } if append.fields.iter().any(|field| {
+                                field.field_id.is_some_and(|field_id| {
+                                    plan_semantic_field_label(plan, field_id.0)
+                                        .starts_with(&format!("{scope_name}."))
+                                })
+                            })
+                        )
+                });
+            has_row_source_route || has_row_state_slot || has_append_row_field
+        })
+}
+
+fn expected_eval_plan_row_expression(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    expected_eval_plan_row_expression_with_stack(
+        plan,
+        list_state,
+        row,
+        expression,
+        report_path,
+        &[],
+    )
+}
+
+fn expected_eval_plan_row_expression_with_stack(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<JsonValue> {
+    match expression {
+        boon_plan::PlanRowExpression::Field { input } => {
+            expected_eval_plan_row_field_ref(plan, row, input, report_path)
+        }
+        boon_plan::PlanRowExpression::Constant { constant_id } => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} row expression constant {} is missing",
+                        report_path.display(),
+                        constant_id.0
+                    )
+                })?;
+            plan_constant_json_value(constant, report_path)
+        }
+        boon_plan::PlanRowExpression::TextTrim { input } => Ok(JsonValue::String(
+            expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?
+            .trim()
+            .to_owned(),
+        )),
+        boon_plan::PlanRowExpression::TextIsEmpty { input } => Ok(JsonValue::Bool(
+            expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?
+            .is_empty(),
+        )),
+        boon_plan::PlanRowExpression::TextStartsWith { input, prefix } => Ok(JsonValue::Bool(
+            expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?
+            .starts_with(&expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                prefix,
+                report_path,
+                stack,
+            )?),
+        )),
+        boon_plan::PlanRowExpression::TextLength { input } => Ok(json!(
+            expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack
+            )?
+            .chars()
+            .count() as i64
+        )),
+        boon_plan::PlanRowExpression::TextToNumber { input } => {
+            let text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            Ok(text
+                .parse::<i64>()
+                .map(JsonValue::from)
+                .unwrap_or_else(|_| JsonValue::String("NaN".to_owned())))
+        }
+        boon_plan::PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        } => {
+            let text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let start = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                start,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let length = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                length,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            Ok(JsonValue::String(
+                text.chars().skip(start).take(length).collect(),
+            ))
+        }
+        boon_plan::PlanRowExpression::NumberInfix { op, left, right } => {
+            let left_value = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                left,
+                report_path,
+                stack,
+            )?;
+            let right_value = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                right,
+                report_path,
+                stack,
+            )?;
+            if expected_row_value_is_cycle_error(&left_value)
+                || expected_row_value_is_cycle_error(&right_value)
+            {
+                return Ok(expected_row_cycle_error_json());
+            }
+            if expected_row_value_is_nan(&left_value) || expected_row_value_is_nan(&right_value) {
+                return Ok(JsonValue::String("NaN".to_owned()));
+            }
+            if op == "+"
+                && (expected_json_number_value(&left_value).is_none()
+                    || expected_json_number_value(&right_value).is_none())
+            {
+                return Ok(JsonValue::String(format!(
+                    "{}{}",
+                    expected_row_value_to_text(&left_value, report_path)?,
+                    expected_row_value_to_text(&right_value, report_path)?
+                )));
+            }
+            let left = expected_row_value_to_number(&left_value, report_path)?;
+            let right = expected_row_value_to_number(&right_value, report_path)?;
+            let value = match op.as_str() {
+                "+" => left + right,
+                "-" => left - right,
+                "*" => left * right,
+                "/" => {
+                    if right == 0 {
+                        return Err(format!(
+                            "{} row expression division by zero",
+                            report_path.display()
+                        )
+                        .into());
+                    }
+                    left / right
+                }
+                "%" => {
+                    if right == 0 {
+                        return Err(format!(
+                            "{} row expression modulo by zero",
+                            report_path.display()
+                        )
+                        .into());
+                    }
+                    left % right
+                }
+                _ => {
+                    return Err(format!(
+                        "{} unsupported row numeric op `{op}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            };
+            Ok(json!(value))
+        }
+        boon_plan::PlanRowExpression::TextConcat { parts } => {
+            let mut text = String::new();
+            for part in parts {
+                text.push_str(&expected_eval_plan_row_text_with_stack(
+                    plan,
+                    list_state,
+                    row,
+                    part,
+                    report_path,
+                    stack,
+                )?);
+            }
+            Ok(JsonValue::String(text))
+        }
+        boon_plan::PlanRowExpression::ListGetField {
+            list_id,
+            index,
+            field,
+        } => {
+            let index = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                index,
+                report_path,
+                stack,
+            )?;
+            let index = usize::try_from(index).map_err(|_| {
+                format!(
+                    "{} row expression List/get index {index} is negative",
+                    report_path.display()
+                )
+            })?;
+            let rows = list_state.get(&list_id.0).ok_or_else(|| {
+                format!(
+                    "{} row expression list {} is not materialized",
+                    report_path.display(),
+                    list_id.0
+                )
+            })?;
+            let row = rows.get(index).ok_or_else(|| {
+                format!(
+                    "{} row expression List/get index {index} is out of range",
+                    report_path.display()
+                )
+            })?;
+            expected_eval_plan_row_lookup_field(
+                plan,
+                list_state,
+                *list_id,
+                row,
+                *field,
+                report_path,
+                stack,
+            )
+        }
+        boon_plan::PlanRowExpression::ListRef { list_id } => {
+            expected_eval_plan_row_list_ref(list_state, *list_id, report_path)
+        }
+        boon_plan::PlanRowExpression::ListFindValue {
+            list_id,
+            field,
+            value,
+            target,
+            fallback,
+        } => {
+            let value = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                value,
+                report_path,
+                stack,
+            )?;
+            let field_name = expected_plan_row_field_local_name(plan, *field);
+            let rows = list_state.get(&list_id.0).ok_or_else(|| {
+                format!(
+                    "{} row expression list {} is not materialized",
+                    report_path.display(),
+                    list_id.0
+                )
+            })?;
+            if let Some(found) = rows.iter().find(|candidate| {
+                expected_row_json_values_equal(candidate.fields.get(&field_name), &value)
+            }) {
+                return expected_eval_plan_row_lookup_field(
+                    plan,
+                    list_state,
+                    *list_id,
+                    found,
+                    *target,
+                    report_path,
+                    stack,
+                );
+            }
+            match fallback {
+                Some(fallback) => expected_eval_plan_row_expression_with_stack(
+                    plan,
+                    list_state,
+                    row,
+                    fallback,
+                    report_path,
+                    stack,
+                ),
+                None => Ok(JsonValue::String("NaN".to_owned())),
+            }
+        }
+        boon_plan::PlanRowExpression::ListRange { from, to } => {
+            let from = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                from,
+                report_path,
+                stack,
+            )?;
+            let to = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                to,
+                report_path,
+                stack,
+            )?;
+            let values = if from <= to {
+                (from..=to).map(JsonValue::from).collect()
+            } else {
+                Vec::new()
+            };
+            Ok(JsonValue::Array(values))
+        }
+        boon_plan::PlanRowExpression::ListMap {
+            input,
+            binding,
+            value,
+        } => {
+            let items = expected_eval_plan_row_list_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let mut output = Vec::with_capacity(items.len());
+            let binding_key = expected_row_map_binding_key(binding);
+            for item in items {
+                let mut bound_row = row.clone();
+                bound_row.fields.insert(binding_key.clone(), item);
+                output.push(expected_eval_plan_row_expression_with_stack(
+                    plan,
+                    list_state,
+                    &bound_row,
+                    value,
+                    report_path,
+                    stack,
+                )?);
+            }
+            Ok(JsonValue::Array(output))
+        }
+        boon_plan::PlanRowExpression::ListMapItem { binding } => {
+            let binding_key = expected_row_map_binding_key(binding);
+            row.fields.get(&binding_key).cloned().ok_or_else(|| {
+                format!(
+                    "{} row expression List/map binding `{binding}` is missing",
+                    report_path.display()
+                )
+                .into()
+            })
+        }
+        boon_plan::PlanRowExpression::ListSum { input } => {
+            let items = expected_eval_plan_row_list_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let mut total = 0i64;
+            for item in items {
+                if let Some(value) = expected_json_number_value(&item) {
+                    total += value;
+                }
+            }
+            Ok(JsonValue::from(total))
+        }
+        boon_plan::PlanRowExpression::Object { fields } => {
+            let mut object = serde_json::Map::with_capacity(fields.len());
+            for field in fields {
+                object.insert(
+                    field.name.clone(),
+                    expected_eval_plan_row_expression_with_stack(
+                        plan,
+                        list_state,
+                        row,
+                        &field.value,
+                        report_path,
+                        stack,
+                    )?,
+                );
+            }
+            Ok(JsonValue::Object(object))
+        }
+        boon_plan::PlanRowExpression::ObjectField { object, field } => {
+            let object = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                object,
+                report_path,
+                stack,
+            )?;
+            object
+                .as_object()
+                .and_then(|object| object.get(field))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "{} row expression object field `{field}` is missing",
+                        report_path.display()
+                    )
+                    .into()
+                })
+        }
+        boon_plan::PlanRowExpression::BuiltinCall {
+            function,
+            input,
+            args,
+        } => expected_eval_plan_row_builtin_call(
+            plan,
+            list_state,
+            row,
+            function,
+            input.as_deref(),
+            args,
+            report_path,
+            stack,
+        ),
+        boon_plan::PlanRowExpression::Select { input, arms } => {
+            let input_value = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            for arm in arms {
+                if expected_row_select_pattern_matches(&arm.pattern, &input_value) {
+                    return expected_eval_plan_row_expression_with_stack(
+                        plan,
+                        list_state,
+                        row,
+                        &arm.value,
+                        report_path,
+                        stack,
+                    );
+                }
+            }
+            Err(format!(
+                "{} row expression select has no matching arm for `{input_value}`",
+                report_path.display()
+            )
+            .into())
+        }
+    }
+}
+
+fn expected_eval_plan_row_list_ref(
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    list_id: boon_ir::ListId,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    let rows = list_state.get(&list_id.0).ok_or_else(|| {
+        format!(
+            "{} row expression list {} is not materialized",
+            report_path.display(),
+            list_id.0
+        )
+    })?;
+    Ok(JsonValue::Array(
+        rows.iter()
+            .map(|row| {
+                JsonValue::Object(
+                    row.fields
+                        .iter()
+                        .map(|(field, value)| (field.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+fn expected_eval_plan_row_list_with_stack(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<Vec<JsonValue>> {
+    let value = expected_eval_plan_row_expression_with_stack(
+        plan,
+        list_state,
+        row,
+        expression,
+        report_path,
+        stack,
+    )?;
+    match value {
+        JsonValue::Array(values) => Ok(values),
+        other => Err(format!(
+            "{} row expression value `{other}` is not a list",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_row_map_binding_key(binding: &str) -> String {
+    format!("$boon$row_map_binding${binding}")
+}
+
+fn expected_row_json_values_equal(left: Option<&JsonValue>, right: &JsonValue) -> bool {
+    let Some(left) = left else {
+        return false;
+    };
+    left == right
+        || expected_json_text_value(left).as_deref() == expected_json_text_value(right).as_deref()
+}
+
+fn expected_json_text_value(value: &JsonValue) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number.to_string());
+    }
+    if let Some(bool_value) = value.as_bool() {
+        return Some(if bool_value { "True" } else { "False" }.to_owned());
+    }
+    None
+}
+
+fn expected_json_number_value(value: &JsonValue) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+}
+
+fn expected_row_value_is_nan(value: &JsonValue) -> bool {
+    value.as_str() == Some("NaN")
+}
+
+fn expected_row_value_is_cycle_error(value: &JsonValue) -> bool {
+    value.as_str() == Some("cycle_error")
+}
+
+fn expected_row_cycle_error_json() -> JsonValue {
+    JsonValue::String("cycle_error".to_owned())
+}
+
+fn expected_row_value_to_number(value: &JsonValue, report_path: &Path) -> RuntimeResult<i64> {
+    if expected_row_value_is_nan(value) {
+        return Ok(0);
+    }
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse::<i64>().map_err(|_| {
+            format!(
+                "{} row expression value `{text}` is not a number",
+                report_path.display()
+            )
+            .into()
+        });
+    }
+    Err(format!(
+        "{} row expression value `{value}` is not a number",
+        report_path.display()
+    )
+    .into())
+}
+
+fn expected_row_value_to_text(value: &JsonValue, report_path: &Path) -> RuntimeResult<String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_owned());
+    }
+    if let Some(number) = value.as_i64() {
+        return Ok(number.to_string());
+    }
+    if let Some(bool_value) = value.as_bool() {
+        return Ok(if bool_value { "True" } else { "False" }.to_owned());
+    }
+    Err(format!(
+        "{} row expression value `{value}` is not text-convertible",
+        report_path.display()
+    )
+    .into())
+}
+
+fn expected_plan_row_field_local_name(
+    plan: &boon_plan::MachinePlan,
+    field_id: boon_ir::FieldId,
+) -> String {
+    local_field_name(&plan_semantic_field_label(plan, field_id.0))
+}
+
+fn expected_eval_plan_row_lookup_field(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    list_id: boon_ir::ListId,
+    row: &ExpectedPlanListRowState,
+    field: boon_ir::FieldId,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<JsonValue> {
+    let target_name = expected_plan_row_field_local_name(plan, field);
+    let key = ExpectedPlanRowEvalKey {
+        list_id: list_id.0,
+        row_key: row.key,
+        field_id: field.0,
+    };
+    if stack.contains(&key) {
+        return Ok(expected_row_cycle_error_json());
+    }
+    if let Some(expression) = expected_plan_indexed_row_expression_for_field(plan, field) {
+        let mut nested_stack = stack.to_vec();
+        nested_stack.push(key);
+        return expected_eval_plan_row_expression_with_stack(
+            plan,
+            list_state,
+            row,
+            expression,
+            report_path,
+            &nested_stack,
+        );
+    }
+    row.fields.get(&target_name).cloned().ok_or_else(|| {
+        format!(
+            "{} row expression lookup target `{target_name}` missing from list {}",
+            report_path.display(),
+            list_id.0
+        )
+        .into()
+    })
+}
+
+fn expected_plan_indexed_row_expression_for_field(
+    plan: &boon_plan::MachinePlan,
+    field: boon_ir::FieldId,
+) -> Option<&boon_plan::PlanRowExpression> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .find_map(|op| {
+            if !op.indexed || op.output != Some(boon_plan::ValueRef::Field(field)) {
+                return None;
+            }
+            let boon_plan::PlanOpKind::DerivedValue {
+                derived_kind: boon_plan::PlanDerivedKind::Pure,
+                expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+            } = &op.kind
+            else {
+                return None;
+            };
+            Some(expression)
+        })
+}
+
+fn expected_eval_plan_row_builtin_call(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    function: &str,
+    input: Option<&boon_plan::PlanRowExpression>,
+    args: &[boon_plan::PlanRowCallArg],
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<JsonValue> {
+    match function {
+        "Text/empty" => Ok(JsonValue::String(String::new())),
+        "Text/to_bytes" => {
+            let text = expected_eval_plan_row_text_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                "text",
+                report_path,
+                stack,
+            )?;
+            let encoding = expected_eval_plan_row_text_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "encoding",
+                report_path,
+                stack,
+            )
+            .unwrap_or_else(|_| "Utf8".to_owned());
+            let bytes = expected_row_text_to_bytes(&text, &encoding);
+            Ok(expected_row_private_bytes_json(&bytes))
+        }
+        "Bytes/length" => {
+            let bytes = expected_eval_plan_row_bytes_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                report_path,
+                stack,
+            )?;
+            i64::try_from(bytes.len())
+                .map(JsonValue::from)
+                .map_err(|_| {
+                    format!(
+                        "{} row Bytes/length exceeds Boon NUMBER",
+                        report_path.display()
+                    )
+                    .into()
+                })
+        }
+        "Bytes/get" => {
+            let bytes = expected_eval_plan_row_bytes_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                report_path,
+                stack,
+            )?;
+            let index = expected_eval_plan_row_number_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "index",
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            bytes
+                .get(index)
+                .copied()
+                .map(|value| JsonValue::from(i64::from(value)))
+                .ok_or_else(|| {
+                    format!(
+                        "{} row Bytes/get index {index} is out of bounds",
+                        report_path.display()
+                    )
+                    .into()
+                })
+        }
+        "Bytes/slice" => {
+            let bytes = expected_eval_plan_row_bytes_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                report_path,
+                stack,
+            )?;
+            let offset = expected_eval_plan_row_number_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "offset",
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let byte_count = expected_eval_plan_row_number_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "byte_count",
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let slice = bytes
+                .get(offset..offset.saturating_add(byte_count))
+                .ok_or_else(|| format!("{} row Bytes/slice out of bounds", report_path.display()))?
+                .to_vec();
+            Ok(expected_row_private_bytes_json(&slice))
+        }
+        "Bytes/find" => {
+            let haystack = expected_eval_plan_row_bytes_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                report_path,
+                stack,
+            )?;
+            let needle = expected_eval_plan_row_bytes_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "needle",
+                report_path,
+                stack,
+            )?;
+            Ok(expected_bytes_find(&haystack, &needle)
+                .map(|index| json!(index as i64))
+                .unwrap_or_else(|| JsonValue::String("NaN".to_owned())))
+        }
+        "Bytes/starts_with" => {
+            let bytes = expected_eval_plan_row_bytes_input_or_arg(
+                plan,
+                list_state,
+                row,
+                input,
+                args,
+                report_path,
+                stack,
+            )?;
+            let prefix = expected_eval_plan_row_bytes_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "prefix",
+                report_path,
+                stack,
+            )?;
+            Ok(JsonValue::Bool(bytes.starts_with(&prefix)))
+        }
+        "Error/new" => {
+            let code = expected_eval_plan_row_text_arg(
+                plan,
+                list_state,
+                row,
+                args,
+                "code",
+                report_path,
+                stack,
+            )
+            .unwrap_or_else(|_| "error".to_owned());
+            Ok(json!({
+                "$boon_type": "ERROR",
+                "code": code,
+            }))
+        }
+        "Error/text" => {
+            let value = match input {
+                Some(input) => expected_eval_plan_row_expression_with_stack(
+                    plan,
+                    list_state,
+                    row,
+                    input,
+                    report_path,
+                    stack,
+                )?,
+                None => expected_eval_plan_row_named_or_first_arg(
+                    plan,
+                    list_state,
+                    row,
+                    args,
+                    "value",
+                    report_path,
+                    stack,
+                )?,
+            };
+            if expected_row_value_is_cycle_error(&value) {
+                return Ok(expected_row_cycle_error_json());
+            }
+            Ok(JsonValue::String(
+                value
+                    .get("$boon_type")
+                    .and_then(JsonValue::as_str)
+                    .filter(|kind| *kind == "ERROR")
+                    .and_then(|_| value.get("code"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ))
+        }
+        _ => Err(format!(
+            "{} unsupported row builtin `{function}`",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_row_text_to_bytes(text: &str, encoding: &str) -> Vec<u8> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "ascii" if text.is_ascii() => text.as_bytes().to_vec(),
+        "ascii" => Vec::new(),
+        _ => text.as_bytes().to_vec(),
+    }
+}
+
+fn expected_row_private_bytes_json(bytes: &[u8]) -> JsonValue {
+    json!({
+        "$boon_type": "BYTES",
+        "storage": "row_inline",
+        "byte_len": bytes.len(),
+        "inline_bytes": bytes,
+    })
+}
+
+fn expected_eval_plan_row_text_input_or_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    input: Option<&boon_plan::PlanRowExpression>,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<String> {
+    match input {
+        Some(input) => {
+            expected_eval_plan_row_text_with_stack(plan, list_state, row, input, report_path, stack)
+        }
+        None => {
+            expected_eval_plan_row_text_arg(plan, list_state, row, args, name, report_path, stack)
+        }
+    }
+}
+
+fn expected_eval_plan_row_text_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<String> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .ok_or_else(|| {
+            format!(
+                "{} row builtin missing text arg `{name}`",
+                report_path.display()
+            )
+        })?;
+    expected_eval_plan_row_text_with_stack(plan, list_state, row, &arg.value, report_path, stack)
+}
+
+fn expected_eval_plan_row_number_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<i64> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .ok_or_else(|| {
+            format!(
+                "{} row builtin missing number arg `{name}`",
+                report_path.display()
+            )
+        })?;
+    expected_eval_plan_row_number_with_stack(plan, list_state, row, &arg.value, report_path, stack)
+}
+
+fn expected_eval_plan_row_named_or_first_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<JsonValue> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .ok_or_else(|| format!("{} row builtin missing arg `{name}`", report_path.display()))?;
+    expected_eval_plan_row_expression_with_stack(
+        plan,
+        list_state,
+        row,
+        &arg.value,
+        report_path,
+        stack,
+    )
+}
+
+fn expected_eval_plan_row_bytes_input_or_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    input: Option<&boon_plan::PlanRowExpression>,
+    args: &[boon_plan::PlanRowCallArg],
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<Vec<u8>> {
+    match input {
+        Some(input) => expected_eval_plan_row_bytes_with_stack(
+            plan,
+            list_state,
+            row,
+            input,
+            report_path,
+            stack,
+        ),
+        None => expected_eval_plan_row_bytes_arg(
+            plan,
+            list_state,
+            row,
+            args,
+            "input",
+            report_path,
+            stack,
+        ),
+    }
+}
+
+fn expected_eval_plan_row_bytes_arg(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<Vec<u8>> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
+        .ok_or_else(|| {
+            format!(
+                "{} row builtin missing bytes arg `{name}`",
+                report_path.display()
+            )
+        })?;
+    expected_eval_plan_row_bytes_with_stack(plan, list_state, row, &arg.value, report_path, stack)
+}
+
+fn expected_eval_plan_row_bytes_with_stack(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<Vec<u8>> {
+    match expression {
+        boon_plan::PlanRowExpression::Field { input } => {
+            let field_name = match input {
+                boon_plan::ValueRef::Field(field_id) => {
+                    local_field_name(&plan_semantic_field_label(plan, field_id.0))
+                }
+                boon_plan::ValueRef::State(state_id) => {
+                    local_field_name(&plan_state_label(plan, state_id.0))
+                }
+                _ => {
+                    return Err(format!(
+                        "{} row bytes input `{input:?}` is not a row field",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            };
+            row.private_bytes.get(&field_name).cloned().ok_or_else(|| {
+                format!(
+                    "{} row bytes field `{field_name}` has no private payload",
+                    report_path.display()
+                )
+                .into()
+            })
+        }
+        boon_plan::PlanRowExpression::Constant { constant_id } => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} row bytes constant {} is missing",
+                        report_path.display(),
+                        constant_id.0
+                    )
+                })?;
+            let boon_plan::PlanConstantValue::Bytes {
+                inline_bytes: Some(bytes),
+                ..
+            } = &constant.value
+            else {
+                return Err(format!(
+                    "{} row expression constant is not inline BYTES",
+                    report_path.display()
+                )
+                .into());
+            };
+            Ok(bytes.clone())
+        }
+        _ => {
+            let value = expected_eval_plan_row_expression_with_stack(
+                plan,
+                list_state,
+                row,
+                expression,
+                report_path,
+                stack,
+            )?;
+            value
+                .get("inline_bytes")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} row expression value is not private BYTES",
+                        report_path.display()
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u8::try_from(value).ok())
+                        .ok_or_else(|| "row private BYTES payload is invalid".into())
+                })
+                .collect()
+        }
+    }
+}
+
+fn expected_bytes_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn expected_row_select_pattern_matches(
+    pattern: &boon_plan::PlanRowSelectPattern,
+    value: &JsonValue,
+) -> bool {
+    match pattern {
+        boon_plan::PlanRowSelectPattern::Bool { value: expected } => {
+            value.as_bool() == Some(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::Text { value: expected } => {
+            value.as_str() == Some(expected.as_str())
+        }
+        boon_plan::PlanRowSelectPattern::Number { value: expected } => {
+            value.as_i64() == Some(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::NaN => value.as_str() == Some("NaN"),
+        boon_plan::PlanRowSelectPattern::Wildcard => true,
+    }
+}
+
+fn expected_eval_plan_row_field_ref(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    input: &boon_plan::ValueRef,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    let field_name = match input {
+        boon_plan::ValueRef::Field(field_id) => {
+            local_field_name(&plan_semantic_field_label(plan, field_id.0))
+        }
+        boon_plan::ValueRef::State(state_id) => {
+            local_field_name(&plan_state_label(plan, state_id.0))
+        }
+        _ => {
+            return Err(format!(
+                "{} row expression input `{input:?}` is not a row field",
+                report_path.display()
+            )
+            .into());
+        }
+    };
+    row.fields
+        .get(&field_name)
+        .cloned()
+        .or_else(|| expected_row_initial_state_fallback(plan, row, input))
+        .ok_or_else(|| {
+            format!(
+                "{} row expression field `{field_name}` is missing",
+                report_path.display()
+            )
+            .into()
+        })
+}
+
+fn expected_row_initial_state_fallback(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    input: &boon_plan::ValueRef,
+) -> Option<JsonValue> {
+    let boon_plan::ValueRef::State(state_id) = input else {
+        return None;
+    };
+    let slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == *state_id)?;
+    let source = slot.initial_row_field_path.as_deref()?;
+    let source_name = local_field_name(source);
+    row.fields.get(&source_name).cloned()
+}
+
+fn expected_eval_plan_row_number_with_stack(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<i64> {
+    let value = expected_eval_plan_row_expression_with_stack(
+        plan,
+        list_state,
+        row,
+        expression,
+        report_path,
+        stack,
+    )?;
+    expected_row_value_to_number(&value, report_path)
+}
+
+fn expected_eval_plan_row_text_with_stack(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    row: &ExpectedPlanListRowState,
+    expression: &boon_plan::PlanRowExpression,
+    report_path: &Path,
+    stack: &[ExpectedPlanRowEvalKey],
+) -> RuntimeResult<String> {
+    let value = expected_eval_plan_row_expression_with_stack(
+        plan,
+        list_state,
+        row,
+        expression,
+        report_path,
+        stack,
+    )?;
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_owned());
+    }
+    if let Some(number) = value.as_i64() {
+        return Ok(number.to_string());
+    }
+    if let Some(bool_value) = value.as_bool() {
+        return Ok(if bool_value { "True" } else { "False" }.to_owned());
+    }
+    Err(format!(
+        "{} row expression value `{value}` is not text-convertible",
+        report_path.display()
+    )
+    .into())
+}
+
+fn expected_row_default_fields(
+    plan: &boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    report_path: &Path,
+) -> RuntimeResult<(BTreeMap<String, JsonValue>, BTreeMap<String, Vec<u8>>)> {
+    let mut fields = BTreeMap::new();
+    let mut private_bytes = BTreeMap::new();
+    for slot in &plan.storage_layout.scalar_slots {
+        if slot.scope_id != list_slot.scope_id {
+            continue;
+        }
+        let Some(constant_id) = slot.initial_constant_id else {
+            continue;
+        };
+        let constant = plan
+            .constants
+            .iter()
+            .find(|constant| constant.id == constant_id)
+            .ok_or_else(|| {
+                format!(
+                    "{} missing row default constant {}",
+                    report_path.display(),
+                    constant_id.0
+                )
+            })?;
+        let field_name = local_field_name(&plan_state_label(plan, slot.state_id.0));
+        fields.insert(
+            field_name.clone(),
+            plan_constant_json_value(constant, report_path)?,
+        );
+        if let Some(bytes) =
+            expected_constant_private_bytes_for_output(plan, slot.state_id, constant, report_path)?
+        {
+            private_bytes.insert(field_name, bytes);
+        }
+    }
+    Ok((fields, private_bytes))
+}
+
+fn expected_list_summary(
+    plan: &boon_plan::MachinePlan,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+) -> JsonValue {
+    let mut lists = serde_json::Map::new();
+    for (list_id, rows) in list_state {
+        let list_label = plan_list_label(plan, *list_id);
+        let titles = rows
+            .iter()
+            .filter_map(|row| row.fields.get("title").cloned())
+            .collect::<Vec<_>>();
+        let active_count = rows
+            .iter()
+            .filter(|row| {
+                row.fields
+                    .get("completed")
+                    .and_then(JsonValue::as_bool)
+                    .map(|completed| !completed)
+                    .unwrap_or(false)
+            })
+            .count();
+        let completed_count = rows
+            .iter()
+            .filter(|row| {
+                row.fields
+                    .get("completed")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        lists.insert(
+            list_label,
+            json!({
+                "row_count": rows.len(),
+                "titles": titles,
+                "active_count": active_count,
+                "completed_count": completed_count,
+                "rows": rows.iter().map(|row| {
+                    json!({
+                        "key": row.key,
+                        "generation": row.generation,
+                        "fields": row.fields,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    JsonValue::Object(lists)
+}
+
+fn expected_materialize_plan_list_retains(
+    plan: &boon_plan::MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedListRetainExecution> {
+    let mut execution = ExpectedListRetainExecution::default();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+    {
+        let boon_plan::PlanOpKind::ListOperation {
+            operation_kind: boon_plan::PlanListOperationKind::Retain,
+            retain: Some(retain),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(boon_plan::ValueRef::List(source_list_id)) = op.output else {
+            return Err(format!(
+                "{} list retain op {} has no source list output",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        let boon_plan::ValueRef::Field(target_field_id) = retain.target else {
+            return Err(format!(
+                "{} list retain op {} target is not a field",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        };
+        if !op.inputs.contains(&retain.target) {
+            return Err(format!(
+                "{} list retain op {} target field is not present in typed inputs",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+        let source_label = plan_list_label(plan, source_list_id.0);
+        let target_label = plan_derived_field_label(plan, target_field_id.0);
+        let rows = list_state.get(&source_list_id.0).ok_or_else(|| {
+            format!(
+                "{} list retain op {} source list {} is not materialized",
+                report_path.display(),
+                op.id.0,
+                source_list_id.0
+            )
+        })?;
+        let mut retained_rows = Vec::new();
+        let mut titles = Vec::new();
+        let mut active_count = 0usize;
+        let mut completed_count = 0usize;
+        let mut predicate_report = None;
+        for (row_index, row) in rows.iter().enumerate() {
+            let resolution = expected_list_retain_predicate_resolution(
+                plan,
+                root_state,
+                &retain.predicate,
+                row,
+                report_path,
+            )?;
+            predicate_report = Some(resolution.report.clone());
+            if !resolution.retained {
+                continue;
+            }
+            if let Some(title) = row.fields.get("title") {
+                titles.push(title.clone());
+            }
+            if row
+                .fields
+                .get("completed")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+            {
+                completed_count += 1;
+            } else {
+                active_count += 1;
+            }
+            retained_rows.push(json!({
+                "source_row_index": row_index,
+                "key": row.key,
+                "generation": row.generation,
+                "fields": row.fields,
+            }));
+        }
+        let predicate = match predicate_report {
+            Some(report) => report,
+            None => expected_list_retain_empty_predicate_report(
+                plan,
+                root_state,
+                &retain.predicate,
+                report_path,
+            )?,
+        };
+        let row_count = retained_rows.len();
+        let summary = json!({
+            "retain_op_id": op.id.0,
+            "target_field_id": target_field_id.0,
+            "target": target_label,
+            "source_list_id": source_list_id.0,
+            "source_list": source_label,
+            "source_row_count": rows.len(),
+            "row_count": row_count,
+            "titles": titles,
+            "active_count": active_count,
+            "completed_count": completed_count,
+            "rows": retained_rows,
+        });
+        execution
+            .summary
+            .insert(target_label.clone(), summary.clone());
+        execution.reports.push(json!({
+            "op_id": op.id.0,
+            "kind": "retain",
+            "target_field_id": target_field_id.0,
+            "target": target_label,
+            "source_list_id": source_list_id.0,
+            "source_list": source_label,
+            "predicate": predicate,
+            "source_row_count": rows.len(),
+            "retained_row_count": row_count,
+            "rows": summary["rows"],
+        }));
+        execution.executed_count += 1;
+        execution.view_count += 1;
+        execution.retained_row_count += row_count;
+    }
+    Ok(execution)
+}
+
+struct ExpectedListRetainPredicateResolution {
+    retained: bool,
+    report: JsonValue,
+}
+
+fn expected_list_retain_predicate_resolution(
+    plan: &boon_plan::MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    predicate: &boon_plan::PlanListRemovePredicate,
+    row: &ExpectedPlanListRowState,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedListRetainPredicateResolution> {
+    match predicate {
+        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility {
+            selector,
+            row_field,
+        } => {
+            let boon_plan::ValueRef::State(selector_id) = selector else {
+                return Err(format!(
+                    "{} selected-filter retain selector is not a state ref",
+                    report_path.display()
+                )
+                .into());
+            };
+            let boon_plan::ValueRef::State(row_field_id) = row_field else {
+                return Err(format!(
+                    "{} selected-filter retain row field is not a state ref",
+                    report_path.display()
+                )
+                .into());
+            };
+            let selector_label = plan_state_label(plan, selector_id.0);
+            let selector_value = root_state
+                .get(&selector_label)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} selected-filter retain selector `{selector_label}` is not text",
+                        report_path.display()
+                    )
+                })?;
+            let row_field_label = plan_state_label(plan, row_field_id.0);
+            let row_field_name = local_field_name(&row_field_label);
+            let row_value = row
+                .fields
+                .get(&row_field_name)
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "{} selected-filter retain row field `{row_field_name}` is not bool on row key {} generation {}",
+                        report_path.display(),
+                        row.key,
+                        row.generation
+                    )
+                })?;
+            let retained = match selector_value {
+                "All" => true,
+                "Active" => !row_value,
+                "Completed" => row_value,
+                other => {
+                    return Err(format!(
+                        "{} selected-filter retain selector `{selector_label}` has unsupported value `{other}`",
+                        report_path.display()
+                    )
+                    .into())
+                }
+            };
+            Ok(ExpectedListRetainPredicateResolution {
+                retained,
+                report: json!({
+                    "kind": "selected_filter_visibility",
+                    "selector_state_id": selector_id.0,
+                    "selector": selector_label,
+                    "selector_value": selector_value,
+                    "row_field_state_id": row_field_id.0,
+                    "row_field": row_field_name,
+                }),
+            })
+        }
+        boon_plan::PlanListRemovePredicate::AlwaysTrue => {
+            Ok(ExpectedListRetainPredicateResolution {
+                retained: true,
+                report: json!({ "kind": "always_true" }),
+            })
+        }
+        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
+            let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(ExpectedListRetainPredicateResolution {
+                retained: value,
+                report: json!({
+                    "kind": "row_field_bool",
+                    "row_field": field_name,
+                }),
+            })
+        }
+        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
+            let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
+            Ok(ExpectedListRetainPredicateResolution {
+                retained: !value,
+                report: json!({
+                    "kind": "row_field_bool_not",
+                    "row_field": field_name,
+                }),
+            })
+        }
+        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
+            "{} schema replay does not support unknown list retain predicate `{summary}`",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_list_retain_empty_predicate_report(
+    plan: &boon_plan::MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    predicate: &boon_plan::PlanListRemovePredicate,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    match predicate {
+        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility {
+            selector,
+            row_field,
+        } => {
+            let boon_plan::ValueRef::State(selector_id) = selector else {
+                return Err(format!(
+                    "{} selected-filter retain selector is not a state ref",
+                    report_path.display()
+                )
+                .into());
+            };
+            let boon_plan::ValueRef::State(row_field_id) = row_field else {
+                return Err(format!(
+                    "{} selected-filter retain row field is not a state ref",
+                    report_path.display()
+                )
+                .into());
+            };
+            let selector_label = plan_state_label(plan, selector_id.0);
+            let selector_value = root_state
+                .get(&selector_label)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} selected-filter retain selector `{selector_label}` is not text",
+                        report_path.display()
+                    )
+                })?;
+            Ok(json!({
+                "kind": "selected_filter_visibility",
+                "selector_state_id": selector_id.0,
+                "selector": selector_label,
+                "selector_value": selector_value,
+                "row_field_state_id": row_field_id.0,
+                "row_field": local_field_name(&plan_state_label(plan, row_field_id.0)),
+            }))
+        }
+        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({ "kind": "always_true" })),
+        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => Ok(json!({
+            "kind": "row_field_bool",
+            "row_field": local_field_name(&expected_plan_state_label_from_ref(plan, input)?),
+        })),
+        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => Ok(json!({
+            "kind": "row_field_bool_not",
+            "row_field": local_field_name(&expected_plan_state_label_from_ref(plan, input)?),
+        })),
+        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
+            "{} schema replay does not support unknown list retain predicate `{summary}`",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_plan_state_label_from_ref(
+    plan: &boon_plan::MachinePlan,
+    value_ref: &boon_plan::ValueRef,
+) -> RuntimeResult<String> {
+    let boon_plan::ValueRef::State(state_id) = value_ref else {
+        return Err(format!("expected state ref, got {value_ref:?}").into());
+    };
+    Ok(plan_state_label(plan, state_id.0))
+}
+
+fn list_summary_mismatch_detail(actual: &JsonValue, expected: &JsonValue) -> String {
+    let Some(actual_lists) = actual.as_object() else {
+        return format!("actual is not an object: {actual}");
+    };
+    let Some(expected_lists) = expected.as_object() else {
+        return format!("expected is not an object: {expected}");
+    };
+    for (list_label, expected_list) in expected_lists {
+        let Some(actual_list) = actual_lists.get(list_label) else {
+            return format!("missing list `{list_label}`");
+        };
+        for key in ["row_count", "titles", "active_count", "completed_count"] {
+            if actual_list.get(key) != expected_list.get(key) {
+                return format!(
+                    "list `{list_label}` key `{key}` actual={} expected={}",
+                    actual_list.get(key).unwrap_or(&JsonValue::Null),
+                    expected_list.get(key).unwrap_or(&JsonValue::Null)
+                );
+            }
+        }
+        let actual_rows = actual_list.get("rows").and_then(JsonValue::as_array);
+        let expected_rows = expected_list.get("rows").and_then(JsonValue::as_array);
+        let (Some(actual_rows), Some(expected_rows)) = (actual_rows, expected_rows) else {
+            return format!("list `{list_label}` rows are not arrays");
+        };
+        if actual_rows.len() != expected_rows.len() {
+            return format!(
+                "list `{list_label}` row length actual={} expected={}",
+                actual_rows.len(),
+                expected_rows.len()
+            );
+        }
+        for (index, (actual_row, expected_row)) in
+            actual_rows.iter().zip(expected_rows.iter()).enumerate()
+        {
+            for key in ["key", "generation"] {
+                if actual_row.get(key) != expected_row.get(key) {
+                    return format!(
+                        "list `{list_label}` row {index} `{key}` actual={} expected={}",
+                        actual_row.get(key).unwrap_or(&JsonValue::Null),
+                        expected_row.get(key).unwrap_or(&JsonValue::Null)
+                    );
+                }
+            }
+            let actual_fields = actual_row.get("fields").and_then(JsonValue::as_object);
+            let expected_fields = expected_row.get("fields").and_then(JsonValue::as_object);
+            let (Some(actual_fields), Some(expected_fields)) = (actual_fields, expected_fields)
+            else {
+                return format!("list `{list_label}` row {index} fields are not objects");
+            };
+            for (field, expected_value) in expected_fields {
+                let actual_value = actual_fields.get(field);
+                if actual_value != Some(expected_value) {
+                    return format!(
+                        "list `{list_label}` row {index} field `{field}` actual={} expected={}",
+                        actual_value.unwrap_or(&JsonValue::Null),
+                        expected_value
+                    );
+                }
+            }
+            for (field, actual_value) in actual_fields {
+                if !expected_fields.contains_key(field) {
+                    return format!(
+                        "list `{list_label}` row {index} unexpected field `{field}` actual={actual_value}"
+                    );
+                }
+            }
+        }
+    }
+    for list_label in actual_lists.keys() {
+        if !expected_lists.contains_key(list_label) {
+            return format!("unexpected list `{list_label}`");
+        }
+    }
+    "no localized mismatch found".to_owned()
+}
+
+fn first_array_mismatch_detail(actual: Option<&JsonValue>, expected: &JsonValue) -> String {
+    let Some(actual) = actual else {
+        return "actual missing".to_owned();
+    };
+    let Some(actual_array) = actual.as_array() else {
+        return format!("actual is not an array: {actual}");
+    };
+    let Some(expected_array) = expected.as_array() else {
+        return format!("expected is not an array: {expected}");
+    };
+    if actual_array.len() != expected_array.len() {
+        return format!(
+            "length actual={} expected={}",
+            actual_array.len(),
+            expected_array.len()
+        );
+    }
+    for (index, (actual_item, expected_item)) in
+        actual_array.iter().zip(expected_array.iter()).enumerate()
+    {
+        if actual_item != expected_item {
+            let actual_step = actual_item
+                .get("step_id")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("<unknown>");
+            let expected_step = expected_item
+                .get("step_id")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("<unknown>");
+            let mut keys = BTreeSet::new();
+            if let Some(object) = actual_item.as_object() {
+                keys.extend(object.keys().cloned());
+            }
+            if let Some(object) = expected_item.as_object() {
+                keys.extend(object.keys().cloned());
+            }
+            let differing_keys = keys
+                .into_iter()
+                .filter(|key| actual_item.get(key) != expected_item.get(key))
+                .collect::<Vec<_>>();
+            return format!(
+                "index {index} actual_step `{actual_step}` expected_step `{expected_step}` differing keys {:?}",
+                differing_keys
+            );
+        }
+    }
+    "no localized mismatch found".to_owned()
+}
+
+fn normalized_plan_executor_per_step_for_semantic_compare(value: &JsonValue) -> JsonValue {
+    let Some(steps) = value.as_array() else {
+        return value.clone();
+    };
+    JsonValue::Array(
+        steps
+            .iter()
+            .map(|step| {
+                let Some(object) = step.as_object() else {
+                    return step.clone();
+                };
+                let mut normalized = object.clone();
+                normalized.remove("bytes_storage_counters");
+                normalized.remove("bytes_storage_no_copy");
+                if let Some(updates) = normalized
+                    .get_mut("updates")
+                    .and_then(JsonValue::as_array_mut)
+                {
+                    for update in updates {
+                        if let Some(update_object) = update.as_object_mut() {
+                            update_object.remove("bytes_access");
+                        }
+                    }
+                }
+                JsonValue::Object(normalized)
+            })
+            .collect(),
+    )
+}
+
+fn scenario_source_event_json(step: &ScenarioStep, report_path: &Path) -> RuntimeResult<JsonValue> {
+    let expected = step.expected_source_event.as_ref().ok_or_else(|| {
+        format!(
+            "{} selected step `{}` has no expected_source_event",
+            report_path.display(),
+            step.id
+        )
+    })?;
+    let source = toml_string_ref(expected, "source").ok_or_else(|| {
+        format!(
+            "{} selected step `{}` expected_source_event missing source",
+            report_path.display(),
+            step.id
+        )
+    })?;
+    let mut payload = serde_json::Map::new();
+    let mut payload_bytes = serde_json::Map::new();
+    for (key, value) in expected {
+        if matches!(
+            key.as_str(),
+            "source"
+                | "text"
+                | "key"
+                | "target_text"
+                | "address"
+                | "target_occurrence"
+                | "target_key"
+                | "target_generation"
+                | "bind_epoch"
+                | "source_id"
+                | "source_epoch"
+                | "list_id"
+                | "pointer_x"
+                | "pointer_y"
+                | "pointer_width"
+                | "pointer_height"
+        ) {
+            continue;
+        }
+        if let Some(field) = source_payload_bytes_field_from_toml_key(key)? {
+            let value = value.as_str().ok_or_else(|| {
+                format!(
+                    "{} selected step `{}` expected_source_event `{key}` BYTES payload must be hex text",
+                    report_path.display(),
+                    step.id
+                )
+            })?;
+            let bytes = scenario_hex_payload_bytes(value, report_path, &step.id, key)?;
+            payload_bytes.insert(field, source_event_payload_bytes_artifact(&bytes));
+            continue;
+        }
+        if let Some(value) = value.as_str() {
+            payload.insert(key.clone(), JsonValue::String(value.to_owned()));
+        }
+    }
+    Ok(json!({
+        "source": source,
+        "text": toml_string_ref(expected, "text"),
+        "key": toml_string_ref(expected, "key"),
+        "address": toml_string_ref(expected, "address"),
+        "target_text": toml_string_ref(expected, "target_text"),
+        "target_occurrence": toml_usize_ref(expected, "target_occurrence"),
+        "target_key": toml_u64_ref(expected, "target_key"),
+        "target_generation": toml_u64_ref(expected, "target_generation"),
+        "bind_epoch": toml_u64_ref(expected, "bind_epoch"),
+        "source_id": toml_u64_ref(expected, "source_id"),
+        "source_epoch": toml_u64_ref(expected, "source_epoch"),
+        "list_id": toml_string_ref(expected, "list_id"),
+        "payload": payload,
+        "payload_bytes": payload_bytes,
+        "pointer_x": toml_string_ref(expected, "pointer_x"),
+        "pointer_y": toml_string_ref(expected, "pointer_y"),
+        "pointer_width": toml_string_ref(expected, "pointer_width"),
+        "pointer_height": toml_string_ref(expected, "pointer_height"),
+    }))
+}
+
+fn source_payload_bytes_field_from_toml_key(key: &str) -> RuntimeResult<Option<String>> {
+    if key == "bytes_hex" {
+        return Ok(Some("bytes".to_owned()));
+    }
+    if key.ends_with("_bytes_hex") {
+        return Err(format!(
+            "named BYTES source payload key `{key}` is not supported in v1; use the reserved `bytes_hex` key"
+        )
+        .into());
+    }
+    Ok(None)
+}
+
+fn source_payload_bytes_toml_key(field: &str) -> String {
+    if field == "bytes" {
+        "bytes_hex".to_owned()
+    } else {
+        format!("{field}_bytes_hex")
+    }
+}
+
+fn verify_source_event_payload_byte_artifacts_listed(
+    report: &JsonValue,
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let Some(payload_bytes) = source_event
+        .get("payload_bytes")
+        .and_then(JsonValue::as_object)
+    else {
+        return Ok(());
+    };
+    let artifact_sha256s = report_artifact_sha256s_by_path(report, report_path)?;
+    for (field, artifact) in payload_bytes {
+        let object = artifact.as_object().ok_or_else(|| {
+            format!(
+                "{} source_event.payload_bytes.{field} is not an object",
+                report_path.display()
+            )
+        })?;
+        source_event_payload_bytes_from_value(
+            artifact,
+            report_path,
+            &format!("source_event.payload_bytes.{field}"),
+            true,
+        )?;
+        if object.get("storage").and_then(JsonValue::as_str) == Some("artifact") {
+            let artifact_path = object
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} source_event.payload_bytes.{field} artifact storage missing artifact_path",
+                        report_path.display()
+                    )
+                })?;
+            let artifact_sha256 =
+                object
+                    .get("artifact_sha256")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} source_event.payload_bytes.{field} artifact storage missing artifact_sha256",
+                            report_path.display()
+                        )
+                    })?;
+            if artifact_sha256s.get(artifact_path).map(String::as_str) != Some(artifact_sha256) {
+                return Err(format!(
+                    "{} source_event.payload_bytes.{field} artifact `{artifact_path}` is not listed in artifact_sha256s with the same hash",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_artifact_sha256s_by_path(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<BTreeMap<String, String>> {
+    let artifacts = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing artifact_sha256s", report_path.display()))?;
+    let mut by_path = BTreeMap::new();
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let path = artifact
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} artifact_sha256s[{index}] missing path",
+                    report_path.display()
+                )
+            })?;
+        let sha256 = artifact
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} artifact_sha256s[{index}] missing sha256",
+                    report_path.display()
+                )
+            })?;
+        by_path.insert(path.to_owned(), sha256.to_owned());
+    }
+    Ok(by_path)
+}
+
+fn scenario_hex_payload_bytes(
+    value: &str,
+    report_path: &Path,
+    step_id: &str,
+    key: &str,
+) -> RuntimeResult<Vec<u8>> {
+    let compact = value.trim();
+    if compact.len() % 2 != 0 {
+        return Err(format!(
+            "{} selected step `{step_id}` expected_source_event `{key}` has odd hex digit count",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut output = Vec::with_capacity(compact.len() / 2);
+    for index in (0..compact.len()).step_by(2) {
+        let pair = &compact[index..index + 2];
+        let byte = u8::from_str_radix(pair, 16).map_err(|_| {
+            format!(
+                "{} selected step `{step_id}` expected_source_event `{key}` has invalid hex byte `{pair}`",
+                report_path.display()
+            )
+        })?;
+        output.push(byte);
+    }
+    Ok(output)
+}
+
+fn source_event_payload_bytes_artifact(bytes: &[u8]) -> JsonValue {
+    let mut summary = expected_inline_bytes_summary(bytes);
+    if let JsonValue::Object(object) = &mut summary {
+        object.insert(
+            "inline_bytes".to_owned(),
+            JsonValue::Array(bytes.iter().map(|byte| json!(*byte)).collect()),
+        );
+    }
+    summary
+}
+
+fn expected_source_payload_json_value(
+    source_event: &serde_json::Map<String, JsonValue>,
+    field: &boon_ir::SourcePayloadField,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    match field {
+        boon_ir::SourcePayloadField::Text => source_event
+            .get("text")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing text payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        boon_ir::SourcePayloadField::Key => source_event
+            .get("key")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing key payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        boon_ir::SourcePayloadField::Address => source_event
+            .get("address")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing address payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        boon_ir::SourcePayloadField::Bytes => {
+            let bytes = source_event_payload_bytes(source_event, report_path)?;
+            Ok(expected_inline_bytes_summary(&bytes))
+        }
+        boon_ir::SourcePayloadField::Named(name) => source_event
+            .get("payload")
+            .and_then(JsonValue::as_object)
+            .and_then(|payload| payload.get(name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event.payload is missing `{name}`",
+                    report_path.display()
+                )
+                .into()
+            }),
+    }
+}
+
+fn source_event_payload_bytes(
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let artifact = source_event
+        .get("payload_bytes")
+        .and_then(JsonValue::as_object)
+        .and_then(|payload| payload.get("bytes"))
+        .ok_or_else(|| {
+            format!(
+                "{} source_event.payload_bytes is missing `bytes`",
+                report_path.display()
+            )
+        })?;
+    source_event_payload_bytes_from_value(
+        artifact,
+        report_path,
+        "source_event.payload_bytes.bytes",
+        false,
+    )
+}
+
+fn source_event_payload_bytes_from_value(
+    artifact: &JsonValue,
+    report_path: &Path,
+    context: &str,
+    enforce_inline_limit: bool,
+) -> RuntimeResult<Vec<u8>> {
+    let object = artifact
+        .as_object()
+        .ok_or_else(|| format!("{} {context} is not an object", report_path.display(),))?;
+    if object.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES") {
+        return Err(format!(
+            "{} {context} is not a BYTES artifact",
+            report_path.display(),
+        )
+        .into());
+    }
+    match object.get("storage").and_then(JsonValue::as_str) {
+        Some("inline") => {
+            source_event_inline_payload_bytes(object, report_path, context, enforce_inline_limit)
+        }
+        Some("artifact") => source_event_file_payload_bytes(object, report_path, context),
+        Some(storage) => Err(format!(
+            "{} {context} has unsupported BYTES storage `{storage}`",
+            report_path.display(),
+        )
+        .into()),
+        None => Err(format!("{} {context} missing storage", report_path.display()).into()),
+    }
+}
+
+fn source_event_inline_payload_bytes(
+    object: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+    context: &str,
+    enforce_inline_limit: bool,
+) -> RuntimeResult<Vec<u8>> {
+    let inline = object
+        .get("inline_bytes")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} {context} is missing inline_bytes",
+                report_path.display(),
+            )
+        })?;
+    if enforce_inline_limit && inline.len() > SOURCE_EVENT_INLINE_BYTES_LIMIT {
+        return Err(format!(
+            "{} {context} inline_bytes length {} exceeds source-event inline limit {}",
+            report_path.display(),
+            inline.len(),
+            SOURCE_EVENT_INLINE_BYTES_LIMIT
+        )
+        .into());
+    }
+    if object
+        .get("inline_byte_limit")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|limit| limit != SOURCE_EVENT_INLINE_BYTES_LIMIT as u64)
+    {
+        return Err(format!(
+            "{} {context} inline_byte_limit does not match schema limit {}",
+            report_path.display(),
+            SOURCE_EVENT_INLINE_BYTES_LIMIT
+        )
+        .into());
+    }
+    let mut bytes = Vec::with_capacity(inline.len());
+    for (index, value) in inline.iter().enumerate() {
+        let byte = value.as_u64().ok_or_else(|| {
+            format!(
+                "{} {context}.inline_bytes[{index}] is not a byte",
+                report_path.display(),
+            )
+        })?;
+        bytes.push(u8::try_from(byte).map_err(|_| {
+            format!(
+                "{} {context}.inline_bytes[{index}] is outside 0..=255",
+                report_path.display(),
+            )
+        })?);
+    }
+    verify_source_event_payload_summary(object, &bytes, report_path, context)?;
+    Ok(bytes)
+}
+
+fn source_event_file_payload_bytes(
+    object: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+    context: &str,
+) -> RuntimeResult<Vec<u8>> {
+    if object.contains_key("inline_bytes") {
+        return Err(format!(
+            "{} {context} artifact storage must not include inline_bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifact_path = object
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} {context} artifact storage missing artifact_path",
+                report_path.display()
+            )
+        })?;
+    let artifact_sha256 = object
+        .get("artifact_sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} {context} artifact storage missing artifact_sha256",
+                report_path.display()
+            )
+        })?;
+    let bytes = fs::read(artifact_path).map_err(|error| {
+        format!(
+            "{} {context} could not read artifact `{artifact_path}`: {error}",
+            report_path.display()
+        )
+    })?;
+    let actual_sha256 = sha256_bytes(&bytes);
+    if actual_sha256 != artifact_sha256 {
+        return Err(format!(
+            "{} {context} artifact_sha256 does not match artifact bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_source_event_payload_summary(object, &bytes, report_path, context)?;
+    Ok(bytes)
+}
+
+fn verify_source_event_payload_summary(
+    object: &serde_json::Map<String, JsonValue>,
+    bytes: &[u8],
+    report_path: &Path,
+    context: &str,
+) -> RuntimeResult<()> {
+    let expected_summary = expected_inline_bytes_summary(&bytes);
+    if object.get("byte_len") != expected_summary.get("byte_len")
+        || object.get("digest") != expected_summary.get("digest")
+    {
+        return Err(format!(
+            "{} {context} digest/length does not match payload bytes",
+            report_path.display(),
+        )
+        .into());
+    }
+    if let Some(artifact_sha256) = object.get("artifact_sha256").and_then(JsonValue::as_str) {
+        if Some(artifact_sha256) != expected_summary.get("digest").and_then(JsonValue::as_str) {
+            return Err(format!(
+                "{} {context} artifact_sha256 does not match payload digest",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn plan_state_is_root_scalar(plan: &boon_plan::MachinePlan, state_id: usize) -> bool {
+    plan.storage_layout
+        .scalar_slots
+        .iter()
+        .any(|slot| slot.state_id.0 == state_id && !slot.indexed)
+}
+
+struct ExpectedRouteExecution {
+    source_id: usize,
+    target_state_id: usize,
+    update_op_id: usize,
+    expression_kind: &'static str,
+    source_payload_field: JsonValue,
+    update_constant_id: JsonValue,
+    update_constant_value: JsonValue,
+    expected_value: JsonValue,
+    payload_schema: JsonValue,
+    full_state_summary: JsonValue,
+    semantic_delta_signatures: JsonValue,
+    semantic_deltas: JsonValue,
+    per_step: JsonValue,
+    executed_update_branch_count: usize,
+    executed_derived_value_count: usize,
+    executed_list_append_count: usize,
+    executed_list_remove_count: usize,
+    executed_indexed_update_count: usize,
+    emitted_source_bind_count: usize,
+    emitted_source_unbind_count: usize,
+}
+
+fn expected_route_execution(
+    plan: &boon_plan::MachinePlan,
+    source: &str,
+    target_state: &str,
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<ExpectedRouteExecution> {
+    let source_id = plan_source_id_for_label(plan, source).ok_or_else(|| {
+        format!(
+            "{} MachinePlan has no source route `{source}`",
+            report_path.display()
+        )
+    })?;
+    let target_state_id = plan_state_id_for_label(plan, target_state).ok_or_else(|| {
+        format!(
+            "{} MachinePlan has no state slot `{target_state}`",
+            report_path.display()
+        )
+    })?;
+    let source_route_slot = plan
+        .source_routes
+        .iter()
+        .find(|route| route.source_id.0 == source_id)
+        .ok_or_else(|| {
+            format!(
+                "{} source route `{source}` has no route slot",
+                report_path.display()
+            )
+        })?;
+    if source_route_slot.scoped {
+        return Err(format!(
+            "{} run-plan-route schema accepts only unscoped root route proofs",
+            report_path.display()
+        )
+        .into());
+    }
+    let route_ops = plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == boon_plan::RegionKind::UpdateBranches)
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            op.inputs.iter().any(|input| {
+                matches!(input, boon_plan::ValueRef::Source(id) if id.0 == source_id)
+            }) && matches!(&op.output, Some(boon_plan::ValueRef::State(id)) if id.0 == target_state_id)
+        })
+        .collect::<Vec<_>>();
+    let [op] = route_ops.as_slice() else {
+        return Err(format!(
+            "{} expected exactly one route op for `{source}` -> `{target_state}`, found {}",
+            report_path.display(),
+            route_ops.len()
+        )
+        .into());
+    };
+    if op.indexed || op.unresolved_executable_ref_count != 0 {
+        return Err(format!(
+            "{} selected route op is indexed or unresolved",
+            report_path.display()
+        )
+        .into());
+    }
+    let (root_state, bytes_state, _) = expected_root_scalar_initial_state(plan, report_path)?;
+    let expected_update = expected_root_scalar_update(
+        plan,
+        op,
+        source_id,
+        source_route_slot,
+        source_event,
+        &root_state,
+        &bytes_state,
+        report_path,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "{} selected route op {} source guard did not match report source_event",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    let scenario = route_scenario_from_source_event(source_event, report_path)?;
+    let selected_step_ids = vec!["live-source-event-0".to_owned()];
+    let full_expected =
+        expected_root_scalar_scenario_execution(plan, &scenario, &selected_step_ids, report_path)?;
+    let full_expected_value = json_value_at_dotted_path(&full_expected.state_summary, target_state)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{} full source-derived route execution did not produce `{target_state}`",
+                report_path.display()
+            )
+        })?;
+    if full_expected_value != expected_update.value {
+        return Err(format!(
+            "{} selected route op value does not match full source-derived execution for `{target_state}`",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(ExpectedRouteExecution {
+        source_id,
+        target_state_id,
+        update_op_id: op.id.0,
+        expression_kind: expected_update.expression_kind,
+        source_payload_field: expected_update.source_payload_field,
+        update_constant_id: expected_update.update_constant_id,
+        update_constant_value: expected_update.update_constant_value,
+        expected_value: expected_update.value,
+        payload_schema: serde_json::to_value(&source_route_slot.payload_schema)?,
+        full_state_summary: full_expected.state_summary,
+        semantic_delta_signatures: full_expected.semantic_delta_signatures,
+        semantic_deltas: full_expected.semantic_deltas,
+        per_step: full_expected.per_step,
+        executed_update_branch_count: full_expected.executed_update_branch_count,
+        executed_derived_value_count: full_expected.executed_derived_value_count,
+        executed_list_append_count: full_expected.executed_list_append_count,
+        executed_list_remove_count: full_expected.executed_list_remove_count,
+        executed_indexed_update_count: full_expected.executed_indexed_update_count,
+        emitted_source_bind_count: full_expected.emitted_source_bind_count,
+        emitted_source_unbind_count: full_expected.emitted_source_unbind_count,
+    })
+}
+
+fn route_scenario_from_source_event(
+    source_event: &serde_json::Map<String, JsonValue>,
+    report_path: &Path,
+) -> RuntimeResult<Scenario> {
+    let mut expected_source_event = BTreeMap::new();
+    let source = source_event
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} route source_event.source is missing",
+                report_path.display()
+            )
+        })?;
+    expected_source_event.insert("source".to_owned(), toml::Value::String(source.to_owned()));
+    for key in [
+        "text",
+        "key",
+        "list_id",
+        "address",
+        "target_text",
+        "pointer_x",
+        "pointer_y",
+        "pointer_width",
+        "pointer_height",
+    ] {
+        if let Some(value) = source_event
+            .get(key)
+            .filter(|value| !value.is_null())
+            .and_then(JsonValue::as_str)
+        {
+            expected_source_event.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+        }
+    }
+    for key in [
+        "target_occurrence",
+        "target_key",
+        "target_generation",
+        "bind_epoch",
+        "source_id",
+        "source_epoch",
+    ] {
+        if let Some(value) = source_event
+            .get(key)
+            .filter(|value| !value.is_null())
+            .and_then(JsonValue::as_u64)
+        {
+            let value = i64::try_from(value).map_err(|_| {
+                format!(
+                    "{} route source_event.{key} exceeds TOML integer range",
+                    report_path.display()
+                )
+            })?;
+            expected_source_event.insert(key.to_owned(), toml::Value::Integer(value));
+        }
+    }
+    if let Some(payload) = source_event.get("payload").and_then(JsonValue::as_object) {
+        for (key, value) in payload {
+            if let Some(value) = value.as_str() {
+                expected_source_event
+                    .entry(key.clone())
+                    .or_insert_with(|| toml::Value::String(value.to_owned()));
+            }
+        }
+    }
+    if let Some(payload_bytes) = source_event
+        .get("payload_bytes")
+        .and_then(JsonValue::as_object)
+    {
+        for (field, artifact) in payload_bytes {
+            let bytes = source_event_payload_bytes_from_artifact(artifact, report_path, field)?;
+            expected_source_event
+                .entry(source_payload_bytes_toml_key(field))
+                .or_insert_with(|| toml::Value::String(expected_bytes_encode_hex(&bytes)));
+        }
+    }
+    Ok(Scenario {
+        source: None,
+        step: vec![ScenarioStep {
+            id: "live-source-event-0".to_owned(),
+            expected_source_event: Some(expected_source_event),
+        }],
+    })
+}
+
+fn source_event_payload_bytes_from_artifact(
+    artifact: &JsonValue,
+    report_path: &Path,
+    field: &str,
+) -> RuntimeResult<Vec<u8>> {
+    source_event_payload_bytes_from_value(
+        artifact,
+        report_path,
+        &format!("source_event.payload_bytes.{field}"),
+        false,
+    )
+}
+
+fn json_value_at_dotted_path<'a>(root: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    if let Some(value) = root.get(path) {
+        return Some(value);
+    }
+    let mut value = root;
+    for segment in path.split('.') {
+        value = value.get(segment)?;
+    }
+    Some(value)
+}
+
+fn plan_constant_json_value(
+    constant: &boon_plan::PlanConstant,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    plan_constant_value_json_value(&constant.value, report_path).map_err(|error| {
+        format!(
+            "{} plan constant {} is not executable: {error}",
+            report_path.display(),
+            constant.id.0
+        )
+        .into()
+    })
+}
+
+fn expected_private_bytes_from_plan_constant_value(
+    value: &boon_plan::PlanConstantValue,
+    context: &str,
+) -> RuntimeResult<Option<Vec<u8>>> {
+    let boon_plan::PlanConstantValue::Bytes {
+        byte_len,
+        sha256,
+        inline_bytes: Some(bytes),
+    } = value
+    else {
+        return Ok(None);
+    };
+    if bytes.len() as u64 != *byte_len || sha256_bytes(bytes) != *sha256 {
+        return Err(
+            format!("{context} bytes constant payload does not match typed digest/length").into(),
+        );
+    }
+    Ok(Some(bytes.clone()))
+}
+
+fn expected_constant_private_bytes_for_output(
+    plan: &boon_plan::MachinePlan,
+    output_state_id: boon_ir::StateId,
+    constant: &boon_plan::PlanConstant,
+    report_path: &Path,
+) -> RuntimeResult<Option<Vec<u8>>> {
+    let Some(slot) = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+    else {
+        return Err(format!(
+            "{} root const update targets missing state {}",
+            report_path.display(),
+            output_state_id.0
+        )
+        .into());
+    };
+    match (&constant.value, &slot.value_type, slot.initial_value_kind) {
+        (
+            boon_plan::PlanConstantValue::Bytes {
+                byte_len,
+                sha256,
+                inline_bytes: Some(bytes),
+            },
+            boon_plan::PlanValueType::Bytes { fixed_len },
+            boon_plan::InitialValueKind::Bytes,
+        ) => {
+            if let Some(expected_len) = *fixed_len
+                && expected_len != *byte_len
+            {
+                return Err(format!(
+                    "{} root const bytes update has byte_len {byte_len} but output fixed_len {expected_len}",
+                    report_path.display()
+                )
+                .into());
+            }
+            if bytes.len() as u64 != *byte_len || sha256_bytes(bytes) != *sha256 {
+                return Err(format!(
+                    "{} root const bytes update payload does not match typed digest/length",
+                    report_path.display()
+                )
+                .into());
+            }
+            Ok(Some(bytes.clone()))
+        }
+        (boon_plan::PlanConstantValue::Bytes { .. }, _, _) => Err(format!(
+            "{} root const bytes update does not target BYTES storage",
+            report_path.display()
+        )
+        .into()),
+        _ => Ok(None),
+    }
+}
+
+fn plan_constant_value_json_value(
+    value: &boon_plan::PlanConstantValue,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    match value {
+        boon_plan::PlanConstantValue::Text { value }
+        | boon_plan::PlanConstantValue::Enum { value } => Ok(JsonValue::String(value.clone())),
+        boon_plan::PlanConstantValue::Number { value } => Ok(json!(value)),
+        boon_plan::PlanConstantValue::Byte { value } => Ok(json!(value)),
+        boon_plan::PlanConstantValue::Bool { value } => Ok(json!(value)),
+        boon_plan::PlanConstantValue::Bytes {
+            byte_len,
+            sha256,
+            inline_bytes: Some(_),
+        } => Ok(json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": sha256,
+            "byte_len": byte_len,
+        })),
+        boon_plan::PlanConstantValue::Bytes {
+            inline_bytes: None, ..
+        } => Err(format!(
+            "{} selected operation references a hash-only byte constant",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn plan_source_id_for_label(plan: &boon_plan::MachinePlan, label: &str) -> Option<usize> {
+    plan.debug_map
+        .source_routes
+        .iter()
+        .find(|entry| entry.label == label)
+        .and_then(|entry| debug_entry_numeric_id(&entry.id, "source"))
+}
+
+fn plan_state_id_for_label(plan: &boon_plan::MachinePlan, label: &str) -> Option<usize> {
+    plan.debug_map
+        .state_slots
+        .iter()
+        .find(|entry| entry.label == label)
+        .and_then(|entry| debug_entry_numeric_id(&entry.id, "state"))
+}
+
+fn plan_list_label(plan: &boon_plan::MachinePlan, list_id: usize) -> String {
+    plan.debug_map
+        .list_slots
+        .iter()
+        .find(|entry| debug_entry_numeric_id(&entry.id, "list") == Some(list_id))
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| format!("list:{list_id}"))
+}
+
+fn plan_semantic_field_label(plan: &boon_plan::MachinePlan, field_id: usize) -> String {
+    plan.debug_map
+        .fields
+        .iter()
+        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(field_id))
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| format!("field:{field_id}"))
+}
+
+fn plan_derived_field_label(plan: &boon_plan::MachinePlan, field_id: usize) -> String {
+    plan.debug_map
+        .derived_values
+        .iter()
+        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(field_id))
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| format!("field:{field_id}"))
+}
+
+fn local_field_name(label: &str) -> String {
+    label
+        .rsplit_once('.')
+        .map(|(_, local)| local.to_owned())
+        .unwrap_or_else(|| label.to_owned())
+}
+
+fn row_scoped_source_routes<'a>(
+    plan: &'a boon_plan::MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+) -> Vec<&'a boon_plan::SourceRoute> {
+    let mut routes = plan
+        .source_routes
+        .iter()
+        .filter(|route| route.scoped && route.scope_id == list_slot.scope_id)
+        .collect::<Vec<_>>();
+    routes.sort_by_key(|route| route.source_id.0);
+    routes
+}
+
+fn plan_json_delta_signature(delta: &JsonValue, report_path: &Path) -> RuntimeResult<String> {
+    let kind = delta
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} semantic delta has no kind", report_path.display()))?;
+    Ok(match delta.get("field_path").and_then(JsonValue::as_str) {
+        Some(field_path) => format!("{kind}:{field_path}"),
+        None => kind.to_owned(),
+    })
+}
+
+fn debug_entry_numeric_id(value: &str, prefix: &str) -> Option<usize> {
+    value
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.strip_prefix(':'))
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+}
+
+fn source_event_payload_value(
+    source_event: &serde_json::Map<String, JsonValue>,
+    field: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    match field {
+        JsonValue::String(name) if name == "Text" => source_event
+            .get("text")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing text payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        JsonValue::String(name) if name == "Key" => source_event
+            .get("key")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing key payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        JsonValue::String(name) if name == "Address" => source_event
+            .get("address")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{} source_event is missing address payload",
+                    report_path.display()
+                )
+                .into()
+            }),
+        JsonValue::String(name) if name == "Bytes" => {
+            let bytes = source_event_payload_bytes(source_event, report_path)?;
+            Ok(expected_inline_bytes_summary(&bytes))
+        }
+        JsonValue::Object(object) => {
+            let name = object
+                .get("Named")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} source_payload_field object is not a Named field",
+                        report_path.display()
+                    )
+                })?;
+            source_event
+                .get("payload")
+                .and_then(JsonValue::as_object)
+                .and_then(|payload| payload.get(name))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "{} source_event.payload is missing `{name}`",
+                        report_path.display()
+                    )
+                    .into()
+                })
+        }
+        _ => Err(format!(
+            "{} source_payload_field has unsupported JSON shape",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn compile_report_machine_plan(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<boon_plan::MachinePlan> {
+    let target = report
+        .get("target_profile")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing target_profile", report_path.display()))?;
+    let target_profile = boon_plan::TargetProfile::from_name(target).map_err(|error| {
+        format!(
+            "{} invalid target_profile `{target}`: {error}",
+            report_path.display()
+        )
+    })?;
+    let parsed = parse_report_program(report, report_path)?;
+    let ir = boon_ir::lower(&parsed).map_err(|error| {
+        format!(
+            "{} could not lower report source files: {error}",
+            report_path.display()
+        )
+    })?;
+    boon_ir::verify_hidden_identity(&ir).map_err(|error| {
+        format!(
+            "{} source-derived IR failed hidden identity verification: {error}",
+            report_path.display()
+        )
+    })?;
+    boon_ir::verify_static_schedule(&ir).map_err(|error| {
+        format!(
+            "{} source-derived IR failed static schedule verification: {error}",
+            report_path.display()
+        )
+    })?;
+    boon_plan::compile_typed_program(&ir, target_profile).map_err(|error| {
+        format!(
+            "{} could not compile source-derived MachinePlan: {error}",
+            report_path.display()
+        )
+        .into()
+    })
+}
+
+fn compile_report_resolved_constant_table(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    let parsed = parse_report_program(report, report_path)?;
+    let ir = boon_ir::lower(&parsed).map_err(|error| {
+        format!(
+            "{} could not lower report source files for resolved constants: {error}",
+            report_path.display()
+        )
+    })?;
+    serde_json::to_value(&ir.typecheck_report.resolved_constant_table).map_err(|error| {
+        format!(
+            "{} could not serialize source-derived resolved_constant_table: {error}",
+            report_path.display()
+        )
+        .into()
+    })
+}
+
+fn compile_report_ir_graph_node_count(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<usize> {
+    let parsed = parse_report_program(report, report_path)?;
+    let ir = boon_ir::lower(&parsed).map_err(|error| {
+        format!(
+            "{} could not lower report source files for graph_node_count: {error}",
+            report_path.display()
+        )
+    })?;
+    Ok(ir.graph_node_count)
+}
+
+struct ReportSourceUnit {
+    path: String,
+    source: String,
+    start_line: usize,
+}
+
+fn parse_report_program(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<boon_parser::ParsedProgram> {
+    let source_path = report
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing source_path", report_path.display()))?;
+    let mut units = report_source_units(report, report_path)?;
+    if units.is_empty() {
+        let source = fs::read_to_string(source_path)?;
+        return Ok(boon_parser::parse_source(source_path.to_owned(), source)?);
+    }
+    if units.len() == 1 {
+        if units[0].path != source_path {
+            return Err(format!(
+                "{} single-file source_files path `{}` does not match source_path `{source_path}`",
+                report_path.display(),
+                units[0].path
+            )
+            .into());
+        }
+        let unit = units.remove(0);
+        return Ok(boon_parser::parse_source(
+            source_path.to_owned(),
+            unit.source,
+        )?);
+    }
+    units.sort_by(|left, right| {
+        left.start_line
+            .cmp(&right.start_line)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(boon_parser::parse_project(
+        source_path.to_owned(),
+        units.into_iter().map(|unit| (unit.path, unit.source)),
+    )?)
+}
+
+fn report_source_units(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<Vec<ReportSourceUnit>> {
+    let Some(source_files) = report.get("source_files").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut units = Vec::new();
+    for (index, file) in source_files.iter().enumerate() {
+        if let Some(path) = file.as_str() {
+            units.push(ReportSourceUnit {
+                path: path.to_owned(),
+                source: fs::read_to_string(path)?,
+                start_line: index + 1,
+            });
+            continue;
+        }
+        let object = file.as_object().ok_or_else(|| {
+            format!(
+                "{} source_files[{index}] is neither a path string nor an object",
+                report_path.display()
+            )
+        })?;
+        let path = object
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} source_files[{index}].path is not a string",
+                    report_path.display()
+                )
+            })?;
+        let start_line = object
+            .get("start_line")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} source_files[{index}].start_line is not a number",
+                    report_path.display()
+                )
+            })?;
+        units.push(ReportSourceUnit {
+            path: path.to_owned(),
+            source: fs::read_to_string(path)?,
+            start_line: start_line as usize,
+        });
+    }
+    Ok(units)
+}
+
+fn expected_initial_state_summary(
+    plan: &boon_plan::MachinePlan,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    let mut state_summary = serde_json::Map::new();
+    let mut initialized_state_count = 0usize;
+    let mut source_route_count = 0usize;
+    for region in &plan.regions {
+        match region.kind {
+            boon_plan::RegionKind::SourceRouting => {
+                for op in &region.ops {
+                    if !matches!(op.kind, boon_plan::PlanOpKind::SourceRoute)
+                        || !matches!(op.output, Some(boon_plan::ValueRef::Source(_)))
+                    {
+                        return Err(format!(
+                            "{} run-plan source-routing region contains unsupported op",
+                            report_path.display()
+                        )
+                        .into());
+                    }
+                    source_route_count += 1;
+                }
+            }
+            boon_plan::RegionKind::StateInitialization => {
+                for op in &region.ops {
+                    let boon_plan::PlanOpKind::StateInitialize {
+                        initial_value_kind,
+                        initial_constant_id,
+                    } = op.kind
+                    else {
+                        return Err(format!(
+                            "{} run-plan state-initialization region contains unsupported op",
+                            report_path.display()
+                        )
+                        .into());
+                    };
+                    let Some(boon_plan::ValueRef::State(state_id)) = op.output else {
+                        return Err(format!(
+                            "{} run-plan StateInitialize op is missing typed state output",
+                            report_path.display()
+                        )
+                        .into());
+                    };
+                    let slot = plan
+                        .storage_layout
+                        .scalar_slots
+                        .iter()
+                        .find(|slot| slot.state_id == state_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "{} run-plan StateInitialize targets missing state {}",
+                                report_path.display(),
+                                state_id.0
+                            )
+                        })?;
+                    if slot.initial_value_kind != initial_value_kind
+                        || slot.initial_constant_id != initial_constant_id
+                    {
+                        return Err(format!(
+                            "{} run-plan StateInitialize op and storage slot disagree for state {}",
+                            report_path.display(),
+                            state_id.0
+                        )
+                        .into());
+                    }
+                    if !slot.indexed {
+                        let value = expected_initial_value(
+                            plan,
+                            slot.initial_constant_id,
+                            &slot.value_type,
+                            slot.initial_value_kind,
+                            report_path,
+                        )?;
+                        state_summary.insert(plan_state_label(plan, state_id.0), value);
+                    }
+                    initialized_state_count += 1;
+                }
+            }
+            boon_plan::RegionKind::DerivedEvaluation => {
+                for op in &region.ops {
+                    match &op.kind {
+                        boon_plan::PlanOpKind::DerivedValue { .. }
+                            if op.unresolved_executable_ref_count == 0 => {}
+                        _ => {
+                            return Err(format!(
+                                "{} run-plan schema does not accept DerivedEvaluation op {} in initial-state proof reports",
+                                report_path.display(),
+                                op.id.0
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            boon_plan::RegionKind::UpdateBranches
+            | boon_plan::RegionKind::ListProjections
+            | boon_plan::RegionKind::DependencyEdges => {}
+            boon_plan::RegionKind::ListOperations => {
+                for op in &region.ops {
+                    match &op.kind {
+                        boon_plan::PlanOpKind::ListOperation { .. }
+                            if op.unresolved_executable_ref_count == 0 => {}
+                        _ => {
+                            return Err(format!(
+                                "{} run-plan schema does not accept {:?} op {} in initial-state proof reports",
+                                report_path.display(),
+                                region.kind,
+                                op.id.0
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if initialized_state_count != plan.storage_layout.scalar_slots.len() {
+        return Err(format!(
+            "{} run-plan initialized {initialized_state_count} state(s), expected {}",
+            report_path.display(),
+            plan.storage_layout.scalar_slots.len()
+        )
+        .into());
+    }
+    if source_route_count != plan.source_routes.len() {
+        return Err(format!(
+            "{} run-plan saw {source_route_count} source route op(s), expected {}",
+            report_path.display(),
+            plan.source_routes.len()
+        )
+        .into());
+    }
+    Ok(JsonValue::Object(state_summary))
+}
+
+fn expected_initial_value(
+    plan: &boon_plan::MachinePlan,
+    constant_id: Option<boon_plan::PlanConstantId>,
+    value_type: &boon_plan::PlanValueType,
+    initial_value_kind: boon_plan::InitialValueKind,
+    report_path: &Path,
+) -> RuntimeResult<JsonValue> {
+    let constant_id = constant_id.ok_or_else(|| {
+        format!(
+            "{} run-plan state initializer is missing a typed constant id",
+            report_path.display()
+        )
+    })?;
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan missing plan constant {}",
+                report_path.display(),
+                constant_id.0
+            )
+        })?;
+    match (&constant.value, value_type, initial_value_kind) {
+        (
+            boon_plan::PlanConstantValue::Text { value },
+            boon_plan::PlanValueType::Text,
+            boon_plan::InitialValueKind::Text,
+        ) => Ok(json!(value)),
+        (
+            boon_plan::PlanConstantValue::Number { value },
+            boon_plan::PlanValueType::Number,
+            boon_plan::InitialValueKind::Number,
+        ) => Ok(json!(value)),
+        (
+            boon_plan::PlanConstantValue::Byte { value },
+            boon_plan::PlanValueType::Byte,
+            boon_plan::InitialValueKind::Byte,
+        ) => Ok(json!(value)),
+        (
+            boon_plan::PlanConstantValue::Bool { value },
+            boon_plan::PlanValueType::Bool,
+            boon_plan::InitialValueKind::Bool,
+        ) => Ok(json!(value)),
+        (
+            boon_plan::PlanConstantValue::Enum { value },
+            boon_plan::PlanValueType::Enum,
+            boon_plan::InitialValueKind::Enum,
+        ) => Ok(json!(value)),
+        (
+            boon_plan::PlanConstantValue::Bytes {
+                byte_len,
+                sha256,
+                inline_bytes: Some(_),
+            },
+            boon_plan::PlanValueType::Bytes { fixed_len },
+            boon_plan::InitialValueKind::Bytes,
+        ) => {
+            if let Some(expected_len) = *fixed_len {
+                if expected_len != *byte_len {
+                    return Err(format!(
+                        "{} run-plan bytes constant {} has byte_len {byte_len} but storage fixed_len {expected_len}",
+                        report_path.display(),
+                        constant_id.0
+                    )
+                    .into());
+                }
+            }
+            Ok(json!({
+                "$boon_type": "BYTES",
+                "storage": "inline",
+                "digest": sha256,
+                "byte_len": byte_len
+            }))
+        }
+        (
+            boon_plan::PlanConstantValue::Bytes {
+                inline_bytes: None, ..
+            },
+            boon_plan::PlanValueType::Bytes { .. },
+            boon_plan::InitialValueKind::Bytes,
+        ) => Err(format!(
+            "{} run-plan bytes constant {} has no executable payload",
+            report_path.display(),
+            constant_id.0
+        )
+        .into()),
+        _ => Err(format!(
+            "{} run-plan constant {} does not match scalar storage type {:?}/{:?}",
+            report_path.display(),
+            constant_id.0,
+            value_type,
+            initial_value_kind
+        )
+        .into()),
+    }
+}
+
+fn expected_initial_inline_bytes(
+    plan: &boon_plan::MachinePlan,
+    slot: &boon_plan::ScalarStorageSlot,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let constant_id = slot.initial_constant_id.ok_or_else(|| {
+        format!(
+            "{} bytes state `{}` has no typed initial constant",
+            report_path.display(),
+            plan_state_label(plan, slot.state_id.0)
+        )
+    })?;
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} missing plan constant {}",
+                report_path.display(),
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Bytes {
+        byte_len,
+        sha256,
+        inline_bytes: Some(bytes),
+    } = &constant.value
+    else {
+        return Err(format!(
+            "{} bytes state `{}` is not backed by an inline byte constant",
+            report_path.display(),
+            plan_state_label(plan, slot.state_id.0)
+        )
+        .into());
+    };
+    if let boon_plan::PlanValueType::Bytes {
+        fixed_len: Some(expected_len),
+    } = &slot.value_type
+        && *expected_len != *byte_len
+    {
+        return Err(format!(
+            "{} bytes state `{}` has byte_len {byte_len} but storage fixed_len {expected_len}",
+            report_path.display(),
+            plan_state_label(plan, slot.state_id.0)
+        )
+        .into());
+    }
+    if sha256_bytes(bytes) != *sha256 || bytes.len() as u64 != *byte_len {
+        return Err(format!(
+            "{} bytes state `{}` initial payload does not match typed digest/length",
+            report_path.display(),
+            plan_state_label(plan, slot.state_id.0)
+        )
+        .into());
+    }
+    Ok(bytes.clone())
+}
+
+fn plan_state_label(plan: &boon_plan::MachinePlan, state_id: usize) -> String {
+    let expected = format!("state:{state_id}");
+    plan.debug_map
+        .state_slots
+        .iter()
+        .find(|entry| entry.id == expected)
+        .map(|entry| entry.label.clone())
+        .unwrap_or(expected)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let version = report
         .get("report_version")
@@ -1274,6 +20653,7 @@ fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> Runtime
         )
         .into());
     }
+    verify_report_binary_hash_matches_command(report, report_path, argv)?;
     let exit_status = report
         .get("exit_status")
         .and_then(JsonValue::as_i64)
@@ -1339,6 +20719,58 @@ fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> Runtime
         if report.get("hardware_plan").is_none() {
             return Err(format!("{} missing hardware_plan", report_path.display()).into());
         }
+    }
+    Ok(())
+}
+
+fn verify_report_binary_hash_matches_command(
+    report: &JsonValue,
+    report_path: &Path,
+    argv: &[JsonValue],
+) -> RuntimeResult<()> {
+    let reported_hash = report
+        .get("binary_hash")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} binary_hash is not a string", report_path.display()))?;
+    if let Some(binary_path) = report.get("binary_path").and_then(JsonValue::as_str) {
+        let binary_path = Path::new(binary_path);
+        if !binary_path.is_file() {
+            return Err(format!(
+                "{} binary_path `{}` is not an existing file",
+                report_path.display(),
+                binary_path.display()
+            )
+            .into());
+        }
+        let actual_hash = cached_report_binary_hash(binary_path)?;
+        if reported_hash != actual_hash {
+            return Err(format!(
+                "{} has stale binary_hash for binary_path `{}`: report={}, actual={}",
+                report_path.display(),
+                binary_path.display(),
+                reported_hash,
+                actual_hash
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    let Some(command_path) = argv.first().and_then(JsonValue::as_str).map(Path::new) else {
+        return Ok(());
+    };
+    if !command_path.is_file() {
+        return Ok(());
+    }
+    let actual_hash = cached_report_binary_hash(command_path)?;
+    if reported_hash != actual_hash {
+        return Err(format!(
+            "{} has stale binary_hash for command `{}`: report={}, actual={}",
+            report_path.display(),
+            command_path.display(),
+            reported_hash,
+            actual_hash
+        )
+        .into());
     }
     Ok(())
 }
@@ -1975,7 +21407,7 @@ fn verify_generic_runtime_slice_metadata(
         .or_else(|| execution.get("adapter_kind").and_then(JsonValue::as_str))
         .or_else(|| report_program_kind(report))
         .unwrap_or_default();
-    require_generic_runtime_slice_flags(slices, example, report_path)?;
+    require_generic_runtime_slice_flags(slices, execution, example, report_path)?;
     for (key, value) in slices {
         let Some(flag) = value.as_bool() else {
             continue;
@@ -2009,6 +21441,7 @@ fn verify_generic_runtime_slice_metadata(
 
 pub fn require_generic_runtime_slice_flags(
     slices: &serde_json::Map<String, JsonValue>,
+    execution: &JsonValue,
     example: &str,
     report_path: &Path,
 ) -> RuntimeResult<()> {
@@ -2054,17 +21487,12 @@ pub fn require_generic_runtime_slice_flags(
             "generic_source_mutation_semantic_delta_emitter",
             "generic_derived_value_semantic_delta_emitter",
             "generic_source_bind_semantic_delta_emitter",
-            "generic_list_remove_semantic_delta_emitter",
-            "generic_source_unbind_semantic_delta_emitter",
             "generic_render_lowering_plan",
             "generic_loaded_runtime_shell",
             "generic_source_route_action_executor",
             "generic_root_text_tick_executor",
             "generic_indexed_hold_commit_executor",
-            "generic_list_append_source_binding_executor",
-            "generic_list_remove_source_unbinding_executor",
             "generic_list_move_semantic_delta_emitter",
-            "generic_list_count_retain_executor",
             "generic_loaded_runtime_state_summary_projection",
             "generic_root_source_dispatch",
             "generic_source_event_route_executor",
@@ -2077,7 +21505,6 @@ pub fn require_generic_runtime_slice_flags(
             "generic_indexed_text_route_index",
             "generic_indexed_bool_route_index",
             "generic_root_source_route_index",
-            "generic_list_remove_predicate_route",
             "generic_routed_root_target_application",
             "generic_routed_indexed_target_application",
             "ir_list_operation_table_loaded",
@@ -2089,6 +21516,67 @@ pub fn require_generic_runtime_slice_flags(
     };
     for key in common_required {
         require_slice_bool(slices, key, true, report_path)?;
+    }
+    let list_append_operation_count =
+        runtime_slice_evidence_count(execution, "list_append_operation_count");
+    let list_append_route_count =
+        runtime_slice_evidence_count(execution, "list_append_route_count");
+    let list_remove_operation_count =
+        runtime_slice_evidence_count(execution, "list_remove_operation_count");
+    let list_remove_route_count =
+        runtime_slice_evidence_count(execution, "list_remove_route_count");
+    let list_count_retain_operation_count =
+        runtime_slice_evidence_count(execution, "list_count_retain_operation_count");
+    let list_source_binding_count =
+        runtime_slice_evidence_count(execution, "list_source_binding_count");
+    if list_append_operation_count > 0
+        && list_append_route_count > 0
+        && list_source_binding_count > 0
+    {
+        require_slice_bool(
+            slices,
+            "generic_list_append_source_binding_executor",
+            true,
+            report_path,
+        )?;
+    }
+    if list_remove_operation_count > 0 {
+        require_slice_bool(
+            slices,
+            "generic_list_remove_semantic_delta_emitter",
+            true,
+            report_path,
+        )?;
+        require_slice_bool(
+            slices,
+            "generic_source_unbind_semantic_delta_emitter",
+            true,
+            report_path,
+        )?;
+    }
+    if list_remove_operation_count > 0 && list_remove_route_count > 0 {
+        require_slice_bool(
+            slices,
+            "generic_list_remove_source_unbinding_executor",
+            true,
+            report_path,
+        )?;
+    }
+    if list_remove_route_count > 0 {
+        require_slice_bool(
+            slices,
+            "generic_list_remove_predicate_route",
+            true,
+            report_path,
+        )?;
+    }
+    if list_count_retain_operation_count > 0 {
+        require_slice_bool(
+            slices,
+            "generic_list_count_retain_executor",
+            true,
+            report_path,
+        )?;
     }
     require_slice_bool(
         slices,
@@ -2129,21 +21617,20 @@ pub fn require_generic_runtime_slice_flags(
             "generic_source_effects_through_action_executor",
             "generic_address_row_context_resolution",
             "generic_routed_source_event",
-            "generic_cells_scenario_expectation_assertions",
-            "generic_cells_scenario_storage_preparation",
-            "generic_cells_dependency_cache",
-            "generic_cells_evaluation_cache",
-            "generic_cells_derived_storage_sync",
-            "generic_cells_display_mutation_emitter",
-            "generic_cells_display_protocol_lowering",
+            "generic_scenario_expectation_assertions",
+            "generic_scenario_preparation",
+            "generic_loaded_runtime_assertion_executor",
+            "generic_derived_value_semantic_delta_emitter",
+            "generic_routed_indexed_text_target_application",
+            "generic_routed_indexed_bool_target_application",
             "generic_source_action_mutation_batch",
             "generic_editor_route_uses_indexed_targets",
             "generic_committed_fields_hold_no_mirror",
-            "generic_cells_edit_state_holds_from_ir",
+            "generic_indexed_text_hold_from_ir",
+            "generic_indexed_bool_hold_from_ir",
             "generic_hold_storage_authoritative",
             "generic_summary_reads_authoritative_storage",
             "generic_hidden_list_keys_from_generic_storage",
-            "generic_cells_pipeline_from_ir",
         ][..],
         "generic" | "novywave" => &[][..],
         _ => {
@@ -2158,6 +21645,14 @@ pub fn require_generic_runtime_slice_flags(
         require_slice_bool(slices, key, true, report_path)?;
     }
     Ok(())
+}
+
+fn runtime_slice_evidence_count(execution: &JsonValue, key: &str) -> u64 {
+    execution
+        .get("generic_runtime_slice_evidence")
+        .and_then(|evidence| evidence.get(key))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default()
 }
 
 fn require_slice_bool(
@@ -2234,6 +21729,7 @@ fn verify_generic_runtime_slice_evidence(
         "source_payload_text_field_count",
         "source_payload_key_field_count",
         "source_payload_address_field_count",
+        "source_payload_bytes_field_count",
         "root_text_slot_count",
         "root_bool_slot_count",
         "root_enum_slot_count",
@@ -2245,6 +21741,7 @@ fn verify_generic_runtime_slice_evidence(
         "list_hidden_key_slot_count",
         "list_hidden_generation_slot_count",
         "derived_text_transform_count",
+        "derived_value_count",
     ] {
         if evidence.get(key).and_then(JsonValue::as_u64)
             != compiled.get(key).and_then(JsonValue::as_u64)
@@ -3270,9 +22767,43 @@ fn verify_runtime_profile_metadata(report: &JsonValue, report_path: &Path) -> Ru
             }
         }
     }
+    let all_bytes_bounded = capacities
+        .get("all_bytes_bounded")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    if let Some(bytes) = capacities.get("bytes") {
+        let bytes = bytes
+            .as_array()
+            .ok_or_else(|| format!("{} capacities bytes is not an array", report_path.display()))?;
+        for byte_state in bytes {
+            for key in [
+                "name",
+                "fixed_len",
+                "effective_capacity",
+                "capacity_source",
+                "dynamic_growth_allowed",
+                "overflow_behavior",
+            ] {
+                if byte_state.get(key).is_none() {
+                    return Err(format!(
+                        "{} capacity report missing BYTES field `{key}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     if matches!(profile, "software_bounded" | "hardware_bounded") && !all_lists_bounded {
         return Err(format!(
             "{} claims {profile} while at least one list has no effective capacity",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile == "hardware_bounded" && !all_bytes_bounded {
+        return Err(format!(
+            "{} claims hardware_bounded while at least one BYTES state has no fixed capacity",
             report_path.display()
         )
         .into());
@@ -3422,6 +22953,7 @@ fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeRes
         )
         .into());
     }
+    verify_release_measurement_summary(report, report_path)?;
 
     let speed_report_path = benchmark
         .get("speed_report_path")
@@ -3483,6 +23015,126 @@ fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeRes
             "{} benchmark report does not hash linked speed report `{}`",
             report_path.display(),
             speed_report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_release_measurement_summary(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let summary = report
+        .get("release_measurement_summary")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing release_measurement_summary",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "interaction_latency_ms",
+        "runtime_tick_ms",
+        "render_lowering_ms",
+    ] {
+        verify_percentile_summary(
+            summary.get(key).ok_or_else(|| {
+                format!(
+                    "{} release_measurement_summary missing `{key}`",
+                    report_path.display()
+                )
+            })?,
+            report_path,
+            key,
+        )?;
+    }
+    for key in [
+        "compile_lower",
+        "warmup_and_allocations",
+        "copy_counters",
+        "rows_and_regions",
+        "runtime_step_profile_ms",
+    ] {
+        if !summary.get(key).is_some_and(JsonValue::is_object) {
+            return Err(format!(
+                "{} release_measurement_summary missing object `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if summary.get("speedup_claim").and_then(JsonValue::as_str) != Some("not_claimed") {
+        return Err(format!(
+            "{} benchmark report must not claim speedups from a single release run",
+            report_path.display()
+        )
+        .into());
+    }
+    let comparison = report
+        .get("phase0_baseline_comparison")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing phase0_baseline_comparison",
+                report_path.display()
+            )
+        })?;
+    let status = comparison
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if !matches!(status, "compared" | "unavailable") {
+        return Err(format!(
+            "{} phase0_baseline_comparison has invalid status `{status}`",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == "compared" {
+        if comparison.get("speedup_claim").and_then(JsonValue::as_str) != Some("not_claimed") {
+            return Err(format!(
+                "{} phase0_baseline_comparison must not claim speedups",
+                report_path.display()
+            )
+            .into());
+        }
+        for key in ["percentile_metrics", "scalar_metrics"] {
+            if !comparison.get(key).is_some_and(JsonValue::is_object) {
+                return Err(format!(
+                    "{} phase0_baseline_comparison missing object `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_percentile_summary(
+    value: &JsonValue,
+    report_path: &Path,
+    context: &str,
+) -> RuntimeResult<()> {
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "{} `{context}` percentile summary is not an object",
+            report_path.display()
+        )
+    })?;
+    for key in ["p50", "p95", "p99", "max"] {
+        if object.get(key).and_then(JsonValue::as_f64).is_none() {
+            return Err(format!(
+                "{} `{context}` missing numeric `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let sample_count = object.get("sample_count").and_then(JsonValue::as_u64);
+    if sample_count.is_none_or(|count| count == 0) {
+        return Err(format!(
+            "{} `{context}` missing positive sample_count",
+            report_path.display()
         )
         .into());
     }
@@ -5311,6 +24963,162 @@ mod tests {
         })
     }
 
+    fn bytes_negative_report() -> JsonValue {
+        let ids = expected_bytes_negative_case_ids();
+        let negative_cases = ids
+            .iter()
+            .map(|id| {
+                let mut case = json!({
+                    "id": id,
+                    "category": "schema-test",
+                    "rejected": true,
+                    "detail": format!("schema test negative case {id} rejected")
+                });
+                if matches!(
+                    *id,
+                    "plan-static-out-of-bounds-slice"
+                        | "plan-bytes-get-out-of-bounds"
+                        | "plan-bytes-set-out-of-bounds"
+                ) {
+                    case["failure_kind"] = json!("structured_error");
+                    case["panic_free"] = json!(true);
+                }
+                case
+            })
+            .collect::<Vec<_>>();
+        let per_step = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "pass": true,
+                    "detail": format!("schema test negative case {id} passed")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut report = base_report();
+        let binary_path = std::env::current_exe().unwrap();
+        report["command"] = json!("verify-bytes-negative");
+        report["command_argv"] = json!(["cargo", "xtask", "verify-bytes-negative"]);
+        report["binary_path"] = json!(binary_path.display().to_string());
+        report["binary_hash"] = json!(sha256_file(&binary_path).unwrap());
+        report["negative_case_count"] = json!(ids.len());
+        report["required_negative_cases"] = json!(ids);
+        report["negative_cases"] = json!(negative_cases);
+        report["per_step_pass_fail"] = json!(per_step);
+        report
+    }
+
+    fn bytes_byte_bank_layout_report() -> JsonValue {
+        let mut report = base_report();
+        report["command"] = json!("verify-bytes-byte-bank-layout");
+        report["command_argv"] = json!(["cargo", "xtask", "verify-bytes-byte-bank-layout"]);
+        report["bytes_byte_bank_layout"] = json!({
+            "status": "pass",
+            "case_count": 3,
+            "fixed_bytes_scalars_require_byte_banks": true,
+            "dynamic_bytes_scalars_must_not_declare_fixed_banks": true,
+            "scope": "MachinePlan StorageLayout byte_banks metadata",
+            "cases": [
+                {
+                    "id": "root-fixed-bytes-bank",
+                    "source_path": "examples/bytes_set_plan_ops.bn",
+                    "status": "pass",
+                    "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "verification_status": "pass",
+                    "fixed_bytes_scalar_count": 4,
+                    "dynamic_bytes_scalar_count": 0,
+                    "byte_bank_count": 4,
+                    "root_byte_bank_count": 4,
+                    "indexed_byte_bank_count": 0,
+                    "fixed_bank_coverage": true,
+                    "no_dynamic_banks": true,
+                    "byte_banks": [
+                        {"id": 6, "state_storage_id": 0, "state_id": 0, "scope_id": null, "indexed": false, "fixed_len": 4, "capacity": 1},
+                        {"id": 7, "state_storage_id": 1, "state_id": 1, "scope_id": null, "indexed": false, "fixed_len": 2, "capacity": 1},
+                        {"id": 8, "state_storage_id": 2, "state_id": 2, "scope_id": null, "indexed": false, "fixed_len": 4, "capacity": 1},
+                        {"id": 9, "state_storage_id": 5, "state_id": 5, "scope_id": null, "indexed": false, "fixed_len": 6, "capacity": 1}
+                    ]
+                },
+                {
+                    "id": "dynamic-bytes-no-fixed-bank",
+                    "source_path": "examples/bytes_source_payload_plan_ops.bn",
+                    "status": "pass",
+                    "plan_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "verification_status": "pass",
+                    "fixed_bytes_scalar_count": 0,
+                    "dynamic_bytes_scalar_count": 1,
+                    "byte_bank_count": 0,
+                    "root_byte_bank_count": 0,
+                    "indexed_byte_bank_count": 0,
+                    "fixed_bank_coverage": true,
+                    "no_dynamic_banks": true,
+                    "byte_banks": []
+                },
+                {
+                    "id": "indexed-fixed-bytes-bank",
+                    "source_path": "examples/bytes_indexed_source_payload_plan_ops.bn",
+                    "status": "pass",
+                    "plan_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "verification_status": "pass",
+                    "fixed_bytes_scalar_count": 1,
+                    "dynamic_bytes_scalar_count": 0,
+                    "byte_bank_count": 1,
+                    "root_byte_bank_count": 0,
+                    "indexed_byte_bank_count": 1,
+                    "fixed_bank_coverage": true,
+                    "no_dynamic_banks": true,
+                    "byte_banks": [
+                        {"id": 4, "state_storage_id": 0, "state_id": 0, "scope_id": 0, "indexed": true, "fixed_len": 3, "capacity": null}
+                    ]
+                }
+            ]
+        });
+        report
+    }
+
+    #[test]
+    fn bytes_byte_bank_layout_schema_rejects_tampered_bank_payloads() {
+        let report = bytes_byte_bank_layout_report();
+        assert!(schema_accepts(
+            report.clone(),
+            "bytes-byte-bank-layout-valid"
+        ));
+
+        let mut missing_bank = report.clone();
+        missing_bank["bytes_byte_bank_layout"]["cases"][0]["byte_banks"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(!schema_accepts(
+            missing_bank,
+            "bytes-byte-bank-layout-missing-bank"
+        ));
+
+        let mut forged_count = report.clone();
+        forged_count["bytes_byte_bank_layout"]["cases"][0]["byte_bank_count"] = json!(3);
+        assert!(!schema_accepts(
+            forged_count,
+            "bytes-byte-bank-layout-forged-count"
+        ));
+
+        let mut bad_fixed_len = report.clone();
+        bad_fixed_len["bytes_byte_bank_layout"]["cases"][2]["byte_banks"][0]["fixed_len"] =
+            json!(4);
+        assert!(!schema_accepts(
+            bad_fixed_len,
+            "bytes-byte-bank-layout-bad-fixed-len"
+        ));
+
+        let mut bad_indexed_flag = report;
+        bad_indexed_flag["bytes_byte_bank_layout"]["cases"][2]["byte_banks"][0]["indexed"] =
+            json!(false);
+        assert!(!schema_accepts(
+            bad_indexed_flag,
+            "bytes-byte-bank-layout-bad-indexed-flag"
+        ));
+    }
+
     fn interaction_report() -> JsonValue {
         let mut report = base_report();
         report["measurement_mode"] = json!("interaction");
@@ -5340,6 +25148,507 @@ mod tests {
         let accepted = verify_report_schema(&path).is_ok();
         let _ = fs::remove_file(path);
         accepted
+    }
+
+    #[test]
+    fn bytes_negative_schema_requires_exact_case_ids() {
+        let valid_path = temp_report_path("bytes-negative-valid");
+        write_json(&valid_path, &bytes_negative_report()).unwrap();
+        verify_report_schema(&valid_path).unwrap();
+        let _ = fs::remove_file(valid_path);
+
+        let mut missing_required = bytes_negative_report();
+        missing_required
+            .as_object_mut()
+            .unwrap()
+            .remove("required_negative_cases");
+        assert!(!schema_accepts(
+            missing_required,
+            "bytes-negative-missing-required"
+        ));
+
+        let mut truncated = bytes_negative_report();
+        truncated["negative_case_count"] = json!(expected_bytes_negative_case_ids().len() - 1);
+        truncated["required_negative_cases"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        truncated["negative_cases"].as_array_mut().unwrap().pop();
+        truncated["per_step_pass_fail"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(!schema_accepts(truncated, "bytes-negative-truncated"));
+
+        let mut forged_pass = bytes_negative_report();
+        forged_pass["per_step_pass_fail"][0]["pass"] = json!(false);
+        assert!(!schema_accepts(forged_pass, "bytes-negative-forged-pass"));
+
+        let mut duplicate = bytes_negative_report();
+        duplicate["negative_cases"][1]["id"] = duplicate["negative_cases"][0]["id"].clone();
+        assert!(!schema_accepts(duplicate, "bytes-negative-duplicate-case"));
+    }
+
+    #[test]
+    fn common_report_shape_binds_existing_command_binary_hash() {
+        let command_path = temp_report_path("command-binary-ok");
+        fs::write(&command_path, b"test command binary").unwrap();
+        assert!(command_path.is_file());
+        let mut report = base_report();
+        report["command_argv"] = json!([command_path.display().to_string()]);
+        report["binary_hash"] = json!(sha256_file(&command_path).unwrap());
+
+        verify_common_report_shape(&report, &temp_report_path("current-binary-common")).unwrap();
+        assert!(schema_accepts(report, "current-binary-hash"));
+        let _ = fs::remove_file(command_path);
+    }
+
+    #[test]
+    fn common_report_shape_rejects_stale_existing_command_binary_hash() {
+        let command_path = temp_report_path("command-binary-stale");
+        fs::write(&command_path, b"test command binary").unwrap();
+        assert!(command_path.is_file());
+        let mut report = base_report();
+        report["command_argv"] = json!([command_path.display().to_string()]);
+        report["binary_hash"] =
+            json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        assert!(
+            verify_common_report_shape(&report, &temp_report_path("stale-binary-common")).is_err()
+        );
+        assert!(!schema_accepts(report, "stale-binary-hash"));
+        let _ = fs::remove_file(command_path);
+    }
+
+    fn program_hash_for_single_source(source_path: &str, source: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(source_path.as_bytes());
+        hasher.update([0]);
+        hasher.update(b"");
+        hasher.update([0]);
+        hasher.update(1usize.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(source.as_bytes());
+        hasher.update([0]);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn compile_plan_for_source(
+        source_path: &Path,
+        source: &str,
+    ) -> (boon_plan::MachinePlan, usize) {
+        let parsed =
+            boon_parser::parse_source(source_path.display().to_string(), source.to_owned())
+                .unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        boon_ir::verify_hidden_identity(&ir).unwrap();
+        boon_ir::verify_static_schedule(&ir).unwrap();
+        let graph_node_count = ir.graph_node_count;
+        let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)
+            .unwrap();
+        (plan, graph_node_count)
+    }
+
+    fn typecheck_report_projection_for_source(source_path: &Path, source: &str) -> JsonValue {
+        let parsed =
+            boon_parser::parse_source(source_path.display().to_string(), source.to_owned())
+                .unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        json!({
+            "resolved_constant_table": ir.typecheck_report.resolved_constant_table
+        })
+    }
+
+    fn dump_plan_report_for_source(source_path: &Path, source: &str) -> JsonValue {
+        fs::write(source_path, source).unwrap();
+        let source_path_string = source_path.display().to_string();
+        let source_hash = sha256_bytes(source.as_bytes());
+        let (plan, graph_node_count) = compile_plan_for_source(source_path, source);
+        let typecheck_report = typecheck_report_projection_for_source(source_path, source);
+        let verification = boon_plan::verify_plan(&plan).unwrap();
+        let typed_lowering_executable = plan.capability_summary.typed_lowering_executable;
+        let report_status = if verification.error_count == 0 && typed_lowering_executable {
+            "pass"
+        } else {
+            "fail"
+        };
+        json!({
+            "status": report_status,
+            "report_version": 1,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "command": "dump-plan",
+            "command_argv": ["boon_cli", "dump-plan", source_path_string.clone()],
+            "measurement_mode": "diagnostic",
+            "exit_status": if verification.error_count == 0 { 0 } else { 1 },
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": source_path_string,
+            "source_hash": source_hash,
+            "source_files": [{
+                "path": source_path.display().to_string(),
+                "module": null,
+                "start_line": 1,
+                "source_hash": source_hash
+            }],
+            "scenario_hash": "n/a",
+            "program_hash": program_hash_for_single_source(&source_path.display().to_string(), source),
+            "budget_hash": "n/a",
+            "graph_node_count": graph_node_count,
+            "target_profile": "software_default",
+            "plan_version": plan.version,
+            "plan_hash": verification.plan_hash,
+            "capability_summary": plan.capability_summary,
+            "verification": verification,
+            "typecheck_report": typecheck_report,
+            "per_step_pass_fail": [
+                {"id": "machine-plan-constructed", "pass": true},
+                {"id": "machine-plan-verified", "pass": true},
+                {
+                    "id": "machine-plan-typed-lowering-executable",
+                    "pass": typed_lowering_executable
+                },
+                {"id": "legacy-runtime-default-preserved", "pass": true}
+            ],
+            "artifact_sha256s": [],
+            "machine_plan": plan
+        })
+    }
+
+    fn run_plan_report_for_source(source_path: &Path, source: &str) -> JsonValue {
+        fs::write(source_path, source).unwrap();
+        let source_path_string = source_path.display().to_string();
+        let source_hash = sha256_bytes(source.as_bytes());
+        let (plan, graph_node_count) = compile_plan_for_source(source_path, source);
+        let plan_hash = boon_plan::plan_sha256(&plan).unwrap();
+        let state_summary = expected_initial_state_summary(&plan, source_path).unwrap();
+        let list_state = expected_initial_list_state(&plan, source_path).unwrap();
+        let list_summary = expected_list_summary(&plan, &list_state);
+        let root_state = state_summary.as_object().unwrap();
+        let retain_execution =
+            expected_materialize_plan_list_retains(&plan, root_state, &list_state, source_path)
+                .unwrap();
+        let plan_executor = json!({
+            "executor": "cpu-plan-initial-state-v1",
+            "initialized_state_count": plan.storage_layout.scalar_slots.len(),
+            "source_route_metadata_count": plan.source_routes.len(),
+            "list_slot_count": plan.storage_layout.list_slots.len(),
+            "list_summary": list_summary,
+            "executed_list_retain_count": retain_execution.executed_count,
+            "executed_list_view_count": retain_execution.view_count,
+            "retained_list_row_count": retain_execution.retained_row_count,
+            "list_view_summary": retain_execution.summary,
+            "list_retains": retain_execution.reports,
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": plan.capability_summary.executable_string_path_count,
+            "unknown_plan_op_count": plan.capability_summary.unknown_plan_op_count,
+            "graph_rebuild_count": plan.capability_summary.graph_rebuild_count,
+            "graph_clones_per_item": plan.capability_summary.graph_clones_per_item,
+            "state_summary": state_summary
+        });
+        json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "run-plan",
+            "command_argv": ["boon_cli", "run-plan", source_path_string],
+            "measurement_mode": "proof",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": source_path.display().to_string(),
+            "source_hash": source_hash,
+            "source_files": [source_path.display().to_string()],
+            "scenario_hash": "n/a",
+            "program_hash": source_hash,
+            "program_kind": "generic",
+            "program_file_count": 1,
+            "budget_hash": "n/a",
+            "graph_node_count": graph_node_count,
+            "target_profile": "software_default",
+            "plan_hash": plan_hash,
+            "plan_version": plan.version,
+            "capability_summary": plan.capability_summary,
+            "state_summary": state_summary,
+            "per_step_pass_fail": [
+                {"id": "machine-plan-verified", "pass": true},
+                {"id": "cpu-plan-executor-initial-state", "pass": true},
+                {"id": "legacy-runtime-not-used", "pass": true}
+            ],
+            "artifact_sha256s": [],
+            "plan_executor": plan_executor
+        })
+    }
+
+    fn run_plan_route_report_for_source(
+        source_path: &Path,
+        source: &str,
+        source_route: &str,
+        target_state: &str,
+        text_payload: Option<&str>,
+    ) -> JsonValue {
+        fs::write(source_path, source).unwrap();
+        let source_path_string = source_path.display().to_string();
+        let source_hash = sha256_bytes(source.as_bytes());
+        let (plan, graph_node_count) = compile_plan_for_source(source_path, source);
+        let plan_hash = boon_plan::plan_sha256(&plan).unwrap();
+        let source_event = json!({
+            "source": source_route,
+            "source_id": plan_source_id_for_label(&plan, source_route).unwrap(),
+            "text": text_payload,
+            "key": null,
+            "list_id": null,
+            "address": null,
+            "target_text": null,
+            "target_occurrence": null,
+            "target_key": null,
+            "target_generation": null,
+            "bind_epoch": null,
+            "source_epoch": null,
+            "payload": {},
+            "pointer_x": null,
+            "pointer_y": null,
+            "pointer_width": null,
+            "pointer_height": null
+        });
+        let source_event_object = source_event.as_object().unwrap();
+        let expected = expected_route_execution(
+            &plan,
+            source_route,
+            target_state,
+            source_event_object,
+            source_path,
+        )
+        .unwrap();
+        let expected_value = expected.expected_value.clone();
+        let state_summary = json!({ target_state: expected_value.clone() });
+        let signatures = expected.semantic_delta_signatures.clone();
+        let route_surface = json!({
+            "source": source_route,
+            "source_id": expected.source_id,
+            "target_state": target_state,
+            "target_state_id": expected.target_state_id,
+            "update_op_id": expected.update_op_id,
+            "expression_kind": expected.expression_kind,
+            "source_payload_field": expected.source_payload_field,
+            "update_constant_id": expected.update_constant_id,
+            "update_constant_value": expected.update_constant_value,
+            "payload_schema": expected.payload_schema,
+            "global_plan_executable": plan.capability_summary.executable,
+            "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
+            "global_cpu_plan_executor_complete": plan.capability_summary.cpu_plan_executor_complete,
+            "global_unresolved_executable_ref_count": plan.capability_summary.unresolved_executable_ref_count,
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "graph_rebuild_count": 0,
+            "graph_clones_per_item": 0,
+            "selected_op_unresolved_executable_ref_count": 0,
+            "selected_op_indexed": false
+        });
+        let semantic_deltas = expected.semantic_deltas.clone();
+        let legacy_comparison = json!({
+            "enabled": true,
+            "passed": true,
+            "state_match": true,
+            "semantic_delta_match": true,
+            "target_state": target_state,
+            "legacy_value": expected_value,
+            "plan_value": expected_value,
+            "legacy_semantic_delta_signatures": signatures,
+            "legacy_semantic_deltas": semantic_deltas,
+            "plan_semantic_delta_signatures": signatures,
+            "plan_semantic_deltas": semantic_deltas,
+            "legacy_render_patch_kinds": ["PatchRootField"],
+            "legacy_semantic_delta_count": semantic_deltas.as_array().map(Vec::len).unwrap_or_default(),
+            "legacy_render_patch_count": 1
+        });
+        let plan_executor = json!({
+            "executor": "cpu-plan-source-route-v1",
+            "source": source_route,
+            "source_id": expected.source_id,
+            "target_state": target_state,
+            "target_state_id": expected.target_state_id,
+            "update_op_id": expected.update_op_id,
+            "expression_kind": expected.expression_kind,
+            "source_payload_field": route_surface["source_payload_field"].clone(),
+            "update_constant_id": route_surface["update_constant_id"].clone(),
+            "update_constant_value": route_surface["update_constant_value"].clone(),
+            "executed_update_branch_count": expected.executed_update_branch_count,
+            "executed_derived_value_count": expected.executed_derived_value_count,
+            "executed_list_append_count": expected.executed_list_append_count,
+            "executed_list_remove_count": expected.executed_list_remove_count,
+            "executed_indexed_update_count": expected.executed_indexed_update_count,
+            "emitted_source_bind_count": expected.emitted_source_bind_count,
+            "emitted_source_unbind_count": expected.emitted_source_unbind_count,
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "graph_rebuild_count": 0,
+            "graph_clones_per_item": 0,
+            "state_summary": state_summary,
+            "full_state_summary": expected.full_state_summary,
+            "semantic_delta_signatures": signatures,
+            "semantic_deltas": semantic_deltas,
+            "per_step": expected.per_step
+        });
+        json!({
+            "status": "pass",
+            "report_version": 1,
+            "command": "run-plan-route",
+            "command_argv": ["boon_cli", "run-plan-route", source_path_string],
+            "measurement_mode": "proof",
+            "exit_status": 0,
+            "generated_at_utc": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            "git_commit": "test",
+            "binary_hash": "test",
+            "source_path": source_path.display().to_string(),
+            "source_hash": source_hash,
+            "source_files": [source_path.display().to_string()],
+            "scenario_hash": "n/a",
+            "program_hash": source_hash,
+            "program_kind": "generic",
+            "program_file_count": 1,
+            "budget_hash": "n/a",
+            "graph_node_count": graph_node_count,
+            "target_profile": "software_default",
+            "plan_hash": plan_hash,
+            "plan_version": plan.version,
+            "capability_summary": plan.capability_summary,
+            "route_surface": route_surface,
+            "source_event": source_event,
+            "state_summary": state_summary,
+            "semantic_delta_signatures": signatures,
+            "semantic_deltas": semantic_deltas,
+            "legacy_comparison": legacy_comparison,
+            "per_step_pass_fail": [
+                {"id": "machine-plan-verified", "pass": true},
+                {"id": "cpu-plan-route-surface-executable", "pass": true},
+                {"id": "cpu-plan-source-route-executed", "pass": true},
+                {"id": "legacy-route-parity", "pass": true}
+            ],
+            "artifact_sha256s": [],
+            "plan_executor": plan_executor
+        })
+    }
+
+    fn run_plan_root_scalar_scenario_report_for_source(
+        source_path: &Path,
+        source: &str,
+        scenario_path: &Path,
+        scenario_text: &str,
+        selected_step_ids: Vec<String>,
+    ) -> JsonValue {
+        fs::write(source_path, source).unwrap();
+        fs::write(scenario_path, scenario_text).unwrap();
+        let source_path_string = source_path.display().to_string();
+        let source_hash = sha256_bytes(source.as_bytes());
+        let scenario_hash = sha256_bytes(scenario_text.as_bytes());
+        let (plan, graph_node_count) = compile_plan_for_source(source_path, source);
+        let plan_hash = boon_plan::plan_sha256(&plan).unwrap();
+        let scenario = parse_scenario(scenario_path).unwrap();
+        let expected = expected_root_scalar_scenario_execution(
+            &plan,
+            &scenario,
+            &selected_step_ids,
+            scenario_path,
+        )
+        .unwrap();
+        let expected_steps = expected.per_step.as_array().unwrap();
+        let legacy_steps = expected_steps
+            .iter()
+            .map(|step| {
+                json!({
+                    "step_id": step["step_id"],
+                    "state_match": true,
+                    "semantic_delta_match": true,
+                    "legacy_semantic_delta_signatures": step["semantic_delta_signatures"],
+                    "legacy_semantic_deltas": step["semantic_deltas"],
+                    "plan_semantic_delta_signatures": step["semantic_delta_signatures"],
+                    "plan_semantic_deltas": step["semantic_deltas"],
+                    "touched_state_summary": step["touched_state_summary"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let legacy_comparison = json!({
+            "enabled": true,
+            "passed": true,
+            "state_match": true,
+            "semantic_delta_match": true,
+            "plan_state_summary": expected.state_summary,
+            "legacy_state_summary": expected.state_summary,
+            "step_comparisons": legacy_steps,
+        });
+        let plan_executor = json!({
+            "executor": "cpu-plan-root-list-scenario-v1",
+            "selected_step_count": expected_steps.len(),
+            "initialized_root_state_count": expected.initialized_root_state_count,
+            "executed_update_branch_count": expected.executed_update_branch_count,
+            "executed_derived_value_count": expected.executed_derived_value_count,
+            "executed_list_append_count": expected.executed_list_append_count,
+            "executed_list_remove_count": expected.executed_list_remove_count,
+            "executed_indexed_update_count": expected.executed_indexed_update_count,
+            "executed_list_retain_count": expected.executed_list_retain_count,
+            "executed_list_view_count": expected.executed_list_view_count,
+            "retained_list_row_count": expected.retained_list_row_count,
+            "emitted_source_bind_count": expected.emitted_source_bind_count,
+            "emitted_source_unbind_count": expected.emitted_source_unbind_count,
+            "list_slot_count": plan.storage_layout.list_slots.len(),
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "graph_rebuild_count": 0,
+            "graph_clones_per_item": 0,
+            "state_summary": expected.state_summary,
+            "list_summary": expected.list_summary,
+            "list_view_summary": expected.list_view_summary,
+            "list_retains": expected.list_retains,
+            "semantic_delta_signatures": expected.semantic_delta_signatures,
+            "per_step": expected.per_step
+        });
+        let mut report = base_report();
+        report["command"] = json!("run-plan-root-scalar-scenario");
+        report["command_argv"] = json!([
+            "boon_cli",
+            "run-plan-root-scalar-scenario",
+            source_path_string
+        ]);
+        report["source_path"] = json!(source_path.display().to_string());
+        report["source_hash"] = json!(source_hash);
+        report["source_files"] = json!([source_path.display().to_string()]);
+        report["scenario_path"] = json!(scenario_path.display().to_string());
+        report["scenario_hash"] = json!(scenario_hash);
+        report["program_hash"] = report["source_hash"].clone();
+        report["program_kind"] = json!("generic");
+        report["program_file_count"] = json!(1);
+        report["graph_node_count"] = json!(graph_node_count);
+        report["target_profile"] = json!("software_default");
+        report["plan_hash"] = json!(plan_hash);
+        report["plan_version"] = json!(plan.version);
+        report["capability_summary"] = json!(plan.capability_summary);
+        report["selected_step_ids"] = json!(selected_step_ids);
+        report["state_summary"] = plan_executor["state_summary"].clone();
+        report["semantic_delta_signatures"] = plan_executor["semantic_delta_signatures"].clone();
+        report["semantic_deltas"] = expected.semantic_deltas;
+        report["legacy_comparison"] = legacy_comparison;
+        report["per_step_pass_fail"] = json!([
+            {"id": "machine-plan-verified", "pass": true},
+            {"id": "cpu-plan-root-list-scenario-executed", "pass": true},
+            {"id": "legacy-root-scenario-parity", "pass": true}
+        ]);
+        report["plan_executor"] = plan_executor;
+        report
     }
 
     #[test]
@@ -5407,6 +25716,2485 @@ mod tests {
         bench["measurement_mode"] = json!("interaction");
         bench["command"] = json!("bench-example");
         assert!(!schema_accepts(bench, "bench-interaction"));
+    }
+
+    #[test]
+    fn dump_plan_diagnostics_may_fail_with_executable_step() {
+        let source_path = temp_report_path("dump-plan-source");
+        let large_bytes = std::iter::repeat_n("16u00", 1025)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "source: SOURCE\npayload:\n    BYTES[1025] {{ {large_bytes} }} |> HOLD payload {{ LATEST {{}} }}\n"
+        );
+        let accepted_report = dump_plan_report_for_source(&source_path, &source);
+        assert_eq!(accepted_report["status"], "fail");
+        assert!(schema_accepts(accepted_report.clone(), "dump-plan-fail"));
+
+        let mut report = accepted_report.clone();
+        report["per_step_pass_fail"] = json!([
+            {"id": "machine-plan-constructed", "pass": true},
+            {"id": "machine-plan-executable", "pass": true}
+        ]);
+        assert!(!schema_accepts(report, "dump-plan-no-failing-step"));
+
+        let mut stale_hash = accepted_report.clone();
+        let forged_hash = "b".repeat(64);
+        stale_hash["plan_hash"] = json!(forged_hash);
+        stale_hash["verification"]["plan_hash"] = json!(forged_hash);
+        assert!(!schema_accepts(stale_hash, "dump-plan-stale-plan-hash"));
+
+        let mut tampered_verification = accepted_report.clone();
+        tampered_verification["verification"]["checks"][0]["pass"] = json!(false);
+        assert!(!schema_accepts(
+            tampered_verification,
+            "dump-plan-tampered-verification"
+        ));
+
+        let mut missing_typecheck_report = accepted_report.clone();
+        missing_typecheck_report
+            .as_object_mut()
+            .unwrap()
+            .remove("typecheck_report");
+        assert!(!schema_accepts(
+            missing_typecheck_report,
+            "dump-plan-missing-typecheck-report"
+        ));
+
+        let mut tampered_resolved_constants = accepted_report.clone();
+        tampered_resolved_constants["typecheck_report"]["resolved_constant_table"]["entries"] =
+            json!([]);
+        assert!(!schema_accepts(
+            tampered_resolved_constants,
+            "dump-plan-tampered-resolved-constants"
+        ));
+
+        let second_source_path = temp_report_path("dump-plan-second-source");
+        let second_report = dump_plan_report_for_source(
+            &second_source_path,
+            "source: SOURCE\npayload:\n    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }\n",
+        );
+        let mut cross_source_machine_plan = accepted_report.clone();
+        cross_source_machine_plan["status"] = json!("pass");
+        cross_source_machine_plan["machine_plan"] = second_report["machine_plan"].clone();
+        cross_source_machine_plan["capability_summary"] =
+            second_report["capability_summary"].clone();
+        cross_source_machine_plan["plan_hash"] = second_report["plan_hash"].clone();
+        cross_source_machine_plan["verification"] = second_report["verification"].clone();
+        cross_source_machine_plan["per_step_pass_fail"] = json!([
+            {"id": "machine-plan-constructed", "pass": true},
+            {"id": "machine-plan-verified", "pass": true},
+            {"id": "machine-plan-typed-lowering-executable", "pass": true},
+            {"id": "legacy-runtime-default-preserved", "pass": true}
+        ]);
+        assert!(!schema_accepts(
+            cross_source_machine_plan,
+            "dump-plan-cross-source-machine-plan"
+        ));
+
+        let mut extra_machine_plan_field = accepted_report;
+        extra_machine_plan_field["machine_plan"]["unexpected"] = json!(true);
+        assert!(!schema_accepts(
+            extra_machine_plan_field,
+            "dump-plan-extra-machine-plan-field"
+        ));
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(second_source_path);
+    }
+
+    #[test]
+    fn run_plan_reports_bind_plan_hash_capabilities_and_state_to_source() {
+        let source_path = temp_report_path("run-plan-source");
+        let accepted_report = run_plan_report_for_source(
+            &source_path,
+            "source: SOURCE\npayload:\n    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }\n",
+        );
+        assert!(schema_accepts(accepted_report.clone(), "run-plan-pass"));
+
+        let mut forged_hash = accepted_report.clone();
+        forged_hash["plan_hash"] = json!("b".repeat(64));
+        assert!(!schema_accepts(forged_hash, "run-plan-forged-hash"));
+
+        let mut forged_capability = accepted_report.clone();
+        forged_capability["capability_summary"]["executable"] = json!(false);
+        assert!(!schema_accepts(
+            forged_capability,
+            "run-plan-forged-capability"
+        ));
+
+        let mut forged_state = accepted_report.clone();
+        forged_state["state_summary"]["payload"]["byte_len"] = json!(5);
+        assert!(!schema_accepts(forged_state, "run-plan-forged-state"));
+
+        let _ = fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn run_plan_route_reports_bind_source_payload_and_const_branches() {
+        let source_path = temp_report_path("run-plan-route-source");
+        let source = include_str!("../../../examples/todomvc.bn");
+
+        let source_payload_report = run_plan_route_report_for_source(
+            &source_path,
+            source,
+            "store.sources.new_todo_input.change",
+            "store.new_todo_text",
+            Some("Test todo"),
+        );
+        assert!(schema_accepts(
+            source_payload_report.clone(),
+            "run-plan-route-source-payload"
+        ));
+
+        let mut forged_source_payload = source_payload_report.clone();
+        forged_source_payload["route_surface"]["source_payload_field"] = json!("Key");
+        assert!(!schema_accepts(
+            forged_source_payload,
+            "run-plan-route-forged-source-payload-field"
+        ));
+
+        let mut forged_top_level_delta = source_payload_report.clone();
+        forged_top_level_delta["semantic_deltas"][0]["value"] = json!("Forged todo");
+        assert!(!schema_accepts(
+            forged_top_level_delta,
+            "run-plan-route-forged-top-level-delta"
+        ));
+
+        let mut forged_executor_delta = source_payload_report.clone();
+        forged_executor_delta["plan_executor"]["semantic_deltas"][0]["source_id"] = json!(999);
+        assert!(!schema_accepts(
+            forged_executor_delta,
+            "run-plan-route-forged-executor-delta"
+        ));
+
+        let mut extra_legacy_signature = source_payload_report.clone();
+        extra_legacy_signature["legacy_comparison"]["legacy_semantic_delta_signatures"] =
+            json!(["FieldSet:store.new_todo_text", "FieldSet:forged"]);
+        assert!(!schema_accepts(
+            extra_legacy_signature,
+            "run-plan-route-extra-legacy-signature"
+        ));
+
+        let mut missing_legacy_deltas = source_payload_report.clone();
+        missing_legacy_deltas["legacy_comparison"]
+            .as_object_mut()
+            .unwrap()
+            .remove("legacy_semantic_deltas");
+        assert!(!schema_accepts(
+            missing_legacy_deltas,
+            "run-plan-route-missing-legacy-deltas"
+        ));
+
+        let const_report = run_plan_route_report_for_source(
+            &source_path,
+            source,
+            "store.sources.filter_active.press",
+            "store.selected_filter",
+            None,
+        );
+        assert!(schema_accepts(const_report.clone(), "run-plan-route-const"));
+
+        let mut forged_const = const_report.clone();
+        forged_const["route_surface"]["update_constant_value"] = json!("Completed");
+        assert!(!schema_accepts(
+            forged_const,
+            "run-plan-route-forged-const-value"
+        ));
+
+        let _ = fs::remove_file(source_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_binds_steps_and_rejects_tamper() {
+        let source_path = temp_report_path("run-plan-root-scalar-source");
+        let scenario_path = temp_report_path("run-plan-root-scalar-scenario");
+        let plan_slice_scenario_path = temp_report_path("run-plan-root-plan-slices-scenario");
+        let source = include_str!("../../../examples/todomvc.bn");
+        let scenario = include_str!("../../../examples/todomvc.scn");
+        let plan_slice_scenario = include_str!("../../../examples/todomvc_plan_slices.scn");
+        let accepted_report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            scenario,
+            vec![
+                "add-test-todo-type".to_owned(),
+                "filter-active".to_owned(),
+                "filter-completed".to_owned(),
+                "filter-all".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            accepted_report.clone(),
+            "run-plan-root-scalar-scenario"
+        ));
+
+        let mut reordered_steps = accepted_report.clone();
+        reordered_steps["selected_step_ids"] = json!([
+            "filter-active",
+            "add-test-todo-type",
+            "filter-completed",
+            "filter-all"
+        ]);
+        assert!(!schema_accepts(
+            reordered_steps,
+            "run-plan-root-scalar-reordered-steps"
+        ));
+
+        let mut forged_const = accepted_report.clone();
+        forged_const["plan_executor"]["per_step"][1]["updates"][0]["update_constant_value"] =
+            json!("Completed");
+        assert!(!schema_accepts(
+            forged_const,
+            "run-plan-root-scalar-forged-const"
+        ));
+
+        let mut forged_semantic_delta = accepted_report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"] = json!("FORGED");
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-scalar-forged-semantic-delta"
+        ));
+
+        let mut forged_legacy_delta = accepted_report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_delta_signatures"] =
+            json!(["FieldSet:store.new_todo_text", "Forged:extra"]);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-scalar-forged-legacy-delta"
+        ));
+
+        let mut missing_legacy = accepted_report.clone();
+        missing_legacy["legacy_comparison"]["enabled"] = json!(false);
+        assert!(!schema_accepts(
+            missing_legacy,
+            "run-plan-root-scalar-missing-legacy"
+        ));
+
+        let submit_report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            scenario,
+            vec![
+                "add-test-todo-type".to_owned(),
+                "add-test-todo-submit".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            submit_report.clone(),
+            "run-plan-root-list-submit-scenario"
+        ));
+
+        let mut missing_prerequisite = submit_report.clone();
+        missing_prerequisite["selected_step_ids"] = json!(["add-test-todo-submit"]);
+        assert!(!schema_accepts(
+            missing_prerequisite,
+            "run-plan-root-list-submit-missing-prerequisite"
+        ));
+
+        let mut forged_derived = submit_report.clone();
+        forged_derived["plan_executor"]["per_step"][1]["derived"][0]["value"] = json!("FORGED");
+        assert!(!schema_accepts(
+            forged_derived,
+            "run-plan-root-list-forged-derived"
+        ));
+
+        let mut forged_list_key = submit_report.clone();
+        forged_list_key["plan_executor"]["per_step"][1]["list_appends"][0]["key"] = json!(6);
+        assert!(!schema_accepts(
+            forged_list_key,
+            "run-plan-root-list-forged-list-key"
+        ));
+
+        let mut forged_list_summary = submit_report.clone();
+        forged_list_summary["plan_executor"]["list_summary"]["todos"]["row_count"] = json!(4);
+        assert!(!schema_accepts(
+            forged_list_summary,
+            "run-plan-root-list-forged-list-summary"
+        ));
+
+        let mut forged_source_bind = submit_report.clone();
+        forged_source_bind["semantic_deltas"][3]["source_id"] = json!(999);
+        assert!(!schema_accepts(
+            forged_source_bind,
+            "run-plan-root-list-forged-source-bind-id"
+        ));
+
+        let mut forged_candidate_ids = submit_report.clone();
+        forged_candidate_ids["plan_executor"]["per_step"][1]["updates"][0]["candidate_update_op_ids"] =
+            json!([32]);
+        assert!(!schema_accepts(
+            forged_candidate_ids,
+            "run-plan-root-list-forged-candidate-update-ids"
+        ));
+
+        let toggle_report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            scenario,
+            vec![
+                "add-test-todo-type".to_owned(),
+                "add-test-todo-submit".to_owned(),
+                "filter-active".to_owned(),
+                "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            toggle_report.clone(),
+            "run-plan-root-list-scoped-toggle-scenario"
+        ));
+
+        let mut toggle_missing_submit = toggle_report.clone();
+        toggle_missing_submit["selected_step_ids"] = json!([
+            "add-test-todo-type",
+            "filter-active",
+            "toggle-dynamic-test-todo-under-active-filter"
+        ]);
+        assert!(!schema_accepts(
+            toggle_missing_submit,
+            "run-plan-root-list-toggle-missing-submit"
+        ));
+
+        let mut forged_indexed_key = toggle_report.clone();
+        forged_indexed_key["plan_executor"]["per_step"][3]["indexed_updates"][0]["key"] = json!(4);
+        assert!(!schema_accepts(
+            forged_indexed_key,
+            "run-plan-root-list-toggle-forged-key"
+        ));
+
+        let mut forged_binding = toggle_report.clone();
+        forged_binding["plan_executor"]["per_step"][3]["indexed_updates"][0]["source_binding_id"] =
+            json!(999);
+        assert!(!schema_accepts(
+            forged_binding,
+            "run-plan-root-list-toggle-forged-source-binding"
+        ));
+
+        let mut forged_resolution = toggle_report.clone();
+        forged_resolution["plan_executor"]["per_step"][3]["indexed_updates"][0]["row_resolution"]
+            ["target_text"] = json!("Buy groceries");
+        assert!(!schema_accepts(
+            forged_resolution,
+            "run-plan-root-list-toggle-forged-row-resolution"
+        ));
+
+        let mut forged_toggle_value = toggle_report.clone();
+        forged_toggle_value["plan_executor"]["per_step"][3]["indexed_updates"][0]["value"] =
+            json!(false);
+        assert!(!schema_accepts(
+            forged_toggle_value,
+            "run-plan-root-list-toggle-forged-value"
+        ));
+
+        let mut forged_row_derived = toggle_report.clone();
+        forged_row_derived["plan_executor"]["per_step"][3]["indexed_updates"][0]["row_fields"]["not_completed"] =
+            json!(true);
+        assert!(!schema_accepts(
+            forged_row_derived,
+            "run-plan-root-list-toggle-forged-row-derived"
+        ));
+
+        let mut forged_toggle_delta = toggle_report.clone();
+        let final_delta_index = forged_toggle_delta["semantic_deltas"]
+            .as_array()
+            .expect("toggle report has semantic deltas")
+            .len()
+            - 1;
+        forged_toggle_delta["semantic_deltas"][final_delta_index]["value"] = json!(true);
+        assert!(!schema_accepts(
+            forged_toggle_delta,
+            "run-plan-root-list-toggle-forged-semantic-delta"
+        ));
+
+        let mut forged_toggle_count = toggle_report.clone();
+        forged_toggle_count["plan_executor"]["executed_indexed_update_count"] = json!(0);
+        assert!(!schema_accepts(
+            forged_toggle_count,
+            "run-plan-root-list-toggle-forged-indexed-count"
+        ));
+
+        let mut forged_toggle_summary = toggle_report.clone();
+        forged_toggle_summary["plan_executor"]["list_summary"]["todos"]["completed_count"] =
+            json!(1);
+        assert!(!schema_accepts(
+            forged_toggle_summary,
+            "run-plan-root-list-toggle-forged-summary"
+        ));
+
+        let mut forged_retain_count = toggle_report.clone();
+        forged_retain_count["plan_executor"]["retained_list_row_count"] = json!(17);
+        assert!(!schema_accepts(
+            forged_retain_count,
+            "run-plan-root-list-toggle-forged-retain-count"
+        ));
+
+        let mut forged_retain_key = toggle_report.clone();
+        forged_retain_key["plan_executor"]["list_view_summary"]["store.visible_todos"]["rows"][0]
+            ["key"] = json!(99);
+        assert!(!schema_accepts(
+            forged_retain_key,
+            "run-plan-root-list-toggle-forged-retain-key"
+        ));
+
+        let mut forged_retain_predicate = toggle_report.clone();
+        forged_retain_predicate["plan_executor"]["list_retains"][0]["predicate"]["selector_value"] =
+            json!("Completed");
+        assert!(!schema_accepts(
+            forged_retain_predicate,
+            "run-plan-root-list-toggle-forged-retain-predicate"
+        ));
+
+        let delete_report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &plan_slice_scenario_path,
+            plan_slice_scenario,
+            vec![
+                "add-test-todo-type".to_owned(),
+                "add-test-todo-submit".to_owned(),
+                "delete-dynamic-test-todo".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            delete_report.clone(),
+            "run-plan-root-list-dynamic-delete-scenario"
+        ));
+
+        let delete_step_index = 2usize;
+        let mut forged_delete_key = delete_report.clone();
+        forged_delete_key["plan_executor"]["per_step"][delete_step_index]["list_removes"][0]["key"] =
+            json!(4);
+        assert!(!schema_accepts(
+            forged_delete_key,
+            "run-plan-root-list-dynamic-delete-forged-key"
+        ));
+
+        let mut forged_delete_binding = delete_report.clone();
+        forged_delete_binding["plan_executor"]["per_step"][delete_step_index]["list_removes"][0]
+            ["source_binding_id"] = json!(999);
+        assert!(!schema_accepts(
+            forged_delete_binding,
+            "run-plan-root-list-dynamic-delete-forged-source-binding"
+        ));
+
+        let mut forged_delete_resolution = delete_report.clone();
+        forged_delete_resolution["plan_executor"]["per_step"][delete_step_index]["list_removes"]
+            [0]["row_resolution"]["target_key"] = json!(4);
+        assert!(!schema_accepts(
+            forged_delete_resolution,
+            "run-plan-root-list-dynamic-delete-forged-row-resolution"
+        ));
+
+        let mut forged_unbind = delete_report.clone();
+        forged_unbind["plan_executor"]["per_step"][delete_step_index]["list_removes"][0]["source_unbinds"]
+            [0]["source_id"] = json!(999);
+        assert!(!schema_accepts(
+            forged_unbind,
+            "run-plan-root-list-dynamic-delete-forged-unbind"
+        ));
+
+        let mut forged_delete_delta = delete_report.clone();
+        let first_delete_delta_index = delete_report["semantic_deltas"]
+            .as_array()
+            .expect("dynamic delete report has semantic deltas")
+            .iter()
+            .position(|delta| delta["kind"].as_str() == Some("SourceUnbind"))
+            .expect("dynamic delete should emit source unbind deltas");
+        forged_delete_delta["semantic_deltas"][first_delete_delta_index]["source_id"] = json!(999);
+        assert!(!schema_accepts(
+            forged_delete_delta,
+            "run-plan-root-list-dynamic-delete-forged-semantic-delta"
+        ));
+
+        let mut forged_delete_count = delete_report.clone();
+        forged_delete_count["plan_executor"]["executed_list_remove_count"] = json!(0);
+        assert!(!schema_accepts(
+            forged_delete_count,
+            "run-plan-root-list-dynamic-delete-forged-remove-count"
+        ));
+
+        let mut forged_unbind_count = delete_report.clone();
+        forged_unbind_count["plan_executor"]["emitted_source_unbind_count"] = json!(0);
+        assert!(!schema_accepts(
+            forged_unbind_count,
+            "run-plan-root-list-dynamic-delete-forged-unbind-count"
+        ));
+
+        let mut forged_delete_summary = delete_report.clone();
+        forged_delete_summary["plan_executor"]["list_summary"]["todos"]["row_count"] = json!(5);
+        assert!(!schema_accepts(
+            forged_delete_summary,
+            "run-plan-root-list-dynamic-delete-forged-summary"
+        ));
+
+        let clear_report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            scenario,
+            vec!["clear-completed".to_owned()],
+        );
+        assert!(schema_accepts(
+            clear_report.clone(),
+            "run-plan-root-list-clear-completed-scenario"
+        ));
+
+        let mut forged_clear_derived = clear_report.clone();
+        forged_clear_derived["plan_executor"]["per_step"][0]["derived"][0]["value"] = json!(true);
+        assert!(!schema_accepts(
+            forged_clear_derived,
+            "run-plan-root-list-clear-completed-forged-derived"
+        ));
+
+        let mut forged_clear_delta = clear_report.clone();
+        let final_clear_delta_index = forged_clear_delta["semantic_deltas"]
+            .as_array()
+            .expect("clear report has semantic deltas")
+            .len()
+            - 1;
+        forged_clear_delta["semantic_deltas"][final_clear_delta_index]["value"] = json!(true);
+        assert!(!schema_accepts(
+            forged_clear_delta,
+            "run-plan-root-list-clear-completed-forged-semantic-delta"
+        ));
+
+        let mut forged_clear_count = clear_report.clone();
+        forged_clear_count["plan_executor"]["executed_derived_value_count"] = json!(0);
+        assert!(!schema_accepts(
+            forged_clear_count,
+            "run-plan-root-list-clear-completed-forged-derived-count"
+        ));
+
+        let mut forged_clear_summary = clear_report.clone();
+        forged_clear_summary["plan_executor"]["list_summary"]["todos"]["completed_count"] =
+            json!(1);
+        assert!(!schema_accepts(
+            forged_clear_summary,
+            "run-plan-root-list-clear-completed-forged-summary"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+        let _ = fs::remove_file(plan_slice_scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_typed_root_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-exprs-source");
+        let scenario_path = temp_report_path("run-plan-root-exprs-scenario");
+        let source = r#"
+store: [
+    toggle: SOURCE
+    input: [change: SOURCE]
+    source_text:
+        TEXT { Seed } |> HOLD source_text { LATEST {} }
+    flag:
+        False |> HOLD flag {
+            LATEST {
+                store.toggle |> THEN { store.flag |> Bool/not() }
+            }
+        }
+    mirrored:
+        TEXT { old } |> HOLD mirrored {
+            LATEST {
+                store.toggle |> THEN { store.source_text }
+            }
+        }
+    copied:
+        TEXT { old } |> HOLD copied {
+            LATEST {
+                store.input.change.text |> THEN { store.input.change.text }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "root scalar expressions"
+source = "{}"
+
+[[step]]
+id = "toggle"
+expected_source_event = {{ source = "store.toggle" }}
+
+[[step]]
+id = "copy"
+expected_source_event = {{ source = "store.input.change", text = "Typed payload" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["toggle".to_owned(), "copy".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-typed-expression-kinds"
+        ));
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(3)
+        );
+        assert_eq!(report["state_summary"]["store.flag"], json!(true));
+        assert_eq!(report["state_summary"]["store.mirrored"], json!("Seed"));
+        assert_eq!(
+            report["state_summary"]["store.copied"],
+            json!("Typed payload")
+        );
+        assert_eq!(
+            report["plan_executor"]["per_step"][1]["updates"][0]["source_payload_field"],
+            json!("Text")
+        );
+
+        let mut forged_payload_field = report.clone();
+        forged_payload_field["plan_executor"]["per_step"][1]["updates"][0]["source_payload_field"] =
+            JsonValue::Null;
+        assert!(!schema_accepts(
+            forged_payload_field,
+            "run-plan-root-typed-expression-forged-payload-field"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_length_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-length-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-length-scenario");
+        let source = r#"
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    byte_len:
+        0 |> HOLD byte_len {
+            LATEST {
+                store.measure |> THEN { payload |> Bytes/length }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes length root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-length-expression-kind"
+        ));
+        assert_eq!(report["state_summary"]["store.byte_len"], json!(4));
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"],
+            json!("bytes_length")
+        );
+
+        let mut forged_value = report.clone();
+        forged_value["plan_executor"]["per_step"][0]["updates"][0]["value"] = json!(5);
+        assert!(!schema_accepts(
+            forged_value,
+            "run-plan-root-bytes-length-forged-value"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"] = json!(5);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-length-forged-legacy-delta-value"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_is_empty_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-is-empty-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-is-empty-scenario");
+        let source = r#"
+empty_payload:
+    BYTES {} |> HOLD empty_payload { LATEST {} }
+
+filled_payload:
+    BYTES[1] { 16u01 } |> HOLD filled_payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    empty_is_empty:
+        False |> HOLD empty_is_empty {
+            LATEST {
+                store.measure |> THEN { empty_payload |> Bytes/is_empty }
+            }
+        }
+    filled_is_empty:
+        True |> HOLD filled_is_empty {
+            LATEST {
+                store.measure |> THEN { filled_payload |> Bytes/is_empty }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes is empty root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-is-empty-expression-kind"
+        ));
+        assert_eq!(report["state_summary"]["store.empty_is_empty"], json!(true));
+        assert_eq!(
+            report["state_summary"]["store.filled_is_empty"],
+            json!(false)
+        );
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(2)
+        );
+
+        let updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("test fixture should expose step updates");
+        let update_index_for = |target: &str| {
+            updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        let empty_index = update_index_for("store.empty_is_empty");
+        let filled_index = update_index_for("store.filled_is_empty");
+        assert_eq!(
+            updates[empty_index]["expression_kind"],
+            json!("bytes_is_empty")
+        );
+        assert_eq!(updates[empty_index]["value"], json!(true));
+        assert_eq!(
+            updates[filled_index]["expression_kind"],
+            json!("bytes_is_empty")
+        );
+        assert_eq!(updates[filled_index]["value"], json!(false));
+
+        let mut forged_value = report.clone();
+        forged_value["plan_executor"]["per_step"][0]["updates"][empty_index]["value"] =
+            json!(false);
+        assert!(!schema_accepts(
+            forged_value,
+            "run-plan-root-bytes-is-empty-forged-value"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][empty_index]["expression_kind"] =
+            json!("bytes_length");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-bytes-is-empty-forged-expression-kind"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"] = json!(false);
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-is-empty-forged-semantic-delta-value"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"] = json!(false);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-is-empty-forged-legacy-delta-value"
+        ));
+
+        let mut forged_update_count = report.clone();
+        forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
+        assert!(!schema_accepts(
+            forged_update_count,
+            "run-plan-root-bytes-is-empty-forged-update-count"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_get_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-get-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-get-scenario");
+        let source = r#"
+payload:
+    BYTES[4] { 16u01, 16u02, 16uFE, 16u04 } |> HOLD payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    selected_byte:
+        16u00 |> HOLD selected_byte {
+            LATEST {
+                store.measure |> THEN { payload |> Bytes/get(index: 2) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes get root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-get-expression-kind"
+        ));
+        assert_eq!(report["state_summary"]["store.selected_byte"], json!(254));
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(1)
+        );
+        let update = &report["plan_executor"]["per_step"][0]["updates"][0];
+        assert_eq!(update["target_state"], json!("store.selected_byte"));
+        assert_eq!(update["expression_kind"], json!("bytes_get"));
+        assert_eq!(update["value"], json!(254));
+        assert!(update["update_constant_id"].is_number());
+        assert_eq!(update["update_constant_value"], json!(2));
+
+        let mut forged_value = report.clone();
+        forged_value["plan_executor"]["per_step"][0]["updates"][0]["value"] = json!(253);
+        assert!(!schema_accepts(
+            forged_value,
+            "run-plan-root-bytes-get-forged-value"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
+            json!("bytes_length");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-bytes-get-forged-expression-kind"
+        ));
+
+        let mut forged_index = report.clone();
+        forged_index["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"] =
+            json!(1);
+        assert!(!schema_accepts(
+            forged_index,
+            "run-plan-root-bytes-get-forged-index-value"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"] = json!(253);
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-get-forged-semantic-delta-value"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"] = json!(253);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-get-forged-legacy-delta-value"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_equal_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-equal-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-equal-scenario");
+        let source = r#"
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
+
+same_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD same_payload { LATEST {} }
+
+different_payload:
+    BYTES[4] { 16u01, 16u02, 16uFE, 16u04 } |> HOLD different_payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    same:
+        False |> HOLD same {
+            LATEST {
+                store.measure |> THEN { payload |> Bytes/equal(with: same_payload) }
+            }
+        }
+    different:
+        True |> HOLD different {
+            LATEST {
+                store.measure |> THEN { Bytes/equal(left: payload, right: different_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes equal root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-equal-expression-kind"
+        ));
+        assert_eq!(report["state_summary"]["store.same"], json!(true));
+        assert_eq!(report["state_summary"]["store.different"], json!(false));
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(2)
+        );
+        let updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("updates should be an array");
+        let update_index_for = |target: &str| {
+            updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        let same_index = update_index_for("store.same");
+        let different_index = update_index_for("store.different");
+        assert_eq!(updates[same_index]["expression_kind"], json!("bytes_equal"));
+        assert_eq!(updates[same_index]["value"], json!(true));
+        assert_eq!(
+            updates[different_index]["expression_kind"],
+            json!("bytes_equal")
+        );
+        assert_eq!(updates[different_index]["value"], json!(false));
+        assert_eq!(updates[same_index]["source_payload_field"], JsonValue::Null);
+        assert_eq!(updates[same_index]["update_constant_id"], JsonValue::Null);
+        assert_eq!(
+            updates[same_index]["update_constant_value"],
+            JsonValue::Null
+        );
+
+        let mut forged_value = report.clone();
+        forged_value["plan_executor"]["per_step"][0]["updates"][same_index]["value"] = json!(false);
+        assert!(!schema_accepts(
+            forged_value,
+            "run-plan-root-bytes-equal-forged-update-value"
+        ));
+
+        let mut forged_state_summary = report.clone();
+        forged_state_summary["state_summary"]["store.same"] = json!(false);
+        assert!(!schema_accepts(
+            forged_state_summary,
+            "run-plan-root-bytes-equal-forged-state-summary"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][same_index]["expression_kind"] =
+            json!("bytes_is_empty");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-bytes-equal-forged-expression-kind"
+        ));
+
+        let mut forged_source_payload_field = report.clone();
+        forged_source_payload_field["plan_executor"]["per_step"][0]["updates"][same_index]["source_payload_field"] =
+            json!({"kind": "text"});
+        assert!(!schema_accepts(
+            forged_source_payload_field,
+            "run-plan-root-bytes-equal-forged-source-payload-field"
+        ));
+
+        let mut forged_update_constant = report.clone();
+        forged_update_constant["plan_executor"]["per_step"][0]["updates"][same_index]["update_constant_id"] =
+            json!(0);
+        assert!(!schema_accepts(
+            forged_update_constant,
+            "run-plan-root-bytes-equal-forged-update-constant-id"
+        ));
+
+        let mut forged_update_constant_value = report.clone();
+        forged_update_constant_value["plan_executor"]["per_step"][0]["updates"][same_index]["update_constant_value"] =
+            json!(0);
+        assert!(!schema_accepts(
+            forged_update_constant_value,
+            "run-plan-root-bytes-equal-forged-update-constant-value"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"] = json!(false);
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-equal-forged-semantic-delta-value"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"] = json!(false);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-equal-forged-legacy-delta-value"
+        ));
+
+        let mut forged_update_count = report.clone();
+        forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
+        assert!(!schema_accepts(
+            forged_update_count,
+            "run-plan-root-bytes-equal-forged-update-count"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_search_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-bytes-search-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-search-scenario");
+        let source = r#"
+left_payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16u04, 16u05 } |> HOLD right_payload { LATEST {} }
+
+found_needle:
+    BYTES[2] { 16u03, 16u04 } |> HOLD found_needle { LATEST {} }
+
+missing_needle:
+    BYTES[2] { 16uFE, 16uFF } |> HOLD missing_needle { LATEST {} }
+
+empty_needle:
+    BYTES {} |> HOLD empty_needle { LATEST {} }
+
+prefix:
+    BYTES[2] { 16u01, 16u02 } |> HOLD prefix { LATEST {} }
+
+wrong_prefix:
+    BYTES[2] { 16u02, 16u03 } |> HOLD wrong_prefix { LATEST {} }
+
+suffix:
+    BYTES[2] { 16u04, 16u05 } |> HOLD suffix { LATEST {} }
+
+wrong_suffix:
+    BYTES[2] { 16u03, 16u04 } |> HOLD wrong_suffix { LATEST {} }
+
+store: [
+    build: SOURCE
+    measure: SOURCE
+    joined:
+        BYTES[5] {} |> HOLD joined {
+            LATEST {
+                store.build |> THEN { left_payload |> Bytes/concat(with: right_payload) }
+            }
+        }
+    found_index:
+        0 |> HOLD found_index {
+            LATEST {
+                store.measure |> THEN { Bytes/find(input: store.joined, needle: found_needle) }
+            }
+        }
+    missing_index:
+        0 |> HOLD missing_index {
+            LATEST {
+                store.measure |> THEN { store.joined |> Bytes/find(needle: missing_needle) }
+            }
+        }
+    empty_index:
+        9 |> HOLD empty_index {
+            LATEST {
+                store.measure |> THEN { store.joined |> Bytes/find(needle: empty_needle) }
+            }
+        }
+    starts:
+        False |> HOLD starts {
+            LATEST {
+                store.measure |> THEN { Bytes/starts_with(input: store.joined, prefix: prefix) }
+            }
+        }
+    not_starts:
+        True |> HOLD not_starts {
+            LATEST {
+                store.measure |> THEN { store.joined |> Bytes/starts_with(prefix: wrong_prefix) }
+            }
+        }
+    ends:
+        False |> HOLD ends {
+            LATEST {
+                store.measure |> THEN { store.joined |> Bytes/ends_with(suffix: suffix) }
+            }
+        }
+    not_ends:
+        True |> HOLD not_ends {
+            LATEST {
+                store.measure |> THEN { Bytes/ends_with(input: store.joined, suffix: wrong_suffix) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes search root scalar"
+source = "{}"
+
+[[step]]
+id = "build-bytes"
+expected_source_event = {{ source = "store.build" }}
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["build-bytes".to_owned(), "measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-search-expression-kinds"
+        ));
+
+        let joined_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0",
+            "byte_len": 5
+        });
+        assert_eq!(report["state_summary"]["store.joined"], joined_summary);
+        assert_eq!(report["state_summary"]["store.found_index"], json!(2));
+        assert_eq!(
+            report["state_summary"]["store.missing_index"],
+            JsonValue::Null
+        );
+        assert_eq!(report["state_summary"]["store.empty_index"], json!(0));
+        assert_eq!(report["state_summary"]["store.starts"], json!(true));
+        assert_eq!(report["state_summary"]["store.not_starts"], json!(false));
+        assert_eq!(report["state_summary"]["store.ends"], json!(true));
+        assert_eq!(report["state_summary"]["store.not_ends"], json!(false));
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(8)
+        );
+
+        let first_updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("first step updates should be an array");
+        assert_eq!(first_updates[0]["value"], joined_summary);
+        let second_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("second step updates should be an array");
+        let update_index_for = |target: &str| {
+            second_updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {second_updates:#?}"))
+        };
+        let found_index = update_index_for("store.found_index");
+        let missing_index = update_index_for("store.missing_index");
+        let empty_index = update_index_for("store.empty_index");
+        let starts_index = update_index_for("store.starts");
+        let not_starts_index = update_index_for("store.not_starts");
+        let ends_index = update_index_for("store.ends");
+        let not_ends_index = update_index_for("store.not_ends");
+        assert_eq!(
+            second_updates[found_index]["expression_kind"],
+            json!("bytes_find")
+        );
+        assert_eq!(second_updates[found_index]["value"], json!(2));
+        assert_eq!(second_updates[missing_index]["value"], JsonValue::Null);
+        assert_eq!(second_updates[empty_index]["value"], json!(0));
+        assert_eq!(
+            second_updates[starts_index]["expression_kind"],
+            json!("bytes_starts_with")
+        );
+        assert_eq!(second_updates[starts_index]["value"], json!(true));
+        assert_eq!(second_updates[not_starts_index]["value"], json!(false));
+        assert_eq!(
+            second_updates[ends_index]["expression_kind"],
+            json!("bytes_ends_with")
+        );
+        assert_eq!(second_updates[ends_index]["value"], json!(true));
+        assert_eq!(second_updates[not_ends_index]["value"], json!(false));
+        assert_eq!(
+            second_updates[found_index]["source_payload_field"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            second_updates[found_index]["update_constant_id"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            second_updates[found_index]["update_constant_value"],
+            JsonValue::Null
+        );
+
+        let mut forged_found_value = report.clone();
+        forged_found_value["plan_executor"]["per_step"][1]["updates"][found_index]["value"] =
+            json!(3);
+        assert!(!schema_accepts(
+            forged_found_value,
+            "run-plan-root-bytes-search-forged-found-value"
+        ));
+
+        let mut forged_missing_value = report.clone();
+        forged_missing_value["plan_executor"]["per_step"][1]["updates"][missing_index]["value"] =
+            json!("NaN");
+        assert!(!schema_accepts(
+            forged_missing_value,
+            "run-plan-root-bytes-search-forged-missing-value"
+        ));
+
+        let mut forged_empty_value = report.clone();
+        forged_empty_value["plan_executor"]["per_step"][1]["updates"][empty_index]["value"] =
+            json!(1);
+        assert!(!schema_accepts(
+            forged_empty_value,
+            "run-plan-root-bytes-search-forged-empty-needle-value"
+        ));
+
+        let mut forged_kind = report.clone();
+        forged_kind["plan_executor"]["per_step"][1]["updates"][starts_index]["expression_kind"] =
+            json!("bytes_ends_with");
+        assert!(!schema_accepts(
+            forged_kind,
+            "run-plan-root-bytes-search-forged-expression-kind"
+        ));
+
+        let mut forged_source_payload = report.clone();
+        forged_source_payload["plan_executor"]["per_step"][1]["updates"][found_index]["source_payload_field"] =
+            json!("Text");
+        assert!(!schema_accepts(
+            forged_source_payload,
+            "run-plan-root-bytes-search-forged-source-payload"
+        ));
+
+        let mut forged_update_constant = report.clone();
+        forged_update_constant["plan_executor"]["per_step"][1]["updates"][ends_index]["update_constant_id"] =
+            json!(0);
+        assert!(!schema_accepts(
+            forged_update_constant,
+            "run-plan-root-bytes-search-forged-update-constant"
+        ));
+
+        let mut forged_state_summary = report.clone();
+        forged_state_summary["state_summary"]["store.not_ends"] = json!(true);
+        assert!(!schema_accepts(
+            forged_state_summary,
+            "run-plan-root-bytes-search-forged-state-summary"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][found_index + 1]["value"] = json!(3);
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-search-forged-semantic-delta"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
+            [not_starts_index]["value"] = json!(true);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-search-forged-legacy-delta"
+        ));
+
+        let mut forged_update_count = report.clone();
+        forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(7);
+        assert!(!schema_accepts(
+            forged_update_count,
+            "run-plan-root-bytes-search-forged-update-count"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_encoding_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-bytes-encoding-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-encoding-scenario");
+        let source = include_str!("../../../examples/bytes_encoding_plan_ops.bn");
+        let scenario_text = format!(
+            r#"
+name = "bytes encoding root scalar"
+source = "{}"
+
+[[step]]
+id = "build-bytes"
+expected_source_event = {{ source = "store.build" }}
+
+[[step]]
+id = "encode-bytes"
+expected_source_event = {{ source = "store.encode" }}
+
+[[step]]
+id = "decode-text"
+expected_source_event = {{ source = "store.decode" }}
+
+[[step]]
+id = "inspect-decoded"
+expected_source_event = {{ source = "store.inspect" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec![
+                "build-bytes".to_owned(),
+                "encode-bytes".to_owned(),
+                "decode-text".to_owned(),
+                "inspect-decoded".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-encoding-expression-kinds"
+        ));
+
+        let bytes_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+            "byte_len": 4
+        });
+        assert_eq!(report["state_summary"]["store.joined"], bytes_summary);
+        assert_eq!(report["state_summary"]["store.hex"], json!("01020304"));
+        assert_eq!(report["state_summary"]["store.base64"], json!("AQIDBA=="));
+        assert_eq!(report["state_summary"]["store.decoded_hex"], bytes_summary);
+        assert_eq!(
+            report["state_summary"]["store.decoded_base64"],
+            bytes_summary
+        );
+        assert_eq!(report["state_summary"]["store.zeros_len"], json!(4));
+        assert_eq!(report["state_summary"]["store.decoded_hex_byte"], json!(3));
+        assert_eq!(
+            report["state_summary"]["store.decoded_base64_hex"],
+            json!("01020304")
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(9)
+        );
+
+        let decode_updates = report["plan_executor"]["per_step"][2]["updates"]
+            .as_array()
+            .expect("decode step should expose update array");
+        assert_eq!(decode_updates[0]["expression_kind"], json!("bytes_zeros"));
+        assert_eq!(
+            decode_updates[1]["expression_kind"],
+            json!("bytes_from_hex")
+        );
+        assert_eq!(
+            decode_updates[2]["expression_kind"],
+            json!("bytes_from_base64")
+        );
+
+        let mut forged_expression = report.clone();
+        forged_expression["plan_executor"]["per_step"][2]["updates"][1]["expression_kind"] =
+            json!("bytes_to_hex");
+        assert!(!schema_accepts(
+            forged_expression,
+            "run-plan-root-bytes-encoding-forged-expression-kind"
+        ));
+
+        let mut forged_digest = report.clone();
+        forged_digest["state_summary"]["store.decoded_base64"]["digest"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-bytes-encoding-forged-digest"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_numeric_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-bytes-numeric-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-numeric-scenario");
+        let source = include_str!("../../../examples/bytes_numeric_plan_ops.bn");
+        let scenario_text = format!(
+            r#"
+name = "bytes numeric root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+
+[[step]]
+id = "write-bytes"
+expected_source_event = {{ source = "store.write" }}
+
+[[step]]
+id = "inspect-written"
+expected_source_event = {{ source = "store.inspect" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec![
+                "measure-bytes".to_owned(),
+                "write-bytes".to_owned(),
+                "inspect-written".to_owned(),
+            ],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-numeric-expression-kinds"
+        ));
+
+        let written_unsigned_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "c76b0857a5d51757ff556afe25625f9224c305e4960e24bd5dc25451cb460093",
+            "byte_len": 8
+        });
+        let written_signed_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "080aff601f9266cd9cc3f3c86e0add56283d3635a0aa200f3801cf7bda944bec",
+            "byte_len": 8
+        });
+        assert_eq!(report["state_summary"]["store.read_u16_le"], json!(513));
+        assert_eq!(report["state_summary"]["store.read_u16_be"], json!(258));
+        assert_eq!(report["state_summary"]["store.read_i16_be"], json!(-2));
+        assert_eq!(report["state_summary"]["store.read_i8"], json!(-128));
+        assert_eq!(
+            report["state_summary"]["store.written_unsigned"],
+            written_unsigned_summary
+        );
+        assert_eq!(
+            report["state_summary"]["store.written_signed"],
+            written_signed_summary
+        );
+        assert_eq!(
+            report["state_summary"]["store.written_unsigned_hex"],
+            json!("0102fffe7f801234")
+        );
+        assert_eq!(
+            report["state_summary"]["store.written_signed_hex"],
+            json!("0102fffe7fff0010")
+        );
+        assert_eq!(
+            report["state_summary"]["store.written_unsigned_read"],
+            json!(4660)
+        );
+        assert_eq!(
+            report["state_summary"]["store.written_signed_read"],
+            json!(-129)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(10)
+        );
+
+        let measure_updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("measure step should expose update array");
+        assert_eq!(
+            measure_updates[0]["expression_kind"],
+            json!("bytes_read_unsigned")
+        );
+        assert_eq!(
+            measure_updates[0]["update_constant_value"],
+            json!({"offset": 0, "byte_count": 2, "endian": "Little"})
+        );
+        assert_eq!(
+            measure_updates[2]["expression_kind"],
+            json!("bytes_read_signed")
+        );
+        assert_eq!(
+            measure_updates[3]["update_constant_value"],
+            json!({"offset": 5, "byte_count": 1, "endian": "Little"})
+        );
+
+        let write_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("write step should expose update array");
+        assert_eq!(
+            write_updates[0]["expression_kind"],
+            json!("bytes_write_unsigned")
+        );
+        assert_eq!(
+            write_updates[0]["update_constant_value"],
+            json!({"offset": 6, "byte_count": 2, "endian": "Big", "value": 4660})
+        );
+        assert_eq!(
+            write_updates[1]["expression_kind"],
+            json!("bytes_write_signed")
+        );
+        assert_eq!(
+            write_updates[1]["update_constant_value"],
+            json!({"offset": 4, "byte_count": 2, "endian": "Little", "value": -129})
+        );
+
+        let mut forged_expression = report.clone();
+        forged_expression["plan_executor"]["per_step"][1]["updates"][0]["expression_kind"] =
+            json!("bytes_write_signed");
+        assert!(!schema_accepts(
+            forged_expression,
+            "run-plan-root-bytes-numeric-forged-expression-kind"
+        ));
+
+        let mut forged_digest = report.clone();
+        forged_digest["state_summary"]["store.written_unsigned"]["digest"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-bytes-numeric-forged-digest"
+        ));
+
+        let mut forged_read = report.clone();
+        forged_read["plan_executor"]["per_step"][2]["updates"][2]["value"] = json!(4659);
+        assert!(!schema_accepts(
+            forged_read,
+            "run-plan-root-bytes-numeric-forged-read-value"
+        ));
+
+        let mut forged_constant = report.clone();
+        forged_constant["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]["endian"] =
+            json!("Big");
+        assert!(!schema_accepts(
+            forged_constant,
+            "run-plan-root-bytes-numeric-forged-constant"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_text_bytes_conversion_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-text-bytes-source");
+        let scenario_path = temp_report_path("run-plan-root-text-bytes-scenario");
+        let source = r#"
+text_payload:
+    TEXT { hi } |> HOLD text_payload { LATEST {} }
+
+store: [
+    encode: SOURCE
+    decode: SOURCE
+    encoded:
+        BYTES[2] {} |> HOLD encoded {
+            LATEST {
+                store.encode |> THEN { text_payload |> Text/to_bytes(encoding: Utf8) }
+            }
+        }
+    encoded_len:
+        0 |> HOLD encoded_len {
+            LATEST {
+                store.decode |> THEN { store.encoded |> Bytes/length }
+            }
+        }
+    decoded:
+        TEXT { old } |> HOLD decoded {
+            LATEST {
+                store.decode |> THEN { store.encoded |> Bytes/to_text(encoding: Utf8) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "text bytes conversion root scalar"
+source = "{}"
+
+[[step]]
+id = "encode-text"
+expected_source_event = {{ source = "store.encode" }}
+
+[[step]]
+id = "decode-bytes"
+expected_source_event = {{ source = "store.decode" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["encode-text".to_owned(), "decode-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-text-bytes-conversion-expression-kinds"
+        ));
+
+        let encoded_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+            "byte_len": 2
+        });
+        assert_eq!(report["state_summary"]["store.encoded"], encoded_summary);
+        assert_eq!(report["state_summary"]["store.encoded_len"], json!(2));
+        assert_eq!(report["state_summary"]["store.decoded"], json!("hi"));
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(3)
+        );
+
+        let encode_update = &report["plan_executor"]["per_step"][0]["updates"][0];
+        assert_eq!(encode_update["target_state"], json!("store.encoded"));
+        assert_eq!(encode_update["expression_kind"], json!("text_to_bytes"));
+        assert_eq!(encode_update["value"], encoded_summary);
+        assert!(encode_update["update_constant_id"].is_number());
+        assert_eq!(encode_update["update_constant_value"], json!("utf8"));
+        assert!(encode_update["value"].get("inline_bytes").is_none());
+
+        let decode_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("second step updates should be an array");
+        let update_index_for = |target: &str| {
+            decode_updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {decode_updates:#?}"))
+        };
+        let len_index = update_index_for("store.encoded_len");
+        let decoded_index = update_index_for("store.decoded");
+        assert_eq!(
+            decode_updates[len_index]["expression_kind"],
+            json!("bytes_length")
+        );
+        assert_eq!(decode_updates[len_index]["value"], json!(2));
+        assert_eq!(
+            decode_updates[decoded_index]["expression_kind"],
+            json!("bytes_to_text")
+        );
+        assert_eq!(decode_updates[decoded_index]["value"], json!("hi"));
+        assert!(decode_updates[decoded_index]["update_constant_id"].is_number());
+        assert_eq!(
+            decode_updates[decoded_index]["update_constant_value"],
+            json!("utf8")
+        );
+
+        let mut forged_digest = report.clone();
+        forged_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-text-bytes-forged-update-digest"
+        ));
+
+        let mut forged_state_byte_len = report.clone();
+        forged_state_byte_len["state_summary"]["store.encoded"]["byte_len"] = json!(3);
+        assert!(!schema_accepts(
+            forged_state_byte_len,
+            "run-plan-root-text-bytes-forged-state-byte-len"
+        ));
+
+        let mut forged_inline_bytes = report.clone();
+        forged_inline_bytes["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
+            json!([104, 105]);
+        assert!(!schema_accepts(
+            forged_inline_bytes,
+            "run-plan-root-text-bytes-forged-inline-bytes"
+        ));
+
+        let mut forged_decoded_value = report.clone();
+        forged_decoded_value["plan_executor"]["per_step"][1]["updates"][decoded_index]["value"] =
+            json!("bye");
+        assert!(!schema_accepts(
+            forged_decoded_value,
+            "run-plan-root-text-bytes-forged-decoded-value"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
+            json!("bytes_concat");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-text-bytes-forged-expression-kind"
+        ));
+
+        let mut forged_encoding_value = report.clone();
+        forged_encoding_value["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"] =
+            json!("utf16");
+        assert!(!schema_accepts(
+            forged_encoding_value,
+            "run-plan-root-text-bytes-forged-encoding-value"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_concat_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-concat-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-concat-scenario");
+        let source = r#"
+left_payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16uFE, 16u04 } |> HOLD right_payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    joined_pipe:
+        BYTES[5] {} |> HOLD joined_pipe {
+            LATEST {
+                store.measure |> THEN { left_payload |> Bytes/concat(with: right_payload) }
+            }
+        }
+    joined_call:
+        BYTES[5] {} |> HOLD joined_call {
+            LATEST {
+                store.measure |> THEN { Bytes/concat(input: left_payload, with: right_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes concat root scalar"
+source = "{}"
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = {{ source = "store.measure" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["measure-bytes".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-concat-expression-kind"
+        ));
+        let expected_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "4fdcf430d9a09a049ecb6b373b31776fa149c6b4fd54d6229534c8f971c29b89",
+            "byte_len": 5
+        });
+        assert_eq!(
+            report["state_summary"]["store.joined_pipe"],
+            expected_summary
+        );
+        assert_eq!(
+            report["state_summary"]["store.joined_call"],
+            expected_summary
+        );
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(2)
+        );
+        let updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("updates should be an array");
+        let update_index_for = |target: &str| {
+            updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        let pipe_index = update_index_for("store.joined_pipe");
+        assert_eq!(
+            updates[pipe_index]["expression_kind"],
+            json!("bytes_concat")
+        );
+        assert_eq!(updates[pipe_index]["value"], expected_summary);
+        assert_eq!(updates[pipe_index]["source_payload_field"], JsonValue::Null);
+        assert_eq!(updates[pipe_index]["update_constant_id"], JsonValue::Null);
+        assert_eq!(
+            updates[pipe_index]["update_constant_value"],
+            JsonValue::Null
+        );
+
+        let mut forged_digest = report.clone();
+        forged_digest["plan_executor"]["per_step"][0]["updates"][pipe_index]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-bytes-concat-forged-update-digest"
+        ));
+
+        let mut forged_state_summary = report.clone();
+        forged_state_summary["state_summary"]["store.joined_pipe"]["byte_len"] = json!(4);
+        assert!(!schema_accepts(
+            forged_state_summary,
+            "run-plan-root-bytes-concat-forged-state-byte-len"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][pipe_index]["expression_kind"] =
+            json!("bytes_equal");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-bytes-concat-forged-expression-kind"
+        ));
+
+        let mut forged_source_payload_field = report.clone();
+        forged_source_payload_field["plan_executor"]["per_step"][0]["updates"][pipe_index]["source_payload_field"] =
+            json!({"kind": "text"});
+        assert!(!schema_accepts(
+            forged_source_payload_field,
+            "run-plan-root-bytes-concat-forged-source-payload-field"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-concat-forged-semantic-delta-value"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-concat-forged-legacy-delta-value"
+        ));
+
+        let mut forged_update_count = report.clone();
+        forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
+        assert!(!schema_accepts(
+            forged_update_count,
+            "run-plan-root-bytes-concat-forged-update-count"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_slice_take_drop_expression_kinds() {
+        let source_path = temp_report_path("run-plan-root-bytes-slice-take-drop-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-slice-take-drop-scenario");
+        let source = include_str!("../../../examples/bytes_slice_take_drop_plan_ops.bn");
+        let scenario_text = format!(
+            r#"
+name = "bytes slice take drop root scalar"
+source = "{}"
+
+[[step]]
+id = "split-bytes"
+expected_source_event = {{ source = "store.split" }}
+
+[[step]]
+id = "inspect-splits"
+expected_source_event = {{ source = "store.inspect" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["split-bytes".to_owned(), "inspect-splits".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-slice-take-drop-expression-kinds"
+        ));
+
+        let sliced_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "56e75135f0ade48aa22e0f12a1b8dbdacf1eacadc82f5af7c1b46757dc4dd697",
+            "byte_len": 3
+        });
+        let joined_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "a499a56927c382e4ada0f391b7f618af78f16063a72fd0f222837e80c14fbde9",
+            "byte_len": 7
+        });
+        assert_eq!(report["state_summary"]["store.sliced"], sliced_summary);
+        assert_eq!(report["state_summary"]["store.sliced_len"], json!(3));
+        assert_eq!(report["state_summary"]["store.taken_byte"], json!(19));
+        assert_eq!(
+            report["state_summary"]["store.dropped_joined"],
+            joined_summary
+        );
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(6)
+        );
+
+        let first_updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("first step updates should be an array");
+        let second_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("second step updates should be an array");
+        let update_index_for = |updates: &[JsonValue], target: &str| {
+            updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        let slice_index = update_index_for(first_updates, "store.sliced");
+        let take_index = update_index_for(first_updates, "store.taken");
+        let drop_index = update_index_for(first_updates, "store.dropped");
+        assert_eq!(
+            first_updates[slice_index]["expression_kind"],
+            json!("bytes_slice")
+        );
+        assert_eq!(first_updates[slice_index]["value"], sliced_summary);
+        assert_eq!(
+            first_updates[slice_index]["update_constant_value"],
+            json!({"offset": 1, "byte_count": 3})
+        );
+        assert!(first_updates[slice_index]["update_constant_id"].is_array());
+        assert_eq!(
+            first_updates[take_index]["expression_kind"],
+            json!("bytes_take")
+        );
+        assert_eq!(first_updates[take_index]["update_constant_value"], json!(4));
+        assert_eq!(
+            first_updates[drop_index]["expression_kind"],
+            json!("bytes_drop")
+        );
+        assert_eq!(first_updates[drop_index]["update_constant_value"], json!(2));
+        let joined_index = update_index_for(second_updates, "store.dropped_joined");
+        assert_eq!(second_updates[joined_index]["value"], joined_summary);
+
+        let mut forged_digest = report.clone();
+        forged_digest["plan_executor"]["per_step"][0]["updates"][slice_index]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-bytes-slice-forged-update-digest"
+        ));
+
+        let mut forged_count = report.clone();
+        forged_count["plan_executor"]["per_step"][0]["updates"][slice_index]["update_constant_value"]
+            ["byte_count"] = json!(2);
+        assert!(!schema_accepts(
+            forged_count,
+            "run-plan-root-bytes-slice-forged-byte-count"
+        ));
+
+        let mut forged_take_kind = report.clone();
+        forged_take_kind["plan_executor"]["per_step"][0]["updates"][take_index]["expression_kind"] =
+            json!("bytes_slice");
+        assert!(!schema_accepts(
+            forged_take_kind,
+            "run-plan-root-bytes-take-forged-expression-kind"
+        ));
+
+        let mut forged_joined = report.clone();
+        forged_joined["state_summary"]["store.dropped_joined"]["byte_len"] = json!(6);
+        assert!(!schema_accepts(
+            forged_joined,
+            "run-plan-root-bytes-slice-take-drop-forged-joined-byte-len"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
+            [joined_index]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-slice-take-drop-forged-legacy-delta"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_accepts_bytes_set_expression_kind() {
+        let source_path = temp_report_path("run-plan-root-bytes-set-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-set-scenario");
+        let source = r#"
+left_payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16uFE, 16u05 } |> HOLD right_payload { LATEST {} }
+
+store: [
+    patch: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[4] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }
+            }
+        }
+    patched_byte:
+        16u00 |> HOLD patched_byte {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/get(index: 2) }
+            }
+        }
+    patched_len:
+        0 |> HOLD patched_len {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/length }
+            }
+        }
+    patched_joined:
+        BYTES[6] {} |> HOLD patched_joined {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/concat(with: right_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes set root scalar"
+source = "{}"
+
+[[step]]
+id = "patch-bytes"
+expected_source_event = {{ source = "store.patch" }}
+
+[[step]]
+id = "inspect-patched"
+expected_source_event = {{ source = "store.inspect" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["patch-bytes".to_owned(), "inspect-patched".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-set-expression-kind"
+        ));
+
+        let patched_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "9c5ec9570d8bf71994dfc97037803d9a280ba40f6dab32591c949310e0d9fdd8",
+            "byte_len": 4
+        });
+        let joined_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "de71c0407a4cf40db6a195c3d88787156c590b5643bbf50c758660c71189c91e",
+            "byte_len": 6
+        });
+        assert_eq!(report["state_summary"]["store.patched"], patched_summary);
+        assert_eq!(report["state_summary"]["store.patched_byte"], json!(170));
+        assert_eq!(report["state_summary"]["store.patched_len"], json!(4));
+        assert_eq!(
+            report["state_summary"]["store.patched_joined"],
+            joined_summary
+        );
+        assert_eq!(
+            report["capability_summary"]["cpu_plan_executor_complete"],
+            json!(true)
+        );
+        assert_eq!(
+            report["plan_executor"]["executed_update_branch_count"],
+            json!(4)
+        );
+
+        let first_updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("first step updates should be an array");
+        let set_update = &first_updates[0];
+        assert_eq!(set_update["target_state"], json!("store.patched"));
+        assert_eq!(set_update["expression_kind"], json!("bytes_set"));
+        assert_eq!(set_update["value"], patched_summary);
+        assert!(set_update["update_constant_id"].is_array());
+        assert_eq!(
+            set_update["update_constant_value"],
+            json!({"index": 2, "value": 170})
+        );
+
+        let second_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("second step updates should be an array");
+        let update_index_for = |target: &str| {
+            second_updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {second_updates:#?}"))
+        };
+        let get_index = update_index_for("store.patched_byte");
+        let concat_index = update_index_for("store.patched_joined");
+        assert_eq!(second_updates[get_index]["value"], json!(170));
+        assert_eq!(second_updates[concat_index]["value"], joined_summary);
+        assert_eq!(report["semantic_deltas"][1]["value"], json!(170));
+        assert_eq!(report["semantic_deltas"][2]["value"], json!(4));
+        assert_eq!(
+            report["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"][0]["value"],
+            json!(170)
+        );
+
+        let mut forged_digest = report.clone();
+        forged_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_digest,
+            "run-plan-root-bytes-set-forged-update-digest"
+        ));
+
+        let mut forged_state_summary = report.clone();
+        forged_state_summary["state_summary"]["store.patched"]["byte_len"] = json!(3);
+        assert!(!schema_accepts(
+            forged_state_summary,
+            "run-plan-root-bytes-set-forged-state-byte-len"
+        ));
+
+        let mut forged_inline_bytes = report.clone();
+        forged_inline_bytes["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
+            json!([1, 2, 170, 4]);
+        assert!(!schema_accepts(
+            forged_inline_bytes,
+            "run-plan-root-bytes-set-forged-inline-bytes"
+        ));
+
+        let mut forged_expression_kind = report.clone();
+        forged_expression_kind["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
+            json!("bytes_concat");
+        assert!(!schema_accepts(
+            forged_expression_kind,
+            "run-plan-root-bytes-set-forged-expression-kind"
+        ));
+
+        let mut forged_index = report.clone();
+        forged_index["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]["index"] =
+            json!(1);
+        assert!(!schema_accepts(
+            forged_index,
+            "run-plan-root-bytes-set-forged-index-value"
+        ));
+
+        let mut forged_byte_value = report.clone();
+        forged_byte_value["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]
+            ["value"] = json!(171);
+        assert!(!schema_accepts(
+            forged_byte_value,
+            "run-plan-root-bytes-set-forged-byte-value"
+        ));
+
+        let mut forged_semantic_delta = report.clone();
+        forged_semantic_delta["semantic_deltas"][0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_semantic_delta,
+            "run-plan-root-bytes-set-forged-semantic-delta"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
+            [0]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-set-forged-legacy-delta"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn run_plan_root_scalar_scenario_replays_private_bytes_from_concat_across_steps() {
+        let source_path = temp_report_path("run-plan-root-bytes-chain-source");
+        let scenario_path = temp_report_path("run-plan-root-bytes-chain-scenario");
+        let source = r#"
+left_payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16uFE, 16u04 } |> HOLD right_payload { LATEST {} }
+
+store: [
+    join: SOURCE
+    inspect: SOURCE
+    joined:
+        BYTES[5] {} |> HOLD joined {
+            LATEST {
+                store.join |> THEN { left_payload |> Bytes/concat(with: right_payload) }
+            }
+        }
+    joined_len:
+        0 |> HOLD joined_len {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/length }
+            }
+        }
+    joined_byte:
+        16u00 |> HOLD joined_byte {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/get(index: 3) }
+            }
+        }
+    joined_again:
+        BYTES[7] {} |> HOLD joined_again {
+            LATEST {
+                store.inspect |> THEN { store.joined |> Bytes/concat(with: right_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let scenario_text = format!(
+            r#"
+name = "bytes concat chain root scalar"
+source = "{}"
+
+[[step]]
+id = "join-bytes"
+expected_source_event = {{ source = "store.join" }}
+
+[[step]]
+id = "inspect-joined"
+expected_source_event = {{ source = "store.inspect" }}
+"#,
+            source_path.display()
+        );
+        let report = run_plan_root_scalar_scenario_report_for_source(
+            &source_path,
+            source,
+            &scenario_path,
+            &scenario_text,
+            vec!["join-bytes".to_owned(), "inspect-joined".to_owned()],
+        );
+        assert!(schema_accepts(
+            report.clone(),
+            "run-plan-root-bytes-chain-private-replay"
+        ));
+
+        let joined_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "4fdcf430d9a09a049ecb6b373b31776fa149c6b4fd54d6229534c8f971c29b89",
+            "byte_len": 5
+        });
+        let joined_again_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "a9290f6579e270419a97e9c69d022898df14bb2bfb3db13d9729b45d1862443a",
+            "byte_len": 7
+        });
+        assert_eq!(report["state_summary"]["store.joined"], joined_summary);
+        assert_eq!(report["state_summary"]["store.joined_len"], json!(5));
+        assert_eq!(report["state_summary"]["store.joined_byte"], json!(254));
+        assert_eq!(
+            report["state_summary"]["store.joined_again"],
+            joined_again_summary
+        );
+        assert!(
+            report["state_summary"]["store.joined"]
+                .get("inline_bytes")
+                .is_none()
+        );
+        assert!(
+            report["state_summary"]["store.joined_again"]
+                .get("inline_bytes")
+                .is_none()
+        );
+
+        let first_updates = report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("first step updates");
+        let second_updates = report["plan_executor"]["per_step"][1]["updates"]
+            .as_array()
+            .expect("second step updates");
+        let update_index_for = |updates: &[JsonValue], target: &str| {
+            updates
+                .iter()
+                .position(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        let joined_index = update_index_for(first_updates, "store.joined");
+        let len_index = update_index_for(second_updates, "store.joined_len");
+        let byte_index = update_index_for(second_updates, "store.joined_byte");
+        let again_index = update_index_for(second_updates, "store.joined_again");
+        assert_eq!(
+            first_updates[joined_index]["expression_kind"],
+            json!("bytes_concat")
+        );
+        assert_eq!(
+            second_updates[len_index]["expression_kind"],
+            json!("bytes_length")
+        );
+        assert_eq!(second_updates[len_index]["value"], json!(5));
+        assert_eq!(
+            second_updates[byte_index]["expression_kind"],
+            json!("bytes_get")
+        );
+        assert_eq!(second_updates[byte_index]["value"], json!(254));
+        assert_eq!(
+            second_updates[again_index]["expression_kind"],
+            json!("bytes_concat")
+        );
+        assert_eq!(second_updates[again_index]["value"], joined_again_summary);
+
+        let mut forged_first_digest = report.clone();
+        forged_first_digest["plan_executor"]["per_step"][0]["updates"][joined_index]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_first_digest,
+            "run-plan-root-bytes-chain-forged-first-digest"
+        ));
+
+        let mut forged_len = report.clone();
+        forged_len["plan_executor"]["per_step"][1]["updates"][len_index]["value"] = json!(0);
+        assert!(!schema_accepts(
+            forged_len,
+            "run-plan-root-bytes-chain-forged-later-length"
+        ));
+
+        let mut forged_byte = report.clone();
+        forged_byte["plan_executor"]["per_step"][1]["updates"][byte_index]["value"] = json!(0);
+        assert!(!schema_accepts(
+            forged_byte,
+            "run-plan-root-bytes-chain-forged-later-byte"
+        ));
+
+        let mut forged_again_digest = report.clone();
+        forged_again_digest["plan_executor"]["per_step"][1]["updates"][again_index]["value"]["digest"] =
+            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        assert!(!schema_accepts(
+            forged_again_digest,
+            "run-plan-root-bytes-chain-forged-second-concat-digest"
+        ));
+
+        let mut forged_legacy_delta = report.clone();
+        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
+            [byte_index]["value"] = json!(0);
+        assert!(!schema_accepts(
+            forged_legacy_delta,
+            "run-plan-root-bytes-chain-forged-legacy-byte-delta"
+        ));
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
     }
 
     #[test]
@@ -5598,6 +28386,7 @@ mod tests {
             "source_payload_text_field_count": 1,
             "source_payload_key_field_count": 0,
             "source_payload_address_field_count": 0,
+            "source_payload_bytes_field_count": 0,
             "source_payload_pointer_field_count": 0
         });
         assert!(schema_accepts(

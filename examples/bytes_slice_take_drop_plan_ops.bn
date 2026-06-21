@@ -1,0 +1,45 @@
+payload:
+    BYTES[6] { 16u10, 16u11, 16u12, 16u13, 16u14, 16u15 } |> HOLD payload { LATEST {} }
+
+store: [
+    split: SOURCE
+    inspect: SOURCE
+    sliced:
+        BYTES[3] {} |> HOLD sliced {
+            LATEST {
+                store.split |> THEN { payload |> Bytes/slice(offset: 1, byte_count: 3) }
+            }
+        }
+    taken:
+        BYTES[4] {} |> HOLD taken {
+            LATEST {
+                store.split |> THEN { Bytes/take(input: payload, byte_count: 4) }
+            }
+        }
+    dropped:
+        BYTES[4] {} |> HOLD dropped {
+            LATEST {
+                store.split |> THEN { payload |> Bytes/drop(count: 2) }
+            }
+        }
+    sliced_len:
+        0 |> HOLD sliced_len {
+            LATEST {
+                store.inspect |> THEN { store.sliced |> Bytes/length }
+            }
+        }
+    taken_byte:
+        16u00 |> HOLD taken_byte {
+            LATEST {
+                store.inspect |> THEN { store.taken |> Bytes/get(index: 3) }
+            }
+        }
+    dropped_joined:
+        BYTES[7] {} |> HOLD dropped_joined {
+            LATEST {
+                store.inspect |> THEN { store.dropped |> Bytes/concat(with: store.sliced) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

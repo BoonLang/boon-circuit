@@ -1,0 +1,24 @@
+store: [
+    load: SOURCE
+    inspect: SOURCE
+    file_bytes:
+        BYTES {} |> HOLD file_bytes {
+            LATEST {
+                store.load |> THEN { TEXT { todo_mvc_physical/assets/icons/checkbox_active.svg } |> File/read_bytes() }
+            }
+        }
+    file_len:
+        0 |> HOLD file_len {
+            LATEST {
+                store.inspect |> THEN { store.file_bytes |> Bytes/length }
+            }
+        }
+    first_byte:
+        16u00 |> HOLD first_byte {
+            LATEST {
+                store.inspect |> THEN { store.file_bytes |> Bytes/get(index: 0) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File bytes }))

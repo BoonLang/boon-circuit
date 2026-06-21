@@ -1,0 +1,10 @@
+name = "root scalar plan ops"
+source = "examples/root_scalar_plan_ops.bn"
+
+[[step]]
+id = "toggle"
+expected_source_event = { source = "store.toggle" }
+
+[[step]]
+id = "copy"
+expected_source_event = { source = "store.input.change", text = "Typed payload" }

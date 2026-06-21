@@ -1,5 +1,6 @@
 use boon_parser::{
-    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, ParsedProgram,
+    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
+    BytesSizeSyntax, ParsedProgram,
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,8 @@ use std::time::Instant;
 pub enum Type {
     Text,
     Number,
+    Byte,
+    Bytes(BytesType),
     Skip,
     VariantSet(Vec<Variant>),
     Object(ObjectShape),
@@ -27,6 +30,12 @@ pub enum Type {
 }
 
 impl EqUnifyValue for Type {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BytesType {
+    Dynamic,
+    Fixed(usize),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Variant {
@@ -252,6 +261,26 @@ pub struct ExprTypeTable {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedConstantEntry {
+    pub expr_id: usize,
+    pub value: ResolvedConstantValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolvedConstantValue {
+    UnsignedInteger { value: u64 },
+    SignedInteger { value: i64 },
+    Byte { value: u8 },
+    Symbol { value: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct ResolvedConstantTable {
+    pub entries: Vec<ResolvedConstantEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FunctionTypeEntry {
     pub name: String,
     pub args: Vec<String>,
@@ -360,6 +389,8 @@ pub struct TypeCheckReport {
     pub expr_type_table: ExprTypeTable,
     pub function_type_table: FunctionTypeTable,
     pub type_hint_table: TypeHintTable,
+    #[serde(default)]
+    pub resolved_constant_table: ResolvedConstantTable,
     pub render_slot_table: RenderSlotTable,
     pub list_map_bindings: Vec<ListMapBinding>,
     pub constraints: Vec<Constraint>,
@@ -452,6 +483,7 @@ struct Checker<'a> {
     expr_type_cache: Vec<Option<FlowType>>,
     expr_type_table: ExprTypeTable,
     function_type_table: FunctionTypeTable,
+    collect_type_hints: bool,
     render_slot_table: RenderSlotTable,
     list_map_bindings: Vec<ListMapBinding>,
     constraints: Vec<Constraint>,
@@ -494,8 +526,12 @@ impl<'a> Checker<'a> {
         let function_param_requirements_ms =
             typecheck_elapsed_ms(function_param_requirements_started);
         let name_bindings_started = Instant::now();
-        let mut name_bindings =
-            name_bindings(program, &source_payload_types, &function_param_requirements);
+        let mut name_bindings = name_bindings(
+            program,
+            &source_payload_types,
+            &function_param_requirements,
+            &function_args_by_name,
+        );
         let name_bindings_ms = typecheck_elapsed_ms(name_bindings_started);
         let passed_context_started = Instant::now();
         if let Some(passed_type) = passed_context_type(program, &name_bindings) {
@@ -536,6 +572,7 @@ impl<'a> Checker<'a> {
             expr_type_cache: vec![None; program.expressions.len()],
             expr_type_table: ExprTypeTable::default(),
             function_type_table: FunctionTypeTable::default(),
+            collect_type_hints: true,
             render_slot_table: RenderSlotTable::default(),
             list_map_bindings: Vec::new(),
             constraints: Vec::new(),
@@ -572,19 +609,34 @@ impl<'a> Checker<'a> {
                 self.program,
                 &self.name_bindings,
                 &self.function_param_requirements,
+                &self.function_args_by_name,
                 &row_scope.function,
                 &row_scope.list,
                 &row_scope.row_scope,
-                return_type,
+                return_type.clone(),
             ) else {
                 continue;
             };
             self.name_bindings
                 .insert(row_scope.row_scope.clone(), row_type.clone());
-            self.name_bindings.insert(
-                row_scope.list.clone(),
-                Type::List(Box::new(row_type.clone())),
-            );
+            let output_item_type = return_type
+                .filter(type_has_known_user_shape)
+                .unwrap_or_else(|| row_type.clone());
+            if !matches!(self.name_bindings.get(&row_scope.list), Some(Type::List(_)))
+                || list_map_input_item_type_for_function_param(
+                    self.program,
+                    &self.name_bindings,
+                    &self.function_args_by_name,
+                    &row_scope.function,
+                    &row_scope.row_scope,
+                )
+                .is_none()
+            {
+                self.name_bindings.insert(
+                    row_scope.list.clone(),
+                    Type::List(Box::new(output_item_type)),
+                );
+            }
             if let Type::Object(shape) = &row_type {
                 for (field, ty) in shape.ordered_fields() {
                     insert_simple_binding_preserving_renderable(
@@ -605,6 +657,7 @@ impl<'a> Checker<'a> {
         init_profile: CheckerInitProfile,
     ) -> (TypeCheckReport, TypeCheckProfile) {
         let total_started = Instant::now();
+        self.collect_type_hints = include_type_hints;
         let recursive_functions_started = Instant::now();
         self.check_recursive_functions();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
@@ -659,6 +712,7 @@ impl<'a> Checker<'a> {
             TypeHintTable::default()
         };
         let type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
+        let resolved_constant_table = resolved_constant_table(self.program);
         let assemble_report_started = Instant::now();
         let report = TypeCheckReport {
             expression_count: self.program.expressions.len(),
@@ -685,6 +739,7 @@ impl<'a> Checker<'a> {
             expr_type_table: std::mem::take(&mut self.expr_type_table),
             function_type_table: std::mem::take(&mut self.function_type_table),
             type_hint_table,
+            resolved_constant_table,
             render_slot_table: std::mem::take(&mut self.render_slot_table),
             list_map_bindings: std::mem::take(&mut self.list_map_bindings),
             constraints: std::mem::take(&mut self.constraints),
@@ -719,6 +774,9 @@ impl<'a> Checker<'a> {
     }
 
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
+        if !self.collect_type_hints && matches!(statement.kind, AstStatementKind::Function { .. }) {
+            return;
+        }
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
@@ -741,7 +799,9 @@ impl<'a> Checker<'a> {
         self.check_pattern_constraints(statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
-        if let AstStatementKind::Function { name, args } = &statement.kind {
+        if self.collect_type_hints
+            && let AstStatementKind::Function { name, args } = &statement.kind
+        {
             let arg_types = args
                 .iter()
                 .map(|arg| self.function_arg_display_type(name, arg))
@@ -792,9 +852,19 @@ impl<'a> Checker<'a> {
             .row_scope_functions
             .iter()
             .any(|row_scope| row_scope.function == function && row_scope.row_scope == arg)
-            && let Some(ty) = self.name_bindings.get(arg)
         {
-            return ty.clone();
+            if let Some(ty) = list_map_input_item_type_for_function_param(
+                self.program,
+                &self.name_bindings,
+                &self.function_args_by_name,
+                function,
+                arg,
+            ) {
+                return ty;
+            }
+            if let Some(ty) = self.name_bindings.get(arg) {
+                return ty.clone();
+            }
         }
         let requirement = self
             .function_param_requirements
@@ -812,7 +882,13 @@ impl<'a> Checker<'a> {
 
     fn function_arg_call_site_type(&self, function: &str, arg: &str) -> Option<Type> {
         let arg_expr_ids = self.function_arg_call_sites.get(function)?.get(arg)?;
-        let mut ty = None;
+        let mut ty = list_map_input_item_type_for_function_param(
+            self.program,
+            &self.name_bindings,
+            &self.function_args_by_name,
+            function,
+            arg,
+        );
         for arg_expr_id in arg_expr_ids {
             let Some(arg_expr) = self.program.expressions.get(*arg_expr_id) else {
                 continue;
@@ -1005,7 +1081,16 @@ impl<'a> Checker<'a> {
             if !render_arg_should_validate_directly(function, name) {
                 continue;
             }
-            let actual = self.ensure_expr(arg.value).ty;
+            let mut actual = self.ensure_expr(arg.value).ty;
+            if !render_field_type_accepts(&actual, &expected)
+                && let Some(static_actual) = self.static_expr_type_for_pipeline_expr(
+                    arg.value,
+                    &mut BTreeSet::new(),
+                    &self.name_bindings,
+                )
+            {
+                actual = static_actual;
+            }
             if !render_field_type_accepts(&actual, &expected) {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     arg.value,
@@ -1067,6 +1152,10 @@ impl<'a> Checker<'a> {
         let ty = match &expr.kind {
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Type::Text,
             AstExprKind::Number(_) => Type::Number,
+            AstExprKind::ByteLiteral { .. } => Type::Byte,
+            AstExprKind::BytesLiteral { size, items } => {
+                self.infer_bytes_literal(expr, size, items)
+            }
             AstExprKind::Bool(value) => Type::VariantSet(vec![Variant::Tag(if *value {
                 "True".to_owned()
             } else {
@@ -1098,6 +1187,8 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                self.check_bytes_builtin_arguments(expr.id, function, args, false);
+                self.check_builtin_call_compatibility(function, None, args);
                 self.check_user_function_arguments(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
                     self.check_style_args(args);
@@ -1131,6 +1222,8 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                self.check_bytes_builtin_arguments(expr.id, op, args, true);
+                self.check_builtin_call_compatibility(op, Some(*input), args);
                 if !op.starts_with("Field/") {
                     self.check_user_function_arguments(expr.id, op, Some(*input), args);
                 }
@@ -1225,10 +1318,19 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Hold { initial, .. } => self.hold_result_type(expr.id, *initial),
-            AstExprKind::Latest => exact_empty_object_type(),
-            AstExprKind::When { input } => self
-                .when_result_type(expr.id)
-                .unwrap_or_else(|| self.ensure_expr(*input).ty),
+            AstExprKind::Latest => self
+                .latest_result_type(expr.id)
+                .unwrap_or_else(exact_empty_object_type),
+            AstExprKind::When { input } => {
+                if self.expr_id_is_bytes_source_payload_path(*input) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        *input,
+                        "BYTES source payload guards are not supported in v1; use `THEN` to route the BYTES payload or convert it explicitly before matching".to_owned(),
+                    ));
+                }
+                self.when_result_type(expr.id)
+                    .unwrap_or_else(|| self.ensure_expr(*input).ty)
+            }
             AstExprKind::Then { input, output } => {
                 let input_flow = self.ensure_expr(*input);
                 if !matches!(
@@ -1287,6 +1389,333 @@ impl<'a> Checker<'a> {
         FlowType {
             mode: self.flow_mode_for_expr(expr),
             ty,
+        }
+    }
+
+    fn infer_bytes_literal(
+        &mut self,
+        expr: &AstExpr,
+        size: &BytesSizeSyntax,
+        items: &[usize],
+    ) -> Type {
+        let mut known_len = 0usize;
+        let mut all_fixed = true;
+        for item in items {
+            let item_flow = self.ensure_expr(*item);
+            match item_flow.ty {
+                Type::Byte => known_len += 1,
+                Type::Bytes(BytesType::Fixed(len)) => known_len += len,
+                Type::Bytes(BytesType::Dynamic) => {
+                    all_fixed = false;
+                    if !matches!(size, BytesSizeSyntax::Dynamic) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            *item,
+                            "fixed BYTES constructors cannot contain dynamic BYTES".to_owned(),
+                        ));
+                    }
+                }
+                Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. } => {
+                    all_fixed = false;
+                }
+                other => {
+                    all_fixed = false;
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        *item,
+                        format!(
+                            "BYTES constructor items must be byte literals or BYTES values, found {}; use Text/to_bytes for explicit TEXT/BYTES conversion",
+                            boon_facing_type_label(&other)
+                        ),
+                    ));
+                }
+            }
+        }
+        match size {
+            BytesSizeSyntax::Dynamic => Type::Bytes(BytesType::Dynamic),
+            BytesSizeSyntax::Infer => {
+                if all_fixed {
+                    Type::Bytes(BytesType::Fixed(known_len))
+                } else {
+                    self.diagnostics.push(
+                        self.diagnostic_for_expr(
+                            expr.id,
+                            "BYTES[__] length cannot be inferred from dynamic or unknown content"
+                                .to_owned(),
+                        ),
+                    );
+                    Type::Bytes(BytesType::Dynamic)
+                }
+            }
+            BytesSizeSyntax::Fixed(expected) => {
+                if !items.is_empty() && all_fixed && known_len != *expected {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expr.id,
+                        format!(
+                            "BYTES[{expected}] contains {known_len} byte(s); fixed BYTES length must match exactly"
+                        ),
+                    ));
+                }
+                Type::Bytes(BytesType::Fixed(*expected))
+            }
+        }
+    }
+
+    fn check_bytes_builtin_arguments(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        piped: bool,
+    ) {
+        if !is_bytes_boundary_builtin(function) {
+            return;
+        }
+        self.check_bytes_builtin_allowed_args(expr_id, function, args, piped);
+        self.check_bytes_builtin_required_args(expr_id, function, args, piped);
+
+        if matches!(function, "Text/to_bytes" | "Bytes/to_text") {
+            self.check_bytes_encoding_argument(expr_id, function, args);
+        }
+
+        if matches!(
+            function,
+            "Bytes/read_unsigned"
+                | "Bytes/read_signed"
+                | "Bytes/write_unsigned"
+                | "Bytes/write_signed"
+        ) {
+            self.check_bytes_numeric_arguments(expr_id, args);
+        }
+    }
+
+    fn check_bytes_builtin_allowed_args(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        piped: bool,
+    ) {
+        for arg in args {
+            let Some(name) = arg.name.as_deref() else {
+                continue;
+            };
+            if bytes_builtin_arg_allowed(function, name, piped) {
+                continue;
+            }
+            self.diagnostics.push(self.diagnostic_for_expr(
+                arg.value,
+                format!("`{function}` does not accept argument `{name}`"),
+            ));
+        }
+        if function == "Bytes/zeros"
+            && args
+                .iter()
+                .any(|arg| arg.name.as_deref().is_some_and(|name| name == "input"))
+        {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                "`Bytes/zeros` creates BYTES and does not accept an input BYTES value".to_owned(),
+            ));
+        }
+    }
+
+    fn check_bytes_builtin_required_args(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        piped: bool,
+    ) {
+        let has_input =
+            piped || has_any_named_arg(args, &["input", "text"]) || has_unnamed_arg(args);
+        let missing_input = || {
+            format!(
+                "`{function}` requires an input {} value",
+                if matches!(
+                    function,
+                    "Text/to_bytes" | "Bytes/from_hex" | "Bytes/from_base64"
+                ) {
+                    "TEXT"
+                } else {
+                    "BYTES"
+                }
+            )
+        };
+        match function {
+            "Text/to_bytes" | "Bytes/from_hex" | "Bytes/from_base64" => {
+                if !has_input {
+                    self.diagnostics
+                        .push(self.diagnostic_for_expr(expr_id, missing_input()));
+                }
+            }
+            "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/to_base64"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed" => {
+                let pair_input = matches!(function, "Bytes/concat" | "Bytes/equal")
+                    && has_any_named_arg(args, &["left", "right"]);
+                if !has_input && !pair_input {
+                    self.diagnostics
+                        .push(self.diagnostic_for_expr(expr_id, missing_input()));
+                }
+            }
+            "Bytes/concat" | "Bytes/equal" => {
+                if has_any_named_arg(args, &["left", "right"]) {
+                    self.require_one_of(expr_id, function, args, &["left"], "left BYTES input");
+                    self.require_one_of(expr_id, function, args, &["right"], "right BYTES input");
+                } else {
+                    if !has_input {
+                        self.diagnostics
+                            .push(self.diagnostic_for_expr(expr_id, missing_input()));
+                    }
+                    self.require_one_of(expr_id, function, args, &["with"], "second BYTES input");
+                }
+            }
+            "Bytes/zeros" => {}
+            _ => {}
+        }
+
+        match function {
+            "Bytes/get" => self.require_one_of(expr_id, function, args, &["index"], "`index`"),
+            "Bytes/set" => {
+                self.require_one_of(expr_id, function, args, &["index"], "`index`");
+                self.require_one_of(expr_id, function, args, &["value"], "`value`");
+            }
+            "Bytes/slice" => {
+                self.require_one_of(expr_id, function, args, &["offset", "start"], "`offset`");
+                self.require_one_of(
+                    expr_id,
+                    function,
+                    args,
+                    &["byte_count", "length", "count"],
+                    "`byte_count`",
+                );
+            }
+            "Bytes/take" | "Bytes/drop" | "Bytes/zeros" => self.require_one_of(
+                expr_id,
+                function,
+                args,
+                &["byte_count", "length", "count"],
+                "`byte_count`",
+            ),
+            "Bytes/find" => self.require_one_of(expr_id, function, args, &["needle"], "`needle`"),
+            "Bytes/starts_with" => {
+                self.require_one_of(expr_id, function, args, &["prefix"], "`prefix`");
+            }
+            "Bytes/ends_with" => {
+                self.require_one_of(expr_id, function, args, &["suffix"], "`suffix`");
+            }
+            "Bytes/read_unsigned" | "Bytes/read_signed" => {
+                self.require_one_of(expr_id, function, args, &["offset"], "`offset`");
+                self.require_one_of(expr_id, function, args, &["byte_count"], "`byte_count`");
+                self.require_one_of(expr_id, function, args, &["endian"], "`endian: Little|Big`");
+            }
+            "Bytes/write_unsigned" | "Bytes/write_signed" => {
+                self.require_one_of(expr_id, function, args, &["offset"], "`offset`");
+                self.require_one_of(expr_id, function, args, &["byte_count"], "`byte_count`");
+                self.require_one_of(expr_id, function, args, &["endian"], "`endian: Little|Big`");
+                self.require_one_of(expr_id, function, args, &["value"], "`value`");
+            }
+            _ => {}
+        }
+    }
+
+    fn require_one_of(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        names: &[&str],
+        label: &str,
+    ) {
+        if has_any_named_arg(args, names) {
+            return;
+        }
+        self.diagnostics
+            .push(self.diagnostic_for_expr(expr_id, format!("`{function}` requires {label}")));
+    }
+
+    fn check_bytes_encoding_argument(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+    ) {
+        match named_arg_expr(args, "encoding").and_then(|arg| self.program.expressions.get(arg)) {
+            Some(AstExpr {
+                kind:
+                    AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value),
+                ..
+            }) if value == "Utf8" || value == "Ascii" => {}
+            Some(expr) => self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr.id,
+                    "`encoding` must be `Utf8` or `Ascii` for explicit TEXT/BYTES conversion"
+                        .to_owned(),
+                ),
+            ),
+            None => self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("`{function}` requires explicit `encoding: Utf8|Ascii`"),
+            )),
+        }
+    }
+
+    fn check_bytes_numeric_arguments(&mut self, expr_id: usize, args: &[AstCallArg]) {
+        match named_arg_expr(args, "endian").and_then(|arg| self.program.expressions.get(arg)) {
+            Some(AstExpr {
+                kind:
+                    AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value),
+                ..
+            }) if value == "Little" || value == "Big" => {}
+            Some(expr) => self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr.id,
+                    "`endian` must be `Little` or `Big` for multi-byte BYTES numeric operations"
+                        .to_owned(),
+                ),
+            ),
+            None => self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                "BYTES numeric operations require explicit `endian: Little|Big`".to_owned(),
+            )),
+        }
+
+        match named_arg_expr(args, "byte_count").and_then(|arg| self.program.expressions.get(arg)) {
+            Some(AstExpr {
+                kind: AstExprKind::Number(value),
+                id,
+                ..
+            }) => match value.parse::<usize>() {
+                Ok(1 | 2 | 4 | 8) => {}
+                _ => self.diagnostics.push(
+                    self.diagnostic_for_expr(
+                        *id,
+                        "`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8 in v1"
+                            .to_owned(),
+                    ),
+                ),
+            },
+            Some(expr) => self.diagnostics.push(self.diagnostic_for_expr(
+                expr.id,
+                "`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8 in v1".to_owned(),
+            )),
+            None => self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                "BYTES numeric operations require explicit `byte_count`".to_owned(),
+            )),
         }
     }
 
@@ -1502,6 +1931,26 @@ impl<'a> Checker<'a> {
         result
     }
 
+    fn latest_result_type(&mut self, expr_id: usize) -> Option<Type> {
+        let branch_expr_ids = latest_branch_expr_ids(
+            &self.program.ast.statements,
+            expr_id,
+            &self.program.expressions,
+        );
+        let mut result: Option<Type> = None;
+        for branch_expr_id in branch_expr_ids {
+            let branch_type = self.ensure_expr(branch_expr_id).ty;
+            if matches!(branch_type, Type::Skip) {
+                continue;
+            }
+            result = Some(match result {
+                Some(existing) => widen_structural_type(&existing, &branch_type),
+                None => branch_type,
+            });
+        }
+        result
+    }
+
     fn hold_result_type(&mut self, expr_id: usize, initial: usize) -> Type {
         let mut ty = self.ensure_expr(initial).ty;
         let updates = hold_update_exprs_for_expr(
@@ -1645,6 +2094,13 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
             AstExprKind::Number(_) => Some(Type::Number),
+            AstExprKind::ByteLiteral { .. } => Some(Type::Byte),
+            AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
+                size,
+                items,
+                self.program.expressions.as_slice(),
+                |expr| self.static_expr_type(expr, active_functions),
+            )),
             AstExprKind::Bool(_) => Some(true_false_type()),
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
@@ -1742,7 +2198,10 @@ impl<'a> Checker<'a> {
                 .get(*output)
                 .and_then(|expr| self.static_expr_type(expr, active_functions)),
             AstExprKind::MatchArm { output: None, .. } => Some(Type::Skip),
-            AstExprKind::Source | AstExprKind::Latest => Some(exact_empty_object_type()),
+            AstExprKind::Source => Some(exact_empty_object_type()),
+            AstExprKind::Latest => self
+                .static_latest_result_type(expr.id, active_functions)
+                .or_else(|| Some(exact_empty_object_type())),
             _ => None,
         }
     }
@@ -1764,6 +2223,36 @@ impl<'a> Checker<'a> {
             result = Some(match result {
                 Some(existing) => widen_structural_type(&existing, &arm_type),
                 None => arm_type,
+            });
+        }
+        result
+    }
+
+    fn static_latest_result_type(
+        &self,
+        expr_id: usize,
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let mut result = None;
+        for branch_expr_id in latest_branch_expr_ids(
+            &self.program.ast.statements,
+            expr_id,
+            &self.program.expressions,
+        ) {
+            let Some(branch_type) = self
+                .program
+                .expressions
+                .get(branch_expr_id)
+                .and_then(|expr| self.static_expr_type(expr, active_functions))
+            else {
+                continue;
+            };
+            if matches!(branch_type, Type::Skip) {
+                continue;
+            }
+            result = Some(match result {
+                Some(existing) => widen_structural_type(&existing, &branch_type),
+                None => branch_type,
             });
         }
         result
@@ -1855,35 +2344,162 @@ impl<'a> Checker<'a> {
             .function_statements
             .get(function)
             .copied()
-            .and_then(|statement| self.function_body_return_type(statement, active_functions));
+            .and_then(|statement| {
+                self.function_body_return_type(function, statement, active_functions)
+            });
         active_functions.remove(function);
         result
     }
 
     fn function_body_return_type(
         &self,
+        function: &str,
         statement: &AstStatement,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
+        let local_bindings = self.user_function_static_bindings(function);
         if let Some(renderable) = statement.children.iter().find_map(|child| {
-            self.static_statement_type(child, active_functions)
+            self.static_statement_type_with_bindings(child, active_functions, &local_bindings)
                 .filter(type_contains_renderable)
         }) {
             return Some(renderable);
         }
         let mut fields = BTreeMap::new();
         let mut field_order = Vec::new();
-        self.collect_static_statement_fields(
+        self.collect_static_statement_fields_with_bindings(
             &statement.children,
             active_functions,
+            &local_bindings,
             &mut fields,
             &mut field_order,
         );
-        (!fields.is_empty()).then_some(Type::Object(ObjectShape {
-            fields,
-            field_order,
-            open: false,
-        }))
+        if !fields.is_empty() {
+            return Some(Type::Object(ObjectShape {
+                fields,
+                field_order,
+                open: false,
+            }));
+        }
+        self.static_block_return_type_with_bindings(
+            &statement.children,
+            active_functions,
+            &local_bindings,
+        )
+    }
+
+    fn user_function_static_bindings(&self, function: &str) -> BTreeMap<String, Type> {
+        let mut bindings = self.name_bindings.clone();
+        if let Some(args) = self.function_args_by_name.get(function) {
+            for arg in args {
+                bindings.insert(arg.clone(), self.function_arg_display_type(function, arg));
+            }
+        }
+        bindings
+    }
+
+    fn collect_static_statement_fields_with_bindings(
+        &self,
+        statements: &[AstStatement],
+        active_functions: &mut BTreeSet<String>,
+        bindings: &BTreeMap<String, Type>,
+        fields: &mut BTreeMap<String, Type>,
+        field_order: &mut Vec<String>,
+    ) {
+        for statement in statements {
+            if semantic_block_statement(statement, &self.program.expressions) {
+                if let Some(Type::Object(shape)) = self.static_block_return_type_with_bindings(
+                    &statement.children,
+                    active_functions,
+                    bindings,
+                ) {
+                    merge_shape_override(fields, field_order, &shape);
+                }
+                continue;
+            }
+            if let Some(field) = statement_output_name(statement)
+                && field != "document"
+                && let Some(ty) =
+                    self.static_statement_type_with_bindings(statement, active_functions, bindings)
+            {
+                insert_ordered_shape_field(fields, field_order, field, ty);
+            } else {
+                self.collect_static_statement_fields_with_bindings(
+                    &statement.children,
+                    active_functions,
+                    bindings,
+                    fields,
+                    field_order,
+                );
+            }
+        }
+    }
+
+    fn static_statement_type_with_bindings(
+        &self,
+        statement: &AstStatement,
+        active_functions: &mut BTreeSet<String>,
+        bindings: &BTreeMap<String, Type>,
+    ) -> Option<Type> {
+        if semantic_block_statement(statement, &self.program.expressions) {
+            return self.static_block_return_type_with_bindings(
+                &statement.children,
+                active_functions,
+                bindings,
+            );
+        }
+        if let Some(ty) =
+            self.static_statement_pipeline_type_with_bindings(statement, active_functions, bindings)
+        {
+            return Some(ty);
+        }
+        if let Some(expr_id) =
+            statement_pipeline_final_expr_id(statement, &self.program.expressions)
+                .or_else(|| direct_statement_value_expr_id(statement, &self.program.expressions))
+            && let Some(expr) = self.program.expressions.get(expr_id)
+            && let Some(ty) =
+                static_expr_type_from_bindings(expr, &self.program.expressions, bindings)
+        {
+            return Some(ty);
+        }
+        self.static_statement_type(statement, active_functions)
+            .or_else(|| {
+                let mut fields = BTreeMap::new();
+                let mut field_order = Vec::new();
+                self.collect_static_statement_fields_with_bindings(
+                    &statement.children,
+                    active_functions,
+                    bindings,
+                    &mut fields,
+                    &mut field_order,
+                );
+                (!fields.is_empty()).then_some(Type::Object(ObjectShape {
+                    fields,
+                    field_order,
+                    open: false,
+                }))
+            })
+    }
+
+    fn static_block_return_type_with_bindings(
+        &self,
+        statements: &[AstStatement],
+        active_functions: &mut BTreeSet<String>,
+        bindings: &BTreeMap<String, Type>,
+    ) -> Option<Type> {
+        let mut result = None;
+        for statement in statements {
+            if statement_is_source_pipe_continuation(statement, &self.program.expressions)
+                && result.is_some()
+            {
+                continue;
+            }
+            if let Some(ty) =
+                self.static_statement_type_with_bindings(statement, active_functions, bindings)
+            {
+                result = Some(ty);
+            }
+        }
+        result
     }
 
     fn collect_static_statement_fields(
@@ -1929,11 +2545,24 @@ impl<'a> Checker<'a> {
         if let Some(arm_type) = self.static_match_arm_statement_type(statement, active_functions) {
             return Some(arm_type);
         }
+        if let Some(ty) = self.static_statement_pipeline_type_with_bindings(
+            statement,
+            active_functions,
+            &self.name_bindings,
+        ) {
+            return Some(ty);
+        }
         match &statement.kind {
-            AstStatementKind::Source { .. } => Some(source_statement_value_type(
-                statement,
-                &self.source_payload_shape_table,
-            )),
+            AstStatementKind::Source { .. } => statement
+                .expr
+                .and_then(|expr_id| self.program.expressions.get(expr_id))
+                .and_then(|expr| self.static_expr_type(expr, active_functions))
+                .or_else(|| {
+                    Some(source_statement_value_type(
+                        statement,
+                        &self.source_payload_shape_table,
+                    ))
+                }),
             AstStatementKind::List { .. } => {
                 self.static_list_statement_type(statement, active_functions)
             }
@@ -1959,15 +2588,106 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn static_statement_pipeline_type_with_bindings(
+        &self,
+        statement: &AstStatement,
+        active_functions: &mut BTreeSet<String>,
+        bindings: &BTreeMap<String, Type>,
+    ) -> Option<Type> {
+        let expr_ids = statement_expression_child_expr_ids(statement);
+        if !expression_sequence_is_pipeline(&expr_ids, &self.program.expressions) {
+            return None;
+        }
+        let (first, rest) = expr_ids.split_first()?;
+        let mut ty = self.static_expr_type_for_pipeline_expr(*first, active_functions, bindings)?;
+        for expr_id in rest {
+            let Some(AstExpr {
+                kind: AstExprKind::Pipe { op, args, .. },
+                ..
+            }) = self.program.expressions.get(*expr_id)
+            else {
+                ty =
+                    self.static_expr_type_for_pipeline_expr(*expr_id, active_functions, bindings)?;
+                continue;
+            };
+            ty = match op.as_str() {
+                "List/retain"
+                | "List/remove"
+                | "List/filter_field_equal"
+                | "List/filter_field_not_equal"
+                | "List/move_field_first"
+                | "List/move_field_last"
+                | "SOURCE" => ty,
+                "List/count" | "List/sum" => Type::Number,
+                "List/append" => {
+                    let append_ty = args
+                        .iter()
+                        .find(|arg| arg.name.as_deref() == Some("item"))
+                        .and_then(|arg| {
+                            self.static_expr_type_for_pipeline_expr(
+                                arg.value,
+                                active_functions,
+                                bindings,
+                            )
+                        });
+                    match (ty, append_ty) {
+                        (Type::List(item), Some(append_ty)) => {
+                            Type::List(Box::new(widen_structural_type(&item, &append_ty)))
+                        }
+                        (existing, _) => existing,
+                    }
+                }
+                "List/map" => self
+                    .static_expr_type_for_pipeline_expr(*expr_id, active_functions, bindings)
+                    .unwrap_or(ty),
+                "Bool/not" | "Bool/and" | "Bool/toggle" | "Text/is_not_empty" | "List/every"
+                | "List/any" | "List/is_not_empty" => true_false_type(),
+                "List/latest" => {
+                    list_item_type_from_list_type(&ty).unwrap_or_else(open_object_type)
+                }
+                _ if op.starts_with("Field/") => {
+                    if let (Type::Object(shape), Some(field)) = (&ty, op.strip_prefix("Field/")) {
+                        shape.fields.get(field).cloned().unwrap_or(Type::Unknown)
+                    } else {
+                        Type::Unknown
+                    }
+                }
+                _ => self
+                    .static_expr_type_for_pipeline_expr(*expr_id, active_functions, bindings)
+                    .unwrap_or(ty),
+            };
+        }
+        Some(ty)
+    }
+
+    fn static_expr_type_for_pipeline_expr(
+        &self,
+        expr_id: usize,
+        active_functions: &mut BTreeSet<String>,
+        bindings: &BTreeMap<String, Type>,
+    ) -> Option<Type> {
+        let expr = self.program.expressions.get(expr_id)?;
+        static_expr_type_from_bindings(expr, &self.program.expressions, bindings)
+            .or_else(|| self.static_expr_type(expr, active_functions))
+    }
+
     fn static_block_return_type(
         &self,
         statements: &[AstStatement],
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
-        statements
-            .iter()
-            .filter_map(|statement| self.static_statement_type(statement, active_functions))
-            .last()
+        let mut result = None;
+        for statement in statements {
+            if statement_is_source_pipe_continuation(statement, &self.program.expressions)
+                && result.is_some()
+            {
+                continue;
+            }
+            if let Some(ty) = self.static_statement_type(statement, active_functions) {
+                result = Some(ty);
+            }
+        }
+        result
     }
 
     fn static_match_arm_statement_type(
@@ -2101,6 +2821,17 @@ impl<'a> Checker<'a> {
         matches!(
             self.program.expressions.get(expr_id).map(|expr| &expr.kind),
             Some(AstExprKind::Path(parts)) if path_is_event_payload_parts(parts)
+        )
+    }
+
+    fn expr_id_is_bytes_source_payload_path(&self, expr_id: usize) -> bool {
+        matches!(
+            self.program.expressions.get(expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Path(parts))
+                if matches!(
+                    self.source_payload_lookup.access_for_parts(parts),
+                    Some(SourcePayloadAccess::Field(field)) if field == "bytes"
+                )
         )
     }
 
@@ -2353,6 +3084,114 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_builtin_call_compatibility(
+        &mut self,
+        function: &str,
+        pipe_input: Option<usize>,
+        call_args: &[AstCallArg],
+    ) {
+        if let Some(input_expr_id) = pipe_input
+            && !self.expr_id_is_pipe_placeholder(input_expr_id)
+        {
+            let actual = self.ensure_expr(input_expr_id).ty;
+            if let Some(expected_label) = builtin_pipe_input_custom_expected_label(function) {
+                if !builtin_pipe_input_custom_accepts(function, &actual) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        input_expr_id,
+                        format!(
+                            "`{function}` pipe input has incompatible type\nexpected: {expected_label}\nfound: {}",
+                            boon_facing_type_label(&actual)
+                        ),
+                    ));
+                }
+            } else if let Some(expected) = pipe_input_expected_type(function) {
+                self.constraints.push(Constraint::Assignable {
+                    actual: actual.clone(),
+                    expected: expected.clone(),
+                });
+                if !type_is_assignable_to(&actual, &expected) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        input_expr_id,
+                        format!(
+                            "`{function}` pipe input has incompatible type\nexpected: {}\nfound: {}",
+                            boon_facing_type_label(&expected),
+                            boon_facing_type_label(&actual)
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let piped = pipe_input.is_some();
+        for arg in call_args {
+            let arg_name = arg.name.as_deref();
+            if function == "Bool/toggle" && arg_name == Some("when") {
+                let actual_flow = self.ensure_expr(arg.value);
+                self.constraints.push(Constraint::FlowCompatible {
+                    actual: actual_flow.clone(),
+                    expected: FlowType {
+                        mode: FlowMode::PresentOrAbsent,
+                        ty: actual_flow.ty.clone(),
+                    },
+                });
+                if !bool_toggle_when_accepts_flow(
+                    &actual_flow,
+                    self.expr_id_is_event_payload_path(arg.value)
+                        || self.expr_id_is_pipe_placeholder(arg.value),
+                ) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        arg.value,
+                        format!(
+                            "`{function}` argument `when` requires a tick-present-or-absent value\nexpected: SOURCE pulse\nfound: {}",
+                            boon_facing_type_label(&actual_flow.ty)
+                        ),
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(expected_label) =
+                builtin_argument_custom_expected_label(function, arg_name, piped)
+            {
+                let actual = self.ensure_expr(arg.value).ty;
+                if !builtin_argument_custom_accepts(function, arg_name, &actual, piped) {
+                    let arg_label = arg.name.as_deref().unwrap_or("argument");
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        arg.value,
+                        format!(
+                            "`{function}` argument `{arg_label}` has incompatible type\nexpected: {expected_label}\nfound: {}",
+                            boon_facing_type_label(&actual)
+                        ),
+                    ));
+                }
+                continue;
+            }
+
+            let Some(expected) =
+                builtin_argument_expected_type(function, arg.name.as_deref(), piped)
+            else {
+                continue;
+            };
+            let actual = self.ensure_expr(arg.value).ty;
+            self.constraints.push(Constraint::Assignable {
+                actual: actual.clone(),
+                expected: expected.clone(),
+            });
+            if type_is_assignable_to(&actual, &expected) {
+                continue;
+            }
+            let arg_label = arg.name.as_deref().unwrap_or("argument");
+            self.diagnostics.push(self.diagnostic_for_expr(
+                arg.value,
+                format!(
+                    "`{function}` argument `{arg_label}` has incompatible type\nexpected: {}\nfound: {}",
+                    boon_facing_type_label(&expected),
+                    boon_facing_type_label(&actual)
+                ),
+            ));
+        }
+    }
+
     fn check_hold_update_compatibility(&mut self, statement: &AstStatement) {
         let Some(expr_id) = statement.expr else {
             return;
@@ -2411,6 +3250,30 @@ impl<'a> Checker<'a> {
             Some(AstExprKind::Latest)
         ) {
             return;
+        }
+        let mut direct_then_sources = BTreeMap::new();
+        for child in &statement.children {
+            let Some((trigger_expr_id, trigger)) =
+                latest_direct_then_trigger_key(child, &self.program.expressions)
+            else {
+                continue;
+            };
+            if let Some(first_expr_id) =
+                direct_then_sources.insert(trigger.clone(), trigger_expr_id)
+            {
+                let first_line = self
+                    .program
+                    .expressions
+                    .get(first_expr_id)
+                    .map(|expr| expr.line)
+                    .unwrap_or_default();
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    trigger_expr_id,
+                    format!(
+                        "duplicate direct `LATEST` branch for source `{trigger}`; first branch is on line {first_line}. Use one branch for a source trigger or make disjoint `WHEN` guards explicit."
+                    ),
+                ));
+            }
         }
         let mut expected_type: Option<Type> = None;
         for branch_expr_id in statement
@@ -3031,11 +3894,17 @@ fn collect_expr_user_function_calls(
                 collect_expr_user_function_calls(field.value, expressions, user_functions, calls);
             }
         }
+        AstExprKind::BytesLiteral { items, .. } => {
+            for item in items {
+                collect_expr_user_function_calls(*item, expressions, user_functions, calls);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Bool(_)
         | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
@@ -3142,6 +4011,22 @@ fn expression_sequence_is_pipeline(expr_ids: &[usize], expressions: &[AstExpr]) 
             .all(|expr_id| expr_is_pipeline_continuation(*expr_id, expressions))
 }
 
+fn statement_is_source_pipe_continuation(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    let Some(expr) = statement.expr.and_then(|expr_id| expressions.get(expr_id)) else {
+        return false;
+    };
+    let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
+        return false;
+    };
+    op == "SOURCE"
+        && expressions
+            .get(*input)
+            .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+}
+
 fn expr_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
     let input = match expressions.get(expr_id).map(|expr| &expr.kind) {
         Some(AstExprKind::Pipe { input, .. })
@@ -3217,6 +4102,24 @@ fn list_map_new_expr_id(args: &[AstCallArg]) -> Option<usize> {
     args.iter()
         .find(|arg| arg.name.as_deref() == Some("new"))
         .map(|arg| arg.value)
+}
+
+fn named_arg_expr(args: &[AstCallArg], name: &str) -> Option<usize> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .map(|arg| arg.value)
+}
+
+fn has_any_named_arg(args: &[AstCallArg], names: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        arg.name
+            .as_deref()
+            .is_some_and(|name| names.contains(&name))
+    })
+}
+
+fn has_unnamed_arg(args: &[AstCallArg]) -> bool {
+    args.iter().any(|arg| arg.name.is_none())
 }
 
 fn pattern_selector_expr_id(expr_id: usize, expressions: &[AstExpr]) -> Option<usize> {
@@ -3322,6 +4225,43 @@ fn statement_expr_ids(statement: &AstStatement) -> Vec<usize> {
     expr_ids
 }
 
+fn resolved_constant_table(program: &ParsedProgram) -> ResolvedConstantTable {
+    let entries = program
+        .expressions
+        .iter()
+        .filter_map(|expr| {
+            let value = match &expr.kind {
+                AstExprKind::Number(value) => {
+                    let value = value.parse::<i64>().ok()?;
+                    if value >= 0 {
+                        ResolvedConstantValue::UnsignedInteger {
+                            value: u64::try_from(value).ok()?,
+                        }
+                    } else {
+                        ResolvedConstantValue::SignedInteger { value }
+                    }
+                }
+                AstExprKind::ByteLiteral { value, .. } => {
+                    ResolvedConstantValue::Byte { value: *value }
+                }
+                AstExprKind::Enum(value) | AstExprKind::Tag(value)
+                    if matches!(value.as_str(), "Little" | "Big" | "Utf8" | "Ascii") =>
+                {
+                    ResolvedConstantValue::Symbol {
+                        value: value.clone(),
+                    }
+                }
+                _ => return None,
+            };
+            Some(ResolvedConstantEntry {
+                expr_id: expr.id,
+                value,
+            })
+        })
+        .collect();
+    ResolvedConstantTable { entries }
+}
+
 fn collect_statement_expr_ids(statement: &AstStatement, expr_ids: &mut Vec<usize>) {
     if let Some(expr_id) = statement.expr {
         expr_ids.push(expr_id);
@@ -3353,6 +4293,8 @@ fn scene_root(program: &ParsedProgram) -> Option<&AstStatement> {
 pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
     number_functions: BTreeSet<&'static str>,
+    byte_functions: BTreeSet<&'static str>,
+    bytes_functions: BTreeSet<&'static str>,
     true_false_functions: BTreeSet<&'static str>,
     list_functions: BTreeSet<&'static str>,
     list_item_functions: BTreeSet<&'static str>,
@@ -3378,6 +4320,11 @@ impl Default for BuiltinSignatureRegistry {
                 "Router/route",
                 "Router/go_to",
                 "Ulid/generate",
+                "Bytes/to_text",
+                "Bytes/to_hex",
+                "Bytes/to_base64",
+                "File/read_text",
+                "File/write_bytes",
             ]
             .into_iter()
             .collect(),
@@ -3397,6 +4344,27 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/find",
                 "Text/length",
                 "Text/to_number",
+                "Bytes/length",
+                "Bytes/find",
+                "Bytes/read_unsigned",
+                "Bytes/read_signed",
+            ]
+            .into_iter()
+            .collect(),
+            byte_functions: ["Bytes/get"].into_iter().collect(),
+            bytes_functions: [
+                "Bytes/set",
+                "Bytes/slice",
+                "Bytes/take",
+                "Bytes/drop",
+                "Bytes/concat",
+                "Bytes/zeros",
+                "Text/to_bytes",
+                "Bytes/from_hex",
+                "Bytes/from_base64",
+                "Bytes/write_unsigned",
+                "Bytes/write_signed",
+                "File/read_bytes",
             ]
             .into_iter()
             .collect(),
@@ -3412,6 +4380,10 @@ impl Default for BuiltinSignatureRegistry {
                 "List/every",
                 "List/any",
                 "List/is_not_empty",
+                "Bytes/is_empty",
+                "Bytes/equal",
+                "Bytes/starts_with",
+                "Bytes/ends_with",
             ]
             .into_iter()
             .collect(),
@@ -3454,6 +4426,10 @@ impl BuiltinSignatureRegistry {
             Type::Text
         } else if self.number_functions.contains(function) {
             Type::Number
+        } else if self.byte_functions.contains(function) {
+            Type::Byte
+        } else if self.bytes_functions.contains(function) {
+            Type::Bytes(BytesType::Dynamic)
         } else if self.true_false_functions.contains(function) {
             true_false_type()
         } else if self.list_functions.contains(function) {
@@ -3628,6 +4604,11 @@ impl RenderContractRegistry {
             .roots
             .get(self.active_root)
             .and_then(|root| root.constructors.get(function))
+            .or_else(|| {
+                self.roots
+                    .values()
+                    .find_map(|root| root.constructors.get(function))
+            })
             .map(|contract| contract.kind_type(&lookup_fields))
             .unwrap_or_else(|| Type::VariantSet(vec![Variant::Tag("Renderable".to_owned())]));
         ordered_fields.push(("kind".to_owned(), kind));
@@ -3785,6 +4766,8 @@ fn boon_facing_type_display_tree_with_depth(
     match ty {
         Type::Text => scalar_type_display_node("TEXT"),
         Type::Number => scalar_type_display_node("NUMBER"),
+        Type::Byte => scalar_type_display_node("BYTE"),
+        Type::Bytes(bytes) => scalar_type_display_node(bytes_type_label(bytes)),
         Type::Skip => scalar_type_display_node("ABSENT"),
         Type::RenderContract => TypeDisplayNode::Object {
             fields: vec![TypeDisplayField {
@@ -3886,6 +4869,8 @@ fn boon_facing_type_label_with_depth(
     match ty {
         Type::Text => "TEXT".to_owned(),
         Type::Number => "NUMBER".to_owned(),
+        Type::Byte => "BYTE".to_owned(),
+        Type::Bytes(bytes) => bytes_type_label(bytes),
         Type::Skip => "ABSENT".to_owned(),
         Type::RenderContract => document_render_contract_label(compact),
         Type::Unknown | Type::Var(_) => "VALUE".to_owned(),
@@ -3973,6 +4958,13 @@ fn document_render_contract_label(compact: bool) -> String {
     kind: Button | Checkbox | Document | Row | Stack | Text | TextInput
 ]"
         .to_owned()
+    }
+}
+
+fn bytes_type_label(bytes: &BytesType) -> String {
+    match bytes {
+        BytesType::Dynamic => "BYTES".to_owned(),
+        BytesType::Fixed(len) => format!("BYTES[{len}]"),
     }
 }
 
@@ -4072,7 +5064,9 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         (_, right) if is_open_object_type(right) => false,
         (Type::Text, Type::Text)
         | (Type::Number, Type::Number)
+        | (Type::Byte, Type::Byte)
         | (Type::RenderContract, Type::RenderContract) => false,
+        (Type::Bytes(left), Type::Bytes(right)) => bytes_type_conflict(left, right),
         (Type::VariantSet(_), Type::VariantSet(_)) => false,
         (Type::Object(left), Type::Object(right)) => {
             left.fields.iter().any(|(field, left_type)| {
@@ -4085,6 +5079,13 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         (Type::List(left), Type::List(right)) => concrete_type_conflict(left, right),
         (Type::Var(_), _) | (_, Type::Var(_)) => false,
         _ => true,
+    }
+}
+
+fn bytes_type_conflict(left: &BytesType, right: &BytesType) -> bool {
+    match (left, right) {
+        (BytesType::Fixed(left), BytesType::Fixed(right)) => left != right,
+        (BytesType::Dynamic, _) | (_, BytesType::Dynamic) => false,
     }
 }
 
@@ -4105,7 +5106,8 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => true,
         (_, expected) if is_open_object_type(expected) => true,
         (actual, _) if is_open_object_type(actual) => true,
-        (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
+        (Type::Text, Type::Text) | (Type::Number, Type::Number) | (Type::Byte, Type::Byte) => true,
+        (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
         (actual, expected) if type_accepts_true_false(expected) => type_accepts_true_false(actual),
         (Type::RenderContract, Type::RenderContract) => true,
         (actual, Type::RenderContract) => is_renderable_type(actual),
@@ -4125,6 +5127,14 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
                 .any(|actual| variant_is_assignable_to(actual, expected))
         }),
         _ => false,
+    }
+}
+
+fn bytes_type_assignable(actual: &BytesType, expected: &BytesType) -> bool {
+    match (actual, expected) {
+        (_, BytesType::Dynamic) => true,
+        (BytesType::Fixed(actual), BytesType::Fixed(expected)) => actual == expected,
+        (BytesType::Dynamic, BytesType::Fixed(_)) => false,
     }
 }
 
@@ -4229,6 +5239,36 @@ fn when_arm_expr_ids(
         let nested = when_arm_expr_ids(&statement.children, expr_id, expressions);
         if !nested.is_empty() {
             return nested;
+        }
+    }
+    Vec::new()
+}
+
+fn latest_branch_expr_ids(
+    statements: &[AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Vec<usize> {
+    for statement in statements {
+        if statement.expr == Some(expr_id) {
+            return statement
+                .children
+                .iter()
+                .flat_map(|child| statement_update_value_exprs(child, expressions))
+                .collect();
+        }
+        let nested = latest_branch_expr_ids(&statement.children, expr_id, expressions);
+        if !nested.is_empty() {
+            return nested;
+        }
+        if statement.expr.is_some_and(|statement_expr_id| {
+            expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+        }) {
+            return statement
+                .children
+                .iter()
+                .flat_map(|child| statement_update_value_exprs(child, expressions))
+                .collect();
         }
     }
     Vec::new()
@@ -4433,6 +5473,37 @@ fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr
         .collect()
 }
 
+fn latest_direct_then_trigger_key(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<(usize, String)> {
+    let expr_ids = statement_pipeline_expr_ids(statement, expressions)
+        .or_else(|| statement.expr.map(|expr_id| vec![expr_id]))?;
+    if expr_ids.iter().any(|expr_id| {
+        matches!(
+            expressions.get(*expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::When { .. })
+        )
+    }) {
+        return None;
+    }
+    let expr_id = *expr_ids.last()?;
+    let AstExprKind::Then { input, .. } = expressions.get(expr_id).map(|expr| &expr.kind)? else {
+        return None;
+    };
+    let key = latest_branch_trigger_expr_key(*input, expressions)?;
+    Some((*input, key))
+}
+
+fn latest_branch_trigger_expr_key(expr_id: usize, expressions: &[AstExpr]) -> Option<String> {
+    match expressions.get(expr_id).map(|expr| &expr.kind)? {
+        AstExprKind::Identifier(value) => Some(value.clone()),
+        AstExprKind::Path(parts) => Some(parts.join(".")),
+        AstExprKind::Pipe { input, .. } => latest_branch_trigger_expr_key(*input, expressions),
+        _ => None,
+    }
+}
+
 fn statement_pipeline_expr_ids(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -4600,10 +5671,43 @@ fn object_shape_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<Obje
     Some(simple_record_shape(fields, expressions))
 }
 
+fn static_bytes_literal_type<F>(
+    size: &BytesSizeSyntax,
+    items: &[usize],
+    expressions: &[AstExpr],
+    mut type_for_expr: F,
+) -> Type
+where
+    F: FnMut(&AstExpr) -> Option<Type>,
+{
+    let mut known_len = 0usize;
+    let mut all_fixed = true;
+    for item in items {
+        match expressions.get(*item).and_then(|expr| type_for_expr(expr)) {
+            Some(Type::Byte) => known_len += 1,
+            Some(Type::Bytes(BytesType::Fixed(len))) => known_len += len,
+            Some(Type::Bytes(BytesType::Dynamic)) | None => all_fixed = false,
+            Some(_) => all_fixed = false,
+        }
+    }
+    match size {
+        BytesSizeSyntax::Dynamic => Type::Bytes(BytesType::Dynamic),
+        BytesSizeSyntax::Infer if all_fixed => Type::Bytes(BytesType::Fixed(known_len)),
+        BytesSizeSyntax::Infer => Type::Bytes(BytesType::Dynamic),
+        BytesSizeSyntax::Fixed(expected) => Type::Bytes(BytesType::Fixed(*expected)),
+    }
+}
+
 fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
     match &expr.kind {
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Type::Text,
         AstExprKind::Number(_) => Type::Number,
+        AstExprKind::ByteLiteral { .. } => Type::Byte,
+        AstExprKind::BytesLiteral { size, items } => {
+            static_bytes_literal_type(size, items, expressions, |expr| {
+                Some(simple_expr_type(expr, expressions))
+            })
+        }
         AstExprKind::Bool(value) => Type::VariantSet(vec![Variant::Tag(if *value {
             "True".to_owned()
         } else {
@@ -4813,11 +5917,8 @@ fn collect_param_requirements_expr(
             );
         }
         AstExprKind::Call { function, args } => {
-            let arg_expected = argument_expected_type(function);
             for arg in args {
-                let expected = render_arg_expected_type(function, arg.name.as_deref())
-                    .or_else(|| list_argument_expected_type(function, arg.name.as_deref()))
-                    .or_else(|| arg_expected.clone());
+                let expected = builtin_argument_expected_type(function, arg.name.as_deref(), false);
                 collect_param_requirements_expr(
                     arg.value,
                     expressions,
@@ -4836,11 +5937,8 @@ fn collect_param_requirements_expr(
                 requirements,
                 input_expected,
             );
-            let arg_expected = argument_expected_type(op);
             for arg in args {
-                let expected = render_arg_expected_type(op, arg.name.as_deref())
-                    .or_else(|| list_argument_expected_type(op, arg.name.as_deref()))
-                    .or_else(|| arg_expected.clone());
+                let expected = builtin_argument_expected_type(op, arg.name.as_deref(), true);
                 collect_param_requirements_expr(
                     arg.value,
                     expressions,
@@ -4901,11 +5999,17 @@ fn collect_param_requirements_expr(
                 );
             }
         }
+        AstExprKind::BytesLiteral { items, .. } => {
+            for item in items {
+                collect_param_requirements_expr(*item, expressions, params, requirements, None);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Bool(_)
         | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
@@ -4953,7 +6057,38 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
         )
     {
         Some(Type::List(Box::new(open_object_type())))
+    } else if function == "Text/to_bytes" {
+        Some(Type::Text)
+    } else if matches!(function, "File/read_bytes" | "File/read_text") {
+        Some(Type::Text)
+    } else if function == "File/write_bytes" {
+        Some(Type::Bytes(BytesType::Dynamic))
     } else if function.starts_with("Text/") {
+        Some(Type::Text)
+    } else if matches!(
+        function,
+        "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/concat"
+            | "Bytes/equal"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/to_base64"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
+    ) {
+        Some(Type::Bytes(BytesType::Dynamic))
+    } else if matches!(function, "Bytes/from_hex" | "Bytes/from_base64") {
         Some(Type::Text)
     } else if function.starts_with("Number/") {
         Some(Type::Number)
@@ -4967,6 +6102,13 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
 fn argument_expected_type(function: &str) -> Option<Type> {
     if function == "Bool/not" || function == "Bool/and" || function == "Bool/toggle" {
         Some(true_false_type())
+    } else if function == "Text/to_bytes" {
+        None
+    } else if matches!(
+        function,
+        "File/read_bytes" | "File/read_text" | "File/write_bytes"
+    ) {
+        Some(Type::Text)
     } else if function.starts_with("Text/") {
         Some(Type::Text)
     } else if function.starts_with("Number/") {
@@ -4976,10 +6118,302 @@ fn argument_expected_type(function: &str) -> Option<Type> {
     }
 }
 
+fn builtin_argument_expected_type(
+    function: &str,
+    arg_name: Option<&str>,
+    piped: bool,
+) -> Option<Type> {
+    if function == "Bool/toggle" && arg_name == Some("when") {
+        return Some(Type::Unknown);
+    }
+    if function == "File/write_bytes" {
+        return match (piped, arg_name) {
+            (true, Some("path") | None) => Some(Type::Text),
+            (false, Some("input") | None) => Some(Type::Bytes(BytesType::Dynamic)),
+            (false, Some("path")) => Some(Type::Text),
+            _ => None,
+        };
+    }
+    if matches!(function, "File/read_bytes" | "File/read_text") {
+        return match arg_name {
+            Some("path") | Some("input") | None => Some(Type::Text),
+            _ => None,
+        };
+    }
+    render_arg_expected_type(function, arg_name)
+        .or_else(|| list_argument_expected_type(function, arg_name))
+        .or_else(|| bytes_argument_expected_type(function, arg_name))
+        .or_else(|| text_argument_expected_type(function, arg_name, piped))
+        .or_else(|| number_argument_expected_type(function, arg_name, piped))
+        .or_else(|| argument_expected_type(function))
+}
+
 fn list_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
     match (function, arg_name) {
         ("List/retain" | "List/every" | "List/any", Some("if")) => Some(true_false_type()),
         _ => None,
+    }
+}
+
+fn text_argument_expected_type(
+    function: &str,
+    arg_name: Option<&str>,
+    piped: bool,
+) -> Option<Type> {
+    match (function, arg_name) {
+        // Current function parameter inference can still classify generic
+        // helper parameters as TEXT before their numeric use is observed.
+        // Unknown blocks the old all-Text fallback without over-constraining
+        // otherwise valid formula helpers.
+        ("Text/substring", Some("start" | "length")) => Some(Type::Unknown),
+        ("Text/substring", Some("input" | "text")) => Some(Type::Text),
+        ("Text/find", Some("needle" | "input" | "text")) => Some(Type::Text),
+        ("Text/starts_with", Some("prefix" | "input" | "text")) => Some(Type::Text),
+        ("Text/ends_with", Some("suffix" | "input" | "text")) => Some(Type::Text),
+        ("Text/concat", Some("with" | "separator" | "input" | "text") | None) => {
+            Some(Type::Unknown)
+        }
+        ("Text/time_range_label", Some("end" | "unit" | "input" | "text") | None) => {
+            Some(Type::Unknown)
+        }
+        ("Text/to_number", Some("radix" | "fallback")) => Some(Type::Number),
+        ("Text/to_number", Some("leading")) => Some(true_false_type()),
+        ("Text/to_number", Some("input" | "text")) => Some(Type::Text),
+        ("Text/to_number", None) if piped => Some(Type::Number),
+        ("Text/to_number", None) => Some(Type::Text),
+        ("Text/to_bytes", Some("input" | "text")) => Some(Type::Text),
+        ("Text/to_bytes", Some("encoding")) => Some(Type::Unknown),
+        _ => None,
+    }
+}
+
+fn number_argument_expected_type(
+    function: &str,
+    arg_name: Option<&str>,
+    piped: bool,
+) -> Option<Type> {
+    match (function, arg_name) {
+        ("Number/to_text", Some("prefix")) => Some(true_false_type()),
+        ("Number/to_text", Some("radix" | "min_width" | "signed_width" | "group_size")) => {
+            Some(Type::Number)
+        }
+        ("Number/to_text", None) if piped => Some(Type::Number),
+        ("Number/project_time", Some("pointer_x" | "pointer_width")) => Some(Type::Unknown),
+        ("Number/project_time", Some("viewport_start" | "viewport_end" | "fallback")) => {
+            Some(Type::Number)
+        }
+        ("Number/project_time", None) => Some(Type::Unknown),
+        _ => None,
+    }
+}
+
+fn builtin_pipe_input_custom_expected_label(function: &str) -> Option<&'static str> {
+    match function {
+        "Text/concat" | "Text/time_range_label" => Some("TEXT, NUMBER, BOOL, or tag"),
+        _ => None,
+    }
+}
+
+fn builtin_pipe_input_custom_accepts(function: &str, actual: &Type) -> bool {
+    match function {
+        "Text/concat" | "Text/time_range_label" => type_is_text_formattable_scalar(actual),
+        _ => false,
+    }
+}
+
+fn builtin_argument_custom_expected_label(
+    function: &str,
+    arg_name: Option<&str>,
+    _piped: bool,
+) -> Option<&'static str> {
+    match (function, arg_name) {
+        ("Text/concat", Some("with" | "separator" | "input" | "text") | None) => {
+            Some("TEXT, NUMBER, BOOL, or tag")
+        }
+        ("Text/time_range_label", Some("end" | "unit" | "input" | "text") | None) => {
+            Some("TEXT, NUMBER, BOOL, or tag")
+        }
+        ("Number/project_time", Some("pointer_x" | "pointer_width") | None) => {
+            Some("NUMBER or numeric TEXT")
+        }
+        _ => None,
+    }
+}
+
+fn builtin_argument_custom_accepts(
+    function: &str,
+    arg_name: Option<&str>,
+    actual: &Type,
+    _piped: bool,
+) -> bool {
+    match (function, arg_name) {
+        ("Text/concat", Some("with" | "separator" | "input" | "text") | None)
+        | ("Text/time_range_label", Some("end" | "unit" | "input" | "text") | None) => {
+            type_is_text_formattable_scalar(actual)
+        }
+        ("Number/project_time", Some("pointer_x" | "pointer_width") | None) => {
+            type_is_number_or_numeric_text(actual)
+        }
+        _ => false,
+    }
+}
+
+fn type_is_text_formattable_scalar(ty: &Type) -> bool {
+    if matches!(
+        ty,
+        Type::Text
+            | Type::Number
+            | Type::Byte
+            | Type::Unknown
+            | Type::Var(_)
+            | Type::UnresolvedShape { .. }
+    ) || is_open_object_type(ty)
+    {
+        return true;
+    }
+    matches!(
+        ty,
+        Type::VariantSet(variants)
+            if variants.iter().all(|variant| matches!(variant, Variant::Tag(_)))
+    )
+}
+
+fn type_is_number_or_numeric_text(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Number
+            | Type::Text
+            | Type::Byte
+            | Type::Unknown
+            | Type::Var(_)
+            | Type::UnresolvedShape { .. }
+    ) || is_open_object_type(ty)
+}
+
+fn bool_toggle_when_accepts_flow(actual: &FlowType, is_event_payload_or_placeholder: bool) -> bool {
+    matches!(
+        actual.mode,
+        FlowMode::TickPresent | FlowMode::PresentOrAbsent
+    ) || is_event_payload_or_placeholder
+        || matches!(
+            actual.ty,
+            Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+        )
+        || is_open_object_type(&actual.ty)
+}
+
+fn bytes_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
+    match (function, arg_name) {
+        (
+            "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/to_base64"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed",
+            Some("input" | "left"),
+        ) => Some(Type::Bytes(BytesType::Dynamic)),
+        (
+            "Bytes/concat" | "Bytes/equal" | "Bytes/find" | "Bytes/starts_with" | "Bytes/ends_with",
+            Some("input" | "left" | "right" | "with" | "needle" | "prefix" | "suffix"),
+        ) => Some(Type::Bytes(BytesType::Dynamic)),
+        ("Bytes/from_hex" | "Bytes/from_base64", Some("input" | "text")) => Some(Type::Text),
+        ("Bytes/to_text", Some("encoding")) => Some(Type::Unknown),
+        ("Bytes/set", Some("value")) => Some(Type::Byte),
+        (
+            "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
+            | "Bytes/zeros",
+            Some("index" | "offset" | "start" | "length" | "count" | "byte_count" | "value"),
+        ) => Some(Type::Number),
+        (
+            "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed",
+            Some("endian"),
+        ) => Some(Type::Unknown),
+        _ => None,
+    }
+}
+
+fn is_bytes_boundary_builtin(function: &str) -> bool {
+    matches!(
+        function,
+        "Text/to_bytes"
+            | "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/concat"
+            | "Bytes/equal"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/zeros"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/from_hex"
+            | "Bytes/to_base64"
+            | "Bytes/from_base64"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
+    )
+}
+
+fn bytes_builtin_arg_allowed(function: &str, name: &str, piped: bool) -> bool {
+    if piped && matches!(name, "input" | "text" | "left" | "right") {
+        return false;
+    }
+    match function {
+        "Text/to_bytes" => matches!(name, "input" | "text" | "encoding"),
+        "Bytes/length" | "Bytes/is_empty" | "Bytes/to_hex" | "Bytes/to_base64" => name == "input",
+        "Bytes/get" => matches!(name, "input" | "index"),
+        "Bytes/set" => matches!(name, "input" | "index" | "value"),
+        "Bytes/slice" => matches!(
+            name,
+            "input" | "offset" | "start" | "byte_count" | "length" | "count"
+        ),
+        "Bytes/take" | "Bytes/drop" => {
+            matches!(name, "input" | "byte_count" | "length" | "count")
+        }
+        "Bytes/concat" | "Bytes/equal" => matches!(name, "input" | "with" | "left" | "right"),
+        "Bytes/find" => matches!(name, "input" | "needle"),
+        "Bytes/starts_with" => matches!(name, "input" | "prefix"),
+        "Bytes/ends_with" => matches!(name, "input" | "suffix"),
+        "Bytes/zeros" => matches!(name, "byte_count" | "length" | "count"),
+        "Bytes/to_text" => matches!(name, "input" | "encoding"),
+        "Bytes/from_hex" | "Bytes/from_base64" => matches!(name, "input" | "text"),
+        "Bytes/read_unsigned" | "Bytes/read_signed" => {
+            matches!(name, "input" | "offset" | "byte_count" | "endian")
+        }
+        "Bytes/write_unsigned" | "Bytes/write_signed" => {
+            matches!(name, "input" | "offset" | "byte_count" | "endian" | "value")
+        }
+        _ => true,
     }
 }
 
@@ -5009,6 +6443,7 @@ fn name_bindings(
     program: &ParsedProgram,
     source_payload_types: &BTreeMap<String, Type>,
     function_param_requirements: &BTreeMap<String, BTreeMap<String, Type>>,
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Type> {
     let mut bindings = BTreeMap::new();
     collect_name_bindings(
@@ -5019,7 +6454,12 @@ fn name_bindings(
         function_param_requirements,
         &mut bindings,
     );
-    collect_row_scope_bindings(program, function_param_requirements, &mut bindings);
+    collect_row_scope_bindings(
+        program,
+        function_param_requirements,
+        function_args_by_name,
+        &mut bindings,
+    );
     collect_state_cell_path_bindings(program, &mut bindings);
     bindings
 }
@@ -5126,6 +6566,13 @@ fn static_expr_type_from_bindings(
         }
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
         AstExprKind::Number(_) => Some(Type::Number),
+        AstExprKind::ByteLiteral { .. } => Some(Type::Byte),
+        AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
+            size,
+            items,
+            expressions,
+            |expr| static_expr_type_from_bindings(expr, expressions, bindings),
+        )),
         AstExprKind::Bool(_) => Some(true_false_type()),
         AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
         AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
@@ -5320,6 +6767,7 @@ fn collect_name_bindings(
 fn collect_row_scope_bindings(
     program: &ParsedProgram,
     function_param_requirements: &BTreeMap<String, BTreeMap<String, Type>>,
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
     bindings: &mut BTreeMap<String, Type>,
 ) {
     bindings.insert("if".to_owned(), open_object_type());
@@ -5338,6 +6786,7 @@ fn collect_row_scope_bindings(
             program,
             bindings,
             function_param_requirements,
+            function_args_by_name,
             &row_scope.function,
             &row_scope.list,
             &row_scope.row_scope,
@@ -5350,12 +6799,22 @@ fn collect_row_scope_bindings(
                 }
             }
             bindings.insert(row_scope.row_scope.clone(), item_ty.clone());
-            bindings
-                .entry(row_scope.list.clone())
-                .and_modify(|existing| {
-                    *existing = Type::List(Box::new(item_ty.clone()));
-                })
-                .or_insert_with(|| Type::List(Box::new(item_ty)));
+            if list_map_input_item_type_for_function_param(
+                program,
+                bindings,
+                function_args_by_name,
+                &row_scope.function,
+                &row_scope.row_scope,
+            )
+            .is_none()
+            {
+                bindings
+                    .entry(row_scope.list.clone())
+                    .and_modify(|existing| {
+                        *existing = Type::List(Box::new(item_ty.clone()));
+                    })
+                    .or_insert_with(|| Type::List(Box::new(item_ty)));
+            }
         }
     }
     for expr in &program.expressions {
@@ -5479,11 +6938,8 @@ fn row_binding_requirement_for_expr(
             let input_expected = pipe_input_expected_type(op);
             let mut requirement =
                 row_binding_requirement_for_expr(program, *input, binding, input_expected);
-            let arg_expected = argument_expected_type(op);
             for arg in args {
-                let expected = render_arg_expected_type(op, arg.name.as_deref())
-                    .or_else(|| list_argument_expected_type(op, arg.name.as_deref()))
-                    .or_else(|| arg_expected.clone());
+                let expected = builtin_argument_expected_type(op, arg.name.as_deref(), true);
                 if let Some(arg_requirement) =
                     row_binding_requirement_for_expr(program, arg.value, binding, expected)
                 {
@@ -5497,11 +6953,8 @@ fn row_binding_requirement_for_expr(
         }
         AstExprKind::Call { function, args } => {
             let mut requirement = None;
-            let arg_expected = argument_expected_type(function);
             for arg in args {
-                let expected = render_arg_expected_type(function, arg.name.as_deref())
-                    .or_else(|| list_argument_expected_type(function, arg.name.as_deref()))
-                    .or_else(|| arg_expected.clone());
+                let expected = builtin_argument_expected_type(function, arg.name.as_deref(), false);
                 if let Some(arg_requirement) =
                     row_binding_requirement_for_expr(program, arg.value, binding, expected)
                 {
@@ -5567,26 +7020,32 @@ fn canonical_row_scope_type(
     program: &ParsedProgram,
     bindings: &BTreeMap<String, Type>,
     function_param_requirements: &BTreeMap<String, BTreeMap<String, Type>>,
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
     function: &str,
     list: &str,
     row_scope: &str,
     canonical_return: Option<Type>,
 ) -> Option<Type> {
-    let mut row_type = canonical_return.filter(type_has_known_user_shape);
-    let list_item_type = bindings
-        .get(list)
-        .and_then(|existing| match existing {
-            Type::List(item) => Some((**item).clone()),
-            _ => None,
-        })
-        .or_else(|| list_item_shape(program, list).map(Type::Object));
+    let list_map_input_item_type = list_map_input_item_type_for_function_param(
+        program,
+        bindings,
+        function_args_by_name,
+        function,
+        row_scope,
+    );
+    let list_item_type = list_map_input_item_type.or_else(|| {
+        bindings
+            .get(list)
+            .and_then(|existing| match existing {
+                Type::List(item) => Some((**item).clone()),
+                _ => None,
+            })
+            .or_else(|| list_item_shape(program, list).map(Type::Object))
+    });
 
-    if let Some(extra) = list_item_type.filter(type_has_known_user_shape) {
-        row_type = Some(match row_type {
-            Some(existing) => merge_canonical_row_type(&existing, &extra),
-            None => extra,
-        });
-    }
+    let mut row_type = list_item_type
+        .filter(type_has_known_user_shape)
+        .or_else(|| canonical_return.filter(type_has_known_user_shape));
 
     let requirement_type = function_param_requirements
         .get(function)
@@ -5600,6 +7059,99 @@ fn canonical_row_scope_type(
     }
 
     row_type
+}
+
+fn list_map_input_item_type_for_function_param(
+    program: &ParsedProgram,
+    bindings: &BTreeMap<String, Type>,
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
+    function: &str,
+    param: &str,
+) -> Option<Type> {
+    let function_args = function_args_by_name.get(function)?;
+    let mut item_type = None;
+    for expr in &program.expressions {
+        let AstExprKind::Pipe { input, op, args } = &expr.kind else {
+            continue;
+        };
+        if op != "List/map" {
+            continue;
+        }
+        let Some(map_item_expr_id) = args
+            .iter()
+            .find(|arg| arg.name.is_none())
+            .map(|arg| arg.value)
+        else {
+            continue;
+        };
+        let Some((template_function, template_args)) = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("new"))
+            .and_then(|arg| program.expressions.get(arg.value))
+            .and_then(child_template)
+        else {
+            continue;
+        };
+        if template_function != function {
+            continue;
+        }
+        let Some(param_expr_id) =
+            function_call_argument_expr(function_args, param, None, &template_args)
+        else {
+            continue;
+        };
+        if param_expr_id != map_item_expr_id
+            && !exprs_name_same_binding(
+                program.expressions.get(param_expr_id),
+                program.expressions.get(map_item_expr_id),
+            )
+        {
+            continue;
+        }
+        let Some(found) = list_item_type_for_expr_id(program, *input, bindings) else {
+            continue;
+        };
+        item_type = Some(match item_type {
+            Some(existing) => merge_canonical_row_type(&existing, &found),
+            None => found,
+        });
+    }
+    item_type
+}
+
+fn exprs_name_same_binding(left: Option<&AstExpr>, right: Option<&AstExpr>) -> bool {
+    match (
+        left.and_then(expr_single_name),
+        right.and_then(expr_single_name),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn list_item_type_for_expr_id(
+    program: &ParsedProgram,
+    expr_id: usize,
+    bindings: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    let expr = program.expressions.get(expr_id)?;
+    let static_item_type = static_expr_type_from_bindings(expr, &program.expressions, bindings)
+        .and_then(|ty| list_item_type_from_list_type(&ty));
+    if static_item_type
+        .as_ref()
+        .is_some_and(|ty| !is_open_object_type(ty))
+    {
+        return static_item_type;
+    }
+    expr_path(Some(expr), &program.expressions)
+        .and_then(|path| {
+            bindings
+                .get(&path)
+                .and_then(list_item_type_from_list_type)
+                .filter(|ty| !is_open_object_type(ty))
+                .or_else(|| list_item_shape(program, &path).map(Type::Object))
+        })
+        .or(static_item_type)
 }
 
 fn type_has_known_user_shape(ty: &Type) -> bool {
@@ -5875,6 +7427,16 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
         (no_element, ty) if is_no_element_type(no_element) => ty.clone(),
         (Type::Text, Type::Text) => Type::Text,
         (Type::Number, Type::Number) => Type::Number,
+        (Type::Byte, Type::Byte) => Type::Byte,
+        (Type::Bytes(left), Type::Bytes(right)) => match (left, right) {
+            (BytesType::Fixed(left), BytesType::Fixed(right)) if left == right => {
+                Type::Bytes(BytesType::Fixed(*left))
+            }
+            _ => Type::Bytes(BytesType::Dynamic),
+        },
+        (Type::Byte, Type::Bytes(_)) | (Type::Bytes(_), Type::Byte) => {
+            Type::Bytes(BytesType::Dynamic)
+        }
         (Type::List(left), Type::List(right)) => {
             Type::List(Box::new(widen_structural_type(left, right)))
         }
@@ -5988,6 +7550,7 @@ fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
 fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
     match suffix {
         "change.text" => SourcePayloadAccess::Field("text".to_owned()),
+        "change.bytes" => SourcePayloadAccess::Field("bytes".to_owned()),
         "key_down.key" => SourcePayloadAccess::Field("key".to_owned()),
         "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
             SourcePayloadAccess::Field(suffix.to_owned())
@@ -6025,6 +7588,7 @@ fn source_payload_field_type(field: &str) -> Type {
         "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
             exact_empty_object_type()
         }
+        "bytes" => Type::Bytes(BytesType::Dynamic),
         _ => Type::Text,
     }
 }
@@ -7164,6 +8728,8 @@ fn type_contains_renderable(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_renderable(&result.ty),
         Type::Text
         | Type::Number
+        | Type::Byte
+        | Type::Bytes(_)
         | Type::Skip
         | Type::Var(_)
         | Type::Unknown
@@ -7183,6 +8749,8 @@ fn type_contains_no_element(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_no_element(&result.ty),
         Type::Text
         | Type::Number
+        | Type::Byte
+        | Type::Bytes(_)
         | Type::Skip
         | Type::RenderContract
         | Type::Var(_)
@@ -7203,6 +8771,8 @@ fn type_contains_skip(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_skip(&result.ty),
         Type::Text
         | Type::Number
+        | Type::Byte
+        | Type::Bytes(_)
         | Type::RenderContract
         | Type::Var(_)
         | Type::Unknown
@@ -7267,6 +8837,8 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
         }
         Type::Text
         | Type::Number
+        | Type::Byte
+        | Type::Bytes(_)
         | Type::Skip
         | Type::RenderContract
         | Type::Unknown
@@ -7423,6 +8995,453 @@ merged: [...base, b: 2, c: TEXT { ok }]
                 .message
                 .contains("duplicate explicit record field `a`")
         }));
+    }
+
+    #[test]
+    fn bytes_literals_infer_fixed_and_dynamic_lengths() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+empty: BYTES {}
+header: BYTES[4] { 16u89, 16u50, 16u4E, 16u47 }
+frame: BYTES[__] { header, BYTES[1] { 16u00 } }
+scratch: BYTES[64] {}
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bytes-types.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+
+        let expr_type = |expr_id| {
+            report
+                .expr_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.expr_id == expr_id)
+                .map(|entry| &entry.flow_type.ty)
+                .expect("bytes expression should be typed")
+        };
+
+        let mut saw_dynamic = false;
+        let mut saw_fixed_header = false;
+        let mut saw_fixed_frame = false;
+        let mut saw_fixed_zero_fill = false;
+        for expr in &parsed.expressions {
+            let AstExprKind::BytesLiteral { size, .. } = &expr.kind else {
+                continue;
+            };
+            match (size, expr_type(expr.id)) {
+                (BytesSizeSyntax::Dynamic, Type::Bytes(BytesType::Dynamic)) => {
+                    saw_dynamic = true;
+                }
+                (BytesSizeSyntax::Fixed(4), Type::Bytes(BytesType::Fixed(4))) => {
+                    saw_fixed_header = true;
+                }
+                (BytesSizeSyntax::Infer, Type::Bytes(BytesType::Fixed(5))) => {
+                    saw_fixed_frame = true;
+                }
+                (BytesSizeSyntax::Fixed(64), Type::Bytes(BytesType::Fixed(64))) => {
+                    saw_fixed_zero_fill = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_dynamic, "BYTES {{}} should stay dynamic");
+        assert!(saw_fixed_header, "BYTES[4] should be fixed length 4");
+        assert!(
+            saw_fixed_frame,
+            "BYTES[__] should infer nested fixed length 5"
+        );
+        assert!(
+            saw_fixed_zero_fill,
+            "empty BYTES[64] should type as fixed zero-filled length 64"
+        );
+    }
+
+    #[test]
+    fn bytes_literals_reject_size_mismatch_and_implicit_text() {
+        let parsed = boon_parser::parse_source(
+            "bad-bytes-types.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+too_short: BYTES[2] { 16u01 }
+implicit_text: BYTES[__] { TEXT { hi } }
+bad_count: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 3, endian: Little)
+bad_endian: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Middle)
+document: []
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("BYTES[2] contains 1 byte(s); fixed BYTES length must match exactly")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("use Text/to_bytes for explicit TEXT/BYTES conversion")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`endian` must be `Little` or `Big`")
+        }));
+    }
+
+    #[test]
+    fn bytes_builtin_signatures_have_boon_types() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+len: bytes |> Bytes/length
+empty: bytes |> Bytes/is_empty
+first: bytes |> Bytes/get(index: 0)
+sliced: bytes |> Bytes/slice(offset: 1, byte_count: 2)
+taken: bytes |> Bytes/take(byte_count: 2)
+dropped: bytes |> Bytes/drop(byte_count: 2)
+grown: bytes |> Bytes/concat(with: BYTES[1] { 16u00 })
+same: bytes |> Bytes/equal(with: BYTES[4] { 16u01, 16u02, 16u03, 16u04 })
+found: bytes |> Bytes/find(needle: BYTES[2] { 16u02, 16u03 })
+starts: bytes |> Bytes/starts_with(prefix: BYTES[2] { 16u01, 16u02 })
+ends: bytes |> Bytes/ends_with(suffix: BYTES[2] { 16u03, 16u04 })
+hex: bytes |> Bytes/to_hex
+decoded: TEXT { 01020304 } |> Bytes/from_hex
+encoded: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
+text: bytes |> Bytes/to_text(encoding: Utf8)
+read: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
+written: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 1)
+zeros: Bytes/zeros(byte_count: 4)
+file_bytes: TEXT { ./asset.svg } |> File/read_bytes()
+file_text: TEXT { ./asset.svg } |> File/read_text()
+file_write: bytes |> File/write_bytes(path: TEXT { output.bin })
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bytes-builtin-signatures.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown function or operator")),
+            "BYTES builtins should be registered: {:?}",
+            report.diagnostics
+        );
+
+        let type_for_function = |function: &str| {
+            let expr_id = parsed
+                .expressions
+                .iter()
+                .find_map(|expr| match &expr.kind {
+                    AstExprKind::Pipe { op, .. } if op == function => Some(expr.id),
+                    AstExprKind::Call { function: call, .. } if call == function => Some(expr.id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("fixture should contain {function}"));
+            report
+                .expr_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.expr_id == expr_id)
+                .map(|entry| &entry.flow_type.ty)
+                .unwrap_or_else(|| panic!("{function} should be typed"))
+        };
+
+        assert_eq!(type_for_function("Bytes/length"), &Type::Number);
+        assert!(type_accepts_true_false(type_for_function("Bytes/is_empty")));
+        assert_eq!(type_for_function("Bytes/get"), &Type::Byte);
+        assert!(matches!(
+            type_for_function("Bytes/slice"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/take"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/drop"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/concat"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(type_accepts_true_false(type_for_function("Bytes/equal")));
+        assert_eq!(type_for_function("Bytes/find"), &Type::Number);
+        assert!(type_accepts_true_false(type_for_function(
+            "Bytes/starts_with"
+        )));
+        assert!(type_accepts_true_false(type_for_function(
+            "Bytes/ends_with"
+        )));
+        assert_eq!(type_for_function("Bytes/to_hex"), &Type::Text);
+        assert!(matches!(
+            type_for_function("Bytes/from_hex"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("Text/to_bytes"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert_eq!(type_for_function("Bytes/to_text"), &Type::Text);
+        assert_eq!(type_for_function("Bytes/read_unsigned"), &Type::Number);
+        assert!(matches!(
+            type_for_function("Bytes/write_unsigned"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/zeros"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert!(matches!(
+            type_for_function("File/read_bytes"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
+        assert_eq!(type_for_function("File/read_text"), &Type::Text);
+        assert_eq!(type_for_function("File/write_bytes"), &Type::Text);
+    }
+
+    #[test]
+    fn bytes_builtin_argument_validation_rejects_missing_and_bad_args() {
+        let parsed = boon_parser::parse_source(
+            "bad-bytes-builtin-args.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+bad_length_input: Bytes/length(input: TEXT { bad })
+missing_get_input: Bytes/get(index: 0)
+missing_set_index: bytes |> Bytes/set(value: 16u01)
+bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
+missing_decode_encoding: bytes |> Bytes/to_text
+bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
+missing_encode_encoding: TEXT { hi } |> Text/to_bytes
+unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
+document: []
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        let messages = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "`Bytes/length` argument `input` has incompatible type",
+            "`Bytes/get` requires an input BYTES value",
+            "`Bytes/set` requires `index`",
+            "`encoding` must be `Utf8` or `Ascii`",
+            "`Bytes/to_text` requires explicit `encoding: Utf8|Ascii`",
+            "`Text/to_bytes` requires explicit `encoding: Utf8|Ascii`",
+            "`Bytes/find` does not accept argument `surprise`",
+        ] {
+            assert!(
+                messages.contains(expected),
+                "missing `{expected}` in diagnostics:\n{messages}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_constant_table_exports_literal_values_for_ir() {
+        let parsed = boon_parser::parse_source(
+            "resolved-constants.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+number_arg: bytes |> Bytes/get(index: 2)
+byte_arg: bytes |> Bytes/set(index: 1, value: 16uFE)
+encoding_arg: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
+endian_arg: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Big)
+document: []
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let constants = report
+            .resolved_constant_table
+            .entries
+            .iter()
+            .map(|entry| (entry.expr_id, &entry.value))
+            .collect::<BTreeMap<_, _>>();
+        let value_for_expr = |predicate: fn(&AstExprKind) -> bool| {
+            let expr = parsed
+                .expressions
+                .iter()
+                .find(|expr| predicate(&expr.kind))
+                .expect("fixture expression should exist");
+            constants
+                .get(&expr.id)
+                .unwrap_or_else(|| panic!("missing resolved constant for expr {}", expr.id))
+        };
+
+        assert_eq!(
+            value_for_expr(|kind| matches!(kind, AstExprKind::Number(value) if value == "2")),
+            &&ResolvedConstantValue::UnsignedInteger { value: 2 }
+        );
+        assert_eq!(
+            value_for_expr(|kind| matches!(kind, AstExprKind::ByteLiteral { value: 0xFE, .. })),
+            &&ResolvedConstantValue::Byte { value: 0xFE }
+        );
+        assert_eq!(
+            value_for_expr(|kind| matches!(
+                kind,
+                AstExprKind::Enum(value) | AstExprKind::Tag(value) if value == "Utf8"
+            )),
+            &&ResolvedConstantValue::Symbol {
+                value: "Utf8".to_owned()
+            }
+        );
+        assert_eq!(
+            value_for_expr(|kind| matches!(
+                kind,
+                AstExprKind::Enum(value) | AstExprKind::Tag(value) if value == "Big"
+            )),
+            &&ResolvedConstantValue::Symbol {
+                value: "Big".to_owned()
+            }
+        );
+        assert!(
+            !report
+                .resolved_constant_table
+                .entries
+                .iter()
+                .any(|entry| matches!(
+                    parsed.expressions.get(entry.expr_id).map(|expr| &expr.kind),
+                    Some(AstExprKind::TextLiteral(_))
+                )),
+            "TEXT literals are not part of the narrow BYTES resolved-constant table"
+        );
+    }
+
+    #[test]
+    fn file_write_bytes_requires_bytes_input_and_text_path() {
+        let parsed = boon_parser::parse_source(
+            "bad-file-write-bytes-types.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+text_payload: TEXT { not bytes }
+bytes_payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }
+bad_input: text_payload |> File/write_bytes(path: TEXT { output.bin })
+bad_path: bytes_payload |> File/write_bytes(path: 7)
+document: []
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`File/write_bytes` pipe input has incompatible type")
+                && diagnostic.message.contains("expected: BYTES")
+                && diagnostic.message.contains("found: TEXT")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`File/write_bytes` argument `path` has incompatible type")
+                && diagnostic.message.contains("expected: TEXT")
+                && diagnostic.message.contains("found: NUMBER")
+        }));
+    }
+
+    #[test]
+    fn bytes_constructor_accepts_function_parameters_from_call_sites() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+FUNCTION one(part) {
+    BYTES[__] { part }
+}
+FUNCTION many(part) {
+    BYTES[__] { part }
+}
+FUNCTION mixed(part) {
+    BYTES { part }
+}
+byte_wrapped: one(part: 16u01)
+byte_wrapped_again: one(part: 16u02)
+bytes_wrapped: many(part: BYTES[2] { 16u02, 16u03 })
+bytes_wrapped_again: many(part: BYTES[2] { 16u04, 16u05 })
+mixed_byte_wrapped: mixed(part: 16u06)
+mixed_bytes_wrapped: mixed(part: BYTES[2] { 16u07, 16u08 })
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bytes-function-params.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+
+        let type_for_function = |function: &str| {
+            let expr_id = parsed
+                .expressions
+                .iter()
+                .find_map(|expr| match &expr.kind {
+                    AstExprKind::Call { function: call, .. } if call == function => Some(expr.id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("fixture should contain {function} call"));
+            report
+                .expr_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.expr_id == expr_id)
+                .map(|entry| &entry.flow_type.ty)
+                .unwrap_or_else(|| panic!("{function} should be typed"))
+        };
+
+        assert!(matches!(
+            type_for_function("one"),
+            Type::Bytes(BytesType::Fixed(1))
+        ));
+        assert!(matches!(
+            type_for_function("many"),
+            Type::Bytes(BytesType::Fixed(2))
+        ));
+        assert!(matches!(
+            type_for_function("mixed"),
+            Type::Bytes(BytesType::Dynamic)
+        ));
     }
 
     #[test]
@@ -8036,6 +10055,161 @@ document: []
     }
 
     #[test]
+    fn list_map_function_args_keep_input_shape_separate_from_output_shape() {
+        let branch_source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+store: [
+    mode: VariableRow
+    rows:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }]
+        }
+    projected:
+        rows |> List/map(row, new: dispatch_row(row: row))
+]
+
+FUNCTION dispatch_row(row) {
+    store.mode |> WHEN {
+        VariableRow => variable_row(row: row)
+        __ => group_row(row: row)
+    }
+}
+
+FUNCTION variable_row(row) {
+    [
+        id: row.id
+        label: row.name
+        variable_only: TEXT { variable }
+    ]
+}
+
+FUNCTION group_row(row) {
+    [
+        id: row.id
+        label: row.name
+        group_only: TEXT { group }
+    ]
+}
+
+document: []
+"#;
+        let branch_parsed =
+            boon_parser::parse_source("list-map-input-output-branch.bn", branch_source).unwrap();
+        let branch_report = check(&branch_parsed);
+        assert!(
+            !branch_report.has_errors(),
+            "branch fixture should typecheck without row output/input pollution: {:?}",
+            branch_report.diagnostics
+        );
+        for function in ["dispatch_row", "variable_row", "group_row"] {
+            let shape = function_arg_shape(&branch_report, function, "row");
+            assert!(
+                shape.fields.contains_key("id"),
+                "{function} row needs id: {shape:?}"
+            );
+            assert!(
+                shape.fields.contains_key("name"),
+                "{function} row needs name: {shape:?}"
+            );
+            assert!(
+                !shape.fields.contains_key("label")
+                    && !shape.fields.contains_key("variable_only")
+                    && !shape.fields.contains_key("group_only"),
+                "{function} input row must not include mapped output-only fields: {shape:?}"
+            );
+        }
+
+        let reusable_source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+store: [
+    cursor: 50
+    source_signals:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }, current: TEXT { fallback }]
+        }
+    segments:
+        LIST {
+            [signal_id: TEXT { a }, start: 0, end: 100, label: TEXT { old }]
+            [signal_id: TEXT { a }, start: 100, end: 200, label: TEXT { new }]
+        }
+    rows_a:
+        source_signals |> List/map(signal, new: row_a(signal: signal))
+    rows_b:
+        source_signals |> List/map(signal, new: row_b(signal: signal))
+]
+
+FUNCTION current_label(signal) {
+    store.segments
+    |> List/filter_field_equal(field: "signal_id", value: signal.id)
+    |> List/retain(segment, if: segment.start <= store.cursor)
+    |> List/retain(segment, if: segment.end > store.cursor)
+    |> List/join_field(field: "label", separator: "", empty: signal.current)
+}
+
+FUNCTION row_a(signal) {
+    [label: current_label(signal: signal)]
+}
+
+FUNCTION row_b(signal) {
+    [label: current_label(signal: signal)]
+}
+
+document: []
+"#;
+        let reusable_parsed =
+            boon_parser::parse_source("list-map-input-output-reusable.bn", reusable_source)
+                .unwrap();
+        let reusable_report = check(&reusable_parsed);
+        assert!(
+            !reusable_report.has_errors(),
+            "reusable fixture should typecheck without row output/input pollution: {:?}",
+            reusable_report.diagnostics
+        );
+        for function in ["current_label", "row_a", "row_b"] {
+            let shape = function_arg_shape(&reusable_report, function, "signal");
+            assert!(
+                shape.fields.contains_key("id"),
+                "{function} signal needs id: {shape:?}"
+            );
+            assert!(
+                shape.fields.contains_key("current"),
+                "{function} signal needs current: {shape:?}"
+            );
+            assert!(
+                !shape.fields.contains_key("label"),
+                "{function} signal input must not be replaced by mapped output: {shape:?}"
+            );
+        }
+    }
+
+    fn function_arg_shape<'a>(
+        report: &'a TypeCheckReport,
+        function: &str,
+        arg: &str,
+    ) -> &'a ObjectShape {
+        let entry = report
+            .function_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.name == function)
+            .unwrap_or_else(|| panic!("{function} function type should be reported"));
+        let arg_index = entry
+            .args
+            .iter()
+            .position(|entry_arg| entry_arg == arg)
+            .unwrap_or_else(|| panic!("{function} should have `{arg}` arg"));
+        let Type::Object(shape) = &entry.arg_types[arg_index] else {
+            panic!(
+                "{function}.{arg} should have an object shape, found {:?}",
+                entry.arg_types[arg_index]
+            );
+        };
+        shape
+    }
+
+    #[test]
     fn rejects_function_argument_field_with_incompatible_required_type() {
         let source = r#"
 source: SOURCE
@@ -8106,6 +10280,138 @@ document: []
                 .message
                 .contains("`LATEST` branches must produce compatible data types")
         }));
+    }
+
+    #[test]
+    fn rejects_duplicate_direct_latest_then_source_branches() {
+        let source = r#"
+rows:
+    LIST {
+        [name: TEXT { beta }, payload: BYTES[3] {}]
+    }
+    |> List/map(row, new: row_widget(row: row))
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                    receive.bytes |> THEN { BYTES[3] { 16u01, 16u02, 16u03 } }
+                }
+            }
+    ]
+}
+
+document: []
+"#;
+        let parsed =
+            boon_parser::parse_source("duplicate-direct-latest-branches.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("duplicate direct `LATEST` branch for source `receive.bytes`")
+        }));
+    }
+
+    #[test]
+    fn inline_latest_branch_result_satisfies_list_retain_bool_filter() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+items: LIST {
+    [title: TEXT { one }, completed: False]
+}
+visible:
+    items |> List/retain(item, if: LATEST {
+        True
+        source |> THEN { item.completed |> Bool/not() }
+        source |> THEN { SKIP }
+    })
+document: []
+"#;
+        let parsed = boon_parser::parse_source("latest-retain-bool.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn bool_toggle_when_accepts_source_pulse() {
+        let source = r#"
+source: SOURCE
+state: "" |> HOLD state { LATEST {} }
+value:
+    False |> Bool/toggle(when: source)
+document: []
+"#;
+        let parsed = boon_parser::parse_source("toggle-when-source.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn bool_toggle_when_rejects_continuous_bool() {
+        let source = r#"
+source: SOURCE
+state: "" |> HOLD state { LATEST {} }
+value:
+    False |> Bool/toggle(when: True)
+document: []
+"#;
+        let parsed = boon_parser::parse_source("toggle-when-continuous.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`Bool/toggle` argument `when` requires a tick-present-or-absent value")
+        }));
+    }
+
+    #[test]
+    fn novywave_style_builtin_argument_shapes_match_runtime_contracts() {
+        let source = r#"
+source: SOURCE
+state: "" |> HOLD state { LATEST {} }
+raw_hex: TEXT { ff }
+parsed:
+    raw_hex |> Text/to_number(radix: 16, leading: True, fallback: 0)
+formatted:
+    parsed |> Number/to_text(radix: 16, min_width: 2, group_size: 4, prefix: True)
+projected:
+    Number/project_time(
+        pointer_x: source.pointer_x
+        pointer_width: source.pointer_width
+        viewport_start: 0
+        viewport_end: 100
+        fallback: parsed
+    )
+label:
+    parsed
+        |> Text/time_range_label(end: projected, unit: TEXT { ns })
+        |> Text/concat(with: formatted, separator: " ")
+        |> Text/concat(with: True, separator: " ")
+        |> Text/concat(with: Hex, separator: " ")
+document: []
+"#;
+        let parsed = boon_parser::parse_source("novywave-builtin-contracts.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
     }
 
     #[test]
@@ -8334,6 +10640,12 @@ document: []
                 "editor", "event", "key_down", "key"
             ])),
             Some(SourcePayloadAccess::Field("key".to_owned()))
+        );
+        assert_eq!(
+            lookup.access_for_parts(&source_payload_parts([
+                "sources", "input", "change", "bytes"
+            ])),
+            Some(SourcePayloadAccess::Field("bytes".to_owned()))
         );
         assert_eq!(
             lookup.access_for_parts(&source_payload_parts([
@@ -8598,15 +10910,19 @@ FUNCTION row(todo) {
             .find(|entry| {
                 entry.line == new_todo_line
                     && entry.category == "function_arg"
-                    && entry.detail_label.contains("sources: [")
+                    && entry.detail_label.contains("title: TEXT")
+                    && entry.detail_label.contains("completed: BOOL")
             })
             .expect("new_todo row argument should have a canonical row shape");
         assert!(
-            new_todo_arg.detail_label.find("sources: [").unwrap()
-                < new_todo_arg.detail_label.find("title: TEXT").unwrap()
-                && new_todo_arg.detail_label.find("title: TEXT").unwrap()
-                    < new_todo_arg.detail_label.find("completed: BOOL").unwrap(),
-            "function row argument should display function-return order with refined field types:\n{}",
+            new_todo_arg.detail_label.find("title: TEXT").unwrap()
+                < new_todo_arg.detail_label.find("completed: BOOL").unwrap(),
+            "function row argument should display the input row order with refined field types:\n{}",
+            new_todo_arg.detail_label
+        );
+        assert!(
+            !new_todo_arg.detail_label.contains("sources: ["),
+            "function input row argument should stay separate from the returned row shape:\n{}",
             new_todo_arg.detail_label
         );
 
@@ -8791,6 +11107,32 @@ document: []
             "unexpected diagnostics: {:?}",
             report.diagnostics
         );
+    }
+
+    #[test]
+    fn rejects_bytes_source_payload_when_guard() {
+        let source = r#"
+store: [
+    receive: SOURCE
+    matched:
+        False |> HOLD matched {
+            LATEST {
+                store.receive.bytes |> WHEN {
+                    __ => True
+                }
+            }
+        }
+]
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bytes-source-payload-guard.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("BYTES source payload guards are not supported in v1")
+        }));
     }
 
     #[test]

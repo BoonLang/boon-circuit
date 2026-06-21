@@ -1,0 +1,10 @@
+name = "bytes search plan ops"
+source = "examples/bytes_search_plan_ops.bn"
+
+[[step]]
+id = "build-bytes"
+expected_source_event = { source = "store.build" }
+
+[[step]]
+id = "measure-bytes"
+expected_source_event = { source = "store.measure" }

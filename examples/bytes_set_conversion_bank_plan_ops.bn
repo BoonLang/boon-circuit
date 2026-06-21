@@ -1,0 +1,33 @@
+left_payload:
+    BYTES[3] { 16u41, 16u42, 16u43 } |> HOLD left_payload { LATEST {} }
+
+store: [
+    patch: SOURCE
+    inspect: SOURCE
+    patched:
+        BYTES[3] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16u5A) }
+            }
+        }
+    text:
+        TEXT { old } |> HOLD text {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/to_text(encoding: Utf8) }
+            }
+        }
+    hex:
+        TEXT { old } |> HOLD hex {
+            LATEST {
+                store.inspect |> THEN { store.patched |> Bytes/to_hex }
+            }
+        }
+    base64:
+        TEXT { old } |> HOLD base64 {
+            LATEST {
+                store.inspect |> THEN { Bytes/to_base64(input: store.patched) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes conversion }))

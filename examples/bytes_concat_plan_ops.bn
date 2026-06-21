@@ -1,0 +1,23 @@
+left_payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD left_payload { LATEST {} }
+
+right_payload:
+    BYTES[2] { 16uFE, 16u04 } |> HOLD right_payload { LATEST {} }
+
+store: [
+    measure: SOURCE
+    joined_pipe:
+        BYTES[5] {} |> HOLD joined_pipe {
+            LATEST {
+                store.measure |> THEN { left_payload |> Bytes/concat(with: right_payload) }
+            }
+        }
+    joined_call:
+        BYTES[5] {} |> HOLD joined_call {
+            LATEST {
+                store.measure |> THEN { Bytes/concat(input: left_payload, with: right_payload) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

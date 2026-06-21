@@ -1,0 +1,18 @@
+name = "bytes encoding plan ops"
+source = "examples/bytes_encoding_plan_ops.bn"
+
+[[step]]
+id = "build-bytes"
+expected_source_event = { source = "store.build" }
+
+[[step]]
+id = "encode-bytes"
+expected_source_event = { source = "store.encode" }
+
+[[step]]
+id = "decode-text"
+expected_source_event = { source = "store.decode" }
+
+[[step]]
+id = "inspect-decoded"
+expected_source_event = { source = "store.inspect" }

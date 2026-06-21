@@ -1,0 +1,10 @@
+name = "bytes source payload plan ops"
+source = "examples/bytes_source_payload_plan_ops.bn"
+
+[[step]]
+id = "receive-bytes"
+expected_source_event = { source = "store.receive", bytes_hex = "01fe04" }
+
+[[step]]
+id = "inspect-bytes"
+expected_source_event = { source = "store.inspect" }

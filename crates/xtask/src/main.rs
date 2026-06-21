@@ -3,10 +3,11 @@
 use boon_runtime::{
     ArtifactScenarioRunOutput, LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer,
     bridge_completion_output_runtime_summary, emit_compiled_artifact, example_paths,
-    inspect_compiled_artifact_report, parse_scenario, run_compiled_artifact_scenario, run_scenario,
-    run_scenario_project, verify_expression_bytecode_report, verify_report_schema, write_json,
+    inspect_compiled_artifact_report, parse_scenario, run_compiled_artifact_scenario,
+    run_plan_source_route, run_scenario, run_scenario_project, verify_expression_bytecode_report,
+    verify_report_schema, write_json,
 };
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -18,11 +19,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS: u64 = 3;
+const BYTES_FILE_READ_PLAN_SOURCE: &str = "examples/bytes_file_read_plan_ops.bn";
+const BYTES_FILE_READ_PLAN_SCENARIO: &str = "examples/bytes_file_read_plan_ops.scn";
+const BYTES_FILE_READ_PLAN_ASSET_REL: &str = "todo_mvc_physical/assets/icons/checkbox_active.svg";
+const BYTES_FILE_WRITE_PLAN_FIXTURE_DIR: &str = "target/generated/bytes-file-write-plan-fixtures";
+const BYTES_FILE_WRITE_PLAN_SOURCE_REL: &str = "bytes_file_write_plan_ops.bn";
+const BYTES_FILE_WRITE_PLAN_SCENARIO_REL: &str = "bytes_file_write_plan_ops.scn";
+const BYTES_FILE_WRITE_PLAN_OUTPUT_REL: &str = "outputs/payload.bin";
 
 const XTASK_COMMANDS: &[&str] = &[
     "verify-example-semantic",
     "verify-example-speed",
     "verify-example-negative",
+    "verify-bytes-negative",
+    "verify-bytes-file-read-plan",
+    "verify-bytes-file-write-plan",
+    "verify-bytes-storage-profile",
+    "verify-bytes-byte-bank-layout",
+    "verify-bytes-machine-plan-adversarial",
+    "verify-bytes-release-benchmark-reproduction",
+    "verify-build-bytes-boundary",
+    "verify-bytes-machine-plan-all",
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
@@ -119,8 +136,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-semantic" => verify_named(&args, VerificationLayer::Semantic),
         "verify-example-speed" => verify_named(&args, VerificationLayer::Speed),
         "verify-example-negative" => verify_negative(&args),
+        "verify-bytes-negative" => verify_bytes_negative(&args),
+        "verify-bytes-file-read-plan" => verify_bytes_file_read_plan(&args),
+        "verify-bytes-file-write-plan" => verify_bytes_file_write_plan(&args),
+        "verify-bytes-storage-profile" => verify_bytes_storage_profile(&args),
+        "verify-bytes-byte-bank-layout" => verify_bytes_byte_bank_layout(&args),
+        "verify-bytes-machine-plan-adversarial" => verify_bytes_machine_plan_adversarial(&args),
+        "verify-bytes-release-benchmark-reproduction" => {
+            verify_bytes_release_benchmark_reproduction(&args)
+        }
+        "verify-build-bytes-boundary" => verify_build_bytes_boundary(&args),
+        "verify-bytes-machine-plan-all" => verify_bytes_machine_plan_all(&args),
         "verify-foundation" => verify_foundation(&args),
-        "verify-report-schema" => verify_reports_schema(),
+        "verify-report-schema" => verify_reports_schema(&args),
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
         "verify-compiled-artifact-inspection" => verify_compiled_artifact_inspection(&args),
         "verify-compiled-artifact-scenario" => verify_compiled_artifact_scenario(&args),
@@ -238,6 +266,7 @@ fn check_bridge(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "exit_status": if all_pass { 0 } else { 1 },
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
         "source_hash": "n/a",
         "scenario_hash": "n/a",
         "program_hash": "n/a",
@@ -2178,6 +2207,7 @@ fn enrich_semantic_build_evidence(
             "output_binding": execution.output_binding,
             "operator_evidence": execution.operator_evidence,
             "input_files": execution.input_files,
+            "input_byte_reads": execution.input_byte_reads,
             "output_sha256": execution.output_sha256,
             "output_bytes": execution.output_bytes,
             "checked_generated_file": output_path,
@@ -2217,6 +2247,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     let speed_report = value_arg(args, "--speed-report")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("target/reports/{name}-bench-speed.json")));
+    let baseline_speed_report = value_arg(args, "--baseline-speed-report").map(PathBuf::from);
 
     let speed_output = run_scenario(
         &source,
@@ -2237,6 +2268,31 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     let scenario_hash = boon_runtime::sha256_file(&scenario)?;
     let budget_hash = boon_runtime::sha256_file(&budget)?;
     let speed_report_hash = boon_runtime::sha256_file(&speed_report)?;
+    let mut artifact_sha256s = vec![json!({
+        "path": speed_report.display().to_string(),
+        "sha256": speed_report_hash
+    })];
+    let phase0_baseline_comparison = if let Some(baseline_speed_report) = baseline_speed_report {
+        let baseline_report = read_json(&baseline_speed_report)?;
+        verify_benchmark_baseline_speed_report_shape(&baseline_report, &baseline_speed_report)?;
+        let baseline_hash = boon_runtime::sha256_file(&baseline_speed_report)?;
+        artifact_sha256s.push(json!({
+            "path": baseline_speed_report.display().to_string(),
+            "sha256": baseline_hash,
+            "kind": "phase0-baseline-speed-report"
+        }));
+        release_benchmark_baseline_comparison(
+            &baseline_report,
+            &speed_output.report,
+            &baseline_speed_report,
+            &speed_report,
+        )
+    } else {
+        json!({
+            "status": "unavailable",
+            "unavailable_reason": "no --baseline-speed-report was supplied; this benchmark records current release numbers only"
+        })
+    };
     let program_hash = speed_output
         .report
         .get("program_hash")
@@ -2298,11 +2354,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         .get("allocations")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let stress_profiles = speed_output
-        .report
-        .get("stress_profiles")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let stress_profiles = speed_output.report.get("stress_profiles").cloned();
     let runtime_profile = speed_output
         .report
         .get("runtime_profile")
@@ -2325,7 +2377,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let report_json = json!({
+    let mut report_json = json!({
         "status": "pass",
         "report_version": 1,
         "generated_at_utc": current_unix_seconds().to_string(),
@@ -2335,6 +2387,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
+        "build_profile": speed_output.report.get("build_profile").cloned().unwrap_or(serde_json::Value::Null),
         "source_path": source.display().to_string(),
         "source_hash": source_hash,
         "scenario_path": scenario.display().to_string(),
@@ -2352,10 +2405,17 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         "render_patch_count_p50_p95_p99_max": render_patch_count,
         "graph_rebuild_count": graph_rebuild_count,
         "allocations": allocations,
-        "stress_profiles": stress_profiles,
         "runtime_profile": runtime_profile,
         "runtime_profile_detail": runtime_profile_detail,
         "capacities": capacities,
+        "release_measurement_summary": release_benchmark_measurement_summary(
+            name,
+            iterations,
+            total_ms,
+            average_ms,
+            &speed_output.report,
+        ),
+        "phase0_baseline_comparison": phase0_baseline_comparison,
         "per_step_pass_fail": [
             {
                 "id": "bench-iterations",
@@ -2373,12 +2433,7 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
                 "detail": "speed report passed budget checks"
             }
         ],
-        "artifact_sha256s": [
-            {
-                "path": speed_report.display().to_string(),
-                "sha256": speed_report_hash
-            }
-        ],
+        "artifact_sha256s": artifact_sha256s,
         "benchmark": {
             "example": name,
             "iterations": iterations,
@@ -2391,6 +2446,9 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
             "heap_alloc_count_after_warmup": bounded_allocs
         }
     });
+    if let Some(stress_profiles) = stress_profiles {
+        report_json["stress_profiles"] = stress_profiles;
+    }
     write_json(&report, &report_json)?;
     verify_report_schema(&report)?;
     println!(
@@ -2399,6 +2457,562 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     );
     println!("wrote {}", report.display());
     Ok(())
+}
+
+fn verify_benchmark_baseline_speed_report_shape(
+    report: &serde_json::Value,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (key, expected) in [
+        ("status", "pass"),
+        ("command", "speed"),
+        ("measurement_mode", "interaction"),
+        ("build_profile", "release"),
+    ] {
+        if report.get(key).and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(format!(
+                "baseline speed report `{}` has invalid `{key}`; expected `{expected}`",
+                path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "input_to_idle_ms_p50_p95_p99_max",
+        "semantic_tick_ms_p50_p95_p99_max",
+        "allocations",
+        "budget_check",
+    ] {
+        if report.get(key).is_none() {
+            return Err(
+                format!("baseline speed report `{}` missing `{key}`", path.display()).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn release_benchmark_measurement_summary(
+    name: &str,
+    iterations: usize,
+    total_ms: f64,
+    average_ms: f64,
+    speed_report: &serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "example": name,
+        "build_profile": speed_report.get("build_profile").cloned().unwrap_or(serde_json::Value::Null),
+        "runtime_profile": speed_report.get("runtime_profile").cloned().unwrap_or(serde_json::Value::Null),
+        "iterations": iterations,
+        "benchmark_wrapper_total_ms": total_ms,
+        "benchmark_wrapper_average_ms_per_iteration": average_ms,
+        "iteration_scope": "full_speed_layer_scenario_rerun_including_reportless_verifier_overhead",
+        "interaction_latency_ms": speed_report_field(speed_report, "input_to_idle_ms_p50_p95_p99_max"),
+        "runtime_tick_ms": speed_report_field(speed_report, "semantic_tick_ms_p50_p95_p99_max"),
+        "render_lowering_ms": speed_report_field(speed_report, "render_lowering_ms_p50_p95_p99_max"),
+        "runtime_step_profile_ms": speed_report_field(speed_report, "runtime_step_profile_ms_p50_p95_p99_max"),
+        "compile_lower": {
+            "load_pipeline_profile": speed_report_field(speed_report, "load_pipeline_profile"),
+            "compile_pipeline_profile": speed_report_field(speed_report, "compile_pipeline_profile")
+        },
+        "warmup_and_allocations": {
+            "allocation_counter_scope": "global allocator deltas around each scenario step after scenario preparation",
+            "allocations": speed_report_field(speed_report, "allocations"),
+            "heap_alloc_count_per_step": speed_report_field(speed_report, "heap_alloc_count_per_step"),
+            "heap_alloc_bytes_per_step": speed_report_field(speed_report, "heap_alloc_bytes_per_step")
+        },
+        "copy_counters": speed_report.get("copy_counters").cloned().unwrap_or_else(|| json!({
+            "status": "unavailable",
+            "unavailable_reason": "linked speed report does not expose copy counters"
+        })),
+        "rows_and_regions": {
+            "dirty_keys": speed_report_field(speed_report, "dirty_key_count_p50_p95_p99_max"),
+            "dirty_nodes": speed_report_field(speed_report, "dirty_node_count_p50_p95_p99_max"),
+            "rows_touched": speed_report_field(speed_report, "rows_touched_p50_p95_p99_max"),
+            "rows_scanned": speed_report_field(speed_report, "rows_scanned_p50_p95_p99_max"),
+            "row_occurrences_scanned": speed_report_field(speed_report, "row_occurrences_scanned_p50_p95_p99_max"),
+            "route_actions_visited": speed_report_field(speed_report, "route_actions_visited_p50_p95_p99_max"),
+            "route_candidates_visited": speed_report_field(speed_report, "route_candidates_visited_p50_p95_p99_max"),
+            "render_patches": speed_report_field(speed_report, "render_patch_count_p50_p95_p99_max")
+        },
+        "stage_counters": speed_report_field(speed_report, "stage_counters"),
+        "speedup_claim": "not_claimed",
+        "claim_policy": "single-run release evidence records current numbers and baseline ratios only; speedups require repeated reproduced measurements"
+    })
+}
+
+fn speed_report_field(report: &serde_json::Value, key: &str) -> serde_json::Value {
+    report.get(key).cloned().unwrap_or_else(|| {
+        json!({
+            "status": "unavailable",
+            "unavailable_reason": format!("linked speed report does not expose `{key}`")
+        })
+    })
+}
+
+fn release_benchmark_baseline_comparison(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    baseline_path: &Path,
+    current_path: &Path,
+) -> serde_json::Value {
+    let mut percentile_metrics = serde_json::Map::new();
+    for (name, pointer) in [
+        ("input_to_idle_ms", "/input_to_idle_ms_p50_p95_p99_max"),
+        ("semantic_tick_ms", "/semantic_tick_ms_p50_p95_p99_max"),
+        ("render_lowering_ms", "/render_lowering_ms_p50_p95_p99_max"),
+        ("dirty_keys", "/dirty_key_count_p50_p95_p99_max"),
+        ("dirty_nodes", "/dirty_node_count_p50_p95_p99_max"),
+        ("rows_touched", "/rows_touched_p50_p95_p99_max"),
+        ("rows_scanned", "/rows_scanned_p50_p95_p99_max"),
+        ("render_patches", "/render_patch_count_p50_p95_p99_max"),
+    ] {
+        percentile_metrics.insert(
+            name.to_owned(),
+            release_benchmark_percentile_comparison(baseline, current, pointer),
+        );
+    }
+
+    let mut scalar_metrics = serde_json::Map::new();
+    for (name, pointer) in [
+        (
+            "bounded_profile_allocs_after_warmup",
+            "/allocations/bounded_profile_allocs_after_warmup",
+        ),
+        (
+            "bounded_profile_alloc_bytes_after_warmup",
+            "/allocations/bounded_profile_alloc_bytes_after_warmup",
+        ),
+        ("total_alloc_count", "/allocations/total_alloc_count"),
+        ("total_alloc_bytes", "/allocations/total_alloc_bytes"),
+        ("graph_rebuild_count", "/graph_rebuild_count"),
+    ] {
+        scalar_metrics.insert(
+            name.to_owned(),
+            release_benchmark_scalar_comparison(baseline, current, pointer),
+        );
+    }
+
+    json!({
+        "status": "compared",
+        "baseline_speed_report_path": baseline_path.display().to_string(),
+        "current_speed_report_path": current_path.display().to_string(),
+        "baseline_git_commit": baseline.get("git_commit").cloned().unwrap_or(serde_json::Value::Null),
+        "current_git_commit": current.get("git_commit").cloned().unwrap_or(serde_json::Value::Null),
+        "baseline_build_profile": baseline.get("build_profile").cloned().unwrap_or(serde_json::Value::Null),
+        "current_build_profile": current.get("build_profile").cloned().unwrap_or(serde_json::Value::Null),
+        "ratio_interpretation": "current / baseline; less than 1.0 is lower/faster for time and count metrics",
+        "percentile_metrics": percentile_metrics,
+        "scalar_metrics": scalar_metrics,
+        "speedup_claim": "not_claimed",
+        "claim_policy": "baseline comparison is single-run diagnostic evidence only"
+    })
+}
+
+fn release_benchmark_percentile_comparison(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    pointer: &str,
+) -> serde_json::Value {
+    let baseline_summary = baseline
+        .pointer(pointer)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let current_summary = current
+        .pointer(pointer)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut ratios = serde_json::Map::new();
+    for key in ["p50", "p95", "p99", "max"] {
+        ratios.insert(
+            key.to_owned(),
+            release_benchmark_ratio(
+                baseline
+                    .pointer(&format!("{pointer}/{key}"))
+                    .and_then(serde_json::Value::as_f64),
+                current
+                    .pointer(&format!("{pointer}/{key}"))
+                    .and_then(serde_json::Value::as_f64),
+            ),
+        );
+    }
+    json!({
+        "baseline": baseline_summary,
+        "current": current_summary,
+        "current_divided_by_baseline": ratios
+    })
+}
+
+fn release_benchmark_scalar_comparison(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    pointer: &str,
+) -> serde_json::Value {
+    let baseline_value = baseline
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_f64);
+    let current_value = current.pointer(pointer).and_then(serde_json::Value::as_f64);
+    json!({
+        "baseline": baseline.pointer(pointer).cloned().unwrap_or(serde_json::Value::Null),
+        "current": current.pointer(pointer).cloned().unwrap_or(serde_json::Value::Null),
+        "current_divided_by_baseline": release_benchmark_ratio(baseline_value, current_value)
+    })
+}
+
+fn release_benchmark_ratio(baseline: Option<f64>, current: Option<f64>) -> serde_json::Value {
+    match (baseline, current) {
+        (Some(baseline), Some(current)) if baseline > 0.0 => json!(current / baseline),
+        (Some(0.0), Some(_)) => json!({
+            "status": "unavailable",
+            "unavailable_reason": "baseline value is zero"
+        }),
+        _ => json!({
+            "status": "unavailable",
+            "unavailable_reason": "baseline or current value is missing/non-numeric"
+        }),
+    }
+}
+
+fn verify_bytes_release_benchmark_reproduction(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "verify-bytes-release-benchmark-reproduction";
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from("target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json")
+    });
+    let benchmark_reports = values_arg(args, "--benchmark-report")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let benchmark_reports = if benchmark_reports.is_empty() {
+        vec![
+            PathBuf::from("target/reports/bytes-plan/todomvc-release-benchmark.json"),
+            PathBuf::from("target/reports/bytes-plan/todomvc-release-benchmark-repeat.json"),
+        ]
+    } else {
+        benchmark_reports
+    };
+    let max_ratio = value_arg(args, "--max-ratio")
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|error| format!("--max-ratio must be a positive number: {error}"))
+        })
+        .transpose()?
+        .unwrap_or(5.0);
+    if !max_ratio.is_finite() || max_ratio < 1.0 {
+        return Err("--max-ratio must be finite and >= 1.0".into());
+    }
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut evidence = Vec::new();
+    let mut identity: Option<(String, String, String, String, String, String)> = None;
+    let mut interaction_p95_values = Vec::new();
+    let mut runtime_tick_p95_values = Vec::new();
+    let mut average_iteration_ms_values = Vec::new();
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "at-least-two-benchmark-reports",
+        benchmark_reports.len() >= 2,
+        format!("benchmark_report_count={}", benchmark_reports.len()),
+        Some("release benchmark reproduction requires at least two benchmark reports".to_owned()),
+    );
+
+    for (index, path) in benchmark_reports.iter().enumerate() {
+        let label = format!("benchmark-report-{index}");
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:present"),
+            exists,
+            path.display().to_string(),
+            Some(format!("missing benchmark report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+
+        match artifact_hash(path) {
+            Ok(artifact) => artifacts.push(artifact),
+            Err(error) => push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{label}:self-hash"),
+                false,
+                error.to_string(),
+                Some(format!(
+                    "failed to hash benchmark report `{}`",
+                    path.display()
+                )),
+            ),
+        }
+
+        let schema_result = verify_report_schema(path);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:schema-valid"),
+            schema_result.is_ok(),
+            schema_result
+                .as_ref()
+                .err()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_else(|| "benchmark report schema accepted".to_owned()),
+            Some(format!(
+                "benchmark report `{}` failed schema",
+                path.display()
+            )),
+        );
+
+        let benchmark = match read_json(path) {
+            Ok(benchmark) => benchmark,
+            Err(error) => {
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!("{label}:json-readable"),
+                    false,
+                    error.to_string(),
+                    Some(format!("benchmark report `{}` is not JSON", path.display())),
+                );
+                continue;
+            }
+        };
+
+        let command = benchmark.get("command").and_then(serde_json::Value::as_str);
+        let command_ok = matches!(command, Some("bench-todomvc" | "bench-example"));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:benchmark-command"),
+            command_ok,
+            format!("command={command:?}"),
+            Some(format!(
+                "benchmark report `{}` is not a bench command",
+                path.display()
+            )),
+        );
+        let mode = benchmark
+            .get("measurement_mode")
+            .and_then(serde_json::Value::as_str);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:diagnostic-mode"),
+            mode == Some("diagnostic"),
+            format!("measurement_mode={mode:?}"),
+            Some(format!(
+                "benchmark report `{}` is not diagnostic benchmark evidence",
+                path.display()
+            )),
+        );
+        let build_profile = benchmark
+            .get("build_profile")
+            .and_then(serde_json::Value::as_str);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:release-build"),
+            build_profile == Some("release"),
+            format!("build_profile={build_profile:?}"),
+            Some(format!(
+                "benchmark report `{}` was not produced by a release binary",
+                path.display()
+            )),
+        );
+        let no_speedup_claim = benchmark
+            .pointer("/release_measurement_summary/speedup_claim")
+            .and_then(serde_json::Value::as_str)
+            == Some("not_claimed")
+            && benchmark
+                .pointer("/phase0_baseline_comparison/speedup_claim")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|claim| claim == "not_claimed");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:no-speedup-claim"),
+            no_speedup_claim,
+            "single benchmark reports must not claim speedups",
+            Some(format!(
+                "benchmark report `{}` claims a speedup without reproduction policy",
+                path.display()
+            )),
+        );
+        let (artifact_fresh, artifact_detail) = child_artifact_hashes_fresh(&benchmark)
+            .unwrap_or_else(|error| (false, error.to_string()));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:linked-artifacts-fresh"),
+            artifact_fresh,
+            artifact_detail,
+            Some(format!(
+                "benchmark report `{}` has stale linked artifacts",
+                path.display()
+            )),
+        );
+
+        let example = benchmark
+            .pointer("/benchmark/example")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let source_hash = benchmark
+            .get("source_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let scenario_hash = benchmark
+            .get("scenario_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let program_hash = benchmark
+            .get("program_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let budget_hash = benchmark
+            .get("budget_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let speed_report_layer = benchmark
+            .pointer("/benchmark/speed_report_layer")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let current_identity = (
+            example.clone(),
+            source_hash.clone(),
+            scenario_hash.clone(),
+            program_hash.clone(),
+            budget_hash.clone(),
+            speed_report_layer.clone(),
+        );
+        let identity_matches = identity
+            .as_ref()
+            .is_none_or(|identity| identity == &current_identity);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:same-benchmark-identity"),
+            identity_matches,
+            format!(
+                "example={example}, source_hash={source_hash}, scenario_hash={scenario_hash}, program_hash={program_hash}, budget_hash={budget_hash}, speed_report_layer={speed_report_layer}"
+            ),
+            Some(format!(
+                "benchmark report `{}` does not match previous report identity",
+                path.display()
+            )),
+        );
+        if identity.is_none() {
+            identity = Some(current_identity);
+        }
+
+        let interaction_p95 = benchmark
+            .pointer("/release_measurement_summary/interaction_latency_ms/p95")
+            .and_then(numeric_value_as_f64);
+        let runtime_tick_p95 = benchmark
+            .pointer("/release_measurement_summary/runtime_tick_ms/p95")
+            .and_then(numeric_value_as_f64);
+        let average_ms = benchmark
+            .pointer("/benchmark/average_ms_per_iteration")
+            .and_then(numeric_value_as_f64);
+        let metrics_present =
+            interaction_p95.is_some() && runtime_tick_p95.is_some() && average_ms.is_some();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("{label}:metrics-present"),
+            metrics_present,
+            format!(
+                "interaction_p95={interaction_p95:?}, runtime_tick_p95={runtime_tick_p95:?}, average_ms={average_ms:?}"
+            ),
+            Some(format!(
+                "benchmark report `{}` is missing reproduction metrics",
+                path.display()
+            )),
+        );
+        if let Some(value) = interaction_p95 {
+            interaction_p95_values.push(value);
+        }
+        if let Some(value) = runtime_tick_p95 {
+            runtime_tick_p95_values.push(value);
+        }
+        if let Some(value) = average_ms {
+            average_iteration_ms_values.push(value);
+        }
+
+        evidence.push(json!({
+            "path": path.display().to_string(),
+            "command": command,
+            "example": example,
+            "build_profile": build_profile,
+            "speed_report_path": benchmark.pointer("/benchmark/speed_report_path").cloned().unwrap_or(serde_json::Value::Null),
+            "interaction_latency_ms_p95": interaction_p95,
+            "runtime_tick_ms_p95": runtime_tick_p95,
+            "average_ms_per_iteration": average_ms
+        }));
+    }
+
+    let interaction_ratio = max_to_min_ratio(&interaction_p95_values);
+    let runtime_tick_ratio = max_to_min_ratio(&runtime_tick_p95_values);
+    let average_iteration_ratio = max_to_min_ratio(&average_iteration_ms_values);
+    for (id, ratio) in [
+        ("interaction-p95-ratio-within-policy", interaction_ratio),
+        ("runtime-tick-p95-ratio-within-policy", runtime_tick_ratio),
+        (
+            "average-iteration-ratio-within-policy",
+            average_iteration_ratio,
+        ),
+    ] {
+        let pass = ratio.is_some_and(|ratio| ratio <= max_ratio);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            id,
+            pass,
+            format!("ratio={ratio:?}, max_ratio={max_ratio}"),
+            Some(format!("{id} failed reproduction variance policy")),
+        );
+    }
+
+    let extra = json!({
+        "reproduction_scope": "todomvc-release-benchmark-current-slices",
+        "benchmark_report_count": benchmark_reports.len(),
+        "benchmark_reports": evidence,
+        "max_allowed_ratio": max_ratio,
+        "variance_policy": "max/min ratio across repeated benchmark reports; reports still do not claim speedups",
+        "metric_ratios": {
+            "interaction_latency_ms_p95": interaction_ratio,
+            "runtime_tick_ms_p95": runtime_tick_ratio,
+            "average_ms_per_iteration": average_iteration_ratio
+        },
+        "speedup_claim": "not_claimed",
+        "claim_policy": "this gate proves repeated measurement integrity only; speedup claims require a later explicit policy",
+        "artifact_sha256s": artifacts
+    });
+    write_static_gate_report(args, COMMAND, report, checks, blockers, extra)
+}
+
+fn max_to_min_ratio(values: &[f64]) -> Option<f64> {
+    if values.len() < 2
+        || values
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return None;
+    }
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Some(max / min)
 }
 
 fn should_reexec_benchmark_in_release() -> bool {
@@ -2585,9 +3199,9 @@ fn verify_large_list_scan_counters(args: &[String]) -> Result<(), Box<dyn std::e
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
-        "source_path": source_path,
+        "source_path": source_path.display().to_string(),
         "source_hash": source_hash,
-        "scenario_path": scenario_path,
+        "scenario_path": scenario_path.display().to_string(),
         "scenario_hash": scenario_hash,
         "program_hash": program_hash,
         "budget_hash": budget_hash,
@@ -29932,6 +30546,7 @@ fn write_native_gate_report(
         json!(worktree_fingerprint()),
     );
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
+    object.insert("binary_path".to_owned(), json!(current_binary_path()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
     object.insert("program_hash".to_owned(), json!("n/a"));
@@ -29984,7 +30599,10 @@ fn write_static_gate_report(
         json!(current_unix_seconds().to_string()),
     );
     object.insert("command".to_owned(), json!(command));
-    object.insert("command_argv".to_owned(), json!(args));
+    object.insert(
+        "command_argv".to_owned(),
+        json!(replayable_xtask_argv(args)),
+    );
     object.insert(
         "measurement_mode".to_owned(),
         json!(measurement_mode_for_command(command)),
@@ -29999,6 +30617,7 @@ fn write_static_gate_report(
         json!(worktree_fingerprint()),
     );
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
+    object.insert("binary_path".to_owned(), json!(current_binary_path()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
     object.insert("program_hash".to_owned(), json!("n/a"));
@@ -33638,8 +34257,8509 @@ fn push_audit_check(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BytesMachinePlanRequiredReport {
+    label: &'static str,
+    path: &'static str,
+    command: &'static str,
+    measurement_mode: &'static str,
+}
+
+fn bytes_machine_plan_required_reports() -> &'static [BytesMachinePlanRequiredReport] {
+    &[
+        BytesMachinePlanRequiredReport {
+            label: "phase0-baseline",
+            path: "target/reports/bytes-plan/phase0-baseline.json",
+            command: "bytes-plan-phase0-baseline",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-initial-dump-plan",
+            path: "target/reports/bytes-plan/bytes-initial-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-initial-run-plan",
+            path: "target/reports/bytes-plan/bytes-initial-run-plan.json",
+            command: "run-plan",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "root-scalar-plan-ops-dump-plan",
+            path: "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "root-scalar-plan-ops-scenario",
+            path: "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-length-scenario",
+            path: "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-is-empty-scenario",
+            path: "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-get-scenario",
+            path: "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-equal-scenario",
+            path: "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-concat-scenario",
+            path: "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-concat-chain-scenario",
+            path: "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-set-scenario",
+            path: "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-text-conversion-scenario",
+            path: "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-slice-take-drop-scenario",
+            path: "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-search-scenario",
+            path: "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-encoding-scenario",
+            path: "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-numeric-scenario",
+            path: "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-source-payload-dump-plan",
+            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-source-payload-route",
+            path: "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-source-payload-large-route",
+            path: "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-source-payload-scenario",
+            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-indexed-source-payload-dump-plan",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-indexed-source-payload-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-negative",
+            path: "target/reports/bytes-plan/bytes-negative.json",
+            command: "verify-bytes-negative",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-machine-plan-adversarial",
+            path: "target/reports/bytes-plan/bytes-machine-plan-adversarial.json",
+            command: "verify-bytes-machine-plan-adversarial",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-release-benchmark-reproduction",
+            path: "target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json",
+            command: "verify-bytes-release-benchmark-reproduction",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-file-read-plan",
+            path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            command: "verify-bytes-file-read-plan",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-file-write-plan",
+            path: "target/reports/bytes-plan/bytes-file-write-plan.json",
+            command: "verify-bytes-file-write-plan",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-storage-profile",
+            path: "target/reports/bytes-plan/bytes-storage-profile.json",
+            command: "verify-bytes-storage-profile",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-byte-bank-layout",
+            path: "target/reports/bytes-plan/bytes-byte-bank-layout.json",
+            command: "verify-bytes-byte-bank-layout",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "build-bytes-boundary",
+            path: "target/reports/bytes-plan/build-bytes-boundary.json",
+            command: "verify-build-bytes-boundary",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-dump-plan",
+            path: "target/reports/bytes-plan/todomvc-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-submit",
+            path: "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-toggle",
+            path: "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-toggle-all",
+            path: "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-dynamic-delete",
+            path: "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-clear-completed",
+            path: "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-edit-commit",
+            path: "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-edit-cancel",
+            path: "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-edit-blur",
+            path: "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-new-text-route",
+            path: "target/reports/bytes-plan/todomvc-new-text-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-filter-active-route",
+            path: "target/reports/bytes-plan/todomvc-filter-active-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-root-scalar",
+            path: "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "todomvc-full-engine-compare",
+            path: "target/reports/bytes-plan/todomvc-full-engine-compare.json",
+            command: "run-plan-scenario-events",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "cells-dump-plan",
+            path: "target/reports/bytes-plan/cells-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "cells-full-engine-compare",
+            path: "target/reports/bytes-plan/cells-plan-compare.json",
+            command: "run-plan-scenario-events",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "cells-ascii-formula",
+            path: "target/reports/bytes-plan/cells-ascii-formula-run.json",
+            command: "semantic",
+            measurement_mode: "proof",
+        },
+    ]
+}
+
+fn verify_bytes_machine_plan_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    verify_bytes_machine_plan_all_with_required(args, bytes_machine_plan_required_reports())
+}
+
+fn verify_bytes_machine_plan_all_with_required(
+    args: &[String],
+    required: &[BytesMachinePlanRequiredReport],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "verify-bytes-machine-plan-all";
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-machine-plan-all.json"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let check_existing = args.iter().any(|arg| arg == "--check-existing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "requires-check-existing",
+        check_existing,
+        "aggregate BYTES/MachinePlan gate only validates already generated child evidence",
+        Some("missing --check-existing".to_owned()),
+    );
+
+    let current_commit = git_commit();
+    let mut child_reports = Vec::new();
+    let mut aggregate_artifacts = Vec::new();
+    let mut proof_report_count = 0usize;
+    let mut diagnostic_report_count = 0usize;
+    let mut plan_executor_report_count = 0usize;
+    let mut no_fallback_plan_executor_count = 0usize;
+
+    if check_existing {
+        for required_report in required {
+            let path = Path::new(required_report.path);
+            let exists = path.exists();
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:present", required_report.label),
+                exists,
+                required_report.path,
+                Some(format!(
+                    "missing required report `{}`",
+                    required_report.path
+                )),
+            );
+            if !exists {
+                continue;
+            }
+
+            match artifact_hash(path) {
+                Ok(artifact) => aggregate_artifacts.push(artifact),
+                Err(error) => push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!("{}:aggregate-artifact-hash", required_report.label),
+                    false,
+                    error.to_string(),
+                    Some(format!(
+                        "failed to hash required report `{}`: {error}",
+                        required_report.path
+                    )),
+                ),
+            }
+
+            let schema_result = verify_report_schema(path);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:schema-valid", required_report.label),
+                schema_result.is_ok(),
+                schema_result
+                    .as_ref()
+                    .err()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| "report schema accepted child report".to_owned()),
+                Some(format!(
+                    "required report `{}` failed report schema",
+                    required_report.path
+                )),
+            );
+
+            let child = match read_json(path) {
+                Ok(child) => child,
+                Err(error) => {
+                    push_audit_check(
+                        &mut checks,
+                        &mut blockers,
+                        format!("{}:json-readable", required_report.label),
+                        false,
+                        error.to_string(),
+                        Some(format!(
+                            "required report `{}` is not readable JSON: {error}",
+                            required_report.path
+                        )),
+                    );
+                    continue;
+                }
+            };
+            let status = child.get("status").and_then(serde_json::Value::as_str);
+            let command = child.get("command").and_then(serde_json::Value::as_str);
+            let mode = child
+                .get("measurement_mode")
+                .and_then(serde_json::Value::as_str);
+            let git = child.get("git_commit").and_then(serde_json::Value::as_str);
+            let child_status_pass = status == Some("pass");
+            let command_matches = command == Some(required_report.command);
+            let mode_matches = mode == Some(required_report.measurement_mode);
+            let git_matches = git
+                .map(|git| {
+                    git == current_commit
+                        || git.starts_with(&current_commit)
+                        || current_commit.starts_with(git)
+                })
+                .unwrap_or(false);
+            let (artifact_hashes_fresh, artifact_detail) = child_artifact_hashes_fresh(&child)
+                .unwrap_or_else(|error| {
+                    (
+                        false,
+                        format!("could not verify child artifact hashes: {error}"),
+                    )
+                });
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:status-pass", required_report.label),
+                child_status_pass,
+                format!("status={status:?}"),
+                Some(format!(
+                    "required report `{}` did not pass",
+                    required_report.path
+                )),
+            );
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:command-match", required_report.label),
+                command_matches,
+                format!(
+                    "expected command `{}`, got {command:?}",
+                    required_report.command
+                ),
+                Some(format!(
+                    "required report `{}` command mismatch",
+                    required_report.path
+                )),
+            );
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:measurement-mode-match", required_report.label),
+                mode_matches,
+                format!(
+                    "expected measurement_mode `{}`, got {mode:?}",
+                    required_report.measurement_mode
+                ),
+                Some(format!(
+                    "required report `{}` measurement mode mismatch",
+                    required_report.path
+                )),
+            );
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:git-current", required_report.label),
+                git_matches,
+                format!("report git={git:?}, current git={current_commit}"),
+                Some(format!(
+                    "required report `{}` was not generated for current commit",
+                    required_report.path
+                )),
+            );
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("{}:artifact-hashes-fresh", required_report.label),
+                artifact_hashes_fresh,
+                artifact_detail,
+                Some(format!(
+                    "required report `{}` has stale artifact hashes",
+                    required_report.path
+                )),
+            );
+
+            if required_report.measurement_mode == "proof" {
+                proof_report_count += 1;
+            } else {
+                diagnostic_report_count += 1;
+            }
+            if let Some((pass, detail)) = plan_executor_no_fallback_counts_zero(&child) {
+                plan_executor_report_count += 1;
+                if pass {
+                    no_fallback_plan_executor_count += 1;
+                }
+                push_audit_check(
+                    &mut checks,
+                    &mut blockers,
+                    format!(
+                        "{}:plan-executor-no-fallback-counters",
+                        required_report.label
+                    ),
+                    pass,
+                    detail,
+                    Some(format!(
+                        "required plan-executor report `{}` used fallback execution",
+                        required_report.path
+                    )),
+                );
+            }
+            let child_sha256 = boon_runtime::sha256_file(path)?;
+            child_reports.push(json!({
+                "label": required_report.label,
+                "path": required_report.path,
+                "sha256": child_sha256,
+                "status": status.unwrap_or("missing"),
+                "command": command.unwrap_or("missing"),
+                "measurement_mode": mode.unwrap_or("missing"),
+                "git_commit": git.unwrap_or("missing"),
+                "schema_valid": schema_result.is_ok(),
+                "artifact_hashes_fresh": artifact_hashes_fresh,
+            }));
+        }
+    }
+
+    let aggregate_checks_pass = blockers.is_empty();
+    let extra = json!({
+        "aggregate_scope": "bytes-machine-plan-current-slices",
+        "check_existing": check_existing,
+        "required_report_count": required.len(),
+        "checked_report_count": child_reports.len(),
+        "proof_report_count": proof_report_count,
+        "diagnostic_report_count": diagnostic_report_count,
+        "plan_executor_report_count": plan_executor_report_count,
+        "no_fallback_plan_executor_count": no_fallback_plan_executor_count,
+        "aggregate_checks_pass": aggregate_checks_pass,
+        "child_reports": child_reports,
+        "artifact_sha256s": aggregate_artifacts
+    });
+    write_static_gate_report(args, COMMAND, report, checks, blockers, extra)
+}
+
+fn child_artifact_hashes_fresh(
+    report: &serde_json::Value,
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    let artifacts = report
+        .get("artifact_sha256s")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("report missing artifact_sha256s array")?;
+    let mut stale = Vec::new();
+    for artifact in artifacts {
+        let path = artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("artifact missing path")?;
+        let expected = artifact
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("artifact missing sha256")?;
+        let actual = boon_runtime::sha256_file(Path::new(path))?;
+        if actual != expected {
+            stale.push(format!("{path}: expected {expected}, got {actual}"));
+        }
+    }
+    if stale.is_empty() {
+        Ok((
+            true,
+            format!("{} child artifact hash(es) are fresh", artifacts.len()),
+        ))
+    } else {
+        Ok((false, stale.join("; ")))
+    }
+}
+
+fn plan_executor_no_fallback_counts_zero(report: &serde_json::Value) -> Option<(bool, String)> {
+    let executor = report.get("plan_executor")?;
+    let mut failures = Vec::new();
+    let mut details = Vec::new();
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        let value = executor.get(key).and_then(serde_json::Value::as_u64);
+        details.push(format!("{key}={value:?}"));
+        if value != Some(0) {
+            failures.push(key);
+        }
+    }
+    Some((failures.is_empty(), details.join(", ")))
+}
+
 fn verify_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     verify_negative_name(named_arg(args, 1)?)
+}
+
+fn verify_bytes_storage_profile(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-storage-profile.json"));
+    let file_write_fixture_dir =
+        PathBuf::from("target/generated/bytes-storage-profile-file-write-fixtures");
+    let file_write_output_dir = file_write_fixture_dir.join("outputs");
+    let file_write_input_dir = file_write_fixture_dir.join("inputs");
+    fs::create_dir_all(&file_write_output_dir)?;
+    fs::create_dir_all(&file_write_input_dir)?;
+    let fixed_file_write_source =
+        file_write_fixture_dir.join("bytes_set_file_write_bank_plan_ops.bn");
+    let fixed_file_write_scenario =
+        file_write_fixture_dir.join("bytes_set_file_write_bank_plan_ops.scn");
+    let fixed_file_write_output = file_write_output_dir.join("patched.bin");
+    let dynamic_file_write_source =
+        file_write_fixture_dir.join("bytes_dynamic_file_write_plan_ops.bn");
+    let dynamic_file_write_scenario =
+        file_write_fixture_dir.join("bytes_dynamic_file_write_plan_ops.scn");
+    let dynamic_file_write_output = file_write_output_dir.join("dynamic.bin");
+    let indexed_file_write_source =
+        file_write_fixture_dir.join("bytes_indexed_file_write_plan_ops.bn");
+    let indexed_file_write_scenario =
+        file_write_fixture_dir.join("bytes_indexed_file_write_plan_ops.scn");
+    let indexed_file_write_output = file_write_output_dir.join("indexed.bin");
+    let indexed_file_read_source =
+        file_write_fixture_dir.join("bytes_indexed_file_read_plan_ops.bn");
+    let indexed_file_read_scenario =
+        file_write_fixture_dir.join("bytes_indexed_file_read_plan_ops.scn");
+    let indexed_file_read_input = file_write_input_dir.join("indexed-read.bin");
+    fs::write(
+        &fixed_file_write_source,
+        "left_payload:\n    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD left_payload { LATEST {} }\n\nstore: [\n    patch: SOURCE\n    write: SOURCE\n    patched:\n        BYTES[4] {} |> HOLD patched {\n            LATEST {\n                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }\n            }\n        }\n    write_status:\n        TEXT { pending } |> HOLD write_status {\n            LATEST {\n                store.write |> THEN { store.patched |> File/write_bytes(path: TEXT { outputs/patched.bin }) }\n            }\n        }\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT { Bytes fixed bank file write }))\n",
+    )?;
+    fs::write(
+        &fixed_file_write_scenario,
+        format!(
+            "name = \"bytes set file write bank plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"patch-bytes\"\nexpected_source_event = {{ source = \"store.patch\" }}\n\n[[step]]\nid = \"write-patched-file\"\nexpected_source_event = {{ source = \"store.write\" }}\n",
+            fixed_file_write_source.display()
+        ),
+    )?;
+    if fixed_file_write_output.exists() {
+        fs::remove_file(&fixed_file_write_output)?;
+    }
+    fs::write(
+        &dynamic_file_write_source,
+        "store: [\n    receive: SOURCE\n    write: SOURCE\n    received:\n        BYTES {} |> HOLD received {\n            LATEST {\n                store.receive.bytes |> THEN { store.receive.bytes }\n            }\n        }\n    write_status:\n        TEXT { pending } |> HOLD write_status {\n            LATEST {\n                store.write |> THEN { store.received |> File/write_bytes(path: TEXT { outputs/dynamic.bin }) }\n            }\n        }\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT { Bytes dynamic file write }))\n",
+    )?;
+    fs::write(
+        &dynamic_file_write_scenario,
+        format!(
+            "name = \"bytes dynamic file write plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"receive-dynamic-bytes\"\nexpected_source_event = {{ source = \"store.receive\", bytes_hex = \"01fe04\" }}\n\n[[step]]\nid = \"write-dynamic-file\"\nexpected_source_event = {{ source = \"store.write\" }}\n",
+            dynamic_file_write_source.display()
+        ),
+    )?;
+    if dynamic_file_write_output.exists() {
+        fs::remove_file(&dynamic_file_write_output)?;
+    }
+    fs::write(
+        &indexed_file_write_source,
+        "store: [\n    rows:\n        LIST {\n            [name: TEXT { alpha }, payload: BYTES[3] {}, path_state: TEXT { outputs/indexed.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[3] {}, path_state: TEXT { outputs/indexed.bin }, write_status: TEXT { pending }]\n        }\n        |> List/map(row, new: row_widget(row: row))\n]\n\nFUNCTION row_widget(row) {\n    [\n        receive: SOURCE\n        write: SOURCE\n        name: row.name\n        path_state: row.path_state\n        payload:\n            row.payload |> HOLD payload {\n                LATEST {\n                    receive.bytes |> THEN { receive.bytes }\n                }\n            }\n        write_status:\n            row.write_status |> HOLD write_status {\n                LATEST {\n                    write |> THEN { payload |> File/write_bytes(path: path_state) }\n                }\n            }\n    ]\n}\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT { Bytes indexed dynamic-path file write }))\n",
+    )?;
+    fs::write(
+        &indexed_file_write_scenario,
+        format!(
+            "name = \"bytes indexed file write plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"receive-indexed-bytes\"\nexpected_source_event = {{ source = \"row.receive\", target_key = 2, target_generation = 1, bytes_hex = \"01fe04\" }}\n\n[[step]]\nid = \"write-indexed-file\"\nexpected_source_event = {{ source = \"row.write\", target_key = 2, target_generation = 1 }}\n",
+            indexed_file_write_source.display()
+        ),
+    )?;
+    if indexed_file_write_output.exists() {
+        fs::remove_file(&indexed_file_write_output)?;
+    }
+    fs::write(&indexed_file_read_input, [0x01, 0xFE, 0x04])?;
+    fs::write(
+        &indexed_file_read_source,
+        "store: [\n    rows:\n        LIST {\n            [name: TEXT { alpha }, path_state: TEXT { inputs/indexed-read.bin }, file_bytes: BYTES[3] {}, first_byte: 16u00]\n            [name: TEXT { beta }, path_state: TEXT { inputs/indexed-read.bin }, file_bytes: BYTES[3] {}, first_byte: 16u00]\n        }\n        |> List/map(row, new: row_widget(row: row))\n]\n\nFUNCTION row_widget(row) {\n    [\n        read: SOURCE\n        inspect: SOURCE\n        name: row.name\n        path_state: row.path_state\n        file_bytes:\n            row.file_bytes |> HOLD file_bytes {\n                LATEST {\n                    read |> THEN { path_state |> File/read_bytes() }\n                }\n            }\n        first_byte:\n            row.first_byte |> HOLD first_byte {\n                LATEST {\n                    inspect |> THEN { file_bytes |> Bytes/get(index: 0) }\n                }\n            }\n    ]\n}\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT { Bytes indexed dynamic-path file read }))\n",
+    )?;
+    fs::write(
+        &indexed_file_read_scenario,
+        format!(
+            "name = \"bytes indexed file read plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"read-indexed-file\"\nexpected_source_event = {{ source = \"row.read\", target_key = 2, target_generation = 1 }}\n\n[[step]]\nid = \"inspect-indexed-read\"\nexpected_source_event = {{ source = \"row.inspect\", target_key = 2, target_generation = 1 }}\n",
+            indexed_file_read_source.display()
+        ),
+    )?;
+    let cases = [
+        BytesStorageProfileCase {
+            id: "fixed-read-only-no-copy",
+            source: "examples/bytes_length_plan_ops.bn",
+            scenario: "examples/bytes_length_plan_ops.scn",
+            steps: &["measure-bytes"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "concat-measured-copy",
+            source: "examples/bytes_concat_plan_ops.bn",
+            scenario: "examples/bytes_concat_plan_ops.scn",
+            steps: &["measure-bytes"],
+            expectation: BytesStorageProfileExpectation::MeasuredCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "slice-take-drop-no-copy",
+            source: "examples/bytes_slice_take_drop_plan_ops.bn",
+            scenario: "examples/bytes_slice_take_drop_plan_ops.scn",
+            steps: &["split-bytes"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "set-fixed-bank-no-copy",
+            source: "examples/bytes_set_plan_ops.bn",
+            scenario: "examples/bytes_set_plan_ops.scn",
+            steps: &["patch-bytes"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-read-after-set-no-copy",
+            source: "examples/bytes_set_read_bank_plan_ops.bn",
+            scenario: "examples/bytes_set_read_bank_plan_ops.scn",
+            steps: &["patch-bytes", "inspect-bank"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-predicates-after-set-no-copy",
+            source: "examples/bytes_set_predicates_bank_plan_ops.bn",
+            scenario: "examples/bytes_set_predicates_bank_plan_ops.scn",
+            steps: &["patch-bytes", "inspect-predicates"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-numeric-read-after-set-no-copy",
+            source: "examples/bytes_set_numeric_bank_plan_ops.bn",
+            scenario: "examples/bytes_set_numeric_bank_plan_ops.scn",
+            steps: &["patch-bytes", "inspect-numeric"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-conversions-after-set-no-copy",
+            source: "examples/bytes_set_conversion_bank_plan_ops.bn",
+            scenario: "examples/bytes_set_conversion_bank_plan_ops.scn",
+            steps: &["patch-bytes", "inspect-conversions"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-numeric-write-after-set-no-copy",
+            source: "examples/bytes_set_numeric_write_bank_plan_ops.bn",
+            scenario: "examples/bytes_set_numeric_write_bank_plan_ops.scn",
+            steps: &[
+                "patch-bytes",
+                "write-unsigned",
+                "write-signed",
+                "inspect-written",
+            ],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: true,
+        },
+        BytesStorageProfileCase {
+            id: "fixed-bank-file-write-after-set-no-copy",
+            source: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_set_file_write_bank_plan_ops.bn",
+            scenario: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_set_file_write_bank_plan_ops.scn",
+            steps: &["patch-bytes", "write-patched-file"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: false,
+        },
+        BytesStorageProfileCase {
+            id: "dynamic-file-write-source-payload-no-copy",
+            source: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_dynamic_file_write_plan_ops.bn",
+            scenario: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_dynamic_file_write_plan_ops.scn",
+            steps: &["receive-dynamic-bytes", "write-dynamic-file"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: false,
+        },
+        BytesStorageProfileCase {
+            id: "indexed-file-write-source-payload-no-copy",
+            source: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_indexed_file_write_plan_ops.bn",
+            scenario: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_indexed_file_write_plan_ops.scn",
+            steps: &["receive-indexed-bytes", "write-indexed-file"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: false,
+        },
+        BytesStorageProfileCase {
+            id: "indexed-file-read-row-field-path-no-copy",
+            source: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_indexed_file_read_plan_ops.bn",
+            scenario: "target/generated/bytes-storage-profile-file-write-fixtures/bytes_indexed_file_read_plan_ops.scn",
+            steps: &["read-indexed-file", "inspect-indexed-read"],
+            expectation: BytesStorageProfileExpectation::NoRuntimeCopy,
+            compare_legacy: false,
+        },
+    ];
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut case_reports = Vec::new();
+    let mut artifact_paths = Vec::new();
+    let mut source_hash_material = Vec::new();
+    artifact_paths.push(indexed_file_read_input.clone());
+
+    for case in cases {
+        let source_path = Path::new(case.source);
+        let scenario_path = Path::new(case.scenario);
+        artifact_paths.push(source_path.to_path_buf());
+        artifact_paths.push(scenario_path.to_path_buf());
+        source_hash_material.extend(fs::read(source_path)?);
+        source_hash_material.push(0);
+        source_hash_material.extend(fs::read(scenario_path)?);
+        source_hash_material.push(0);
+
+        boon_runtime::reset_runtime_bytes_storage_counters();
+        let step_ids = case
+            .steps
+            .iter()
+            .map(|step| (*step).to_owned())
+            .collect::<Vec<_>>();
+        let output = boon_runtime::run_plan_root_scalar_scenario(
+            source_path,
+            scenario_path,
+            boon_plan::TargetProfile::SoftwareDefault,
+            &step_ids,
+            case.compare_legacy,
+            None,
+        )?;
+        let counters = output
+            .report
+            .pointer("/plan_executor/bytes_storage_counters")
+            .cloned()
+            .ok_or_else(|| format!("{} missing plan_executor.bytes_storage_counters", case.id))?;
+        let no_copy = output
+            .report
+            .pointer("/plan_executor/bytes_storage_no_copy")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let copy_bytes = bytes_counter_u64(&counters, "copy_from_slice_bytes")?;
+        let vec_clone_bytes = bytes_counter_u64(&counters, "vec_clone_bytes")?;
+        let vec_alloc_bytes = bytes_counter_u64(&counters, "vec_alloc_bytes")?;
+        let inline_value_count = bytes_counter_u64(&counters, "inline_value_count")?;
+        let measured_copy_bytes = copy_bytes
+            .saturating_add(vec_clone_bytes)
+            .saturating_add(vec_alloc_bytes);
+        let mut borrowed_read_evidence = JsonValue::Null;
+        let mut pass = match case.expectation {
+            BytesStorageProfileExpectation::NoRuntimeCopy => no_copy && measured_copy_bytes == 0,
+            BytesStorageProfileExpectation::MeasuredCopy => {
+                !no_copy && inline_value_count > 0 && measured_copy_bytes > 0
+            }
+        };
+        if case.id == "fixed-bank-read-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_read_after_set_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "slice-take-drop-no-copy" {
+            borrowed_read_evidence = slice_take_drop_view_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "fixed-bank-predicates-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_predicates_after_set_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "fixed-bank-numeric-read-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_numeric_reads_after_set_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "fixed-bank-conversions-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_conversions_after_set_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "fixed-bank-numeric-write-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_numeric_writes_after_set_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "fixed-bank-file-write-after-set-no-copy" {
+            borrowed_read_evidence = fixed_bank_file_write_after_set_evidence(&output.report)?;
+            if let Some(artifact_path) = borrowed_read_evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+            {
+                artifact_paths.push(PathBuf::from(artifact_path));
+            }
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "dynamic-file-write-source-payload-no-copy" {
+            borrowed_read_evidence = dynamic_file_write_source_payload_evidence(&output.report)?;
+            if let Some(artifact_path) = borrowed_read_evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+            {
+                artifact_paths.push(PathBuf::from(artifact_path));
+            }
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "indexed-file-write-source-payload-no-copy" {
+            borrowed_read_evidence = indexed_file_write_source_payload_evidence(&output.report)?;
+            if let Some(artifact_path) = borrowed_read_evidence
+                .get("artifact_path")
+                .and_then(JsonValue::as_str)
+            {
+                artifact_paths.push(PathBuf::from(artifact_path));
+            }
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        } else if case.id == "indexed-file-read-row-field-path-no-copy" {
+            borrowed_read_evidence = indexed_file_read_row_field_path_evidence(&output.report)?;
+            pass = pass
+                && borrowed_read_evidence
+                    .get("status")
+                    .and_then(JsonValue::as_str)
+                    == Some("pass");
+        }
+        let detail = format!(
+            "expectation={:?}, no_copy={no_copy}, copy_from_slice_bytes={copy_bytes}, vec_clone_bytes={vec_clone_bytes}, vec_alloc_bytes={vec_alloc_bytes}, inline_value_count={inline_value_count}",
+            case.expectation
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("bytes-storage-profile:{}:counter-shape", case.id),
+            pass,
+            detail,
+            Some(format!(
+                "BYTES storage counters did not match expectation for {}",
+                case.id
+            )),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("bytes-storage-profile:{}:no-fallback", case.id),
+            plan_executor_no_fallback_counts_zero(&output.report)
+                .map(|(pass, _)| pass)
+                .unwrap_or(false),
+            "PlanExecutor fallback counters are zero".to_owned(),
+            Some(format!("{} used fallback execution", case.id)),
+        );
+        case_reports.push(json!({
+            "id": case.id,
+            "source_path": case.source,
+            "scenario_path": case.scenario,
+            "steps": case.steps,
+            "expectation": case.expectation.as_str(),
+            "status": if pass { json!("pass") } else { output.report.get("status").cloned().unwrap_or_else(|| json!("missing")) },
+            "legacy_comparison_enabled": case.compare_legacy,
+            "plan_hash": output.plan_hash,
+            "state_summary": output.state_summary,
+            "bytes_storage_counters": counters,
+            "bytes_storage_no_copy": no_copy,
+            "measured_copy_bytes": measured_copy_bytes,
+            "borrowed_read_evidence": borrowed_read_evidence,
+        }));
+    }
+
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    write_static_gate_report(
+        args,
+        "verify-bytes-storage-profile",
+        report,
+        checks,
+        blockers,
+        json!({
+            "source_hash": boon_runtime::sha256_bytes(&source_hash_material),
+            "program_hash": boon_runtime::sha256_bytes(&source_hash_material),
+            "bytes_storage_profile": {
+                "status": "measured",
+                "case_count": case_reports.len(),
+                "cases": case_reports,
+                "fixed_read_only_zero_copy_required": true,
+                "slice_take_drop_zero_copy_required": true,
+                "fixed_set_zero_copy_required": true,
+                "dynamic_mutating_operations_must_report_copy_cost": true,
+                "counter_scope": "PlanExecutor root-scenario BYTES ticks after initial state warm-up"
+            },
+            "artifact_sha256s": artifact_sha256s
+        }),
+    )
+}
+
+fn verify_bytes_byte_bank_layout(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-byte-bank-layout.json"));
+    let cases = [
+        BytesByteBankLayoutCase {
+            id: "root-fixed-bytes-bank",
+            source: "examples/bytes_set_plan_ops.bn",
+            min_fixed_bytes_scalars: 1,
+            min_dynamic_bytes_scalars: 0,
+            min_root_byte_banks: 1,
+            min_indexed_byte_banks: 0,
+            require_no_dynamic_banks: true,
+        },
+        BytesByteBankLayoutCase {
+            id: "dynamic-bytes-no-fixed-bank",
+            source: "examples/bytes_source_payload_plan_ops.bn",
+            min_fixed_bytes_scalars: 0,
+            min_dynamic_bytes_scalars: 1,
+            min_root_byte_banks: 0,
+            min_indexed_byte_banks: 0,
+            require_no_dynamic_banks: true,
+        },
+        BytesByteBankLayoutCase {
+            id: "indexed-fixed-bytes-bank",
+            source: "examples/bytes_indexed_source_payload_plan_ops.bn",
+            min_fixed_bytes_scalars: 1,
+            min_dynamic_bytes_scalars: 0,
+            min_root_byte_banks: 0,
+            min_indexed_byte_banks: 1,
+            require_no_dynamic_banks: true,
+        },
+    ];
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut case_reports = Vec::new();
+    let mut artifact_paths = Vec::new();
+    let mut source_hash_material = Vec::new();
+
+    for case in cases {
+        let source_path = Path::new(case.source);
+        artifact_paths.push(source_path.to_path_buf());
+        let source = fs::read_to_string(source_path)?;
+        source_hash_material.extend(source.as_bytes());
+        source_hash_material.push(0);
+        let parsed = boon_parser::parse_source(case.source, source)?;
+        let ir = boon_ir::lower(&parsed)?;
+        let plan =
+            boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+        let verification = boon_plan::verify_plan(&plan)?;
+        let fixed_bytes_scalars = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.value_type,
+                    boon_plan::PlanValueType::Bytes { fixed_len: Some(_) }
+                )
+            })
+            .count();
+        let dynamic_bytes_scalars = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.value_type,
+                    boon_plan::PlanValueType::Bytes { fixed_len: None }
+                )
+            })
+            .count();
+        let root_byte_banks = plan
+            .storage_layout
+            .byte_banks
+            .iter()
+            .filter(|bank| !bank.indexed)
+            .count();
+        let indexed_byte_banks = plan
+            .storage_layout
+            .byte_banks
+            .iter()
+            .filter(|bank| bank.indexed)
+            .count();
+        let byte_bank_count = plan.storage_layout.byte_banks.len();
+        let fixed_bank_coverage = fixed_bytes_scalars == byte_bank_count;
+        let no_dynamic_banks = plan.storage_layout.byte_banks.iter().all(|bank| {
+            plan.storage_layout.scalar_slots.iter().any(|slot| {
+                slot.id == bank.state_storage_id
+                    && matches!(
+                        slot.value_type,
+                        boon_plan::PlanValueType::Bytes {
+                            fixed_len: Some(fixed_len)
+                        } if fixed_len == bank.fixed_len
+                    )
+            })
+        });
+        let bank_check = verification
+            .checks
+            .iter()
+            .any(|check| check.id == "byte-bank-slots-match-fixed-bytes" && check.pass);
+        let pass = verification.status == "pass"
+            && bank_check
+            && fixed_bank_coverage
+            && fixed_bytes_scalars >= case.min_fixed_bytes_scalars
+            && dynamic_bytes_scalars >= case.min_dynamic_bytes_scalars
+            && root_byte_banks >= case.min_root_byte_banks
+            && indexed_byte_banks >= case.min_indexed_byte_banks
+            && (!case.require_no_dynamic_banks || no_dynamic_banks);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("bytes-byte-bank-layout:{}:shape", case.id),
+            pass,
+            format!(
+                "verification_status={}, fixed_bytes_scalars={fixed_bytes_scalars}, dynamic_bytes_scalars={dynamic_bytes_scalars}, byte_bank_count={byte_bank_count}, root_byte_banks={root_byte_banks}, indexed_byte_banks={indexed_byte_banks}, fixed_bank_coverage={fixed_bank_coverage}, no_dynamic_banks={no_dynamic_banks}, bank_check={bank_check}",
+                verification.status
+            ),
+            Some(format!(
+                "byte-bank layout did not match expectation for {}",
+                case.id
+            )),
+        );
+        case_reports.push(json!({
+            "id": case.id,
+            "source_path": case.source,
+            "status": if pass { "pass" } else { "fail" },
+            "plan_hash": boon_plan::plan_sha256(&plan)?,
+            "verification_status": verification.status,
+            "fixed_bytes_scalar_count": fixed_bytes_scalars,
+            "dynamic_bytes_scalar_count": dynamic_bytes_scalars,
+            "byte_bank_count": byte_bank_count,
+            "root_byte_bank_count": root_byte_banks,
+            "indexed_byte_bank_count": indexed_byte_banks,
+            "fixed_bank_coverage": fixed_bank_coverage,
+            "no_dynamic_banks": no_dynamic_banks,
+            "byte_banks": plan.storage_layout.byte_banks,
+        }));
+    }
+
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let layout_status = if blockers.is_empty() { "pass" } else { "fail" };
+    write_static_gate_report(
+        args,
+        "verify-bytes-byte-bank-layout",
+        report,
+        checks,
+        blockers,
+        json!({
+            "source_hash": boon_runtime::sha256_bytes(&source_hash_material),
+            "program_hash": boon_runtime::sha256_bytes(&source_hash_material),
+            "bytes_byte_bank_layout": {
+                "status": layout_status,
+                "case_count": case_reports.len(),
+                "cases": case_reports,
+                "fixed_bytes_scalars_require_byte_banks": true,
+                "dynamic_bytes_scalars_must_not_declare_fixed_banks": true,
+                "scope": "MachinePlan StorageLayout byte_banks metadata"
+            },
+            "artifact_sha256s": artifact_sha256s
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct BytesByteBankLayoutCase {
+    id: &'static str,
+    source: &'static str,
+    min_fixed_bytes_scalars: usize,
+    min_dynamic_bytes_scalars: usize,
+    min_root_byte_banks: usize,
+    min_indexed_byte_banks: usize,
+    require_no_dynamic_banks: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BytesStorageProfileCase {
+    id: &'static str,
+    source: &'static str,
+    scenario: &'static str,
+    steps: &'static [&'static str],
+    expectation: BytesStorageProfileExpectation,
+    compare_legacy: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BytesStorageProfileExpectation {
+    NoRuntimeCopy,
+    MeasuredCopy,
+}
+
+impl BytesStorageProfileExpectation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRuntimeCopy => "no-runtime-copy",
+            Self::MeasuredCopy => "measured-copy",
+        }
+    }
+}
+
+fn fixed_bank_read_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank read evidence missing plan_executor.per_step")?;
+    let inspect_step = per_step
+        .get(1)
+        .ok_or("fixed bank read evidence missing second step")?;
+    let step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = inspect_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank read evidence missing second-step updates")?;
+    let read_updates = updates
+        .iter()
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(kind, "bytes_get" | "bytes_length").then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let get_update = read_updates.iter().copied().find(|update| {
+        update.get("expression_kind").and_then(JsonValue::as_str) == Some("bytes_get")
+    });
+    let length_update = read_updates.iter().copied().find(|update| {
+        update.get("expression_kind").and_then(JsonValue::as_str) == Some("bytes_length")
+    });
+    let borrowed_reads = read_updates.iter().all(|update| {
+        update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("root_fixed_byte_bank")
+            && update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(JsonValue::as_str)
+                == Some("borrowed")
+    });
+    let values_match =
+        get_update.and_then(|update| update.get("value").and_then(JsonValue::as_i64)) == Some(170)
+            && length_update.and_then(|update| update.get("value").and_then(JsonValue::as_i64))
+                == Some(4);
+    let step_no_copy = inspect_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = inspect_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let pass = step_id == "inspect-bank"
+        && read_updates.len() == 2
+        && borrowed_reads
+        && values_match
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "read_update_count": read_updates.len(),
+        "borrowed_reads": borrowed_reads,
+        "values_match": values_match,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "updates": read_updates,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn slice_take_drop_view_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("slice/take/drop evidence missing plan_executor.per_step")?;
+    let split_step = per_step
+        .first()
+        .ok_or("slice/take/drop evidence missing first step")?;
+    let step_id = split_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = split_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("slice/take/drop evidence missing first-step updates")?;
+    let slice_updates = updates
+        .iter()
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(kind, "bytes_slice" | "bytes_take" | "bytes_drop").then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let expected = BTreeMap::from([
+        ("store.sliced", ("bytes_slice", 1u64, 3u64, 3u64)),
+        ("store.taken", ("bytes_take", 0u64, 4u64, 4u64)),
+        ("store.dropped", ("bytes_drop", 2u64, 4u64, 4u64)),
+    ]);
+    let mut seen_targets = BTreeSet::new();
+    let mut value_mismatches = Vec::new();
+    let mut access_mismatches = Vec::new();
+    for update in &slice_updates {
+        let target = update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        seen_targets.insert(target.to_owned());
+        match expected.get(target) {
+            Some((kind, offset, byte_count, output_len))
+                if update.get("expression_kind").and_then(JsonValue::as_str) == Some(*kind)
+                    && update
+                        .get("value")
+                        .and_then(|value| value.get("byte_len"))
+                        .and_then(JsonValue::as_u64)
+                        == Some(*output_len)
+                    && update
+                        .pointer("/bytes_access/offset")
+                        .and_then(JsonValue::as_u64)
+                        == Some(*offset)
+                    && update
+                        .pointer("/bytes_access/byte_count")
+                        .and_then(JsonValue::as_u64)
+                        == Some(*byte_count)
+                    && update
+                        .pointer("/bytes_access/output_byte_len")
+                        .and_then(JsonValue::as_u64)
+                        == Some(*output_len) => {}
+            Some((kind, offset, byte_count, output_len)) => value_mismatches.push(format!(
+                "{target}: expected {kind} offset {offset} byte_count {byte_count} output_len {output_len}, got kind {:?} value_len {:?} access {:?}",
+                update.get("expression_kind").and_then(JsonValue::as_str),
+                update
+                    .get("value")
+                    .and_then(|value| value.get("byte_len"))
+                    .and_then(JsonValue::as_u64),
+                update.get("bytes_access").unwrap_or(&JsonValue::Null)
+            )),
+            None => value_mismatches.push(format!("{target}: unexpected slice/take/drop update")),
+        }
+        if update
+            .pointer("/bytes_access/read_only")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+            || update
+                .pointer("/bytes_access/output_storage_kind")
+                .and_then(JsonValue::as_str)
+                != Some("bytes_slice_view")
+            || update
+                .pointer("/bytes_access/output_cow_kind")
+                .and_then(JsonValue::as_str)
+                != Some("borrowed_view")
+        {
+            access_mismatches.push(format!(
+                "{target}: missing bytes_slice_view output access evidence"
+            ));
+        }
+    }
+    let step_no_copy = split_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = split_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let targets_match = seen_targets == expected.keys().map(|key| key.to_string()).collect();
+    let values_match = value_mismatches.is_empty();
+    let output_views = access_mismatches.is_empty();
+    let pass = step_id == "split-bytes"
+        && slice_updates.len() == expected.len()
+        && targets_match
+        && values_match
+        && output_views
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "slice_update_count": slice_updates.len(),
+        "expected_target_count": expected.len(),
+        "targets_match": targets_match,
+        "values_match": values_match,
+        "output_slice_views": output_views,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "value_mismatches": value_mismatches,
+        "access_mismatches": access_mismatches,
+        "updates": slice_updates,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn fixed_bank_predicates_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank predicate evidence missing plan_executor.per_step")?;
+    let inspect_step = per_step
+        .get(1)
+        .ok_or("fixed bank predicate evidence missing second step")?;
+    let step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = inspect_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank predicate evidence missing second-step updates")?;
+    let predicate_updates = updates
+        .iter()
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(
+                kind,
+                "bytes_equal" | "bytes_find" | "bytes_starts_with" | "bytes_ends_with"
+            )
+            .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let expected_targets = BTreeMap::from([
+        ("store.same", json!(true)),
+        ("store.found_index", json!(2)),
+        ("store.missing_index", JsonValue::Null),
+        ("store.starts", json!(true)),
+        ("store.ends", json!(true)),
+    ]);
+    let mut seen_targets = BTreeSet::new();
+    let mut value_mismatches = Vec::new();
+    let mut access_mismatches = Vec::new();
+    for update in &predicate_updates {
+        let target = update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        seen_targets.insert(target.to_owned());
+        match expected_targets.get(target) {
+            Some(expected) if update.get("value") == Some(expected) => {}
+            Some(expected) => value_mismatches.push(format!(
+                "{target}: expected {expected}, got {}",
+                update.get("value").unwrap_or(&JsonValue::Null)
+            )),
+            None => value_mismatches.push(format!("{target}: unexpected predicate update")),
+        }
+        let inputs = update
+            .pointer("/bytes_access/inputs")
+            .and_then(JsonValue::as_array);
+        let Some(inputs) = inputs else {
+            access_mismatches.push(format!("{target}: missing bytes_access.inputs"));
+            continue;
+        };
+        let has_fixed_bank_borrow = inputs.iter().any(|input| {
+            input.get("access_source").and_then(JsonValue::as_str) == Some("root_fixed_byte_bank")
+                && input.get("cow_kind").and_then(JsonValue::as_str) == Some("borrowed")
+        });
+        let all_borrowed = inputs
+            .iter()
+            .all(|input| input.get("cow_kind").and_then(JsonValue::as_str) == Some("borrowed"));
+        if !has_fixed_bank_borrow {
+            access_mismatches.push(format!(
+                "{target}: no input borrowed from root_fixed_byte_bank"
+            ));
+        }
+        if !all_borrowed {
+            access_mismatches.push(format!("{target}: not all byte inputs were borrowed"));
+        }
+    }
+    let step_no_copy = inspect_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = inspect_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let targets_match =
+        seen_targets == expected_targets.keys().map(|key| key.to_string()).collect();
+    let values_match = value_mismatches.is_empty();
+    let borrowed_predicate_reads = access_mismatches.is_empty();
+    let pass = step_id == "inspect-predicates"
+        && predicate_updates.len() == expected_targets.len()
+        && targets_match
+        && values_match
+        && borrowed_predicate_reads
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "predicate_update_count": predicate_updates.len(),
+        "expected_target_count": expected_targets.len(),
+        "targets_match": targets_match,
+        "values_match": values_match,
+        "borrowed_predicate_reads": borrowed_predicate_reads,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "value_mismatches": value_mismatches,
+        "access_mismatches": access_mismatches,
+        "updates": predicate_updates,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn fixed_bank_numeric_reads_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank numeric evidence missing plan_executor.per_step")?;
+    let inspect_step = per_step
+        .get(1)
+        .ok_or("fixed bank numeric evidence missing second step")?;
+    let step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = inspect_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank numeric evidence missing second-step updates")?;
+    let numeric_updates = updates
+        .iter()
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(kind, "bytes_read_unsigned" | "bytes_read_signed").then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let expected_values = BTreeMap::from([
+        ("store.read_u16_be", json!(510)),
+        ("store.read_u16_le", json!(65025)),
+        ("store.read_i8", json!(-2)),
+    ]);
+    let expected_kinds = BTreeMap::from([
+        ("store.read_u16_be", "bytes_read_unsigned"),
+        ("store.read_u16_le", "bytes_read_unsigned"),
+        ("store.read_i8", "bytes_read_signed"),
+    ]);
+    let mut seen_targets = BTreeSet::new();
+    let mut value_mismatches = Vec::new();
+    let mut access_mismatches = Vec::new();
+    for update in &numeric_updates {
+        let target = update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        seen_targets.insert(target.to_owned());
+        match (expected_kinds.get(target), expected_values.get(target)) {
+            (Some(kind), Some(expected))
+                if update.get("expression_kind").and_then(JsonValue::as_str) == Some(*kind)
+                    && update.get("value") == Some(expected) => {}
+            (Some(kind), Some(expected)) => value_mismatches.push(format!(
+                "{target}: expected {kind} value {expected}, got kind {:?} value {}",
+                update.get("expression_kind").and_then(JsonValue::as_str),
+                update.get("value").unwrap_or(&JsonValue::Null)
+            )),
+            _ => value_mismatches.push(format!("{target}: unexpected numeric read update")),
+        }
+        let read_only = update
+            .pointer("/bytes_access/read_only")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+        let fixed_bank_borrowed = update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("root_fixed_byte_bank")
+            && update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(JsonValue::as_str)
+                == Some("borrowed");
+        if !read_only {
+            access_mismatches.push(format!("{target}: numeric read was not marked read_only"));
+        }
+        if !fixed_bank_borrowed {
+            access_mismatches.push(format!(
+                "{target}: numeric read was not borrowed from root_fixed_byte_bank"
+            ));
+        }
+    }
+    let step_no_copy = inspect_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = inspect_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let targets_match = seen_targets
+        == expected_values
+            .keys()
+            .map(|key| key.to_string())
+            .collect::<BTreeSet<_>>();
+    let values_match = value_mismatches.is_empty();
+    let borrowed_numeric_reads = access_mismatches.is_empty();
+    let pass = step_id == "inspect-numeric"
+        && numeric_updates.len() == expected_values.len()
+        && targets_match
+        && values_match
+        && borrowed_numeric_reads
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "numeric_update_count": numeric_updates.len(),
+        "expected_target_count": expected_values.len(),
+        "targets_match": targets_match,
+        "values_match": values_match,
+        "borrowed_numeric_reads": borrowed_numeric_reads,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "value_mismatches": value_mismatches,
+        "access_mismatches": access_mismatches,
+        "updates": numeric_updates,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn fixed_bank_conversions_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank conversion evidence missing plan_executor.per_step")?;
+    let inspect_step = per_step
+        .get(1)
+        .ok_or("fixed bank conversion evidence missing second step")?;
+    let step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = inspect_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank conversion evidence missing second-step updates")?;
+    let conversion_updates = updates
+        .iter()
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(kind, "bytes_to_text" | "bytes_to_hex" | "bytes_to_base64").then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let expected_values = BTreeMap::from([
+        ("store.text", json!("AZC")),
+        ("store.hex", json!("415a43")),
+        ("store.base64", json!("QVpD")),
+    ]);
+    let expected_kinds = BTreeMap::from([
+        ("store.text", "bytes_to_text"),
+        ("store.hex", "bytes_to_hex"),
+        ("store.base64", "bytes_to_base64"),
+    ]);
+    let mut seen_targets = BTreeSet::new();
+    let mut value_mismatches = Vec::new();
+    let mut access_mismatches = Vec::new();
+    for update in &conversion_updates {
+        let target = update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        seen_targets.insert(target.to_owned());
+        match (expected_kinds.get(target), expected_values.get(target)) {
+            (Some(kind), Some(expected))
+                if update.get("expression_kind").and_then(JsonValue::as_str) == Some(*kind)
+                    && update.get("value") == Some(expected) => {}
+            (Some(kind), Some(expected)) => value_mismatches.push(format!(
+                "{target}: expected {kind} value {expected}, got kind {:?} value {}",
+                update.get("expression_kind").and_then(JsonValue::as_str),
+                update.get("value").unwrap_or(&JsonValue::Null)
+            )),
+            _ => value_mismatches.push(format!("{target}: unexpected conversion update")),
+        }
+        let read_only = update
+            .pointer("/bytes_access/read_only")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+        let fixed_bank_borrowed = update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("root_fixed_byte_bank")
+            && update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(JsonValue::as_str)
+                == Some("borrowed");
+        if !read_only {
+            access_mismatches.push(format!("{target}: conversion was not marked read_only"));
+        }
+        if !fixed_bank_borrowed {
+            access_mismatches.push(format!(
+                "{target}: conversion was not borrowed from root_fixed_byte_bank"
+            ));
+        }
+    }
+    let step_no_copy = inspect_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = inspect_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let targets_match = seen_targets
+        == expected_values
+            .keys()
+            .map(|key| key.to_string())
+            .collect::<BTreeSet<_>>();
+    let values_match = value_mismatches.is_empty();
+    let borrowed_conversion_reads = access_mismatches.is_empty();
+    let pass = step_id == "inspect-conversions"
+        && conversion_updates.len() == expected_values.len()
+        && targets_match
+        && values_match
+        && borrowed_conversion_reads
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "conversion_update_count": conversion_updates.len(),
+        "expected_target_count": expected_values.len(),
+        "targets_match": targets_match,
+        "values_match": values_match,
+        "borrowed_conversion_reads": borrowed_conversion_reads,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "value_mismatches": value_mismatches,
+        "access_mismatches": access_mismatches,
+        "updates": conversion_updates,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn fixed_bank_numeric_writes_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank numeric write evidence missing plan_executor.per_step")?;
+    let unsigned_step = per_step
+        .get(1)
+        .ok_or("fixed bank numeric write evidence missing write-unsigned step")?;
+    let signed_step = per_step
+        .get(2)
+        .ok_or("fixed bank numeric write evidence missing write-signed step")?;
+    let inspect_step = per_step
+        .get(3)
+        .ok_or("fixed bank numeric write evidence missing inspect-written step")?;
+    let unsigned_step_id = unsigned_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let signed_step_id = signed_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let inspect_step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+
+    let write_updates = [unsigned_step, signed_step]
+        .into_iter()
+        .flat_map(|step| {
+            step.get("updates")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|update| {
+            let kind = update.get("expression_kind").and_then(JsonValue::as_str)?;
+            matches!(kind, "bytes_write_unsigned" | "bytes_write_signed").then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let inspect_updates = inspect_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank numeric write evidence missing inspect updates")?;
+
+    let expected_writes =
+        BTreeMap::from([("bytes_write_unsigned", 2u64), ("bytes_write_signed", 2u64)]);
+    let mut seen_write_kinds = BTreeSet::new();
+    let mut access_mismatches = Vec::new();
+    for update in &write_updates {
+        let kind = update
+            .get("expression_kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        seen_write_kinds.insert(kind.to_owned());
+        let target = update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<missing>");
+        let expected_patch_count = expected_writes.get(kind).copied();
+        if target != "store.patched" {
+            access_mismatches.push(format!("{kind}: unexpected target `{target}`"));
+        }
+        if update
+            .pointer("/bytes_access/read_only")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        {
+            access_mismatches.push(format!("{kind}: write was not marked read_only=false"));
+        }
+        if update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            != Some("root_fixed_byte_bank")
+            || update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(JsonValue::as_str)
+                != Some("borrowed")
+            || update
+                .pointer("/bytes_access/mutation_kind")
+                .and_then(JsonValue::as_str)
+                != Some("fixed_byte_bank_patches")
+        {
+            access_mismatches.push(format!(
+                "{kind}: numeric write did not prove borrowed fixed-bank patch mutation"
+            ));
+        }
+        if update
+            .pointer("/bytes_access/patch_count")
+            .and_then(JsonValue::as_u64)
+            != expected_patch_count
+        {
+            access_mismatches.push(format!(
+                "{kind}: expected patch_count {:?}, got {:?}",
+                expected_patch_count,
+                update
+                    .pointer("/bytes_access/patch_count")
+                    .and_then(JsonValue::as_u64)
+            ));
+        }
+        if update
+            .get("value")
+            .and_then(|value| value.get("byte_len"))
+            .and_then(JsonValue::as_u64)
+            != Some(4)
+        {
+            access_mismatches.push(format!("{kind}: output summary byte_len was not 4"));
+        }
+    }
+
+    let expected_inspect_values = BTreeMap::from([
+        ("store.hex", json!("feff1234")),
+        ("store.read_u16_be", json!(4660)),
+        ("store.read_i16_le", json!(-2)),
+    ]);
+    let expected_inspect_kinds = BTreeMap::from([
+        ("store.hex", "bytes_to_hex"),
+        ("store.read_u16_be", "bytes_read_unsigned"),
+        ("store.read_i16_le", "bytes_read_signed"),
+    ]);
+    let mut seen_inspect_targets = BTreeSet::new();
+    let mut value_mismatches = Vec::new();
+    for update in inspect_updates {
+        let Some(target) = update.get("target_state").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if let Some(expected_value) = expected_inspect_values.get(target) {
+            seen_inspect_targets.insert(target.to_owned());
+            let expected_kind = expected_inspect_kinds
+                .get(target)
+                .copied()
+                .unwrap_or("<missing>");
+            if update.get("expression_kind").and_then(JsonValue::as_str) != Some(expected_kind)
+                || update.get("value") != Some(expected_value)
+            {
+                value_mismatches.push(format!(
+                    "{target}: expected {expected_kind} value {expected_value}, got kind {:?} value {}",
+                    update.get("expression_kind").and_then(JsonValue::as_str),
+                    update.get("value").unwrap_or(&JsonValue::Null)
+                ));
+            }
+        }
+    }
+
+    let step_zero_byte_counters =
+        [unsigned_step, signed_step, inspect_step]
+            .into_iter()
+            .all(|step| {
+                step.get("bytes_storage_no_copy")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                    && [
+                        "copy_from_slice_bytes",
+                        "vec_clone_bytes",
+                        "vec_alloc_bytes",
+                        "zero_fill_bytes",
+                    ]
+                    .iter()
+                    .all(|key| {
+                        step.pointer(&format!("/bytes_storage_counters/{key}"))
+                            .and_then(JsonValue::as_u64)
+                            == Some(0)
+                    })
+            });
+    let write_kinds_match = seen_write_kinds
+        == expected_writes
+            .keys()
+            .map(|key| key.to_string())
+            .collect::<BTreeSet<_>>();
+    let inspect_targets_match = seen_inspect_targets
+        == expected_inspect_values
+            .keys()
+            .map(|key| key.to_string())
+            .collect::<BTreeSet<_>>();
+    let values_match = value_mismatches.is_empty();
+    let borrowed_numeric_writes = access_mismatches.is_empty();
+    let pass = unsigned_step_id == "write-unsigned"
+        && signed_step_id == "write-signed"
+        && inspect_step_id == "inspect-written"
+        && write_updates.len() == expected_writes.len()
+        && write_kinds_match
+        && inspect_targets_match
+        && values_match
+        && borrowed_numeric_writes
+        && step_zero_byte_counters;
+
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "unsigned_step_id": unsigned_step_id,
+        "signed_step_id": signed_step_id,
+        "inspect_step_id": inspect_step_id,
+        "write_update_count": write_updates.len(),
+        "expected_write_count": expected_writes.len(),
+        "write_kinds_match": write_kinds_match,
+        "inspect_targets_match": inspect_targets_match,
+        "values_match": values_match,
+        "borrowed_numeric_writes": borrowed_numeric_writes,
+        "step_zero_byte_counters": step_zero_byte_counters,
+        "value_mismatches": value_mismatches,
+        "access_mismatches": access_mismatches,
+        "write_updates": write_updates,
+        "inspect_updates": inspect_updates,
+        "unsigned_step_counters": unsigned_step.get("bytes_storage_counters").cloned().unwrap_or(JsonValue::Null),
+        "signed_step_counters": signed_step.get("bytes_storage_counters").cloned().unwrap_or(JsonValue::Null),
+        "inspect_step_counters": inspect_step.get("bytes_storage_counters").cloned().unwrap_or(JsonValue::Null),
+    }))
+}
+
+fn fixed_bank_file_write_after_set_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank file-write evidence missing plan_executor.per_step")?;
+    let write_step = per_step
+        .get(1)
+        .ok_or("fixed bank file-write evidence missing write-patched-file step")?;
+    let step_id = write_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let updates = write_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("fixed bank file-write evidence missing write-step updates")?;
+    let file_write_updates = updates
+        .iter()
+        .filter_map(|update| {
+            (update.get("expression_kind").and_then(JsonValue::as_str) == Some("file_write_bytes"))
+                .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let write_update = file_write_updates
+        .first()
+        .copied()
+        .unwrap_or(&JsonValue::Null);
+    let host_effect = write_update
+        .get("host_effect")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let artifact_path = host_effect
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let artifact_bytes = if artifact_path == "<missing>" {
+        Vec::new()
+    } else {
+        fs::read(artifact_path)?
+    };
+    let expected_bytes = [0x01, 0x02, 0xAA, 0x04];
+    let expected_sha256 = boon_runtime::sha256_bytes(&expected_bytes);
+    let artifact_matches = artifact_bytes == expected_bytes;
+    let host_effect_matches = host_effect.get("status").and_then(JsonValue::as_str) == Some("pass")
+        && host_effect.get("kind").and_then(JsonValue::as_str) == Some("file_write_bytes")
+        && host_effect.get("path").and_then(JsonValue::as_str) == Some("outputs/patched.bin")
+        && host_effect.get("byte_len").and_then(JsonValue::as_u64) == Some(4)
+        && host_effect.get("first_byte").and_then(JsonValue::as_u64) == Some(1)
+        && host_effect.get("last_byte").and_then(JsonValue::as_u64) == Some(4)
+        && host_effect.get("sha256").and_then(JsonValue::as_str) == Some(expected_sha256.as_str())
+        && host_effect
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let update_matches = write_update.get("target_state").and_then(JsonValue::as_str)
+        == Some("store.write_status")
+        && write_update.get("value").and_then(JsonValue::as_str) == Some("outputs/patched.bin")
+        && write_update.get("changed").and_then(JsonValue::as_bool) == Some(true);
+    let borrowed_file_write = write_update
+        .pointer("/bytes_access/read_only")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+        && write_update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("root_fixed_byte_bank")
+        && write_update
+            .pointer("/bytes_access/cow_kind")
+            .and_then(JsonValue::as_str)
+            == Some("borrowed")
+        && write_update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            == Some("file_write_bytes")
+        && write_update
+            .pointer("/bytes_access/byte_len")
+            .and_then(JsonValue::as_u64)
+            == Some(4);
+    let step_no_copy = write_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = write_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let pass = step_id == "write-patched-file"
+        && file_write_updates.len() == 1
+        && update_matches
+        && borrowed_file_write
+        && host_effect_matches
+        && artifact_matches
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "step_id": step_id,
+        "file_write_update_count": file_write_updates.len(),
+        "expected_update_count": 1,
+        "update_matches": update_matches,
+        "borrowed_file_write": borrowed_file_write,
+        "host_effect_matches": host_effect_matches,
+        "artifact_matches": artifact_matches,
+        "artifact_path": artifact_path,
+        "expected_sha256": expected_sha256,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "updates": file_write_updates,
+        "host_effect": host_effect,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn dynamic_file_write_source_payload_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("dynamic file-write evidence missing plan_executor.per_step")?;
+    let receive_step = per_step
+        .first()
+        .ok_or("dynamic file-write evidence missing receive-dynamic-bytes step")?;
+    let write_step = per_step
+        .get(1)
+        .ok_or("dynamic file-write evidence missing write-dynamic-file step")?;
+    let receive_step_id = receive_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let write_step_id = write_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let receive_updates = receive_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("dynamic file-write evidence missing receive updates")?;
+    let receive_update = receive_updates.first().unwrap_or(&JsonValue::Null);
+    let expected_bytes = [0x01, 0xFE, 0x04];
+    let expected_sha256 = boon_runtime::sha256_bytes(&expected_bytes);
+    let receive_matches = receive_updates.len() == 1
+        && receive_update
+            .get("expression_kind")
+            .and_then(JsonValue::as_str)
+            == Some("source_payload")
+        && receive_update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            == Some("store.received")
+        && receive_update
+            .get("source_payload_field")
+            .and_then(JsonValue::as_str)
+            == Some("Bytes")
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("$boon_type"))
+            .and_then(JsonValue::as_str)
+            == Some("BYTES")
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("byte_len"))
+            .and_then(JsonValue::as_u64)
+            == Some(3)
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("digest"))
+            .and_then(JsonValue::as_str)
+            == Some(expected_sha256.as_str());
+
+    let updates = write_step
+        .get("updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("dynamic file-write evidence missing write-step updates")?;
+    let file_write_updates = updates
+        .iter()
+        .filter_map(|update| {
+            (update.get("expression_kind").and_then(JsonValue::as_str) == Some("file_write_bytes"))
+                .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let write_update = file_write_updates
+        .first()
+        .copied()
+        .unwrap_or(&JsonValue::Null);
+    let host_effect = write_update
+        .get("host_effect")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let artifact_path = host_effect
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let artifact_bytes = if artifact_path == "<missing>" {
+        Vec::new()
+    } else {
+        fs::read(artifact_path)?
+    };
+    let artifact_matches = artifact_bytes == expected_bytes;
+    let host_effect_matches = host_effect.get("status").and_then(JsonValue::as_str) == Some("pass")
+        && host_effect.get("kind").and_then(JsonValue::as_str) == Some("file_write_bytes")
+        && host_effect.get("path").and_then(JsonValue::as_str) == Some("outputs/dynamic.bin")
+        && host_effect.get("byte_len").and_then(JsonValue::as_u64) == Some(3)
+        && host_effect.get("first_byte").and_then(JsonValue::as_u64) == Some(1)
+        && host_effect.get("last_byte").and_then(JsonValue::as_u64) == Some(4)
+        && host_effect.get("sha256").and_then(JsonValue::as_str) == Some(expected_sha256.as_str())
+        && host_effect
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let update_matches = write_update.get("target_state").and_then(JsonValue::as_str)
+        == Some("store.write_status")
+        && write_update.get("value").and_then(JsonValue::as_str) == Some("outputs/dynamic.bin")
+        && write_update.get("changed").and_then(JsonValue::as_bool) == Some(true);
+    let borrowed_file_write = write_update
+        .pointer("/bytes_access/read_only")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+        && write_update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("root_bytes_state")
+        && write_update
+            .pointer("/bytes_access/cow_kind")
+            .and_then(JsonValue::as_str)
+            == Some("borrowed")
+        && write_update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            == Some("file_write_bytes")
+        && write_update
+            .pointer("/bytes_access/byte_len")
+            .and_then(JsonValue::as_u64)
+            == Some(3);
+    let step_no_copy = write_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = write_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let pass = receive_step_id == "receive-dynamic-bytes"
+        && write_step_id == "write-dynamic-file"
+        && receive_matches
+        && file_write_updates.len() == 1
+        && update_matches
+        && borrowed_file_write
+        && host_effect_matches
+        && artifact_matches
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "receive_step_id": receive_step_id,
+        "write_step_id": write_step_id,
+        "receive_matches": receive_matches,
+        "file_write_update_count": file_write_updates.len(),
+        "expected_update_count": 1,
+        "update_matches": update_matches,
+        "borrowed_file_write": borrowed_file_write,
+        "host_effect_matches": host_effect_matches,
+        "artifact_matches": artifact_matches,
+        "artifact_path": artifact_path,
+        "expected_sha256": expected_sha256,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "receive_updates": receive_updates,
+        "updates": file_write_updates,
+        "host_effect": host_effect,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn indexed_file_write_source_payload_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-write evidence missing plan_executor.per_step")?;
+    let receive_step = per_step
+        .first()
+        .ok_or("indexed file-write evidence missing receive-indexed-bytes step")?;
+    let write_step = per_step
+        .get(1)
+        .ok_or("indexed file-write evidence missing write-indexed-file step")?;
+    let receive_step_id = receive_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let write_step_id = write_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let expected_bytes = [0x01, 0xFE, 0x04];
+    let expected_sha256 = boon_runtime::sha256_bytes(&expected_bytes);
+    let receive_updates = receive_step
+        .get("indexed_updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-write evidence missing receive indexed updates")?;
+    let receive_update = receive_updates.first().unwrap_or(&JsonValue::Null);
+    let receive_matches = receive_updates.len() == 1
+        && receive_update
+            .get("expression_kind")
+            .and_then(JsonValue::as_str)
+            == Some("source_payload")
+        && receive_update
+            .get("target_state")
+            .and_then(JsonValue::as_str)
+            == Some("row.payload")
+        && receive_update.get("field_path").and_then(JsonValue::as_str) == Some("payload")
+        && receive_update.get("key").and_then(JsonValue::as_u64) == Some(2)
+        && receive_update
+            .get("source_payload_field")
+            .and_then(JsonValue::as_str)
+            == Some("Bytes")
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("$boon_type"))
+            .and_then(JsonValue::as_str)
+            == Some("BYTES")
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("byte_len"))
+            .and_then(JsonValue::as_u64)
+            == Some(3)
+        && receive_update
+            .get("value")
+            .and_then(|value| value.get("digest"))
+            .and_then(JsonValue::as_str)
+            == Some(expected_sha256.as_str());
+
+    let updates = write_step
+        .get("indexed_updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-write evidence missing write indexed updates")?;
+    let file_write_updates = updates
+        .iter()
+        .filter_map(|update| {
+            (update.get("expression_kind").and_then(JsonValue::as_str) == Some("file_write_bytes"))
+                .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let write_update = file_write_updates
+        .first()
+        .copied()
+        .unwrap_or(&JsonValue::Null);
+    let host_effect = write_update
+        .get("host_effect")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let artifact_path = host_effect
+        .get("artifact_path")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let artifact_bytes = if artifact_path == "<missing>" {
+        Vec::new()
+    } else {
+        fs::read(artifact_path)?
+    };
+    let artifact_matches = artifact_bytes == expected_bytes;
+    let host_effect_matches = host_effect.get("status").and_then(JsonValue::as_str) == Some("pass")
+        && host_effect.get("kind").and_then(JsonValue::as_str) == Some("file_write_bytes")
+        && host_effect.get("path").and_then(JsonValue::as_str) == Some("outputs/indexed.bin")
+        && host_effect.get("byte_len").and_then(JsonValue::as_u64) == Some(3)
+        && host_effect.get("first_byte").and_then(JsonValue::as_u64) == Some(1)
+        && host_effect.get("last_byte").and_then(JsonValue::as_u64) == Some(4)
+        && host_effect.get("sha256").and_then(JsonValue::as_str) == Some(expected_sha256.as_str())
+        && host_effect
+            .get("public_inline_bytes_absent")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let update_matches = write_update.get("target_state").and_then(JsonValue::as_str)
+        == Some("row.write_status")
+        && write_update.get("field_path").and_then(JsonValue::as_str) == Some("write_status")
+        && write_update.get("key").and_then(JsonValue::as_u64) == Some(2)
+        && write_update.get("value").and_then(JsonValue::as_str) == Some("outputs/indexed.bin")
+        && write_update.get("changed").and_then(JsonValue::as_bool) == Some(true);
+    let borrowed_file_write = write_update
+        .pointer("/bytes_access/read_only")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+        && write_update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("indexed_fixed_byte_bank")
+        && write_update
+            .pointer("/bytes_access/cow_kind")
+            .and_then(JsonValue::as_str)
+            == Some("borrowed")
+        && write_update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            == Some("file_write_bytes")
+        && write_update
+            .pointer("/bytes_access/byte_len")
+            .and_then(JsonValue::as_u64)
+            == Some(3)
+        && write_update
+            .pointer("/bytes_access/byte_bank_declared")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        && write_update
+            .pointer("/bytes_access/byte_bank_used")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        && write_update
+            .pointer("/bytes_access/path_source")
+            .and_then(JsonValue::as_str)
+            == Some("row_field");
+    let dynamic_path_matches = write_update
+        .get("update_constant_id")
+        .is_none_or(JsonValue::is_null)
+        && write_update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            == Some("outputs/indexed.bin")
+        && write_update
+            .pointer("/update_constant_value/path_source")
+            .and_then(JsonValue::as_str)
+            == Some("row_field")
+        && write_update
+            .pointer("/update_constant_value/path_field")
+            .and_then(JsonValue::as_str)
+            == Some("row.path_state")
+        && write_update
+            .pointer("/update_constant_value/path_field_id")
+            .and_then(JsonValue::as_u64)
+            .is_some();
+    let step_no_copy = write_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let counters = write_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let zero_byte_counters = [
+        "copy_from_slice_bytes",
+        "vec_clone_bytes",
+        "vec_alloc_bytes",
+        "zero_fill_bytes",
+    ]
+    .iter()
+    .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0));
+    let pass = receive_step_id == "receive-indexed-bytes"
+        && write_step_id == "write-indexed-file"
+        && receive_matches
+        && file_write_updates.len() == 1
+        && update_matches
+        && borrowed_file_write
+        && dynamic_path_matches
+        && host_effect_matches
+        && artifact_matches
+        && step_no_copy
+        && zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "receive_step_id": receive_step_id,
+        "write_step_id": write_step_id,
+        "receive_matches": receive_matches,
+        "file_write_update_count": file_write_updates.len(),
+        "expected_update_count": 1,
+        "update_matches": update_matches,
+        "borrowed_file_write": borrowed_file_write,
+        "dynamic_path_matches": dynamic_path_matches,
+        "host_effect_matches": host_effect_matches,
+        "artifact_matches": artifact_matches,
+        "artifact_path": artifact_path,
+        "expected_sha256": expected_sha256,
+        "step_bytes_storage_no_copy": step_no_copy,
+        "step_zero_byte_counters": zero_byte_counters,
+        "receive_updates": receive_updates,
+        "updates": file_write_updates,
+        "host_effect": host_effect,
+        "bytes_storage_counters": counters,
+    }))
+}
+
+fn indexed_file_read_row_field_path_evidence(
+    report: &JsonValue,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let per_step = report
+        .pointer("/plan_executor/per_step")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-read evidence missing plan_executor.per_step")?;
+    let read_step = per_step
+        .first()
+        .ok_or("indexed file-read evidence missing read-indexed-file step")?;
+    let inspect_step = per_step
+        .get(1)
+        .ok_or("indexed file-read evidence missing inspect-indexed-read step")?;
+    let read_step_id = read_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let inspect_step_id = inspect_step
+        .get("step_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<missing>");
+    let expected_bytes = [0x01, 0xFE, 0x04];
+    let expected_sha256 = boon_runtime::sha256_bytes(&expected_bytes);
+    let read_updates = read_step
+        .get("indexed_updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-read evidence missing read indexed updates")?;
+    let file_read_updates = read_updates
+        .iter()
+        .filter_map(|update| {
+            (update.get("expression_kind").and_then(JsonValue::as_str) == Some("file_read_bytes"))
+                .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let read_update = file_read_updates
+        .first()
+        .copied()
+        .unwrap_or(&JsonValue::Null);
+    let read_matches = file_read_updates.len() == 1
+        && read_update.get("target_state").and_then(JsonValue::as_str) == Some("row.file_bytes")
+        && read_update.get("field_path").and_then(JsonValue::as_str) == Some("file_bytes")
+        && read_update.get("key").and_then(JsonValue::as_u64) == Some(2)
+        && read_update
+            .get("value")
+            .and_then(|value| value.get("$boon_type"))
+            .and_then(JsonValue::as_str)
+            == Some("BYTES")
+        && read_update
+            .get("value")
+            .and_then(|value| value.get("byte_len"))
+            .and_then(JsonValue::as_u64)
+            == Some(3)
+        && read_update
+            .get("value")
+            .and_then(|value| value.get("digest"))
+            .and_then(JsonValue::as_str)
+            == Some(expected_sha256.as_str());
+    let dynamic_path_matches = read_update
+        .get("update_constant_id")
+        .is_none_or(JsonValue::is_null)
+        && read_update
+            .pointer("/update_constant_value/path")
+            .and_then(JsonValue::as_str)
+            == Some("inputs/indexed-read.bin")
+        && read_update
+            .pointer("/update_constant_value/path_source")
+            .and_then(JsonValue::as_str)
+            == Some("row_field")
+        && read_update
+            .pointer("/update_constant_value/path_field")
+            .and_then(JsonValue::as_str)
+            == Some("row.path_state")
+        && read_update
+            .pointer("/update_constant_value/path_field_id")
+            .and_then(JsonValue::as_u64)
+            .is_some()
+        && read_update
+            .pointer("/bytes_access/host_boundary")
+            .and_then(JsonValue::as_str)
+            == Some("file_read_bytes")
+        && read_update
+            .pointer("/bytes_access/path_source")
+            .and_then(JsonValue::as_str)
+            == Some("row_field")
+        && read_update
+            .pointer("/bytes_access/byte_len")
+            .and_then(JsonValue::as_u64)
+            == Some(3)
+        && read_update
+            .pointer("/bytes_access/byte_bank_declared")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+
+    let inspect_updates = inspect_step
+        .get("indexed_updates")
+        .and_then(JsonValue::as_array)
+        .ok_or("indexed file-read evidence missing inspect indexed updates")?;
+    let bytes_get_updates = inspect_updates
+        .iter()
+        .filter_map(|update| {
+            (update.get("expression_kind").and_then(JsonValue::as_str) == Some("bytes_get"))
+                .then_some(update)
+        })
+        .collect::<Vec<_>>();
+    let get_update = bytes_get_updates
+        .first()
+        .copied()
+        .unwrap_or(&JsonValue::Null);
+    let borrowed_indexed_read = bytes_get_updates.len() == 1
+        && get_update.get("target_state").and_then(JsonValue::as_str) == Some("row.first_byte")
+        && get_update.get("field_path").and_then(JsonValue::as_str) == Some("first_byte")
+        && get_update.get("key").and_then(JsonValue::as_u64) == Some(2)
+        && get_update.get("value").and_then(JsonValue::as_i64) == Some(1)
+        && get_update
+            .pointer("/bytes_access/read_only")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        && get_update
+            .pointer("/bytes_access/access_source")
+            .and_then(JsonValue::as_str)
+            == Some("indexed_fixed_byte_bank")
+        && get_update
+            .pointer("/bytes_access/cow_kind")
+            .and_then(JsonValue::as_str)
+            == Some("borrowed")
+        && get_update
+            .pointer("/bytes_access/byte_bank_declared")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        && get_update
+            .pointer("/bytes_access/byte_bank_used")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let read_step_no_copy = read_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let inspect_step_no_copy = inspect_step
+        .get("bytes_storage_no_copy")
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    let read_counters = read_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let inspect_counters = inspect_step
+        .get("bytes_storage_counters")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+    let step_zero_byte_counters = [&read_counters, &inspect_counters]
+        .into_iter()
+        .all(|counters| {
+            [
+                "copy_from_slice_bytes",
+                "vec_clone_bytes",
+                "vec_alloc_bytes",
+                "zero_fill_bytes",
+            ]
+            .iter()
+            .all(|key| counters.get(*key).and_then(JsonValue::as_u64) == Some(0))
+        });
+    let pass = read_step_id == "read-indexed-file"
+        && inspect_step_id == "inspect-indexed-read"
+        && read_matches
+        && dynamic_path_matches
+        && borrowed_indexed_read
+        && read_step_no_copy
+        && inspect_step_no_copy
+        && step_zero_byte_counters;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "read_step_id": read_step_id,
+        "inspect_step_id": inspect_step_id,
+        "file_read_update_count": file_read_updates.len(),
+        "bytes_get_update_count": bytes_get_updates.len(),
+        "expected_update_count": 1,
+        "read_matches": read_matches,
+        "dynamic_path_matches": dynamic_path_matches,
+        "borrowed_indexed_read": borrowed_indexed_read,
+        "read_step_bytes_storage_no_copy": read_step_no_copy,
+        "inspect_step_bytes_storage_no_copy": inspect_step_no_copy,
+        "step_zero_byte_counters": step_zero_byte_counters,
+        "expected_sha256": expected_sha256,
+        "read_updates": file_read_updates,
+        "inspect_updates": bytes_get_updates,
+        "read_step_counters": read_counters,
+        "inspect_step_counters": inspect_counters,
+    }))
+}
+
+fn bytes_counter_u64(
+    counters: &serde_json::Value,
+    key: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    counters
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("bytes storage counters missing u64 `{key}`").into())
+}
+
+fn verify_build_bytes_boundary(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/build-bytes-boundary.json"));
+    let entries = boon_runtime::example_manifest_entries()?;
+    let build_entries = entries
+        .into_iter()
+        .filter(|entry| !entry.build_files.is_empty())
+        .collect::<Vec<_>>();
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut builds = Vec::new();
+    let mut artifact_paths = Vec::new();
+
+    for entry in build_entries {
+        for build_file in &entry.build_files {
+            let build_path = PathBuf::from(build_file);
+            artifact_paths.push(build_path.clone());
+            let project_root = build_path
+                .parent()
+                .ok_or_else(|| format!("build file `{build_file}` has no parent directory"))?;
+            let build_name = build_path
+                .file_name()
+                .ok_or_else(|| format!("build file `{build_file}` has no file name"))?;
+            let source = fs::read_to_string(&build_path)?;
+            let execution =
+                boon_runtime::run_project_build_file(project_root, Path::new(build_name), false)?;
+            let output_path = project_root.join(execution.output_file.trim_start_matches("./"));
+            artifact_paths.push(output_path.clone());
+            artifact_paths.extend(
+                execution
+                    .input_files
+                    .iter()
+                    .map(|path| project_root.join(path)),
+            );
+            let checked_generated = fs::read(&output_path)?;
+            let checked_generated_hash = boon_runtime::sha256_bytes(&checked_generated);
+            let output_matches_checked_generated =
+                checked_generated_hash == execution.output_sha256;
+
+            let has_read_bytes = execution
+                .operator_evidence
+                .iter()
+                .any(|operator| operator == "File/read_bytes");
+            let has_bytes_to_text = execution
+                .operator_evidence
+                .iter()
+                .any(|operator| operator == "Bytes/to_text");
+            let has_read_text = source.contains("File/read_text");
+            let byte_read_count_matches = execution.input_byte_reads.len()
+                == execution.input_files.len()
+                && !execution.input_byte_reads.is_empty();
+            let byte_read_hashes_valid = execution
+                .input_byte_reads
+                .iter()
+                .all(|read| is_sha256_hex(&read.sha256) && read.decoded_as == "Utf8");
+            let byte_reads_match_files = execution.input_byte_reads.iter().all(|read| {
+                execution
+                    .input_files
+                    .iter()
+                    .any(|input_file| input_file == &read.path)
+            });
+
+            for (id, pass, detail) in [
+                (
+                    format!("{}:{}:uses-file-read-bytes", entry.id, build_file),
+                    has_read_bytes,
+                    format!("operator_evidence={:?}", execution.operator_evidence),
+                ),
+                (
+                    format!("{}:{}:uses-explicit-bytes-to-text", entry.id, build_file),
+                    has_bytes_to_text,
+                    format!("operator_evidence={:?}", execution.operator_evidence),
+                ),
+                (
+                    format!("{}:{}:does-not-use-file-read-text", entry.id, build_file),
+                    !has_read_text,
+                    "BUILD.bn source must not use File/read_text for asset payloads".to_owned(),
+                ),
+                (
+                    format!("{}:{}:records-byte-read-per-input", entry.id, build_file),
+                    byte_read_count_matches,
+                    format!(
+                        "input_files={}, input_byte_reads={}",
+                        execution.input_files.len(),
+                        execution.input_byte_reads.len()
+                    ),
+                ),
+                (
+                    format!("{}:{}:byte-read-hashes-valid", entry.id, build_file),
+                    byte_read_hashes_valid && byte_reads_match_files,
+                    format!("input_byte_reads={:?}", execution.input_byte_reads),
+                ),
+                (
+                    format!(
+                        "{}:{}:checked-generated-output-matches",
+                        entry.id, build_file
+                    ),
+                    output_matches_checked_generated,
+                    format!(
+                        "generated={}, checked={}",
+                        execution.output_sha256, checked_generated_hash
+                    ),
+                ),
+            ] {
+                checks.push(json!({
+                    "id": id,
+                    "pass": pass,
+                    "detail": detail
+                }));
+                if !pass {
+                    blockers.push(id);
+                }
+            }
+
+            builds.push(json!({
+                "example": entry.id,
+                "build_file": build_file,
+                "status": execution.status,
+                "project_root": execution.project_root,
+                "icons_directory": execution.icons_directory,
+                "output_file": execution.output_file,
+                "output_binding": execution.output_binding,
+                "operator_evidence": execution.operator_evidence,
+                "input_files": execution.input_files,
+                "input_byte_reads": execution.input_byte_reads,
+                "output_sha256": execution.output_sha256,
+                "output_bytes": execution.output_bytes,
+                "checked_generated_file": output_path,
+                "checked_generated_sha256": checked_generated_hash,
+                "output_matches_checked_generated": output_matches_checked_generated,
+                "logs": execution.logs
+            }));
+        }
+    }
+
+    if !blockers.is_empty() {
+        return Err(format!("build BYTES boundary gate failed: {}", blockers.join(", ")).into());
+    }
+
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_bytes = builds
+        .iter()
+        .map(|build| serde_json::to_vec(build))
+        .collect::<Result<Vec<_>, _>>()?
+        .concat();
+    let command_argv = std::iter::once(json!("cargo"))
+        .chain(std::iter::once(json!("xtask")))
+        .chain(args.iter().map(|arg| json!(arg)))
+        .collect::<Vec<_>>();
+    let report_json = json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-build-bytes-boundary",
+        "command_argv": command_argv,
+        "measurement_mode": "proof",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_hash": boon_runtime::sha256_bytes(&source_bytes),
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "build_count": builds.len(),
+        "build_file_execution": {
+            "status": "pass",
+            "mode": "validate-bytes-boundary-generated-output",
+            "builds": builds
+        },
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifact_sha256s
+    });
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_bytes_file_read_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-file-read-plan.json"));
+    let source_path = Path::new(BYTES_FILE_READ_PLAN_SOURCE);
+    let scenario_path = Path::new(BYTES_FILE_READ_PLAN_SCENARIO);
+    let host_root = source_path
+        .parent()
+        .ok_or("bytes file-read fixture source has no parent directory")?;
+    let asset_path = host_root.join(BYTES_FILE_READ_PLAN_ASSET_REL);
+    let dynamic_fixture_dir =
+        PathBuf::from("target/generated/bytes-file-read-dynamic-path-fixtures");
+    let dynamic_asset_dir = dynamic_fixture_dir.join("assets");
+    let dynamic_asset_rel = "assets/dynamic-read.bin";
+    let dynamic_asset_path = dynamic_fixture_dir.join(dynamic_asset_rel);
+    let dynamic_source_path = dynamic_fixture_dir.join("bytes_file_read_dynamic_path_plan_ops.bn");
+    let dynamic_scenario_path =
+        dynamic_fixture_dir.join("bytes_file_read_dynamic_path_plan_ops.scn");
+    fs::create_dir_all(&dynamic_asset_dir)?;
+    fs::write(&dynamic_asset_path, [0xDE, 0xAD, 0xBE, 0xEF])?;
+    fs::write(
+        &dynamic_source_path,
+        format!(
+            "store: [\n    load: SOURCE\n    inspect: SOURCE\n    path_state:\n        TEXT {{ {dynamic_asset_rel} }} |> HOLD path_state {{ LATEST {{}} }}\n    file_bytes:\n        BYTES {{}} |> HOLD file_bytes {{\n            LATEST {{\n                store.load |> THEN {{ store.path_state |> File/read_bytes() }}\n            }}\n        }}\n    file_len:\n        0 |> HOLD file_len {{\n            LATEST {{\n                store.inspect |> THEN {{ store.file_bytes |> Bytes/length }}\n            }}\n        }}\n    first_byte:\n        16u00 |> HOLD first_byte {{\n            LATEST {{\n                store.inspect |> THEN {{ store.file_bytes |> Bytes/get(index: 0) }}\n            }}\n        }}\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT {{ Dynamic file bytes }}))\n"
+        ),
+    )?;
+    fs::write(
+        &dynamic_scenario_path,
+        format!(
+            "name = \"bytes file read dynamic path plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"read-file-bytes-dynamic-path\"\nexpected_source_event = {{ source = \"store.load\" }}\n\n[[step]]\nid = \"inspect-file-bytes-dynamic-path\"\nexpected_source_event = {{ source = \"store.inspect\" }}\n",
+            dynamic_source_path.display()
+        ),
+    )?;
+    let selected_step_ids = vec![
+        "read-file-bytes".to_owned(),
+        "inspect-file-bytes".to_owned(),
+    ];
+    let dynamic_selected_step_ids = vec![
+        "read-file-bytes-dynamic-path".to_owned(),
+        "inspect-file-bytes-dynamic-path".to_owned(),
+    ];
+
+    let parsed = boon_parser::parse_source(
+        source_path.display().to_string(),
+        fs::read_to_string(source_path)?,
+    )?;
+    let ir = boon_ir::lower(&parsed)?;
+    boon_ir::verify_hidden_identity(&ir)?;
+    boon_ir::verify_static_schedule(&ir)?;
+    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan_hash = boon_plan::plan_sha256(&plan)?;
+    let plan_verification = boon_plan::verify_plan(&plan)?;
+    let plan_has_file_read = plan.regions.iter().any(|region| {
+        region.ops.iter().any(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                    ..
+                }
+            )
+        })
+    });
+
+    let output = boon_runtime::run_plan_root_scalar_scenario(
+        source_path,
+        scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &selected_step_ids,
+        false,
+        None,
+    )?;
+    let plan_report = output.report;
+    let asset_bytes = fs::read(&asset_path)?;
+    let asset_sha256 = boon_runtime::sha256_bytes(&asset_bytes);
+    let asset_len = asset_bytes.len() as u64;
+    let first_byte = asset_bytes.first().copied().unwrap_or_default() as u64;
+
+    let read_update = plan_report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or("bytes file-read plan report missing first update")?;
+    let read_value = read_update
+        .get("value")
+        .ok_or("bytes file-read plan report missing read update value")?;
+    let state_bytes = plan_report
+        .pointer("/state_summary/store.file_bytes")
+        .ok_or("bytes file-read plan report missing store.file_bytes state")?;
+
+    let dynamic_parsed = boon_parser::parse_source(
+        dynamic_source_path.display().to_string(),
+        fs::read_to_string(&dynamic_source_path)?,
+    )?;
+    let dynamic_ir = boon_ir::lower(&dynamic_parsed)?;
+    boon_ir::verify_hidden_identity(&dynamic_ir)?;
+    boon_ir::verify_static_schedule(&dynamic_ir)?;
+    let dynamic_plan =
+        boon_plan::compile_typed_program(&dynamic_ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let dynamic_plan_hash = boon_plan::plan_sha256(&dynamic_plan)?;
+    let dynamic_plan_verification = boon_plan::verify_plan(&dynamic_plan)?;
+    let dynamic_file_read_ops = dynamic_plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let dynamic_file_read_op = dynamic_file_read_ops.first().copied();
+    let dynamic_path_operand_is_state = dynamic_file_read_op.is_some_and(|op| {
+        let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+            return false;
+        };
+        matches!(ordered_inputs.as_slice(), [boon_plan::ValueRef::State(_)])
+    });
+    let dynamic_output = boon_runtime::run_plan_root_scalar_scenario(
+        &dynamic_source_path,
+        &dynamic_scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &dynamic_selected_step_ids,
+        false,
+        None,
+    )?;
+    let dynamic_plan_report = dynamic_output.report;
+    let dynamic_asset_bytes = fs::read(&dynamic_asset_path)?;
+    let dynamic_asset_sha256 = boon_runtime::sha256_bytes(&dynamic_asset_bytes);
+    let dynamic_asset_len = dynamic_asset_bytes.len() as u64;
+    let dynamic_first_byte = dynamic_asset_bytes.first().copied().unwrap_or_default() as u64;
+    let dynamic_read_update = dynamic_plan_report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or("dynamic-path bytes file-read plan report missing read update")?;
+    let dynamic_read_value = dynamic_read_update
+        .get("value")
+        .ok_or("dynamic-path bytes file-read plan report missing read update value")?;
+    let dynamic_state_bytes = dynamic_plan_report
+        .pointer("/state_summary/store.file_bytes")
+        .ok_or("dynamic-path bytes file-read report missing store.file_bytes")?;
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "source-machine-plan-verified",
+        plan_verification.status == "pass",
+        format!("plan_verification.status={}", plan_verification.status),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "source-machine-plan-has-file-read-bytes-op",
+        plan_has_file_read,
+        "source-derived MachinePlan contains PlanExpressionKind::FileReadBytes",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-report-plan-hash-matches-source-plan",
+        plan_report
+            .get("plan_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(plan_hash.as_str()),
+        format!("expected_plan_hash={plan_hash}"),
+    );
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("plan-executor-{key}-zero"),
+            plan_report
+                .pointer(&format!("/plan_executor/{key}"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            format!(
+                "plan_executor.{key}={:?}",
+                plan_report.pointer(&format!("/plan_executor/{key}"))
+            ),
+        );
+    }
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "legacy-comparison-disabled-for-host-file-boundary",
+        plan_report
+            .pointer("/legacy_comparison/enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
+        "typed host File/read_bytes is verified by this gate instead of legacy parity",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-read-update-kind",
+        read_update
+            .get("expression_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("file_read_bytes"),
+        format!("expression_kind={:?}", read_update.get("expression_kind")),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-read-static-path-bound",
+        read_update
+            .pointer("/update_constant_value/path")
+            .and_then(serde_json::Value::as_str)
+            == Some(BYTES_FILE_READ_PLAN_ASSET_REL),
+        format!("expected_path={BYTES_FILE_READ_PLAN_ASSET_REL}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-read-byte-length-matches-asset",
+        read_value
+            .get("byte_len")
+            .and_then(serde_json::Value::as_u64)
+            == Some(asset_len)
+            && state_bytes
+                .get("byte_len")
+                .and_then(serde_json::Value::as_u64)
+                == Some(asset_len),
+        format!("asset_len={asset_len}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-read-digest-matches-asset",
+        read_value.get("digest").and_then(serde_json::Value::as_str) == Some(asset_sha256.as_str())
+            && state_bytes
+                .get("digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(asset_sha256.as_str()),
+        format!("asset_sha256={asset_sha256}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-length-consumes-file-bytes-state",
+        plan_report
+            .pointer("/state_summary/store.file_len")
+            .and_then(serde_json::Value::as_u64)
+            == Some(asset_len),
+        format!("expected_len={asset_len}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-get-consumes-file-bytes-state",
+        plan_report
+            .pointer("/state_summary/store.first_byte")
+            .and_then(serde_json::Value::as_u64)
+            == Some(first_byte),
+        format!("expected_first_byte={first_byte}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "public-report-does-not-leak-inline-bytes",
+        !json_contains_key(&plan_report, "inline_bytes"),
+        "PlanExecutor public report contains only digest/length BYTES summaries",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-machine-plan-verified",
+        dynamic_plan_verification.status == "pass",
+        format!(
+            "dynamic_plan_verification.status={}",
+            dynamic_plan_verification.status
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-has-one-file-read-bytes-op",
+        dynamic_file_read_ops.len() == 1,
+        format!(
+            "dynamic FileReadBytes op count={}",
+            dynamic_file_read_ops.len()
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-uses-state-path-operand",
+        dynamic_path_operand_is_state,
+        "dynamic File/read_bytes ordered input must be [State(path_text)]",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-runtime-report-plan-hash-matches",
+        dynamic_plan_report
+            .get("plan_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_plan_hash.as_str()),
+        format!("expected_dynamic_plan_hash={dynamic_plan_hash}"),
+    );
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("dynamic-path-plan-executor-{key}-zero"),
+            dynamic_plan_report
+                .pointer(&format!("/plan_executor/{key}"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            format!(
+                "dynamic plan_executor.{key}={:?}",
+                dynamic_plan_report.pointer(&format!("/plan_executor/{key}"))
+            ),
+        );
+    }
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-file-read-update-kind",
+        dynamic_read_update
+            .get("expression_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("file_read_bytes"),
+        format!(
+            "dynamic expression_kind={:?}",
+            dynamic_read_update.get("expression_kind")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-bound-from-state",
+        dynamic_read_update
+            .pointer("/update_constant_value/path")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_asset_rel)
+            && dynamic_read_update
+                .pointer("/update_constant_value/path_state")
+                .and_then(serde_json::Value::as_str)
+                == Some("store.path_state")
+            && dynamic_read_update
+                .pointer("/update_constant_value/path_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("state"),
+        format!(
+            "dynamic update_constant_value={:?}",
+            dynamic_read_update.get("update_constant_value")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-byte-length-matches-asset",
+        dynamic_read_value
+            .get("byte_len")
+            .and_then(serde_json::Value::as_u64)
+            == Some(dynamic_asset_len)
+            && dynamic_state_bytes
+                .get("byte_len")
+                .and_then(serde_json::Value::as_u64)
+                == Some(dynamic_asset_len),
+        format!("dynamic_asset_len={dynamic_asset_len}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-digest-matches-asset",
+        dynamic_read_value
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_asset_sha256.as_str())
+            && dynamic_state_bytes
+                .get("digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(dynamic_asset_sha256.as_str()),
+        format!("dynamic_asset_sha256={dynamic_asset_sha256}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-follow-up-bytes-ops-consume-file-bytes",
+        dynamic_plan_report
+            .pointer("/state_summary/store.file_len")
+            .and_then(serde_json::Value::as_u64)
+            == Some(dynamic_asset_len)
+            && dynamic_plan_report
+                .pointer("/state_summary/store.first_byte")
+                .and_then(serde_json::Value::as_u64)
+                == Some(dynamic_first_byte),
+        format!("dynamic_first_byte={dynamic_first_byte}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-public-report-does-not-leak-inline-bytes",
+        !json_contains_key(&dynamic_plan_report, "inline_bytes"),
+        "dynamic read proof contains only digest/length BYTES summaries",
+    );
+
+    let live_negative_dir =
+        PathBuf::from("target/generated/bytes-file-read-live-negative-fixtures");
+    let live_negative_setup_artifacts =
+        prepare_bytes_file_read_live_negative_fixtures(&live_negative_dir, &mut blockers)?;
+    let mut live_negative_artifacts = live_negative_setup_artifacts.clone();
+    let mut live_negative_cases = Vec::new();
+    for case in bytes_file_read_live_negative_cases() {
+        let result = run_bytes_file_read_live_negative_case(
+            &live_negative_dir,
+            &case,
+            &mut live_negative_artifacts,
+        )?;
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("live-negative-{}-rejected", result.id),
+            result.rejected,
+            if result.rejected {
+                format!(
+                    "live File/read_bytes negative fixture `{}` failed as expected with `{}`",
+                    result.id, result.expected_error_contains
+                )
+            } else {
+                format!(
+                    "live File/read_bytes negative fixture `{}` did not fail with `{}`: {}",
+                    result.id, result.expected_error_contains, result.detail
+                )
+            },
+        );
+        live_negative_cases.push(result.report_json());
+    }
+
+    let mut fabricated_plan_negative_cases = Vec::new();
+    for case in bytes_file_read_fabricated_plan_negative_cases() {
+        let result = run_bytes_file_read_fabricated_plan_negative_case(&plan, &case)?;
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("fabricated-plan-negative-{}-rejected", result.id),
+            result.rejected,
+            if result.rejected {
+                format!(
+                    "fabricated MachinePlan FileReadBytes negative `{}` failed checks {:?}",
+                    result.id, result.failed_check_ids
+                )
+            } else {
+                format!(
+                    "fabricated MachinePlan FileReadBytes negative `{}` was not rejected; failed checks {:?}",
+                    result.id, result.failed_check_ids
+                )
+            },
+        );
+        fabricated_plan_negative_cases.push(result.report_json());
+    }
+
+    if !blockers.is_empty() {
+        return Err(format!(
+            "BYTES File/read_bytes MachinePlan gate failed: {}",
+            blockers.join(", ")
+        )
+        .into());
+    }
+
+    let artifact_paths = [
+        source_path.to_path_buf(),
+        scenario_path.to_path_buf(),
+        asset_path.clone(),
+        dynamic_source_path.clone(),
+        dynamic_scenario_path.clone(),
+        dynamic_asset_path.clone(),
+    ]
+    .into_iter()
+    .chain(live_negative_artifacts.into_iter())
+    .collect::<Vec<_>>();
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let command_argv = std::iter::once(json!("cargo"))
+        .chain(std::iter::once(json!("xtask")))
+        .chain(args.iter().map(|arg| json!(arg)))
+        .collect::<Vec<_>>();
+    let graph_node_count = plan_report
+        .get("graph_node_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut report_json = json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-bytes-file-read-plan",
+        "command_argv": command_argv,
+        "measurement_mode": "proof",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_path": source_path,
+        "source_hash": file_hash(BYTES_FILE_READ_PLAN_SOURCE),
+        "scenario_path": scenario_path,
+        "scenario_hash": file_hash(BYTES_FILE_READ_PLAN_SCENARIO),
+        "program_hash": file_hash(BYTES_FILE_READ_PLAN_SOURCE),
+        "budget_hash": "n/a",
+        "graph_node_count": graph_node_count,
+        "target_profile": "software_default",
+        "plan_hash": plan_hash,
+        "plan_version": plan.version,
+        "capability_summary": plan.capability_summary,
+        "selected_step_ids": selected_step_ids,
+        "state_summary": plan_report["state_summary"].clone(),
+        "semantic_delta_signatures": plan_report["semantic_delta_signatures"].clone(),
+        "semantic_deltas": plan_report["semantic_deltas"].clone(),
+        "legacy_comparison": plan_report["legacy_comparison"].clone(),
+        "file_read_summary": {
+            "status": "pass",
+            "mode": "typed-machine-plan-host-file-read-v1",
+            "host_root": host_root.display().to_string(),
+            "path": BYTES_FILE_READ_PLAN_ASSET_REL,
+            "artifact_path": asset_path.display().to_string(),
+            "byte_len": asset_len,
+            "sha256": asset_sha256,
+            "first_byte": first_byte,
+            "expression_kind": "file_read_bytes",
+            "report_value_digest_matches_file": true,
+            "public_inline_bytes_absent": true
+        },
+        "dynamic_path_file_read_summary": {
+            "status": "pass",
+            "mode": "typed-machine-plan-host-file-read-v1",
+            "source_path": dynamic_source_path.display().to_string(),
+            "source_hash": file_hash(&dynamic_source_path.display().to_string()),
+            "scenario_path": dynamic_scenario_path.display().to_string(),
+            "scenario_hash": file_hash(&dynamic_scenario_path.display().to_string()),
+            "selected_step_ids": dynamic_selected_step_ids,
+            "target_profile": "software_default",
+            "plan_hash": dynamic_plan_hash,
+            "plan_version": dynamic_plan.version,
+            "capability_summary": dynamic_plan.capability_summary,
+            "path_operand": "state",
+            "path_state": "store.path_state",
+            "path": dynamic_asset_rel,
+            "host_root": dynamic_fixture_dir.display().to_string(),
+            "artifact_path": dynamic_asset_path.display().to_string(),
+            "byte_len": dynamic_asset_len,
+            "sha256": dynamic_asset_sha256,
+            "first_byte": dynamic_first_byte,
+            "expression_kind": "file_read_bytes",
+            "report_value_digest_matches_file": true,
+            "public_inline_bytes_absent": true,
+            "state_summary": dynamic_plan_report["state_summary"].clone(),
+            "semantic_delta_signatures": dynamic_plan_report["semantic_delta_signatures"].clone(),
+            "semantic_deltas": dynamic_plan_report["semantic_deltas"].clone(),
+            "legacy_comparison": dynamic_plan_report["legacy_comparison"].clone(),
+            "plan_executor": dynamic_plan_report["plan_executor"].clone(),
+        },
+        "plan_executor": plan_report["plan_executor"].clone(),
+        "live_negative_case_count": live_negative_cases.len(),
+        "live_negative_cases": live_negative_cases,
+        "fabricated_plan_negative_case_count": fabricated_plan_negative_cases.len(),
+        "fabricated_plan_negative_cases": fabricated_plan_negative_cases,
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifact_sha256s
+    });
+    let mut checks = report_json["per_step_pass_fail"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let negative_descriptors = bytes_file_read_report_negative_descriptors();
+    let mut mutation_base = report_json.clone();
+    let mut mutation_base_checks = checks.clone();
+    for (id, category) in &negative_descriptors {
+        mutation_base_checks.push(json!({
+            "id": format!("negative-{id}-rejected"),
+            "pass": true,
+            "detail": format!("schema rejected mutated file-read report `{id}`")
+        }));
+        let _ = category;
+    }
+    mutation_base["per_step_pass_fail"] = json!(mutation_base_checks);
+    mutation_base["negative_case_count"] = json!(negative_descriptors.len());
+    mutation_base["negative_cases"] = json!(
+        negative_descriptors
+            .iter()
+            .map(|(id, category)| json!({
+                "id": id,
+                "category": category,
+                "rejected": true,
+                "path": format!("target/generated/bytes-file-read-negative-reports/{id}.json")
+            }))
+            .collect::<Vec<_>>()
+    );
+    let mut negative_cases = Vec::new();
+    let negative_dir = PathBuf::from("target/generated/bytes-file-read-negative-reports");
+    fs::create_dir_all(&negative_dir)?;
+    for case in bytes_file_read_report_negative_cases(&mutation_base) {
+        let negative_path = negative_dir.join(format!("{}.json", case.id));
+        write_json(&negative_path, &case.report)?;
+        let rejected = schema_rejects(&negative_path)?;
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("negative-{}-rejected", case.id),
+            rejected,
+            if rejected {
+                format!("schema rejected mutated file-read report `{}`", case.id)
+            } else {
+                format!("schema accepted mutated file-read report `{}`", case.id)
+            },
+        );
+        negative_cases.push(json!({
+            "id": case.id,
+            "category": case.category,
+            "rejected": rejected,
+            "path": negative_path.display().to_string()
+        }));
+    }
+    if negative_cases.len() != negative_descriptors.len() {
+        blockers.push(format!(
+            "negative-case-count-mismatch:{}:{}",
+            negative_cases.len(),
+            negative_descriptors.len()
+        ));
+    }
+    if !blockers.is_empty() {
+        return Err(format!(
+            "BYTES File/read_bytes MachinePlan negative checks failed: {}",
+            blockers.join(", ")
+        )
+        .into());
+    }
+    report_json["per_step_pass_fail"] = json!(checks);
+    report_json["negative_case_count"] = json!(negative_cases.len());
+    report_json["negative_cases"] = json!(negative_cases);
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_bytes_file_write_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-file-write-plan.json"));
+    let fixture_dir = PathBuf::from(BYTES_FILE_WRITE_PLAN_FIXTURE_DIR);
+    let output_dir = fixture_dir.join("outputs");
+    fs::create_dir_all(&output_dir)?;
+    let source_path = fixture_dir.join(BYTES_FILE_WRITE_PLAN_SOURCE_REL);
+    let scenario_path = fixture_dir.join(BYTES_FILE_WRITE_PLAN_SCENARIO_REL);
+    let output_path = fixture_dir.join(BYTES_FILE_WRITE_PLAN_OUTPUT_REL);
+    let dynamic_source_path = fixture_dir.join("bytes_file_write_dynamic_path_plan_ops.bn");
+    let dynamic_scenario_path = fixture_dir.join("bytes_file_write_dynamic_path_plan_ops.scn");
+    let dynamic_output_rel = "outputs/dynamic-path.bin";
+    let dynamic_output_path = fixture_dir.join(dynamic_output_rel);
+    let source_text = format!(
+        "payload:\n    BYTES[4] {{ 16uDE, 16uAD, 16uBE, 16uEF }} |> HOLD payload {{ LATEST {{}} }}\n\nstore: [\n    write: SOURCE\n    write_status:\n        TEXT {{ pending }} |> HOLD write_status {{\n            LATEST {{\n                store.write |> THEN {{ payload |> File/write_bytes(path: TEXT {{ {BYTES_FILE_WRITE_PLAN_OUTPUT_REL} }}) }}\n            }}\n        }}\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))\n"
+    );
+    let scenario_text = format!(
+        "name = \"bytes file write plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"write-file-bytes\"\nexpected_source_event = {{ source = \"store.write\" }}\n",
+        source_path.display()
+    );
+    fs::write(&source_path, source_text)?;
+    fs::write(&scenario_path, scenario_text)?;
+    let dynamic_source_text = format!(
+        "payload:\n    BYTES[4] {{ 16uDE, 16uAD, 16uBE, 16uEF }} |> HOLD payload {{ LATEST {{}} }}\n\nstore: [\n    write: SOURCE\n    path_state:\n        TEXT {{ {dynamic_output_rel} }} |> HOLD path_state {{ LATEST {{}} }}\n    write_status:\n        TEXT {{ pending }} |> HOLD write_status {{\n            LATEST {{\n                store.write |> THEN {{ payload |> File/write_bytes(path: store.path_state) }}\n            }}\n        }}\n]\n\ndocument: Document/new(root: Element/label(element: [], label: TEXT {{ Dynamic path File write bytes }}))\n"
+    );
+    let dynamic_scenario_text = format!(
+        "name = \"bytes file write dynamic path plan ops\"\nsource = \"{}\"\n\n[[step]]\nid = \"write-file-bytes-dynamic-path\"\nexpected_source_event = {{ source = \"store.write\" }}\n",
+        dynamic_source_path.display()
+    );
+    fs::write(&dynamic_source_path, dynamic_source_text)?;
+    fs::write(&dynamic_scenario_path, dynamic_scenario_text)?;
+    if output_path.exists() {
+        fs::remove_file(&output_path)?;
+    }
+    if dynamic_output_path.exists() {
+        fs::remove_file(&dynamic_output_path)?;
+    }
+    let selected_step_ids = vec!["write-file-bytes".to_owned()];
+    let dynamic_selected_step_ids = vec!["write-file-bytes-dynamic-path".to_owned()];
+
+    let parsed = boon_parser::parse_source(
+        source_path.display().to_string(),
+        fs::read_to_string(&source_path)?,
+    )?;
+    let ir = boon_ir::lower(&parsed)?;
+    boon_ir::verify_hidden_identity(&ir)?;
+    boon_ir::verify_static_schedule(&ir)?;
+    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan_hash = boon_plan::plan_sha256(&plan)?;
+    let plan_verification = boon_plan::verify_plan(&plan)?;
+    let file_write_ops = plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan_has_file_write = file_write_ops.len() == 1;
+
+    let output = boon_runtime::run_plan_root_scalar_scenario(
+        &source_path,
+        &scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &selected_step_ids,
+        false,
+        None,
+    )?;
+    let plan_report = output.report;
+    let output_bytes = fs::read(&output_path)?;
+    let output_sha256 = boon_runtime::sha256_bytes(&output_bytes);
+    let output_len = output_bytes.len() as u64;
+    let first_byte = output_bytes.first().copied().unwrap_or_default() as u64;
+    let last_byte = output_bytes.last().copied().unwrap_or_default() as u64;
+    let write_update = plan_report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or("bytes file-write plan report missing write update")?;
+    let host_effect = write_update
+        .get("host_effect")
+        .ok_or("bytes file-write plan report missing host_effect")?;
+
+    let dynamic_parsed = boon_parser::parse_source(
+        dynamic_source_path.display().to_string(),
+        fs::read_to_string(&dynamic_source_path)?,
+    )?;
+    let dynamic_ir = boon_ir::lower(&dynamic_parsed)?;
+    boon_ir::verify_hidden_identity(&dynamic_ir)?;
+    boon_ir::verify_static_schedule(&dynamic_ir)?;
+    let dynamic_plan =
+        boon_plan::compile_typed_program(&dynamic_ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let dynamic_plan_hash = boon_plan::plan_sha256(&dynamic_plan)?;
+    let dynamic_plan_verification = boon_plan::verify_plan(&dynamic_plan)?;
+    let dynamic_file_write_ops = dynamic_plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter())
+        .filter(|op| {
+            matches!(
+                op.kind,
+                boon_plan::PlanOpKind::UpdateBranch {
+                    expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let dynamic_file_write_op = dynamic_file_write_ops.first().copied();
+    let dynamic_path_operand_is_state = dynamic_file_write_op.is_some_and(|op| {
+        let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+            return false;
+        };
+        matches!(
+            ordered_inputs.as_slice(),
+            [boon_plan::ValueRef::State(_), boon_plan::ValueRef::State(_)]
+        )
+    });
+    let dynamic_output = boon_runtime::run_plan_root_scalar_scenario(
+        &dynamic_source_path,
+        &dynamic_scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &dynamic_selected_step_ids,
+        false,
+        None,
+    )?;
+    let dynamic_plan_report = dynamic_output.report;
+    let dynamic_output_bytes = fs::read(&dynamic_output_path)?;
+    let dynamic_output_sha256 = boon_runtime::sha256_bytes(&dynamic_output_bytes);
+    let dynamic_output_len = dynamic_output_bytes.len() as u64;
+    let dynamic_first_byte = dynamic_output_bytes.first().copied().unwrap_or_default() as u64;
+    let dynamic_last_byte = dynamic_output_bytes.last().copied().unwrap_or_default() as u64;
+    let dynamic_write_update = dynamic_plan_report
+        .pointer("/plan_executor/per_step/0/updates/0")
+        .ok_or("dynamic-path bytes file-write plan report missing write update")?;
+    let dynamic_host_effect = dynamic_write_update
+        .get("host_effect")
+        .ok_or("dynamic-path bytes file-write plan report missing host_effect")?;
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "source-machine-plan-verified",
+        plan_verification.status == "pass",
+        format!("plan_verification.status={}", plan_verification.status),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "source-machine-plan-has-one-file-write-bytes-op",
+        plan_has_file_write,
+        format!("FileWriteBytes op count={}", file_write_ops.len()),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-report-plan-hash-matches-source-plan",
+        plan_report
+            .get("plan_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(plan_hash.as_str()),
+        format!("expected_plan_hash={plan_hash}"),
+    );
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("plan-executor-{key}-zero"),
+            plan_report
+                .pointer(&format!("/plan_executor/{key}"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            format!(
+                "plan_executor.{key}={:?}",
+                plan_report.pointer(&format!("/plan_executor/{key}"))
+            ),
+        );
+    }
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "legacy-comparison-disabled-for-host-file-boundary",
+        plan_report
+            .pointer("/legacy_comparison/enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false),
+        "typed host File/write_bytes is verified by this gate instead of legacy parity",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-write-update-kind",
+        write_update
+            .get("expression_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("file_write_bytes"),
+        format!("expression_kind={:?}", write_update.get("expression_kind")),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-write-static-path-bound",
+        write_update
+            .pointer("/update_constant_value/path")
+            .and_then(serde_json::Value::as_str)
+            == Some(BYTES_FILE_WRITE_PLAN_OUTPUT_REL),
+        format!("expected_path={BYTES_FILE_WRITE_PLAN_OUTPUT_REL}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-write-status-state-is-path",
+        plan_report
+            .pointer("/state_summary/store.write_status")
+            .and_then(serde_json::Value::as_str)
+            == Some(BYTES_FILE_WRITE_PLAN_OUTPUT_REL),
+        "File/write_bytes v1 returns the written relative path as TEXT status",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-write-bytes-access-is-explicit",
+        write_update
+            .pointer("/bytes_access/read_only")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && write_update
+                .pointer("/bytes_access/access_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("root_bytes_state")
+            && write_update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("borrowed")
+            && write_update
+                .pointer("/bytes_access/host_boundary")
+                .and_then(serde_json::Value::as_str)
+                == Some("file_write_bytes")
+            && write_update
+                .pointer("/bytes_access/byte_len")
+                .and_then(serde_json::Value::as_u64)
+                == Some(output_len),
+        format!("bytes_access={:?}", write_update.get("bytes_access")),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "file-write-runtime-bytes-storage-no-copy",
+        plan_report
+            .pointer("/plan_executor/bytes_storage_no_copy")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && [
+                "copy_from_slice_bytes",
+                "vec_clone_bytes",
+                "vec_alloc_bytes",
+                "zero_fill_bytes",
+            ]
+            .iter()
+            .all(|key| {
+                plan_report
+                    .pointer(&format!("/plan_executor/bytes_storage_counters/{key}"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+            }),
+        format!(
+            "bytes_storage_counters={:?}",
+            plan_report.pointer("/plan_executor/bytes_storage_counters")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "host-effect-byte-length-matches-output",
+        host_effect
+            .get("byte_len")
+            .and_then(serde_json::Value::as_u64)
+            == Some(output_len),
+        format!("output_len={output_len}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "host-effect-digest-matches-output",
+        host_effect
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(output_sha256.as_str()),
+        format!("output_sha256={output_sha256}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "public-report-does-not-leak-inline-bytes",
+        !json_contains_key(&plan_report, "inline_bytes"),
+        "PlanExecutor public report contains only digest/length BYTES summaries and host-effect hashes",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-machine-plan-verified",
+        dynamic_plan_verification.status == "pass",
+        format!(
+            "dynamic_plan_verification.status={}",
+            dynamic_plan_verification.status
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-has-one-file-write-bytes-op",
+        dynamic_file_write_ops.len() == 1,
+        format!(
+            "dynamic FileWriteBytes op count={}",
+            dynamic_file_write_ops.len()
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-uses-state-path-operand",
+        dynamic_path_operand_is_state,
+        "dynamic File/write_bytes ordered inputs must be [State(bytes), State(path_text)]",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-runtime-report-plan-hash-matches",
+        dynamic_plan_report
+            .get("plan_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_plan_hash.as_str()),
+        format!("expected_dynamic_plan_hash={dynamic_plan_hash}"),
+    );
+    for key in [
+        "runtime_ast_eval_count",
+        "executable_string_path_count",
+        "unknown_plan_op_count",
+        "graph_rebuild_count",
+        "graph_clones_per_item",
+    ] {
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("dynamic-path-plan-executor-{key}-zero"),
+            dynamic_plan_report
+                .pointer(&format!("/plan_executor/{key}"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            format!(
+                "dynamic plan_executor.{key}={:?}",
+                dynamic_plan_report.pointer(&format!("/plan_executor/{key}"))
+            ),
+        );
+    }
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-file-write-update-kind",
+        dynamic_write_update
+            .get("expression_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("file_write_bytes"),
+        format!(
+            "dynamic expression_kind={:?}",
+            dynamic_write_update.get("expression_kind")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-bound-from-state",
+        dynamic_write_update
+            .pointer("/update_constant_value/path")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_output_rel)
+            && dynamic_write_update
+                .pointer("/update_constant_value/path_state")
+                .and_then(serde_json::Value::as_str)
+                == Some("store.path_state")
+            && dynamic_write_update
+                .pointer("/bytes_access/path_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("state"),
+        format!(
+            "dynamic update_constant_value={:?}, bytes_access={:?}",
+            dynamic_write_update.get("update_constant_value"),
+            dynamic_write_update.get("bytes_access")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-status-state-is-path",
+        dynamic_plan_report
+            .pointer("/state_summary/store.write_status")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_output_rel),
+        "dynamic File/write_bytes returns the resolved path as TEXT status",
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-bytes-access-is-explicit",
+        dynamic_write_update
+            .pointer("/bytes_access/read_only")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && dynamic_write_update
+                .pointer("/bytes_access/access_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("root_bytes_state")
+            && dynamic_write_update
+                .pointer("/bytes_access/cow_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("borrowed")
+            && dynamic_write_update
+                .pointer("/bytes_access/host_boundary")
+                .and_then(serde_json::Value::as_str)
+                == Some("file_write_bytes")
+            && dynamic_write_update
+                .pointer("/bytes_access/byte_len")
+                .and_then(serde_json::Value::as_u64)
+                == Some(dynamic_output_len),
+        format!(
+            "dynamic bytes_access={:?}",
+            dynamic_write_update.get("bytes_access")
+        ),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-host-effect-digest-matches-output",
+        dynamic_host_effect
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(dynamic_output_sha256.as_str())
+            && dynamic_host_effect
+                .get("byte_len")
+                .and_then(serde_json::Value::as_u64)
+                == Some(dynamic_output_len),
+        format!("dynamic_output_sha256={dynamic_output_sha256}"),
+    );
+    record_bytes_file_read_check(
+        &mut checks,
+        &mut blockers,
+        "dynamic-path-public-report-does-not-leak-inline-bytes",
+        !json_contains_key(&dynamic_plan_report, "inline_bytes"),
+        "dynamic path proof contains only digest/length BYTES summaries and host-effect hashes",
+    );
+
+    let live_negative_dir =
+        PathBuf::from("target/generated/bytes-file-write-live-negative-fixtures");
+    let live_negative_setup_artifacts =
+        prepare_bytes_file_write_live_negative_fixtures(&live_negative_dir, &mut blockers)?;
+    let mut live_negative_artifacts = live_negative_setup_artifacts.clone();
+    let mut live_negative_cases = Vec::new();
+    for case in bytes_file_write_live_negative_cases() {
+        let result = run_bytes_file_write_live_negative_case(
+            &live_negative_dir,
+            &case,
+            &mut live_negative_artifacts,
+        )?;
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("live-negative-{}-rejected", result.id),
+            result.rejected,
+            if result.rejected {
+                format!(
+                    "live File/write_bytes negative fixture `{}` failed as expected with `{}`",
+                    result.id, result.expected_error_contains
+                )
+            } else {
+                format!(
+                    "live File/write_bytes negative fixture `{}` did not fail with `{}`: {}",
+                    result.id, result.expected_error_contains, result.detail
+                )
+            },
+        );
+        live_negative_cases.push(result.report_json());
+    }
+    let mut fabricated_plan_negative_cases = Vec::new();
+    for case in bytes_file_write_fabricated_plan_negative_cases() {
+        let result = run_bytes_file_write_fabricated_plan_negative_case(&plan, &case)?;
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("fabricated-plan-negative-{}-rejected", result.id),
+            result.rejected,
+            if result.rejected {
+                format!(
+                    "fabricated File/write_bytes MachinePlan `{}` failed verifier check(s) {:?}",
+                    result.id, result.failed_check_ids
+                )
+            } else {
+                format!(
+                    "fabricated File/write_bytes MachinePlan `{}` unexpectedly verified with status {}",
+                    result.id, result.verification.status
+                )
+            },
+        );
+        fabricated_plan_negative_cases.push(result.report_json());
+    }
+    if !blockers.is_empty() {
+        return Err(format!(
+            "BYTES File/write_bytes MachinePlan gate failed: {}",
+            blockers.join(", ")
+        )
+        .into());
+    }
+
+    let command_argv = std::iter::once(json!("cargo"))
+        .chain(std::iter::once(json!("xtask")))
+        .chain(args.iter().map(|arg| json!(arg)))
+        .collect::<Vec<_>>();
+    let graph_node_count = plan_report
+        .get("graph_node_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let source_path_string = source_path.display().to_string();
+    let scenario_path_string = scenario_path.display().to_string();
+    let output_path_string = output_path.display().to_string();
+    let artifact_sha256s = [
+        source_path.clone(),
+        scenario_path.clone(),
+        output_path.clone(),
+        dynamic_source_path.clone(),
+        dynamic_scenario_path.clone(),
+        dynamic_output_path.clone(),
+    ]
+    .into_iter()
+    .chain(live_negative_artifacts.iter().cloned())
+    .map(|path| artifact_hash(&path))
+    .collect::<Result<Vec<_>, _>>()?;
+    let mut report_json = json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-bytes-file-write-plan",
+        "command_argv": command_argv,
+        "measurement_mode": "proof",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_path": current_binary_path(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source_path_string,
+        "source_hash": file_hash(&source_path.display().to_string()),
+        "scenario_path": scenario_path_string,
+        "scenario_hash": file_hash(&scenario_path.display().to_string()),
+        "program_hash": file_hash(&source_path.display().to_string()),
+        "budget_hash": "n/a",
+        "graph_node_count": graph_node_count,
+        "target_profile": "software_default",
+        "plan_hash": plan_hash,
+        "plan_version": plan.version,
+        "capability_summary": plan.capability_summary,
+        "selected_step_ids": selected_step_ids,
+        "state_summary": plan_report["state_summary"].clone(),
+        "semantic_delta_signatures": plan_report["semantic_delta_signatures"].clone(),
+        "semantic_deltas": plan_report["semantic_deltas"].clone(),
+        "legacy_comparison": plan_report["legacy_comparison"].clone(),
+        "file_write_summary": {
+            "status": "pass",
+            "mode": "typed-machine-plan-host-file-write-v1",
+            "host_root": fixture_dir.display().to_string(),
+            "path": BYTES_FILE_WRITE_PLAN_OUTPUT_REL,
+            "artifact_path": output_path_string,
+            "byte_len": output_len,
+            "sha256": output_sha256,
+            "first_byte": first_byte,
+            "last_byte": last_byte,
+            "expression_kind": "file_write_bytes",
+            "write_mode": "create_or_truncate",
+            "verified_after_write": true,
+            "public_inline_bytes_absent": true
+        },
+        "dynamic_path_file_write_summary": {
+            "status": "pass",
+            "mode": "typed-machine-plan-host-file-write-v1",
+            "source_path": dynamic_source_path.display().to_string(),
+            "source_hash": file_hash(&dynamic_source_path.display().to_string()),
+            "scenario_path": dynamic_scenario_path.display().to_string(),
+            "scenario_hash": file_hash(&dynamic_scenario_path.display().to_string()),
+            "selected_step_ids": dynamic_selected_step_ids,
+            "target_profile": "software_default",
+            "plan_hash": dynamic_plan_hash,
+            "plan_version": dynamic_plan.version,
+            "capability_summary": dynamic_plan.capability_summary,
+            "path_operand": "state",
+            "path_state": "store.path_state",
+            "path": dynamic_output_rel,
+            "host_root": fixture_dir.display().to_string(),
+            "artifact_path": dynamic_output_path.display().to_string(),
+            "byte_len": dynamic_output_len,
+            "sha256": dynamic_output_sha256,
+            "first_byte": dynamic_first_byte,
+            "last_byte": dynamic_last_byte,
+            "expression_kind": "file_write_bytes",
+            "write_mode": "create_or_truncate",
+            "verified_after_write": true,
+            "public_inline_bytes_absent": true,
+            "state_summary": dynamic_plan_report["state_summary"].clone(),
+            "semantic_delta_signatures": dynamic_plan_report["semantic_delta_signatures"].clone(),
+            "semantic_deltas": dynamic_plan_report["semantic_deltas"].clone(),
+            "legacy_comparison": dynamic_plan_report["legacy_comparison"].clone(),
+            "plan_executor": dynamic_plan_report["plan_executor"].clone(),
+        },
+        "plan_executor": plan_report["plan_executor"].clone(),
+        "live_negative_case_count": live_negative_cases.len(),
+        "live_negative_cases": live_negative_cases,
+        "fabricated_plan_negative_case_count": fabricated_plan_negative_cases.len(),
+        "fabricated_plan_negative_cases": fabricated_plan_negative_cases,
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifact_sha256s
+    });
+
+    let mut checks = report_json["per_step_pass_fail"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let negative_descriptors = bytes_file_write_report_negative_descriptors();
+    let mut mutation_base = report_json.clone();
+    let mut mutation_base_checks = checks.clone();
+    for (id, category) in &negative_descriptors {
+        mutation_base_checks.push(json!({
+            "id": format!("negative-{id}-rejected"),
+            "pass": true,
+            "detail": format!("schema rejected mutated file-write report `{id}`")
+        }));
+        let _ = category;
+    }
+    mutation_base["per_step_pass_fail"] = json!(mutation_base_checks);
+    mutation_base["negative_case_count"] = json!(negative_descriptors.len());
+    mutation_base["negative_cases"] = json!(
+        negative_descriptors
+            .iter()
+            .map(|(id, category)| json!({
+                "id": id,
+                "category": category,
+                "rejected": true,
+                "path": format!("target/generated/bytes-file-write-negative-reports/{id}.json")
+            }))
+            .collect::<Vec<_>>()
+    );
+    let negative_dir = PathBuf::from("target/generated/bytes-file-write-negative-reports");
+    fs::create_dir_all(&negative_dir)?;
+    let mut negative_cases = Vec::new();
+    let mut negative_paths = Vec::new();
+    for case in bytes_file_write_report_negative_cases(&mutation_base) {
+        let negative_path = negative_dir.join(format!("{}.json", case.id));
+        write_json(&negative_path, &case.report)?;
+        let rejected =
+            boon_runtime::verify_bytes_file_write_negative_artifact(&negative_path, case.id)
+                .is_ok();
+        let negative_sha256 = file_hash(&negative_path.display().to_string());
+        record_bytes_file_read_check(
+            &mut checks,
+            &mut blockers,
+            format!("negative-{}-rejected", case.id),
+            rejected,
+            if rejected {
+                format!("schema rejected mutated file-write report `{}`", case.id)
+            } else {
+                format!("schema accepted mutated file-write report `{}`", case.id)
+            },
+        );
+        negative_cases.push(json!({
+            "id": case.id,
+            "category": case.category,
+            "rejected": rejected,
+            "path": negative_path.display().to_string(),
+            "sha256": negative_sha256
+        }));
+        negative_paths.push(negative_path);
+    }
+    if !blockers.is_empty() {
+        return Err(format!(
+            "BYTES File/write_bytes MachinePlan negative checks failed: {}",
+            blockers.join(", ")
+        )
+        .into());
+    }
+    report_json["per_step_pass_fail"] = json!(checks);
+    report_json["negative_case_count"] = json!(negative_cases.len());
+    report_json["negative_cases"] = json!(negative_cases);
+    let artifact_paths = [
+        source_path.clone(),
+        scenario_path.clone(),
+        output_path.clone(),
+    ]
+    .into_iter()
+    .chain(live_negative_artifacts)
+    .chain(negative_paths)
+    .collect::<Vec<_>>();
+    report_json["artifact_sha256s"] = json!(
+        artifact_paths
+            .iter()
+            .map(|path| artifact_hash(path))
+            .collect::<Result<Vec<_>, _>>()?
+    );
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+struct BytesFileWriteReportNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    report: serde_json::Value,
+}
+
+#[derive(Clone, Copy)]
+enum BytesFileWriteFabricatedPlanMutation {
+    MissingBytesOperand,
+    ExtraPathOperand,
+    RowFieldPathOpNotIndexed,
+    RowFieldPathInputMissing,
+    RowFieldPathForeignList,
+    MissingPathConstant,
+    NonTextPathConstant,
+    NonStaticParentPath,
+    MissingSourceInput,
+    ExtraSourceInput,
+    SourcePayloadInputDeclared,
+    UpdateConstantPresent,
+    SourcePayloadFieldPresent,
+    InputNotBytes,
+    OutputNotText,
+}
+
+struct BytesFileWriteFabricatedPlanCase {
+    id: &'static str,
+    category: &'static str,
+    mutation: BytesFileWriteFabricatedPlanMutation,
+}
+
+struct BytesFileWriteFabricatedPlanResult {
+    id: &'static str,
+    category: &'static str,
+    mutation: &'static str,
+    base_plan_hash: String,
+    mutated_plan_hash: String,
+    verification: boon_plan::PlanVerification,
+    expected_failed_check_ids: Vec<String>,
+    failed_check_ids: Vec<String>,
+    error_count: usize,
+    rejected: bool,
+}
+
+impl BytesFileWriteFabricatedPlanResult {
+    fn report_json(&self) -> serde_json::Value {
+        json!({
+            "id": self.id,
+            "category": self.category,
+            "stage": "machine-plan-verifier",
+            "mutation": self.mutation,
+            "target_profile": "software_default",
+            "evidence_level": "verifier-only",
+            "runtime_executed": false,
+            "runtime_non_execution_reason": "fabricated MachinePlan is checked with boon_plan::verify_plan only",
+            "base_plan_hash": self.base_plan_hash,
+            "fabricated_plan_hash": self.mutated_plan_hash,
+            "mutated_plan_hash": self.mutated_plan_hash,
+            "expected_verification_status": "fail",
+            "actual_verification_status": self.verification.status,
+            "expected_failed_check_ids": self.expected_failed_check_ids,
+            "actual_failed_check_ids": self.failed_check_ids,
+            "failed_check_ids": self.failed_check_ids,
+            "error_count": self.error_count,
+            "boon_plan_verification": self.verification,
+            "rejected": self.rejected
+        })
+    }
+}
+
+fn bytes_file_write_fabricated_plan_negative_cases() -> Vec<BytesFileWriteFabricatedPlanCase> {
+    use BytesFileWriteFabricatedPlanMutation::*;
+    vec![
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-bytes-operand",
+            category: "operand-shape",
+            mutation: MissingBytesOperand,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-extra-path-operand",
+            category: "operand-shape",
+            mutation: ExtraPathOperand,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-op-not-indexed",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathOpNotIndexed,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-input-missing",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathInputMissing,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-row-field-path-foreign-list",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathForeignList,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-path-constant",
+            category: "constant-binding",
+            mutation: MissingPathConstant,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-non-text-path-constant",
+            category: "constant-binding",
+            mutation: NonTextPathConstant,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-non-static-parent-path",
+            category: "path-policy",
+            mutation: NonStaticParentPath,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-missing-source-input",
+            category: "operand-shape",
+            mutation: MissingSourceInput,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-extra-source-input",
+            category: "operand-shape",
+            mutation: ExtraSourceInput,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-source-payload-input-declared",
+            category: "operand-shape",
+            mutation: SourcePayloadInputDeclared,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-update-constant-present",
+            category: "operand-shape",
+            mutation: UpdateConstantPresent,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-source-payload-field-present",
+            category: "operand-shape",
+            mutation: SourcePayloadFieldPresent,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-input-not-bytes",
+            category: "type-policy",
+            mutation: InputNotBytes,
+        },
+        BytesFileWriteFabricatedPlanCase {
+            id: "fabricated-output-not-text",
+            category: "type-policy",
+            mutation: OutputNotText,
+        },
+    ]
+}
+
+fn run_bytes_file_write_fabricated_plan_negative_case(
+    source_plan: &boon_plan::MachinePlan,
+    case: &BytesFileWriteFabricatedPlanCase,
+) -> Result<BytesFileWriteFabricatedPlanResult, Box<dyn std::error::Error>> {
+    let base_plan_hash = boon_plan::plan_sha256(source_plan)?;
+    let mut mutated_plan = source_plan.clone();
+    mutate_bytes_file_write_plan(&mut mutated_plan, case.mutation)?;
+    let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan)?;
+    let verification = boon_plan::verify_plan(&mutated_plan)?;
+    let failed_check_ids = verification
+        .checks
+        .iter()
+        .filter(|check| !check.pass)
+        .map(|check| check.id.clone())
+        .collect::<Vec<_>>();
+    let expected_failed_check_ids = failed_check_ids.clone();
+    let error_count = verification.error_count;
+    let rejected = verification.status == "fail"
+        && failed_check_ids
+            .iter()
+            .any(|id| id == "file-write-bytes-ops-well-formed");
+    Ok(BytesFileWriteFabricatedPlanResult {
+        id: case.id,
+        category: case.category,
+        mutation: case.mutation.as_str(),
+        base_plan_hash,
+        mutated_plan_hash,
+        verification,
+        expected_failed_check_ids,
+        failed_check_ids,
+        error_count,
+        rejected,
+    })
+}
+
+impl BytesFileWriteFabricatedPlanMutation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingBytesOperand => "missing_bytes_operand",
+            Self::ExtraPathOperand => "extra_path_operand",
+            Self::RowFieldPathOpNotIndexed => "row_field_path_op_not_indexed",
+            Self::RowFieldPathInputMissing => "row_field_path_input_missing",
+            Self::RowFieldPathForeignList => "row_field_path_foreign_list",
+            Self::MissingPathConstant => "missing_path_constant",
+            Self::NonTextPathConstant => "non_text_path_constant",
+            Self::NonStaticParentPath => "non_static_parent_path",
+            Self::MissingSourceInput => "missing_source_input",
+            Self::ExtraSourceInput => "extra_source_input",
+            Self::SourcePayloadInputDeclared => "source_payload_input_declared",
+            Self::UpdateConstantPresent => "update_constant_present",
+            Self::SourcePayloadFieldPresent => "source_payload_field_present",
+            Self::InputNotBytes => "input_not_bytes",
+            Self::OutputNotText => "output_not_text",
+        }
+    }
+}
+
+fn mutate_bytes_file_write_plan(
+    plan: &mut boon_plan::MachinePlan,
+    mutation: BytesFileWriteFabricatedPlanMutation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (region_index, op_index) = bytes_file_write_plan_op_location(plan)?;
+    let path_constant_id = bytes_file_write_path_constant_id(plan, region_index, op_index)?;
+    let bytes_input_state_id = bytes_file_write_input_state_id(plan, region_index, op_index)?;
+    let output_state_id = bytes_file_write_output_state_id(plan, region_index, op_index)?;
+    let source_id = plan
+        .source_routes
+        .first()
+        .map(|route| route.source_id)
+        .ok_or("source plan has no source routes for fabricated FileWriteBytes mutation")?;
+    match mutation {
+        BytesFileWriteFabricatedPlanMutation::MissingBytesOperand => {
+            bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+        }
+        BytesFileWriteFabricatedPlanMutation::ExtraPathOperand => {
+            bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?
+                .push(boon_plan::ValueRef::Constant(path_constant_id));
+        }
+        BytesFileWriteFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = false;
+            op.inputs.push(field_ref.clone());
+            *bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        BytesFileWriteFabricatedPlanMutation::RowFieldPathInputMissing => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            plan.regions[region_index].ops[op_index].indexed = true;
+            *bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        BytesFileWriteFabricatedPlanMutation::RowFieldPathForeignList => {
+            let path_field_id = install_foreign_row_field_path_scope(
+                plan,
+                output_state_id,
+                boon_plan::PlanValueType::Text,
+            )?;
+            let field_ref = boon_plan::ValueRef::Field(path_field_id);
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = true;
+            if !op.inputs.contains(&field_ref) {
+                op.inputs.push(field_ref.clone());
+            }
+            *bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
+        }
+        BytesFileWriteFabricatedPlanMutation::MissingPathConstant => {
+            *bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? = vec![
+                boon_plan::ValueRef::State(bytes_input_state_id),
+                boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(999_999)),
+            ];
+        }
+        BytesFileWriteFabricatedPlanMutation::NonTextPathConstant => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or("source plan missing FileWriteBytes path constant")?;
+            constant.value = boon_plan::PlanConstantValue::Number { value: 7 };
+        }
+        BytesFileWriteFabricatedPlanMutation::NonStaticParentPath => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or("source plan missing FileWriteBytes path constant")?;
+            constant.value = boon_plan::PlanConstantValue::Text {
+                value: "../payload.bin".to_owned(),
+            };
+        }
+        BytesFileWriteFabricatedPlanMutation::MissingSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .retain(|input| !matches!(input, boon_plan::ValueRef::Source(_)));
+        }
+        BytesFileWriteFabricatedPlanMutation::ExtraSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                    source_id.0.saturating_add(999_999),
+                )));
+        }
+        BytesFileWriteFabricatedPlanMutation::SourcePayloadInputDeclared => {
+            plan.regions[region_index].ops[op_index].inputs.push(
+                boon_plan::ValueRef::SourcePayload {
+                    source_id,
+                    field: boon_ir::SourcePayloadField::Text,
+                },
+            );
+        }
+        BytesFileWriteFabricatedPlanMutation::UpdateConstantPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                update_constant_id, ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *update_constant_id = Some(path_constant_id);
+            }
+        }
+        BytesFileWriteFabricatedPlanMutation::SourcePayloadFieldPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                source_payload_field,
+                ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+            }
+        }
+        BytesFileWriteFabricatedPlanMutation::InputNotBytes => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == bytes_input_state_id)
+                .ok_or("source plan missing FileWriteBytes input storage slot")?;
+            slot.value_type = boon_plan::PlanValueType::Text;
+        }
+        BytesFileWriteFabricatedPlanMutation::OutputNotText => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or("source plan missing FileWriteBytes output storage slot")?;
+            slot.value_type = boon_plan::PlanValueType::Bytes { fixed_len: None };
+        }
+    }
+    Ok(())
+}
+
+fn bytes_file_write_plan_op_location(
+    plan: &boon_plan::MachinePlan,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    plan.regions
+        .iter()
+        .enumerate()
+        .find_map(|(region_index, region)| {
+            region
+                .ops
+                .iter()
+                .enumerate()
+                .find(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        boon_plan::PlanOpKind::UpdateBranch {
+                            expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                            ..
+                        }
+                    )
+                })
+                .map(|(op_index, _)| (region_index, op_index))
+        })
+        .ok_or_else(|| "source plan has no FileWriteBytes op".into())
+}
+
+fn bytes_file_write_path_constant_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<boon_plan::PlanConstantId, Box<dyn std::error::Error>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    let [_, boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
+        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
+    };
+    Ok(*path_constant_id)
+}
+
+fn bytes_file_write_input_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    let [boon_plan::ValueRef::State(state_id), _] = ordered_inputs.as_slice() else {
+        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
+    };
+    Ok(*state_id)
+}
+
+fn bytes_file_write_output_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+    let Some(boon_plan::ValueRef::State(state_id)) =
+        plan.regions[region_index].ops[op_index].output.as_ref()
+    else {
+        return Err("FileWriteBytes op does not have a state output".into());
+    };
+    Ok(*state_id)
+}
+
+fn bytes_file_write_ordered_inputs_mut(
+    plan: &mut boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<&mut Vec<boon_plan::ValueRef>, Box<dyn std::error::Error>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &mut plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileWriteBytes op is not an update branch".into());
+    };
+    Ok(ordered_inputs)
+}
+
+fn install_foreign_row_field_path_scope(
+    plan: &mut boon_plan::MachinePlan,
+    output_state_id: boon_ir::StateId,
+    output_value_type: boon_plan::PlanValueType,
+) -> Result<boon_ir::FieldId, Box<dyn std::error::Error>> {
+    let output_scope_id = boon_ir::ScopeId(900_001);
+    let foreign_scope_id = boon_ir::ScopeId(900_002);
+    let output_field_id = boon_ir::FieldId(900_003);
+    let foreign_path_field_id = boon_ir::FieldId(900_004);
+    let output_list_id = boon_ir::ListId(900_005);
+    let foreign_list_id = boon_ir::ListId(900_006);
+
+    let output_slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter_mut()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or("fabricated foreign row-field path mutation missing output storage slot")?;
+    output_slot.indexed = true;
+    output_slot.scope_id = Some(output_scope_id);
+
+    plan.storage_layout.list_slots.retain(|slot| {
+        slot.scope_id != Some(output_scope_id) && slot.scope_id != Some(foreign_scope_id)
+    });
+    plan.storage_layout
+        .list_slots
+        .push(boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(900_007),
+            list_id: output_list_id,
+            scope_id: Some(output_scope_id),
+            row_field_ids: vec![output_field_id],
+            capacity: None,
+            hidden_key_type: "RowKey".to_owned(),
+            has_generation: true,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![boon_plan::PlanInitialListField {
+                    name: "output".to_owned(),
+                    field_id: Some(output_field_id),
+                    value: plan_constant_value_for_type(&output_value_type),
+                }],
+            }],
+        });
+    plan.storage_layout
+        .list_slots
+        .push(boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(900_008),
+            list_id: foreign_list_id,
+            scope_id: Some(foreign_scope_id),
+            row_field_ids: vec![foreign_path_field_id],
+            capacity: None,
+            hidden_key_type: "RowKey".to_owned(),
+            has_generation: true,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![boon_plan::PlanInitialListField {
+                    name: "foreign_path".to_owned(),
+                    field_id: Some(foreign_path_field_id),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "foreign-list.bin".to_owned(),
+                    },
+                }],
+            }],
+        });
+
+    Ok(foreign_path_field_id)
+}
+
+fn plan_constant_value_for_type(
+    value_type: &boon_plan::PlanValueType,
+) -> boon_plan::PlanConstantValue {
+    match value_type {
+        boon_plan::PlanValueType::Text => boon_plan::PlanConstantValue::Text {
+            value: "pending".to_owned(),
+        },
+        boon_plan::PlanValueType::Bytes { .. } => boon_plan::PlanConstantValue::Bytes {
+            byte_len: 0,
+            sha256: boon_runtime::sha256_bytes(&[]),
+            inline_bytes: Some(Vec::new()),
+        },
+        boon_plan::PlanValueType::Byte => boon_plan::PlanConstantValue::Byte { value: 0 },
+        boon_plan::PlanValueType::Number => boon_plan::PlanConstantValue::Number { value: 0 },
+        boon_plan::PlanValueType::Bool => boon_plan::PlanConstantValue::Bool { value: false },
+        boon_plan::PlanValueType::Enum => boon_plan::PlanConstantValue::Enum {
+            value: "unknown".to_owned(),
+        },
+        boon_plan::PlanValueType::RootInitialField
+        | boon_plan::PlanValueType::RowInitialField
+        | boon_plan::PlanValueType::Unknown => boon_plan::PlanConstantValue::Text {
+            value: "unsupported".to_owned(),
+        },
+    }
+}
+
+fn bytes_file_write_report_negative_descriptors() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("forged-summary-digest", "file-artifact-binding"),
+        ("forged-host-effect-digest", "executor-host-effect-binding"),
+        ("forged-byte-length", "file-artifact-binding"),
+        ("forged-last-byte", "file-artifact-binding"),
+        ("public-inline-bytes-leak", "payload-leak"),
+        ("expression-kind-downgrade", "typed-op-binding"),
+        ("missing-file-write-update", "executor-shape"),
+        ("nonzero-runtime-ast-eval", "fallback-counter"),
+        ("forged-plan-hash", "plan-binding"),
+        ("forged-binary-hash", "binary-binding"),
+        ("missing-live-negative-evidence", "live-negative-evidence"),
+        ("forged-live-negative-detail", "live-negative-evidence"),
+        (
+            "missing-fabricated-plan-negative-evidence",
+            "fabricated-plan-negative-evidence",
+        ),
+        (
+            "forged-fabricated-plan-negative-hash",
+            "fabricated-plan-negative-binding",
+        ),
+        (
+            "forged-fabricated-plan-negative-check",
+            "fabricated-plan-negative-binding",
+        ),
+        (
+            "forged-fabricated-plan-runtime-executed",
+            "fabricated-plan-negative-boundary",
+        ),
+        (
+            "fabricated-plan-extra-runtime-claim",
+            "fabricated-plan-negative-boundary",
+        ),
+        (
+            "fabricated-plan-duplicate-case",
+            "fabricated-plan-negative-binding",
+        ),
+        ("missing-negative-evidence", "negative-evidence"),
+    ]
+}
+
+fn bytes_file_write_report_negative_cases(
+    base: &serde_json::Value,
+) -> Vec<BytesFileWriteReportNegativeCase> {
+    let mut cases = Vec::new();
+
+    let mut forged_summary_digest = base.clone();
+    forged_summary_digest["file_write_summary"]["sha256"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-summary-digest",
+        category: "file-artifact-binding",
+        report: forged_summary_digest,
+    });
+
+    let mut forged_host_effect_digest = base.clone();
+    forged_host_effect_digest["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["sha256"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-host-effect-digest",
+        category: "executor-host-effect-binding",
+        report: forged_host_effect_digest,
+    });
+
+    let mut forged_len = base.clone();
+    forged_len["file_write_summary"]["byte_len"] = json!(99);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-byte-length",
+        category: "file-artifact-binding",
+        report: forged_len,
+    });
+
+    let mut forged_last_byte = base.clone();
+    forged_last_byte["file_write_summary"]["last_byte"] = json!(0);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-last-byte",
+        category: "file-artifact-binding",
+        report: forged_last_byte,
+    });
+
+    let mut inline_payload_leak = base.clone();
+    inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["inline_bytes"] =
+        json!([222, 173, 190, 239]);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "public-inline-bytes-leak",
+        category: "payload-leak",
+        report: inline_payload_leak,
+    });
+
+    let mut expression_kind_downgrade = base.clone();
+    expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
+        json!("read_path");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "expression-kind-downgrade",
+        category: "typed-op-binding",
+        report: expression_kind_downgrade,
+    });
+
+    let mut missing_update = base.clone();
+    missing_update["plan_executor"]["per_step"][0]["updates"] = json!([]);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "missing-file-write-update",
+        category: "executor-shape",
+        report: missing_update,
+    });
+
+    let mut nonzero_ast = base.clone();
+    nonzero_ast["plan_executor"]["runtime_ast_eval_count"] = json!(1);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "nonzero-runtime-ast-eval",
+        category: "fallback-counter",
+        report: nonzero_ast,
+    });
+
+    let mut forged_plan_hash = base.clone();
+    forged_plan_hash["plan_hash"] =
+        json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-plan-hash",
+        category: "plan-binding",
+        report: forged_plan_hash,
+    });
+
+    let mut forged_binary_hash = base.clone();
+    forged_binary_hash["binary_hash"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-binary-hash",
+        category: "binary-binding",
+        report: forged_binary_hash,
+    });
+
+    let mut missing_live_negative = base.clone();
+    missing_live_negative
+        .as_object_mut()
+        .expect("report must be object")
+        .remove("live_negative_cases");
+    missing_live_negative
+        .as_object_mut()
+        .expect("report must be object")
+        .remove("live_negative_case_count");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "missing-live-negative-evidence",
+        category: "live-negative-evidence",
+        report: missing_live_negative,
+    });
+
+    let mut forged_live_negative_detail = base.clone();
+    forged_live_negative_detail["live_negative_cases"][0]["detail"] =
+        json!("PlanExecutor accepted forged live-negative evidence");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-live-negative-detail",
+        category: "live-negative-evidence",
+        report: forged_live_negative_detail,
+    });
+
+    let mut missing_fabricated_plan_negative_evidence = base.clone();
+    if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
+        object.remove("fabricated_plan_negative_case_count");
+        object.remove("fabricated_plan_negative_cases");
+    }
+    if let Some(checks) = missing_fabricated_plan_negative_evidence
+        .get_mut("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        checks.retain(|check| {
+            !check
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
+        });
+    }
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "missing-fabricated-plan-negative-evidence",
+        category: "fabricated-plan-negative-evidence",
+        report: missing_fabricated_plan_negative_evidence,
+    });
+
+    let mut forged_fabricated_plan_negative_hash = base.clone();
+    forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-fabricated-plan-negative-hash",
+        category: "fabricated-plan-negative-binding",
+        report: forged_fabricated_plan_negative_hash,
+    });
+
+    let mut forged_fabricated_plan_negative_check = base.clone();
+    forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
+        json!(["capability-summary-derived-counts"]);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-fabricated-plan-negative-check",
+        category: "fabricated-plan-negative-binding",
+        report: forged_fabricated_plan_negative_check,
+    });
+
+    let mut forged_fabricated_plan_runtime_executed = base.clone();
+    forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
+        json!(true);
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "forged-fabricated-plan-runtime-executed",
+        category: "fabricated-plan-negative-boundary",
+        report: forged_fabricated_plan_runtime_executed,
+    });
+
+    let mut fabricated_plan_extra_runtime_claim = base.clone();
+    fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
+        json!(["write-file-bytes"]);
+    fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
+        json!({"executor": "fake-runtime-claim"});
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "fabricated-plan-extra-runtime-claim",
+        category: "fabricated-plan-negative-boundary",
+        report: fabricated_plan_extra_runtime_claim,
+    });
+
+    let mut fabricated_plan_duplicate_case = base.clone();
+    if let Some(cases_array) = fabricated_plan_duplicate_case
+        .get_mut("fabricated_plan_negative_cases")
+        .and_then(serde_json::Value::as_array_mut)
+        .cloned()
+    {
+        let mut duplicated = cases_array;
+        if let Some(first) = duplicated.first().cloned() {
+            duplicated.push(first);
+        }
+        fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
+    }
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "fabricated-plan-duplicate-case",
+        category: "fabricated-plan-negative-binding",
+        report: fabricated_plan_duplicate_case,
+    });
+
+    let mut missing_negative = base.clone();
+    missing_negative
+        .as_object_mut()
+        .expect("report must be object")
+        .remove("negative_cases");
+    missing_negative
+        .as_object_mut()
+        .expect("report must be object")
+        .remove("negative_case_count");
+    cases.push(BytesFileWriteReportNegativeCase {
+        id: "missing-negative-evidence",
+        category: "negative-evidence",
+        report: missing_negative,
+    });
+
+    cases
+}
+
+struct BytesFileWriteLiveNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    source: &'static str,
+    expected_error_contains: &'static str,
+    target_path: Option<&'static str>,
+    target_kind: Option<&'static str>,
+}
+
+struct BytesFileWriteLiveNegativeResult {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    source_path: PathBuf,
+    source_sha256: String,
+    scenario_path: PathBuf,
+    scenario_sha256: String,
+    selected_step_ids: Vec<String>,
+    expected_error_contains: &'static str,
+    rejected: bool,
+    detail: String,
+    detail_sha256: String,
+    target_path: Option<PathBuf>,
+    target_kind: Option<&'static str>,
+}
+
+impl BytesFileWriteLiveNegativeResult {
+    fn report_json(&self) -> serde_json::Value {
+        let mut value = json!({
+            "id": self.id,
+            "category": self.category,
+            "stage": self.stage,
+            "source_path": self.source_path.display().to_string(),
+            "source_sha256": self.source_sha256,
+            "scenario_path": self.scenario_path.display().to_string(),
+            "scenario_sha256": self.scenario_sha256,
+            "target_profile": "software_default",
+            "selected_step_ids": self.selected_step_ids,
+            "expected_error_contains": self.expected_error_contains,
+            "rejected": self.rejected,
+            "detail": self.detail,
+            "detail_sha256": self.detail_sha256
+        });
+        if let Some(target_path) = &self.target_path {
+            value["target_path"] = json!(target_path.display().to_string());
+        }
+        if let Some(target_kind) = self.target_kind {
+            value["target_kind"] = json!(target_kind);
+        }
+        value
+    }
+}
+
+fn prepare_bytes_file_write_live_negative_fixtures(
+    fixture_dir: &Path,
+    _blockers: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    if fixture_dir.exists() {
+        fs::remove_dir_all(fixture_dir)?;
+    }
+    fs::create_dir_all(fixture_dir)?;
+    fs::create_dir_all(fixture_dir.join("outputs"))?;
+    fs::create_dir_all(fixture_dir.join("directory-target"))?;
+    let existing_target = fixture_dir.join("outputs/existing.bin");
+    fs::write(&existing_target, b"existing write-negative target")?;
+
+    let mut artifacts = vec![existing_target.clone()];
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let symlink_target = fixture_dir.join("symlink-target.bin");
+        if symlink_target.exists() || symlink_target.symlink_metadata().is_ok() {
+            fs::remove_file(&symlink_target)?;
+        }
+        symlink(existing_target.canonicalize()?, &symlink_target)?;
+
+        let outside_dir = fixture_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("target/generated"))
+            .join("bytes-file-write-live-negative-outside");
+        if outside_dir.exists() {
+            fs::remove_dir_all(&outside_dir)?;
+        }
+        fs::create_dir_all(&outside_dir)?;
+        let outside_marker = outside_dir.join("outside-marker.bin");
+        fs::write(&outside_marker, b"outside write root")?;
+        artifacts.push(outside_marker);
+        let outside_dir = outside_dir.canonicalize()?;
+
+        let parent_escape = fixture_dir.join("outside-parent");
+        if parent_escape.exists() || parent_escape.symlink_metadata().is_ok() {
+            fs::remove_file(&parent_escape)?;
+        }
+        symlink(&outside_dir, &parent_escape)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        _blockers.push("live-negative-file-write-symlink-cases-unavailable-on-non-unix".to_owned());
+    }
+
+    Ok(artifacts)
+}
+
+fn bytes_file_write_live_negative_cases() -> Vec<BytesFileWriteLiveNegativeCase> {
+    let mut cases = vec![
+        BytesFileWriteLiveNegativeCase {
+            id: "source-empty-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { })",
+            ),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "source-absolute-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { /tmp/boon-file-write-negative.bin })",
+            ),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "source-parent-directory-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { ../payload.bin })",
+            ),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "source-missing-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes()",
+            ),
+            expected_error_contains: "unsupported update expression",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "typecheck-non-bytes-input",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            source: bytes_file_write_negative_source(
+                "TEXT { not bytes }",
+                "payload |> File/write_bytes(path: TEXT { outputs/non-bytes.bin })",
+            ),
+            expected_error_contains: "File/write_bytes",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "typecheck-wrong-path-type",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: 7)",
+            ),
+            expected_error_contains: "File/write_bytes",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-dynamic-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+payload:
+    BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF } |> HOLD payload { LATEST {} }
+
+store: [
+    write: SOURCE
+    path_state:
+        TEXT { ../dynamic.bin } |> HOLD path_state { LATEST {} }
+    write_status:
+        TEXT { pending } |> HOLD write_status {
+            LATEST {
+                store.write |> THEN { payload |> File/write_bytes(path: store.path_state) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File write bytes }))
+"#,
+            expected_error_contains: "may not contain parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        path_state: row.path_state
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: path_state) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes negative }))
+"#,
+            expected_error_contains: "may not contain parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-parent",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        path_state: row.path_state
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: path_state) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes missing parent negative }))
+"#,
+            expected_error_contains: "cannot write `missing-parent/out.bin`",
+            target_path: Some("missing-parent/out.bin"),
+            target_kind: Some("missing_parent"),
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "typecheck-indexed-row-field-non-text-path",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        path_state: row.path_state
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: path_state) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes non-text path negative }))
+"#,
+            expected_error_contains: "File/write_bytes",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-target-row",
+            category: "indexed-row-dispatch-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        path_state: row.path_state
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: path_state) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes missing target row negative }))
+"#,
+            expected_error_contains: "target key/generation 999/1 not found",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "typecheck-indexed-row-field-unknown-path-field",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: row.missing_path) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes unknown path field negative }))
+"#,
+            expected_error_contains: "missing_path",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
+            category: "indexed-row-shape-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/mixed-row-shape.bin }, write_status: TEXT { pending }]
+            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, write_status: TEXT { pending }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { payload |> File/write_bytes(path: row.path_state) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes mixed row-shape negative }))
+"#,
+            expected_error_contains: "is not in the static schedule symbol table",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-missing-parent",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { missing-parent/out.bin })",
+            ),
+            expected_error_contains: "cannot write `missing-parent/out.bin`",
+            target_path: Some("missing-parent/out.bin"),
+            target_kind: Some("missing_parent"),
+        },
+        BytesFileWriteLiveNegativeCase {
+            id: "runtime-directory-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { directory-target })",
+            ),
+            expected_error_contains: "targets a directory",
+            target_path: Some("directory-target"),
+            target_kind: Some("directory"),
+        },
+    ];
+
+    #[cfg(unix)]
+    {
+        cases.push(BytesFileWriteLiveNegativeCase {
+            id: "runtime-symlink-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { symlink-target.bin })",
+            ),
+            expected_error_contains: "may not target a symlink",
+            target_path: Some("symlink-target.bin"),
+            target_kind: Some("symlink"),
+        });
+        cases.push(BytesFileWriteLiveNegativeCase {
+            id: "runtime-symlink-parent-escape",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_write_negative_source(
+                "BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }",
+                "payload |> File/write_bytes(path: TEXT { outside-parent/out.bin })",
+            ),
+            expected_error_contains: "escapes source root",
+            target_path: Some("outside-parent"),
+            target_kind: Some("symlink_parent_escape"),
+        });
+    }
+
+    cases
+}
+
+fn bytes_file_write_negative_source(initial: &'static str, update: &'static str) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+payload:
+    {initial} |> HOLD payload {{ LATEST {{}} }}
+
+store: [
+    write: SOURCE
+    write_status:
+        TEXT {{ pending }} |> HOLD write_status {{
+            LATEST {{
+                store.write |> THEN {{ {update} }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn run_bytes_file_write_live_negative_case(
+    fixture_dir: &Path,
+    case: &BytesFileWriteLiveNegativeCase,
+    artifact_paths: &mut Vec<PathBuf>,
+) -> Result<BytesFileWriteLiveNegativeResult, Box<dyn std::error::Error>> {
+    let source_path = write_bytes_negative_fixture(fixture_dir, case.id, "bn", case.source)?;
+    let scenario_text = format!(
+        r#"
+name = "{}"
+source = "{}"
+
+[[step]]
+id = "write"
+expected_source_event = {}
+"#,
+        case.id,
+        source_path.display(),
+        bytes_file_write_live_negative_event(case.id)
+    );
+    let scenario_path = write_bytes_negative_fixture(fixture_dir, case.id, "scn", &scenario_text)?;
+    artifact_paths.push(source_path.clone());
+    artifact_paths.push(scenario_path.clone());
+
+    let selected_step_ids = vec!["write".to_owned()];
+    let result = boon_runtime::run_plan_root_scalar_scenario(
+        &source_path,
+        &scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &selected_step_ids,
+        false,
+        None,
+    );
+    let detail = match result {
+        Ok(_) => "PlanExecutor accepted live negative File/write_bytes fixture".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    let rejected = detail.contains(case.expected_error_contains);
+    let source_sha256 = boon_runtime::sha256_file(&source_path)?;
+    let scenario_sha256 = boon_runtime::sha256_file(&scenario_path)?;
+    let detail_sha256 = boon_runtime::sha256_bytes(detail.as_bytes());
+    Ok(BytesFileWriteLiveNegativeResult {
+        id: case.id,
+        category: case.category,
+        stage: case.stage,
+        source_path,
+        source_sha256,
+        scenario_path,
+        scenario_sha256,
+        selected_step_ids,
+        expected_error_contains: case.expected_error_contains,
+        rejected,
+        detail,
+        detail_sha256,
+        target_path: case.target_path.map(|path| fixture_dir.join(path)),
+        target_kind: case.target_kind,
+    })
+}
+
+fn bytes_file_write_live_negative_event(case_id: &str) -> String {
+    if matches!(
+        case_id,
+        "runtime-indexed-row-field-parent-path"
+            | "runtime-indexed-row-field-missing-parent"
+            | "typecheck-indexed-row-field-non-text-path"
+            | "typecheck-indexed-row-field-unknown-path-field"
+            | "runtime-indexed-row-field-mixed-row-shape-missing-path"
+    ) {
+        "{ source = \"row.write\", target_key = 2, target_generation = 1 }".to_owned()
+    } else if case_id == "runtime-indexed-row-field-missing-target-row" {
+        "{ source = \"row.write\", target_key = 999, target_generation = 1 }".to_owned()
+    } else {
+        "{ source = \"store.write\" }".to_owned()
+    }
+}
+
+struct BytesFileReadReportNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    report: serde_json::Value,
+}
+
+fn bytes_file_read_report_negative_descriptors() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("forged-summary-digest", "file-artifact-binding"),
+        ("forged-update-digest", "executor-value-binding"),
+        ("forged-state-digest", "state-binding"),
+        ("forged-byte-length", "file-artifact-binding"),
+        ("forged-first-byte", "file-artifact-binding"),
+        ("forged-followup-bytes-length", "bytes-consumer-binding"),
+        ("forged-followup-bytes-get", "bytes-consumer-binding"),
+        ("public-inline-bytes-leak", "payload-leak"),
+        ("expression-kind-downgrade", "typed-op-binding"),
+        ("path-parent-escape", "path-policy"),
+        ("missing-artifact", "artifact-binding"),
+        ("missing-file-read-update", "executor-shape"),
+        ("nonzero-runtime-ast-eval", "fallback-counter"),
+        ("forged-plan-hash", "plan-binding"),
+        ("missing-negative-evidence", "negative-evidence"),
+        ("forged-semantic-delta-digest", "semantic-delta-binding"),
+        ("forged-executor-step-id", "executor-trace-binding"),
+        ("forged-file-read-update-op-id", "executor-trace-binding"),
+        ("host-root-path-rebind", "file-artifact-binding"),
+        ("forged-program-hash", "source-binding"),
+        ("forged-graph-node-count", "source-binding"),
+        ("forged-summary-mode", "file-artifact-binding"),
+        ("missing-live-negative-evidence", "live-negative-evidence"),
+        (
+            "forged-live-negative-expected-error",
+            "live-negative-binding",
+        ),
+        ("forged-live-negative-target-kind", "live-negative-binding"),
+        (
+            "missing-fabricated-plan-negative-evidence",
+            "fabricated-plan-negative-evidence",
+        ),
+        (
+            "forged-fabricated-plan-negative-hash",
+            "fabricated-plan-negative-binding",
+        ),
+        (
+            "forged-fabricated-plan-negative-check",
+            "fabricated-plan-negative-binding",
+        ),
+        (
+            "forged-fabricated-plan-runtime-executed",
+            "fabricated-plan-negative-boundary",
+        ),
+        (
+            "fabricated-plan-extra-runtime-claim",
+            "fabricated-plan-negative-boundary",
+        ),
+        (
+            "fabricated-plan-duplicate-case",
+            "fabricated-plan-negative-binding",
+        ),
+    ]
+}
+
+fn bytes_file_read_report_negative_cases(
+    base: &serde_json::Value,
+) -> Vec<BytesFileReadReportNegativeCase> {
+    let mut cases = Vec::new();
+
+    let mut forged_summary_digest = base.clone();
+    forged_summary_digest["file_read_summary"]["sha256"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-summary-digest",
+        category: "file-artifact-binding",
+        report: forged_summary_digest,
+    });
+
+    let mut forged_update_digest = base.clone();
+    forged_update_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-update-digest",
+        category: "executor-value-binding",
+        report: forged_update_digest,
+    });
+
+    let mut forged_state_digest = base.clone();
+    forged_state_digest["state_summary"]["store.file_bytes"]["digest"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-state-digest",
+        category: "state-binding",
+        report: forged_state_digest,
+    });
+
+    let mut forged_len = base.clone();
+    forged_len["file_read_summary"]["byte_len"] = json!(175);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-byte-length",
+        category: "file-artifact-binding",
+        report: forged_len,
+    });
+
+    let mut forged_first_byte = base.clone();
+    forged_first_byte["file_read_summary"]["first_byte"] = json!(61);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-first-byte",
+        category: "file-artifact-binding",
+        report: forged_first_byte,
+    });
+
+    let mut forged_followup_len = base.clone();
+    forged_followup_len["state_summary"]["store.file_len"] = json!(175);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-followup-bytes-length",
+        category: "bytes-consumer-binding",
+        report: forged_followup_len,
+    });
+
+    let mut forged_followup_first = base.clone();
+    forged_followup_first["state_summary"]["store.first_byte"] = json!(61);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-followup-bytes-get",
+        category: "bytes-consumer-binding",
+        report: forged_followup_first,
+    });
+
+    let mut inline_payload_leak = base.clone();
+    inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
+        json!([60, 115, 118, 103]);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "public-inline-bytes-leak",
+        category: "payload-leak",
+        report: inline_payload_leak,
+    });
+
+    let mut expression_kind_downgrade = base.clone();
+    expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
+        json!("read_path");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "expression-kind-downgrade",
+        category: "typed-op-binding",
+        report: expression_kind_downgrade,
+    });
+
+    let mut path_escape = base.clone();
+    path_escape["file_read_summary"]["path"] =
+        json!("../todo_mvc_physical/assets/icons/checkbox_active.svg");
+    path_escape["file_read_summary"]["artifact_path"] =
+        json!("todo_mvc_physical/assets/icons/checkbox_active.svg");
+    path_escape["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]["path"] =
+        json!("../todo_mvc_physical/assets/icons/checkbox_active.svg");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "path-parent-escape",
+        category: "path-policy",
+        report: path_escape,
+    });
+
+    let mut missing_artifact = base.clone();
+    missing_artifact["file_read_summary"]["artifact_path"] =
+        json!("examples/todo_mvc_physical/assets/icons/missing.svg");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "missing-artifact",
+        category: "artifact-binding",
+        report: missing_artifact,
+    });
+
+    let mut missing_file_read_op = base.clone();
+    missing_file_read_op["plan_executor"]["per_step"][0]["updates"] = json!([]);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "missing-file-read-update",
+        category: "executor-shape",
+        report: missing_file_read_op,
+    });
+
+    let mut nonzero_fallback = base.clone();
+    nonzero_fallback["plan_executor"]["runtime_ast_eval_count"] = json!(1);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "nonzero-runtime-ast-eval",
+        category: "fallback-counter",
+        report: nonzero_fallback,
+    });
+
+    let mut forged_plan_hash = base.clone();
+    forged_plan_hash["plan_hash"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-plan-hash",
+        category: "plan-binding",
+        report: forged_plan_hash,
+    });
+
+    let mut missing_negative_evidence = base.clone();
+    if let Some(object) = missing_negative_evidence.as_object_mut() {
+        object.remove("negative_case_count");
+        object.remove("negative_cases");
+    }
+    if let Some(checks) = missing_negative_evidence
+        .get_mut("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        checks.retain(|check| {
+            !check
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("negative-"))
+        });
+    }
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "missing-negative-evidence",
+        category: "negative-evidence",
+        report: missing_negative_evidence,
+    });
+
+    let mut forged_semantic_delta = base.clone();
+    forged_semantic_delta["semantic_deltas"][0]["value"]["digest"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-semantic-delta-digest",
+        category: "semantic-delta-binding",
+        report: forged_semantic_delta,
+    });
+
+    let mut forged_executor_step_id = base.clone();
+    forged_executor_step_id["plan_executor"]["per_step"][0]["step_id"] = json!("wrong-step");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-executor-step-id",
+        category: "executor-trace-binding",
+        report: forged_executor_step_id,
+    });
+
+    let mut forged_file_read_update_op_id = base.clone();
+    forged_file_read_update_op_id["plan_executor"]["per_step"][0]["updates"][0]["update_op_id"] =
+        json!(999);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-file-read-update-op-id",
+        category: "executor-trace-binding",
+        report: forged_file_read_update_op_id,
+    });
+
+    let mut host_root_path_rebind = base.clone();
+    host_root_path_rebind["file_read_summary"]["host_root"] = json!("");
+    host_root_path_rebind["file_read_summary"]["path"] =
+        json!("examples/todo_mvc_physical/assets/icons/checkbox_active.svg");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "host-root-path-rebind",
+        category: "file-artifact-binding",
+        report: host_root_path_rebind,
+    });
+
+    let mut forged_program_hash = base.clone();
+    forged_program_hash["program_hash"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-program-hash",
+        category: "source-binding",
+        report: forged_program_hash,
+    });
+
+    let mut forged_graph_node_count = base.clone();
+    forged_graph_node_count["graph_node_count"] = json!(999);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-graph-node-count",
+        category: "source-binding",
+        report: forged_graph_node_count,
+    });
+
+    let mut forged_summary_mode = base.clone();
+    forged_summary_mode["file_read_summary"]["mode"] = json!("generic-proof");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-summary-mode",
+        category: "file-artifact-binding",
+        report: forged_summary_mode,
+    });
+
+    let mut missing_live_negative_evidence = base.clone();
+    if let Some(object) = missing_live_negative_evidence.as_object_mut() {
+        object.remove("live_negative_case_count");
+        object.remove("live_negative_cases");
+    }
+    if let Some(checks) = missing_live_negative_evidence
+        .get_mut("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        checks.retain(|check| {
+            !check
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("live-negative-"))
+        });
+    }
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "missing-live-negative-evidence",
+        category: "live-negative-evidence",
+        report: missing_live_negative_evidence,
+    });
+
+    let mut forged_live_negative_expected_error = base.clone();
+    forged_live_negative_expected_error["live_negative_cases"][0]["expected_error_contains"] =
+        json!("forged expected error");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-live-negative-expected-error",
+        category: "live-negative-binding",
+        report: forged_live_negative_expected_error,
+    });
+
+    let mut forged_live_negative_target_kind = base.clone();
+    if let Some(case) = forged_live_negative_target_kind
+        .get_mut("live_negative_cases")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|cases| {
+            cases.iter_mut().find(|case| {
+                case.get("target_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+        })
+    {
+        case["target_kind"] = json!("file");
+    }
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-live-negative-target-kind",
+        category: "live-negative-binding",
+        report: forged_live_negative_target_kind,
+    });
+
+    let mut missing_fabricated_plan_negative_evidence = base.clone();
+    if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
+        object.remove("fabricated_plan_negative_case_count");
+        object.remove("fabricated_plan_negative_cases");
+    }
+    if let Some(checks) = missing_fabricated_plan_negative_evidence
+        .get_mut("per_step_pass_fail")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        checks.retain(|check| {
+            !check
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
+        });
+    }
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "missing-fabricated-plan-negative-evidence",
+        category: "fabricated-plan-negative-evidence",
+        report: missing_fabricated_plan_negative_evidence,
+    });
+
+    let mut forged_fabricated_plan_negative_hash = base.clone();
+    forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-fabricated-plan-negative-hash",
+        category: "fabricated-plan-negative-binding",
+        report: forged_fabricated_plan_negative_hash,
+    });
+
+    let mut forged_fabricated_plan_negative_check = base.clone();
+    forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
+        json!(["capability-summary-derived-counts"]);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-fabricated-plan-negative-check",
+        category: "fabricated-plan-negative-binding",
+        report: forged_fabricated_plan_negative_check,
+    });
+
+    let mut forged_fabricated_plan_runtime_executed = base.clone();
+    forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
+        json!(true);
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "forged-fabricated-plan-runtime-executed",
+        category: "fabricated-plan-negative-boundary",
+        report: forged_fabricated_plan_runtime_executed,
+    });
+
+    let mut fabricated_plan_extra_runtime_claim = base.clone();
+    fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
+        json!(["load"]);
+    fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
+        json!({"executor": "fake-runtime-claim"});
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "fabricated-plan-extra-runtime-claim",
+        category: "fabricated-plan-negative-boundary",
+        report: fabricated_plan_extra_runtime_claim,
+    });
+
+    let mut fabricated_plan_duplicate_case = base.clone();
+    if let Some(cases_array) = fabricated_plan_duplicate_case
+        .get_mut("fabricated_plan_negative_cases")
+        .and_then(serde_json::Value::as_array_mut)
+        .cloned()
+    {
+        let mut duplicated = cases_array;
+        if let Some(first) = duplicated.first().cloned() {
+            duplicated.push(first);
+        }
+        fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
+    }
+    cases.push(BytesFileReadReportNegativeCase {
+        id: "fabricated-plan-duplicate-case",
+        category: "fabricated-plan-negative-binding",
+        report: fabricated_plan_duplicate_case,
+    });
+
+    cases
+}
+
+#[derive(Clone, Copy)]
+enum BytesFileReadFabricatedPlanMutation {
+    MissingPathOperand,
+    ExtraPathOperand,
+    RowFieldPathOpNotIndexed,
+    RowFieldPathInputMissing,
+    RowFieldPathForeignList,
+    MissingPathConstant,
+    NonTextPathConstant,
+    NonStaticParentPath,
+    MissingSourceInput,
+    ExtraSourceInput,
+    StateInputDeclared,
+    SourcePayloadInputDeclared,
+    UpdateConstantPresent,
+    SourcePayloadFieldPresent,
+    OutputNotBytes,
+}
+
+struct BytesFileReadFabricatedPlanCase {
+    id: &'static str,
+    category: &'static str,
+    mutation: BytesFileReadFabricatedPlanMutation,
+}
+
+struct BytesFileReadFabricatedPlanResult {
+    id: &'static str,
+    category: &'static str,
+    mutation: &'static str,
+    base_plan_hash: String,
+    mutated_plan_hash: String,
+    verification: boon_plan::PlanVerification,
+    expected_failed_check_ids: Vec<String>,
+    failed_check_ids: Vec<String>,
+    error_count: usize,
+    rejected: bool,
+}
+
+impl BytesFileReadFabricatedPlanResult {
+    fn report_json(&self) -> serde_json::Value {
+        json!({
+            "id": self.id,
+            "category": self.category,
+            "stage": "machine-plan-verifier",
+            "mutation": self.mutation,
+            "target_profile": "software_default",
+            "evidence_level": "verifier-only",
+            "runtime_executed": false,
+            "runtime_non_execution_reason": "fabricated MachinePlan is checked with boon_plan::verify_plan only",
+            "base_plan_hash": self.base_plan_hash,
+            "fabricated_plan_hash": self.mutated_plan_hash,
+            "mutated_plan_hash": self.mutated_plan_hash,
+            "expected_verification_status": "fail",
+            "actual_verification_status": self.verification.status,
+            "expected_failed_check_ids": self.expected_failed_check_ids,
+            "actual_failed_check_ids": self.failed_check_ids,
+            "failed_check_ids": self.failed_check_ids,
+            "error_count": self.error_count,
+            "boon_plan_verification": self.verification,
+            "rejected": self.rejected
+        })
+    }
+}
+
+fn bytes_file_read_fabricated_plan_negative_cases() -> Vec<BytesFileReadFabricatedPlanCase> {
+    use BytesFileReadFabricatedPlanMutation::*;
+    vec![
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-path-operand",
+            category: "operand-shape",
+            mutation: MissingPathOperand,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-extra-path-operand",
+            category: "operand-shape",
+            mutation: ExtraPathOperand,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-op-not-indexed",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathOpNotIndexed,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-input-missing",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathInputMissing,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-row-field-path-foreign-list",
+            category: "indexed-row-field-path",
+            mutation: RowFieldPathForeignList,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-path-constant",
+            category: "constant-binding",
+            mutation: MissingPathConstant,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-non-text-path-constant",
+            category: "constant-binding",
+            mutation: NonTextPathConstant,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-non-static-parent-path",
+            category: "path-policy",
+            mutation: NonStaticParentPath,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-missing-source-input",
+            category: "operand-shape",
+            mutation: MissingSourceInput,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-extra-source-input",
+            category: "operand-shape",
+            mutation: ExtraSourceInput,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-state-input-declared",
+            category: "operand-shape",
+            mutation: StateInputDeclared,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-source-payload-input-declared",
+            category: "operand-shape",
+            mutation: SourcePayloadInputDeclared,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-update-constant-present",
+            category: "operand-shape",
+            mutation: UpdateConstantPresent,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-source-payload-field-present",
+            category: "operand-shape",
+            mutation: SourcePayloadFieldPresent,
+        },
+        BytesFileReadFabricatedPlanCase {
+            id: "fabricated-output-not-bytes",
+            category: "type-policy",
+            mutation: OutputNotBytes,
+        },
+    ]
+}
+
+fn run_bytes_file_read_fabricated_plan_negative_case(
+    source_plan: &boon_plan::MachinePlan,
+    case: &BytesFileReadFabricatedPlanCase,
+) -> Result<BytesFileReadFabricatedPlanResult, Box<dyn std::error::Error>> {
+    let base_plan_hash = boon_plan::plan_sha256(source_plan)?;
+    let mut mutated_plan = source_plan.clone();
+    mutate_bytes_file_read_plan(&mut mutated_plan, case.mutation)?;
+    let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan)?;
+    let verification = boon_plan::verify_plan(&mutated_plan)?;
+    let failed_check_ids = verification
+        .checks
+        .iter()
+        .filter(|check| !check.pass)
+        .map(|check| check.id.clone())
+        .collect::<Vec<_>>();
+    let expected_failed_check_ids = failed_check_ids.clone();
+    let error_count = verification.error_count;
+    let rejected = verification.status == "fail"
+        && failed_check_ids
+            .iter()
+            .any(|id| id == "file-read-bytes-ops-well-formed");
+    Ok(BytesFileReadFabricatedPlanResult {
+        id: case.id,
+        category: case.category,
+        mutation: case.mutation.as_str(),
+        base_plan_hash,
+        mutated_plan_hash,
+        verification,
+        expected_failed_check_ids,
+        failed_check_ids,
+        error_count,
+        rejected,
+    })
+}
+
+impl BytesFileReadFabricatedPlanMutation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingPathOperand => "missing_path_operand",
+            Self::ExtraPathOperand => "extra_path_operand",
+            Self::RowFieldPathOpNotIndexed => "row_field_path_op_not_indexed",
+            Self::RowFieldPathInputMissing => "row_field_path_input_missing",
+            Self::RowFieldPathForeignList => "row_field_path_foreign_list",
+            Self::MissingPathConstant => "missing_path_constant",
+            Self::NonTextPathConstant => "non_text_path_constant",
+            Self::NonStaticParentPath => "non_static_parent_path",
+            Self::MissingSourceInput => "missing_source_input",
+            Self::ExtraSourceInput => "extra_source_input",
+            Self::StateInputDeclared => "state_input_declared",
+            Self::SourcePayloadInputDeclared => "source_payload_input_declared",
+            Self::UpdateConstantPresent => "update_constant_present",
+            Self::SourcePayloadFieldPresent => "source_payload_field_present",
+            Self::OutputNotBytes => "output_not_bytes",
+        }
+    }
+}
+
+fn mutate_bytes_file_read_plan(
+    plan: &mut boon_plan::MachinePlan,
+    mutation: BytesFileReadFabricatedPlanMutation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (region_index, op_index) = bytes_file_read_plan_op_location(plan)?;
+    let path_constant_id = bytes_file_read_path_constant_id(plan, region_index, op_index)?;
+    let output_state_id = bytes_file_read_output_state_id(plan, region_index, op_index)?;
+    let source_id = plan
+        .source_routes
+        .first()
+        .map(|route| route.source_id)
+        .ok_or("source plan has no source routes for fabricated FileReadBytes mutation")?;
+    match mutation {
+        BytesFileReadFabricatedPlanMutation::MissingPathOperand => {
+            bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+        }
+        BytesFileReadFabricatedPlanMutation::ExtraPathOperand => {
+            bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?
+                .push(boon_plan::ValueRef::Constant(path_constant_id));
+        }
+        BytesFileReadFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = false;
+            op.inputs.push(field_ref.clone());
+            *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? = vec![field_ref];
+        }
+        BytesFileReadFabricatedPlanMutation::RowFieldPathInputMissing => {
+            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            plan.regions[region_index].ops[op_index].indexed = true;
+            *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? = vec![field_ref];
+        }
+        BytesFileReadFabricatedPlanMutation::RowFieldPathForeignList => {
+            let path_field_id = install_foreign_row_field_path_scope(
+                plan,
+                output_state_id,
+                boon_plan::PlanValueType::Bytes { fixed_len: None },
+            )?;
+            let field_ref = boon_plan::ValueRef::Field(path_field_id);
+            let op = &mut plan.regions[region_index].ops[op_index];
+            op.indexed = true;
+            if !op.inputs.contains(&field_ref) {
+                op.inputs.push(field_ref.clone());
+            }
+            *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? = vec![field_ref];
+        }
+        BytesFileReadFabricatedPlanMutation::MissingPathConstant => {
+            *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+                vec![boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(
+                    999_999,
+                ))];
+        }
+        BytesFileReadFabricatedPlanMutation::NonTextPathConstant => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or("source plan missing FileReadBytes path constant")?;
+            constant.value = boon_plan::PlanConstantValue::Number { value: 7 };
+        }
+        BytesFileReadFabricatedPlanMutation::NonStaticParentPath => {
+            let constant = plan
+                .constants
+                .iter_mut()
+                .find(|constant| constant.id == path_constant_id)
+                .ok_or("source plan missing FileReadBytes path constant")?;
+            constant.value = boon_plan::PlanConstantValue::Text {
+                value: "../small.bin".to_owned(),
+            };
+        }
+        BytesFileReadFabricatedPlanMutation::MissingSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .retain(|input| !matches!(input, boon_plan::ValueRef::Source(_)));
+        }
+        BytesFileReadFabricatedPlanMutation::ExtraSourceInput => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                    source_id.0.saturating_add(999_999),
+                )));
+        }
+        BytesFileReadFabricatedPlanMutation::StateInputDeclared => {
+            plan.regions[region_index].ops[op_index]
+                .inputs
+                .push(boon_plan::ValueRef::State(output_state_id));
+        }
+        BytesFileReadFabricatedPlanMutation::SourcePayloadInputDeclared => {
+            plan.regions[region_index].ops[op_index].inputs.push(
+                boon_plan::ValueRef::SourcePayload {
+                    source_id,
+                    field: boon_ir::SourcePayloadField::Text,
+                },
+            );
+        }
+        BytesFileReadFabricatedPlanMutation::UpdateConstantPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                update_constant_id, ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *update_constant_id = Some(path_constant_id);
+            }
+        }
+        BytesFileReadFabricatedPlanMutation::SourcePayloadFieldPresent => {
+            if let boon_plan::PlanOpKind::UpdateBranch {
+                source_payload_field,
+                ..
+            } = &mut plan.regions[region_index].ops[op_index].kind
+            {
+                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+            }
+        }
+        BytesFileReadFabricatedPlanMutation::OutputNotBytes => {
+            let slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter_mut()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or("source plan missing FileReadBytes output storage slot")?;
+            slot.value_type = boon_plan::PlanValueType::Text;
+        }
+    }
+    Ok(())
+}
+
+fn bytes_file_read_plan_op_location(
+    plan: &boon_plan::MachinePlan,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    plan.regions
+        .iter()
+        .enumerate()
+        .find_map(|(region_index, region)| {
+            region
+                .ops
+                .iter()
+                .enumerate()
+                .find(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        boon_plan::PlanOpKind::UpdateBranch {
+                            expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+                            ..
+                        }
+                    )
+                })
+                .map(|(op_index, _)| (region_index, op_index))
+        })
+        .ok_or_else(|| "source plan has no FileReadBytes op".into())
+}
+
+fn bytes_file_read_path_constant_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<boon_plan::PlanConstantId, Box<dyn std::error::Error>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileReadBytes op is not an update branch".into());
+    };
+    let [boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
+        return Err("FileReadBytes op does not have one path constant input".into());
+    };
+    Ok(*path_constant_id)
+}
+
+fn bytes_file_read_output_state_id(
+    plan: &boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+    let Some(boon_plan::ValueRef::State(state_id)) =
+        plan.regions[region_index].ops[op_index].output.as_ref()
+    else {
+        return Err("FileReadBytes op does not have a state output".into());
+    };
+    Ok(*state_id)
+}
+
+fn bytes_file_read_ordered_inputs_mut(
+    plan: &mut boon_plan::MachinePlan,
+    region_index: usize,
+    op_index: usize,
+) -> Result<&mut Vec<boon_plan::ValueRef>, Box<dyn std::error::Error>> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
+        &mut plan.regions[region_index].ops[op_index].kind
+    else {
+        return Err("FileReadBytes op is not an update branch".into());
+    };
+    Ok(ordered_inputs)
+}
+
+struct BytesFileReadLiveNegativeCase {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    source: &'static str,
+    expected_error_contains: &'static str,
+    target_path: Option<&'static str>,
+    target_kind: Option<&'static str>,
+}
+
+struct BytesFileReadLiveNegativeResult {
+    id: &'static str,
+    category: &'static str,
+    stage: &'static str,
+    source_path: PathBuf,
+    source_sha256: String,
+    scenario_path: PathBuf,
+    scenario_sha256: String,
+    selected_step_ids: Vec<String>,
+    expected_error_contains: &'static str,
+    rejected: bool,
+    detail: String,
+    detail_sha256: String,
+    target_path: Option<PathBuf>,
+    target_kind: Option<&'static str>,
+}
+
+impl BytesFileReadLiveNegativeResult {
+    fn report_json(&self) -> serde_json::Value {
+        let mut value = json!({
+            "id": self.id,
+            "category": self.category,
+            "stage": self.stage,
+            "source_path": self.source_path.display().to_string(),
+            "source_sha256": self.source_sha256,
+            "scenario_path": self.scenario_path.display().to_string(),
+            "scenario_sha256": self.scenario_sha256,
+            "target_profile": "software_default",
+            "selected_step_ids": self.selected_step_ids,
+            "expected_error_contains": self.expected_error_contains,
+            "rejected": self.rejected,
+            "detail": self.detail,
+            "detail_sha256": self.detail_sha256
+        });
+        if let Some(target_path) = &self.target_path {
+            value["target_path"] = json!(target_path.display().to_string());
+        }
+        if let Some(target_kind) = self.target_kind {
+            value["target_kind"] = json!(target_kind);
+        }
+        value
+    }
+}
+
+fn prepare_bytes_file_read_live_negative_fixtures(
+    fixture_dir: &Path,
+    _blockers: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    fs::create_dir_all(fixture_dir)?;
+    let small_path = fixture_dir.join("small.bin");
+    fs::write(&small_path, b"abcd")?;
+    let too_long_path = fixture_dir.join("too-long.bin");
+    fs::write(&too_long_path, b"abcd")?;
+    fs::create_dir_all(fixture_dir.join("directory-target"))?;
+
+    let mut artifacts = vec![small_path, too_long_path];
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside_dir = fixture_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("target/generated"))
+            .join("bytes-file-read-live-negative-outside");
+        fs::create_dir_all(&outside_dir)?;
+        let outside_file = outside_dir.join("outside.bin");
+        fs::write(&outside_file, b"outside source root")?;
+        let outside_file = outside_file.canonicalize()?;
+        let link_path = fixture_dir.join("outside-link");
+        if link_path.exists() || link_path.symlink_metadata().is_ok() {
+            fs::remove_file(&link_path)?;
+        }
+        symlink(&outside_file, &link_path)?;
+        artifacts.push(outside_file);
+    }
+
+    #[cfg(not(unix))]
+    {
+        _blockers.push("live-negative-symlink-escape-unavailable-on-non-unix".to_owned());
+    }
+
+    Ok(artifacts)
+}
+
+fn bytes_file_read_live_negative_cases() -> Vec<BytesFileReadLiveNegativeCase> {
+    let mut cases = vec![
+        BytesFileReadLiveNegativeCase {
+            id: "source-empty-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_read_negative_source("BYTES {}", "TEXT { } |> File/read_bytes()"),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "source-absolute-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_read_negative_source(
+                "BYTES {}",
+                "TEXT { /tmp/boon-file-read-negative.bin } |> File/read_bytes()",
+            ),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "source-parent-directory-path",
+            category: "source-path-policy",
+            stage: "semantic-ir",
+            source: bytes_file_read_negative_source(
+                "BYTES {}",
+                "TEXT { ../small.bin } |> File/read_bytes()",
+            ),
+            expected_error_contains: "must be a non-empty relative path without parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-dynamic-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    load: SOURCE
+    path:
+        TEXT { ../small.bin } |> HOLD path { LATEST {} }
+    file_bytes:
+        BYTES {} |> HOLD file_bytes {
+            LATEST {
+                store.load |> THEN { store.path |> File/read_bytes() }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File bytes }))
+"#,
+            expected_error_contains: "may not contain parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-parent-path",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        path_state: row.path_state
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes negative }))
+"#,
+            expected_error_contains: "may not contain parent-directory segments",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-file",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        path_state: row.path_state
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes missing file negative }))
+"#,
+            expected_error_contains: "cannot read `missing.bin`",
+            target_path: Some("missing.bin"),
+            target_kind: Some("missing"),
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-fixed-output-length-mismatch",
+            category: "runtime-type-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]
+            [name: TEXT { beta }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        path_state: row.path_state
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes fixed mismatch negative }))
+"#,
+            expected_error_contains: "fixed length 1 does not match produced length 4",
+            target_path: Some("too-long.bin"),
+            target_kind: Some("file"),
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "typecheck-indexed-row-field-non-text-path",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: 7, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, path_state: 7, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        path_state: row.path_state
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes non-text path negative }))
+"#,
+            expected_error_contains: "File/read_bytes",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-missing-target-row",
+            category: "indexed-row-dispatch-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        path_state: row.path_state
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes missing target row negative }))
+"#,
+            expected_error_contains: "target key/generation 999/1 not found",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "typecheck-indexed-row-field-unknown-path-field",
+            category: "indexed-row-field-type-policy",
+            stage: "typecheck",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { row.missing_path |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes unknown path field negative }))
+"#,
+            expected_error_contains: "missing_path",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
+            category: "indexed-row-shape-policy",
+            stage: "plan-executor",
+            source: r#"
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
+            [name: TEXT { beta }, file_bytes: BYTES[4] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { row.path_state |> File/read_bytes() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes mixed row-shape negative }))
+"#,
+            expected_error_contains: "is not in the static schedule symbol table",
+            target_path: None,
+            target_kind: None,
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-missing-file",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_read_negative_source(
+                "BYTES {}",
+                "TEXT { missing.bin } |> File/read_bytes()",
+            ),
+            expected_error_contains: "cannot read `missing.bin`",
+            target_path: Some("missing.bin"),
+            target_kind: Some("missing"),
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-directory-target",
+            category: "runtime-path-policy",
+            stage: "plan-executor",
+            source: bytes_file_read_negative_source(
+                "BYTES {}",
+                "TEXT { directory-target } |> File/read_bytes()",
+            ),
+            expected_error_contains: "cannot read `directory-target`",
+            target_path: Some("directory-target"),
+            target_kind: Some("directory"),
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "runtime-fixed-output-length-mismatch",
+            category: "runtime-type-policy",
+            stage: "plan-executor",
+            source: bytes_file_read_negative_source(
+                "BYTES[1] {}",
+                "TEXT { too-long.bin } |> File/read_bytes()",
+            ),
+            expected_error_contains: "fixed length 1 does not match produced length 4",
+            target_path: Some("too-long.bin"),
+            target_kind: Some("file"),
+        },
+        BytesFileReadLiveNegativeCase {
+            id: "plan-wrong-output-type",
+            category: "typecheck-policy",
+            stage: "typecheck",
+            source: bytes_file_read_negative_source(
+                "TEXT { old }",
+                "TEXT { small.bin } |> File/read_bytes()",
+            ),
+            expected_error_contains: "`HOLD` update must match the held value type",
+            target_path: Some("small.bin"),
+            target_kind: Some("file"),
+        },
+    ];
+
+    #[cfg(unix)]
+    cases.push(BytesFileReadLiveNegativeCase {
+        id: "runtime-symlink-escape",
+        category: "runtime-path-policy",
+        stage: "plan-executor",
+        source: bytes_file_read_negative_source(
+            "BYTES {}",
+            "TEXT { outside-link } |> File/read_bytes()",
+        ),
+        expected_error_contains: "escapes source root",
+        target_path: Some("outside-link"),
+        target_kind: Some("symlink_escape"),
+    });
+
+    cases
+}
+
+fn bytes_file_read_negative_source(initial: &'static str, update: &'static str) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+store: [
+    load: SOURCE
+    file_bytes:
+        {initial} |> HOLD file_bytes {{
+            LATEST {{
+                store.load |> THEN {{ {update} }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ File bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn run_bytes_file_read_live_negative_case(
+    fixture_dir: &Path,
+    case: &BytesFileReadLiveNegativeCase,
+    artifact_paths: &mut Vec<PathBuf>,
+) -> Result<BytesFileReadLiveNegativeResult, Box<dyn std::error::Error>> {
+    let source_path = write_bytes_negative_fixture(fixture_dir, case.id, "bn", case.source)?;
+    let scenario_text = format!(
+        r#"
+name = "{}"
+source = "{}"
+
+[[step]]
+id = "load"
+expected_source_event = {}
+"#,
+        case.id,
+        source_path.display(),
+        bytes_file_read_live_negative_event(case.id)
+    );
+    let scenario_path = write_bytes_negative_fixture(fixture_dir, case.id, "scn", &scenario_text)?;
+    artifact_paths.push(source_path.clone());
+    artifact_paths.push(scenario_path.clone());
+    if case.target_kind == Some("file") {
+        if let Some(target_path) = case.target_path {
+            artifact_paths.push(fixture_dir.join(target_path));
+        }
+    }
+
+    let selected_step_ids = vec!["load".to_owned()];
+    let result = boon_runtime::run_plan_root_scalar_scenario(
+        &source_path,
+        &scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &selected_step_ids,
+        false,
+        None,
+    );
+    let detail = match result {
+        Ok(_) => "PlanExecutor accepted live negative File/read_bytes fixture".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    let rejected = detail.contains(case.expected_error_contains);
+    let source_sha256 = boon_runtime::sha256_file(&source_path)?;
+    let scenario_sha256 = boon_runtime::sha256_file(&scenario_path)?;
+    let detail_sha256 = boon_runtime::sha256_bytes(detail.as_bytes());
+    Ok(BytesFileReadLiveNegativeResult {
+        id: case.id,
+        category: case.category,
+        stage: case.stage,
+        source_path,
+        source_sha256,
+        scenario_path,
+        scenario_sha256,
+        selected_step_ids,
+        expected_error_contains: case.expected_error_contains,
+        rejected,
+        detail,
+        detail_sha256,
+        target_path: case.target_path.map(|path| fixture_dir.join(path)),
+        target_kind: case.target_kind,
+    })
+}
+
+fn bytes_file_read_live_negative_event(case_id: &str) -> String {
+    if matches!(
+        case_id,
+        "runtime-indexed-row-field-parent-path"
+            | "runtime-indexed-row-field-missing-file"
+            | "runtime-indexed-row-field-fixed-output-length-mismatch"
+            | "typecheck-indexed-row-field-non-text-path"
+            | "typecheck-indexed-row-field-unknown-path-field"
+            | "runtime-indexed-row-field-mixed-row-shape-missing-path"
+    ) {
+        "{ source = \"row.load\", target_key = 2, target_generation = 1 }".to_owned()
+    } else if case_id == "runtime-indexed-row-field-missing-target-row" {
+        "{ source = \"row.load\", target_key = 999, target_generation = 1 }".to_owned()
+    } else {
+        "{ source = \"store.load\" }".to_owned()
+    }
+}
+
+fn record_bytes_file_read_check(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: impl Into<String>,
+    pass: bool,
+    detail: impl Into<String>,
+) {
+    let id = id.into();
+    checks.push(json!({
+        "id": id,
+        "pass": pass,
+        "detail": detail.into()
+    }));
+    if !pass {
+        blockers.push(id);
+    }
+}
+
+fn json_contains_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key(key) || map.values().any(|value| json_contains_key(value, key))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| json_contains_key(value, key))
+        }
+        _ => false,
+    }
+}
+
+fn verify_bytes_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-negative.json"));
+    let fixture_dir = PathBuf::from("target/generated/bytes-negative-fixtures");
+    fs::create_dir_all(&fixture_dir)?;
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut case_results = Vec::new();
+    let mut artifact_paths = Vec::new();
+
+    let invalid_hex_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16uGG }\n";
+    let invalid_hex_path =
+        write_bytes_negative_fixture(&fixture_dir, "parser-invalid-hex", "bn", invalid_hex_source)?;
+    artifact_paths.push(invalid_hex_path.clone());
+    let invalid_hex_result =
+        boon_parser::parse_source(invalid_hex_path.display().to_string(), invalid_hex_source);
+    let invalid_hex_detail = invalid_hex_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted invalid hex byte literal".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-invalid-hex-byte",
+        "parser",
+        invalid_hex_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.contains("outside base 16")),
+        invalid_hex_detail,
+    );
+
+    let multiline_invalid_hex_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16uGG\n}\n";
+    let multiline_invalid_hex_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "parser-multiline-invalid-hex",
+        "bn",
+        multiline_invalid_hex_source,
+    )?;
+    artifact_paths.push(multiline_invalid_hex_path.clone());
+    let multiline_invalid_hex_result = boon_parser::parse_source(
+        multiline_invalid_hex_path.display().to_string(),
+        multiline_invalid_hex_source,
+    );
+    let multiline_invalid_hex_detail = multiline_invalid_hex_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted multiline invalid hex byte literal".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-multiline-invalid-hex-byte",
+        "parser",
+        multiline_invalid_hex_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.contains("outside base 16")),
+        multiline_invalid_hex_detail,
+    );
+
+    let overflow_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u100 }\n";
+    let overflow_path =
+        write_bytes_negative_fixture(&fixture_dir, "parser-byte-overflow", "bn", overflow_source)?;
+    artifact_paths.push(overflow_path.clone());
+    let overflow_result =
+        boon_parser::parse_source(overflow_path.display().to_string(), overflow_source);
+    let overflow_detail = overflow_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted byte literal >255".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-byte-overflow",
+        "parser",
+        overflow_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.contains("bytes must be 0..255")),
+        overflow_detail,
+    );
+
+    let bad_size_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[foo] {}\n";
+    let bad_size_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "parser-bad-size-expression",
+        "bn",
+        bad_size_source,
+    )?;
+    artifact_paths.push(bad_size_path.clone());
+    let bad_size_result =
+        boon_parser::parse_source(bad_size_path.display().to_string(), bad_size_source);
+    let bad_size_detail = bad_size_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted unsupported BYTES size expression".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-bad-size-expression",
+        "parser",
+        bad_size_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.contains("BYTES size must be `__`")),
+        bad_size_detail,
+    );
+
+    let missing_body_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[4]\n";
+    let missing_body_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "parser-missing-body",
+        "bn",
+        missing_body_source,
+    )?;
+    artifact_paths.push(missing_body_path.clone());
+    let missing_body_result =
+        boon_parser::parse_source(missing_body_path.display().to_string(), missing_body_source);
+    let missing_body_detail = missing_body_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted BYTES constructor without body".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-missing-body",
+        "parser",
+        missing_body_result.as_ref().err().is_some_and(|error| {
+            error
+                .message
+                .contains("BYTES constructor requires a `{ ... }` body")
+        }),
+        missing_body_detail,
+    );
+
+    let multiline_trailing_source =
+        "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16u00\n} trailing\n";
+    let multiline_trailing_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "parser-multiline-trailing-token",
+        "bn",
+        multiline_trailing_source,
+    )?;
+    artifact_paths.push(multiline_trailing_path.clone());
+    let multiline_trailing_result = boon_parser::parse_source(
+        multiline_trailing_path.display().to_string(),
+        multiline_trailing_source,
+    );
+    let multiline_trailing_detail = multiline_trailing_result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| "parser accepted multiline BYTES trailing token".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "parser-multiline-trailing-token",
+        "parser",
+        multiline_trailing_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| {
+                error
+                    .message
+                    .contains("BYTES constructor has unexpected trailing token `trailing`")
+            }),
+        multiline_trailing_detail,
+    );
+
+    let typecheck_source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+too_short: BYTES[2] { 16u01 }
+implicit_text: BYTES[__] { TEXT { hi } }
+bad_count: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 3, endian: Little)
+bad_endian: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Middle)
+bad_length_input: Bytes/length(input: TEXT { bad })
+missing_get_input: Bytes/get(index: 0)
+missing_set_index: bytes |> Bytes/set(value: 16u01)
+bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
+missing_decode_encoding: bytes |> Bytes/to_text
+bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
+missing_encode_encoding: TEXT { hi } |> Text/to_bytes
+unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
+document: []
+"#;
+    let typecheck_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "typecheck-bytes-errors",
+        "bn",
+        typecheck_source,
+    )?;
+    artifact_paths.push(typecheck_path.clone());
+    let parsed = boon_parser::parse_source(typecheck_path.display().to_string(), typecheck_source)?;
+    let typecheck_report = boon_typecheck::check(&parsed);
+    let typecheck_messages = typecheck_report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (id, needle) in [
+        (
+            "typecheck-fixed-size-mismatch",
+            "BYTES[2] contains 1 byte(s); fixed BYTES length must match exactly",
+        ),
+        (
+            "typecheck-implicit-text-rejected",
+            "use Text/to_bytes for explicit TEXT/BYTES conversion",
+        ),
+        (
+            "typecheck-invalid-numeric-byte-count",
+            "`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8",
+        ),
+        (
+            "typecheck-invalid-numeric-endian",
+            "`endian` must be `Little` or `Big`",
+        ),
+        (
+            "typecheck-bytes-call-input-type",
+            "`Bytes/length` argument `input` has incompatible type",
+        ),
+        (
+            "typecheck-missing-bytes-call-input",
+            "`Bytes/get` requires an input BYTES value",
+        ),
+        (
+            "typecheck-missing-bytes-required-arg",
+            "`Bytes/set` requires `index`",
+        ),
+        (
+            "typecheck-invalid-bytes-to-text-encoding",
+            "`encoding` must be `Utf8` or `Ascii`",
+        ),
+        (
+            "typecheck-missing-bytes-to-text-encoding",
+            "`Bytes/to_text` requires explicit `encoding: Utf8|Ascii`",
+        ),
+        (
+            "typecheck-invalid-text-to-bytes-encoding",
+            "`encoding` must be `Utf8` or `Ascii`",
+        ),
+        (
+            "typecheck-missing-text-to-bytes-encoding",
+            "`Text/to_bytes` requires explicit `encoding: Utf8|Ascii`",
+        ),
+        (
+            "typecheck-unknown-bytes-builtin-argument",
+            "`Bytes/find` does not accept argument `surprise`",
+        ),
+    ] {
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            id,
+            "typecheck",
+            typecheck_messages.contains(needle),
+            format!("typecheck diagnostic search for `{needle}`"),
+        );
+    }
+    let lower_result = boon_ir::lower(&parsed);
+    let lower_detail = lower_result
+        .as_ref()
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "IR lowering accepted typecheck-failing BYTES source".to_owned());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "ir-lowering-rejects-typecheck-failing-bytes-source",
+        "semantic-ir",
+        lower_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.to_string().contains("typecheck failed")),
+        lower_detail,
+    );
+
+    for plan_case in bytes_negative_plan_cases() {
+        let (pass, detail, paths, failure_kind, panic_free) =
+            run_bytes_negative_plan_case(&fixture_dir, &plan_case)?;
+        artifact_paths.extend(paths);
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            plan_case.id,
+            "plan-executor",
+            pass,
+            detail,
+        );
+        if let Some(case) = case_results.last_mut()
+            && case.get("id").and_then(serde_json::Value::as_str) == Some(plan_case.id)
+        {
+            case["failure_kind"] = json!(failure_kind);
+            case["panic_free"] = json!(panic_free);
+        }
+    }
+
+    let duplicate_indexed_source =
+        Path::new("examples/bytes_indexed_duplicate_update_conflict_plan_ops.bn");
+    let duplicate_indexed_scenario =
+        Path::new("examples/bytes_indexed_duplicate_update_conflict_plan_ops.scn");
+    artifact_paths.push(duplicate_indexed_source.to_path_buf());
+    artifact_paths.push(duplicate_indexed_scenario.to_path_buf());
+    let duplicate_indexed_result = boon_runtime::run_plan_root_scalar_scenario(
+        duplicate_indexed_source,
+        duplicate_indexed_scenario,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &["receive-beta-bytes".to_owned()],
+        false,
+        None,
+    );
+    let duplicate_indexed_error = match duplicate_indexed_result {
+        Ok(_) => "compiler accepted duplicate indexed update branches".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "plan-indexed-duplicate-update-branch-rejected",
+        "semantic-ir",
+        duplicate_indexed_error.contains("duplicate direct `LATEST` branch")
+            && duplicate_indexed_error.contains("receive.bytes"),
+        duplicate_indexed_error,
+    );
+
+    let named_bytes_scenario = r#"
+name = "named bytes payload rejected"
+source = "examples/bytes_source_payload_plan_ops.bn"
+
+[[step]]
+id = "receive-bytes"
+expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }
+"#;
+    let named_bytes_scenario_path = write_bytes_negative_fixture(
+        &fixture_dir,
+        "source-payload-named-bytes-scenario-key",
+        "scn",
+        named_bytes_scenario,
+    )?;
+    artifact_paths.push(named_bytes_scenario_path.clone());
+    let named_bytes_result = boon_runtime::run_plan_root_scalar_scenario(
+        Path::new("examples/bytes_source_payload_plan_ops.bn"),
+        &named_bytes_scenario_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        &["receive-bytes".to_owned()],
+        true,
+        None,
+    );
+    let named_bytes_error = match named_bytes_result {
+        Ok(_) => "PlanExecutor accepted named BYTES source payload key".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "source-payload-named-bytes-scenario-key",
+        "scenario",
+        named_bytes_error
+            .contains("named BYTES source payload key `blob_bytes_hex` is not supported in v1"),
+        named_bytes_error,
+    );
+
+    let mut named_direct_payload_bytes = BTreeMap::new();
+    named_direct_payload_bytes.insert("blob".to_owned(), vec![1, 254, 4]);
+    let named_direct_result = boon_runtime::run_plan_source_route(
+        Path::new("examples/bytes_source_payload_plan_ops.bn"),
+        boon_plan::TargetProfile::SoftwareDefault,
+        "store.receive",
+        "store.received",
+        LiveSourceEvent {
+            source: "store.receive".to_owned(),
+            payload_bytes: named_direct_payload_bytes,
+            ..Default::default()
+        },
+        false,
+        None,
+    );
+    let named_direct_error = match named_direct_result {
+        Ok(_) => "PlanExecutor accepted direct named BYTES source payload key".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "source-payload-named-bytes-direct-api-key",
+        "plan-source-route",
+        named_direct_error.contains("named BYTES source payload key `blob` is not supported in v1"),
+        named_direct_error,
+    );
+
+    for route_case in bytes_negative_source_payload_route_cases() {
+        let (pass, detail, paths) =
+            run_bytes_negative_source_payload_route_case(&fixture_dir, &route_case)?;
+        artifact_paths.extend(paths);
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            route_case.id,
+            "plan-source-route",
+            pass,
+            detail,
+        );
+    }
+
+    let positive_report_path = PathBuf::from("target/reports/bytes-plan/bytes-negative-base.json");
+    boon_runtime::run_plan_root_scalar_scenario(
+        Path::new("examples/bytes_set_plan_ops.bn"),
+        Path::new("examples/bytes_set_plan_ops.scn"),
+        boon_plan::TargetProfile::SoftwareDefault,
+        &["patch-bytes".to_owned(), "inspect-patched".to_owned()],
+        true,
+        Some(&positive_report_path),
+    )?;
+    verify_report_schema(&positive_report_path)?;
+    artifact_paths.push(positive_report_path.clone());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "bytes-positive-report-schema-valid",
+        "report-schema",
+        true,
+        format!(
+            "fresh BYTES positive report validated at {}",
+            positive_report_path.display()
+        ),
+    );
+    let positive_report = read_json(&positive_report_path)?;
+    for report_case in bytes_report_negative_cases(&positive_report) {
+        let negative_path = PathBuf::from(format!(
+            "target/reports/bytes-plan/_negative-bytes-{}.json",
+            report_case.id
+        ));
+        write_json(&negative_path, &report_case.report)?;
+        let rejected = schema_rejects(&negative_path)?;
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            report_case.id,
+            "report-schema",
+            rejected,
+            if rejected {
+                "schema rejected mutated BYTES report".to_owned()
+            } else {
+                "schema accepted mutated BYTES report".to_owned()
+            },
+        );
+    }
+
+    let source_payload_report_path =
+        PathBuf::from("target/reports/bytes-plan/bytes-negative-source-payload-route-base.json");
+    let mut payload_bytes = BTreeMap::new();
+    payload_bytes.insert("bytes".to_owned(), vec![1, 254, 4]);
+    run_plan_source_route(
+        Path::new("examples/bytes_source_payload_plan_ops.bn"),
+        boon_plan::TargetProfile::SoftwareDefault,
+        "store.receive",
+        "store.received",
+        LiveSourceEvent {
+            source: "store.receive".to_owned(),
+            payload_bytes,
+            ..Default::default()
+        },
+        true,
+        Some(&source_payload_report_path),
+    )?;
+    verify_report_schema(&source_payload_report_path)?;
+    artifact_paths.push(source_payload_report_path.clone());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "bytes-source-payload-positive-route-schema-valid",
+        "report-schema",
+        true,
+        format!(
+            "fresh BYTES source-payload route report validated at {}",
+            source_payload_report_path.display()
+        ),
+    );
+    let source_payload_report = read_json(&source_payload_report_path)?;
+    for report_case in bytes_source_payload_report_negative_cases(&source_payload_report) {
+        let negative_path = PathBuf::from(format!(
+            "target/reports/bytes-plan/_negative-bytes-source-payload-{}.json",
+            report_case.id
+        ));
+        write_json(&negative_path, &report_case.report)?;
+        let rejected = schema_rejects(&negative_path)?;
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            report_case.id,
+            "report-schema",
+            rejected,
+            if rejected {
+                "schema rejected mutated BYTES source-payload report".to_owned()
+            } else {
+                "schema accepted mutated BYTES source-payload report".to_owned()
+            },
+        );
+    }
+
+    let large_source_payload_report_path =
+        PathBuf::from("target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json");
+    let mut large_payload_bytes = BTreeMap::new();
+    large_payload_bytes.insert("bytes".to_owned(), vec![1; 1025]);
+    run_plan_source_route(
+        Path::new("examples/bytes_source_payload_plan_ops.bn"),
+        boon_plan::TargetProfile::SoftwareDefault,
+        "store.receive",
+        "store.received",
+        LiveSourceEvent {
+            source: "store.receive".to_owned(),
+            payload_bytes: large_payload_bytes,
+            ..Default::default()
+        },
+        true,
+        Some(&large_source_payload_report_path),
+    )?;
+    verify_report_schema(&large_source_payload_report_path)?;
+    artifact_paths.push(large_source_payload_report_path.clone());
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "bytes-source-payload-large-artifact-route-schema-valid",
+        "report-schema",
+        true,
+        format!(
+            "fresh large BYTES source-payload route report validated at {}",
+            large_source_payload_report_path.display()
+        ),
+    );
+    let large_source_payload_report = read_json(&large_source_payload_report_path)?;
+    for report_case in
+        bytes_large_source_payload_report_negative_cases(&large_source_payload_report)
+    {
+        let negative_path = PathBuf::from(format!(
+            "target/reports/bytes-plan/_negative-bytes-source-payload-{}.json",
+            report_case.id
+        ));
+        write_json(&negative_path, &report_case.report)?;
+        let rejected = schema_rejects(&negative_path)?;
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            report_case.id,
+            "report-schema",
+            rejected,
+            if rejected {
+                "schema rejected mutated large BYTES source-payload report".to_owned()
+            } else {
+                "schema accepted mutated large BYTES source-payload report".to_owned()
+            },
+        );
+    }
+
+    for aggregate_case in bytes_machine_plan_aggregate_tamper_cases() {
+        let (rejected, detail) = run_bytes_machine_plan_aggregate_tamper_case(&aggregate_case)?;
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            aggregate_case.id,
+            "aggregate-tamper",
+            rejected,
+            detail,
+        );
+    }
+
+    let hardware_unbounded_report = bytes_hardware_unbounded_bytes_negative_report();
+    let hardware_unbounded_path =
+        PathBuf::from("target/reports/bytes-plan/_negative-bytes-hardware-unbounded-bytes.json");
+    write_json(&hardware_unbounded_path, &hardware_unbounded_report)?;
+    let (hardware_unbounded_rejected, hardware_unbounded_detail) =
+        schema_rejection(&hardware_unbounded_path)?;
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "hardware-bounded-unbounded-bytes-rejected",
+        "report-schema",
+        hardware_unbounded_rejected
+            && hardware_unbounded_detail.contains("BYTES state has no fixed capacity"),
+        hardware_unbounded_detail,
+    );
+
+    let (fake_benchmark_rejected, fake_benchmark_detail) =
+        fake_benchmark_profile_rejection(&fixture_dir)?;
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "fake-benchmark-profile-rejected",
+        "report-schema",
+        fake_benchmark_rejected,
+        fake_benchmark_detail,
+    );
+
+    if !blockers.is_empty() {
+        return Err(format!("BYTES negative gate failed: {}", blockers.join(", ")).into());
+    }
+
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let command_argv = std::iter::once(json!("cargo"))
+        .chain(std::iter::once(json!("xtask")))
+        .chain(args.iter().map(|arg| json!(arg)))
+        .collect::<Vec<_>>();
+    let required_negative_cases = case_results
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let report_json = json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-bytes-negative",
+        "command_argv": command_argv,
+        "measurement_mode": "proof",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_hash": "n/a",
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "negative_case_count": case_results.len(),
+        "required_negative_cases": required_negative_cases,
+        "negative_cases": case_results,
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifact_sha256s
+    });
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_bytes_machine_plan_adversarial(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "verify-bytes-machine-plan-adversarial";
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from("target/reports/bytes-plan/bytes-machine-plan-adversarial.json")
+    });
+    let fixture_dir = PathBuf::from("target/generated/bytes-machine-plan-adversarial");
+    fs::create_dir_all(&fixture_dir)?;
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut case_results = Vec::new();
+    let mut artifact_paths = BTreeSet::new();
+
+    for aggregate_case in bytes_machine_plan_aggregate_tamper_cases() {
+        artifact_paths.insert(PathBuf::from(aggregate_case.child_path));
+        let (rejected, detail) = run_bytes_machine_plan_aggregate_tamper_case(&aggregate_case)?;
+        record_bytes_negative_case(
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+            aggregate_case.id,
+            "aggregate-tamper",
+            rejected,
+            detail,
+        );
+    }
+
+    let hardware_unbounded_report = bytes_hardware_unbounded_bytes_negative_report();
+    let hardware_unbounded_path = fixture_dir.join("hardware-bounded-unbounded-bytes.json");
+    write_json(&hardware_unbounded_path, &hardware_unbounded_report)?;
+    let (hardware_unbounded_rejected, hardware_unbounded_detail) =
+        schema_rejection(&hardware_unbounded_path)?;
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "hardware-bounded-unbounded-bytes-rejected",
+        "report-schema",
+        hardware_unbounded_rejected
+            && hardware_unbounded_detail.contains("BYTES state has no fixed capacity"),
+        hardware_unbounded_detail,
+    );
+
+    let benchmark_path = PathBuf::from("target/reports/bytes-plan/todomvc-release-benchmark.json");
+    if benchmark_path.exists() {
+        artifact_paths.insert(benchmark_path);
+    }
+    let (fake_benchmark_rejected, fake_benchmark_detail) =
+        fake_benchmark_profile_rejection(&fixture_dir)?;
+    record_bytes_negative_case(
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "fake-benchmark-profile-rejected",
+        "report-schema",
+        fake_benchmark_rejected,
+        fake_benchmark_detail,
+    );
+
+    let required_adversarial_cases = case_results
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let extra = json!({
+        "adversarial_scope": "bytes-machine-plan-aggregate-and-report-schema",
+        "adversarial_case_count": case_results.len(),
+        "required_adversarial_cases": required_adversarial_cases,
+        "adversarial_cases": case_results,
+        "artifact_sha256s": artifact_sha256s,
+    });
+    write_static_gate_report(args, COMMAND, report, checks, blockers, extra)
+}
+
+struct BytesNegativePlanCase {
+    id: &'static str,
+    source: &'static str,
+    expected_error: &'static str,
+}
+
+struct BytesNegativeSourcePayloadRouteCase {
+    id: &'static str,
+    source: &'static str,
+    source_route: &'static str,
+    target_state: &'static str,
+    payload_bytes: &'static [u8],
+    expected_error: &'static str,
+}
+
+struct BytesReportNegativeCase {
+    id: &'static str,
+    report: serde_json::Value,
+}
+
+struct BytesMachinePlanAggregateTamperCase {
+    id: &'static str,
+    child_path: &'static str,
+    mutation: BytesMachinePlanAggregateMutation,
+}
+
+enum BytesMachinePlanAggregateMutation {
+    RemoveChild,
+    StaleArtifactHash,
+    EditedSuccessFlag,
+    RuntimeAstEval,
+    ExecutableStringPath,
+    UnknownPlanOp,
+    StorageProfileIndexedPrivateBytesTamper,
+}
+
+fn bytes_machine_plan_aggregate_tamper_cases() -> Vec<BytesMachinePlanAggregateTamperCase> {
+    vec![
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-missing-child-report-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::RemoveChild,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-stale-child-artifact-hash-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::StaleArtifactHash,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-edited-child-success-flag-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::EditedSuccessFlag,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-runtime-ast-fallback-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::RuntimeAstEval,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-executable-string-path-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::ExecutableStringPath,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-unknown-plan-op-rejected",
+            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
+            mutation: BytesMachinePlanAggregateMutation::UnknownPlanOp,
+        },
+        BytesMachinePlanAggregateTamperCase {
+            id: "aggregate-storage-profile-indexed-private-bytes-tamper-rejected",
+            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
+            mutation: BytesMachinePlanAggregateMutation::StorageProfileIndexedPrivateBytesTamper,
+        },
+    ]
+}
+
+fn run_bytes_machine_plan_aggregate_tamper_case(
+    case: &BytesMachinePlanAggregateTamperCase,
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    let child_path = Path::new(case.child_path);
+    let original = fs::read(child_path)?;
+    let tamper_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        match case.mutation {
+            BytesMachinePlanAggregateMutation::RemoveChild => {
+                fs::remove_file(child_path)?;
+            }
+            BytesMachinePlanAggregateMutation::StaleArtifactHash => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                child["artifact_sha256s"][0]["sha256"] =
+                    json!("0000000000000000000000000000000000000000000000000000000000000000");
+                write_json(child_path, &child)?;
+            }
+            BytesMachinePlanAggregateMutation::EditedSuccessFlag => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                child["per_step_pass_fail"][0]["pass"] = json!(false);
+                write_json(child_path, &child)?;
+            }
+            BytesMachinePlanAggregateMutation::RuntimeAstEval => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                child["plan_executor"]["runtime_ast_eval_count"] = json!(1);
+                write_json(child_path, &child)?;
+            }
+            BytesMachinePlanAggregateMutation::ExecutableStringPath => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                child["plan_executor"]["executable_string_path_count"] = json!(1);
+                write_json(child_path, &child)?;
+            }
+            BytesMachinePlanAggregateMutation::UnknownPlanOp => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                child["plan_executor"]["unknown_plan_op_count"] = json!(1);
+                write_json(child_path, &child)?;
+            }
+            BytesMachinePlanAggregateMutation::StorageProfileIndexedPrivateBytesTamper => {
+                let mut child: serde_json::Value = serde_json::from_slice(&original)?;
+                let cases = child
+                    .pointer_mut("/bytes_storage_profile/cases")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or("storage-profile child report missing cases")?;
+                let case = cases
+                    .iter_mut()
+                    .find(|case| {
+                        case.get("id").and_then(serde_json::Value::as_str)
+                            == Some("indexed-file-read-row-field-path-no-copy")
+                    })
+                    .ok_or("storage-profile child report missing indexed file-read case")?;
+                let digest = case
+                    .pointer_mut(
+                        "/borrowed_read_evidence/inspect_updates/0/row_fields/file_bytes/digest",
+                    )
+                    .ok_or(
+                        "storage-profile indexed file-read case missing row_fields.file_bytes digest",
+                    )?;
+                *digest = json!("0000000000000000000000000000000000000000000000000000000000000000");
+                write_json(child_path, &child)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = tamper_result {
+        fs::write(child_path, &original)?;
+        return Err(error);
+    }
+
+    let report_path = PathBuf::from(format!(
+        "target/reports/bytes-plan/_negative-bytes-machine-plan-all-{}.json",
+        case.id
+    ));
+    let args = vec![
+        "verify-bytes-machine-plan-all".to_owned(),
+        "--check-existing".to_owned(),
+        "--report".to_owned(),
+        report_path.display().to_string(),
+    ];
+    let required = bytes_machine_plan_required_reports_without_adversarial();
+    let result = verify_bytes_machine_plan_all_with_required(&args, &required);
+    let detail = match &result {
+        Ok(()) => "aggregate accepted tampered child evidence".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    fs::write(child_path, &original)?;
+    let _ = fs::remove_file(report_path);
+    Ok((result.is_err(), detail))
+}
+
+fn bytes_machine_plan_required_reports_without_adversarial() -> Vec<BytesMachinePlanRequiredReport>
+{
+    bytes_machine_plan_required_reports()
+        .iter()
+        .copied()
+        .filter(|report| report.label != "bytes-machine-plan-adversarial")
+        .collect()
+}
+
+fn bytes_hardware_unbounded_bytes_negative_report() -> serde_json::Value {
+    let source = "examples/bytes_source_payload_plan_ops.bn";
+    let source_hash =
+        boon_runtime::sha256_file(Path::new(source)).unwrap_or_else(|_| "missing".to_owned());
+    json!({
+        "status": "pass",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "explain-hardware",
+        "command_argv": ["cargo", "run", "-p", "boon_cli", "--", "explain-hardware", source, "--target", "fpga_todomvc"],
+        "measurement_mode": "diagnostic",
+        "exit_status": 0,
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_path": source,
+        "source_hash": source_hash,
+        "scenario_hash": "n/a",
+        "program_hash": source_hash,
+        "budget_hash": "missing-budget",
+        "graph_node_count": 1,
+        "runtime_profile": "hardware_bounded",
+        "runtime_profile_detail": {
+            "name": "hardware_bounded",
+            "mode": "bounded_hardware",
+            "capacity_source": "negative fixture",
+            "unbounded_lists": [],
+            "unbounded_bytes": ["store.received"],
+            "overflow_behavior": "hard runtime error before capacity is exceeded",
+            "bounded_allocation_budget_applies_after_preparation": true
+        },
+        "capacities": {
+            "profile": "hardware_bounded",
+            "all_lists_bounded": true,
+            "lists": [],
+            "all_bytes_bounded": false,
+            "bytes": [{
+                "name": "store.received",
+                "scope": "root",
+                "fixed_len": null,
+                "effective_capacity": null,
+                "capacity_source": "dynamic BYTES",
+                "dynamic_growth_allowed": false,
+                "overflow_behavior": "not_hardware_bounded"
+            }]
+        },
+        "per_step_pass_fail": [{"id": "negative-fixture-shape", "pass": true}],
+        "artifact_sha256s": []
+    })
+}
+
+fn fake_benchmark_profile_rejection(
+    fixture_dir: &Path,
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    let benchmark_path = Path::new("target/reports/bytes-plan/todomvc-release-benchmark.json");
+    if !benchmark_path.exists() {
+        return Ok((
+            false,
+            format!(
+                "required benchmark report `{}` is missing",
+                benchmark_path.display()
+            ),
+        ));
+    }
+    let mut benchmark = read_json(benchmark_path)?;
+    benchmark["stress_profiles"] = json!([{
+        "name": "fake-profile",
+        "graph_node_count": 1,
+        "graph_clones_per_item": 0,
+        "heap_alloc_count": 0,
+        "heap_alloc_bytes": 0,
+        "dirty_key_count": 1,
+        "render_patch_count": 1
+    }]);
+    let fake_path = fixture_dir.join("fake-benchmark-profile.json");
+    write_json(&fake_path, &benchmark)?;
+    schema_rejection(&fake_path)
+}
+
+fn bytes_report_negative_cases(base: &serde_json::Value) -> Vec<BytesReportNegativeCase> {
+    let mut forged_update_digest = base.clone();
+    forged_update_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+
+    let mut inline_payload_leak = base.clone();
+    inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
+        json!([1, 2, 170, 4]);
+
+    let mut forged_update_constant = base.clone();
+    forged_update_constant["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]
+        ["value"] = json!(171);
+
+    let mut forged_state_byte_len = base.clone();
+    forged_state_byte_len["state_summary"]["store.patched"]["byte_len"] = json!(5);
+
+    vec![
+        BytesReportNegativeCase {
+            id: "forged-update-digest",
+            report: forged_update_digest,
+        },
+        BytesReportNegativeCase {
+            id: "public-inline-payload-leak",
+            report: inline_payload_leak,
+        },
+        BytesReportNegativeCase {
+            id: "forged-update-constant",
+            report: forged_update_constant,
+        },
+        BytesReportNegativeCase {
+            id: "forged-state-byte-len",
+            report: forged_state_byte_len,
+        },
+    ]
+}
+
+fn bytes_source_payload_report_negative_cases(
+    base: &serde_json::Value,
+) -> Vec<BytesReportNegativeCase> {
+    let mut missing_payload_bytes = base.clone();
+    if let Some(payload_bytes) = missing_payload_bytes
+        .get_mut("source_event")
+        .and_then(|event| event.get_mut("payload_bytes"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        payload_bytes.remove("bytes");
+    }
+
+    let mut forged_payload_digest = base.clone();
+    forged_payload_digest["source_event"]["payload_bytes"]["bytes"]["digest"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+
+    let mut forged_payload_len = base.clone();
+    forged_payload_len["source_event"]["payload_bytes"]["bytes"]["byte_len"] = json!(4);
+
+    let mut missing_inline_bytes = base.clone();
+    if let Some(bytes) = missing_inline_bytes
+        .get_mut("source_event")
+        .and_then(|event| event.get_mut("payload_bytes"))
+        .and_then(|payload| payload.get_mut("bytes"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        bytes.remove("inline_bytes");
+    }
+
+    let mut out_of_range_inline_byte = base.clone();
+    out_of_range_inline_byte["source_event"]["payload_bytes"]["bytes"]["inline_bytes"][1] =
+        json!(300);
+
+    let mut forged_route_surface_payload_field = base.clone();
+    forged_route_surface_payload_field["route_surface"]["source_payload_field"] = json!("Text");
+
+    let mut forged_executor_payload_field = base.clone();
+    forged_executor_payload_field["plan_executor"]["source_payload_field"] = json!("Text");
+
+    let mut forged_update_payload_field = base.clone();
+    forged_update_payload_field["plan_executor"]["per_step"][0]["updates"][0]["source_payload_field"] =
+        json!("Text");
+
+    vec![
+        BytesReportNegativeCase {
+            id: "source-payload-missing-bytes-artifact",
+            report: missing_payload_bytes,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-forged-digest",
+            report: forged_payload_digest,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-forged-byte-len",
+            report: forged_payload_len,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-missing-inline-bytes",
+            report: missing_inline_bytes,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-inline-byte-out-of-range",
+            report: out_of_range_inline_byte,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-forged-route-field",
+            report: forged_route_surface_payload_field,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-forged-executor-field",
+            report: forged_executor_payload_field,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-forged-update-field",
+            report: forged_update_payload_field,
+        },
+    ]
+}
+
+fn bytes_large_source_payload_report_negative_cases(
+    base: &serde_json::Value,
+) -> Vec<BytesReportNegativeCase> {
+    let mut missing_artifact_listing = base.clone();
+    missing_artifact_listing["artifact_sha256s"] = json!([]);
+
+    let mut forged_artifact_sha256 = base.clone();
+    forged_artifact_sha256["artifact_sha256s"][0]["sha256"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+
+    let mut inline_over_limit = base.clone();
+    let large_inline_bytes = std::iter::repeat_n(json!(1), 1025).collect::<Vec<_>>();
+    inline_over_limit["source_event"]["payload_bytes"]["bytes"] = json!({
+        "$boon_type": "BYTES",
+        "storage": "inline",
+        "digest": base["source_event"]["payload_bytes"]["bytes"]["digest"].clone(),
+        "byte_len": 1025,
+        "inline_byte_limit": 1024,
+        "inline_bytes": large_inline_bytes
+    });
+
+    let mut artifact_inline_leak = base.clone();
+    artifact_inline_leak["source_event"]["payload_bytes"]["bytes"]["inline_bytes"] = json!([1]);
+
+    vec![
+        BytesReportNegativeCase {
+            id: "source-payload-large-missing-artifact-listing",
+            report: missing_artifact_listing,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-large-forged-artifact-sha256",
+            report: forged_artifact_sha256,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-large-inline-over-limit",
+            report: inline_over_limit,
+        },
+        BytesReportNegativeCase {
+            id: "source-payload-large-artifact-inline-leak",
+            report: artifact_inline_leak,
+        },
+    ]
+}
+
+fn bytes_negative_plan_cases() -> Vec<BytesNegativePlanCase> {
+    vec![
+        BytesNegativePlanCase {
+            id: "plan-static-out-of-bounds-slice",
+            expected_error: "MachinePlan verification failed",
+            source: r#"
+payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    sliced:
+        BYTES[2] {} |> HOLD sliced {
+            LATEST {
+                store.trigger |> THEN { payload |> Bytes/slice(offset: 2, byte_count: 2) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-bytes-get-out-of-bounds",
+            expected_error: "index 4 is out of bounds",
+            source: r#"
+payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    byte:
+        16u00 |> HOLD byte {
+            LATEST {
+                store.trigger |> THEN { payload |> Bytes/get(index: 4) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-bytes-set-out-of-bounds",
+            expected_error: "MachinePlan verification failed",
+            source: r#"
+payload:
+    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    patched:
+        BYTES[3] {} |> HOLD patched {
+            LATEST {
+                store.trigger |> THEN { payload |> Bytes/set(index: 4, value: 16uAA) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-invalid-utf8-bytes-to-text",
+            expected_error: "not valid UTF-8",
+            source: r#"
+bad_payload:
+    BYTES[2] { 16uC3, 16u28 } |> HOLD bad_payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    decoded:
+        TEXT { old } |> HOLD decoded {
+            LATEST {
+                store.trigger |> THEN { bad_payload |> Bytes/to_text(encoding: Utf8) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-write-unsigned-overflow",
+            expected_error: "MachinePlan verification failed",
+            source: r#"
+payload:
+    BYTES[1] { 16u00 } |> HOLD payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    patched:
+        BYTES[1] {} |> HOLD patched {
+            LATEST {
+                store.trigger |> THEN { payload |> Bytes/write_unsigned(offset: 0, byte_count: 1, endian: Little, value: 256) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-read-unsigned-number-overflow",
+            expected_error: "overflows Boon NUMBER",
+            source: r#"
+payload:
+    BYTES[8] { 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF } |> HOLD payload { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    read:
+        0 |> HOLD read {
+            LATEST {
+                store.trigger |> THEN { payload |> Bytes/read_unsigned(offset: 0, byte_count: 8, endian: Big) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-bytes-source-payload-guard-rejected",
+            expected_error: "BYTES source payload guards are not supported in v1",
+            source: r#"
+store: [
+    trigger: SOURCE
+    receive: SOURCE
+    matched:
+        False |> HOLD matched {
+            LATEST {
+                store.receive.bytes |> WHEN {
+                    __ => True
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+        },
+        BytesNegativePlanCase {
+            id: "plan-row-initial-bool-rejects-source-payload-text",
+            expected_error: "expected: BOOL\nfound: TEXT",
+            source: r#"
+store: [
+    trigger: SOURCE
+    rows:
+        LIST {
+            [flag: False]
+            [flag: True]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        edit: SOURCE
+        flag:
+            row.flag |> HOLD flag {
+                LATEST {
+                    edit.text |> THEN { edit.text }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Row initial }))
+"#,
+        },
+    ]
+}
+
+fn bytes_negative_source_payload_route_cases() -> Vec<BytesNegativeSourcePayloadRouteCase> {
+    vec![
+        BytesNegativeSourcePayloadRouteCase {
+            id: "source-payload-bytes-to-text-output",
+            source_route: "store.receive",
+            target_state: "store.received",
+            payload_bytes: &[1, 254, 4],
+            expected_error: "`HOLD` update must match the held value type",
+            source: r#"
+store: [
+    receive: SOURCE
+    received:
+        TEXT { old } |> HOLD received {
+            LATEST {
+                store.receive.bytes |> THEN { store.receive.bytes }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))
+"#,
+        },
+        BytesNegativeSourcePayloadRouteCase {
+            id: "source-payload-fixed-length-mismatch",
+            source_route: "store.receive",
+            target_state: "store.received",
+            payload_bytes: &[1, 254, 4],
+            expected_error: "BYTES payload has byte_len 3 but output fixed_len 2",
+            source: r#"
+store: [
+    receive: SOURCE
+    received:
+        BYTES[2] {} |> HOLD received {
+            LATEST {
+                store.receive.bytes |> THEN { store.receive.bytes }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))
+"#,
+        },
+    ]
+}
+
+fn run_bytes_negative_plan_case(
+    fixture_dir: &Path,
+    case: &BytesNegativePlanCase,
+) -> Result<(bool, String, Vec<PathBuf>, &'static str, bool), Box<dyn std::error::Error>> {
+    let source_path = write_bytes_negative_fixture(fixture_dir, case.id, "bn", case.source)?;
+    let scenario_text = format!(
+        r#"
+name = "{}"
+source = "{}"
+
+[[step]]
+id = "trigger"
+expected_source_event = {{ source = "store.trigger" }}
+"#,
+        case.id,
+        source_path.display()
+    );
+    let scenario_path = write_bytes_negative_fixture(fixture_dir, case.id, "scn", &scenario_text)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        boon_runtime::run_plan_root_scalar_scenario(
+            &source_path,
+            &scenario_path,
+            boon_plan::TargetProfile::SoftwareDefault,
+            &["trigger".to_owned()],
+            true,
+            None,
+        )
+    }));
+    let (error, failure_kind, panic_free) = match result {
+        Ok(Ok(_)) => (
+            "PlanExecutor accepted negative BYTES fixture".to_owned(),
+            "accepted",
+            true,
+        ),
+        Ok(Err(error)) => (error.to_string(), "structured_error", true),
+        Err(payload) => (
+            format!(
+                "PlanExecutor panicked while rejecting negative BYTES fixture: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+            "panic",
+            false,
+        ),
+    };
+    Ok((
+        panic_free && error.contains(case.expected_error),
+        error,
+        vec![source_path, scenario_path],
+        failure_kind,
+        panic_free,
+    ))
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+}
+
+fn run_bytes_negative_source_payload_route_case(
+    fixture_dir: &Path,
+    case: &BytesNegativeSourcePayloadRouteCase,
+) -> Result<(bool, String, Vec<PathBuf>), Box<dyn std::error::Error>> {
+    let source_path = write_bytes_negative_fixture(fixture_dir, case.id, "bn", case.source)?;
+    let mut payload_bytes = BTreeMap::new();
+    payload_bytes.insert("bytes".to_owned(), case.payload_bytes.to_vec());
+    let result = boon_runtime::run_plan_source_route(
+        &source_path,
+        boon_plan::TargetProfile::SoftwareDefault,
+        case.source_route,
+        case.target_state,
+        LiveSourceEvent {
+            source: case.source_route.to_owned(),
+            payload_bytes,
+            ..Default::default()
+        },
+        false,
+        None,
+    );
+    let error = match result {
+        Ok(_) => "PlanExecutor accepted negative BYTES source-payload route fixture".to_owned(),
+        Err(error) => error.to_string(),
+    };
+    Ok((
+        error.contains(case.expected_error),
+        error,
+        vec![source_path],
+    ))
+}
+
+fn write_bytes_negative_fixture(
+    fixture_dir: &Path,
+    name: &str,
+    extension: &str,
+    text: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = fixture_dir.join(format!("{name}.{extension}"));
+    fs::write(&path, text)?;
+    Ok(path)
+}
+
+fn record_bytes_negative_case(
+    checks: &mut Vec<serde_json::Value>,
+    case_results: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: &str,
+    category: &str,
+    pass: bool,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    checks.push(json!({
+        "id": id,
+        "pass": pass,
+        "detail": detail
+    }));
+    case_results.push(json!({
+        "id": id,
+        "category": category,
+        "rejected": pass,
+        "detail": detail
+    }));
+    if !pass {
+        blockers.push(id.to_owned());
+    }
 }
 
 fn verify_negative_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -34492,9 +43612,18 @@ fn enrich_negative_fixture(name: &str, case: &str, report: &mut serde_json::Valu
 }
 
 fn schema_rejects(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let rejected = verify_report_schema(path).is_err();
+    schema_rejection(path).map(|(rejected, _)| rejected)
+}
+
+fn schema_rejection(path: &Path) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    let result = verify_report_schema(path);
+    let rejected = result.is_err();
+    let detail = match result {
+        Ok(()) => "schema accepted report".to_owned(),
+        Err(error) => error.to_string(),
+    };
     let _ = std::fs::remove_file(path);
-    Ok(rejected)
+    Ok((rejected, detail))
 }
 
 fn current_unix_seconds() -> u64 {
@@ -34504,7 +43633,13 @@ fn current_unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
+fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() > 1 {
+        for path in &args[1..] {
+            verify_report_schema(Path::new(path))?;
+        }
+        return Ok(());
+    }
     let dir = Path::new("target/reports");
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
@@ -34512,6 +43647,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
     let mut checked = 0usize;
     let mut seen = 0usize;
     let mut debug_failures = 0usize;
+    let mut diagnostic_failures = 0usize;
     let mut manual_templates = 0usize;
     let mut debug_dumps = 0usize;
     let mut app_window_loop_reports = 0usize;
@@ -34543,6 +43679,9 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
                 verify_report_schema(&path)?;
             }
             debug_failures += 1;
+        } else if status == "fail" && report_command_is(&report, "dump-plan") {
+            verify_report_schema(&path)?;
+            diagnostic_failures += 1;
         } else if status == "needs_manual" && path.starts_with(dir.join("manual-templates")) {
             manual_templates += 1;
         } else if is_debug_dump_report(&path, &report, dir) {
@@ -34576,6 +43715,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
             {"id": "report-json-files-seen-recursively", "pass": true, "count": seen},
             {"id": "schema-valid-pass-reports-checked", "pass": true, "count": checked},
             {"id": "debug-failure-artifacts-accounted", "pass": true, "count": debug_failures},
+            {"id": "diagnostic-failure-artifacts-accounted", "pass": true, "count": diagnostic_failures},
             {"id": "manual-template-artifacts-accounted", "pass": true, "count": manual_templates},
             {"id": "debug-dump-artifacts-accounted", "pass": true, "count": debug_dumps},
             {"id": "app-window-loop-artifacts-accounted", "pass": true, "count": app_window_loop_reports}
@@ -34633,6 +43773,10 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-linux-human-like-all"
         )
     )
+}
+
+fn report_command_is(report: &serde_json::Value, expected: &str) -> bool {
+    report.get("command").and_then(serde_json::Value::as_str) == Some(expected)
 }
 
 fn schema_summary_should_hash_report(
@@ -35430,6 +44574,13 @@ fn value_arg(args: &[String], flag: &str) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
+fn values_arg(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+        .collect()
+}
+
 fn report_path(name: &str, layer: VerificationLayer) -> PathBuf {
     PathBuf::from(format!("target/reports/{name}-{}.json", layer.as_str()))
 }
@@ -35481,6 +44632,24 @@ fn current_binary_hash() -> String {
                 .unwrap_or_else(|| "unknown".to_owned())
         })
         .clone()
+}
+
+fn current_binary_path() -> String {
+    static CURRENT_BINARY_PATH: OnceLock<String> = OnceLock::new();
+    CURRENT_BINARY_PATH
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        })
+        .clone()
+}
+
+fn replayable_xtask_argv(args: &[String]) -> Vec<String> {
+    std::iter::once(current_binary_path())
+        .chain(args.iter().cloned())
+        .collect()
 }
 
 fn artifact_hash(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

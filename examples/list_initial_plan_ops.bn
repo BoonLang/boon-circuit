@@ -1,0 +1,12 @@
+store: [
+    refresh: SOURCE
+    ready:
+        True |> HOLD ready { LATEST {} }
+    rows:
+        LIST {
+            [name: TEXT { alpha }, completed: False]
+            [name: TEXT { beta }, completed: True]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { List initial plan ops }))

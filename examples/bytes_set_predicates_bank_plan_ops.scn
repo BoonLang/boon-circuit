@@ -1,0 +1,10 @@
+name = "bytes set predicates bank plan ops"
+source = "examples/bytes_set_predicates_bank_plan_ops.bn"
+
+[[step]]
+id = "patch-bytes"
+expected_source_event = { source = "store.patch" }
+
+[[step]]
+id = "inspect-predicates"
+expected_source_event = { source = "store.inspect" }

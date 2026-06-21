@@ -555,8 +555,8 @@ FUNCTION new_todo_title_text_input() {
         style: [
             width: Fill
             height: Fill
-            padding: [column: 16, left: 6, right: 16]
-            text_inset: 6
+            padding: [column: 16, left: Theme/spacing(of: NewTodoInputInset), right: 16]
+            text_inset: Theme/spacing(of: NewTodoInputInset)
             font: Theme/font(of: Input)
             size: Theme/font(of: Input).size
             weight: Theme/font(of: Input).weight

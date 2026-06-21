@@ -46545,7 +46545,7 @@ label:
             .iter()
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
-                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && (item.bounds.width - 45.0).abs() <= 1.0
                     && item.bounds.x <= toggle_all_text.bounds.x + 0.5
                     && item.bounds.y <= input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
@@ -46555,7 +46555,7 @@ label:
         assert!(
             !layout.display_list.iter().any(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
-                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && (item.bounds.width - 45.0).abs() <= 1.0
                     && item.bounds.y <= input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
                         >= input.bounds.y + input.bounds.height - 0.5
@@ -46821,8 +46821,8 @@ label:
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
                     && item.bounds.width >= 480.0
-                    && item.bounds.y >= 150.0
-                    && item.bounds.y <= 152.0
+                    && item.bounds.y >= 129.0
+                    && item.bounds.y <= 131.0
             })
             .expect("document TodoMVC new input should render");
         let physical_input = physical_layout
@@ -46836,7 +46836,7 @@ label:
             .iter()
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
-                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && (item.bounds.width - 45.0).abs() <= 1.0
                     && item.bounds.x <= physical_toggle_all_text.bounds.x + 0.5
                     && item.bounds.y <= physical_input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
@@ -46846,7 +46846,7 @@ label:
         assert!(
             !physical_layout.display_list.iter().any(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
-                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && (item.bounds.width - 45.0).abs() <= 1.0
                     && item.bounds.y <= physical_input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
                         >= physical_input.bounds.y + physical_input.bounds.height - 0.5
@@ -46872,7 +46872,7 @@ label:
         assert_close(
             "new-todo input x",
             physical_input.bounds.x,
-            reference_panel_left + 54.0,
+            reference_panel_left + 45.0,
             1.5,
         );
         assert_close(
@@ -47424,9 +47424,10 @@ label:
                                 >= input.bounds.y + input.bounds.height - 0.5
                     })
                     .unwrap_or_else(|| panic!("{context} toggle-all chevron button should render"));
+                let expected_toggle_width = if theme == "Classic" { 45.0 } else { 60.0 };
                 assert!(
-                    (toggle_all.bounds.width - 54.0).abs() <= 1.0,
-                    "{context} toggle-all should use the shared TodoMVC control width: {:?}",
+                    (toggle_all.bounds.width - expected_toggle_width).abs() <= 1.0,
+                    "{context} toggle-all should use the theme TodoMVC control width {expected_toggle_width}: {:?}",
                     toggle_all.bounds
                 );
                 assert!(
@@ -53484,8 +53485,8 @@ label:
         );
         assert_eq!(
             new_todo_input.style.get("text_inset"),
-            Some(&boon_document_model::StyleValue::Number(6.0)),
-            "new-todo input should keep the old TodoMVC left text padding"
+            Some(&boon_document_model::StyleValue::Number(15.0)),
+            "new-todo input should keep the reference TodoMVC text gutter after the 45px toggle control"
         );
         let new_todo_text_left = new_todo_input.bounds.x
             + style_number_from_map(&new_todo_input.style, "text_inset")
@@ -54102,7 +54103,7 @@ label:
             .expect("empty TodoMVC should keep the new-todo input");
         assert_eq!(
             new_todo_input.style.get("text_inset"),
-            Some(&boon_document_model::StyleValue::Number(51.0)),
+            Some(&boon_document_model::StyleValue::Number(60.0)),
             "empty TodoMVC should keep the reference left text gutter even without the toggle-all chevron"
         );
         for absent_text in [

@@ -404,7 +404,7 @@ FUNCTION geometry() {
 FUNCTION sizing(of) {
     of |> WHEN {
         TouchTarget => 40
-        ToggleControl => 54
+        ToggleControl => 45
         IconContainer => 34
         EditingInputWidth => 405
     }
@@ -418,7 +418,8 @@ FUNCTION spacing(of) {
         Standard => 9
         IconOffset => 18
         Section => 61
-        TitlePanelGap => 21
+        TitlePanelGap => 0
+        NewTodoInputInset => 15
     }
 }
 

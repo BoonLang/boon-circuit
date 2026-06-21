@@ -1770,14 +1770,19 @@ fn normalized_quarter_turn(value: Option<f32>) -> u32 {
 }
 
 fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> RenderTextAlign {
-    match style_text(style, "align").unwrap_or("") {
-        "left" => RenderTextAlign::Left,
-        "right" => RenderTextAlign::Right,
-        "center" => RenderTextAlign::Center,
-        _ if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) => {
-            RenderTextAlign::Center
-        }
-        _ => RenderTextAlign::Left,
+    let align = style_text(style, "text_align")
+        .or_else(|| style_text(style, "align"))
+        .unwrap_or("");
+    if align.eq_ignore_ascii_case("left") {
+        RenderTextAlign::Left
+    } else if align.eq_ignore_ascii_case("right") {
+        RenderTextAlign::Right
+    } else if align.eq_ignore_ascii_case("center") {
+        RenderTextAlign::Center
+    } else if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) {
+        RenderTextAlign::Center
+    } else {
+        RenderTextAlign::Left
     }
 }
 
@@ -3050,6 +3055,34 @@ mod tests {
         assert_eq!(runs[0].size, 12.0);
         assert_eq!(runs[0].color, [136, 153, 170, 255]);
         assert_eq!(runs[0].vertical_align, RenderTextVerticalAlign::Center);
+    }
+
+    #[test]
+    fn render_text_runs_honor_public_text_align_style() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "text_align".to_owned(),
+            StyleValue::Text("Center".to_owned()),
+        );
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("title".to_owned()),
+            kind: DocumentNodeKind::Stack,
+            bounds: Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 200.0,
+                height: 60.0,
+            },
+            style,
+            text: Some("todos".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let mut columns = ApproximateTextColumnMeasurer;
+        let runs = render_text_runs(&frame, 320, 200, &mut columns);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].align, RenderTextAlign::Center);
     }
 
     #[test]

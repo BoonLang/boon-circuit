@@ -42,7 +42,7 @@ FUNCTION geometry() {
 FUNCTION sizing(of) {
     of |> WHEN {
         TouchTarget => 40
-        ToggleControl => 54
+        ToggleControl => get(from: Sizing, of: of)
         IconContainer => 34
         EditingInputWidth => 405
         __ => get(from: Sizing, of: of)
@@ -51,7 +51,8 @@ FUNCTION sizing(of) {
 
 FUNCTION spacing(of) {
     of |> WHEN {
-        TitlePanelGap => 21
+        TitlePanelGap => get(from: Spacing, of: of)
+        NewTodoInputInset => get(from: Spacing, of: of)
         Section => 61
         SwitcherBottomPush => 260
         __ => get(from: Spacing, of: of)

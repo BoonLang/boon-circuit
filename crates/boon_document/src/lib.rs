@@ -1802,6 +1802,7 @@ fn style_key_affects_font(key: &str) -> bool {
         || key == "font_style"
         || key == "line_height"
         || key == "letter_spacing"
+        || key == "text_align"
 }
 
 fn style_key_affects_pseudo_state(key: &str) -> bool {

@@ -421,6 +421,8 @@ FUNCTION spacing(of) {
         Standard => 10
         IconOffset => 18
         Section => 65
+        TitlePanelGap => 21
+        NewTodoInputInset => 6
     }
 }
 

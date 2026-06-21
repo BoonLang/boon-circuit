@@ -97,7 +97,7 @@ store: [
         active_count == 0 |> Bool/and(completed_count > 0)
 
     new_todo_focused:
-        True |> HOLD state {
+        False |> HOLD state {
             LATEST {
                 sources.new_todo_input.events.focus |> THEN { True }
                 sources.new_todo_input.events.blur |> THEN { False }
@@ -219,7 +219,6 @@ FUNCTION todo_app() {
         ]
         items: LIST {
             todo_header()
-            todo_title_gap()
             todo_panel()
             todo_gap()
             todo_info()
@@ -232,7 +231,7 @@ FUNCTION todo_title_gap() {
         element: []
         style: [
             width: 550
-            height: 21
+            height: 0
             paint: False
             background: [color: Oklch[lightness:0.97]]
         ]
@@ -267,6 +266,8 @@ FUNCTION todo_header() {
                 color: Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]
                 weight: ExtraLight
             ]
+            line_height: 130
+            text_align: Center
             vertical_align: Center
         ]
         child: TEXT { todos }
@@ -306,7 +307,7 @@ FUNCTION todo_new_entry() {
             padding: 0
             gap: 0
             background: [color: Oklch[lightness:1]]
-            border: [color: Oklch[lightness:0.66,chroma:0.11,hue:20,alpha:0.45]]
+            border: [color: Oklch[lightness:0.93]]
             border_width: 1
             outline:
                 PASSED.store.new_todo_focused |> WHILE {
@@ -318,7 +319,7 @@ FUNCTION todo_new_entry() {
             Element/button(
                 element: [events: PASSED.store.sources.toggle_all_checkbox.events]
                 style: [
-                    width: 54
+                    width: 45
                     height: 65
                     background: [color: Oklch[lightness:1,alpha:0]]
                     cursor: Pointer
@@ -354,8 +355,8 @@ FUNCTION todo_new_entry() {
                     line_height: 33.6
                     text_inset:
                         PASSED.store.has_todos |> WHILE {
-                            True => 6
-                            False => 51
+                            True => 15
+                            False => 60
                         }
                     text_clip_padding: 16
                     placeholder_color: Oklch[lightness:0.68]

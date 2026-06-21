@@ -14713,6 +14713,151 @@ Open findings:
 - Runtime production hardening, runtime finality, and machine-readiness reports
   are still missing.
 
+## Phase 9/10 Readiness Refresh and Native TodoMVC Parity Detour
+
+Recorded at: `2026-06-21T21:39:57+02:00`
+
+Status: partial readiness progress. Current BYTES/MachinePlan aggregate evidence
+was refreshed for committed `d6eb154`, runtime production hardening and
+runtime finality pass for that commit, and the previous native TodoMVC preview
+E2E timeout was resolved with a longer run. The full goal remains incomplete:
+the current dirty worktree makes the aggregate stale again, machine-readiness
+still fails on native TodoMVC reference parity, TASK-0804A remains postponed,
+and Phase 10 default execution has not switched.
+
+Base/current commit:
+
+- Base at start of slice: `d6eb154`.
+- Current HEAD while recording: `d6eb154`.
+- Worktree after this slice is intentionally dirty because the native TodoMVC
+  source/renderer fixes are not committed in this goal continuation.
+
+Files changed:
+
+- `crates/boon_document/src/render_scene.rs`
+  - `render_text_runs` now honors the public `text_align` style key before the
+    older internal `align` key and parses the value case-insensitively.
+  - Added `render_text_runs_honor_public_text_align_style`.
+- `crates/boon_document/src/lib.rs`
+  - `text_align` now participates in font/style identity classification.
+- `examples/todomvc.bn`
+  - Aligned the initial TodoMVC reference geometry with the native reference:
+    removed the title-panel spacer from the active item list, made the
+    toggle-all hit area `45`, adjusted the input text inset to keep the text
+    gutter aligned, centered the title text, neutralized the unfocused new-row
+    border, and changed initial `new_todo_focused` from `True` to `False`.
+- `examples/todo_mvc_physical/**`
+  - Made the physical theme wrapper delegate `ToggleControl` and
+    `TitlePanelGap` to active theme values.
+  - Added `NewTodoInputInset` spacing values so Classic can use the same
+    45px/15px reference gutter while non-Classic themes retain their existing
+    60px/6px geometry.
+- `crates/boon_native_playground/src/main.rs`
+  - Updated focused TodoMVC geometry tests to the reference 45px Classic
+    toggle control and theme-specific physical widths.
+
+Decisions:
+
+- The previous native preview E2E timeout was not treated as proof of a render
+  failure. A single longer `900s` rerun produced
+  `target/reports/native-gpu/preview-e2e-todomvc.json` with `status=pass`.
+- The failing reference parity was not worked around by weakening the verifier.
+  The actual causes found were stale source geometry and a renderer bug where
+  `text_align: Center` was ignored for stack/container text runs.
+- The remaining native reference-parity failure is now narrow: all structural,
+  chevron, title-bounds, mean/p95/high-diff pixel checks pass; only the largest
+  connected high-diff region remains above the strict threshold.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+  - Note: this is current for committed `d6eb154`, but stale for the dirty
+    worktree after this slice's source/renderer edits.
+- `target/reports/runtime-production-hardening.json`
+  - `status=pass`
+- `target/reports/runtime-finality.json`
+  - `status=pass`
+- `target/reports/native-gpu/preview-e2e-todomvc.json`
+  - `status=pass`
+  - The log still records a nested layout-proof binary-hash warning where the
+    child artifact reports `running:/.../boon_native_playground`; the final E2E
+    wrapper report itself passes and binds `git_commit=d6eb154`.
+- `target/reports/native-gpu/todomvc-two-window-content.json`
+  - `status=pass`
+- `target/reports/native-gpu/todomvc-reference-parity.json`
+  - `status=fail`
+  - Remaining blocker:
+    `native TodoMVC framebuffer does not contain the expected title/panel/text pixel regions`
+  - Current remaining pixel miss: `no large connected mismatch regions`
+  - `normalized_crop_high_diff_ratio=0.026589795918367347`
+    versus max `0.028`
+  - `normalized_crop_mean_abs_diff=5.382708163265306`
+    versus max `6.0`
+  - `normalized_crop_p95_abs_diff=28.0`
+    versus max `30.0`
+  - `normalized_crop_largest_mismatch_region_ratio=0.002551020408163265`
+    versus max `0.002`
+  - Visual artifacts:
+    `target/reports/native-gpu/todomvc-native-normalized-crop.png`,
+    `target/reports/native-gpu/todomvc-reference-normalized-crop.png`,
+    `target/reports/native-gpu/todomvc-reference-diff-heatmap.png`
+
+Subagent review:
+
+- Subagent `019eeb67-7a3c-7fa3-b30b-3a8d68612c7a` (`Laplace the 4th`) performed
+  a read-only native-readiness audit.
+- Findings used:
+  - The prior `verify-native-gpu-preview-e2e --example todomvc` run consumed
+    most of a `360s` timeout in build/startup and never wrote the final report.
+  - No native verifier/playground process was left running.
+  - Smallest next step was a single longer `900s` rerun before treating the
+    native child as a hard failure.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Fresh readiness report initially showed stale aggregate/runtime/schema reports and machine-readiness failure. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask --quiet` | Pass | Rebuilt `xtask`; existing native GPU dead-code warnings were emitted. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-runtime-production-hardening --report target/reports/runtime-production-hardening.json` | Pass | Runtime hardening report regenerated for `d6eb154`. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-runtime-finality --report target/reports/runtime-finality.json` | Pass | Runtime finality report regenerated for `d6eb154`. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 bash -lc '<replay 46 stale aggregate child command_argv entries>'` | Pass | Replayed stale child reports from their saved `command_argv`. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Rerun last so embedded child artifact hashes were fresh. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Aggregate passed for committed `d6eb154`. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/runtime-production-hardening.json target/reports/runtime-finality.json` | Pass | Targeted schema validation for refreshed aggregate/runtime reports. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json` | Pass | Longer rerun resolved previous timeout and wrote final passing E2E report. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-two-window-content --report target/reports/native-gpu/todomvc-two-window-content.json` | Pass | Required machine-readiness child passed. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-todomvc-reference-parity --report target/reports/native-gpu/todomvc-reference-parity.json` | Fail | Initially failed structural regions, pixel regions, and chevron contract. After fixes it fails only the largest connected mismatch region pixel check. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/boon_cli dump-ir examples/todomvc.bn` | Pass | Rechecked document TodoMVC after source geometry/focus edits. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/boon_cli dump-ir examples/todo_mvc_physical/RUN.bn` | Pass | Rechecked physical TodoMVC after theme token edits. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Formatting check after code/source edits. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_document render_text_runs_honor_public_text_align_style -- --nocapture --test-threads=1` | Pass | Regression test for public `text_align`. |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_native_playground physical_todomvc_classic_matches_document_todomvc_visual_zones -- --nocapture --test-threads=1` | Pass | Classic physical/document geometry remains aligned after 45px/15px gutter change. |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_native_playground todomvc_empty_state_keeps_only_new_todo_row_inside_white_panel -- --nocapture --test-threads=1` | Pass | Empty-state no-toggle gutter now expects 60px. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/native-gpu/preview-e2e-todomvc.json target/reports/native-gpu/todomvc-reference-parity.json target/reports/bytes-plan/bytes-machine-plan-all.json` | Expected Fail | Fails because `todomvc-reference-parity.json` honestly has `status=fail`; this is not a schema crash. |
+
+Open findings:
+
+- Machine readiness is still not satisfied. The next focused native slice should
+  investigate the remaining connected mismatch region in the app-owned
+  TodoMVC crop instead of continuing BYTES aggregate refresh work.
+- Because `examples/todomvc.bn`, physical TodoMVC sources, and document render
+  code changed after the aggregate refresh, the BYTES/MachinePlan aggregate
+  must be refreshed again before any readiness/finality claim.
+- `target/reports/native-gpu/todomvc-input-parity.json`,
+  current `target/reports/playground-genericity.json`, and a fresh
+  `target/reports/debug/machine-readiness.json` were not regenerated after the
+  reference-parity failure stopped the child chain.
+- TASK-0804A Cells release benchmark evidence remains postponed.
+- Phase 10 default switch remains not started.
+
 ## Phase 3/9 Dump-Plan Resolved Constant Report Contract
 
 Recorded at: `2026-06-21T13:23:42+02:00`

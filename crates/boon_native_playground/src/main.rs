@@ -20829,6 +20829,13 @@ fn inherit_canonical_text_style(
     let Some(parent_node) = frame.nodes.get(parent) else {
         return;
     };
+    let child_font_size = style_number_from_map(&node.style, "size");
+    let parent_font_size = style_number_from_map(&parent_node.style, "size");
+    let child_changes_font_size = match (child_font_size, parent_font_size) {
+        (Some(child), Some(parent)) => (child - parent).abs() > f32::EPSILON,
+        (Some(_), None) => true,
+        _ => false,
+    };
     for key in [
         "font",
         "font_style",
@@ -20838,6 +20845,9 @@ fn inherit_canonical_text_style(
         "color",
         "line_height",
     ] {
+        if key == "line_height" && child_changes_font_size {
+            continue;
+        }
         if !node.style.contains_key(key)
             && let Some(value) = parent_node.style.get(key)
         {
@@ -53245,6 +53255,11 @@ label:
             Some(&boon_document_model::StyleValue::Bool(true)),
             "completed todo titles should stay struck through"
         );
+        assert!(
+            !completed_todo_title.style.contains_key("line_height"),
+            "completed todo labels set their own 24px font size and should not inherit the app body's 19.6px line height: {:?}",
+            completed_todo_title.style
+        );
         let panel = layout
             .display_list
             .iter()
@@ -53260,8 +53275,8 @@ label:
         );
         let title_panel_gap = panel.bounds.y - (title.bounds.y + title.bounds.height);
         assert!(
-            (20.0..=22.0).contains(&title_panel_gap),
-            "TodoMVC title should have a deliberate visual spacer before the white panel: gap={title_panel_gap}, title={:?}, panel={:?}",
+            title_panel_gap.abs() <= 1.0,
+            "TodoMVC title should sit directly above the white panel in the reference layout: gap={title_panel_gap}, title={:?}, panel={:?}",
             title.bounds,
             panel.bounds
         );
@@ -53376,8 +53391,8 @@ label:
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
                     && item.bounds.width >= 480.0
-                    && item.bounds.y >= 150.0
-                    && item.bounds.y <= 152.0
+                    && item.bounds.y >= 129.0
+                    && item.bounds.y <= 131.0
             })
             .expect("new TodoMVC text input should render even while unfocused");
         assert_eq!(

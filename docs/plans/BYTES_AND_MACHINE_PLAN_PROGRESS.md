@@ -14858,6 +14858,71 @@ Open findings:
 - TASK-0804A Cells release benchmark evidence remains postponed.
 - Phase 10 default switch remains not started.
 
+Follow-up recorded at: `2026-06-21T23:58:00+02:00`
+
+Status: native TodoMVC parity remains incomplete; this detour is intentionally
+not considered a BYTES/MachinePlan phase exit.
+
+Additional findings:
+
+- Independent read-only subagent `019eebb4-7ecf-7db0-8265-d7786481e66e`
+  confirmed that the dominant connected diff region was the completed todo
+  title/strikethrough band (`Finish TodoMVC renderer`) and that the lowered
+  item had incorrectly inherited the app/body `line_height: 19.6` while also
+  declaring `size: 24`.
+- Local component scans confirmed the same region. Before the follow-up fix the
+  largest high-diff component was around
+  `normalized_crop_largest_mismatch_region_ratio=0.002551020408163265`
+  against the `0.002` budget.
+- The native document lowering now avoids inheriting an absolute parent
+  `line_height` when a child explicitly changes `size` and does not specify its
+  own `line_height`.
+- The broad TodoMVC lowering test still contained stale geometry assumptions
+  from before the reference-aligned source changes. It now expects the title to
+  sit directly above the panel and finds the new-todo input at the current
+  reference y-coordinate.
+
+Rejected experiments:
+
+- Changing the generic renderer fallback line-height from `1.25 * font_size` to
+  `1.2 * font_size` was tested and reverted. It did not improve the accepted
+  connected-region metric; the largest connected region increased to
+  `0.002653061224489796`.
+- Restoring initial `new_todo_focused=True` was tested and reverted. It made
+  the native crop draw a red input focus outline that the current title-pixel
+  detector counted as red title pixels, causing `large centered red title pixel
+  bounds` to fail.
+
+Commands run in the follow-up:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_native_playground todomvc_layout_uses_generic_visual_contracts -- --nocapture --test-threads=1` | Fail, then Pass | First failures were stale test expectations for title-panel gap and input y-coordinate; passed after aligning the assertions with the current reference geometry and adding the no-stale-line-height assertion. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_document render_text_runs_honor_public_text_align_style -- --nocapture --test-threads=1` | Pass | Rechecked prior document renderer text-align regression test. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Formatting after follow-up edits. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_native_playground --quiet` | Pass | Focused compile; existing native GPU dead-code warnings only. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask --quiet` | Pass | Rebuilt `xtask` before native verifier reruns. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json` | Pass | Passed during follow-up runs; the nested layout-proof binary-hash warning remained. The latest report became stale for the current worktree after reverting the failed fallback-line-height experiment. |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-todomvc-reference-parity --report target/reports/native-gpu/todomvc-reference-parity.json` | Fail | Still failed `no large connected mismatch regions`; the report from the failed fallback-line-height experiment showed `normalized_crop_largest_mismatch_region_ratio=0.002653061224489796`, high-diff ratio `0.025544897959183674`, mean abs diff `5.2065551020408165`, and p95 `27.0`. That report is stale for the current worktree after reverting the fallback experiment. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/boon_cli dump-ir examples/todomvc.bn` | Pass | Rechecked TodoMVC source while testing/reverting focus-state changes. |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_native_gpu strikethrough_uses_the_same_vertical_center_as_text -- --nocapture --test-threads=1` | Pass | Rechecked native strikethrough placement helper while testing/reverting fallback line-height. |
+
+Open follow-up findings:
+
+- The line-height inheritance fix is a real generic lowering fix, but it does
+  not complete native TodoMVC reference parity by itself.
+- The native reference-parity report currently on disk is stale for the current
+  worktree because the failed fallback-line-height experiment was reverted after
+  the last comparator run.
+- The reference artifact and verifier appear to disagree around the focused
+  new-todo input outline: drawing the focus outline makes red title detection
+  fail, while not drawing it leaves a visible reference/native input-outline
+  mismatch. This should be handled in a future native verifier/reference
+  contract slice, not as a BYTES/MachinePlan default-switch blocker workaround.
+- Because native parity remains incomplete, the next BYTES/MachinePlan work
+  should not claim machine-readiness. It may proceed on independent unfinished
+  BYTES/MachinePlan slices with this native detour recorded as unresolved.
+
 ## Phase 3/9 Dump-Plan Resolved Constant Report Contract
 
 Recorded at: `2026-06-21T13:23:42+02:00`

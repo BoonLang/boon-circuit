@@ -40,6 +40,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-bytes-release-benchmark-reproduction",
     "verify-build-bytes-boundary",
     "verify-bytes-machine-plan-all",
+    "audit-goal-readiness",
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
@@ -147,6 +148,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "verify-build-bytes-boundary" => verify_build_bytes_boundary(&args),
         "verify-bytes-machine-plan-all" => verify_bytes_machine_plan_all(&args),
+        "audit-goal-readiness" => audit_goal_readiness(&args),
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(&args),
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
@@ -1735,7 +1737,6 @@ fn legacy_ply_cosmic_testing_command(command: &str) -> bool {
             | "verify-playground-split-wayland"
             | "verify-playground-custom-source"
             | "write-manual-handoff"
-            | "audit-goal-readiness"
             | "audit-manual-readiness"
             | "verify-todomvc-ply-headless"
             | "verify-todomvc-headed-ply"
@@ -6023,6 +6024,313 @@ fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "readiness_contract": "combined runtime production plus native TodoMVC parity gates",
             "required_reports": linked,
             "human_testing_required_after_machine_pass": true
+        }),
+    )
+}
+
+fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "audit-goal-readiness";
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/goal-readiness.json"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut linked_reports = Vec::new();
+    let mut phase_lines = Vec::new();
+
+    let implementation_plan = Path::new("docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md");
+    let progress_ledger = Path::new("docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md");
+    let bytes_semantics = Path::new("docs/architecture/BYTES_SEMANTICS.md");
+    for (id, path) in [
+        ("implementation-plan-present", implementation_plan),
+        ("progress-ledger-present", progress_ledger),
+        ("bytes-semantics-present", bytes_semantics),
+    ] {
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("goal-readiness:{id}"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing required goal artifact `{}`", path.display())),
+        );
+        if exists {
+            linked_reports.push(artifact_hash(path)?);
+        }
+    }
+
+    let progress_text = fs::read_to_string(progress_ledger).unwrap_or_default();
+    let mut in_phase_table = false;
+    let mut partial_phases = Vec::new();
+    let mut not_started_phases = Vec::new();
+    for line in progress_text.lines() {
+        if line.trim() == "## Phase Status" {
+            in_phase_table = true;
+            continue;
+        }
+        if in_phase_table && line.starts_with("## ") {
+            break;
+        }
+        if !in_phase_table || !line.starts_with("| Phase ") {
+            continue;
+        }
+        phase_lines.push(line.to_owned());
+        if line.contains("| Partial |") {
+            partial_phases.push(line.to_owned());
+        }
+        if line.contains("| Not started |") {
+            not_started_phases.push(line.to_owned());
+        }
+    }
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:phase-status-table-present",
+        !phase_lines.is_empty(),
+        format!("phase_status_line_count={}", phase_lines.len()),
+        phase_lines
+            .is_empty()
+            .then(|| "progress ledger has no Phase Status table".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:no-partial-phases",
+        partial_phases.is_empty(),
+        format!("partial_phase_count={}", partial_phases.len()),
+        (!partial_phases.is_empty()).then(|| {
+            format!(
+                "{} phases are still partial in the progress ledger",
+                partial_phases.len()
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:no-not-started-phases",
+        not_started_phases.is_empty(),
+        format!("not_started_phase_count={}", not_started_phases.len()),
+        (!not_started_phases.is_empty()).then(|| {
+            format!(
+                "{} phases are still not started in the progress ledger",
+                not_started_phases.len()
+            )
+        }),
+    );
+
+    let aggregate_path = Path::new("target/reports/bytes-plan/bytes-machine-plan-all.json");
+    let aggregate_exists = aggregate_path.exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:aggregate-present",
+        aggregate_exists,
+        aggregate_path.display().to_string(),
+        (!aggregate_exists).then(|| {
+            format!(
+                "missing BYTES/MachinePlan aggregate report `{}`",
+                aggregate_path.display()
+            )
+        }),
+    );
+    if aggregate_exists {
+        linked_reports.push(artifact_hash(aggregate_path)?);
+        let aggregate = read_json(aggregate_path)?;
+        let aggregate_pass = aggregate.get("status").and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && aggregate
+                .get("aggregate_checks_pass")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:aggregate-pass",
+            aggregate_pass,
+            format!(
+                "status={:?} aggregate_checks_pass={:?}",
+                aggregate.get("status"),
+                aggregate.get("aggregate_checks_pass")
+            ),
+            (!aggregate_pass).then(|| "BYTES/MachinePlan aggregate is not passing".to_owned()),
+        );
+        let aggregate_fresh_commit = aggregate
+            .get("git_commit")
+            .and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:aggregate-git-fresh",
+            aggregate_fresh_commit,
+            format!(
+                "aggregate_git_commit={:?} current_git_commit={}",
+                aggregate.get("git_commit"),
+                git_commit()
+            ),
+            (!aggregate_fresh_commit)
+                .then(|| "BYTES/MachinePlan aggregate is stale for current HEAD".to_owned()),
+        );
+        let aggregate_fresh_worktree = aggregate
+            .get("worktree_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            == Some(worktree_fingerprint().as_str());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:aggregate-worktree-fresh",
+            aggregate_fresh_worktree,
+            format!(
+                "aggregate_worktree_fingerprint={:?} current_worktree_fingerprint={}",
+                aggregate.get("worktree_fingerprint"),
+                worktree_fingerprint()
+            ),
+            (!aggregate_fresh_worktree).then(|| {
+                "BYTES/MachinePlan aggregate is stale for current worktree fingerprint".to_owned()
+            }),
+        );
+        let no_fallback_count = aggregate
+            .get("no_fallback_plan_executor_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:no-fallback-planexecutor-evidence",
+            no_fallback_count >= 33,
+            format!("no_fallback_plan_executor_count={no_fallback_count}"),
+            (no_fallback_count < 33)
+                .then(|| "aggregate has insufficient no-fallback PlanExecutor evidence".to_owned()),
+        );
+    }
+
+    let cells_benchmark_path = Path::new("target/reports/bytes-plan/cells-release-benchmark.json");
+    let cells_benchmark_exists = cells_benchmark_path.exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:cells-release-benchmark-present",
+        cells_benchmark_exists,
+        cells_benchmark_path.display().to_string(),
+        (!cells_benchmark_exists).then(|| {
+            "Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets".to_owned()
+        }),
+    );
+    if cells_benchmark_exists {
+        linked_reports.push(artifact_hash(cells_benchmark_path)?);
+        let cells_benchmark = read_json(cells_benchmark_path)?;
+        let pass = cells_benchmark
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:cells-release-benchmark-pass",
+            pass,
+            format!("status={:?}", cells_benchmark.get("status")),
+            (!pass).then(|| "Cells release benchmark wrapper report is not passing".to_owned()),
+        );
+    }
+
+    for (label, path) in [
+        (
+            "runtime-production-hardening",
+            Path::new("target/reports/runtime-production-hardening.json"),
+        ),
+        (
+            "runtime-finality",
+            Path::new("target/reports/runtime-finality.json"),
+        ),
+        (
+            "machine-readiness",
+            Path::new("target/reports/debug/machine-readiness.json"),
+        ),
+        ("report-schema", Path::new("target/reports/schema.json")),
+    ] {
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("goal-readiness:{label}:present"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing required readiness report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+        linked_reports.push(artifact_hash(path)?);
+        let child = read_json(path)?;
+        let pass = child.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("goal-readiness:{label}:pass"),
+            pass,
+            format!("{} status={:?}", path.display(), child.get("status")),
+            (!pass).then(|| {
+                format!(
+                    "required readiness report `{}` did not pass",
+                    path.display()
+                )
+            }),
+        );
+        let fresh = child.get("git_commit").and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("goal-readiness:{label}:git-fresh"),
+            fresh,
+            format!(
+                "{} git_commit={:?} current_git_commit={}",
+                path.display(),
+                child.get("git_commit"),
+                git_commit()
+            ),
+            (!fresh).then(|| {
+                format!(
+                    "required readiness report `{}` is stale for current HEAD",
+                    path.display()
+                )
+            }),
+        );
+    }
+
+    let default_engine_source = fs::read_to_string("crates/boon_cli/src/main.rs")?;
+    let default_engine_is_plan =
+        default_engine_source.contains("let mut engine = \"plan\".to_owned()");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:default-engine-plan",
+        default_engine_is_plan,
+        "boon_cli run default engine must switch only at Phase 10",
+        (!default_engine_is_plan).then(|| {
+            "Phase 10 default switch has not happened; boon_cli run still defaults to legacy"
+                .to_owned()
+        }),
+    );
+
+    write_static_gate_report(
+        args,
+        COMMAND,
+        report,
+        checks,
+        blockers,
+        json!({
+            "readiness_contract": "BYTES language/runtime and typed MachinePlan goal final readiness",
+            "progress_ledger": progress_ledger.display().to_string(),
+            "implementation_plan": implementation_plan.display().to_string(),
+            "phase_status_lines": phase_lines,
+            "partial_phases": partial_phases,
+            "not_started_phases": not_started_phases,
+            "required_reports": linked_reports,
+            "default_switch_required_for_pass": true,
+            "cells_release_benchmark_required_for_pass": true,
+            "human_or_native_visible_evidence_claimed": false
         }),
     )
 }
@@ -43731,7 +44039,8 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
     matches!(
         report.get("command").and_then(serde_json::Value::as_str),
         Some(
-            "verify-platform-contract"
+            "audit-goal-readiness"
+                | "verify-platform-contract"
                 | "boon-native-playground-role"
                 | "verify-native-gpu-dependency-graph"
                 | "verify-native-gpu-architecture"

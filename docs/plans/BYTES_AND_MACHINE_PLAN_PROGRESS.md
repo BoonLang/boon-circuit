@@ -48,7 +48,7 @@ MachinePlan migration.
 | `cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn` | Pass | Raw log: `target/reports/bytes-plan/logs/08-cargo-run--p-boon-cli----run-examples-todomvc-bn---scenario-examples-todomvc-scn.log`. |
 | `cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn` | Fail | Raw log: `target/reports/bytes-plan/logs/09-cargo-run--p-boon-cli----run-examples-cells-bn---scenario-examples-cells-scn.log`; `commit-c0-formula-bar-sum-through-a3` expected `["C0"]`, got `[]`. |
 | `cargo xtask verify-report-schema` | Fail | Raw log: `target/reports/bytes-plan/logs/10-cargo-xtask-verify-report-schema.log`; rejects `target/reports/native-gpu/headed-scenario-counter-basic-headed.json` as an unrecognized report shape with status `pass`. |
-| `cargo xtask audit-goal-readiness` | Fail | Raw log: `target/reports/bytes-plan/logs/11-cargo-xtask-audit-goal-readiness.log`; the command reports it was removed and points to the native GPU gates in `docs/architecture/NATIVE_GPU_PIPELINE.md`. |
+| `cargo xtask audit-goal-readiness` | Fail | Raw log: `target/reports/bytes-plan/logs/11-cargo-xtask-audit-goal-readiness.log`; at Phase 0 the command reported it was removed and pointed to native GPU gates. This historical blocker is superseded by the active `audit-goal-readiness` BYTES/MachinePlan preflight added in the Phase 9/10 readiness slice below. |
 | `cargo xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-bench.json --speed-report target/reports/bytes-plan/todomvc-bench-speed.json` | Fail | The linked speed report was generated and passed, but the benchmark command exited fail because schema verification rejected the benchmark report: it did not copy `stress_profiles` from `target/reports/bytes-plan/todomvc-bench-speed.json`. Baseline speed numbers from the linked speed report: `input_to_idle_ms` p50 `0.127891`, p95 `0.266734`, p99/max `0.804681`, sample count `29`; bounded warm-up allocations `2595`; graph rebuild count `0`. |
 | `cargo xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-bench.json --speed-report target/reports/bytes-plan/cells-bench-speed.json` | Fail | No benchmark report was produced; release run fails at `commit-c0-formula-bar-sum-through-a3`, expected `["C0"]`, got `[]`, matching the semantic Cells baseline failure. |
 
@@ -60,7 +60,11 @@ MachinePlan migration.
 - `boon_parser`: two list-memory detection tests fail because expected `items` list memories are absent. Treat as pre-BYTES baseline failure.
 - `boon_runtime`: Cells scenario, developer summary, and observed Cells source tests fail before a NovyWave bridge cursor stack overflow aborts the target. Treat as pre-BYTES baseline failure.
 - `verify-report-schema`: currently fails because an existing headed scenario report is under the report tree but is not registered as an accepted report shape.
-- `audit-goal-readiness`: the objective requires this command, but current repo behavior intentionally rejects it as a removed legacy Ply/COSMIC audit. Future final verification must document the conflict and use the active native GPU contract where applicable instead of pretending the removed command passed.
+- `audit-goal-readiness`: at Phase 0 the objective required this command, but
+  then-current repo behavior rejected it as a removed legacy Ply/COSMIC audit.
+  This baseline conflict is superseded by the active BYTES/MachinePlan
+  `audit-goal-readiness` preflight added later in the Phase 9/10 readiness
+  slice.
 - Release benchmark baseline:
   - TodoMVC has usable linked speed evidence at `target/reports/bytes-plan/todomvc-bench-speed.json`, but the wrapper benchmark report is schema-invalid in current HEAD.
   - Cells has no usable benchmark report because its scenario fails before measurement completes.
@@ -111,12 +115,16 @@ public, deterministic `boon_plan` crate, using current runtime-plan tables as a
 compatibility reference. Avoid a parallel plan model that cannot execute current
 TodoMVC/Cells behavior.
 
-### ADR-BMP-0004: Removed legacy readiness command is a recorded conflict
+### ADR-BMP-0004: Readiness command conflict and replacement
 
 The goal requires `cargo xtask audit-goal-readiness`, but current HEAD rejects
 that command as removed. The conflict is recorded as baseline evidence. Later
 verification must not fake a pass; it must either implement a current equivalent
 or document the active native GPU gates that replace the removed audit.
+
+Update: the Phase 9/10 readiness slice implements the current equivalent as an
+active BYTES/MachinePlan blocker-reporting preflight. Native GPU gates remain
+separate and must not be used as fake BYTES/MachinePlan completion evidence.
 
 ## Open Phase 0 Work
 
@@ -9347,7 +9355,7 @@ Commands run:
 | `cargo fmt --all -- --check` | Pass | Formatting check after the focused patches. |
 | `cargo check -p boon_report_schema -p boon_runtime -p boon_cli -p xtask --quiet` | Pass | Existing `boon_native_gpu` dead-code warnings remain. |
 | `cargo check --workspace --all-targets` | Pass | Finished in `1m 02s`; existing native GPU / native playground dead-code warnings remain. |
-| `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Removed verifier | xtask reports this legacy Ply/COSMIC command has been removed from active verification and points to the native GPU gates in `docs/architecture/NATIVE_GPU_PIPELINE.md`. This command is no longer valid final evidence for the BYTES/MachinePlan goal. |
+| `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Removed verifier at the time | xtask reported this legacy Ply/COSMIC command had been removed from active verification and pointed to native GPU gates. This historical result is superseded by the active BYTES/MachinePlan readiness preflight added later. |
 | `git diff --check` | Pass | No whitespace errors in the current diff. |
 
 Open findings:
@@ -14747,6 +14755,94 @@ Open findings:
 - Native gate reports still use the native helper's existing `args` shape and
   were not changed in this slice.
 - Phase 10 default switch readiness remains not started.
+
+## Phase 9/10 Goal Readiness Preflight Gate
+
+Recorded at: `2026-06-21T17:51:41+02:00`
+
+Status: partial Phase 9/10 readiness evidence; complete for restoring an
+active `audit-goal-readiness` command that reports honest BYTES/MachinePlan
+goal blockers. This is not a Phase 10 default-switch pass.
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+Independent review:
+
+- Subagent `019eeadd-192c-7013-8a04-18efa73cef67`
+  (`Socrates the 4th`) performed a read-only audit. It independently found
+  that `cargo xtask audit-goal-readiness` was still treated as a removed legacy
+  Ply/COSMIC command even though the implementation plan requires it as a final
+  goal check. It recommended a blocker-reporting readiness preflight rather
+  than attempting the Phase 10 default switch.
+
+What changed:
+
+- Re-added `audit-goal-readiness` to the active `XTASK_COMMANDS` list and
+  command dispatcher.
+- Removed `audit-goal-readiness` from the legacy Ply/COSMIC removed-command
+  list.
+- Added `audit_goal_readiness`, writing
+  `target/reports/bytes-plan/goal-readiness.json` by default.
+- The gate intentionally fails until the full goal is actually ready. It checks:
+  - required plan/docs artifacts;
+  - phase status from `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`;
+  - current BYTES/MachinePlan aggregate presence, pass status, git freshness,
+    and worktree freshness;
+  - Cells release benchmark wrapper presence;
+  - runtime production hardening, runtime finality, machine-readiness, and
+    report-schema summary reports;
+  - whether `boon_cli run` has switched its default engine to PlanExecutor.
+- Added `audit-goal-readiness` to the report-schema blocker-audit whitelist so
+  an intentional failing readiness report is accepted as an accounted blocker
+  report instead of being mistaken for an unknown report shape.
+
+Evidence:
+
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - `command=audit-goal-readiness`
+  - `measurement_mode=proof`
+  - `git_commit=99f8104`
+  - `blocker_count=10`
+- Current blocker summary:
+  - 10 phases still partial in the progress ledger.
+  - 1 phase still not started in the progress ledger.
+  - BYTES/MachinePlan aggregate is stale for current HEAD.
+  - BYTES/MachinePlan aggregate is stale for current worktree fingerprint.
+  - Cells release benchmark wrapper report is missing because TASK-0804A
+    remains blocked by speed budgets.
+  - `target/reports/runtime-production-hardening.json` is missing.
+  - `target/reports/runtime-finality.json` is missing.
+  - `target/reports/debug/machine-readiness.json` is missing.
+  - `target/reports/schema.json` is stale for current HEAD.
+  - Phase 10 default switch has not happened; `boon_cli run` still defaults to
+    legacy.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p xtask --quiet` | Pass | Focused compile after adding the readiness gate; existing native GPU dead-code warnings only. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all && timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Applied and verified formatting. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask --quiet` | Pass | Built current debug xtask; existing native GPU dead-code warnings only. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Wrote schema-valid blocker report with 10 current readiness blockers. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/goal-readiness.json` | Pass | Schema accepted the failing readiness report as an intentional blocker audit. |
+| `./target/debug/xtask help \| rg 'audit-goal-readiness\|audit-machine-readiness\|verify-bytes-machine-plan-all'` | Pass | Confirmed the active command appears in help output. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema` | Fail | Recursive report sweep failed on unrelated stale `target/reports/bytecode-counter.json` binary hash. The new goal-readiness report was not the blocker. |
+
+Open findings:
+
+- The readiness gate is now available and honest, but it is red by design until
+  the listed blockers are resolved.
+- The BYTES/MachinePlan aggregate and several child reports need refresh after
+  the checkpoint commit `99f8104`.
+- The recursive report-schema sweep has a stale bytecode report outside this
+  slice; refresh or isolate it before using full `verify-report-schema` as final
+  evidence.
+- Phase 10 default switch remains intentionally blocked.
 
 ## Phase 2/7/9 BYTES Multiline Parser Fixtures And Row BYTES Report Consistency
 

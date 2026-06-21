@@ -14603,6 +14603,132 @@ above in `Phase 7 Fixed Indexed Byte-Bank Backing`. It supersedes the
 historical row-private indexed file-write proof in this section for the narrow
 indexed source-payload -> fixed row bank -> indexed `File/write_bytes` slice.
 
+## TASK-0804A Root Read Dependency Churn Follow-up
+
+Recorded at: `2026-06-21T23:35:00+02:00`
+
+Status: partial. This reduces one measured `store.selected_input`
+dependency-storage hot path, but TASK-0804A is not finished because the Cells
+release benchmark still fails latency budgets.
+
+Base/current commit: `3c12f9a`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed current checkpoint reports under `target/reports/bytes-plan/`
+- added benchmark logs:
+  - `target/reports/bytes-plan/logs/cells-release-benchmark-after-root-read-noop.log`
+  - `target/reports/bytes-plan/logs/cells-release-benchmark-after-root-read-diff.log`
+
+What changed:
+
+- `GenericDerivedState::replace_root_reads` now returns whether dependency
+  edges changed.
+- If the root read set is identical, it returns early without tearing down and
+  rebuilding `root_dependents_by_read`.
+- If the read set changed, it now updates only the set difference instead of
+  removing and reinserting every shared dependency edge.
+- Added a focused unit test proving unchanged root-read replacement is a no-op
+  and changed replacement removes only deleted reads while registering added
+  reads.
+
+Checkpoint report refresh before code changes:
+
+- After commit `3c12f9a`, the aggregate correctly rejected stale child report
+  hashes.
+- All replayable child reports were refreshed from their own `command_argv`
+  values. The TodoMVC release benchmark wrappers also had to be regenerated
+  before `verify-bytes-release-benchmark-reproduction` could pass.
+- Final checkpoint aggregate before the runtime edit:
+  `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+
+Cells benchmark evidence after the runtime edit:
+
+- `target/reports/bytes-plan/cells-release-benchmark-speed.json` was produced,
+  but the wrapper benchmark report was not accepted because the speed budget
+  failed.
+- Budget result:
+
+| Metric | Budget | Measured | Status |
+| --- | --- | --- | --- |
+| `latency_p95_budget` | `4.0 ms` | `10.823539 ms` | Fail |
+| `latency_max_budget` | `8.0 ms` | `12.473322999999999 ms` | Fail |
+| `graph_rebuild_budget` | `0` | `0` | Pass |
+| bounded allocation budget | not applied for `software_dynamic` | `13750` warm-up allocs | Pass/unapplied |
+
+- Latency summary:
+  - p50 `5.154798 ms`
+  - p95 `10.823539 ms`
+  - p99/max `12.473322999999999 ms`
+  - sample count `25`
+- Slowest steps:
+  - `commit-c0-formula-bar-sum-through-a3`: `12.473322999999999 ms`
+  - `edit-a0-literal`: `10.823539 ms`
+  - `commit-a0-literal`: `10.801625 ms`
+  - `select-a3-for-literal-entry`: `8.174539999999999 ms`
+  - `select-c0-for-formula-update`: `8.015951000000001 ms`
+- Runtime profile still points at root materialization:
+  - `source_action_root_materialization_ms` p95 `7.671489 ms`, max `9.792668 ms`
+  - `source_action_root_flush_ms` p95 `8.088621 ms`, max `10.154711 ms`
+  - `source_action_eval_ms` p95 `9.216409 ms`, max `12.09911 ms`
+- The specific direct `List/find` lookup remains indexed and cheap, but some
+  `root_read_commit_ms` outliers remain:
+  - max `8.871221 ms`
+  - p95 sample `6.807373 ms`
+  - top samples include `8.871221`, `6.807373`, `5.948023`, `5.025742`,
+    `4.416454`, `3.786833`, `3.153269`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail | Expected after checkpoint commit; child reports were stale for commit/binary hashes. |
+| replay required reports from child `command_argv` values | Partial then Pass | Initial replay failed only because a shell wrapper lost quotes around `--text "Test todo"`; rerun manually with correct quoting. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 /home/martinkavik/repos/boon-circuit/target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Rerun after refreshing child reports so artifact hashes were current. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Checkpoint aggregate was green before the later runtime edit. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Formatting after runtime edit. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime generic_derived_state_skips_unchanged_root_read_replacement -- --nocapture --test-threads=1` | Pass | New focused dependency-storage regression test. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture --test-threads=1` | Pass | Existing Cells selected-input behavior still passes. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_runtime --quiet` | Pass | Focused compile for touched runtime crate. |
+| `timeout 1200s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | First run after no-op short-circuit: p95 `9.30413 ms`, max `10.575226 ms`; failed `latency_p95_budget` and `latency_max_budget`. |
+| same Cells benchmark command after diff-update replacement | Fail | p95 `10.823539 ms`, max `12.473322999999999 ms`; still failed `latency_p95_budget` and `latency_max_budget`. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-report-schema target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Correctly rejected the speed report because speed budgets failed. |
+
+Independent review:
+
+- Subagent `019eebf0-6e30-7ef2-8181-2638ee776243` identified TASK-0804A
+  Cells release benchmark as the next highest-value unfinished slice and
+  pointed to `try_materialize_root_list_find_projection_field` /
+  `GenericDerivedState::replace_root_reads` as the narrow implementable
+  hotspot.
+- Follow-up reviewer `019eec16-e7df-7840-99c2-e6f603df29a2` confirmed the
+  runtime diff is semantically safe under the expected invariant that
+  `root_reads_by_field` and `root_dependents_by_read` stay consistent.
+- The same reviewer confirmed the focused test covers unchanged, removed,
+  shared, and added dependency edges, and warned that TASK-0804A still needs a
+  split fix: selected-input root-read commit outliers remain on edit/select
+  actions, while the slowest formula-commit sample is dominated by broader
+  `source_action_eval_ms` rather than direct `List/find` root-read commit.
+
+Open findings:
+
+- TASK-0804A remains open. The correctness path works, but the Cells release
+  speed budget still fails.
+- The next likely implementation step is deeper root materialization scheduling
+  or dependency-index storage work, not another blind micro-change.
+- Current source changes make the previously green aggregate reports stale
+  again; refresh the aggregate only after the next accepted runtime slice or
+  before committing this partial slice.
+
 ## Phase 6/9 PlanExecutor Assertion-Only Scenario Checkpoints
 
 Recorded at: `2026-06-21T22:42:53+02:00`

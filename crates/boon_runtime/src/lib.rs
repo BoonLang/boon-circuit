@@ -57777,9 +57777,12 @@ impl GenericDerivedState {
         self.root_numeric_stability_guards_by_field.remove(field);
     }
 
-    fn replace_root_reads(&mut self, field: String, reads: BTreeSet<GenericReadKey>) {
-        if let Some(previous) = self.root_reads_by_field.remove(&field) {
-            for read in previous {
+    fn replace_root_reads(&mut self, field: String, reads: BTreeSet<GenericReadKey>) -> bool {
+        if let Some(previous) = self.root_reads_by_field.get(&field).cloned() {
+            if previous == reads {
+                return false;
+            }
+            for read in previous.difference(&reads) {
                 if let Some(dependents) = self.root_dependents_by_read.get_mut(&read) {
                     dependents.remove(&field);
                     if dependents.is_empty() {
@@ -57787,6 +57790,14 @@ impl GenericDerivedState {
                     }
                 }
             }
+            for read in reads.difference(&previous) {
+                self.root_dependents_by_read
+                    .entry(read.clone())
+                    .or_default()
+                    .insert(field.clone());
+            }
+            self.root_reads_by_field.insert(field, reads);
+            return true;
         }
         for read in &reads {
             self.root_dependents_by_read
@@ -57795,6 +57806,7 @@ impl GenericDerivedState {
                 .insert(field.clone());
         }
         self.root_reads_by_field.insert(field, reads);
+        true
     }
 
     fn dependents_for_reads(
@@ -67770,6 +67782,59 @@ FUNCTION new_todo(title) {
                 .list_row_textlike("selected_input", 0, "value")
                 .unwrap(),
             "6"
+        );
+    }
+
+    #[test]
+    fn generic_derived_state_skips_unchanged_root_read_replacement() {
+        let mut state = GenericDerivedState::default();
+        let mut reads = root_read_keys_for_path("store.selected_address")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        reads.insert(list_read_key("cells"));
+        reads.insert(list_column_read_key("cells", "address"));
+
+        assert!(
+            state.replace_root_reads("store.selected_input".to_owned(), reads.clone()),
+            "first root read registration should install dependency edges"
+        );
+        let reads_before = state.root_reads_by_field.clone();
+        let dependents_before = state.root_dependents_by_read.clone();
+
+        assert!(
+            !state.replace_root_reads("store.selected_input".to_owned(), reads),
+            "unchanged root read registration should not churn dependency edges"
+        );
+        assert_eq!(state.root_reads_by_field, reads_before);
+        assert_eq!(state.root_dependents_by_read, dependents_before);
+
+        let shared_read = list_read_key("cells");
+        let removed_read = list_column_read_key("cells", "address");
+        let added_read = list_column_read_key("cells", "value");
+        let mut changed_reads = BTreeSet::new();
+        changed_reads.insert(shared_read.clone());
+        changed_reads.insert(added_read.clone());
+        assert!(
+            state.replace_root_reads("store.selected_input".to_owned(), changed_reads),
+            "changed root reads should update only the dependency edge diff"
+        );
+        assert!(
+            state
+                .root_dependents_by_read
+                .get(&shared_read)
+                .is_some_and(|dependents| dependents.contains("store.selected_input")),
+            "shared read edge should remain registered"
+        );
+        assert!(
+            !state.root_dependents_by_read.contains_key(&removed_read),
+            "removed read edge should be deleted"
+        );
+        assert!(
+            state
+                .root_dependents_by_read
+                .get(&added_read)
+                .is_some_and(|dependents| dependents.contains("store.selected_input")),
+            "added read edge should be registered"
         );
     }
 

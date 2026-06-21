@@ -3449,8 +3449,8 @@ pub fn run_plan_scenario_events(
         .collect::<Vec<_>>();
 
     let plan = compile_typed_program(&ir, target_profile)?;
-    let output =
-        execute_machine_plan_root_scenario_inner(&plan, &selected_steps, source_path.parent())?;
+    let all_steps = scenario.step.iter().collect::<Vec<_>>();
+    let output = execute_machine_plan_root_scenario_inner(&plan, &all_steps, source_path.parent())?;
     let source_hash = report_source_hash_for_parsed(&parsed);
     let units = parsed
         .files
@@ -3476,7 +3476,17 @@ pub fn run_plan_scenario_events(
         })
     };
     let legacy_passed = legacy_comparison.get("passed").and_then(JsonValue::as_bool) == Some(true);
-    let report_status = if legacy_passed { "pass" } else { "fail" };
+    let assertion_only_covered = output.assertion_checkpoints.len()
+        == assertion_only_step_ids.len()
+        && output
+            .assertion_checkpoints
+            .iter()
+            .all(plan_assertion_checkpoint_report_is_covered);
+    let report_status = if legacy_passed && assertion_only_covered {
+        "pass"
+    } else {
+        "fail"
+    };
     let report_command = "run-plan-scenario-events";
     let plan_executor_coverage = json!({
         "surface": "scenario-expected-source-event-replay",
@@ -3485,9 +3495,14 @@ pub fn run_plan_scenario_events(
         "selected_step_ids": selected_step_ids,
         "assertion_only_step_ids": assertion_only_step_ids,
         "covers_all_source_events": true,
-        "covers_assertion_only_steps": false,
-        "full_scenario_parity": false,
-        "full_scenario_parity_blocker": "PlanExecutor currently replays expected_source_event steps and compares touched state plus semantic deltas; assertion-only scenario checkpoints still require the legacy semantic scenario runner."
+        "covers_assertion_only_steps": assertion_only_covered,
+        "full_scenario_parity": assertion_only_covered,
+        "full_scenario_parity_blocker": if assertion_only_covered {
+            JsonValue::Null
+        } else {
+            JsonValue::String("PlanExecutor did not check every assertion-only scenario checkpoint".to_owned())
+        },
+        "assertion_checkpoint_count": output.assertion_checkpoints.len(),
     });
     let report = json!({
         "status": report_status,
@@ -3495,7 +3510,7 @@ pub fn run_plan_scenario_events(
         "command": report_command,
         "command_argv": std::env::args().collect::<Vec<_>>(),
         "measurement_mode": "proof",
-        "exit_status": if legacy_passed { 0 } else { 1 },
+        "exit_status": if legacy_passed && assertion_only_covered { 0 } else { 1 },
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -3542,8 +3557,8 @@ pub fn run_plan_scenario_events(
             },
             {
                 "id": "assertion-only-coverage-recorded",
-                "pass": true,
-                "detail": "assertion-only checkpoints are recorded in plan_executor_coverage and are not claimed as PlanExecutor parity yet"
+                "pass": assertion_only_covered,
+                "detail": "CPU PlanExecutor checked assertion-only scenario checkpoints in scenario order"
             }
         ],
         "artifact_sha256s": [],
@@ -3582,6 +3597,7 @@ struct RootScenarioExecution {
     semantic_delta_signatures: Vec<String>,
     semantic_deltas: JsonValue,
     per_step: Vec<JsonValue>,
+    assertion_checkpoints: Vec<JsonValue>,
     executor_report: JsonValue,
 }
 
@@ -3994,8 +4010,18 @@ fn execute_machine_plan_root_scenario_inner(
     let mut executed_list_retain_count = 0usize;
     let mut executed_list_view_count = 0usize;
     let mut retained_list_row_count = 0usize;
+    let mut assertion_checkpoints = Vec::new();
 
     for step in selected_steps {
+        if step.expected_source_event.is_none() {
+            assertion_checkpoints.push(assert_plan_executor_scenario_checkpoint(
+                plan,
+                &root_state,
+                &list_state,
+                step,
+            )?);
+            continue;
+        }
         let step_bytes_counter_start = runtime_bytes_storage_counters_snapshot();
         let generic_event = GenericSourceEvent::require(step)?;
         let event = live_source_event_from_generic(&generic_event);
@@ -4382,7 +4408,7 @@ fn execute_machine_plan_root_scenario_inner(
     let semantic_deltas = JsonValue::Array(semantic_deltas);
     let executor_report = json!({
         "executor": "cpu-plan-root-list-scenario-v1",
-        "selected_step_count": selected_steps.len(),
+        "selected_step_count": per_step.len(),
         "initialized_root_state_count": initialized_state_count,
         "executed_update_branch_count": executed_update_branch_count,
         "executed_derived_value_count": executed_derived_value_count,
@@ -4413,6 +4439,7 @@ fn execute_machine_plan_root_scenario_inner(
         "semantic_delta_signatures": semantic_delta_signatures,
         "semantic_deltas": semantic_deltas.clone(),
         "per_step": per_step,
+        "assertion_checkpoints": assertion_checkpoints,
         "bytes_storage_counters": bytes_storage_counters.report_json(),
         "bytes_storage_no_copy": bytes_storage_counters.no_runtime_byte_copies(),
     });
@@ -4422,8 +4449,289 @@ fn execute_machine_plan_root_scenario_inner(
         semantic_delta_signatures,
         semantic_deltas,
         per_step,
+        assertion_checkpoints,
         executor_report,
     })
+}
+
+fn assert_plan_executor_scenario_checkpoint(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    step: &ScenarioStep,
+) -> RuntimeResult<JsonValue> {
+    if !step.expect_semantic_delta_contains.is_empty()
+        || !step.expect_render_delta_contains.is_empty()
+    {
+        return Err(format!(
+            "{} assertion-only PlanExecutor checkpoint cannot validate delta expectations without a source event",
+            step.id
+        )
+        .into());
+    }
+
+    let mut checked = Vec::new();
+    let todos = plan_rows_with_field(list_state, "title");
+    if let Some(expected) = &step.expect_titles {
+        let actual = todos
+            .iter()
+            .filter_map(|row| row_textlike_field(row, "title"))
+            .collect::<Vec<_>>();
+        assert_eq_report(&step.id, "titles", expected, &actual)?;
+        checked.push("expect_titles");
+    }
+    if let Some(expected) = &step.expect_visible_titles {
+        let retain_execution = materialize_plan_list_retains(plan, root_state, list_state)?;
+        let actual = plan_visible_titles_from_retains(&retain_execution)?;
+        assert_eq_report(&step.id, "visible_titles", expected, &actual)?;
+        checked.push("expect_visible_titles");
+    }
+    if let Some(expected) = &step.expect_completed_titles {
+        let actual = todos
+            .iter()
+            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) == Some(true))
+            .filter_map(|row| row_textlike_field(row, "title"))
+            .collect::<Vec<_>>();
+        assert_eq_report(&step.id, "completed_titles", expected, &actual)?;
+        checked.push("expect_completed_titles");
+    }
+    if let Some(expected) = step.expect_active_count {
+        let actual = todos
+            .iter()
+            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) != Some(true))
+            .count();
+        assert_num(&step.id, "active_count", expected, actual)?;
+        checked.push("expect_active_count");
+    }
+    if let Some(expected) = step.expect_completed_count {
+        let actual = todos
+            .iter()
+            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) == Some(true))
+            .count();
+        assert_num(&step.id, "completed_count", expected, actual)?;
+        checked.push("expect_completed_count");
+    }
+    if let Some(expected) = &step.expect_filter {
+        let actual = plan_root_textlike_for_assertion(
+            root_state,
+            "store.selected_filter",
+            "selected_filter",
+        )?;
+        assert_eq_report(&step.id, "filter", expected, &actual)?;
+        checked.push("expect_filter");
+    }
+    if let Some(expected) = &step.expect_new_text {
+        let actual =
+            plan_root_textlike_for_assertion(root_state, "store.new_todo_text", "new_todo_text")?;
+        assert_eq_report(&step.id, "new_text", expected, &actual)?;
+        checked.push("expect_new_text");
+    }
+    if let Some(expected) = &step.expect_editing_title {
+        let row = plan_single_editing_row(&todos, &step.id)?;
+        let actual = row_textlike_field(row, "title")
+            .ok_or_else(|| format!("{} editing row is missing textlike title", step.id))?;
+        assert_eq_report(&step.id, "editing_title", expected, &actual)?;
+        checked.push("expect_editing_title");
+    }
+    if let Some(expected) = &step.expect_edit_text {
+        let row = plan_single_editing_row(&todos, &step.id)?;
+        let actual = row_textlike_field(row, "edit_text")
+            .ok_or_else(|| format!("{} editing row is missing textlike edit_text", step.id))?;
+        assert_eq_report(&step.id, "edit_text", expected, &actual)?;
+        checked.push("expect_edit_text");
+    }
+    if let Some(expected) = step.expect_no_editing {
+        let actual = !todos
+            .iter()
+            .any(|row| row.fields.get("editing").and_then(JsonValue::as_bool) == Some(true));
+        assert_eq_report(&step.id, "no_editing", &expected, &actual)?;
+        checked.push("expect_no_editing");
+    }
+    if let Some(expect) = &step.expect_cell {
+        let mut required_fields = Vec::new();
+        if expect.value.is_some() {
+            required_fields.push("value");
+        }
+        if expect.formula.is_some() {
+            required_fields.push("formula_text");
+        }
+        if expect.editing_text.is_some() {
+            required_fields.push("editing_text");
+        }
+        if expect.editing.is_some() {
+            required_fields.push("editing");
+        }
+        let row = plan_cell_row(list_state, &expect.address, &required_fields, &step.id)?;
+        if let Some(expected) = &expect.value {
+            let actual = row_textlike_field(row, "value").unwrap_or_default();
+            assert_eq_report(&step.id, "cell.value", expected, &actual)?;
+            checked.push("expect_cell.value");
+        }
+        if let Some(expected) = &expect.formula {
+            let actual = row_textlike_field(row, "formula_text").unwrap_or_default();
+            assert_eq_report(&step.id, "cell.formula", expected, &actual)?;
+            checked.push("expect_cell.formula");
+        }
+        if let Some(expected) = &expect.editing_text {
+            let actual = row_textlike_field(row, "editing_text").unwrap_or_default();
+            assert_eq_report(&step.id, "cell.editing_text", expected, &actual)?;
+            checked.push("expect_cell.editing_text");
+        }
+        if let Some(expected) = expect.editing {
+            let actual = row
+                .fields
+                .get("editing")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            assert_eq_report(&step.id, "cell.editing", &expected, &actual)?;
+            checked.push("expect_cell.editing");
+        }
+    }
+    if let Some(expect) = &step.expect_error {
+        let row = plan_cell_row(list_state, &expect.address, &["error"], &step.id)?;
+        let actual = row_textlike_field(row, "error").filter(|error| !error.is_empty());
+        assert_eq_report(
+            &step.id,
+            "cell.error",
+            &Some(expect.error.as_str()),
+            &actual.as_deref(),
+        )?;
+        checked.push("expect_error");
+    }
+    if step.expect_recomputed.is_some() {
+        return Err(format!(
+            "{} assertion-only PlanExecutor checkpoint cannot validate expect_recomputed without a source event recompute set",
+            step.id
+        )
+        .into());
+    }
+    for (path, expected) in &step.expect_root_text {
+        let actual = plan_root_textlike_for_assertion(root_state, path, path)?;
+        assert_eq_report(&step.id, path, expected, &actual)?;
+        checked.push("expect_root_text");
+    }
+
+    Ok(json!({
+        "step_id": step.id,
+        "source_intent_exemption": step.source_intent_exemption,
+        "checked_expectations": checked,
+        "checked_expectation_count": checked.len(),
+        "passed": true,
+    }))
+}
+
+fn plan_rows_with_field<'a>(
+    list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
+    field: &str,
+) -> Vec<&'a PlanListRowState> {
+    list_state
+        .values()
+        .find(|rows| rows.iter().any(|row| row.fields.contains_key(field)))
+        .map(|rows| rows.iter().collect())
+        .unwrap_or_default()
+}
+
+fn row_textlike_field(row: &PlanListRowState, field: &str) -> Option<String> {
+    row.fields.get(field).and_then(json_scalar_text)
+}
+
+fn plan_visible_titles_from_retains(
+    retain_execution: &ListRetainExecution,
+) -> RuntimeResult<Vec<String>> {
+    retain_execution
+        .summary
+        .iter()
+        .find(|(target, _)| target.ends_with("visible_todos") || target.as_str() == "visible_todos")
+        .or_else(|| retain_execution.summary.iter().next())
+        .map(|(_, summary)| {
+            summary
+                .get("titles")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| "PlanExecutor retain summary is missing visible titles".into())
+                .and_then(|titles| {
+                    titles
+                        .iter()
+                        .map(|title| {
+                            json_scalar_text(title)
+                                .ok_or_else(|| "PlanExecutor visible title is not textlike".into())
+                        })
+                        .collect::<RuntimeResult<Vec<_>>>()
+                })
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn plan_single_editing_row<'a>(
+    rows: &[&'a PlanListRowState],
+    step_id: &str,
+) -> RuntimeResult<&'a PlanListRowState> {
+    let editing = rows
+        .iter()
+        .copied()
+        .filter(|row| row.fields.get("editing").and_then(JsonValue::as_bool) == Some(true))
+        .collect::<Vec<_>>();
+    match editing.as_slice() {
+        [row] => Ok(*row),
+        [] => Err(format!("{step_id}: expected one editing row, found none").into()),
+        rows => Err(format!("{step_id}: expected one editing row, found {}", rows.len()).into()),
+    }
+}
+
+fn plan_cell_row<'a>(
+    list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
+    address: &str,
+    required_fields: &[&str],
+    step_id: &str,
+) -> RuntimeResult<&'a PlanListRowState> {
+    for rows in list_state.values() {
+        for row in rows {
+            if row_textlike_field(row, "address").as_deref() == Some(address)
+                && required_fields
+                    .iter()
+                    .all(|field| row.fields.contains_key(*field))
+            {
+                return Ok(row);
+            }
+        }
+    }
+    Err(format!(
+        "{step_id}: PlanExecutor cell address `{address}` with fields {:?} not found",
+        required_fields
+    )
+    .into())
+}
+
+fn plan_root_textlike_for_assertion(
+    root_state: &serde_json::Map<String, JsonValue>,
+    path: &str,
+    fallback_path: &str,
+) -> RuntimeResult<String> {
+    let root = JsonValue::Object(root_state.clone());
+    for candidate in [
+        path.to_owned(),
+        format!("store.{fallback_path}"),
+        fallback_path.to_owned(),
+    ] {
+        if let Some(value) = json_value_at_dotted_path(&root, &candidate)
+            && let Some(text) = json_scalar_text(value)
+        {
+            return Ok(text);
+        }
+    }
+    Err(format!("PlanExecutor root text assertion path `{path}` not found").into())
+}
+
+fn plan_assertion_checkpoint_report_is_covered(checkpoint: &JsonValue) -> bool {
+    let checked = checkpoint
+        .get("checked_expectations")
+        .and_then(JsonValue::as_array);
+    checkpoint.get("passed").and_then(JsonValue::as_bool) == Some(true)
+        && checked.is_some_and(|checked| {
+            checkpoint
+                .get("checked_expectation_count")
+                .and_then(JsonValue::as_u64)
+                == Some(checked.len() as u64)
+        })
 }
 
 fn root_plan_semantic_delta_value(value: &JsonValue) -> JsonValue {
@@ -80358,6 +80666,34 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 .expect("Cells expected-source-event scenario should compare through PlanExecutor");
 
                 assert_eq!(output.report["status"], "pass");
+                assert_eq!(
+                    output.report["plan_executor_coverage"]["covers_assertion_only_steps"],
+                    true
+                );
+                assert_eq!(
+                    output.report["plan_executor_coverage"]["full_scenario_parity"],
+                    true
+                );
+                assert_eq!(
+                    output.report["plan_executor_coverage"]["assertion_checkpoint_count"],
+                    6
+                );
+                assert_eq!(
+                    output.report["plan_executor"]["assertion_checkpoints"]
+                        .as_array()
+                        .expect("Cells compare report should expose assertion checkpoints")
+                        .iter()
+                        .map(|checkpoint| checkpoint["step_id"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "initial",
+                        "initial-add-function",
+                        "initial-sum-function",
+                        "initial-empty-cell-is-blank",
+                        "a0-recomputes-after-cycle-break",
+                        "d0-updated-by-fanout"
+                    ]
+                );
                 assert_eq!(output.report["legacy_comparison"]["passed"], true);
                 assert_eq!(output.report["legacy_comparison"]["state_match"], true);
                 assert_eq!(

@@ -14603,6 +14603,116 @@ above in `Phase 7 Fixed Indexed Byte-Bank Backing`. It supersedes the
 historical row-private indexed file-write proof in this section for the narrow
 indexed source-payload -> fixed row bank -> indexed `File/write_bytes` slice.
 
+## Phase 6/9 PlanExecutor Assertion-Only Scenario Checkpoints
+
+Recorded at: `2026-06-21T22:42:53+02:00`
+
+Status: partial Phase 6/9 progress. TodoMVC and Cells `run-plan-scenario-events`
+reports now cover assertion-only scenario checkpoints in scenario order using
+PlanExecutor-owned root/list state. This does not complete full Phase 6,
+Phase 9, aggregate freshness, performance, native parity, or Phase 10 readiness.
+
+Base/current commit:
+
+- Base commit before this slice: `0f8acf1`
+- Current worktree after this slice: dirty, with the files listed below.
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+Implementation notes:
+
+- `run_plan_scenario_events` now passes the full scenario step sequence into
+  the CPU PlanExecutor. Steps with `expected_source_event` are executed as
+  before; steps without a source event are checked as assertion checkpoints
+  against the current PlanExecutor state.
+- `plan_executor.assertion_checkpoints` records the checked no-event steps,
+  their exact expectation names, count, source-intent exemption text, and
+  `passed=true`.
+- Runtime coverage now requires matching checkpoint count plus internal
+  checkpoint consistency (`passed=true` and `checked_expectation_count` matching
+  `checked_expectations.len()`), not just count equality.
+- The schema-side scenario parser now reads assertion expectation fields and
+  verifies each checkpoint's `checked_expectations` and
+  `checked_expectation_count` against the actual `.scn` step.
+- The initial failed Cells run exposed a real lookup bug in the first
+  implementation attempt: assertion lookup found `cells_default_values.A0`
+  before the real `cells.A0` row. The final lookup requires the row fields being
+  asserted, so `expect_cell.formula` selects rows with `formula_text`, not the
+  defaults table.
+
+Report evidence:
+
+- `target/reports/bytes-plan/cells-plan-compare.json`
+  - `status=pass`
+  - `event_step_count=19`
+  - `assertion_checkpoint_count=6`
+  - `covers_assertion_only_steps=true`
+  - `full_scenario_parity=true`
+  - `full_scenario_parity_blocker=null`
+  - checkpoint IDs: `initial`, `initial-add-function`,
+    `initial-sum-function`, `initial-empty-cell-is-blank`,
+    `a0-recomputes-after-cycle-break`, `d0-updated-by-fanout`
+  - no-fallback counters:
+    `runtime_ast_eval_count=0`, `executable_string_path_count=0`,
+    `unknown_plan_op_count=0`, `graph_rebuild_count=0`,
+    `graph_clones_per_item=0`
+- `target/reports/bytes-plan/todomvc-full-engine-compare.json`
+  - `status=pass`
+  - `event_step_count=26`
+  - `assertion_checkpoint_count=3`
+  - `covers_assertion_only_steps=true`
+  - `full_scenario_parity=true`
+  - `full_scenario_parity_blocker=null`
+  - checkpoint IDs: `initial`, `hover-delete-clean-room`, `empty-state`
+  - no-fallback counters:
+    `runtime_ast_eval_count=0`, `executable_string_path_count=0`,
+    `unknown_plan_op_count=0`, `graph_rebuild_count=0`,
+    `graph_clones_per_item=0`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_runtime --quiet` | Pass | Focused runtime compile after checkpoint implementation. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_report_schema --quiet` | Pass | Focused schema compile after expectation binding. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Fail, then Pass | Initial fail was rustfmt drift after edits; passed after `cargo fmt --all`. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all` | Pass | Applied formatting. |
+| `timeout 420s env CARGO_BUILD_JOBS=1 nice -n 19 cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --engine compare --report target/reports/bytes-plan/cells-plan-compare.json` | Fail, then Pass | First fail exposed field-ambiguous `A0` lookup against `cells_default_values`; passed after requiring asserted row fields. |
+| `timeout 420s env CARGO_BUILD_JOBS=1 nice -n 19 cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --engine compare --report target/reports/bytes-plan/todomvc-full-engine-compare.json` | Fail, then Pass | First fail was before the full sequence was wired into the correct function; final run passed. |
+| `timeout 420s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1` | Fail, then Pass | First fail reported `status=fail` before checkpoint wiring was corrected; final run passed and asserts all six Cells checkpoint IDs. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-report-schema target/reports/bytes-plan/todomvc-full-engine-compare.json target/reports/bytes-plan/cells-plan-compare.json` | Pass | Stricter schema accepted both regenerated reports; existing native GPU dead-code warnings only. |
+| `timeout 420s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail | Aggregate wrote a fresh failing report. `todomvc-full-engine-compare` and `cells-full-engine-compare` are current/pass inside the aggregate, but most older required child reports still fail schema due stale `boon_cli` binary hashes and old `git_commit=d6eb154` evidence. |
+
+Independent review:
+
+- Subagent `019eebd4-c006-7101-a896-a9b6a299c830` identified this as the best
+  next non-native slice: TodoMVC and Cells reports previously passed while
+  explicitly declaring assertion-only steps uncovered.
+- Subagent `019eebe4-b56d-7052-9c16-d1a52db858a7` reviewed the first diff and
+  found two medium evidence gaps: runtime parity was based on checkpoint count
+  alone, and schema did not bind checkpoint contents to scenario expectations.
+  Both findings were addressed before the final verification above.
+
+Open findings:
+
+- Runtime checkpoint helpers are intentionally scoped to the assertion fields
+  present in current TodoMVC and Cells scenarios. Unsupported no-event delta or
+  recompute expectations fail loudly instead of being treated as covered.
+- Todo assertions still identify the current `title` list and `visible_todos`
+  retain summary by conventions used by TodoMVC. This is acceptable for the
+  current TodoMVC/Cells parity slice but should become more ID-driven if this
+  checkpoint machinery is generalized to arbitrary examples.
+- The BYTES/MachinePlan aggregate report still needs a later fresh
+  `verify-bytes-machine-plan-all --check-existing` refresh after all child
+  reports required by the aggregate are current. This slice refreshed only the
+  TodoMVC and Cells compare reports touched by assertion-only coverage.
+- Native TodoMVC reference parity and TASK-0804A release benchmark remain
+  separate unresolved items.
+
 ## Phase 9 Report Freshness and Aggregate Revalidation
 
 Status: partial Phase 9 verification hygiene evidence; complete for the current

@@ -20,11 +20,62 @@ struct Scenario {
     step: Vec<ScenarioStep>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 struct ScenarioStep {
     id: String,
     #[serde(default)]
     expected_source_event: Option<BTreeMap<String, toml::Value>>,
+    #[serde(default)]
+    expect_titles: Option<Vec<String>>,
+    #[serde(default)]
+    expect_visible_titles: Option<Vec<String>>,
+    #[serde(default)]
+    expect_completed_titles: Option<Vec<String>>,
+    #[serde(default)]
+    expect_active_count: Option<usize>,
+    #[serde(default)]
+    expect_completed_count: Option<usize>,
+    #[serde(default)]
+    expect_filter: Option<String>,
+    #[serde(default)]
+    expect_new_text: Option<String>,
+    #[serde(default)]
+    expect_editing_title: Option<String>,
+    #[serde(default)]
+    expect_edit_text: Option<String>,
+    #[serde(default)]
+    expect_no_editing: Option<bool>,
+    #[serde(default)]
+    expect_cell: Option<ScenarioCellExpectation>,
+    #[serde(default)]
+    expect_error: Option<ScenarioCellErrorExpectation>,
+    #[serde(default)]
+    expect_recomputed: Option<Vec<String>>,
+    #[serde(default)]
+    expect_semantic_delta_contains: Vec<String>,
+    #[serde(default)]
+    expect_render_delta_contains: Vec<String>,
+    #[serde(default)]
+    expect_root_text: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ScenarioCellExpectation {
+    address: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    formula: Option<String>,
+    #[serde(default)]
+    editing_text: Option<String>,
+    #[serde(default)]
+    editing: Option<bool>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ScenarioCellErrorExpectation {
+    address: String,
+    error: String,
 }
 
 fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
@@ -3635,11 +3686,15 @@ fn verify_run_plan_scenario_events_report(
         || coverage
             .get("covers_assertion_only_steps")
             .and_then(JsonValue::as_bool)
-            != Some(expected_assertion_only_step_ids.is_empty())
+            != Some(true)
         || coverage
             .get("full_scenario_parity")
             .and_then(JsonValue::as_bool)
-            != Some(expected_assertion_only_step_ids.is_empty())
+            != Some(true)
+        || coverage
+            .get("assertion_checkpoint_count")
+            .and_then(JsonValue::as_u64)
+            != Some(expected_assertion_only_step_ids.len() as u64)
     {
         return Err(format!(
             "{} run-plan-scenario-events coverage does not match scenario event/assertion split",
@@ -3647,14 +3702,12 @@ fn verify_run_plan_scenario_events_report(
         )
         .into());
     }
-    if !expected_assertion_only_step_ids.is_empty()
-        && coverage
-            .get("full_scenario_parity_blocker")
-            .and_then(JsonValue::as_str)
-            .is_none_or(str::is_empty)
+    if !coverage
+        .get("full_scenario_parity_blocker")
+        .is_some_and(JsonValue::is_null)
     {
         return Err(format!(
-            "{} run-plan-scenario-events must explain uncovered assertion-only steps",
+            "{} run-plan-scenario-events must not claim a full-scenario parity blocker when assertion-only checkpoints are covered",
             report_path.display()
         )
         .into());
@@ -3724,6 +3777,55 @@ fn verify_run_plan_scenario_events_report(
             report_path.display()
         )
         .into());
+    }
+    let assertion_checkpoints = executor
+        .get("assertion_checkpoints")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events plan_executor.assertion_checkpoints is not an array",
+                report_path.display()
+            )
+        })?;
+    if assertion_checkpoints.len() != expected_assertion_only_step_ids.len() {
+        return Err(format!(
+            "{} run-plan-scenario-events assertion checkpoint count does not match scenario",
+            report_path.display()
+        )
+        .into());
+    }
+    let assertion_only_steps = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_none())
+        .collect::<Vec<_>>();
+    for ((checkpoint, expected_step_id), scenario_step) in assertion_checkpoints
+        .iter()
+        .zip(expected_assertion_only_step_ids.iter())
+        .zip(assertion_only_steps.iter())
+    {
+        let expected_checked = scenario_assertion_checkpoint_expectation_names(scenario_step)?;
+        let expected_checked_json = JsonValue::Array(
+            expected_checked
+                .iter()
+                .map(|name| JsonValue::String((*name).to_owned()))
+                .collect::<Vec<_>>(),
+        );
+        if checkpoint.get("step_id") != Some(expected_step_id)
+            || checkpoint.get("passed").and_then(JsonValue::as_bool) != Some(true)
+            || checkpoint
+                .get("checked_expectation_count")
+                .and_then(JsonValue::as_u64)
+                != Some(expected_checked.len() as u64)
+            || checkpoint.get("checked_expectations") != Some(&expected_checked_json)
+        {
+            return Err(format!(
+                "{} run-plan-scenario-events assertion checkpoint does not prove checked expectations for step {}",
+                report_path.display(),
+                expected_step_id
+            )
+            .into());
+        }
     }
 
     let legacy = report
@@ -3821,6 +3923,81 @@ fn verify_run_plan_scenario_events_report(
         .into());
     }
     Ok(())
+}
+
+fn scenario_assertion_checkpoint_expectation_names(
+    step: &ScenarioStep,
+) -> RuntimeResult<Vec<&'static str>> {
+    if !step.expect_semantic_delta_contains.is_empty()
+        || !step.expect_render_delta_contains.is_empty()
+    {
+        return Err(format!(
+            "run-plan-scenario-events assertion-only step `{}` cannot carry delta expectations",
+            step.id
+        )
+        .into());
+    }
+    if step.expect_recomputed.is_some() {
+        return Err(format!(
+            "run-plan-scenario-events assertion-only step `{}` cannot carry expect_recomputed",
+            step.id
+        )
+        .into());
+    }
+
+    let mut names = Vec::new();
+    if step.expect_titles.is_some() {
+        names.push("expect_titles");
+    }
+    if step.expect_visible_titles.is_some() {
+        names.push("expect_visible_titles");
+    }
+    if step.expect_completed_titles.is_some() {
+        names.push("expect_completed_titles");
+    }
+    if step.expect_active_count.is_some() {
+        names.push("expect_active_count");
+    }
+    if step.expect_completed_count.is_some() {
+        names.push("expect_completed_count");
+    }
+    if step.expect_filter.is_some() {
+        names.push("expect_filter");
+    }
+    if step.expect_new_text.is_some() {
+        names.push("expect_new_text");
+    }
+    if step.expect_editing_title.is_some() {
+        names.push("expect_editing_title");
+    }
+    if step.expect_edit_text.is_some() {
+        names.push("expect_edit_text");
+    }
+    if step.expect_no_editing.is_some() {
+        names.push("expect_no_editing");
+    }
+    if let Some(expect) = &step.expect_cell {
+        let _address = &expect.address;
+        if expect.value.is_some() {
+            names.push("expect_cell.value");
+        }
+        if expect.formula.is_some() {
+            names.push("expect_cell.formula");
+        }
+        if expect.editing_text.is_some() {
+            names.push("expect_cell.editing_text");
+        }
+        if expect.editing.is_some() {
+            names.push("expect_cell.editing");
+        }
+    }
+    if let Some(expect) = &step.expect_error {
+        let _address = &expect.address;
+        let _error = &expect.error;
+        names.push("expect_error");
+    }
+    names.extend(std::iter::repeat("expect_root_text").take(step.expect_root_text.len()));
+    Ok(names)
 }
 
 fn verify_bytes_file_write_plan_report(
@@ -19822,6 +19999,7 @@ fn route_scenario_from_source_event(
         step: vec![ScenarioStep {
             id: "live-source-event-0".to_owned(),
             expected_source_event: Some(expected_source_event),
+            ..ScenarioStep::default()
         }],
     })
 }

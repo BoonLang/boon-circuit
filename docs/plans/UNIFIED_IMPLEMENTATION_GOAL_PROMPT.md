@@ -33,6 +33,14 @@ This is a continuation of an active half-migration, not a rewrite and not a fres
 
 Do not stop after writing another plan. Implement code, tests, examples, reports, and documentation. Continue through the ordered phases as far as the current environment and real blockers permit. Do not claim completion while readiness gates still report implementation blockers. If a platform/human prerequisite prevents honest proof, complete all non-blocked work, preserve the strict gate, record the precise blocker, and stop with an evidence-based handoff rather than weakening or fabricating the result.
 
+This is intended to be one continuous `/goal`, not a sequence of unrelated
+short plans. Preserve forward progress: when one task blocks repeatedly after
+bounded diagnosis, record the blocker in the progress ledger, keep the relevant
+readiness/default-switch gate failing, and continue into the next non-blocked
+architectural phase if that phase can produce useful implementation evidence or
+may remove the blocker by changing the runtime/document/layout/render pipeline.
+Do not spin indefinitely on one benchmark or slow path.
+
 ──────────────────────────────────────────────────────────────────────────────
 A. FIRST: INSPECT, RECONCILE, AND PRESERVE THE ACTIVE MIGRATION
 ──────────────────────────────────────────────────────────────────────────────
@@ -144,7 +152,7 @@ Required outcomes:
 - complete MachinePlan lowering coverage;
 - finish typed/columnar hot runtime storage and dense route indexes;
 - close remaining row/function BYTES operation gaps;
-- close the current release Cells benchmark/speed-budget work, including the actual successor of TASK-0804A if IDs changed;
+- diagnose and attempt to close the current release Cells benchmark/speed-budget work, including the actual successor of TASK-0804A if IDs changed;
 - prove parity across TodoMVC, full Cells, BYTES, keyed LIST behavior, negative cases, and reports;
 - ensure runtime output is typed semantic change batches;
 - switch normal boon_cli run to PlanExecutor only after parity, performance, and readiness gates permit it;
@@ -152,6 +160,26 @@ Required outcomes:
 - remove legacy code only after default-path soak and no-hidden-fallback verification.
 
 Do not describe the runtime as final while audit-goal-readiness reports runtime implementation blockers.
+
+TASK-0804A and related Cells benchmark blockers are not permission to loop
+forever. Run a bounded investigation, preserve the best measurements and
+root-cause notes, and make one of these decisions:
+
+- fixed: update the BYTES/MachinePlan progress ledger, rerun aggregate and
+  readiness gates, and continue toward the default switch;
+- still blocked by the current runtime architecture: keep the default switch and
+  old readiness gate blocked, create or update a reviewed ADR/progress entry
+  that says which later runtime/document/layout/render phases are expected to
+  remove the cost, then continue into those phases;
+- invalid/stale task: supersede it with replacement evidence, an explicit ADR,
+  and a new tracked task/report.
+
+Do not relabel TASK-0804A as solved merely because later phases are planned.
+Also do not prevent later runtime, retained document/layout/render, or WGPU
+work from starting solely because TASK-0804A remains open; those changes may be
+the real fix. The unified goal is only complete when the final readiness and
+performance gates prove the blocker is fixed, superseded, or no longer relevant
+to the default path.
 
 PHASE 2 — TRANSACTIONAL DOCUMENT CHANGES AND HOT RETAINED MODEL
 

@@ -1,0 +1,6 @@
+name = "bytes indexed same-event dependency plan ops"
+source = "examples/bytes_indexed_same_event_dependency_plan_ops.bn"
+
+[[step]]
+id = "receive-beta-bytes-and-read"
+expected_source_event = { source = "row.receive", target_key = 2, target_generation = 1, bytes_hex = "01fe04" }

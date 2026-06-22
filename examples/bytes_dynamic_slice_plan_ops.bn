@@ -1,0 +1,29 @@
+payload:
+    BYTES[6] { 16u10, 16u11, 16u12, 16u13, 16u14, 16u15 } |> HOLD payload { LATEST {} }
+
+store: [
+    split: SOURCE
+    inspect: SOURCE
+    slice_count:
+        3 |> HOLD slice_count { LATEST {} }
+    dynamic_sliced:
+        BYTES {} |> HOLD dynamic_sliced {
+            LATEST {
+                store.split |> THEN { payload |> Bytes/slice(offset: 1, byte_count: store.slice_count) }
+            }
+        }
+    dynamic_len:
+        0 |> HOLD dynamic_len {
+            LATEST {
+                store.inspect |> THEN { store.dynamic_sliced |> Bytes/length }
+            }
+        }
+    dynamic_byte:
+        16u00 |> HOLD dynamic_byte {
+            LATEST {
+                store.inspect |> THEN { store.dynamic_sliced |> Bytes/get(index: 2) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Dynamic bytes slice }))

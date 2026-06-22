@@ -1,0 +1,10 @@
+name = "bytes dynamic slice plan ops"
+source = "examples/bytes_dynamic_slice_plan_ops.bn"
+
+[[step]]
+id = "split-dynamic-bytes"
+expected_source_event = { source = "store.split" }
+
+[[step]]
+id = "inspect-dynamic-slice"
+expected_source_event = { source = "store.inspect" }

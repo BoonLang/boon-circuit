@@ -1,8 +1,8 @@
 use boon_ir::{
-    DerivedValueKind, FieldId, FileBytesPath, InitialValue, ListAppendFieldValue, ListId,
-    ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, ScopeId, SourceId,
-    SourcePayloadField, SourcePayloadSchema, StateId, TypedProgram, UpdateExpression, UpdateGuard,
-    UpdateValueExpression,
+    BytesScalarArg, DerivedValueKind, FieldId, FileBytesPath, InitialValue, ListAppendFieldValue,
+    ListId, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, ScopeId,
+    SourceId, SourcePayloadField, SourcePayloadSchema, SourcePayloadValueType, StateId,
+    TypedProgram, UpdateExpression, UpdateGuard, UpdateValueExpression,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, BytesSizeSyntax,
@@ -483,6 +483,42 @@ pub enum PlanRowExpression {
         input: Box<PlanRowExpression>,
         start: Box<PlanRowExpression>,
         length: Box<PlanRowExpression>,
+    },
+    TextToBytes {
+        input: Box<PlanRowExpression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoding: Option<Box<PlanRowExpression>>,
+    },
+    BytesIsEmpty {
+        input: Box<PlanRowExpression>,
+    },
+    BytesLength {
+        input: Box<PlanRowExpression>,
+    },
+    BytesGet {
+        input: Box<PlanRowExpression>,
+        index: Box<PlanRowExpression>,
+    },
+    BytesSlice {
+        input: Box<PlanRowExpression>,
+        offset: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+    },
+    BytesFind {
+        input: Box<PlanRowExpression>,
+        needle: Box<PlanRowExpression>,
+    },
+    BytesStartsWith {
+        input: Box<PlanRowExpression>,
+        prefix: Box<PlanRowExpression>,
+    },
+    BytesEndsWith {
+        input: Box<PlanRowExpression>,
+        suffix: Box<PlanRowExpression>,
+    },
+    BytesEqual {
+        left: Box<PlanRowExpression>,
+        right: Box<PlanRowExpression>,
     },
     NumberInfix {
         op: String,
@@ -2677,22 +2713,55 @@ fn bytes_slice_inputs_are_supported(
         ordered_inputs,
         [
             ValueRef::State(input),
-            ValueRef::Constant(offset_constant_id),
-            ValueRef::Constant(byte_count_constant_id)
+            offset_ref,
+            byte_count_ref
         ] if op.inputs.contains(&ValueRef::State(*input))
+            && bytes_number_operand_is_supported(scalar_slots, constants, op, offset_ref)
+            && bytes_number_operand_is_supported(scalar_slots, constants, op, byte_count_ref)
             && state_bytes_fixed_len(scalar_slots, *input).is_some_and(|input_len| {
-                let Some(offset) = plan_number_constant_u64(constants, *offset_constant_id) else {
-                    return false;
-                };
-                let Some(byte_count) = plan_number_constant_u64(constants, *byte_count_constant_id) else {
-                    return false;
-                };
-                match input_len {
-                    Some(len) => offset.checked_add(byte_count).is_some_and(|end| end <= len),
-                    None => true,
+                match (
+                    input_len,
+                    bytes_number_operand_constant_u64(constants, offset_ref),
+                    bytes_number_operand_constant_u64(constants, byte_count_ref),
+                ) {
+                    (Some(len), Some(offset), Some(byte_count)) => {
+                        offset.checked_add(byte_count).is_some_and(|end| end <= len)
+                    }
+                    (Some(_), Some(_), None) => true,
+                    (Some(_), None, _) => true,
+                    (None, _, _) => true,
                 }
             })
     )
+}
+
+fn bytes_number_operand_is_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    value_ref: &ValueRef,
+) -> bool {
+    match value_ref {
+        ValueRef::Constant(constant_id) => {
+            plan_number_constant_u64(constants, *constant_id).is_some()
+        }
+        ValueRef::State(state_id) => {
+            op.inputs.contains(&ValueRef::State(*state_id))
+                && plan_value_type_for_state_slots(scalar_slots, *state_id)
+                    == Some(&PlanValueType::Number)
+        }
+        _ => false,
+    }
+}
+
+fn bytes_number_operand_constant_u64(
+    constants: &[PlanConstant],
+    value_ref: &ValueRef,
+) -> Option<u64> {
+    match value_ref {
+        ValueRef::Constant(constant_id) => plan_number_constant_u64(constants, *constant_id),
+        _ => None,
+    }
 }
 
 fn numeric_byte_count_is_valid(byte_count: u64) -> bool {
@@ -2818,15 +2887,14 @@ fn bytes_take_inputs_are_supported(
     let ordered_inputs = update_branch_ordered_inputs(op);
     matches!(
         ordered_inputs,
-        [ValueRef::State(input), ValueRef::Constant(byte_count_constant_id)]
+        [ValueRef::State(input), byte_count_ref]
             if op.inputs.contains(&ValueRef::State(*input))
+                && bytes_number_operand_is_supported(scalar_slots, constants, op, byte_count_ref)
                 && state_bytes_fixed_len(scalar_slots, *input).is_some_and(|input_len| {
-                    let Some(byte_count) = plan_number_constant_u64(constants, *byte_count_constant_id) else {
-                        return false;
-                    };
-                    match input_len {
-                        Some(len) => byte_count <= len,
-                        None => true,
+                    match (input_len, bytes_number_operand_constant_u64(constants, byte_count_ref)) {
+                        (Some(len), Some(byte_count)) => byte_count <= len,
+                        (Some(_), None) => true,
+                        (None, _) => true,
                     }
                 })
     )
@@ -3057,19 +3125,13 @@ fn bytes_slice_fixed_lengths_match(
     op: &PlanOp,
 ) -> bool {
     let ordered_inputs = update_branch_ordered_inputs(op);
-    let [
-        ValueRef::State(_input),
-        ValueRef::Constant(_offset_constant_id),
-        ValueRef::Constant(byte_count_constant_id),
-    ] = ordered_inputs
-    else {
-        return false;
-    };
-    let Some(byte_count) = plan_number_constant_u64(constants, *byte_count_constant_id) else {
+    let [ValueRef::State(_input), _offset_ref, byte_count_ref] = ordered_inputs else {
         return false;
     };
     match output_bytes_fixed_len(scalar_slots, op) {
-        Some(Some(output_len)) => output_len == byte_count,
+        Some(Some(output_len)) => {
+            bytes_number_operand_constant_u64(constants, byte_count_ref) == Some(output_len)
+        }
         Some(None) => true,
         None => false,
     }
@@ -3081,18 +3143,13 @@ fn bytes_take_fixed_lengths_match(
     op: &PlanOp,
 ) -> bool {
     let ordered_inputs = update_branch_ordered_inputs(op);
-    let [
-        ValueRef::State(_input),
-        ValueRef::Constant(byte_count_constant_id),
-    ] = ordered_inputs
-    else {
-        return false;
-    };
-    let Some(byte_count) = plan_number_constant_u64(constants, *byte_count_constant_id) else {
+    let [ValueRef::State(_input), byte_count_ref] = ordered_inputs else {
         return false;
     };
     match output_bytes_fixed_len(scalar_slots, op) {
-        Some(Some(output_len)) => output_len == byte_count,
+        Some(Some(output_len)) => {
+            bytes_number_operand_constant_u64(constants, byte_count_ref) == Some(output_len)
+        }
         Some(None) => true,
         None => false,
     }
@@ -3104,25 +3161,24 @@ fn bytes_drop_fixed_lengths_match(
     op: &PlanOp,
 ) -> bool {
     let ordered_inputs = update_branch_ordered_inputs(op);
-    let [
-        ValueRef::State(input),
-        ValueRef::Constant(byte_count_constant_id),
-    ] = ordered_inputs
-    else {
-        return false;
-    };
-    let Some(byte_count) = plan_number_constant_u64(constants, *byte_count_constant_id) else {
+    let [ValueRef::State(input), byte_count_ref] = ordered_inputs else {
         return false;
     };
     let Some(output_len) = output_bytes_fixed_len(scalar_slots, op) else {
         return false;
     };
-    match (state_bytes_fixed_len(scalar_slots, *input), output_len) {
-        (Some(Some(input_len)), Some(output_len)) => input_len
+    match (
+        state_bytes_fixed_len(scalar_slots, *input),
+        output_len,
+        bytes_number_operand_constant_u64(constants, byte_count_ref),
+    ) {
+        (Some(Some(input_len)), Some(output_len), Some(byte_count)) => input_len
             .checked_sub(byte_count)
             .is_some_and(|expected| expected == output_len),
-        (Some(Some(_)), None) => true,
-        (Some(None), _) => true,
+        (Some(Some(_)), Some(_), None) => false,
+        (Some(Some(_)), None, _) => true,
+        (Some(None), None, _) => true,
+        (Some(None), Some(_), _) => false,
         _ => false,
     }
 }
@@ -3259,6 +3315,55 @@ fn source_payload_input_matches_single_source(op: &PlanOp, expected: &SourcePayl
         payload_inputs.as_slice(),
         [(payload_source_id, field)] if payload_source_id == source_id && field == expected
     )
+}
+
+fn source_payload_refs_are_declared_and_typed(
+    plan: &MachinePlan,
+    op: &PlanOp,
+    expected: &SourcePayloadField,
+) -> bool {
+    let Some(output_type) = output_state_type(&plan.storage_layout.scalar_slots, op) else {
+        return false;
+    };
+    let payload_inputs = source_payload_input_ids(op);
+    if payload_inputs.is_empty() {
+        return false;
+    }
+    for (source_id, field) in payload_inputs {
+        if &field != expected {
+            return false;
+        }
+        let Some(route) = plan
+            .source_routes
+            .iter()
+            .find(|route| route.source_id == source_id)
+        else {
+            return false;
+        };
+        let Some(payload_type) = route
+            .payload_schema
+            .typed_fields
+            .iter()
+            .find(|descriptor| descriptor.field == field)
+            .map(|descriptor| descriptor.value_type)
+        else {
+            return false;
+        };
+        if !source_payload_value_type_matches_plan_type(payload_type, output_type) {
+            return false;
+        }
+    }
+    true
+}
+
+fn source_payload_value_type_matches_plan_type(
+    payload_type: SourcePayloadValueType,
+    plan_type: &PlanValueType,
+) -> bool {
+    match payload_type {
+        SourcePayloadValueType::Bytes => matches!(plan_type, PlanValueType::Bytes { .. }),
+        SourcePayloadValueType::Text => plan_type == &PlanValueType::Text,
+    }
 }
 
 fn source_payload_output_type_is_supported(
@@ -4622,6 +4727,17 @@ fn row_expression_value_type(
         PlanRowExpression::TextTrim { .. }
         | PlanRowExpression::TextSubstring { .. }
         | PlanRowExpression::TextConcat { .. } => Some(PlanValueType::Text),
+        PlanRowExpression::TextToBytes { .. } | PlanRowExpression::BytesSlice { .. } => {
+            Some(PlanValueType::Bytes { fixed_len: None })
+        }
+        PlanRowExpression::BytesLength { .. } | PlanRowExpression::BytesFind { .. } => {
+            Some(PlanValueType::Number)
+        }
+        PlanRowExpression::BytesGet { .. } => Some(PlanValueType::Byte),
+        PlanRowExpression::BytesIsEmpty { .. }
+        | PlanRowExpression::BytesStartsWith { .. }
+        | PlanRowExpression::BytesEndsWith { .. }
+        | PlanRowExpression::BytesEqual { .. } => Some(PlanValueType::Bool),
         PlanRowExpression::TextIsEmpty { .. } | PlanRowExpression::TextStartsWith { .. } => {
             Some(PlanValueType::Bool)
         }
@@ -4631,8 +4747,6 @@ fn row_expression_value_type(
         | PlanRowExpression::ListSum { .. } => Some(PlanValueType::Number),
         PlanRowExpression::BuiltinCall { function, .. } => match function.as_str() {
             "Text/empty" | "Error/text" => Some(PlanValueType::Text),
-            "Bytes/length" | "Bytes/find" => Some(PlanValueType::Number),
-            "Bytes/starts_with" => Some(PlanValueType::Bool),
             _ => None,
         },
         PlanRowExpression::Select { arms, .. } => {
@@ -4930,11 +5044,14 @@ fn row_generic_builtin(function: &str) -> bool {
         function,
         "Text/empty"
             | "Text/to_bytes"
+            | "Bytes/is_empty"
             | "Bytes/length"
             | "Bytes/get"
             | "Bytes/slice"
             | "Bytes/find"
             | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/equal"
             | "Error/new"
             | "Error/text"
     )
@@ -5229,11 +5346,123 @@ fn lower_row_builtin_call(
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    if function == "Text/to_bytes" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
+        let encoding = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("encoding"))
+            .map(|arg| Box::new(arg.value.clone()));
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::TextToBytes {
+            input: Box::new(input),
+            encoding,
+        }));
+    }
+    if function == "Bytes/is_empty" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesIsEmpty {
+            input: Box::new(input),
+        }));
+    }
+    if function == "Bytes/length" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesLength {
+            input: Box::new(input),
+        }));
+    }
+    if function == "Bytes/get" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let index = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("index"))
+            .map(|arg| arg.value.clone())?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesGet {
+            input: Box::new(input),
+            index: Box::new(index),
+        }));
+    }
+    if function == "Bytes/slice" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let offset = args
+            .iter()
+            .find(|arg| {
+                arg.name
+                    .as_deref()
+                    .is_some_and(|name| name == "offset" || name == "start")
+            })
+            .map(|arg| arg.value.clone())?;
+        let byte_count = args
+            .iter()
+            .find(|arg| {
+                arg.name
+                    .as_deref()
+                    .is_some_and(|name| name == "byte_count" || name == "length" || name == "count")
+            })
+            .map(|arg| arg.value.clone())?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesSlice {
+            input: Box::new(input),
+            offset: Box::new(offset),
+            byte_count: Box::new(byte_count),
+        }));
+    }
+    if function == "Bytes/find" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let needle = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("needle"))
+            .map(|arg| arg.value.clone())?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesFind {
+            input: Box::new(input),
+            needle: Box::new(needle),
+        }));
+    }
+    if function == "Bytes/starts_with" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let prefix = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("prefix"))
+            .map(|arg| arg.value.clone())?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesStartsWith {
+                input: Box::new(input),
+                prefix: Box::new(prefix),
+            },
+        ));
+    }
+    if function == "Bytes/ends_with" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let suffix = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("suffix"))
+            .map(|arg| arg.value.clone())?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesEndsWith {
+            input: Box::new(input),
+            suffix: Box::new(suffix),
+        }));
+    }
+    if function == "Bytes/equal" {
+        let left = input.or_else(|| row_call_arg_value(&args, &["left", "input"]))?;
+        let right = row_call_arg_value(&args, &["right", "with"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesEqual {
+            left: Box::new(left),
+            right: Box::new(right),
+        }));
+    }
+
     Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
         function: function.to_owned(),
         input: input.map(Box::new),
         args,
     }))
+}
+
+fn row_call_arg_value(args: &[PlanRowCallArg], names: &[&str]) -> Option<PlanRowExpression> {
+    args.iter()
+        .find(|arg| {
+            arg.name
+                .as_deref()
+                .is_some_and(|name| names.iter().any(|candidate| *candidate == name))
+        })
+        .map(|arg| arg.value.clone())
 }
 
 fn row_builtin_arg_expects_number(function: &str, arg_name: Option<&str>) -> bool {
@@ -5948,9 +6177,6 @@ fn collect_update_expression_refs(
         | UpdateExpression::BytesIsEmpty { path }
         | UpdateExpression::BytesGet { path, .. }
         | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesSlice { path, .. }
-        | UpdateExpression::BytesTake { path, .. }
-        | UpdateExpression::BytesDrop { path, .. }
         | UpdateExpression::BytesToHex { path }
         | UpdateExpression::BytesFromHex { path }
         | UpdateExpression::BytesToBase64 { path }
@@ -5962,6 +6188,30 @@ fn collect_update_expression_refs(
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
             resolve_update_path(index, source, target, indexed, path, refs, unresolved)
+        }
+        UpdateExpression::BytesSlice {
+            path,
+            offset,
+            byte_count,
+        } => {
+            let mut count =
+                resolve_update_path(index, source, target, indexed, path, refs, unresolved);
+            count += collect_bytes_scalar_arg_ref(
+                index, source, target, indexed, offset, refs, unresolved,
+            );
+            count += collect_bytes_scalar_arg_ref(
+                index, source, target, indexed, byte_count, refs, unresolved,
+            );
+            count
+        }
+        UpdateExpression::BytesTake { path, byte_count }
+        | UpdateExpression::BytesDrop { path, byte_count } => {
+            let mut count =
+                resolve_update_path(index, source, target, indexed, path, refs, unresolved);
+            count += collect_bytes_scalar_arg_ref(
+                index, source, target, indexed, byte_count, refs, unresolved,
+            );
+            count
         }
         UpdateExpression::FileWriteBytes { bytes_path, path } => {
             let unresolved_count =
@@ -6112,6 +6362,23 @@ fn collect_update_expression_refs(
     }
 }
 
+fn collect_bytes_scalar_arg_ref(
+    index: &ValueIndex,
+    source: &str,
+    target: &str,
+    indexed: bool,
+    arg: &BytesScalarArg,
+    refs: &mut Vec<ValueRef>,
+    unresolved: &mut BTreeSet<String>,
+) -> usize {
+    match arg {
+        BytesScalarArg::Static(_) => 0,
+        BytesScalarArg::Path(path) => {
+            resolve_update_path(index, source, target, indexed, path, refs, unresolved)
+        }
+    }
+}
+
 fn ordered_update_expression_inputs(
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
@@ -6166,45 +6433,29 @@ fn ordered_update_expression_inputs(
             let Some(input) = resolve_update_value_ref(index, source, target, indexed, path) else {
                 return Vec::new();
             };
-            let Some(offset_value) = i64::try_from(*offset).ok() else {
+            let Some(offset_ref) =
+                bytes_scalar_arg_value_ref(index, constants, source, target, indexed, offset)
+            else {
                 return Vec::new();
             };
-            let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
+            let Some(byte_count_ref) =
+                bytes_scalar_arg_value_ref(index, constants, source, target, indexed, byte_count)
+            else {
                 return Vec::new();
             };
-            let offset_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: offset_value,
-                },
-            );
-            let byte_count_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: byte_count_value,
-                },
-            );
-            vec![
-                input,
-                ValueRef::Constant(offset_constant_id),
-                ValueRef::Constant(byte_count_constant_id),
-            ]
+            vec![input, offset_ref, byte_count_ref]
         }
         UpdateExpression::BytesTake { path, byte_count }
         | UpdateExpression::BytesDrop { path, byte_count } => {
             let Some(input) = resolve_update_value_ref(index, source, target, indexed, path) else {
                 return Vec::new();
             };
-            let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
+            let Some(byte_count_ref) =
+                bytes_scalar_arg_value_ref(index, constants, source, target, indexed, byte_count)
+            else {
                 return Vec::new();
             };
-            let byte_count_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: byte_count_value,
-                },
-            );
-            vec![input, ValueRef::Constant(byte_count_constant_id)]
+            vec![input, byte_count_ref]
         }
         UpdateExpression::BytesZeros { byte_count } => {
             let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
@@ -6630,6 +6881,28 @@ fn source_event_ref_variants(source: &str) -> Vec<String> {
     variants
 }
 
+fn bytes_scalar_arg_value_ref(
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    source: &str,
+    target: &str,
+    indexed: bool,
+    arg: &BytesScalarArg,
+) -> Option<ValueRef> {
+    match arg {
+        BytesScalarArg::Static(value) => {
+            let value = i64::try_from(*value).ok()?;
+            Some(ValueRef::Constant(push_plan_constant(
+                constants,
+                PlanConstantValue::Number { value },
+            )))
+        }
+        BytesScalarArg::Path(path) => {
+            resolve_update_value_ref(index, source, target, indexed, path)
+        }
+    }
+}
+
 fn update_expression_kind_for_branch(
     index: &ValueIndex,
     source: &str,
@@ -6895,6 +7168,9 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                     let Some(field) = source_payload_field.as_ref() else {
                         return false;
                     };
+                    if !source_payload_refs_are_declared_and_typed(plan, op, field) {
+                        return false;
+                    }
                     if update_constant_id.is_some() {
                         return false;
                     }
@@ -7011,11 +7287,7 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         return false;
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
-                    let [
-                        ValueRef::State(input),
-                        ValueRef::Constant(offset_constant_id),
-                        ValueRef::Constant(byte_count_constant_id),
-                    ] = ordered_inputs
+                    let [ValueRef::State(input), offset_ref, byte_count_ref] = ordered_inputs
                     else {
                         return false;
                     };
@@ -7031,20 +7303,26 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                     else {
                         return false;
                     };
-                    let Some(offset) =
-                        plan_number_constant_u64(&plan.constants, *offset_constant_id)
-                    else {
+                    if !bytes_number_operand_is_supported(
+                        &plan.storage_layout.scalar_slots,
+                        &plan.constants,
+                        op,
+                        offset_ref,
+                    ) || !bytes_number_operand_is_supported(
+                        &plan.storage_layout.scalar_slots,
+                        &plan.constants,
+                        op,
+                        byte_count_ref,
+                    ) {
                         return false;
-                    };
-                    let Some(byte_count) =
-                        plan_number_constant_u64(&plan.constants, *byte_count_constant_id)
-                    else {
-                        return false;
-                    };
-                    if let Some(len) = input_len
-                        && !offset
-                            .checked_add(byte_count)
-                            .is_some_and(|end| end <= *len)
+                    }
+                    if let (Some(len), Some(offset), Some(byte_count)) = (
+                        input_len,
+                        bytes_number_operand_constant_u64(&plan.constants, offset_ref),
+                        bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
+                    ) && !offset
+                        .checked_add(byte_count)
+                        .is_some_and(|end| end <= *len)
                     {
                         return false;
                     }
@@ -7069,11 +7347,7 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         return false;
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
-                    let [
-                        ValueRef::State(input),
-                        ValueRef::Constant(byte_count_constant_id),
-                    ] = ordered_inputs
-                    else {
+                    let [ValueRef::State(input), byte_count_ref] = ordered_inputs else {
                         return false;
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
@@ -7088,13 +7362,18 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                     else {
                         return false;
                     };
-                    let Some(byte_count) =
-                        plan_number_constant_u64(&plan.constants, *byte_count_constant_id)
-                    else {
+                    if !bytes_number_operand_is_supported(
+                        &plan.storage_layout.scalar_slots,
+                        &plan.constants,
+                        op,
+                        byte_count_ref,
+                    ) {
                         return false;
-                    };
-                    if let Some(len) = input_len
-                        && byte_count > *len
+                    }
+                    if let (Some(len), Some(byte_count)) = (
+                        input_len,
+                        bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
+                    ) && byte_count > *len
                     {
                         return false;
                     }
@@ -7119,11 +7398,7 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         return false;
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
-                    let [
-                        ValueRef::State(input),
-                        ValueRef::Constant(byte_count_constant_id),
-                    ] = ordered_inputs
-                    else {
+                    let [ValueRef::State(input), byte_count_ref] = ordered_inputs else {
                         return false;
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
@@ -7138,13 +7413,18 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                     else {
                         return false;
                     };
-                    let Some(byte_count) =
-                        plan_number_constant_u64(&plan.constants, *byte_count_constant_id)
-                    else {
+                    if !bytes_number_operand_is_supported(
+                        &plan.storage_layout.scalar_slots,
+                        &plan.constants,
+                        op,
+                        byte_count_ref,
+                    ) {
                         return false;
-                    };
-                    if let Some(len) = input_len
-                        && byte_count > *len
+                    }
+                    if let (Some(len), Some(byte_count)) = (
+                        input_len,
+                        bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
+                    ) && byte_count > *len
                     {
                         return false;
                     }
@@ -8017,6 +8297,38 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
                 && row_expression_refs_resolve(op, start)
                 && row_expression_refs_resolve(op, length)
         }
+        PlanRowExpression::TextToBytes { input, encoding } => {
+            row_expression_refs_resolve(op, input)
+                && encoding
+                    .as_deref()
+                    .is_none_or(|encoding| row_expression_refs_resolve(op, encoding))
+        }
+        PlanRowExpression::BytesIsEmpty { input } => row_expression_refs_resolve(op, input),
+        PlanRowExpression::BytesLength { input } => row_expression_refs_resolve(op, input),
+        PlanRowExpression::BytesGet { input, index } => {
+            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, index)
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => {
+            row_expression_refs_resolve(op, input)
+                && row_expression_refs_resolve(op, offset)
+                && row_expression_refs_resolve(op, byte_count)
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, needle)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix } => {
+            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, prefix)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, suffix)
+        }
+        PlanRowExpression::BytesEqual { left, right } => {
+            row_expression_refs_resolve(op, left) && row_expression_refs_resolve(op, right)
+        }
         PlanRowExpression::NumberInfix { left, right, .. } => {
             row_expression_refs_resolve(op, left) && row_expression_refs_resolve(op, right)
         }
@@ -8114,6 +8426,47 @@ fn row_expression_list_fields_resolve_inner(
                 && row_expression_list_fields_resolve_inner(plan, start)
                 && row_expression_list_fields_resolve_inner(plan, length)
         }
+        PlanRowExpression::TextToBytes { input, encoding } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && encoding
+                    .as_deref()
+                    .is_none_or(|encoding| row_expression_list_fields_resolve_inner(plan, encoding))
+        }
+        PlanRowExpression::BytesIsEmpty { input } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+        }
+        PlanRowExpression::BytesLength { input } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, index)
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, offset)
+                && row_expression_list_fields_resolve_inner(plan, byte_count)
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, needle)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, prefix)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, suffix)
+        }
+        PlanRowExpression::BytesEqual { left, right } => {
+            row_expression_list_fields_resolve_inner(plan, left)
+                && row_expression_list_fields_resolve_inner(plan, right)
+        }
         PlanRowExpression::NumberInfix { left, right, .. } => {
             row_expression_list_fields_resolve_inner(plan, left)
                 && row_expression_list_fields_resolve_inner(plan, right)
@@ -8210,6 +8563,38 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                 && row_expression_cpu_evaluable(start)
                 && row_expression_cpu_evaluable(length)
         }
+        PlanRowExpression::TextToBytes { input, encoding } => {
+            row_expression_cpu_evaluable(input)
+                && encoding
+                    .as_deref()
+                    .is_some_and(row_expression_cpu_evaluable)
+        }
+        PlanRowExpression::BytesIsEmpty { input } => row_expression_cpu_evaluable(input),
+        PlanRowExpression::BytesLength { input } => row_expression_cpu_evaluable(input),
+        PlanRowExpression::BytesGet { input, index } => {
+            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(index)
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => {
+            row_expression_cpu_evaluable(input)
+                && row_expression_cpu_evaluable(offset)
+                && row_expression_cpu_evaluable(byte_count)
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(needle)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix } => {
+            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(prefix)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(suffix)
+        }
+        PlanRowExpression::BytesEqual { left, right } => {
+            row_expression_cpu_evaluable(left) && row_expression_cpu_evaluable(right)
+        }
         PlanRowExpression::NumberInfix { left, right, .. } => {
             row_expression_cpu_evaluable(left) && row_expression_cpu_evaluable(right)
         }
@@ -8223,18 +8608,8 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
             input,
             args,
         } => {
-            matches!(
-                function.as_str(),
-                "Text/empty"
-                    | "Text/to_bytes"
-                    | "Bytes/length"
-                    | "Bytes/get"
-                    | "Bytes/slice"
-                    | "Bytes/find"
-                    | "Bytes/starts_with"
-                    | "Error/new"
-                    | "Error/text"
-            ) && input.as_deref().is_none_or(row_expression_cpu_evaluable)
+            matches!(function.as_str(), "Text/empty" | "Error/new" | "Error/text")
+                && input.as_deref().is_none_or(row_expression_cpu_evaluable)
                 && args
                     .iter()
                     .all(|arg| row_expression_cpu_evaluable(&arg.value))
@@ -10035,6 +10410,132 @@ document: Document/new(root: Element/label(element: [], label: store.decoded))
     }
 
     #[test]
+    fn bytes_set_conversion_bank_updates_lower_to_typed_executable_plan_ops() {
+        let parsed = boon_parser::parse_source(
+            "examples/bytes_set_conversion_bank_plan_ops.bn",
+            include_str!("../../../examples/bytes_set_conversion_bank_plan_ops.bn").to_owned(),
+        )
+        .unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let verification = verify_plan(&plan).unwrap();
+        assert_eq!(verification.status, "pass");
+        assert!(plan.capability_summary.cpu_plan_executor_complete);
+        assert_eq!(
+            plan.capability_summary
+                .cpu_plan_executor_unsupported_op_count,
+            0
+        );
+        assert_eq!(plan.capability_summary.executable_string_path_count, 0);
+        assert_eq!(plan.capability_summary.runtime_ast_dependency_count, 0);
+        assert_eq!(plan.capability_summary.unknown_plan_op_count, 0);
+
+        let constant_value = |constant_id: PlanConstantId| {
+            plan.constants
+                .iter()
+                .find(|constant| constant.id == constant_id)
+                .map(|constant| &constant.value)
+                .unwrap_or_else(|| panic!("missing plan constant {constant_id:?}"))
+        };
+        let patch_source_id =
+            debug_entry_id(&plan.debug_map.source_routes, "source", "store.patch");
+        let inspect_source_id =
+            debug_entry_id(&plan.debug_map.source_routes, "source", "store.inspect");
+        let left_payload_state_id =
+            debug_entry_id(&plan.debug_map.state_slots, "state", "left_payload");
+        let patched_state_id =
+            debug_entry_id(&plan.debug_map.state_slots, "state", "store.patched");
+
+        let op_for = |source_id: usize, target: &str| {
+            let target_state_id = debug_entry_id(&plan.debug_map.state_slots, "state", target);
+            plan.regions
+                .iter()
+                .filter(|region| region.kind == RegionKind::UpdateBranches)
+                .flat_map(|region| region.ops.iter())
+                .find(|op| {
+                    op.inputs
+                        .iter()
+                        .any(|input| matches!(input, ValueRef::Source(id) if id.0 == source_id))
+                        && matches!(&op.output, Some(ValueRef::State(id)) if id.0 == target_state_id)
+                })
+                .unwrap_or_else(|| panic!("missing update op for {target}"))
+        };
+
+        let patch_op = op_for(patch_source_id, "store.patched");
+        let PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::BytesSet,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } = &patch_op.kind
+        else {
+            panic!("Bytes/set op should carry typed ordered operands: {patch_op:#?}");
+        };
+        let [
+            ValueRef::State(input_bytes),
+            ValueRef::Constant(index_id),
+            ValueRef::Constant(value_id),
+        ] = ordered_inputs.as_slice()
+        else {
+            panic!("Bytes/set ordered operands should be state/index/value: {ordered_inputs:#?}");
+        };
+        assert_eq!(input_bytes.0, left_payload_state_id);
+        assert_eq!(
+            constant_value(*index_id),
+            &PlanConstantValue::Number { value: 1 }
+        );
+        assert_eq!(
+            constant_value(*value_id),
+            &PlanConstantValue::Byte { value: 0x5A }
+        );
+
+        let text_op = op_for(inspect_source_id, "store.text");
+        let PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::BytesToText,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } = &text_op.kind
+        else {
+            panic!("Bytes/to_text op should carry typed ordered operands: {text_op:#?}");
+        };
+        let [ValueRef::State(text_input), ValueRef::Constant(encoding_id)] =
+            ordered_inputs.as_slice()
+        else {
+            panic!(
+                "Bytes/to_text ordered operands should be patched state plus encoding: {ordered_inputs:#?}"
+            );
+        };
+        assert_eq!(text_input.0, patched_state_id);
+        assert_eq!(
+            constant_value(*encoding_id),
+            &PlanConstantValue::Text {
+                value: "Utf8".to_owned()
+            }
+        );
+
+        for (target, expression_kind) in [
+            ("store.hex", PlanExpressionKind::BytesToHex),
+            ("store.base64", PlanExpressionKind::BytesToBase64),
+        ] {
+            let op = op_for(inspect_source_id, target);
+            assert!(matches!(
+                &op.kind,
+                PlanOpKind::UpdateBranch {
+                    expression_kind: actual_kind,
+                    source_payload_field: None,
+                    update_constant_id: None,
+                    ordered_inputs,
+                    ..
+                } if *actual_kind == expression_kind
+                    && ordered_inputs == &vec![ValueRef::State(StateId(patched_state_id))]
+            ));
+        }
+    }
+
+    #[test]
     fn bytes_numeric_updates_lower_to_ordered_typed_executable_plan_ops() {
         let parsed = boon_parser::parse_source(
             "examples/bytes_numeric_plan_ops.bn",
@@ -10584,6 +11085,101 @@ document: Document/new(root: Element/label(element: [], label: store.decoded))
     }
 
     #[test]
+    fn bytes_dynamic_slice_count_lowers_to_typed_number_state_operand() {
+        let parsed = boon_parser::parse_source(
+            "examples/bytes_dynamic_slice_plan_ops.bn",
+            include_str!("../../../examples/bytes_dynamic_slice_plan_ops.bn").to_owned(),
+        )
+        .unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let verification = verify_plan(&plan).unwrap();
+        assert_eq!(verification.status, "pass");
+        assert!(
+            plan.capability_summary.cpu_plan_executor_complete,
+            "dynamic Bytes/slice fixture should be executable by the CPU PlanExecutor: {:#?}",
+            plan.capability_summary
+        );
+        assert_eq!(plan.capability_summary.executable_string_path_count, 0);
+        assert_eq!(plan.capability_summary.unknown_plan_op_count, 0);
+
+        let source_id = debug_entry_id(&plan.debug_map.source_routes, "source", "store.split");
+        let payload_state_id = debug_entry_id(&plan.debug_map.state_slots, "state", "payload");
+        let count_state_id =
+            debug_entry_id(&plan.debug_map.state_slots, "state", "store.slice_count");
+        let output_state_id =
+            debug_entry_id(&plan.debug_map.state_slots, "state", "store.dynamic_sliced");
+        let output_slot = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id.0 == output_state_id)
+            .expect("dynamic_sliced storage slot should lower");
+        assert_eq!(
+            output_slot.value_type,
+            PlanValueType::Bytes { fixed_len: None }
+        );
+
+        let op = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::UpdateBranches)
+            .flat_map(|region| region.ops.iter())
+            .find(|op| {
+                op.inputs
+                    .iter()
+                    .any(|input| matches!(input, ValueRef::Source(id) if id.0 == source_id))
+                    && matches!(&op.output, Some(ValueRef::State(id)) if id.0 == output_state_id)
+            })
+            .expect("store.split should lower dynamic Bytes/slice update");
+        let PlanOpKind::UpdateBranch {
+            expression_kind,
+            source_payload_field,
+            update_constant_id,
+            ordered_inputs,
+            ..
+        } = &op.kind
+        else {
+            panic!("dynamic slice should lower as an update branch: {op:#?}");
+        };
+        assert_eq!(*expression_kind, PlanExpressionKind::BytesSlice);
+        assert_eq!(*source_payload_field, None);
+        assert_eq!(*update_constant_id, None);
+        assert_eq!(ordered_inputs.len(), 3);
+        assert_eq!(
+            ordered_inputs[0],
+            ValueRef::State(StateId(payload_state_id))
+        );
+        assert!(matches!(ordered_inputs[1], ValueRef::Constant(_)));
+        assert_eq!(ordered_inputs[2], ValueRef::State(StateId(count_state_id)));
+        assert!(
+            op.inputs
+                .contains(&ValueRef::State(StateId(count_state_id)))
+        );
+
+        let mut tampered = plan.clone();
+        let count_slot = tampered
+            .storage_layout
+            .scalar_slots
+            .iter_mut()
+            .find(|slot| slot.state_id.0 == count_state_id)
+            .expect("count storage slot should lower");
+        count_slot.value_type = PlanValueType::Text;
+        let tampered_verification = verify_plan(&tampered).unwrap();
+        assert_eq!(tampered_verification.status, "fail");
+        assert!(
+            tampered_verification.checks.iter().any(|check| check.id
+                == "constant-refs-resolve-and-match-storage-types"
+                && !check.pass)
+                || tampered_verification
+                    .checks
+                    .iter()
+                    .any(|check| check.id == "capability-summary-derived-counts" && !check.pass),
+            "dynamic Bytes/slice count must be a NUMBER state: {tampered_verification:#?}"
+        );
+    }
+
+    #[test]
     fn verifier_rejects_tampered_inline_bytes_payload() {
         let parsed = boon_parser::parse_source(
             "bytes-plan-literal.bn",
@@ -10813,6 +11409,41 @@ payload:
     }
 
     #[test]
+    fn verify_plan_rejects_tampered_bytes_source_payload_descriptor_type() {
+        let parsed = boon_parser::parse_source(
+            "examples/bytes_source_payload_plan_ops.bn",
+            include_str!("../../../examples/bytes_source_payload_plan_ops.bn").to_owned(),
+        )
+        .unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let mut plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        assert_eq!(verify_plan(&plan).unwrap().status, "pass");
+
+        let route = plan
+            .source_routes
+            .iter_mut()
+            .find(|route| route.path == "store.receive")
+            .expect("fixture should contain store.receive source route");
+        let descriptor = route
+            .payload_schema
+            .typed_fields
+            .iter_mut()
+            .find(|descriptor| descriptor.field == SourcePayloadField::Bytes)
+            .expect("BYTES source route should declare a typed Bytes payload descriptor");
+        assert_eq!(descriptor.value_type, SourcePayloadValueType::Bytes);
+        descriptor.value_type = SourcePayloadValueType::Text;
+
+        let verification = verify_plan(&plan).unwrap();
+        assert_eq!(verification.status, "fail");
+        assert!(
+            verification.checks.iter().any(|check| check.id
+                == "constant-refs-resolve-and-match-storage-types"
+                && !check.pass),
+            "tampered Bytes payload descriptor must fail storage/type verification: {verification:#?}"
+        );
+    }
+
+    #[test]
     fn verify_plan_rejects_tampered_text_source_payload_field_after_lowering() {
         let parsed = boon_parser::parse_source(
             "examples/root_scalar_plan_ops.bn",
@@ -10868,8 +11499,8 @@ payload:
         assert!(
             verification.checks.iter().any(|check| check.id
                 == "constant-refs-resolve-and-match-storage-types"
-                && check.pass),
-            "TEXT-to-key tamper keeps output storage compatible, so storage verification should still pass: {verification:#?}"
+                && !check.pass),
+            "TEXT-to-key tamper must fail typed payload declaration verification: {verification:#?}"
         );
         assert!(
             verification
@@ -11913,12 +12544,340 @@ payload:
     }
 
     #[test]
+    fn row_bytes_predicates_lower_to_typed_expressions() {
+        fn count_kind(value: &serde_json::Value, kind: &str) -> usize {
+            match value {
+                serde_json::Value::Object(object) => {
+                    usize::from(object.get("kind").and_then(|value| value.as_str()) == Some(kind))
+                        + object
+                            .values()
+                            .map(|value| count_kind(value, kind))
+                            .sum::<usize>()
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().map(|value| count_kind(value, kind)).sum()
+                }
+                _ => 0,
+            }
+        }
+
+        fn count_generic_builtin(value: &serde_json::Value, function: &str) -> usize {
+            match value {
+                serde_json::Value::Object(object) => {
+                    usize::from(
+                        object.get("kind").and_then(|value| value.as_str()) == Some("builtin_call")
+                            && object.get("function").and_then(|value| value.as_str())
+                                == Some(function),
+                    ) + object
+                        .values()
+                        .map(|value| count_generic_builtin(value, function))
+                        .sum::<usize>()
+                }
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(|value| count_generic_builtin(value, function))
+                    .sum(),
+                _ => 0,
+            }
+        }
+
+        fn replace_first_row_bytes_builtin(
+            expression: &mut PlanRowExpression,
+            function: &str,
+        ) -> bool {
+            match expression {
+                PlanRowExpression::BytesIsEmpty { input } if function == "Bytes/is_empty" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesLength { input } if function == "Bytes/length" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesGet { input, index } if function == "Bytes/get" => {
+                    let input = (**input).clone();
+                    let index = (**index).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("index".to_owned()),
+                            value: index,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix }
+                    if function == "Bytes/ends_with" =>
+                {
+                    let input = (**input).clone();
+                    let suffix = (**suffix).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("suffix".to_owned()),
+                            value: suffix,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesEqual { left, right } if function == "Bytes/equal" => {
+                    let left = (**left).clone();
+                    let right = (**right).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(left)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("with".to_owned()),
+                            value: right,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::Object { fields } => fields
+                    .iter_mut()
+                    .any(|field| replace_first_row_bytes_builtin(&mut field.value, function)),
+                PlanRowExpression::TextTrim { input }
+                | PlanRowExpression::TextIsEmpty { input }
+                | PlanRowExpression::TextLength { input }
+                | PlanRowExpression::TextToNumber { input }
+                | PlanRowExpression::ObjectField { object: input, .. }
+                | PlanRowExpression::ListSum { input }
+                | PlanRowExpression::BytesIsEmpty { input }
+                | PlanRowExpression::BytesLength { input } => {
+                    replace_first_row_bytes_builtin(input, function)
+                }
+                PlanRowExpression::TextStartsWith { input, prefix } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(prefix, function)
+                }
+                PlanRowExpression::TextSubstring {
+                    input,
+                    start,
+                    length,
+                } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(start, function)
+                        || replace_first_row_bytes_builtin(length, function)
+                }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || encoding.as_deref_mut().is_some_and(|encoding| {
+                            replace_first_row_bytes_builtin(encoding, function)
+                        })
+                }
+                PlanRowExpression::BytesGet { input, index } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(index, function)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(offset, function)
+                        || replace_first_row_bytes_builtin(byte_count, function)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(needle, function)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(prefix, function)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(suffix, function)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    replace_first_row_bytes_builtin(left, function)
+                        || replace_first_row_bytes_builtin(right, function)
+                }
+                PlanRowExpression::NumberInfix { left, right, .. } => {
+                    replace_first_row_bytes_builtin(left, function)
+                        || replace_first_row_bytes_builtin(right, function)
+                }
+                PlanRowExpression::TextConcat { parts } => parts
+                    .iter_mut()
+                    .any(|part| replace_first_row_bytes_builtin(part, function)),
+                PlanRowExpression::ListGetField { index, .. } => {
+                    replace_first_row_bytes_builtin(index, function)
+                }
+                PlanRowExpression::ListFindValue {
+                    value, fallback, ..
+                } => {
+                    replace_first_row_bytes_builtin(value, function)
+                        || fallback.as_deref_mut().is_some_and(|fallback| {
+                            replace_first_row_bytes_builtin(fallback, function)
+                        })
+                }
+                PlanRowExpression::ListRange { from, to } => {
+                    replace_first_row_bytes_builtin(from, function)
+                        || replace_first_row_bytes_builtin(to, function)
+                }
+                PlanRowExpression::ListMap { input, value, .. } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(value, function)
+                }
+                PlanRowExpression::BuiltinCall { input, args, .. } => {
+                    input
+                        .as_deref_mut()
+                        .is_some_and(|input| replace_first_row_bytes_builtin(input, function))
+                        || args
+                            .iter_mut()
+                            .any(|arg| replace_first_row_bytes_builtin(&mut arg.value, function))
+                }
+                PlanRowExpression::Select { input, arms } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || arms
+                            .iter_mut()
+                            .any(|arm| replace_first_row_bytes_builtin(&mut arm.value, function))
+                }
+                PlanRowExpression::Field { .. }
+                | PlanRowExpression::Constant { .. }
+                | PlanRowExpression::ListRef { .. }
+                | PlanRowExpression::ListMapItem { .. } => false,
+            }
+        }
+
+        let source = r#"
+store: [
+    trigger: SOURCE
+    tick:
+        0 |> HOLD tick {
+            LATEST {
+                trigger |> THEN { 1 }
+            }
+        }
+    rows:
+        LIST {
+            [payload: BYTES[3] { 16u01, 16u02, 16u03 }]
+            [payload: BYTES[0] {}]
+        }
+        |> List/map(row, new: row_summary(row: row))
+]
+
+FUNCTION row_summary(row) {
+    [
+        payload: row.payload
+        suffix: BYTES[2] { 16u02, 16u03 }
+        empty: row.payload |> Bytes/is_empty
+        len: row.payload |> Bytes/length
+        second: row.payload |> Bytes/get(index: 1)
+        ends: row.payload |> Bytes/ends_with(suffix: BYTES[2] { 16u02, 16u03 })
+        same: row.payload |> Bytes/equal(with: row.payload)
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { row bytes }))
+"#;
+
+        let parsed = boon_parser::parse_source("row-bytes-predicates.bn", source).unwrap();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let plan_json = serde_json::to_value(&plan).unwrap();
+
+        assert_eq!(count_kind(&plan_json, "bytes_is_empty"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_length"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_get"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_ends_with"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_equal"), 1);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/is_empty"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/length"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/get"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/ends_with"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/equal"), 0);
+
+        let verification = verify_plan(&plan).unwrap();
+        assert_eq!(verification.status, "pass");
+
+        for function in [
+            "Bytes/is_empty",
+            "Bytes/length",
+            "Bytes/get",
+            "Bytes/ends_with",
+            "Bytes/equal",
+        ] {
+            let mut tampered = plan.clone();
+            let replaced = tampered
+                .regions
+                .iter_mut()
+                .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+                .flat_map(|region| region.ops.iter_mut())
+                .any(|op| match &mut op.kind {
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } => replace_first_row_bytes_builtin(expression, function),
+                    _ => false,
+                });
+            assert!(
+                replaced,
+                "row fixture should contain a typed {function} expression"
+            );
+            let tampered_verification = verify_plan(&tampered).unwrap();
+            assert_eq!(tampered_verification.status, "fail");
+            assert!(
+                tampered_verification
+                    .checks
+                    .iter()
+                    .any(|check| check.id == "capability-summary-derived-counts" && !check.pass),
+                "generic row {function} must not remain verifier-admissible: {tampered_verification:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn cells_formula_byte_scan_offsets_lower_as_numeric_infix() {
         fn expression_contains_function(
             expression: &PlanRowExpression,
             function_name: &str,
         ) -> bool {
             match expression {
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    function_name == "Text/to_bytes"
+                        || expression_contains_function(input, function_name)
+                        || encoding.as_deref().is_some_and(|encoding| {
+                            expression_contains_function(encoding, function_name)
+                        })
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    function_name == "Bytes/find"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(needle, function_name)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    function_name == "Bytes/starts_with"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(prefix, function_name)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    function_name == "Bytes/ends_with"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(suffix, function_name)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    function_name == "Bytes/is_empty"
+                        || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    function_name == "Bytes/equal"
+                        || expression_contains_function(left, function_name)
+                        || expression_contains_function(right, function_name)
+                }
                 PlanRowExpression::BuiltinCall {
                     function,
                     input,
@@ -11955,6 +12914,24 @@ payload:
                     expression_contains_function(input, function_name)
                         || expression_contains_function(start, function_name)
                         || expression_contains_function(length, function_name)
+                }
+                PlanRowExpression::BytesLength { input } => {
+                    function_name == "Bytes/length"
+                        || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesGet { input, index } => {
+                    function_name == "Bytes/get"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(index, function_name)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    expression_contains_function(input, function_name)
+                        || expression_contains_function(offset, function_name)
+                        || expression_contains_function(byte_count, function_name)
                 }
                 PlanRowExpression::NumberInfix { left, right, .. } => {
                     expression_contains_function(left, function_name)
@@ -11996,10 +12973,11 @@ payload:
         }
 
         fn is_direct_bytes_find_result(expression: &PlanRowExpression) -> bool {
-            matches!(
-                expression,
-                PlanRowExpression::BuiltinCall { function, .. } if function == "Bytes/find"
-            )
+            match expression {
+                PlanRowExpression::BytesFind { .. } => true,
+                PlanRowExpression::BuiltinCall { function, .. } => function == "Bytes/find",
+                _ => false,
+            }
         }
 
         fn contains_direct_bytes_find_text_concat(expression: &PlanRowExpression) -> bool {
@@ -12030,6 +13008,47 @@ payload:
                     contains_direct_bytes_find_text_concat(input)
                         || contains_direct_bytes_find_text_concat(start)
                         || contains_direct_bytes_find_text_concat(length)
+                }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || encoding
+                            .as_deref()
+                            .is_some_and(contains_direct_bytes_find_text_concat)
+                }
+                PlanRowExpression::BytesLength { input } => {
+                    contains_direct_bytes_find_text_concat(input)
+                }
+                PlanRowExpression::BytesGet { input, index } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(index)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(offset)
+                        || contains_direct_bytes_find_text_concat(byte_count)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(needle)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(prefix)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(suffix)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    contains_direct_bytes_find_text_concat(input)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    contains_direct_bytes_find_text_concat(left)
+                        || contains_direct_bytes_find_text_concat(right)
                 }
                 PlanRowExpression::NumberInfix { left, right, .. } => {
                     contains_direct_bytes_find_text_concat(left)
@@ -12105,6 +13124,45 @@ payload:
                         || contains_bytes_find_numeric_plus(start)
                         || contains_bytes_find_numeric_plus(length)
                 }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || encoding
+                            .as_deref()
+                            .is_some_and(contains_bytes_find_numeric_plus)
+                }
+                PlanRowExpression::BytesLength { input } => contains_bytes_find_numeric_plus(input),
+                PlanRowExpression::BytesGet { input, index } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(index)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(offset)
+                        || contains_bytes_find_numeric_plus(byte_count)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(needle)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(prefix)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(suffix)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    contains_bytes_find_numeric_plus(input)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    contains_bytes_find_numeric_plus(left)
+                        || contains_bytes_find_numeric_plus(right)
+                }
                 PlanRowExpression::NumberInfix { left, right, .. } => {
                     contains_bytes_find_numeric_plus(left)
                         || contains_bytes_find_numeric_plus(right)
@@ -12151,6 +13209,488 @@ payload:
             }
         }
 
+        fn contains_typed_bytes_slice(expression: &PlanRowExpression) -> bool {
+            match expression {
+                PlanRowExpression::BytesSlice {
+                    input, byte_count, ..
+                } => {
+                    matches!(byte_count.as_ref(), PlanRowExpression::NumberInfix { .. })
+                        || contains_typed_bytes_slice(input)
+                        || contains_typed_bytes_slice(byte_count)
+                }
+                PlanRowExpression::TextTrim { input }
+                | PlanRowExpression::TextIsEmpty { input }
+                | PlanRowExpression::TextLength { input }
+                | PlanRowExpression::TextToNumber { input }
+                | PlanRowExpression::ObjectField { object: input, .. }
+                | PlanRowExpression::ListSum { input } => contains_typed_bytes_slice(input),
+                PlanRowExpression::Object { fields } => fields
+                    .iter()
+                    .any(|field| contains_typed_bytes_slice(&field.value)),
+                PlanRowExpression::TextStartsWith { input, prefix } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(prefix)
+                }
+                PlanRowExpression::TextSubstring {
+                    input,
+                    start,
+                    length,
+                } => {
+                    contains_typed_bytes_slice(input)
+                        || contains_typed_bytes_slice(start)
+                        || contains_typed_bytes_slice(length)
+                }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    contains_typed_bytes_slice(input)
+                        || encoding.as_deref().is_some_and(contains_typed_bytes_slice)
+                }
+                PlanRowExpression::BytesLength { input } => contains_typed_bytes_slice(input),
+                PlanRowExpression::BytesGet { input, index } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(index)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(needle)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(prefix)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(suffix)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => contains_typed_bytes_slice(input),
+                PlanRowExpression::BytesEqual { left, right } => {
+                    contains_typed_bytes_slice(left) || contains_typed_bytes_slice(right)
+                }
+                PlanRowExpression::NumberInfix { left, right, .. } => {
+                    contains_typed_bytes_slice(left) || contains_typed_bytes_slice(right)
+                }
+                PlanRowExpression::TextConcat { parts } => {
+                    parts.iter().any(contains_typed_bytes_slice)
+                }
+                PlanRowExpression::ListGetField { index, .. } => contains_typed_bytes_slice(index),
+                PlanRowExpression::ListFindValue {
+                    value, fallback, ..
+                } => {
+                    contains_typed_bytes_slice(value)
+                        || fallback.as_deref().is_some_and(contains_typed_bytes_slice)
+                }
+                PlanRowExpression::ListRange { from, to } => {
+                    contains_typed_bytes_slice(from) || contains_typed_bytes_slice(to)
+                }
+                PlanRowExpression::ListMap { input, value, .. } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(value)
+                }
+                PlanRowExpression::BuiltinCall { input, args, .. } => {
+                    input.as_deref().is_some_and(contains_typed_bytes_slice)
+                        || args
+                            .iter()
+                            .any(|arg| contains_typed_bytes_slice(&arg.value))
+                }
+                PlanRowExpression::Select { input, arms } => {
+                    contains_typed_bytes_slice(input)
+                        || arms
+                            .iter()
+                            .any(|arm| contains_typed_bytes_slice(&arm.value))
+                }
+                PlanRowExpression::Field { .. }
+                | PlanRowExpression::Constant { .. }
+                | PlanRowExpression::ListRef { .. }
+                | PlanRowExpression::ListMapItem { .. } => false,
+            }
+        }
+
+        fn contains_typed_byte_scanner_ops(expression: &PlanRowExpression) -> bool {
+            match expression {
+                PlanRowExpression::TextToBytes { .. }
+                | PlanRowExpression::BytesFind { .. }
+                | PlanRowExpression::BytesStartsWith { .. }
+                | PlanRowExpression::BytesEndsWith { .. }
+                | PlanRowExpression::BytesIsEmpty { .. }
+                | PlanRowExpression::BytesEqual { .. } => true,
+                PlanRowExpression::TextTrim { input }
+                | PlanRowExpression::TextIsEmpty { input }
+                | PlanRowExpression::TextLength { input }
+                | PlanRowExpression::TextToNumber { input }
+                | PlanRowExpression::ObjectField { object: input, .. }
+                | PlanRowExpression::ListSum { input } => contains_typed_byte_scanner_ops(input),
+                PlanRowExpression::Object { fields } => fields
+                    .iter()
+                    .any(|field| contains_typed_byte_scanner_ops(&field.value)),
+                PlanRowExpression::TextStartsWith { input, prefix } => {
+                    contains_typed_byte_scanner_ops(input)
+                        || contains_typed_byte_scanner_ops(prefix)
+                }
+                PlanRowExpression::TextSubstring {
+                    input,
+                    start,
+                    length,
+                } => {
+                    contains_typed_byte_scanner_ops(input)
+                        || contains_typed_byte_scanner_ops(start)
+                        || contains_typed_byte_scanner_ops(length)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    contains_typed_byte_scanner_ops(input)
+                        || contains_typed_byte_scanner_ops(offset)
+                        || contains_typed_byte_scanner_ops(byte_count)
+                }
+                PlanRowExpression::BytesLength { input } => contains_typed_byte_scanner_ops(input),
+                PlanRowExpression::BytesGet { input, index } => {
+                    contains_typed_byte_scanner_ops(input) || contains_typed_byte_scanner_ops(index)
+                }
+                PlanRowExpression::NumberInfix { left, right, .. } => {
+                    contains_typed_byte_scanner_ops(left) || contains_typed_byte_scanner_ops(right)
+                }
+                PlanRowExpression::TextConcat { parts } => {
+                    parts.iter().any(contains_typed_byte_scanner_ops)
+                }
+                PlanRowExpression::ListGetField { index, .. } => {
+                    contains_typed_byte_scanner_ops(index)
+                }
+                PlanRowExpression::ListFindValue {
+                    value, fallback, ..
+                } => {
+                    contains_typed_byte_scanner_ops(value)
+                        || fallback
+                            .as_deref()
+                            .is_some_and(contains_typed_byte_scanner_ops)
+                }
+                PlanRowExpression::ListRange { from, to } => {
+                    contains_typed_byte_scanner_ops(from) || contains_typed_byte_scanner_ops(to)
+                }
+                PlanRowExpression::ListMap { input, value, .. } => {
+                    contains_typed_byte_scanner_ops(input) || contains_typed_byte_scanner_ops(value)
+                }
+                PlanRowExpression::BuiltinCall { input, args, .. } => {
+                    input
+                        .as_deref()
+                        .is_some_and(contains_typed_byte_scanner_ops)
+                        || args
+                            .iter()
+                            .any(|arg| contains_typed_byte_scanner_ops(&arg.value))
+                }
+                PlanRowExpression::Select { input, arms } => {
+                    contains_typed_byte_scanner_ops(input)
+                        || arms
+                            .iter()
+                            .any(|arm| contains_typed_byte_scanner_ops(&arm.value))
+                }
+                PlanRowExpression::Field { .. }
+                | PlanRowExpression::Constant { .. }
+                | PlanRowExpression::ListRef { .. }
+                | PlanRowExpression::ListMapItem { .. } => false,
+            }
+        }
+
+        fn matches_generic_row_builtin_function(
+            expression: &PlanRowExpression,
+            function_name: &str,
+        ) -> bool {
+            match expression {
+                PlanRowExpression::BuiltinCall {
+                    function,
+                    input,
+                    args,
+                } => {
+                    function == function_name
+                        || input.as_deref().is_some_and(|input| {
+                            matches_generic_row_builtin_function(input, function_name)
+                        })
+                        || args.iter().any(|arg| {
+                            matches_generic_row_builtin_function(&arg.value, function_name)
+                        })
+                }
+                PlanRowExpression::TextTrim { input }
+                | PlanRowExpression::TextIsEmpty { input }
+                | PlanRowExpression::TextLength { input }
+                | PlanRowExpression::TextToNumber { input }
+                | PlanRowExpression::ObjectField { object: input, .. }
+                | PlanRowExpression::ListSum { input } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                }
+                PlanRowExpression::Object { fields } => fields
+                    .iter()
+                    .any(|field| matches_generic_row_builtin_function(&field.value, function_name)),
+                PlanRowExpression::TextStartsWith { input, prefix } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(prefix, function_name)
+                }
+                PlanRowExpression::TextSubstring {
+                    input,
+                    start,
+                    length,
+                } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(start, function_name)
+                        || matches_generic_row_builtin_function(length, function_name)
+                }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || encoding.as_deref().is_some_and(|encoding| {
+                            matches_generic_row_builtin_function(encoding, function_name)
+                        })
+                }
+                PlanRowExpression::BytesLength { input } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                }
+                PlanRowExpression::BytesGet { input, index } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(index, function_name)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(offset, function_name)
+                        || matches_generic_row_builtin_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(needle, function_name)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(prefix, function_name)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(suffix, function_name)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    matches_generic_row_builtin_function(left, function_name)
+                        || matches_generic_row_builtin_function(right, function_name)
+                }
+                PlanRowExpression::NumberInfix { left, right, .. } => {
+                    matches_generic_row_builtin_function(left, function_name)
+                        || matches_generic_row_builtin_function(right, function_name)
+                }
+                PlanRowExpression::TextConcat { parts } => parts
+                    .iter()
+                    .any(|part| matches_generic_row_builtin_function(part, function_name)),
+                PlanRowExpression::ListGetField { index, .. } => {
+                    matches_generic_row_builtin_function(index, function_name)
+                }
+                PlanRowExpression::ListFindValue {
+                    value, fallback, ..
+                } => {
+                    matches_generic_row_builtin_function(value, function_name)
+                        || fallback.as_deref().is_some_and(|fallback| {
+                            matches_generic_row_builtin_function(fallback, function_name)
+                        })
+                }
+                PlanRowExpression::ListRange { from, to } => {
+                    matches_generic_row_builtin_function(from, function_name)
+                        || matches_generic_row_builtin_function(to, function_name)
+                }
+                PlanRowExpression::ListMap { input, value, .. } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(value, function_name)
+                }
+                PlanRowExpression::Select { input, arms } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || arms.iter().any(|arm| {
+                            matches_generic_row_builtin_function(&arm.value, function_name)
+                        })
+                }
+                PlanRowExpression::Field { .. }
+                | PlanRowExpression::Constant { .. }
+                | PlanRowExpression::ListRef { .. }
+                | PlanRowExpression::ListMapItem { .. } => false,
+            }
+        }
+
+        fn replace_first_typed_byte_scanner_with_generic(
+            expression: &mut PlanRowExpression,
+        ) -> bool {
+            match expression {
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    let input = (**input).clone();
+                    let args = encoding
+                        .as_deref()
+                        .map(|encoding| PlanRowCallArg {
+                            name: Some("encoding".to_owned()),
+                            value: encoding.clone(),
+                        })
+                        .into_iter()
+                        .collect();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Text/to_bytes".to_owned(),
+                        input: Some(Box::new(input)),
+                        args,
+                    };
+                    true
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/slice".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    let input = (**input).clone();
+                    let needle = (**needle).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/find".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("needle".to_owned()),
+                            value: needle,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    let input = (**input).clone();
+                    let prefix = (**prefix).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/starts_with".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("prefix".to_owned()),
+                            value: prefix,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    let input = (**input).clone();
+                    let suffix = (**suffix).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/ends_with".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("suffix".to_owned()),
+                            value: suffix,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/is_empty".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    let left = (**left).clone();
+                    let right = (**right).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/equal".to_owned(),
+                        input: Some(Box::new(left)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("with".to_owned()),
+                            value: right,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::TextTrim { input }
+                | PlanRowExpression::TextIsEmpty { input }
+                | PlanRowExpression::TextLength { input }
+                | PlanRowExpression::TextToNumber { input }
+                | PlanRowExpression::ObjectField { object: input, .. }
+                | PlanRowExpression::ListSum { input } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                }
+                PlanRowExpression::Object { fields } => fields
+                    .iter_mut()
+                    .any(|field| replace_first_typed_byte_scanner_with_generic(&mut field.value)),
+                PlanRowExpression::TextStartsWith { input, prefix } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                        || replace_first_typed_byte_scanner_with_generic(prefix)
+                }
+                PlanRowExpression::TextSubstring {
+                    input,
+                    start,
+                    length,
+                } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                        || replace_first_typed_byte_scanner_with_generic(start)
+                        || replace_first_typed_byte_scanner_with_generic(length)
+                }
+                PlanRowExpression::BytesLength { input } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                }
+                PlanRowExpression::BytesGet { input, index } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                        || replace_first_typed_byte_scanner_with_generic(index)
+                }
+                PlanRowExpression::NumberInfix { left, right, .. } => {
+                    replace_first_typed_byte_scanner_with_generic(left)
+                        || replace_first_typed_byte_scanner_with_generic(right)
+                }
+                PlanRowExpression::TextConcat { parts } => parts
+                    .iter_mut()
+                    .any(replace_first_typed_byte_scanner_with_generic),
+                PlanRowExpression::ListGetField { index, .. } => {
+                    replace_first_typed_byte_scanner_with_generic(index)
+                }
+                PlanRowExpression::ListFindValue {
+                    value, fallback, ..
+                } => {
+                    replace_first_typed_byte_scanner_with_generic(value)
+                        || fallback
+                            .as_deref_mut()
+                            .is_some_and(replace_first_typed_byte_scanner_with_generic)
+                }
+                PlanRowExpression::ListRange { from, to } => {
+                    replace_first_typed_byte_scanner_with_generic(from)
+                        || replace_first_typed_byte_scanner_with_generic(to)
+                }
+                PlanRowExpression::ListMap { input, value, .. } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                        || replace_first_typed_byte_scanner_with_generic(value)
+                }
+                PlanRowExpression::BuiltinCall { input, args, .. } => {
+                    input
+                        .as_deref_mut()
+                        .is_some_and(replace_first_typed_byte_scanner_with_generic)
+                        || args.iter_mut().any(|arg| {
+                            replace_first_typed_byte_scanner_with_generic(&mut arg.value)
+                        })
+                }
+                PlanRowExpression::Select { input, arms } => {
+                    replace_first_typed_byte_scanner_with_generic(input)
+                        || arms.iter_mut().any(|arm| {
+                            replace_first_typed_byte_scanner_with_generic(&mut arm.value)
+                        })
+                }
+                PlanRowExpression::Field { .. }
+                | PlanRowExpression::Constant { .. }
+                | PlanRowExpression::ListRef { .. }
+                | PlanRowExpression::ListMapItem { .. } => false,
+            }
+        }
+
         let parsed = parse_cells_project_for_plan_test();
         let ir = boon_ir::lower(&parsed).unwrap();
         let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
@@ -12178,6 +13718,53 @@ payload:
         assert!(
             !contains_direct_bytes_find_text_concat(value_expression),
             "Bytes/find parser offsets must not lower through text concatenation"
+        );
+        assert!(
+            contains_typed_bytes_slice(value_expression),
+            "Cells formula byte scanning should lower Bytes/slice as a typed row expression with a dynamic numeric byte_count"
+        );
+        assert!(
+            !expression_contains_function(value_expression, "Bytes/slice"),
+            "Cells formula byte scanning must not leave Bytes/slice as a generic row builtin call"
+        );
+        assert!(
+            contains_typed_byte_scanner_ops(value_expression),
+            "Cells formula byte scanning should lower text-to-bytes and byte scanner calls as typed row expressions"
+        );
+        for function in ["Text/to_bytes", "Bytes/find", "Bytes/starts_with"] {
+            assert!(
+                !matches_generic_row_builtin_function(value_expression, function),
+                "Cells formula byte scanning must not leave {function} as a generic row builtin call"
+            );
+        }
+
+        let mut tampered = plan.clone();
+        let replaced = tampered
+            .regions
+            .iter_mut()
+            .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+            .flat_map(|region| region.ops.iter_mut())
+            .any(|op| match &mut op.kind {
+                PlanOpKind::DerivedValue {
+                    expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                    ..
+                } if matches!(op.output, Some(ValueRef::Field(field_id)) if field_id.0 == value_id) => {
+                    replace_first_typed_byte_scanner_with_generic(expression)
+                }
+                _ => false,
+            });
+        assert!(
+            replaced,
+            "Cells should contain a typed row byte scanner to tamper"
+        );
+        let tampered_verification = verify_plan(&tampered).unwrap();
+        assert_eq!(tampered_verification.status, "fail");
+        assert!(
+            tampered_verification
+                .checks
+                .iter()
+                .any(|check| check.id == "capability-summary-derived-counts" && !check.pass),
+            "generic row byte scanner BuiltinCall must not remain verifier-admissible: {tampered_verification:#?}"
         );
     }
 
@@ -12214,6 +13801,45 @@ payload:
                     tamper_first_row_lookup(input, invalid)
                         || tamper_first_row_lookup(start, invalid)
                         || tamper_first_row_lookup(length, invalid)
+                }
+                PlanRowExpression::TextToBytes { input, encoding } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || encoding
+                            .as_deref_mut()
+                            .is_some_and(|encoding| tamper_first_row_lookup(encoding, invalid))
+                }
+                PlanRowExpression::BytesLength { input } => tamper_first_row_lookup(input, invalid),
+                PlanRowExpression::BytesGet { input, index } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(index, invalid)
+                }
+                PlanRowExpression::BytesSlice {
+                    input,
+                    offset,
+                    byte_count,
+                } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(offset, invalid)
+                        || tamper_first_row_lookup(byte_count, invalid)
+                }
+                PlanRowExpression::BytesFind { input, needle } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(needle, invalid)
+                }
+                PlanRowExpression::BytesStartsWith { input, prefix } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(prefix, invalid)
+                }
+                PlanRowExpression::BytesEndsWith { input, suffix } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(suffix, invalid)
+                }
+                PlanRowExpression::BytesIsEmpty { input } => {
+                    tamper_first_row_lookup(input, invalid)
+                }
+                PlanRowExpression::BytesEqual { left, right } => {
+                    tamper_first_row_lookup(left, invalid)
+                        || tamper_first_row_lookup(right, invalid)
                 }
                 PlanRowExpression::NumberInfix { left, right, .. } => {
                     tamper_first_row_lookup(left, invalid)

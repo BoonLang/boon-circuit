@@ -1,0 +1,6 @@
+name = "bytes same event dependency plan ops"
+source = "examples/bytes_same_event_dependency_plan_ops.bn"
+
+[[step]]
+id = "patch-and-read-bytes"
+expected_source_event = { source = "store.patch" }

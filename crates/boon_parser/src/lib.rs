@@ -1580,6 +1580,7 @@ fn ast_pipe_expr_kind(
             .get(pipe + 2)
             .cloned()
             .unwrap_or_else(|| "hold".to_owned());
+        push_inline_hold_latest_exprs(&tokens[pipe + 3..], item, expressions, source);
         return AstExprKind::Hold {
             initial: input,
             name,
@@ -1710,6 +1711,19 @@ fn ast_operator_block_expr(
     let open = tokens.iter().position(|token| token == "{")?;
     let close = matching_close(tokens, open)?;
     (close > open + 1).then(|| parse_ast_expr(&tokens[open + 1..close], item, expressions, source))
+}
+
+fn push_inline_hold_latest_exprs(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) {
+    let Some(latest) = tokens.iter().position(|token| token == "LATEST") else {
+        return;
+    };
+    let _ = parse_ast_expr(&tokens[latest..=latest], item, expressions, source);
+    let _ = ast_operator_block_expr(&tokens[latest..], item, expressions, source);
 }
 
 fn push_inline_when_match_arms(
@@ -4975,6 +4989,9 @@ SOURCE
 HOLD
 LATEST
 empty_dynamic: BYTES {}
+binary_byte: BYTES[1] { 2u10101010 }
+octal_byte: BYTES[1] { 8u377 }
+decimal_byte: BYTES[1] { 10u255 }
 png_magic: BYTES[__] { 16u89, 16u50, 16u4E, 16u47 }
 header: BYTES[4] { 16u89, 16u50, 16u4E, 16u47 }
 scratch: BYTES[64] {}
@@ -4996,6 +5013,9 @@ patched: Bytes/set(input: header, index: 0, value: 16uFF)
             .collect::<Vec<_>>();
         assert!(byte_values.contains(&(16, "89".to_owned(), 0x89)));
         assert!(byte_values.contains(&(16, "FF".to_owned(), 0xFF)));
+        assert!(byte_values.contains(&(2, "10101010".to_owned(), 0b1010_1010)));
+        assert!(byte_values.contains(&(8, "377".to_owned(), 0xFF)));
+        assert!(byte_values.contains(&(10, "255".to_owned(), 0xFF)));
 
         let bytes_literals = program
             .expressions
@@ -5010,6 +5030,44 @@ patched: Bytes/set(input: header, index: 0, value: 16uFF)
         assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(4), 4)));
         assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(64), 0)));
         assert!(bytes_literals.contains(&(BytesSizeSyntax::Fixed(1), 1)));
+    }
+
+    #[test]
+    fn bytes_literals_and_byte_literals_keep_exact_spans() {
+        let source = "SOURCE\nHOLD\nLATEST\npayload: BYTES[2] { 16uAA, 10u7 }\ndocument: []\n";
+        let program = parse_source("bytes-spans.bn", source).unwrap();
+        let bytes_start = source.find("BYTES[2] { 16uAA, 10u7 }").unwrap();
+        let bytes_end = bytes_start + "BYTES[2] { 16uAA, 10u7 }".len();
+        assert!(
+            program.expressions.iter().any(|expr| {
+                matches!(
+                    expr.kind,
+                    AstExprKind::BytesLiteral {
+                        size: BytesSizeSyntax::Fixed(2),
+                        ..
+                    }
+                ) && expr.start == bytes_start
+                    && expr.end == bytes_end
+            }),
+            "BYTES literal span should cover the full constructor body"
+        );
+
+        let first_byte_start = source.find("16uAA").unwrap();
+        let first_byte_end = first_byte_start + "16uAA".len();
+        assert!(
+            program.expressions.iter().any(|expr| {
+                matches!(
+                    &expr.kind,
+                    AstExprKind::ByteLiteral {
+                        radix: 16,
+                        digits,
+                        value: 0xAA,
+                    } if digits == "AA"
+                ) && expr.start == first_byte_start
+                    && expr.end == first_byte_end
+            }),
+            "byte literal span should cover the adjacent base+u+digits token"
+        );
     }
 
     #[test]
@@ -5072,6 +5130,28 @@ trailing_comment: BYTES[1] { 16u2A } -- comment after inline constructor
         .unwrap_err();
         assert!(overflow.message.contains("bytes must be 0..255"));
 
+        let bad_base = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 3u12 }\n",
+        )
+        .unwrap_err();
+        assert!(
+            bad_base
+                .message
+                .contains("byte literal base must be one of")
+        );
+
+        let missing_digits = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u }\n",
+        )
+        .unwrap_err();
+        assert!(
+            missing_digits
+                .message
+                .contains("byte literal must include digits after `u`")
+        );
+
         let bad_size =
             parse_source("bad-bytes.bn", "SOURCE\nHOLD\nLATEST\nbad: BYTES[foo] {}\n").unwrap_err();
         assert!(bad_size.message.contains("BYTES size must be `__`"));
@@ -5090,6 +5170,17 @@ trailing_comment: BYTES[1] { 16u2A } -- comment after inline constructor
             missing_body
                 .message
                 .contains("BYTES constructor requires a `{ ... }` body")
+        );
+
+        let missing_closing_body = parse_source(
+            "bad-bytes.bn",
+            "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u00\n",
+        )
+        .unwrap_err();
+        assert!(
+            missing_closing_body
+                .message
+                .contains("BYTES constructor is missing closing `}`")
         );
 
         let trailing = parse_source(

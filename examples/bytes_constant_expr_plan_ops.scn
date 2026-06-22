@@ -1,0 +1,6 @@
+name = "bytes constant expression plan ops"
+source = "examples/bytes_constant_expr_plan_ops.bn"
+
+[[step]]
+id = "inspect-folded-args"
+expected_source_event = { source = "store.inspect" }

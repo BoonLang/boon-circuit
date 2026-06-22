@@ -483,7 +483,22 @@ pub struct RowScope {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub typed_fields: Vec<SourcePayloadDescriptor>,
     pub address_lookup_field: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcePayloadDescriptor {
+    pub field: SourcePayloadField,
+    pub value_type: SourcePayloadValueType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePayloadValueType {
+    Bytes,
+    Text,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -713,6 +728,12 @@ pub enum FileBytesPath {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BytesScalarArg {
+    Static(u64),
+    Path(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UpdateExpression {
     SourcePayload {
         path: String,
@@ -772,16 +793,16 @@ pub enum UpdateExpression {
     },
     BytesSlice {
         path: String,
-        offset: u64,
-        byte_count: u64,
+        offset: BytesScalarArg,
+        byte_count: BytesScalarArg,
     },
     BytesTake {
         path: String,
-        byte_count: u64,
+        byte_count: BytesScalarArg,
     },
     BytesDrop {
         path: String,
-        byte_count: u64,
+        byte_count: BytesScalarArg,
     },
     BytesZeros {
         byte_count: u64,
@@ -2768,8 +2789,26 @@ fn source_payload_schema(
         payload_fields.insert(SourcePayloadField::Address);
     }
     SourcePayloadSchema {
-        fields: payload_fields.into_iter().collect(),
+        fields: payload_fields.iter().cloned().collect(),
+        typed_fields: payload_fields
+            .iter()
+            .cloned()
+            .map(|field| SourcePayloadDescriptor {
+                value_type: source_payload_value_type(&field),
+                field,
+            })
+            .collect(),
         address_lookup_field,
+    }
+}
+
+fn source_payload_value_type(field: &SourcePayloadField) -> SourcePayloadValueType {
+    match field {
+        SourcePayloadField::Bytes => SourcePayloadValueType::Bytes,
+        SourcePayloadField::Address
+        | SourcePayloadField::Key
+        | SourcePayloadField::Named(_)
+        | SourcePayloadField::Text => SourcePayloadValueType::Text,
     }
 }
 
@@ -5227,9 +5266,6 @@ fn verify_scheduled_update_expression(
         | UpdateExpression::BytesIsEmpty { path }
         | UpdateExpression::BytesGet { path, .. }
         | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesSlice { path, .. }
-        | UpdateExpression::BytesTake { path, .. }
-        | UpdateExpression::BytesDrop { path, .. }
         | UpdateExpression::BytesToHex { path }
         | UpdateExpression::BytesFromHex { path }
         | UpdateExpression::BytesToBase64 { path }
@@ -5241,6 +5277,20 @@ fn verify_scheduled_update_expression(
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
             require_known_symbol("bytes update path", path, known_symbols)
+        }
+        UpdateExpression::BytesSlice {
+            path,
+            offset,
+            byte_count,
+        } => {
+            require_known_symbol("bytes update path", path, known_symbols)?;
+            require_known_bytes_scalar_arg("bytes slice offset", offset, known_symbols)?;
+            require_known_bytes_scalar_arg("bytes slice byte_count", byte_count, known_symbols)
+        }
+        UpdateExpression::BytesTake { path, byte_count }
+        | UpdateExpression::BytesDrop { path, byte_count } => {
+            require_known_symbol("bytes update path", path, known_symbols)?;
+            require_known_bytes_scalar_arg("bytes count", byte_count, known_symbols)
         }
         UpdateExpression::BytesZeros { .. } => Ok(()),
         UpdateExpression::FileReadBytes { path } => match path {
@@ -5359,6 +5409,17 @@ fn verify_scheduled_update_expression(
         UpdateExpression::Unknown { summary } => Err(format!(
             "static schedule contains unsupported update expression for `{target}` from `{source}`: `{summary}`"
         )),
+    }
+}
+
+fn require_known_bytes_scalar_arg(
+    context: &str,
+    arg: &BytesScalarArg,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    match arg {
+        BytesScalarArg::Static(_) => Ok(()),
+        BytesScalarArg::Path(path) => require_known_symbol(context, path, known_symbols),
     }
 }
 
@@ -5746,9 +5807,6 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         | UpdateExpression::BytesIsEmpty { path }
         | UpdateExpression::BytesGet { path, .. }
         | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesSlice { path, .. }
-        | UpdateExpression::BytesTake { path, .. }
-        | UpdateExpression::BytesDrop { path, .. }
         | UpdateExpression::BytesToHex { path }
         | UpdateExpression::BytesFromHex { path }
         | UpdateExpression::BytesToBase64 { path }
@@ -5760,6 +5818,20 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
             reject_hidden_identity_identifier("update expression path", path)
+        }
+        UpdateExpression::BytesSlice {
+            path,
+            offset,
+            byte_count,
+        } => {
+            reject_hidden_identity_identifier("update expression path", path)?;
+            reject_bytes_scalar_arg_identity("bytes slice offset", offset)?;
+            reject_bytes_scalar_arg_identity("bytes slice byte_count", byte_count)
+        }
+        UpdateExpression::BytesTake { path, byte_count }
+        | UpdateExpression::BytesDrop { path, byte_count } => {
+            reject_hidden_identity_identifier("update expression path", path)?;
+            reject_bytes_scalar_arg_identity("bytes count", byte_count)
         }
         UpdateExpression::BytesZeros { .. } => Ok(()),
         UpdateExpression::FileReadBytes { path } => match path {
@@ -5890,6 +5962,13 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::Const { value } => {
             reject_hidden_identity_identifier("const value", value)
         }
+    }
+}
+
+fn reject_bytes_scalar_arg_identity(context: &str, arg: &BytesScalarArg) -> Result<(), String> {
+    match arg {
+        BytesScalarArg::Static(_) => Ok(()),
+        BytesScalarArg::Path(path) => reject_hidden_identity_identifier(context, path),
     }
 }
 
@@ -7597,6 +7676,20 @@ fn bytes_u64_arg_in_exprs(
         .and_then(|arg| resolved_constants.unsigned_integer(arg.value))
 }
 
+fn bytes_scalar_arg_in_exprs(
+    exprs: &[AstExpr],
+    resolved_constants: &ResolvedConstantLookup<'_>,
+    args: &[AstCallArg],
+    names: &[&str],
+    positional_index: usize,
+) -> Option<BytesScalarArg> {
+    let arg = bytes_arg_expr_id(args, names, positional_index)?;
+    if let Some(value) = resolved_constants.unsigned_integer(arg.value) {
+        return Some(BytesScalarArg::Static(value));
+    }
+    ast_argument_value_in_exprs(exprs, arg.value).map(BytesScalarArg::Path)
+}
+
 fn bytes_slice_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
     bytes_get_input_arg_in_exprs(exprs, args)
 }
@@ -7616,12 +7709,14 @@ fn bytes_slice_offset_arg_in_exprs(
 }
 
 fn bytes_slice_byte_count_arg_in_exprs(
+    exprs: &[AstExpr],
     resolved_constants: &ResolvedConstantLookup<'_>,
     args: &[AstCallArg],
     piped: bool,
-) -> Option<u64> {
+) -> Option<BytesScalarArg> {
     let positional_index = if piped { 1 } else { 2 };
-    bytes_u64_arg_in_exprs(
+    bytes_scalar_arg_in_exprs(
+        exprs,
         resolved_constants,
         args,
         &["byte_count", "length", "count"],
@@ -7630,12 +7725,14 @@ fn bytes_slice_byte_count_arg_in_exprs(
 }
 
 fn bytes_count_arg_in_exprs(
+    exprs: &[AstExpr],
     resolved_constants: &ResolvedConstantLookup<'_>,
     args: &[AstCallArg],
     piped: bool,
-) -> Option<u64> {
+) -> Option<BytesScalarArg> {
     let positional_index = if piped { 0 } else { 1 };
-    bytes_u64_arg_in_exprs(
+    bytes_scalar_arg_in_exprs(
+        exprs,
         resolved_constants,
         args,
         &["byte_count", "count", "length"],
@@ -8994,7 +9091,7 @@ fn update_expression_for_routed_branch(
     {
         return expression;
     }
-    if let Some(expression) = branch.then_bytes_zeros_expression(resolved_constants) {
+    if let Some(expression) = branch.then_bytes_zeros_expression(field, resolved_constants) {
         return expression;
     }
     if let Some(expression) = branch.then_bytes_to_hex_expression(field, target, fields) {
@@ -10581,6 +10678,20 @@ fn canonical_scalar_update_path_for_source(
     }
 }
 
+fn canonical_bytes_scalar_arg(
+    field: &FieldDef,
+    target: &str,
+    arg: BytesScalarArg,
+    fields: &[FieldDef],
+) -> BytesScalarArg {
+    match arg {
+        BytesScalarArg::Static(value) => BytesScalarArg::Static(value),
+        BytesScalarArg::Path(path) => BytesScalarArg::Path(
+            canonical_scalar_update_path_with_fields(field, target, &path, fields),
+        ),
+    }
+}
+
 fn field_hold_name(field: &FieldDef) -> Option<String> {
     match &field.statement.kind {
         AstStatementKind::Hold { name, .. } => name.clone(),
@@ -10995,17 +11106,17 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, index) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/get" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_get_index_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/get" => (
-                    bytes_get_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_get_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_get_index_arg_in_exprs(resolved_constants, args, false)?,
                 ),
                 _ => return None,
@@ -11032,18 +11143,18 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, index, value) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/set" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_set_index_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_set_value_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/set" => (
-                    bytes_set_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_set_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_set_index_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_set_value_arg_in_exprs(resolved_constants, args, false)?,
                 ),
@@ -11072,27 +11183,37 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, offset, byte_count) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/slice" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_slice_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_slice_byte_count_arg_in_exprs(resolved_constants, args, true)?,
+                    bytes_slice_byte_count_arg_in_exprs(
+                        &field.ast_exprs,
+                        resolved_constants,
+                        args,
+                        true,
+                    )?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/slice" => (
-                    bytes_slice_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_slice_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_slice_byte_count_arg_in_exprs(resolved_constants, args, false)?,
+                    bytes_slice_byte_count_arg_in_exprs(
+                        &field.ast_exprs,
+                        resolved_constants,
+                        args,
+                        false,
+                    )?,
                 ),
                 _ => return None,
             };
             Some(UpdateExpression::BytesSlice {
                 path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset,
-                byte_count,
+                offset: BytesScalarArg::Static(offset),
+                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
             })
         })
     }
@@ -11112,24 +11233,24 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, byte_count) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/take" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_count_arg_in_exprs(resolved_constants, args, true)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
+                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/take" => (
-                    bytes_slice_input_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_count_arg_in_exprs(resolved_constants, args, false)?,
+                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
+                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, false)?,
                 ),
                 _ => return None,
             };
             Some(UpdateExpression::BytesTake {
                 path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                byte_count,
+                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
             })
         })
     }
@@ -11149,30 +11270,31 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, byte_count) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/drop" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_count_arg_in_exprs(resolved_constants, args, true)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
+                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/drop" => (
-                    bytes_slice_input_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_count_arg_in_exprs(resolved_constants, args, false)?,
+                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
+                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, false)?,
                 ),
                 _ => return None,
             };
             Some(UpdateExpression::BytesDrop {
                 path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                byte_count,
+                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
             })
         })
     }
 
     fn then_bytes_zeros_expression(
         &self,
+        field: &FieldDef,
         resolved_constants: &ResolvedConstantLookup<'_>,
     ) -> Option<UpdateExpression> {
         self.ast_exprs.iter().find_map(|expr| {
@@ -11183,7 +11305,7 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
@@ -11344,19 +11466,19 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, offset, byte_count, endian) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/read_unsigned" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/read_unsigned" => (
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
@@ -11387,19 +11509,19 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, offset, byte_count, endian) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/read_signed" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/read_signed" => (
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
@@ -11430,20 +11552,20 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, offset, byte_count, endian, value) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/write_unsigned" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_value_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/write_unsigned" => (
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
@@ -11476,20 +11598,20 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self
+            let output = field
                 .ast_exprs
                 .iter()
                 .find(|candidate| candidate.id == output)?;
             let (raw_path, offset, byte_count, endian, value) = match &output.kind {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/write_signed" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
                     bytes_numeric_value_arg_in_exprs(resolved_constants, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/write_signed" => (
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?,
+                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
                     bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
@@ -13086,6 +13208,13 @@ fn push_field_def(
 fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
     let mut expr_ids = Vec::new();
     collect_statement_expr_ids(statement, program, &mut Vec::new(), &mut expr_ids);
+    let mut lines = Vec::new();
+    collect_statement_lines(statement, &mut lines);
+    for expr in &program.ast.expressions {
+        if lines.contains(&expr.line) && !expr_ids.contains(&expr.id) {
+            collect_expr_tree(expr.id, program, &mut Vec::new(), &mut expr_ids);
+        }
+    }
     expr_ids
         .into_iter()
         .filter_map(|id| program.ast.expressions.get(id).cloned())
@@ -14605,6 +14734,50 @@ store: [
     }
 
     #[test]
+    fn bytes_set_conversion_bank_update_expressions_lower_from_fixed_bank_fixture() {
+        let parsed = boon_parser::parse_source(
+            "examples/bytes_set_conversion_bank_plan_ops.bn",
+            include_str!("../../../examples/bytes_set_conversion_bank_plan_ops.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch_for = |target: &str| {
+            ir.update_branches
+                .iter()
+                .find(|branch| branch.target == target)
+                .unwrap_or_else(|| panic!("missing update branch for {target}"))
+        };
+        assert_eq!(
+            branch_for("store.patched").expression,
+            UpdateExpression::BytesSet {
+                path: "left_payload".to_owned(),
+                index: 1,
+                value: 0x5A,
+            }
+        );
+        assert_eq!(
+            branch_for("store.text").expression,
+            UpdateExpression::BytesToText {
+                path: "store.patched".to_owned(),
+                encoding: "Utf8".to_owned(),
+            }
+        );
+        assert_eq!(
+            branch_for("store.hex").expression,
+            UpdateExpression::BytesToHex {
+                path: "store.patched".to_owned(),
+            }
+        );
+        assert_eq!(
+            branch_for("store.base64").expression,
+            UpdateExpression::BytesToBase64 {
+                path: "store.patched".to_owned(),
+            }
+        );
+        verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
     fn bytes_text_conversion_update_expressions_require_explicit_encoding() {
         let parsed = boon_parser::parse_source(
             "examples/bytes_text_conversion_plan_ops.bn",
@@ -15804,6 +15977,45 @@ store: [
             }
         );
         assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn inline_latest_then_bytes_update_lowers_or_rejects_like_multiline() {
+        let valid_source = r#"
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD bytes { LATEST {} }
+store: [
+    measure: SOURCE
+    selected: 16u00 |> HOLD selected { LATEST { store.measure |> THEN { bytes |> Bytes/get(index: 2) } } }
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#;
+        let parsed =
+            boon_parser::parse_source("inline-latest-then-bytes-valid.bn", valid_source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| branch.target == "store.selected" && branch.source == "store.measure")
+            .expect("inline LATEST/THEN should lower a source update branch");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::BytesGet {
+                path: "bytes".to_owned(),
+                index: 2,
+            }
+        );
+
+        let invalid_source = valid_source.replace("index: 2", "index: 4 / 2");
+        let parsed = boon_parser::parse_source(
+            "inline-latest-then-bytes-unsupported-static.bn",
+            &invalid_source,
+        )
+        .unwrap();
+        let error = lower(&parsed).expect_err("unsupported inline static arg must be rejected");
+        assert!(
+            error.contains("requires a static integer expression"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

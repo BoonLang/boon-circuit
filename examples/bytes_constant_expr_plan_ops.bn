@@ -1,0 +1,32 @@
+payload:
+    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
+
+store: [
+    inspect: SOURCE
+    folded_byte:
+        16u00 |> HOLD folded_byte {
+            LATEST {
+                store.inspect |> THEN { payload |> Bytes/get(index: 0 + 1) }
+            }
+        }
+    folded_slice:
+        BYTES[2] {} |> HOLD folded_slice {
+            LATEST {
+                store.inspect |> THEN { payload |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1) }
+            }
+        }
+    folded_read:
+        0 |> HOLD folded_read {
+            LATEST {
+                store.inspect |> THEN { payload |> Bytes/read_unsigned(offset: 2 - 2, byte_count: 2 * 2, endian: Big) }
+            }
+        }
+    folded_write:
+        BYTES[4] {} |> HOLD folded_write {
+            LATEST {
+                store.inspect |> THEN { payload |> Bytes/write_unsigned(offset: 2 + 0, byte_count: 1 + 1, endian: Big, value: 258) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes constant expressions }))

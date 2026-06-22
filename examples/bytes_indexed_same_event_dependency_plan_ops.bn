@@ -1,0 +1,47 @@
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[3] {}]
+            [name: TEXT { beta }, payload: BYTES[3] {}]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                }
+            }
+        patched:
+            row.payload |> HOLD patched {
+                LATEST {
+                    receive |> THEN { payload |> Bytes/set(index: 0, value: 16uAA) }
+                }
+            }
+        payload_len:
+            0 |> HOLD payload_len {
+                LATEST {
+                    receive |> THEN { payload |> Bytes/length }
+                }
+            }
+        payload_second:
+            16u00 |> HOLD payload_second {
+                LATEST {
+                    receive |> THEN { payload |> Bytes/get(index: 1) }
+                }
+            }
+        patched_first:
+            16u00 |> HOLD patched_first {
+                LATEST {
+                    receive |> THEN { patched |> Bytes/get(index: 0) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed same-event BYTES dependency }))

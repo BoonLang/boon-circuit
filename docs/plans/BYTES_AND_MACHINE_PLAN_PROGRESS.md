@@ -16,15 +16,15 @@ MachinePlan migration.
 | Phase | Status | Evidence |
 | --- | --- | --- |
 | Phase 0 - Baseline | Partial | Raw baseline exists at `target/reports/bytes-plan/phase0-baseline.json`, but the exit gate is not satisfied because current HEAD has pre-existing failing checks and release benchmark baselines have not yet been captured. |
-| Phase 1 - Plan Boundary | Partial | Added `crates/boon_plan`, deterministic plan hashing/verifier, typed source/storage/region/op/delta/debug structures, `boon_cli dump-plan`, multi-file source identity, and schema-side canonical MachinePlan/hash verification. Current TodoMVC and Cells plans lower structurally with `unresolved_executable_ref_count=0` and `typed_lowering_executable=true`, but whole-plan CPU executor readiness and PlanExecutor scenario parity are not proven. |
-| Phase 2 - BYTES Parser | Partial | Parser now has `ByteLiteral`, `BytesLiteral`, dynamic/inferred/fixed size syntax, explicit-base byte literal validation, nested item coverage, multiline `BYTES` constructor support with `--` comments, focused parser tests, and `verify-bytes-negative` parser cases for multiline invalid bytes/trailing tokens. Exit remains partial until final Phase 2 audit confirms every parser requirement and negative fixture is covered at full scope. |
-| Phase 3 - BYTES Type System | Partial | Typechecker now has `Type::Byte`, `Type::Bytes(dynamic/fixed)`, fixed/inferred length checks, TEXT/BYTES conversion diagnostics, v1 builtin return signatures, BYTES-scoped builtin argument validation for required inputs/operands, explicit `Utf8`/`Ascii` TEXT/BYTES encodings, numeric byte-count/endian checks, unknown-arg rejection, `File/read_bytes` as TEXT-pipe input returning dynamic BYTES, `File/read_text` as TEXT-pipe input returning TEXT, `docs/architecture/BYTES_SEMANTICS.md`, focused type tests, schema-required `verify-bytes-negative` compiler cases, a narrow `TypeCheckReport.resolved_constant_table`, resolved-constant-driven IR readers for root/scalar BYTES compile-time numeric/byte/endian/encoding arguments, and dump-plan report-schema binding for the resolved constant table. Exit is not satisfied until broader constant evaluation policy, runtime-body audit, and final Phase 3 gate coverage are complete. |
-| Phase 4 - Semantic IR | Partial | `boon_ir` expression classifiers/walkers now cover byte and bytes AST nodes so they do not compile as `Unknown` or get skipped. `InitialValue::Byte` and typed update expressions for `Bytes/length`, `Bytes/is_empty`, pipe/call-form `Bytes/get(index: literal)`, pipe/call-form `Bytes/set(index: literal, value: byte literal)`, pipe/call-form `Bytes/equal`, pipe/call-form `Bytes/concat`, and static-path `File/read_bytes` now exist. `InitialValue::Bytes` now preserves dynamic vs fixed length metadata so `BYTES {}` can target dynamic host-read output while `BYTES[N]` remains fixed. MachinePlan constant allocation now interns repeated `PlanConstantValue`s by value, including BYTES constants, and `verify_plan` rejects duplicate constant-pool values. Broader typed byte operations in semantic IR summaries and source-payload typing remain open. |
+| Phase 1 - Plan Boundary | Complete | Added `crates/boon_plan` to the workspace with `PlanVersion`, `MachinePlan`, `TargetProfile`, typed plan IDs, constants, source routes, storage layout, operation regions, dirty/commit/delta plans, capability summary, `DebugMap`, deterministic plan hashing, and `verify_plan`. Added `compile_typed_program` and the `boon_cli dump-plan` developer command. The CLI default remains legacy execution. CPU PlanExecutor completeness, full parity, executable dirty scheduling, performance, and the default switch remain tracked by later phases. |
+| Phase 2 - BYTES Parser | Complete | Parser now has `ByteLiteral`, `BytesLiteral`, exact spans, dynamic/inferred/fixed size syntax, explicit-base byte literal validation for supported bases, nested item coverage, multiline `BYTES` constructor support with `--` comments, focused parser tests, and schema-required `verify-bytes-negative` parser cases for bad bases, missing digits, overflow, bad size expressions, missing bodies, unterminated bodies, and multiline trailing tokens. This is parser-surface complete; type, IR, runtime, and executor work remain tracked by later phases. |
+| Phase 3 - BYTES Type System | Partial | Typechecker now has `Type::Byte`, `Type::Bytes(dynamic/fixed)`, fixed/inferred length checks, TEXT/BYTES conversion diagnostics, v1 builtin return signatures, BYTES-scoped builtin argument validation for required inputs/operands, explicit `Utf8`/`Ascii` TEXT/BYTES encodings, numeric byte-count/endian checks, unknown-arg rejection, contextual fixed-length result refinement for static `Bytes/set`, `Bytes/write_unsigned`, `Bytes/write_signed`, `Bytes/slice`, `Bytes/take`, `Bytes/drop`, `Bytes/concat`, and `Bytes/zeros`, compiler rejection for ambiguous positional BYTES builtin args and constructor-style `Bytes/zeros` inputs, `File/read_bytes` as TEXT-pipe input returning dynamic BYTES, `File/read_text` as TEXT-pipe input returning TEXT, `docs/architecture/BYTES_SEMANTICS.md`, focused type tests, schema-required `verify-bytes-negative` compiler cases, a narrow `TypeCheckReport.resolved_constant_table`, checked static integer folding for BYTES scalar args over literal `+`, `-`, and `*`, explicit overflow and MachinePlan `i64` range diagnostics for folded BYTES scalar arguments, resolved-constant-driven IR readers for root/scalar BYTES compile-time numeric/byte/endian/encoding arguments, and dump-plan report-schema binding for the resolved constant table. Exit is not satisfied until broader constant evaluation policy, runtime-body audit, and final Phase 3 gate coverage are complete. |
+| Phase 4 - Semantic IR | Partial | `boon_ir` expression classifiers/walkers now cover byte and bytes AST nodes so they do not compile as `Unknown` or get skipped. `InitialValue::Byte` and typed update expressions for `Bytes/length`, `Bytes/is_empty`, pipe/call-form `Bytes/get(index: literal-or-folded-static-integer)`, pipe/call-form `Bytes/set(index: literal-or-folded-static-integer, value: byte literal)`, pipe/call-form `Bytes/slice`, `Bytes/read_unsigned`, `Bytes/write_unsigned`, pipe/call-form `Bytes/equal`, pipe/call-form `Bytes/concat`, and static-path `File/read_bytes` now exist. `InitialValue::Bytes` now preserves dynamic vs fixed length metadata so `BYTES {}` can target dynamic host-read output while `BYTES[N]` remains fixed. MachinePlan constant allocation now interns repeated `PlanConstantValue`s by value, including BYTES constants, and `verify_plan` rejects duplicate constant-pool values. Broader typed byte operations in semantic IR summaries and source-payload typing remain open. |
 | Phase 5 - Real MachinePlan Lowering | Partial | Minimal BYTES[4] scalar initial state now lowers to typed storage, typed byte constants, and executable `StateInitialize`/`SourceRoute` ops. `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes` lower to typed `PlanExpressionKind`s; `Bytes/get` requires `PlanValueType::Byte` output and a typed index constant, `Bytes/set` uses ordered typed operands `[State(BYTES), Constant(Number index), Constant(Byte value)]` plus same-length BYTES output and fixed-length out-of-bounds rejection, `Bytes/equal` requires two distinct BYTES state inputs and a BOOL output, `Bytes/concat` uses ordered typed BYTES operands plus BYTES output fixed-length checking, and `File/read_bytes` uses one static TEXT constant path operand with dynamic BYTES output support. Source-payload update branches lower to typed `ValueRef::SourcePayload` operands, const update branches carry typed `update_constant_id` refs, indexed row aliases resolve to typed scoped state refs, TodoMVC list storage now carries typed initial rows with typed row-field IDs, TodoMVC `List/append` carries typed trigger/row-field metadata, and `store.title_to_add` plus row `Bool/not` fields lower to typed derived expressions. TodoMVC and Cells now have typed-lowering-executable plans, but whole-plan CPU executor support and full operation semantics are not proven. |
 | Phase 6 - CPU PlanExecutor and Parity | Partial | Added explicit `run-plan` initial-state CPU PlanExecutor proof for scalar constants and typed list initial storage, `run-plan-route` for one unscoped source-payload update route plus one unscoped const update route, a four-step TodoMVC root-scalar scenario subset, a narrow TodoMVC submit root/list slice, TodoMVC retain-backed `store.visible_todos` materialization, and root-scalar BYTES op parity for `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. `examples/list_initial_plan_ops.bn` proves `run-plan` can initialize one typed list slot and report row fields without fallback counters. `examples/bytes_concat_chain_plan_ops.bn` proves committed-step chaining from `Bytes/concat`; `examples/bytes_set_plan_ops.bn` proves committed-step chaining from `Bytes/set` into later `Bytes/get`, `Bytes/length`, and `Bytes/concat`; `examples/bytes_file_read_plan_ops.bn` proves file-read BYTES state can be consumed by later `Bytes/length` and `Bytes/get` through typed PlanExecutor state. `examples/bytes_initial.bn`, `examples/list_initial_plan_ops.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, TodoMVC `store.sources.new_todo_input.change -> store.new_todo_text`, TodoMVC `store.sources.filter_active.press -> store.selected_filter`, TodoMVC selected steps `add-test-todo-type,filter-active,filter-completed,filter-all`, TodoMVC `add-test-todo-type,add-test-todo-submit`, TodoMVC `add-test-todo-type,add-test-todo-submit,filter-active,toggle-dynamic-test-todo-under-active-filter`, and whitespace submit rejection prove zero fallback counters on their selected surfaces. TodoMVC and Cells full scenario compare reports now pass on the current aggregate surface, but broader conflict/error/source-binding coverage, generic dependency-frontier scheduling, and final default-switch readiness remain open. |
-| Phase 7 - BYTES Runtime/Storage | Partial | Legacy runtime can evaluate source-language BYTES constructors and v1 BYTES builtins into existing inline `RuntimeBytes`; root-scalar PlanExecutor can initialize inline BYTES and replay `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. PlanExecutor now carries a private root BYTES sidecar state initialized from typed constants and updated by BYTES-producing branches, so committed BYTES outputs can be consumed by later BYTES operations while public reports still expose only digest/length summaries. Fixed root BYTES now have preallocated byte-bank metadata, fixed root `Bytes/set` can mutate the private destination bank with zero measured runtime copy/alloc counters, and focused patch-then-read/write storage-profile cases prove later `Bytes/get`, `Bytes/length`, `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, `Bytes/ends_with`, `Bytes/read_unsigned`, `Bytes/read_signed`, `Bytes/to_text`, `Bytes/to_hex`, `Bytes/to_base64`, `Bytes/write_unsigned`, and `Bytes/write_signed` use `root_fixed_byte_bank` borrowed views or patch mutations without measured byte copies. Root-scalar `Bytes/slice`, `Bytes/take`, and `Bytes/drop` now have schema-enforced view-backed output evidence with zero measured byte-buffer copy/clone/alloc/fill counters. `Bytes/concat` still has a root BYTES commit path for exact legacy semantic-delta parity but remains a measured-copy operation. Static `File/read_bytes` reads a sandboxed source-relative host file into dynamic BYTES with digest/length report evidence. Static-path typed MachinePlan `File/write_bytes` writes private BYTES state to a sandboxed host file and reports digest/length host-effect evidence. Root-scalar dynamic-path `File/write_bytes` now lowers and verifies `[State(BYTES), State(TEXT path)]`, resolves the path through PlanExecutor state, writes through the same sandboxed host boundary, and rejects a dynamic `../` path-state negative at runtime. Root-scalar dynamic-path `File/read_bytes` now lowers and verifies `[State(TEXT path)]`, resolves the path through PlanExecutor state, reads through the same sandboxed host boundary, feeds later `Bytes/length` and `Bytes/get`, and rejects a dynamic `../` path-state negative at runtime. Indexed row `File/write_bytes` now writes fixed indexed row byte-bank state and reports `indexed_fixed_byte_bank` / `byte_bank_used=true` borrowed host-boundary evidence for the indexed source-payload file-write slice. Indexed row-field dynamic-path `File/write_bytes` now accepts `[State(BYTES), Field(TEXT path)]`, resolves the path from the current row, writes through the same sandboxed host boundary, and preserves zero byte-copy counters in the storage-profile proof. Indexed row-field dynamic-path `File/read_bytes` now accepts `[Field(TEXT path)]`, resolves the path from the current row, reads through the same sandboxed host boundary, stores the result in a fixed indexed byte bank, and proves a later `Bytes/get` reads from `indexed_fixed_byte_bank` with borrowed access and zero measured byte-copy counters. Indexed row-field dynamic-path read/write gates now reject parent-directory paths, missing indexed target rows, unknown row path fields, non-TEXT row path fields, missing files/parents, fixed-output length mismatch for read, fabricated malformed row-field path operand shapes, mixed row-shape dynamic paths, and foreign-list row-field dynamic paths. Storage-profile schema now binds indexed row BYTES public summaries to private indexed byte-bank evidence and aggregate adversarial checks reject forged nested row summary digests. Dynamic byte mutation storage beyond inline sidecar, same-event BYTES dependency scheduling, byte source payload hardening, broad malformed private-state runtime tests, broad borrowed execution for remaining BYTES ops, complete fixed indexed byte-bank coverage beyond the proven file-write/read/length/get slices, broad no-panic/OOB coverage beyond the focused negative cases, and zero-allocation fixed-byte ticks remain open. |
+| Phase 7 - BYTES Runtime/Storage | Partial | Legacy runtime can evaluate source-language BYTES constructors and v1 BYTES builtins into existing inline `RuntimeBytes`; root-scalar PlanExecutor can initialize inline BYTES and replay `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. PlanExecutor now carries a private root BYTES sidecar state initialized from typed constants and updated by BYTES-producing branches, so committed BYTES outputs can be consumed by later BYTES operations while public reports still expose only digest/length summaries. Fixed root BYTES now have preallocated byte-bank metadata, fixed root `Bytes/set` can mutate the private destination bank with zero measured runtime copy/alloc counters, and focused patch-then-read/write storage-profile cases prove later `Bytes/get`, `Bytes/length`, `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, `Bytes/ends_with`, `Bytes/read_unsigned`, `Bytes/read_signed`, `Bytes/to_text`, `Bytes/to_hex`, `Bytes/to_base64`, `Bytes/write_unsigned`, and `Bytes/write_signed` use `root_fixed_byte_bank` borrowed views or patch mutations without measured byte copies. Root-scalar `Bytes/slice`, `Bytes/take`, and `Bytes/drop` now have schema-enforced view-backed output evidence with zero measured byte-buffer copy/clone/alloc/fill counters. The standalone `verify-bytes-fixed-warm-tick` gate now proves selected root fixed-BYTES warm ticks and a focused indexed source-payload receive/readback warm tick after PlanExecutor initial state, indexed/list/source binding setup, and fixed byte-bank preparation have zero measured byte-buffer helper copy/clone/alloc/zero-fill counters. `Bytes/concat` still has a root BYTES commit path for exact legacy semantic-delta parity but remains a measured-copy operation. Static `File/read_bytes` reads a sandboxed source-relative host file into dynamic BYTES with digest/length report evidence. Static-path typed MachinePlan `File/write_bytes` writes private BYTES state to a sandboxed host file and reports digest/length host-effect evidence. Root-scalar dynamic-path `File/write_bytes` now lowers and verifies `[State(BYTES), State(TEXT path)]`, resolves the path through PlanExecutor state, writes through the same sandboxed host boundary, and rejects a dynamic `../` path-state negative at runtime. Root-scalar dynamic-path `File/read_bytes` now lowers and verifies `[State(TEXT path)]`, resolves the path through PlanExecutor state, reads through the same sandboxed host boundary, feeds later `Bytes/length` and `Bytes/get`, and rejects a dynamic `../` path-state negative at runtime. Indexed row `File/write_bytes` now writes fixed indexed row byte-bank state and reports `indexed_fixed_byte_bank` / `byte_bank_used=true` borrowed host-boundary evidence for the indexed source-payload file-write slice. Indexed row-field dynamic-path `File/write_bytes` now accepts `[State(BYTES), Field(TEXT path)]`, resolves the path from the current row, writes through the same sandboxed host boundary, and preserves zero byte-copy counters in the storage-profile proof. Indexed row-field dynamic-path `File/read_bytes` now accepts `[Field(TEXT path)]`, resolves the path from the current row, reads through the same sandboxed host boundary, stores the result in a fixed indexed byte bank, and proves a later `Bytes/get` reads from `indexed_fixed_byte_bank` with borrowed access and zero measured byte-copy counters. Indexed row-field dynamic-path read/write gates now reject parent-directory paths, missing indexed target rows, unknown row path fields, non-TEXT row path fields, missing files/parents, fixed-output length mismatch for read, fabricated malformed row-field path operand shapes, mixed row-shape dynamic paths, and foreign-list row-field dynamic paths. Storage-profile schema now binds indexed row BYTES public summaries to private indexed byte-bank evidence and aggregate adversarial checks reject forged nested row summary digests. Source-payload negative coverage now includes missing required `bytes` payload rejection for BYTES source routes. Dynamic byte mutation storage beyond inline sidecar, broad indexed warm-tick coverage beyond the focused source-payload/readback shape, broader byte source payload hardening, broad malformed private-state runtime tests, broad borrowed execution for remaining BYTES ops, complete fixed indexed byte-bank coverage beyond the proven file-write/read/length/get and focused warm-tick slices, and broad no-panic/OOB coverage beyond the focused negative cases remain open. |
 | Phase 8 - Examples | Partial | Added `examples/bytes_initial.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, `examples/bytes_concat_chain_plan_ops.bn`, and `examples/bytes_file_read_plan_ops.bn` as stable focused BYTES fixtures. `examples/todo_mvc_physical/BUILD.bn` and `examples/novywave/BUILD.bn` now use `File/read_bytes() |> Bytes/to_text(encoding: Utf8)` at the asset ingestion boundary. `examples/cells/formula.bn` keeps `formula_text` as TEXT but scans formula grammar through an explicit `Text/to_bytes(encoding: Ascii)` boundary and BYTES search operations. Final BYTES-backed asset descriptors and full example behavior parity remain open. |
-| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, and the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 47/47 required reports checked, 40 proof reports, 7 diagnostic reports, and 33 no-fallback PlanExecutor reports. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, and the TodoMVC release benchmark reproduction proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
+| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, folded static-integer BYTES scalar argument proof for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and `Bytes/write_unsigned`, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields plus folded static integer overflow/range diagnostics and missing required BYTES source-payload rejection, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence, and the aggregate-required `verify-bytes-fixed-warm-tick` gate with focused root/indexed fixed-BYTES warm-tick byte-buffer evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 54/54 required reports checked, 45 proof reports, 9 diagnostic reports, and 37 no-fallback PlanExecutor reports, including root and indexed same-event BYTES dependency scenarios, folded static integer BYTES scalar argument reports, fixed-bank conversion MachinePlan proof reports, and fixed warm-tick storage evidence. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, the TodoMVC release benchmark reproduction proof, and the fixed warm-tick proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
 | Phase 10 - Default Switch | Not started | Pending. |
 
 ## Current Baseline
@@ -242,6 +242,117 @@ Open findings:
   gate.
 - Full workspace tests and Phase 10 default switch readiness are still not
   claimed.
+
+## Phase 3 BYTES Result-Length Refinement and Ambiguity Rejection
+
+Recorded at: `2026-06-22T04:20:00+02:00`
+
+Status: partial Phase 3 type-system evidence; complete for the focused static
+BYTES builtin result-length refinement and ambiguous-argument rejection slice.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed `target/reports/bytes-plan/bytes-negative.json`
+
+What changed:
+
+- Added contextual BYTES result typing in the typechecker. Static
+  fixed-length-preserving/derivable builtins no longer collapse to dynamic
+  BYTES when the compiler already knows enough:
+  - `Bytes/set`, `Bytes/write_unsigned`, and `Bytes/write_signed` preserve the
+    input BYTES type.
+  - `Bytes/slice`, `Bytes/take`, and `Bytes/zeros` return fixed BYTES when
+    `byte_count` / `length` / `count` is a numeric literal.
+  - `Bytes/drop` returns fixed BYTES when both the input length and count are
+    statically known and the count is in range.
+  - `Bytes/concat` returns fixed BYTES when both operands are fixed-length
+    BYTES; otherwise it remains dynamic.
+- Ambiguous positional arguments for BYTES boundary builtins are now compiler
+  errors. BYTES builtins must use named arguments, with pipe input reserved for
+  the actual receiver.
+- `Bytes/zeros` now rejects both named `input:` and piped input forms because
+  it is a constructor, not a BYTES-transforming operation.
+- Extended `verify-bytes-negative` and report schema required cases with:
+  - `typecheck-bytes-zeros-rejects-pipe`
+  - `typecheck-bytes-rejects-positional-args`
+
+Evidence:
+
+- `cargo test -p boon_typecheck bytes -- --nocapture`
+  - `7 passed; 0 failed`
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=67`
+  - contains required cases
+    `typecheck-bytes-zeros-rejects-pipe` and
+    `typecheck-bytes-rejects-positional-args`
+  - `typecheck-bytes-zeros-rejects-input` and
+    `typecheck-bytes-zeros-rejects-pipe` are now generated from independent
+    fixtures, not one shared joined diagnostic string.
+- `target/reports/bytes-plan/bytes-negative.json` schema validation passed.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_typecheck bytes -- --nocapture` | Pass | Focused BYTES typechecker tests passed after result refinement and after the ambiguity fixes. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Fail, then Pass | Failed on wrapping after manual helper edits, then passed after `cargo fmt --all`. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all` | Pass | Applied standard formatting. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_typecheck -p xtask -p boon_report_schema --quiet` | Pass | Focused compile passed; existing native GPU dead-code warnings only. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask --quiet` | Pass | Rebuilt the verifier binary after typechecker/schema/xtask edits; existing native GPU dead-code warnings only. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Rebuilt binary wrote the 67-case negative report. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Schema accepted the refreshed negative report. |
+| Replay loop over 44 stale `target/reports/bytes-plan/*` reports using each report's recorded `command_argv` | Pass | Refreshed stale `boon_cli` and `xtask` child reports after rebuilding the binaries. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial report after child artifact hashes changed. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First failed on stale child reports, then on stale adversarial child hashes; passed after targeted refresh. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted the refreshed aggregate. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected fail | Readiness still fails on partial phases, Phase 10 not started, missing Cells release wrapper, and legacy default execution. |
+
+Independent review:
+
+- Subagent `019eed47-a4e2-7351-8838-b9232a818125` reviewed the initial
+  refinement and confirmed the valid named/pipe forms preserved fixed lengths
+  as intended, but found two medium issues:
+  - positional call-form BYTES inputs could bypass type validation;
+  - `bytes |> Bytes/zeros(byte_count: 4)` was accepted even though `zeros`
+    should not accept input.
+- Both medium findings were fixed in this slice. Follow-up review confirmed
+  they were functionally resolved and found no new medium/high blocker.
+- The follow-up review also found one low coverage issue: the two
+  `Bytes/zeros` negative IDs initially searched one combined diagnostic string.
+  That was fixed by adding independent unit-test and `verify-bytes-negative`
+  fixtures.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase3-result-length-refinement-review.md`.
+
+Open findings:
+
+- This narrows the Phase 3 type-system gap, but Phase 3 remains partial.
+- Broader constant evaluation policy, runtime-body audit, and final Phase 3
+  gate coverage remain open.
+- The aggregate BYTES/MachinePlan report was refreshed and passed after the
+  stale child reports and adversarial hash chain were regenerated.
 
 ## Phase 3/4 BYTES Literal-Only IR Constant Readers
 
@@ -14603,6 +14714,1126 @@ above in `Phase 7 Fixed Indexed Byte-Bank Backing`. It supersedes the
 historical row-private indexed file-write proof in this section for the narrow
 indexed source-payload -> fixed row bank -> indexed `File/write_bytes` slice.
 
+## Phase 7/9 Large Dynamic Source-Payload File/write_bytes Shared Storage
+
+Status: partial Phase 7 runtime/storage and Phase 9 verification evidence;
+complete for the focused root dynamic SOURCE payload -> PlanExecutor BYTES
+state -> `File/write_bytes` host-boundary path when the payload is larger than
+the inline threshold and must use shared runtime storage.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase7-large-dynamic-file-write-shared-review.md`
+- refreshed `target/reports/bytes-plan/bytes-storage-profile.json`
+- refreshed stale `xtask` child reports under `target/reports/bytes-plan/`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- refreshed `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- `verify-bytes-storage-profile` now generates a second dynamic
+  `File/write_bytes` fixture:
+  - source:
+    `target/generated/bytes-storage-profile-file-write-fixtures/bytes_dynamic_large_file_write_plan_ops.bn`
+  - scenario:
+    `target/generated/bytes-storage-profile-file-write-fixtures/bytes_dynamic_large_file_write_plan_ops.scn`
+  - receive step: `receive-large-dynamic-bytes`
+  - write step: `write-large-dynamic-file`
+  - output: `outputs/dynamic-large.bin`
+- The payload is 1025 bytes, so it is above
+  `SOURCE_EVENT_INLINE_BYTES_LIMIT=1024`. It uses first byte `0xDE`, last byte
+  `0xEF`, and `0x7E` filler.
+- `dynamic_file_write_source_payload_evidence` is now data-driven instead of
+  hardcoding the previous 3-byte inline case. It checks expected byte length,
+  digest, storage kind, step IDs, output path, final state summary, host
+  effect, artifact bytes, borrowed root BYTES access, and zero measured byte
+  counters.
+- Report schema now requires
+  `dynamic-large-file-write-source-payload-shared-no-copy`, requires
+  `storage == "shared"` for that case, and validates the 1025-byte artifact and
+  borrowed `root_bytes_state` host-boundary access.
+
+Measured counter and artifact evidence from
+`target/reports/bytes-plan/bytes-storage-profile.json`:
+
+| Field | Value |
+| --- | --- |
+| Storage-profile case count | `14` |
+| Case id | `dynamic-large-file-write-source-payload-shared-no-copy` |
+| Case status | `pass` |
+| `state_summary.store.received.storage` | `shared` |
+| `state_summary.store.received.byte_len` | `1025` |
+| `state_summary.store.received.digest` | `298f7814d0bdead3a1fa29fc8651af888fcc493ae8aa807c731c75dae4682799` |
+| `bytes_storage_no_copy` | `true` |
+| `measured_copy_bytes` | `0` |
+| `receive_value.storage` | `shared` |
+| `bytes_access.access_source` | `root_bytes_state` |
+| `bytes_access.cow_kind` | `borrowed` |
+| `bytes_access.host_boundary` | `file_write_bytes` |
+| `bytes_access.byte_len` | `1025` |
+| Host artifact byte length | `1025` |
+| Host artifact first byte | `222` (`0xDE`) |
+| Host artifact last byte | `239` (`0xEF`) |
+| `public_inline_bytes_absent` | `true` |
+| `copy_from_slice_bytes` | `0` |
+| `vec_clone_bytes` | `0` |
+| `vec_alloc_bytes` | `0` |
+| `zero_fill_bytes` | `0` |
+
+Aggregate evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - expected status: `fail`
+  - remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Fail, then Pass | Initial failure was rustfmt shape after schema edits; passed after `cargo fmt --all`. |
+| `cargo fmt --all` | Pass | Applied formatting. |
+| `cargo check -p xtask -p boon_report_schema -p boon_runtime --quiet` | Pass | Focused compile for touched crates; existing native GPU dead-code warnings only. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt current `xtask`; existing native GPU dead-code warnings only. |
+| `./target/debug/xtask verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json` | Pass | First run used stale pre-rebuild `xtask` and lacked the new case; rerun after rebuild passed with 14 cases. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-storage-profile.json` | Pass | Schema accepted the required large shared dynamic case. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Old aggregate/readiness reports had stale `binary_hash` after rebuilding `xtask`. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First refreshed run blocked on stale child reports; passed after refreshing stale children. |
+| `./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed negative gate and nested large source-payload route evidence. |
+| `./target/debug/xtask verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-bytes-byte-bank-layout --report target/reports/bytes-plan/bytes-byte-bank-layout.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-build-bytes-boundary --report target/reports/bytes-plan/build-bytes-boundary.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed stale adversarial child report. |
+| `./target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Pass | Refreshed stale benchmark reproduction report. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json target/reports/bytes-plan/bytes-file-read-plan.json target/reports/bytes-plan/bytes-file-write-plan.json target/reports/bytes-plan/bytes-byte-bank-layout.json target/reports/bytes-plan/build-bytes-boundary.json` | Pass | Confirmed all previously stale required reports validate. |
+| `./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Remaining blockers are partial phases, missing Cells release wrapper, and Phase 10 default switch. |
+
+Independent review:
+
+- Subagent `019eedcb-d06a-7b61-81b3-5b3ca9bfa610`
+  (`performance/storage auditor`) confirmed the gap: storage-profile evidence
+  covered only a 3-byte inline dynamic source payload, while the existing 1025
+  byte route proof did not continue into `File/write_bytes`.
+- The reviewer recommended requiring a 1025-byte shared-storage source payload,
+  borrowed `root_bytes_state` host-boundary access, zero write-step copy
+  counters, descriptor-only public summaries, and byte-for-byte artifact
+  verification.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase7-large-dynamic-file-write-shared-review.md`.
+
+Open findings:
+
+- This closes the focused large dynamic source-payload ->
+  `File/write_bytes` shared-storage proof.
+- It does not claim zero allocation before the external event enters the
+  runtime-owned BYTES representation.
+- `Bytes/concat` remains a measured-copy operation.
+- Broad Phase 7 runtime/storage hardening, broad Phase 9 performance evidence,
+  postponed `TASK-0804A` Cells release benchmark work, full workspace tests, and
+  Phase 10 default-switch readiness remain open.
+
+## Phase 9 Large Dynamic Shared Storage Adversarial Hardening
+
+Status: partial Phase 9 adversarial verification evidence; complete for
+aggregate tamper rejection of the large dynamic shared SOURCE payload ->
+`File/write_bytes` storage-profile proof.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase9-large-dynamic-shared-adversarial-review.md`
+- refreshed `target/reports/bytes-plan/bytes-storage-profile.json`
+- refreshed `target/reports/bytes-plan/bytes-file-read-plan.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- refreshed stale required aggregate children under `target/reports/bytes-plan/`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- refreshed `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- `verify-bytes-machine-plan-adversarial` now has five required aggregate
+  tamper cases for the large dynamic shared storage-profile proof:
+  - `aggregate-storage-profile-large-dynamic-state-summary-tamper-rejected`
+  - `aggregate-storage-profile-large-dynamic-shared-storage-tamper-rejected`
+  - `aggregate-storage-profile-large-dynamic-byte-len-tamper-rejected`
+  - `aggregate-storage-profile-large-dynamic-host-digest-tamper-rejected`
+  - `aggregate-storage-profile-large-dynamic-bytes-access-len-tamper-rejected`
+- The adversarial mutations target the required
+  `dynamic-large-file-write-source-payload-shared-no-copy` case in
+  `bytes-storage-profile.json`.
+- The report schema now requires the five new adversarial IDs.
+- The storage-profile schema now directly validates public
+  `case.state_summary.store.received` fields, `store.write_status`,
+  `host_effect.artifact_path`, host effect status/mode/write mode,
+  `verified_after_write=true`, artifact listing in `artifact_sha256s`, and
+  emitted `bytes_access.input_state_id` plus `bytes_access.path_source`.
+
+Adversarial evidence from
+`target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+
+| Field | Value |
+| --- | --- |
+| Report status | `pass` |
+| `adversarial_case_count` | `14` |
+| Large dynamic state summary tamper | rejected |
+| Large dynamic shared storage tamper | rejected |
+| Large dynamic byte length tamper | rejected |
+| Large dynamic host digest tamper | rejected |
+| Large dynamic bytes-access length tamper | rejected |
+
+Representative rejection reasons:
+
+- State summary tamper: `state_summary does not match dynamic file-write
+  evidence`.
+- Shared storage and byte-length tamper: `receive update did not prove dynamic
+  BYTES source payload`.
+- Host digest tamper: `host_effect did not match dynamic artifact`.
+- Bytes-access length tamper: `dynamic file-write update did not prove borrowed
+  root-bytes host-boundary access`.
+
+Aggregate evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - expected status: `fail`
+  - remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Fail, then Pass | Initial failures were rustfmt wrapping after xtask/schema edits; passed after `cargo fmt --all`. |
+| `cargo check -p xtask -p boon_report_schema --quiet` | Fail, then Pass | First failure caught a misplaced schema block in the fixed-bank branch; passed after moving it to the dynamic branch. Existing native GPU dead-code warnings only. |
+| `cargo fmt --all` | Pass | Applied formatting. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt current `xtask`; existing native GPU dead-code warnings only. |
+| `./target/debug/xtask verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json` | Pass | Refreshed fresh child report for adversarial mutation. |
+| `./target/debug/xtask verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Refreshed fresh child report for existing aggregate tamper cases. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-storage-profile.json target/reports/bytes-plan/bytes-file-read-plan.json` | Pass after rerun | A parallel validation raced with adversarial mutation and transiently saw a stale child; sequential validation passed. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Fail, then Pass | First run exposed the old schema-required adversarial ID list; passed after adding the new IDs. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First run identified stale child reports after rebuilding `xtask`; passed after refreshing the stale children. |
+| `./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed stale negative report and nested large source-payload route report. |
+| `./target/debug/xtask verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-bytes-byte-bank-layout --report target/reports/bytes-plan/bytes-byte-bank-layout.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-build-bytes-boundary --report target/reports/bytes-plan/build-bytes-boundary.json` | Pass | Refreshed stale child report. |
+| `./target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Pass | Refreshed stale benchmark reproduction report. |
+| `./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Remaining blockers are partial phases, missing Cells release wrapper, and Phase 10 default switch. |
+
+Independent review:
+
+- Subagent `019eeddd-7249-7fa0-841e-636558f0c3b3`
+  (`adversarial verification auditor`) confirmed that adversarial coverage did
+  not yet tamper the new large dynamic shared storage-profile case.
+- The reviewer also identified missing direct schema bindings for public
+  `case.state_summary`, host artifact metadata, artifact listing, and two
+  emitted `bytes_access` fields.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase9-large-dynamic-shared-adversarial-review.md`.
+
+Open findings:
+
+- The large dynamic shared source-payload file-write proof now has aggregate
+  tamper rejection for public state summary, source-payload storage, byte
+  length, host digest, and bytes-access length.
+- This remains focused Phase 9 evidence. It does not complete broad
+  performance coverage, final Phase 9 exit, postponed `TASK-0804A`, full
+  workspace tests, or Phase 10 default-switch readiness.
+
+## Phase 7 Malformed Private BYTES Artifact Runtime Safety
+
+Status: partial Phase 7 runtime-safety evidence; complete for focused
+malformed private `RuntimeBytes::from_artifact` rejection without panics.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase7-malformed-private-bytes-artifact-review.md`
+
+What changed:
+
+- Added
+  `runtime_bytes_from_artifact_rejects_malformed_private_state`.
+- The test table-drives malformed private BYTES artifact payloads and wraps
+  every decode in `std::panic::catch_unwind`.
+- Each malformed case must return a structured `Err`, not panic and not decode
+  successfully.
+- Covered malformed artifacts:
+  - missing `inline_bytes`;
+  - non-array `inline_bytes`;
+  - non-byte `inline_bytes` entry;
+  - `inline_bytes` entry above `255`;
+  - declared `byte_len` mismatch;
+  - empty digest;
+  - unsupported storage kind.
+- Updated the existing
+  `root_scalar_plan_executor_rejects_static_out_of_bounds_bytes_slice` test to
+  assert the current earlier typecheck diagnostic instead of the older
+  MachinePlan verifier message. The engine now rejects this static OOB fixture
+  before plan execution, which is stricter than the old expectation.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_runtime runtime_bytes_from_artifact_rejects_malformed_private_state -- --nocapture` | Fail, then Pass | First run failed because the new test referenced an `xtask`-local panic helper. After replacing it with local panic-message extraction, the test passed. |
+| `cargo test -p boon_runtime bytes_runtime_builtins_report_deterministic_errors -- --nocapture` | Pass | Existing deterministic BYTES builtin error test still passes. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_rejects_static_out_of_bounds_bytes_slice -- --nocapture` | Fail, then Pass | First run exposed that the compiler now rejects the static OOB slice at typecheck with a precise bounds diagnostic. The test expectation was updated and passed. |
+| `cargo fmt --all -- --check` | Pass | Formatting check after runtime/doc edits. |
+| `cargo check -p boon_runtime --quiet` | Pass | Focused runtime compile. |
+
+Independent review:
+
+- Subagent `019eedf0-4150-7ff1-bd07-604c3ea9385c`
+  (`runtime safety auditor`) identified malformed private BYTES artifact decode
+  as the smallest useful Phase 7 safety gap.
+- The reviewer recommended a focused `boon_runtime` unit test because the
+  decoder is a private runtime boundary and would otherwise require an indirect
+  public test hook.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase7-malformed-private-bytes-artifact-review.md`.
+
+Open findings:
+
+- This closes one focused malformed private-state decode boundary.
+- Broader malformed in-memory runtime-state tests, dynamic runtime OOB matrices,
+  zero-allocation fixed-byte warm ticks, broad Phase 9 performance evidence,
+  postponed `TASK-0804A`, full workspace tests, and Phase 10 default-switch
+  readiness remain open.
+
+## 2026-06-22 - Phase 7 Dynamic Shared BYTES Storage For Large Payloads
+
+Status: partial Phase 7 runtime/storage and Phase 9 verification evidence;
+complete for large runtime-owned source-payload and dynamic-path
+`File/read_bytes` payloads using executable shared storage instead of inline
+runtime storage.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase7-dynamic-shared-bytes-review.md`
+- refreshed `target/reports/bytes-plan/bytes-negative.json`
+- refreshed
+  `target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json`
+- refreshed `target/reports/bytes-plan/bytes-file-read-plan.json`
+- refreshed stale xtask-owned child reports and
+  `target/reports/bytes-plan/bytes-machine-plan-all.json`
+
+What changed:
+
+- Added `RuntimeBytesPayload::Shared(Bytes)` for runtime-owned dynamic BYTES
+  larger than the current 1024 byte source-event inline threshold.
+- Added dynamic constructors that keep small runtime-owned buffers as `inline`
+  and store larger runtime-owned buffers as `shared`.
+- `RuntimeBytes::inline_bytes()` now accepts both `Inline` and `Shared`
+  executable payloads. `BlobRef` and `PageRef` still reject executable byte
+  operations because they are descriptor-only until a resolver exists.
+- Root and generic source-payload BYTES ingestion now use the dynamic
+  constructor, so large source payloads are not reintroduced as inline runtime
+  state after being artifact-backed in reports.
+- Root and indexed PlanExecutor `File/read_bytes` now use the dynamic
+  constructor, so large file-read results become shared executable runtime
+  BYTES.
+- Report-schema replay now expects `shared` summaries for source-payload and
+  dynamic file-read BYTES values above the inline threshold.
+- `verify-bytes-file-read-plan` now generates a 1025 byte dynamic-path file-read
+  fixture and requires update/state storage to be `shared` while proving later
+  `Bytes/length` and `Bytes/get` consume the value correctly.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json`
+  - `status=pass`
+  - source-event payload storage remains `artifact`
+  - PlanExecutor update value storage is `shared`
+  - `byte_len=1025`
+  - `bytes_storage_no_copy=true`
+  - measured BYTES helper counters for the step:
+    `copy_from_slice_bytes=0`, `vec_clone_bytes=0`, `vec_alloc_bytes=0`,
+    `zero_fill_bytes=0`, and `inline_value_bytes=0`
+- `target/reports/bytes-plan/bytes-file-read-plan.json`
+  - `status=pass`
+  - dynamic-path file-read fixture `byte_len=1025`
+  - dynamic-path update storage is `shared`
+  - final `store.file_bytes.storage=shared`
+  - follow-up `store.file_len=1025`
+  - follow-up `store.first_byte=222`
+  - check `dynamic-path-large-file-read-uses-shared-storage` passed
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime bytes_value_summary_hides_inline_payload -- --nocapture` | Pass | Existing inline summary test still hides raw bytes. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime large_dynamic_bytes_use_shared_storage_without_public_inline_payload -- --nocapture` | Pass | New shared storage unit test passed. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture` | Pass | Existing source-payload PlanExecutor scenario still passed after shared storage change. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_runtime -p xtask -p boon_report_schema --quiet` | Pass | Focused compile passed; existing native GPU dead-code warnings only. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask --quiet` | Pass | Rebuilt current verifier binary; existing native GPU dead-code warnings only. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed negative report and nested large source-payload route report with `shared` runtime storage. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json` | Pass | Schema accepted the negative and large source-payload reports. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Dynamic-path file-read now proves large shared storage and follow-up BYTES consumers. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Schema accepted the large dynamic file-read storage evidence. |
+| Targeted refresh loop for `bytes-negative`, `todomvc-release-benchmark-reproduction`, `bytes-file-write-plan`, `bytes-storage-profile`, `bytes-byte-bank-layout`, `build-bytes-boundary`, and `bytes-machine-plan-adversarial` | Pass | Refreshed stale xtask-owned children after rebuilding `xtask`; adversarial regenerated last. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First failed on stale children after the binary/schema change; passed after targeted refresh. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Targeted schema validation passed. |
+
+Independent review:
+
+- Subagent `019eedad-3929-7943-9529-58231762bbaf` found the remaining inline
+  large-payload issue by reading current runtime/plan/schema/xtask code.
+- It recommended an executable shared payload variant for runtime-owned dynamic
+  bytes, leaving descriptor-only `BlobRef`/`PageRef` unresolved until a future
+  resolver exists.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase7-dynamic-shared-bytes-review.md`.
+
+Open findings:
+
+- This does not implement descriptor resolution for bridge `BlobRef` or
+  `PageRef`.
+- `Bytes/concat` and broad dynamic mutation storage remain open Phase 7 work.
+- Fixed byte-bank warm-tick zero-allocation proof remains open.
+- TASK-0804A Cells release benchmark evidence remains postponed, so Phase 9 and
+  Phase 10 remain open.
+
+## 2026-06-22 - Phase 3 Static Text-to-BYTES Conversion Refinement
+
+Recorded at: `2026-06-22T06:48:03+02:00`
+
+Status: partial Phase 3 type-system evidence; complete for static literal
+TEXT/BYTES conversion length refinement and invalid static conversion
+diagnostics in the covered v1 conversion builtins.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase3-static-conversion-review.md`
+- refreshed `target/reports/bytes-plan/bytes-negative.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- refreshed stale xtask-owned child reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Static literal `Text/to_bytes(encoding: Utf8)` now refines to fixed BYTES
+  length using UTF-8 byte length.
+- Static literal `Text/to_bytes(encoding: Ascii)` now refines to fixed BYTES
+  length when the literal is ASCII and emits a typechecker diagnostic when a
+  static literal contains non-ASCII text.
+- Static literal `Bytes/from_hex` now refines to fixed decoded BYTES length
+  when the literal is valid hex text and emits a typechecker diagnostic for
+  odd-length or invalid static hex text.
+- Static literal `Bytes/from_base64` now refines to fixed decoded BYTES length
+  when the literal is valid base64 text and emits a typechecker diagnostic for
+  invalid static base64 text.
+- Dynamic text inputs intentionally remain `BYTES[dynamic]`; their malformed
+  data remains a deterministic runtime/plan error instead of a compiler error.
+- The paired same-message negative cases for invalid static hex/base64 are now
+  independent fixtures so one diagnostic cannot satisfy two required IDs.
+
+Report evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=83`
+  - required static conversion IDs:
+    - `typecheck-static-text-to-bytes-ascii-rejects-non-ascii`
+    - `typecheck-static-bytes-from-hex-rejects-odd-digits`
+    - `typecheck-static-bytes-from-hex-rejects-invalid-digits`
+    - `typecheck-static-bytes-from-base64-rejects-bad-length`
+    - `typecheck-static-bytes-from-base64-rejects-invalid-digit`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Fresh formatting check after the current code changes. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_typecheck bytes -- --nocapture` | Pass | 8 BYTES typechecker tests passed, including `static_text_to_bytes_refines_only_literal_inputs`. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_typecheck -p xtask -p boon_report_schema --quiet` | Pass | Focused compile passed; existing native GPU dead-code warnings only. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Wrote the 83-case negative report. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Schema accepted the refreshed negative report. |
+| Targeted refresh loop for `bytes-machine-plan-adversarial`, `todomvc-release-benchmark-reproduction`, `bytes-file-read-plan`, `bytes-file-write-plan`, `bytes-storage-profile`, `bytes-byte-bank-layout`, and `build-bytes-boundary` | Pass | Refreshed stale xtask-owned child reports after rebuilding/verifier edits. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First failed because the adversarial report was generated before refreshed child hashes; passed after regenerating the adversarial report last. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted the refreshed aggregate. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected fail | Readiness still fails on partial phases, missing Cells release wrapper, and legacy default execution. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/goal-readiness.json` | Pass | Schema accepted the readiness report. |
+
+Independent review:
+
+- Subagent `019eed8f-bba8-73d1-80a0-7615082a8663` reviewed the static
+  conversion logic and found no implementation mismatch.
+- The reviewer identified one medium verification issue: odd/invalid hex and
+  bad-length/invalid-digit base64 initially used paired same-message fixtures,
+  so one diagnostic could have masked another required ID.
+- That finding was fixed by splitting the paired cases into independent
+  `verify-bytes-negative` fixtures.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase3-static-conversion-review.md`.
+
+Open findings:
+
+- This narrows Phase 3's constant/refinement gap, but Phase 3 remains partial.
+- Broader constant evaluation policy, runtime-body audit, and final Phase 3
+  exit coverage remain open.
+- TASK-0804A Cells release benchmark evidence remains postponed, so Phase 9 and
+  Phase 10 remain open.
+
+## 2026-06-22 - Phase 3 Static Fixed-BYTES Bounds Diagnostics
+
+Status: partial Phase 3 type-system evidence; complete for statically known
+fixed-BYTES out-of-bounds diagnostics in the covered v1 builtin families.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase3-static-bounds-review.md`
+- refreshed `target/reports/bytes-plan/bytes-negative.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- refreshed 44 stale child reports under `target/reports/bytes-plan/` from
+  their recorded `command_argv` values after rebuilding `boon_cli` and `xtask`
+
+What changed:
+
+- BYTES builtin argument validation now receives the actual piped input
+  expression ID rather than only a boolean pipe flag. This lets the typechecker
+  inspect fixed-BYTES input lengths while preserving call-form validation.
+- The typechecker now emits compile-time diagnostics when all required facts
+  are static:
+  - `Bytes/get(index: literal)`
+  - `Bytes/set(index: literal, value: ...)`
+  - `Bytes/slice(offset|start: literal, byte_count|length|count: literal)`
+  - `Bytes/take(byte_count|length|count: literal)`
+  - `Bytes/drop(byte_count|length|count: literal)`
+  - `Bytes/read_unsigned`, `Bytes/read_signed`
+  - `Bytes/write_unsigned`, `Bytes/write_signed`
+- Signed numeric literals are considered for bounds diagnostics, so `index: -1`
+  and negative offsets/counts are rejected as statically known out-of-bounds
+  mistakes.
+- Static-bounds input lookup ignores invalid positional BYTES call arguments.
+  Positional args still produce the existing ambiguity diagnostic, but no longer
+  cascade into misleading static-bounds diagnostics.
+- `docs/architecture/BYTES_SEMANTICS.md` now states the convention explicitly:
+  statically known fixed-BYTES OOB is a typechecker diagnostic; dynamic OOB
+  remains a deterministic runtime/plan error.
+- `verify-bytes-negative` now requires 78 negative cases. New schema-required
+  typecheck IDs cover static positive OOB, negative OOB, signed numeric OOB,
+  and the previous plan-level static slice/set cases now expect the earlier
+  typechecker diagnostics.
+
+Report evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=78`
+  - required static-bounds IDs include:
+    `typecheck-bytes-get-static-out-of-bounds`,
+    `typecheck-bytes-get-negative-static-out-of-bounds`,
+    `typecheck-bytes-set-static-out-of-bounds`,
+    `typecheck-bytes-slice-static-out-of-bounds`,
+    `typecheck-bytes-slice-negative-static-out-of-bounds`,
+    `typecheck-bytes-take-static-out-of-bounds`,
+    `typecheck-bytes-drop-static-out-of-bounds`,
+    `typecheck-bytes-read-static-out-of-bounds`,
+    `typecheck-bytes-write-static-out-of-bounds`,
+    `typecheck-bytes-read-signed-static-out-of-bounds`, and
+    `typecheck-bytes-write-signed-static-out-of-bounds`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Fail, then Pass | First run found formatting drift after edits; passed after `cargo fmt --all`. |
+| `cargo fmt --all` | Pass | Applied formatting. |
+| `cargo test -p boon_typecheck bytes -- --nocapture` | Pass | 7 focused BYTES typechecker tests passed. |
+| `cargo check -p boon_typecheck -p xtask -p boon_report_schema --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo build -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Fail, then Pass | Initial failure exposed stale expectations for two old plan-level OOB cases after static typecheck diagnostics moved earlier. Final report passed with 78 cases. |
+| `./target/debug/boon_cli run-plan-root-scalar-scenario ...plan-static-out-of-bounds-slice...` | Fail as expected | Rebuilt CLI showed `typecheck failed` with `` `Bytes/slice` byte range 2..4 is out of bounds for fixed BYTES[3] ``. |
+| `./target/debug/boon_cli run-plan-root-scalar-scenario ...plan-bytes-set-out-of-bounds...` | Fail as expected | Rebuilt CLI showed `typecheck failed` with `` `Bytes/set` index 4 is out of bounds for fixed BYTES[3] ``. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Schema accepted the expanded 78-case negative report. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First run found 44 stale child reports after binary rebuilds; passed after replaying each stale report's recorded `command_argv`. |
+| Sequential replay of 44 stale child `command_argv` values from `target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Refreshed stale `boon_cli` and `xtask` child reports. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed standalone adversarial proof after binary rebuild. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted refreshed evidence. |
+| `./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial phases, Phase 10 not started, missing Cells release benchmark wrapper, and legacy default execution. |
+
+Independent review:
+
+- Subagent `019eed70-25d2-75e1-930c-1a30cb391912`
+  (`Hume the 4th`) reviewed the static-bounds slice.
+- Findings resolved in this slice:
+  - stale `verify-bytes-negative` plan expectations after moving static OOB
+    rejection into the typechecker;
+  - missed negative numeric literals such as `index: -1`;
+  - missing signed read/write static-OOB gate coverage;
+  - positional BYTES args cascading into misleading static-bounds diagnostics.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase3-static-bounds-review.md`.
+
+Open findings:
+
+- Dynamic indexes, offsets, and counts intentionally remain runtime/plan
+  deterministic-error work; this slice only covers statically known literals.
+- Phase 3 remains partial because broader constant-evaluation policy,
+  runtime-body audit, and final Phase 3 exit coverage are still incomplete.
+- The full BYTES/MachinePlan objective remains incomplete: Phase 0 and Phases
+  3-9 remain partial, Phase 10 is not started, and `TASK-0804A` still blocks
+  Cells release benchmark readiness.
+
+## 2026-06-22 - Phase 2 Parser Closure And Adversarial Gate Cost Fix
+
+Status: Phase 2 parser surface is complete. The full BYTES/MachinePlan goal is
+still incomplete because Phases 0-1 and 3-9 remain partial, Phase 10 is not
+started, and `TASK-0804A` still blocks the Cells release benchmark wrapper.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc` with a dirty
+BYTES/MachinePlan worktree.
+
+Files changed:
+
+- `crates/boon_parser/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed `target/reports/bytes-plan/bytes-negative.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+
+What changed:
+
+- Added parser coverage for supported explicit byte-literal bases:
+  `2u10101010`, `8u377`, `10u255`, and existing hexadecimal forms.
+- Added exact-span assertions for a full `BYTES[2] { 16uAA, 10u7 }`
+  constructor and the nested `16uAA` byte literal.
+- Extended malformed BYTES parser cases for unsupported bases, missing digits,
+  and unterminated constructor bodies.
+- Extended `verify-bytes-negative` and report-schema expectations with:
+  `parser-unsupported-byte-base`, `parser-byte-missing-digits`, and
+  `parser-missing-closing-body`.
+- Fixed the adversarial verifier cost shape. The old adversarial path ran the
+  full 47-report aggregate once per aggregate tamper case. A single aggregate
+  pass took about 36-70 seconds on this worktree, so the adversarial gate could
+  run for minutes at one full CPU core with no output.
+- The adversarial tamper runner now validates only the mutated required child
+  report against the aggregate-facing contract: presence, report schema,
+  `status=pass`, command, measurement mode, current git, artifact hash
+  freshness, and no-fallback PlanExecutor counters when present. The real
+  `verify-bytes-machine-plan-all --check-existing` aggregate gate is unchanged.
+- Added a process-local file-hash cache in `xtask`, keyed by path, length, and
+  modified timestamp, so stable large artifacts such as `target/debug/xtask`
+  are not rehashed repeatedly inside one verifier process while rewritten child
+  reports still invalidate correctly.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=63`
+  - parser negative cases include:
+    `parser-invalid-hex-byte`, `parser-multiline-invalid-hex-byte`,
+    `parser-byte-overflow`, `parser-unsupported-byte-base`,
+    `parser-byte-missing-digits`, `parser-bad-size-expression`,
+    `parser-missing-body`, `parser-missing-closing-body`, and
+    `parser-multiline-trailing-token`.
+- `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+  - `status=pass`
+  - `adversarial_case_count=9`
+  - required cases include missing child report, stale child artifact hash,
+    edited child success flag, runtime AST fallback, executable string-path,
+    unknown plan op, indexed private BYTES summary tamper, hardware-bounded
+    unbounded BYTES rejection, and fake benchmark profile rejection.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=33`
+
+Timing evidence:
+
+- Pre-fix independent subagent diagnostic: one non-tampering aggregate pass took
+  `36.09s` at `99%` CPU, and the old adversarial verifier multiplied that by
+  seven aggregate tamper cases.
+- Pre-targeting tactical cache run: standalone adversarial gate completed in
+  `1:39.60` at `99%` CPU.
+- Post-targeting final run: standalone adversarial gate completed in `0:38.00`
+  at `100%` CPU.
+- Final aggregate run completed in `1:10.41` at `100%` CPU.
+
+Independent review:
+
+- Subagent `019eed19-075b-7eb1-8977-ae96385d93ca`
+  (`Zeno the 4th`) independently diagnosed the adversarial verifier cost. The
+  reviewer found that `verify_bytes_machine_plan_adversarial` called
+  `verify_bytes_machine_plan_all_with_required` for every tamper case, causing
+  full report-schema and artifact-hash validation of all required reports for
+  each case.
+- The reviewer recommended targeted child validation for adversarial negative
+  cases and a hash-cache/fail-fast mitigation. The implementation follows that
+  direction while leaving the real aggregate gate unchanged.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_parser bytes -- --nocapture` | Pass | Four focused BYTES parser tests passed, including exact spans and malformed syntax diagnostics. |
+| `cargo check -p boon_parser -p xtask -p boon_report_schema --quiet` | Pass | Focused compile after parser/schema/verifier edits; existing native GPU dead-code warnings only. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt current verifier binary; existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed 63-case negative report with the new parser cases. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Schema accepted the refreshed negative report. |
+| `timeout 20s strace -f -tt -o target/reports/bytes-plan/adversarial-strace.log target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Expected timeout | Diagnostic trace showed repeated large-file hashing of `target/debug/xtask` during aggregate child validation. |
+| `cargo fmt --all -- --check` | Fail, then Pass | Failed on one wrapping diff after the targeted helper; passed after `cargo fmt --all`. |
+| `cargo check -p xtask --quiet` | Pass | Focused compile for the targeted adversarial helper; existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Refreshed a child report left missing/stale by an interrupted earlier adversarial run. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | First post-cache run completed in `1:39.60`; final targeted run completed in `0:38.00`. |
+| `target/debug/boon_cli run-plan-route examples/bytes_source_payload_plan_ops.bn --source store.receive --target-state store.received --payload-bytes-file bytes=target/reports/bytes-plan/bytes-source-payload-large-route-run-plan-artifacts/source-event-bytes-dac90dfc2ed7a188456dd23a7b89f16056a5c02eb64cf1301640065c74e38ed3.bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json` | Pass | Refreshed stale large BYTES source-payload route report. |
+| `target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Pass | Refreshed stale benchmark reproduction report. |
+| `target/debug/xtask verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json` | Pass | Refreshed stale file-write report. |
+| `target/debug/xtask verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json` | Pass | Refreshed stale storage-profile report. |
+| `target/debug/xtask verify-bytes-byte-bank-layout --report target/reports/bytes-plan/bytes-byte-bank-layout.json` | Pass | Refreshed stale byte-bank layout report. |
+| `target/debug/xtask verify-build-bytes-boundary --report target/reports/bytes-plan/build-bytes-boundary.json` | Pass | Refreshed stale build-boundary report. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | Failed while stale child reports remained; final run passed after refreshing file-read and adversarial reports without rebuilding in between. |
+
+Open findings:
+
+- The adversarial gate is no longer a multi-minute full-aggregate multiplier,
+  but it still takes about 38 seconds because schema checks and binary/report
+  hashing remain expensive. This is acceptable for the current proof gate, but a
+  broader report-schema hashing cache would be useful future cleanup.
+- Phase 2 is complete only for parser syntax/diagnostics/coverage. BYTES type,
+  IR, runtime, storage, examples, performance, and default-switch readiness
+  remain governed by later phases.
+- `TASK-0804A` remains unfinished. Cells release benchmark speed still blocks
+  the Cells benchmark wrapper and Phase 9/10 readiness.
+
+## 2026-06-22 - Phase 1 Plan Boundary Closure Audit
+
+Status: Phase 1 plan-boundary implementation is complete. This does not claim
+Phase 5 real MachinePlan lowering, Phase 6 CPU PlanExecutor parity, Phase 9
+performance, or Phase 10 default-switch readiness.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc` with a dirty
+BYTES/MachinePlan worktree.
+
+Files changed:
+
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- generated `target/reports/bytes-plan/phase1-bytes-initial-dump-plan.json`
+
+Phase 1 requirements and current evidence:
+
+- Workspace crate: `crates/boon_plan` is listed in the root workspace and
+  dependency table.
+- Plan types: `crates/boon_plan/src/lib.rs` defines `PlanVersion`,
+  `TargetProfile`, typed plan IDs, `MachinePlan`, `PlanConstant`,
+  `SourceRoute`, `StorageLayout`, `OperationRegion`, `DirtyPlan`,
+  `CommitPlan`, `DeltaPlan`, `CapabilitySummary`, and `DebugMap`.
+- Compile boundary: `compile_typed_program` lowers a `TypedProgram` into a
+  `MachinePlan`.
+- Deterministic hash/verifier: `verify_plan` checks typed route/storage/op
+  identities, byte constant hashes, constant deduplication, byte-bank layout,
+  typed refs, capability counts, and debug-map separation; `plan_sha256` hashes
+  the serialized typed plan.
+- Developer command: `boon_cli dump-plan` produces schema-valid reports with
+  plan version, target profile, plan hash, capability summary, plan JSON, and
+  `verify_plan` checks.
+- Default preservation: `boon_cli run` still defaults to legacy execution; plan
+  mode remains opt-in.
+
+Focused evidence:
+
+- `target/reports/bytes-plan/phase1-bytes-initial-dump-plan.json`
+  - `status=pass`
+  - `command=dump-plan`
+  - `plan_version=1.0`
+  - `target_profile=software_default`
+  - `machine-plan-constructed=true`
+  - `machine-plan-verified=true`
+  - `machine-plan-typed-lowering-executable=true`
+  - `legacy-runtime-default-preserved=true`
+- Existing aggregate evidence:
+  `target/reports/bytes-plan/bytes-machine-plan-all.json` remains a broader
+  proof with 47/47 required reports checked, 40 proof reports, 7 diagnostic
+  reports, and 33 no-fallback PlanExecutor reports.
+
+Independent review:
+
+- Subagent `019eed2f-ffd9-74e1-804e-8f599bcd265c`
+  (`Noether the 4th`) performed a read-only Phase 1 closure audit and concluded
+  that Phase 1 is implementation-complete when scoped to the objective's plan
+  boundary: typed `MachinePlan` boundary, compile/dump/verifier surfaces, and
+  preserved legacy default.
+- The reviewer explicitly warned not to count later CPU PlanExecutor parity or
+  full real lowering semantics as Phase 1 work. Those remain Phase 5/6/9/10
+  concerns.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_plan plan_hash_is_stable_for_same_plan -- --nocapture` | Pass | Deterministic plan hash and empty-plan verifier smoke test. |
+| `cargo test -p boon_plan bytes_literal_lowers_to_executable_typed_storage_and_constant_payload -- --nocapture` | Pass | Minimal BYTES[4] literal lowers to typed executable storage/constant payload. |
+| `cargo run -p boon_cli -- dump-plan examples/bytes_initial.bn --report target/reports/bytes-plan/phase1-bytes-initial-dump-plan.json` | Pass | Produced a passing dump-plan report for a focused BYTES fixture. |
+| `cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn` | Pass | Confirms the default CLI run path still works without switching to PlanExecutor by default. |
+
+Open findings:
+
+- There is still no narrow `verify-phase1-plan-boundary` xtask gate. Current
+  proof comes from code, focused tests, `dump-plan`, report schema, and the
+  broader BYTES/MachinePlan aggregate.
+- `DebugMap` separation is structurally true because executable operands are
+  typed IDs/refs and human-readable labels live in `debug_map`, but the current
+  verifier check for that separation is not adversarial.
+- `DirtyPlan` and `CommitPlan` are still boundary summaries rather than the
+  final executable dirty/commit schedule. Real lowering/scheduling remains
+  Phase 5/6 work.
+- The deterministic serialization is the current Rust `serde_json` encoding
+  plus schema-side canonical reserialization, not a separately specified
+  cross-language binary format.
+
+## TASK-0804A Cells Benchmark Source-Action Culprit Slice
+
+Status: still incomplete. This is Phase 9 diagnostic evidence for the missing
+Cells release benchmark wrapper, not a passing proof. `TASK-0804A` remains the
+blocking speed item for the BYTES/MachinePlan readiness audit.
+
+Base/current commit: current working tree after `0f891e5f5d49508e3f8618d03913741e58215e11`
+with local runtime instrumentation.
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed diagnostic report:
+  `target/reports/bytes-plan/cells-release-benchmark-speed.json`
+
+What changed and what was learned:
+
+- Kept: storage-backed root list views such as `store.selected_input` no longer
+  need an expensive `root_value_cache` insert on the direct `List/find` path.
+  The runtime can treat storage-backed list views with current root reads as
+  materialized and return the storage `ListRef`.
+- Kept: direct `List/find`/root-read instrumentation now exposes root-read
+  replacement sub-timers and confirms that `store.selected_input` materialization
+  is no longer the main bottleneck.
+- Kept: source-action instrumentation now splits `source_action_eval_ms` into
+  indexed text/value/bool commit time and indexed followup time, including
+  row-derived recompute time.
+- Killed: a dependency-driven replacement for the broad
+  `recompute_generic_derived_for_row` followup was tried and reverted. It reduced
+  some route scan/allocation counters but did not improve p95/max latency and
+  added semantic risk. The current worktree is back on the broad row followup.
+
+Current measured cause from the kept-code diagnostic report:
+
+- The current report still fails both strict Cells latency budgets:
+  - max `10.080917ms` vs allowed `8.0ms`
+  - p95 `10.024215ms` vs allowed `4.0ms`
+  - p50 `7.457788ms`, p99 `10.080917ms`, sample count `25`
+- Graph rebuild budget still passes:
+  `measured_graph_rebuilds_per_interaction=0`.
+- Allocation budget is not applied for the `software_dynamic` profile; the
+  report observed `13661` bounded-profile allocations after warm-up.
+- The old suspected `store.selected_input` direct `List/find` path is now
+  sub-millisecond and not the main p95 cause.
+- Two real remaining hot shapes are visible:
+  - formula/value row recompute inside indexed source-action followups, for
+    example `type-a3-literal-20` has
+    `source_action_eval_ms=9.811120` and
+    `source_action_indexed_followup_row_recompute_ms=9.771785`.
+  - root flush dirty-scheduler overhead, for example
+    `edit-a0-literal` has `source_action_root_flush_ms=8.230928`,
+    `source_action_root_dirty_scheduler_ms=8.181546`, and
+    `source_action_root_dirty_scheduler_unattributed_ms=8.158735`.
+
+Independent review:
+
+- Subagent `019eecc9-fcb1-7bf2-bc64-811429216a2a`
+  (`Bernoulli the 4th`) independently inspected the report/code and reached the
+  same conclusion: selected-input materialization is no longer the culprit; the
+  remaining families are broad indexed row followups/formula recompute and root
+  dirty-scheduler overhead.
+- The subagent recommended measuring row-followup recompute and dirty-scheduler
+  internals before further optimization. The row-followup timers added here
+  confirm that formula/value recompute can dominate `source_action_eval_ms`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Formatting after instrumentation and revert of the killed row-followup experiment. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_runtime --quiet` | Pass | Focused runtime compile. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime generic_derived_state_skips_unchanged_root_read_replacement -- --nocapture --test-threads=1` | Pass | Existing root-read replacement fast-path test. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture --test-threads=1` | Pass | Focused Cells direct-list materialization test. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `timeout 1200s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Diagnostic speed report was written, but the wrapper proof remains missing because `latency_max_budget` and `latency_p95_budget` fail. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask verify-report-schema target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Expected for this diagnostic report: schema verification rejects it because speed budgets fail. |
+
+Next direction:
+
+- Do not spend more time on the old `store.selected_input` root-value-cache path;
+  the current evidence moved the bottleneck elsewhere.
+- The next proper fixes should target:
+  - compiled/cached Cells formula evaluation and avoiding duplicated
+    `compute_value` work across `cell.value`/`cell.error` without making a
+    Cells-only Rust branch; or
+  - root dirty-scheduler internals that currently spend several milliseconds in
+    unattributed scheduler work even when the materialized list view itself is
+    tiny.
+- The Cells release benchmark wrapper remains absent until both max and p95
+  budgets pass on a current release binary.
+
+## 2026-06-22 - Native TodoMVC Source Identity Routing Fix
+
+Status: focused Phase 6/9 runtime/native correctness evidence improved. The
+full BYTES/MachinePlan objective remains partial.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc` with a dirty
+runtime worktree while this ledger entry was written.
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- generated
+  `target/reports/bytes-plan/subagents/native-todomvc-source-identity-review.json`
+- refreshed `target/reports/runtime-production-hardening.json`
+- refreshed `target/reports/runtime-finality.json`
+- refreshed `target/reports/native-gpu/preview-e2e-todomvc.json`
+- refreshed `target/reports/native-gpu/todomvc-input-parity.json`
+- refreshed `target/reports/native-gpu/todomvc-two-window-content.json`
+- refreshed `target/reports/native-gpu/todomvc-reference-parity.json`
+- refreshed `target/reports/playground-genericity.json`
+- refreshed `target/reports/debug/machine-readiness.json`
+- refreshed `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- refreshed stale child reports under `target/reports/bytes-plan/`
+- refreshed `target/reports/schema.json`
+- refreshed `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- Document-summary rows for storage-backed root `ListView` fields now use the
+  canonical storage/list summary path instead of allowing raw computed
+  list-view values to shadow identity-rich stored rows.
+- Projected root list rows now publish the source row identity for
+  document-facing `$boon.row_key` / `generation` when a source identity sidecar
+  exists. Row-scoped source bindings also resolve against that source list/key,
+  so TodoMVC filtered rows route clicks to `todos` instead of to projection
+  storage identities.
+- Root list-view materialization now treats identity-only sidecar changes as
+  real invalidations. If the visible row fields are byte-for-byte unchanged but
+  the source row behind them changed, the runtime updates/rebinds the rows and
+  broadens changed read keys for that identity-only case.
+- The same invalidation shape was applied to the direct-find materialization
+  path and the general root list-view path.
+- No Boon source/scenario workaround was left behind for this bug.
+
+Why this mattered:
+
+- The native TodoMVC input parity verifier found that
+  `toggle-dynamic-test-todo-under-active-filter` routed to stale row key `4`
+  after the Active filter even though the visible row text was `Test todo` and
+  the source `todos` key was `5`.
+- The runtime had two identities for the same visible row shape: projection row
+  identity and source row identity. The document/source-routing contract needs
+  the source identity because user events target source-owned row state.
+
+Regression coverage:
+
+- `document_summary_uses_source_identity_for_filtered_todomvc_rows` applies the
+  TodoMVC setup sequence through the Active filter and asserts the `Test todo`
+  document row exposes source key `5` and `sources/todo_checkbox/click/list_id`
+  is `todos`.
+- `root_list_view_identity_only_change_updates_document_identity` creates two
+  duplicate-looking source rows, switches the selector from the first to the
+  second while the visible projected fields remain identical, and asserts the
+  document-facing `$boon.row_key` changes from `1` to `2`.
+
+Independent review:
+
+- Subagent `019eec5d-7bdb-79b0-9116-6116107529b8` isolated the parity failure
+  to stale projected row identity: target text was `Test todo`, but the event
+  route carried stale `target_key=4`; the source `todos` key for `Test todo`
+  was `5`.
+- Subagent `019eec6d-c7bd-70f0-a680-40c9077ec88c` found a high-severity
+  follow-up risk: `root_source_identities` could still go stale on
+  identity-only projection changes because the runtime returned early when row
+  fields compared equal. The duplicate-row regression above covers the fixed
+  shape.
+- Subagent `019eec7e-f257-7f70-a7d1-2ca51b866ec0` reviewed the final dirty
+  runtime diff and current TodoMVC input parity report, found no blocking
+  issues, and independently ran both focused runtime regressions. The reviewer
+  confirmed both the direct-find and general root list-view materializers now
+  treat identity-only source-sidecar changes as invalidations.
+- Review report:
+  `target/reports/bytes-plan/subagents/native-todomvc-source-identity-review.json`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Formatting check before the ledger edit. |
+| `cargo fmt --all && timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime document_summary_uses_source_identity_for_filtered_todomvc_rows -- --nocapture --test-threads=1 && timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime root_list_view_identity_only_change_updates_document_identity -- --nocapture --test-threads=1` | Pass | Both focused runtime regressions passed. Subagent `019eec7e-f257-7f70-a7d1-2ca51b866ec0` independently reran both tests and reported pass. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/boon_cli dump-ir examples/todomvc.bn >/tmp/todomvc-dump-ir.out` | Pass | TodoMVC source still dumps after the runtime fix. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build -p xtask -p boon_native_playground --quiet` | Pass | Rebuilt current verifier/playground binaries; existing native dead-code warnings only. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-runtime-production-hardening --report target/reports/runtime-production-hardening.json` | Pass | Runtime hardening report refreshed. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-runtime-finality --report target/reports/runtime-finality.json` | Pass | Runtime finality report refreshed. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json` | Pass | Wrapper exited 0; emitted a stale layout-proof warning for a nested proof artifact. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-todomvc-input-parity --report target/reports/native-gpu/todomvc-input-parity.json` | Pass | Report status `pass`, commit `6494b54`, 26 host-route assertions. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-two-window-content --report target/reports/native-gpu/todomvc-two-window-content.json` | Pass | Two-window content proof refreshed. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-native-todomvc-reference-parity --report target/reports/native-gpu/todomvc-reference-parity.json` | Pass | Native/reference parity proof refreshed. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-playground-genericity --report target/reports/playground-genericity.json` | Pass | Genericity proof refreshed. |
+| `timeout 240s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/runtime-production-hardening.json target/reports/runtime-finality.json target/reports/native-gpu/preview-e2e-todomvc.json target/reports/native-gpu/todomvc-input-parity.json target/reports/native-gpu/todomvc-two-window-content.json target/reports/native-gpu/todomvc-reference-parity.json target/reports/playground-genericity.json` | Pass | Focused schema bundle accepted. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json` | Pass | Machine-readiness report now passes with no blockers. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected fail | Initial post-fix goal-readiness still had seven blockers. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/goal-readiness.json target/reports/debug/machine-readiness.json` | Pass | Focused schema check for current readiness reports accepted. |
+| `timeout 120s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema target/reports/bytes-plan/subagents/native-todomvc-source-identity-review.json` | Pass | New subagent-review artifact validates. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-report-schema` | Fail, then Pass | First exposed stale report binary hashes under `target/reports/`; after refreshing stale bytecode, BYTES, TodoMVC, Cells, benchmark, and aggregate reports, the full recursive schema sweep passed. Final pass saw 348 JSON reports and checked 201 pass reports. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytecode counter --report target/reports/bytecode-counter.json` | Pass | Refreshed stale top-level bytecode report required by the full schema sweep. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn --steps measure-bytes --compare-legacy --report target/reports/bytes-length-audit.json` | Pass | Refreshed stale top-level BYTES length audit report. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-build-bytes-boundary --report target/reports/bytes-plan/build-bytes-boundary.json` | Pass | Refreshed stale xtask child report. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-byte-bank-layout --report target/reports/bytes-plan/bytes-byte-bank-layout.json` | Pass | Refreshed stale xtask child report. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json` | Pass | Refreshed stale xtask child report. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json` | Pass | Refreshed stale xtask child report. |
+| Sequential refresh of 39 stale `target/debug/boon_cli` reports under `target/reports/bytes-plan/` from their recorded `command_argv` values | Pass | Refreshed stale dump-plan, route, scenario, TodoMVC, and Cells child reports; stopped-on-failure script reached `done`. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed negative gate and its nested/base reports. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json` | Pass | Refreshed storage profile child report. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial aggregate report after aggregate artifact hash changes. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-speed.json` | Pass | Refreshed TodoMVC release benchmark wrapper; 20 iterations in 1378.894 ms, 68.945 ms/iteration. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark-repeat.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-repeat-speed.json` | Pass | Refreshed repeat TodoMVC release benchmark wrapper; 20 iterations in 1353.270 ms, 67.664 ms/iteration. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Fail, then Pass | First failed because the two benchmark wrappers had stale `source_hash` values. Passed after refreshing both release benchmark reports. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First failed because adversarial child artifact hashes lagged the regenerated aggregate. Passed after rerunning the adversarial report and then the aggregate. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected fail | Final readiness blocker count is four; stale aggregate/worktree/schema blockers are gone. |
+
+Current readiness evidence:
+
+- `target/reports/debug/machine-readiness.json`: `status=pass`.
+- `target/reports/native-gpu/todomvc-input-parity.json`: `status=pass`,
+  `host_route_assertions=26`.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`: `status=pass`,
+  `required_report_count=47`, `checked_report_count=47`,
+  `proof_report_count=40`, `diagnostic_report_count=7`,
+  `no_fallback_plan_executor_count=33`.
+- `target/reports/schema.json`: `status=pass`, saw 348 JSON reports and
+  schema-checked 201 passing reports.
+- `target/reports/bytes-plan/goal-readiness.json`: `status=fail`.
+
+Open blockers from the current goal-readiness report:
+
+- `10 phases are still partial in the progress ledger`
+- `1 phases are still not started in the progress ledger`
+- `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+- `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Open findings:
+
+- A direct-find-specific duplicate identity regression remains optional
+  hardening. The implementation path was updated for direct-find too, and the
+  final independent runtime diff review found no blocking direct-find issue.
+- The full `target/reports/schema.json` summary and
+  `target/reports/bytes-plan/bytes-machine-plan-all.json` aggregate are now
+  current for this dirty worktree.
+- TASK-0804A / Cells release performance remains unfinished and postponed, so
+  Phase 9 and Phase 10 remain open.
+
 ## TASK-0804A Root Read Dependency Churn Follow-up
 
 Recorded at: `2026-06-21T23:35:00+02:00`
@@ -16242,6 +17473,210 @@ Decision:
 - Do not add Cells release benchmark or reproduction reports to the aggregate
   until an honest passing wrapper exists.
 
+## TASK-0804A Scheduler/Profile Cost Follow-up
+
+Recorded at: `2026-06-22T03:25:50+02:00`
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+Status:
+
+- `TASK-0804A` remains unfinished.
+- `target/reports/bytes-plan/cells-release-benchmark.json` is still missing
+  because the benchmark wrapper correctly refuses to write a passing report
+  while the Cells release speed budget fails.
+- The current diagnostic report is
+  `target/reports/bytes-plan/cells-release-benchmark-speed.json`.
+
+Independent review:
+
+- Subagent `019eecdc-a75a-74b1-8d91-66b4f90c3a4b`
+  (`Jason the 4th`) performed a read-only audit. The reviewer confirmed that
+  the previous report was stale relative to the dirty scheduler buckets and
+  identified the likely unbucketed work inside
+  `materialize_root_derived_field_commits_for_changed_reads` as:
+  `remove_structured_child_ready_roots`, `record_root_materialization_sample`,
+  and `prune_structured_child_dirty_roots_for_changed_reads`.
+- The same review also warned that if those buckets did not absorb the time,
+  the fixed `6-8 ms` shape could be wall-clock descheduling rather than normal
+  Rust work.
+
+What the refreshed measurements proved:
+
+- After adding the scheduler buckets, the earlier large
+  `source_action_root_dirty_scheduler_unattributed_ms` mostly disappeared.
+- `source_action_root_dirty_ready_refresh_ms` and
+  `source_action_root_prune_structured_ms` stayed near microsecond scale.
+- The selection-step root flush spikes moved to
+  `source_action_root_record_sample_ms`, while actual root-list
+  materialization stayed tiny.
+- Representative pre-fix refreshed samples:
+  - `select-a3-for-literal-entry`: latency `7.944764 ms`,
+    `root_flush=7.865871`, `root_dirty_scheduler=7.697502`,
+    `record_sample=7.668707`, `root_materialization=0.148521`,
+    `eval=0.015575`.
+  - `edit-a0-literal`: latency `6.418822 ms`, `root_flush=5.645331`,
+    `root_dirty_scheduler=5.608430`, `record_sample=5.564283`,
+    `root_materialization=0.069671`, `eval=0.557781`.
+  - Formula/value edits remained dominated by indexed row recomputation, e.g.
+    `type-a3-literal-20`: latency `9.908217 ms`, `eval=9.688423`,
+    `indexed_followup_row_recompute=9.646797`.
+
+Runtime changes:
+
+- Added `source_action_root_dirty_ready_refresh_ms`,
+  `source_action_root_record_sample_ms`, and
+  `source_action_root_prune_structured_ms` to `LiveRuntimeStepProfile` so the
+  root dirty scheduler timing is no longer a single large unattributed bucket.
+- Added non-test diagnostic gates:
+  - `BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES=1` keeps full
+    root-materialization samples.
+  - `BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS=1` keeps detailed list-view
+    aggregates under root-materialization by-path stats.
+- Tests still keep those detailed profiles enabled by default, preserving the
+  existing unit-test diagnostics.
+
+Results after the first diagnostic gate:
+
+- Full sample retention was disabled in the release benchmark.
+- `latency_max_budget` passed, but `latency_p95_budget` still failed:
+  - p50 `3.898245 ms`
+  - p95 `7.357230 ms`
+  - p99/max `7.396376 ms`
+  - max budget `<= 8 ms` passed
+  - p95 budget `<= 4 ms` failed
+- Retained root-materialization samples were `0`, but selection steps still
+  showed large `source_action_root_record_sample_ms`, proving the retained
+  sample vector itself was not the complete cause.
+
+Results after the second diagnostic gate:
+
+- Detailed list-view by-path aggregation was also disabled in the release
+  benchmark.
+- The benchmark remained unstable/failing:
+  - p50 `2.830359 ms`
+  - p95 `7.071146 ms`
+  - p99/max `9.382550 ms`
+  - max budget `<= 8 ms` failed
+  - p95 budget `<= 4 ms` failed
+- The report confirms `root_materialization_stats.samples=0` and by-path stats
+  contain only lightweight counters for the slow selection samples, but
+  `source_action_root_record_sample_ms` still caught wall-clock stalls:
+  - `select-b0-shows-formula-in-bar`: latency `9.382550 ms`,
+    `root_flush=8.353696`, `root_dirty_scheduler=8.047402`,
+    `record_sample=8.020761`, `root_materialization=0.286612`.
+  - `select-a3-for-literal-entry`: latency `6.242231 ms`,
+    `root_flush=5.699045`, `root_dirty_scheduler=5.646100`,
+    `record_sample=5.621809`, `root_materialization=0.036942`.
+  - `select-c0-for-formula-update`: latency `5.831525 ms`,
+    `root_flush=5.585813`, `root_dirty_scheduler=5.529483`,
+    `record_sample=5.038162`, `root_materialization=0.040688`.
+
+Current conclusion:
+
+- One real cause was measurement/report overhead: full root-materialization
+  samples and list-view aggregate details were being maintained on the measured
+  release hot path even though the speed budget does not need them. That is now
+  controlled by explicit diagnostic environment variables.
+- That was not enough to finish `TASK-0804A`. The remaining budget failures
+  have two distinct shapes:
+  - selection steps still show wall-clock stalls around the
+    root-materialization record/drop boundary even after retained samples and
+    detailed by-path aggregates are disabled;
+  - formula/value edit steps are dominated by
+    `source_action_indexed_followup_row_recompute_ms`, indicating the Cells
+    row recompute path still evaluates too much or repeats formula work.
+- The next useful TASK-0804A continuation should add a wall-time vs thread-CPU
+  timer around `record_root_materialization_sample` and the caller-side
+  `result.profile` drop boundary, then separately target formula/value
+  recomputation with a real dependency-frontier or function/formula cache
+  design. Continuing with blind micro-edits is not justified.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Built the dirty scheduler-bucket instrumentation before the first refreshed benchmark; existing native GPU dead-code warnings were emitted. |
+| `timeout 1200s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Refreshed stale report; failed `latency_max_budget` and `latency_p95_budget`, but identified `record_sample` and indexed row recompute as the two hot shapes. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all -- --check` | Pass | Passed before the diagnostic gates; later failed only on wrapping after the second gate and was corrected with `cargo fmt --all`. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 cargo check -p boon_runtime --quiet` | Pass | Passed after each diagnostic gate. |
+| `timeout 360s env CARGO_BUILD_JOBS=1 nice -n 19 cargo test -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture --test-threads=1` | Pass | Passed after each diagnostic gate; detailed test diagnostics remain enabled under `cfg(test)`. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Rebuilt after the first diagnostic gate; existing native GPU dead-code warnings were emitted. |
+| `timeout 1200s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | After disabling full sample retention, max passed at `7.396376 ms`, but p95 still failed at `7.357230 ms`; wrapper report remained missing. |
+| `timeout 180s env CARGO_BUILD_JOBS=1 nice -n 19 cargo fmt --all` | Pass | Applied rustfmt wrapping after the second diagnostic gate. |
+| `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Rebuilt after disabling detailed list-view by-path aggregation; existing native GPU dead-code warnings were emitted. |
+| `timeout 1200s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | After disabling detailed list-view by-path aggregation, p95 `7.071146 ms` and max `9.382550 ms` still failed; wrapper report remained missing. |
+
+Decision:
+
+- Keep the diagnostic gates and scheduler buckets because they make the report
+  overhead explicit and avoid retaining heavy diagnostics by default in
+  non-test release measurements.
+- Do not mark `TASK-0804A` complete.
+- Do not add Cells release benchmark evidence to the aggregate.
+- Move to other unfinished goal work after recording this evidence unless a
+  future focused TASK-0804A turn is explicitly requested.
+
+## Phase 9 Aggregate Freshness Refresh After TASK-0804A Follow-up
+
+Recorded at: `2026-06-22T03:25:50+02:00`
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- `target/reports/bytes-plan/goal-readiness.json`
+
+Status:
+
+- The BYTES/MachinePlan aggregate freshness blocker was cleared for the current
+  worktree fingerprint.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json` now reports:
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=47`
+  - `checked_report_count=47`
+  - `proof_report_count=40`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=33`
+  - `no_fallback_plan_executor_count=33`
+  - `binary_hash=60228160d3d1d9a36d19c541d899d6fc0f2102b4faba6efe4fc45d35baed7518`
+  - current `worktree_fingerprint` is intentionally left to the report as the
+    source of truth because this progress ledger is part of the hashed input.
+
+Readiness result:
+
+- `target/reports/bytes-plan/goal-readiness.json` still reports `status=fail`,
+  but the previous stale-aggregate blocker is gone.
+- Remaining blockers:
+  - `10 phases are still partial in the progress ledger`
+  - `1 phases are still not started in the progress ledger`
+  - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+  - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Refreshed the aggregate for the current dirty worktree. |
+| `timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | The stale-aggregate blocker is gone; remaining blockers are partial phases, Phase 10 not started, missing Cells release wrapper, and legacy default execution. |
+| `timeout 600s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && timeout 300s env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Reran after editing this ledger so hashes were not stale; aggregate passed first, readiness then failed on the same four remaining blockers. |
+
+Decision:
+
+- Do not attempt Phase 10 while the progress ledger still marks every earlier
+  phase partial and `TASK-0804A` has no passing Cells release wrapper.
+- The next non-0804 work should be a final audit/closure pass for individual
+  partial phases, starting with the smallest phase whose requirements can be
+  proven from current reports and tests without weakening acceptance criteria.
+
 ## Phase 9 Standalone Aggregate Adversarial Gate
 
 Status: partial Phase 9 adversarial verification evidence; complete for the
@@ -17488,3 +18923,2577 @@ Latest supersession note: the current fixed indexed byte-bank proof is recorded
 above in `Phase 7 Fixed Indexed Byte-Bank Backing`. It supersedes the
 historical row-private indexed file-write proof in this section for the narrow
 indexed source-payload -> fixed row bank -> indexed `File/write_bytes` slice.
+
+## 2026-06-22 - Phase 3 Runtime-Body BYTES Contract Hardening
+
+Status: partial Phase 3 runtime-body audit evidence; complete for the focused
+runtime BYTES builtin argument-contract hardening slice.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase3-runtime-body-contract-review.md`
+
+What changed:
+
+- Added a runtime BYTES builtin contract guard before private runtime-body
+  execution.
+- Runtime now rejects compiler-rejected BYTES builtin shapes instead of
+  accepting them through direct runtime artifact/body evaluation:
+  - unnamed positional BYTES builtin args;
+  - missing explicit `encoding` for `Text/to_bytes` and `Bytes/to_text`;
+  - missing explicit `endian` for numeric read/write builtins;
+  - unknown BYTES builtin named args;
+  - `Bytes/zeros` with piped or named input;
+  - explicit `input`/`text`/`left`/`right` args on piped calls.
+- Tightened runtime normalization so conversion encodings accept only
+  compiler-approved `Utf8` and `Ascii`, and numeric endian accepts only
+  compiler-approved `Little` and `Big`.
+- Preserved compiler-approved named pair forms for `Bytes/concat(left:, right:)`
+  and `Bytes/equal(left:, right:)`.
+- Preserved compiler-approved `text:` input for `Text/to_bytes`,
+  `Bytes/from_hex`, and `Bytes/from_base64`.
+
+Independent review:
+
+- Subagent `019eedf7-8e75-7ba1-9cc8-f1b71bf694bb`
+  (`Phase 3 runtime-body auditor`) independently identified the same focused
+  gap: typechecker BYTES argument validation was stricter than the runtime
+  BYTES builtin body. The reviewer also called out unknown args and
+  constructor-style `Bytes/zeros(input: ...)` as missing guard cases; both were
+  added in this slice.
+- Subagent `019eedf7-8f8e-7390-8a6f-d51d37ff707a`
+  (`Phase 7 runtime/storage auditor`) recommended root-scalar same-event BYTES
+  dependency scheduling as the next bounded Phase 7 target. That target is not
+  implemented in this slice.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase3-runtime-body-contract-review.md`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_runtime --quiet` | Fail, then Pass | Initial compile failed on a temporary helper rename miss while tightening numeric byte-count handling. Final compile passed. |
+| `cargo test -p boon_typecheck bytes_builtin_argument_validation_rejects_missing_and_bad_args -- --nocapture` | Pass | Typechecker contract still rejects the source-level shapes that the runtime body now also rejects. |
+| `cargo test -p boon_runtime bytes_runtime_builtins_report_deterministic_errors -- --nocapture` | Fail, then Pass | First final rerun exposed an accidentally edited expected error in the old deterministic test; restored `bytes_invalid_byte_count` for named `byte_count: 3`. |
+| `cargo test -p boon_runtime bytes_runtime_builtins_reject_compiler_rejected_arg_shapes -- --nocapture` | Fail, then Pass | First run expected the wrong error for numeric `count:`; final test asserts runtime rejects it as an unexpected arg, matching the typechecker allowed-arg table. |
+| `cargo test -p boon_runtime bytes_runtime_builtins_accept_compiler_allowed_named_pair_args -- --nocapture` | Pass | Proves direct named `left:`/`right:` pair calls and named `text:` conversion still execute. |
+| `cargo test -p boon_runtime bytes_runtime_builtins_execute_through_live_runtime -- --nocapture` | Pass | Source-level BYTES builtin fixture still evaluates through `LiveRuntime`. |
+| `cargo fmt --all -- --check` | Pass | Formatting check after the final patch. |
+
+Open findings:
+
+- This closes one focused Phase 3 runtime-body contract gap.
+- Phase 3 remains partial: broader constant evaluation policy and final Phase 3
+  gate coverage are still incomplete.
+- Phase 7 same-event BYTES dependency scheduling remains open and is the next
+  independently recommended bounded runtime/storage target.
+- Broad Phase 9 performance evidence, postponed `TASK-0804A`, full workspace
+  tests, and Phase 10 default-switch readiness remain open.
+
+## 2026-06-22 - Phase 7 Same-Event BYTES Dependency Scheduling
+
+Status: partial Phase 7 runtime/storage evidence; complete for root-scalar
+same-event fixed-bank BYTES dependencies where one source event writes a BYTES
+root and dependent same-event roots read that new value.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `examples/bytes_same_event_dependency_plan_ops.bn`
+- `examples/bytes_same_event_dependency_plan_ops.scn`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- added
+  `target/reports/bytes-plan/subagents/phase7-same-event-bytes-dependency-review.md`
+- generated
+  `target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json`
+
+What changed:
+
+- Added dependency ordering for non-indexed root update ops using typed state
+  inputs and outputs.
+- Root-scalar PlanExecutor now evaluates same-event root updates against staged
+  root state, staged private BYTES state, and staged fixed-byte banks.
+- Public state and semantic deltas still commit at the existing tick boundary,
+  but the final commit order now follows selected execution order so dependent
+  fixed-byte mutations are applied after their producers.
+- Report-schema source-derived replay now uses the same dependency ordering and
+  staged state, so schema validation checks the engine contract instead of the
+  old pre-event-only replay.
+- Added a focused same-event fixture:
+  - `Bytes/set` writes `store.patched`;
+  - same-event `Bytes/get` reads byte `170` from `store.patched`;
+  - same-event `Bytes/length` reads length `4` from `store.patched`.
+
+Measured/proof evidence:
+
+- `target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `legacy_comparison.state_match=true`
+  - `legacy_comparison.semantic_delta_match=true`
+  - `plan_executor.executed_update_branch_count=3`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - same-event `Bytes/get` and `Bytes/length` read from
+    `root_fixed_byte_bank` with borrowed access;
+  - per-step `bytes_storage_no_copy=true`;
+  - per-step `copy_from_slice_bytes=0`, `vec_clone_bytes=0`,
+    `vec_alloc_bytes=0`, and `zero_fill_bytes=0`.
+
+Independent review:
+
+- Subagent `019eedf7-8f8e-7390-8a6f-d51d37ff707a`
+  (`Phase 7 runtime/storage auditor`) identified same-event BYTES dependency
+  scheduling as the highest-value bounded Phase 7 target after the Phase 3
+  runtime-body contract slice.
+- Reviewer report:
+  `target/reports/bytes-plan/subagents/phase7-same-event-bytes-dependency-review.md`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_runtime --quiet` | Fail, then Pass | Initial compile failed because the new root-output helper moved `op.output`; borrowing the output fixed it. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_same_event_bytes_dependency -- --nocapture` | Fail, then Pass | First run failed only because the fixture included `Bytes/concat`, which correctly made the no-copy assertion false. The fixture was narrowed to fixed-bank `Bytes/set -> Bytes/get/length` and passed. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_set_state -- --nocapture` | Pass | Existing two-step BYTES set/inspect chain still passes. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain -- --nocapture` | Pass | Existing slice/take/drop BYTES chain still passes. |
+| `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_same_event_dependency_plan_ops.bn --scenario examples/bytes_same_event_dependency_plan_ops.scn --steps patch-and-read-bytes --compare-legacy --report target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json` | Pass | Generated the same-event proof report. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json` | Fail, then Pass | First run exposed that report-schema source-derived replay still used pre-event state. After mirroring staged same-event replay, the report passed schema validation. |
+| `cargo check -p boon_report_schema --quiet` | Pass | Schema compile after staged replay update. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt `xtask`; existing native GPU dead-code warnings only. |
+| `cargo check -p boon_runtime -p boon_report_schema --quiet` | Pass | Final focused compile for changed crates. |
+| `cargo fmt --all -- --check` | Pass | Final formatting check. |
+
+Open findings:
+
+- This closes the focused root-scalar fixed-bank same-event BYTES dependency
+  scheduling gap.
+- Phase 7 remains partial: broader indexed same-event BYTES shapes beyond the
+  source-payload -> fixed row byte-bank -> same-event `Bytes/length`/`Bytes/get`
+  proof, broader conflict/coalescing edge cases, complete fixed indexed
+  byte-bank coverage, broad no-panic/OOB coverage, and zero-allocation
+  fixed-byte warm ticks remain open.
+- Phase 9 remains partial. The stale aggregate note from this slice is
+  superseded by the later `2026-06-22 - Phase 9 Aggregate Refresh After
+  Same-Event Scheduling` section, which records the 48/48 refreshed aggregate
+  pass.
+- `TASK-0804A`, full workspace tests, and Phase 10 default-switch readiness
+  remain open.
+
+## 2026-06-22 - Phase 9 Aggregate Refresh After Same-Event Scheduling
+
+Status: partial Phase 9 verification evidence; complete for refreshing the
+focused BYTES/MachinePlan aggregate after adding the same-event BYTES
+dependency proof.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in the implementation slice that required the refresh:
+
+- `crates/boon_parser/src/lib.rs`
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `examples/bytes_same_event_dependency_plan_ops.bn`
+- `examples/bytes_same_event_dependency_plan_ops.scn`
+
+What changed:
+
+- Promoted
+  `target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json` into
+  the aggregate-required BYTES/MachinePlan child list.
+- Refreshed stale child reports using each report's recorded `command_argv`
+  after rebuilding `boon_cli`/`xtask` changed linked artifact hashes.
+- Re-ran the adversarial proof after the child refresh, because its own
+  tamper/stale-hash evidence correctly became stale when its inputs changed.
+- Re-ran the aggregate against the refreshed 48-report set.
+
+Aggregate evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=48`
+  - `checked_report_count=48`
+  - `proof_report_count=41`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=34`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - blockers:
+    - `8 phases are still partial in the progress ledger`;
+    - `1 phases are still not started in the progress ledger`;
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`;
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail | First retry after the child refresh wrote a blocked aggregate because `bytes-machine-plan-adversarial.json` had stale child hashes. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Regenerated the adversarial proof after the refreshed child reports changed hashes. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate passed with 48/48 required reports, 41 proof reports, 7 diagnostic reports, and 34 no-fallback PlanExecutor reports. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted the refreshed aggregate report. |
+| `./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Fail | Expected fail: records remaining partial phases, missing Cells release benchmark wrapper, and Phase 10 default-switch blocker. |
+
+Open findings:
+
+- This refresh proves the focused aggregate evidence is current after the
+  same-event dependency slice.
+- It does not complete Phase 9: Cells release benchmark evidence, broader
+  performance coverage, stricter repeated-performance policy, and remaining
+  parity/negative coverage are still open.
+- It does not complete Phase 10: the default `boon_cli run` path remains
+  legacy until all parity, performance/regression, report-schema, readiness,
+  and existing example gates pass.
+
+## 2026-06-22 - Phase 7 Indexed Same-Event BYTES Dependency Proof
+
+Status: partial Phase 7 runtime/storage evidence; complete for the focused
+indexed same-event source-payload -> fixed row byte-bank ->
+`Bytes/length`/`Bytes/get` dependency proof.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `examples/bytes_indexed_same_event_dependency_plan_ops.bn`
+- `examples/bytes_indexed_same_event_dependency_plan_ops.scn`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+What changed:
+
+- Added a focused indexed same-event fixture where one row-scoped
+  `row.receive` event:
+  - writes `row.payload` from a BYTES source payload;
+  - reads the same-event `payload` through `Bytes/length`;
+  - reads the same-event `payload` through `Bytes/get(index: 1)`.
+- Added a runtime regression test proving the single event executes all three
+  indexed updates, preserves legacy parity, uses `indexed_fixed_byte_bank` for
+  the dependent readers, and keeps fallback/copy counters at zero.
+- Promoted the generated report into the aggregate-required child list in both
+  `xtask` and report-schema expected-child validation.
+
+Measured/proof evidence:
+
+- `target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `legacy_comparison.state_match=true`
+  - `legacy_comparison.semantic_delta_match=true`
+  - `plan_executor.executed_indexed_update_count=3`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - same-event indexed `Bytes/length` and `Bytes/get` read from
+    `indexed_fixed_byte_bank` with `byte_bank_used=true`;
+  - per-step `bytes_storage_no_copy=true`;
+  - per-step `copy_from_slice_bytes=0`, `vec_clone_bytes=0`,
+    `vec_alloc_bytes=0`, and `zero_fill_bytes=0`.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=49`
+  - `checked_report_count=49`
+  - `proof_report_count=42`
+  - `diagnostic_report_count=7`
+  - `no_fallback_plan_executor_count=35`
+
+Independent review:
+
+- Subagent `019eee1e-ec52-7303-a64a-0acc1707c015`
+  (`Phase 7 runtime/storage reviewer`) independently selected this exact
+  indexed same-event dependency proof as the highest-value next Phase 7 slice
+  and warned that aggregate/schema replay must require it, not just leave it as
+  a one-off report.
+- Subagent `019eee1e-cbd1-7312-b4cf-fac0a2d77c31`
+  (`Phase 9/readiness reviewer`) confirmed that, after this storage proof,
+  the highest-value readiness blocker is `TASK-0804A` Cells release benchmark
+  budget closure.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Pass | Generated the indexed same-event proof report. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Pass | Schema accepted the new report. |
+| `cargo fmt --all -- --check` | Pass | Formatting check after adding the aggregate child entries and runtime test. |
+| `cargo check -p boon_report_schema --quiet` | Pass | Report-schema compiled after adding the expected aggregate child. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt `xtask`; existing native GPU dead-code warnings only. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency -- --nocapture` | Pass | Focused regression passed. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First attempts exposed stale child hashes after rebuilding runtime/xtask. After replaying 47 child report commands and rerunning adversarial, the aggregate passed with 49/49 required reports. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Regenerated adversarial proof after refreshed child hashes changed. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted the refreshed 49-report aggregate. |
+
+Open findings:
+
+- This closes the focused indexed same-event BYTES dependency proof for
+  source-payload writes followed by same-event indexed fixed-bank readers.
+- Phase 7 remains partial for broader indexed same-event shapes, broader
+  conflict/coalescing cases, complete fixed indexed byte-bank coverage, broad
+  no-panic/OOB coverage, and zero-allocation fixed-byte warm ticks.
+- Phase 9 remains partial because `TASK-0804A` still blocks Cells release
+  benchmark evidence.
+- Phase 10 remains not started because the default `boon_cli run` path remains
+  legacy.
+
+## TASK-0804A Indexed Row Dependency-Frontier Follow-up
+
+Status: incomplete. This is a real runtime improvement and a sharper diagnosis,
+but it does not close the Cells release benchmark budget.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+What changed:
+
+- Added a row-scoped dependency-frontier path for indexed source-action
+  followups:
+  - build changed row reads with the existing `ListColumn` + exact
+    `ListField` read keys;
+  - look up same-row dirty fields through `GenericDerivedState::dependents_for_reads`;
+  - propagate transitive same-row dirty fields when materialized fields change;
+  - include same-row indexed `SourceEventTransform` fields whose AST is
+    triggered by the current source payload/key/text/address;
+  - fall back to the old full-row recompute when dependency records for
+    non-source-event indexed fields are incomplete.
+- Preserved full-row recompute for append/new-row initialization paths.
+- Kept cache invalidation before recompute.
+
+Measured evidence:
+
+- Before this slice, after the profile-overhead fixes, the Cells release
+  benchmark showed `p50=1.470842ms`, `p95=7.736818ms`, `max=8.308514ms`, with
+  slow steps dominated by
+  `source_action_indexed_followup_row_recompute_ms`.
+- After the dependency-frontier patch:
+  - `target/reports/bytes-plan/cells-release-benchmark-speed.json`
+  - `latency_ms_p50_p95_p99_max.p50=1.566411`
+  - `latency_ms_p50_p95_p99_max.p95=8.922568`
+  - `latency_ms_p50_p95_p99_max.max=9.784671`
+  - `budget_check.latency_p95_budget.pass=false`
+  - `budget_check.latency_max_budget.pass=false`
+  - `graph_rebuild_budget.pass=true`
+  - allocation budget remains non-applicable for the `software_dynamic` profile.
+- Slow-step examples after this patch:
+  - `change-a0-updates-b0`: `latency_ms=9.784671`,
+    `source_action_indexed_followup_row_recompute_ms=7.183014`,
+    `source_action_indexed_followup_row_materialization_count=3`,
+    recomputed fields `cells[0].value`, `cells[1].value`, `cells[2].value`.
+  - `commit-b0-formula`: `latency_ms=8.496544`,
+    `source_action_indexed_followup_row_recompute_ms=6.823881`,
+    `source_action_indexed_followup_row_materialization_count=1`,
+    recomputed field `cells[1].value`.
+  - `commit-a3-literal-20`: `latency_ms=6.554087`,
+    `source_action_indexed_followup_row_recompute_ms=6.324839`,
+    `source_action_indexed_followup_row_materialization_count=1`,
+    recomputed field `cells[78].value`.
+- The remaining culprit is no longer broad row-field scheduling alone. Even one
+  `cells[*].value` materialization can cost 5-7ms. Per-step
+  `function_call_stats` is empty on representative slow rows, so the next
+  diagnostic should instrument `recompute_generic_derived_key_value` /
+  `eval_runtime_generic_statement` / `eval_statement_value` directly rather
+  than assuming user-function-cache overhead is visible in the current report.
+
+Independent review:
+
+- Subagent `019eee50-ed74-7262-bd84-907bcf74cada`
+  (`TASK-0804A dependency-frontier reviewer`) independently inspected the
+  current dirty runtime code and recommended this exact patch shape: use
+  `reads_by_field` / `dependents_by_read`, propagate same-row dirty fields,
+  keep full-row fallback for incomplete dependency records, and include
+  source-event transforms triggered by the source payload/key/text/address.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass, then Pass | First pass before the source-event transform addition passed; after the addition it reported wrapping differences only. After `cargo fmt --all`, the final check passed. |
+| `cargo check -p boon_runtime -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo test -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture --test-threads=1` | Pass | Focused Cells projection/storage invariant still passes. |
+| `cargo test -p boon_runtime root_list_view_same_source_rows_patch_in_place_and_keep_target_identity -- --nocapture --test-threads=1` | Pass | Focused root-list-view identity regression still passes. |
+| `cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn` | Pass | Debug scenario completed successfully; output is very large because it prints the final Cells state. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Speed budget still fails: `latency_max_budget` and `latency_p95_budget`. The speed report exists; the passing wrapper report remains blocked. |
+
+Open findings:
+
+- `TASK-0804A` remains open. Do not add the Cells benchmark wrapper to the
+  aggregate until the speed budget passes.
+- The current `bytes-machine-plan-all` aggregate report is still useful as the
+  last 49/49 proof set, but runtime/xtask changes after that aggregate mean a
+  final readiness claim requires refreshing stale child reports again.
+- Next TASK-0804A work should instrument/evaluate the single-field
+  `cells[*].value` materialization path itself. The scheduling layer now proves
+  fewer fields are recomputed; the remaining cost is per-field expression
+  execution.
+
+## TASK-0804A Single-Field Recompute Debugging Loop
+
+Status: incomplete and postponed again. The focused debugging loop improved the
+diagnosis and kept one local BYTES fast path, but it did not close the Cells
+release benchmark budget.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+
+What changed:
+
+- Added a one-byte fast path to `bytes_find`: `Bytes/find` now uses direct byte
+  position search when the needle length is exactly one, and avoids
+  `windows()` when the needle is longer than the haystack.
+- Tried preserving indexed derived field value caches across
+  `apply_generic_step` boundaries while still clearing root/function caches.
+  This was killed and reverted because the canonical Cells speed run failed
+  with `cycle-error: generic derived row recompute budget exhausted`.
+- Tried field-aware indexed lookup cache invalidation for row-field writes.
+  This passed focused correctness tests but was reverted because it did not
+  improve the speed gate and produced worse tail latency in the measured run.
+- Kept the dependency-frontier fix from the previous TASK-0804A section; that
+  remains a real scheduling improvement, but the remaining blocker is still
+  per-field `cells[*].value` expression execution.
+
+Measured evidence:
+
+- Function-profile diagnostic from this debugging pass identified expensive
+  inclusive `compute_value` / `cell_address` calls during single-field
+  materialization. BYTES helper calls were not the dominant reported cost.
+- Unsafe cache-preservation experiment:
+  - command:
+    `RUST_BACKTRACE=1 target/release/xtask bench-example cells --iterations 1 --report target/diagnostics/bytes-plan/cells-cache-preserve-fail.json --speed-report target/diagnostics/bytes-plan/cells-cache-preserve-fail-speed.json`
+  - status: fail
+  - failure: `cycle-error: generic derived row recompute budget exhausted`
+  - decision: killed and reverted.
+- Field-aware lookup-cache experiment:
+  - command:
+    `env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json`
+  - status: fail
+  - `p50=1.474244ms`, `p95=10.441334ms`, `max=11.009139ms`
+  - decision: correctness looked acceptable in focused tests, but the speed
+    result did not justify keeping the cache-invalidation rewrite in this
+    TASK-0804A pass.
+- Isolated one-byte `Bytes/find` fast path:
+  - report: `target/reports/bytes-plan/cells-release-benchmark-speed.json`
+  - status: fail
+  - `latency_ms_p50_p95_p99_max.p50=1.531215`
+  - `latency_ms_p50_p95_p99_max.p95=8.518988`
+  - `latency_ms_p50_p95_p99_max.max=11.140398`
+  - `budget_check.latency_p95_budget.pass=false`
+  - `budget_check.latency_max_budget.pass=false`
+  - `graph_rebuild_budget.pass=true`
+  - allocation budget remains non-applicable for the `software_dynamic`
+    profile.
+- Slow-step examples after the isolated `Bytes/find` fast path:
+  - `commit-d0-fanout-formula`: `latency_ms=11.140398`,
+    `source_action_indexed_followup_row_recompute_ms=8.922193`,
+    one recomputed field: `cells[3].value`.
+  - `change-a0-updates-b0`: `latency_ms=8.518988`,
+    `source_action_indexed_followup_row_recompute_ms=6.220503`,
+    recomputed fields `cells[0].value`, `cells[1].value`, `cells[2].value`.
+  - `change-a0-fanout-recomputes-dependents-only`: `latency_ms=8.40131`,
+    `source_action_indexed_followup_row_recompute_ms=6.206957`,
+    recomputed fields `cells[0].value`, `cells[2].value`, `cells[3].value`.
+
+Independent review:
+
+- Subagent `019eee5d-3f75-7db2-be18-d3a2e8568b72`
+  (`TASK-0804A single-field recompute reviewer`) independently inspected the
+  hotspot and recommended measuring row-recompute internals, byte builtins, and
+  `List/find` cache behavior before trying more blind changes. It also called
+  out `Text/to_bytes`, one-byte `Bytes/find`, and broad indexed lookup-cache
+  clearing as plausible but unproven optimization candidates.
+- Subagent `019eee63-2f8f-7e31-ae6f-775341698bac`
+  (`TASK-0804A cache-lifetime reviewer`) reviewed the cache-preservation
+  experiment as bounded in the normal path but warned about direct mutation
+  bypasses and forced source-event transform recompute. The subsequent
+  benchmark failure killed that experiment before it could be accepted.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Formatting remained clean after the final isolated `Bytes/find` fast path. |
+| `cargo check -p boon_runtime -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo test -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture --test-threads=1` | Pass | Focused Cells storage invariant still passes. |
+| `cargo test -p boon_runtime root_list_view_same_source_rows_patch_in_place_and_keep_target_identity -- --nocapture --test-threads=1` | Pass | Root-list-view identity regression still passes. |
+| `cargo test -p boon_runtime user_function_cache_ -- --nocapture --test-threads=1` | Pass | Existing user-function cache regressions still pass. |
+| `cargo test -p boon_runtime pure_boon_cells_replacing_reference_removes_stale_dependents -- --nocapture --test-threads=1` | Pass | Focused stale-dependency Cells regression passed during the field-aware cache experiment. |
+| `cargo test -p boon_runtime pure_boon_cells_fanout_recomputes_from_generic_read_index -- --nocapture --test-threads=1` | Pass | Focused fanout/index regression passed during the field-aware cache experiment. |
+| `cargo test -p boon_runtime cells_unrelated_row_commit_preserves_default_sum_until_formula_changes -- --nocapture --test-threads=1` | Pass | Focused unrelated-row Cells regression passed during the field-aware cache experiment. |
+| `cargo test -p boon_runtime cells_source_event_recompute_samples_accumulate_source_action_followups -- --nocapture --test-threads=1` | Pass | Source-action followup profiling regression passed. |
+| `cargo test -p boon_runtime root_list_view_field_cache_keeps_numeric_guarded_entries -- --nocapture --test-threads=1` | Pass | Root-list-view numeric guarded cache regression passed. |
+| `cargo test -p boon_runtime root_list_view_change_preserves_reusable_user_function_cache_entries -- --nocapture --test-threads=1` | Pass | Root-list-view user-function cache regression passed. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_search_updates -- --nocapture --test-threads=1` | Pass | BYTES search fixture still passes after the one-byte `Bytes/find` fast path. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_search_updates cells_source_event_recompute_samples_accumulate_source_action_followups -- --nocapture --test-threads=1` | Fail | Command misuse: Cargo accepts only one test filter. Both filters passed when rerun separately. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Release `xtask` rebuilt after the final runtime change; existing native GPU dead-code warnings only. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Speed budget still fails: `latency_max_budget` and `latency_p95_budget`. The speed report exists; the passing wrapper report remains blocked. |
+
+Open findings:
+
+- `TASK-0804A` remains open and should not block further BYTES/MachinePlan
+  feature work in this turn. The current evidence says the next effective fix
+  is not a small byte-search tweak or broad cache-lifetime change.
+- The remaining speed work needs a proper evaluator-level plan for
+  `compute_value` / `cell_address` / formula expression execution, probably by
+  compiling hot Boon function bodies or by adding stable per-row derived
+  argument storage with precise invalidation. That should be handled as a
+  dedicated follow-up task rather than more blind microchanges in TASK-0804A.
+- The latest `bytes-machine-plan-all` aggregate is stale relative to these
+  runtime changes. A final readiness claim still requires refreshing all
+  affected child reports and rerunning the aggregate.
+
+## 2026-06-22 - Phase 7 Indexed Same-Event `Bytes/set` Dependency Proof
+
+Status: partial Phase 7 runtime/storage and Phase 9 verification evidence;
+complete for the focused indexed source-payload -> fixed indexed byte-bank ->
+same-event `Bytes/set` -> same-event `Bytes/get` proof. The broader aggregate
+refresh remains blocked by an unrelated Cells full-compare semantic-delta order
+mismatch discovered while replaying stale child reports.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_runtime/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `examples/bytes_indexed_same_event_dependency_plan_ops.bn`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- regenerated
+  `target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`
+- regenerated many stale aggregate child reports from their recorded
+  `command_argv` values after `boon_cli` / `xtask` relinked.
+
+What changed:
+
+- Extended the indexed same-event BYTES fixture so `row.receive` now:
+  - writes `row.payload` from the BYTES source payload;
+  - writes `row.patched` with `payload |> Bytes/set(index: 0, value: 16uAA)`;
+  - reads `row.payload` through same-event `Bytes/length`;
+  - reads `row.payload` through same-event `Bytes/get(index: 1)`;
+  - reads `row.patched` through same-event `Bytes/get(index: 0)`.
+- Added indexed PlanExecutor support for `PlanExpressionKind::BytesSet`,
+  including typed ordered operands `[State(BYTES), Constant(index),
+  Constant(BYTE)]`, fixed-output length validation, bounds validation, private
+  BYTES update, and report evidence.
+- Added indexed runtime route classification for row BYTES-producing
+  `Bytes/set` branches. Without this, legacy/generic runtime updated
+  `row.payload` but left same-event `row.patched` and `row.patched_first` at
+  defaults, so `--compare-legacy` correctly failed.
+- Added report-schema source-derived replay support for indexed `Bytes/set`,
+  including expected typed operands, `bytes_access`, `bytes_storage`,
+  `update_constant_id`, and `update_constant_value`.
+
+Proof evidence:
+
+- `target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `legacy_comparison.state_match=true`
+  - `legacy_comparison.semantic_delta_match=true`
+  - `plan_executor.executed_indexed_update_count=5`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - indexed `Bytes/set` reports `bytes_access.access_source =
+    indexed_fixed_byte_bank`, `bytes_access.read_only=false`,
+    `bytes_access.byte_bank_used=true`, `bytes_storage.storage =
+    indexed_fixed_byte_bank`, `bytes_storage.byte_bank_used=true`;
+  - same-event `patched_first` reads byte `170` from
+    `indexed_fixed_byte_bank`.
+
+Independent review:
+
+- Subagent `019eee7d-a7e5-7821-be06-e12db5dcfce1`
+  independently inspected the indexed `Bytes/set` gap and identified the same
+  required shape: PlanExecutor indexed `Bytes/set`, report fields for
+  `bytes_access` / `bytes_storage`, schema replay support, and the legacy
+  semantic-delta mismatch caused by legacy/generic runtime not updating
+  `row.patched` / `row.patched_first`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Final formatting check for the focused slice. |
+| `cargo check -p boon_runtime -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo check -p boon_report_schema -p boon_runtime -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency -- --nocapture --test-threads=1` | Fail, then Pass | First failed while legacy emitted only three deltas. Passed after indexed `Bytes/set` PlanExecutor support and legacy route classification were added. |
+| `cargo run -q -p boon_cli -- run examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn` | Pass | Diagnostic legacy run now shows beta `patched.digest=9a82810e...` and `patched_first=170`. |
+| `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Fail, then Pass | First failed with legacy semantic-delta mismatch; final report passes with five matching indexed deltas. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Fail, then Pass | First failed because the stale verifier binary/source-derived replay did not support indexed `Bytes/set`; final run passes after rebuilding `xtask`. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed after child report hashes changed. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt debug `xtask`; existing native GPU dead-code warnings only. |
+| `cargo build --release -p xtask --quiet` | Pass | Rebuilt release `xtask`; existing native GPU dead-code warnings only. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-speed.json` | Pass | Refreshed stale release benchmark report; `20` iterations in `1260.046ms`, `63.002ms/iteration`. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark-repeat.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-repeat-speed.json` | Pass | Refreshed repeat benchmark report; `20` iterations in `1264.556ms`, `63.228ms/iteration`. |
+| `./target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Fail, then Pass | First failed because linked TodoMVC speed reports had stale release `xtask` binary hashes. Passed after refreshing both benchmark reports. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail | Initial run failed because 46 child reports had stale `boon_cli`/`xtask` binary hashes. After replaying child commands, the refresh stopped at `target/reports/bytes-plan/cells-plan-compare.json`, which now fails full compare on semantic-delta order while state still matches. |
+
+Open findings:
+
+- The focused indexed same-event `Bytes/set` dependency proof is complete.
+- The current `bytes-machine-plan-all` aggregate remains blocked and should not
+  be cited as fresh readiness evidence. The refreshed
+  `target/reports/bytes-plan/cells-plan-compare.json` has
+  `legacy_comparison.state_match=true` but `semantic_delta_match=false`.
+  Mismatching steps include `commit-a0-literal`, `change-a0-updates-b0`,
+  `cycle-error`, `replace-b0-formula-removes-stale-cycle-edge`,
+  `change-a0-after-edge-replacement-does-not-recompute-b0`, and
+  `change-a0-fanout-recomputes-dependents-only`. The common pattern is
+  PlanExecutor emitting `editing=false` before dependent `value` deltas where
+  legacy emits dependent `value` deltas before `editing=false`.
+- This aggregate blocker is separate from the indexed BYTES fixture: the Cells
+  example does not use `Bytes/set`, and the focused indexed BYTES report passes
+  schema and legacy comparison.
+
+## 2026-06-22 - TASK-0804A Cells Indexed Followup Delta-Order Fix
+
+Status: partial Phase 6 and Phase 9 parity evidence; complete for the focused
+Cells full-compare semantic-delta order blocker discovered during the indexed
+same-event `Bytes/set` aggregate refresh.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed stale aggregate child reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Fixed PlanExecutor indexed-row followup delta ordering without relaxing
+  `legacy_comparison` or report schema equality.
+- Root cause: indexed source-route ops were executed in route order, but
+  cross-row derived `value`/`error` followups were delayed until the final
+  end-of-step `refresh_all_indexed_derived_fields` call. That let later direct
+  source-route deltas such as `editing=false` overtake earlier dependent
+  `value`/`error` deltas.
+- Added a generic indexed followup frontier:
+  - refresh the changed row's indexed derived fields immediately;
+  - emit changed-row `error` before `value` where legacy does;
+  - if the changed row itself enters `cycle_error`, defer cross-row settling to
+    the existing final refresh so recursive-cycle value deltas remain
+    suppressed consistently;
+  - otherwise refresh other indexed derived rows immediately after the changed
+    row so value fanout and cycle recovery deltas occur before later direct
+    source-route bool/text commits.
+- Kept the final full indexed-derived refresh as the end-of-event safety net.
+- The fix is not Cells-specific: it uses indexed derived dependency/followup
+  semantics and generic cycle-error delta detection, not scenario IDs, field
+  names beyond the existing semantic `error` field, or app-specific branches.
+
+Proof evidence:
+
+- `target/reports/bytes-plan/cells-plan-compare.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `legacy_comparison.state_match=true`
+  - `legacy_comparison.semantic_delta_match=true`
+  - `capability_summary.executable_string_path_count=0`
+  - `capability_summary.runtime_ast_dependency_count=0`
+  - `capability_summary.unknown_plan_op_count=0`
+  - `capability_summary.graph_rebuild_count=0`
+  - `capability_summary.graph_clones_per_item=0`
+- `target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `legacy_comparison.semantic_delta_match=true`
+  - `plan_executor.executed_indexed_update_count=5`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=49`
+  - `checked_report_count=49`
+  - `proof_report_count=42`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=35`
+  - `no_fallback_plan_executor_count=35`
+
+Independent review:
+
+- Subagent `019eee97-ea02-7332-ad9c-61c3104891c0` independently inspected the
+  Cells compare blocker and identified the same root cause: PlanExecutor
+  buffered indexed deltas and appended `refresh_all_indexed_derived_fields`
+  after all source-route ops, while legacy emits followups through
+  `apply_indexed_row_commit_followups` immediately after each indexed
+  text/value commit. The reviewer explicitly recommended fixing runtime
+  emission rather than normalizing/sorting comparison output.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Ran before and after the runtime ordering fix. |
+| `cargo check -p boon_runtime --quiet` | Pass | Focused compile after the first runtime ordering edit. |
+| `cargo build -p boon_cli --quiet` | Pass | Rebuilt debug `boon_cli` so report binary hashes reflected the runtime change. |
+| `target/debug/boon_cli run examples/cells.bn --scenario examples/cells.scn --engine compare --report target/reports/bytes-plan/cells-plan-compare.json` | Fail, then Pass | First fresh run fixed `commit-a0-literal` but exposed cycle-order mismatches. Final run passed after changed-row-first and cycle-deferral logic. |
+| `cargo test -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1` | Pass | Focused existing regression passed; `1 passed`, `308 filtered out`, `finished in 62.21s`. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-plan-compare.json` | Pass | Schema accepted the refreshed Cells full compare report. |
+| `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Pass | Indexed same-event `Bytes/set` proof still passes after the ordering fix. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json` | Pass | Schema accepted the refreshed indexed BYTES proof report. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency -- --nocapture --test-threads=1` | Pass | Indexed BYTES dependency unit passed; `1 passed`, `308 filtered out`. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First run checked `49/49` reports but failed because many child reports had stale debug `boon_cli` binary hashes. After replaying the stale child `command_argv` values and refreshing `bytes-machine-plan-adversarial.json`, the aggregate passed. |
+
+Open findings:
+
+- This closes the Cells full-compare semantic-delta order blocker that was
+  blocking the current focused aggregate refresh.
+- Phase 9 is still partial overall: Cells release benchmark evidence,
+  broader repeated-performance policy, and full workspace test readiness remain
+  separate open items.
+- Phase 10 remains not started: default `boon_cli run` still has not switched
+  to PlanExecutor.
+
+## 2026-06-22 - TASK-0804A Cells Release Benchmark Slow-Path Attribution
+
+Status: partial Phase 9 performance evidence; TASK-0804A remains unfinished and
+postponed for a larger dependency-signature/skip design after one targeted
+generic runtime-cache experiment.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed diagnostic/release reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added narrowed cache keys for runtime-generic user functions so the runtime
+  path no longer hashes the whole caller row/environment when the lowered
+  function only depends on explicit arguments or selected argument fields.
+- Added runtime-generic free-name and argument-access collectors that mirror the
+  older AST path's cache-key narrowing, plus separate runtime-function metadata
+  caches in `GenericDerivedState`.
+- This is a generic runtime optimization, not a Cells branch and not a syntax or
+  Boon example change.
+
+Slow-path evidence:
+
+- The current release benchmark still fails the speed budget:
+  `target/reports/bytes-plan/cells-release-benchmark-speed.json`
+  - `latency_ms_p50_p95_p99_max.p50 = 1.714761`
+  - `latency_ms_p50_p95_p99_max.p95 = 8.062479000000002`
+  - `latency_ms_p50_p95_p99_max.max = 8.986186`
+  - p95 budget is `4.0ms`, so it still fails.
+  - max budget is `8.0ms`, so it still fails.
+  - `graph_rebuild_budget.pass=true`, measured graph rebuilds `0`.
+  - allocation budget is not applied for the `software_dynamic` profile;
+    measured bounded-profile allocs after warmup are `11483`.
+- The hot bucket remains indexed followup row recomputation:
+  - `change-a0-after-edge-replacement-does-not-recompute-b0`:
+    `latency_ms=8.986186`,
+    `source_action_eval_ms=6.8599310000000004`,
+    `source_action_indexed_followup_row_recompute_ms=6.8189589999999995`.
+  - `change-a0-updates-b0`: `latency_ms=8.062479000000002`,
+    `source_action_indexed_followup_row_recompute_ms=6.044644000000001`.
+  - `commit-a0-literal`: `latency_ms=7.957007`,
+    `source_action_indexed_followup_row_recompute_ms=7.370584999999999`.
+- Compared with the previous speed report, the cache-key experiment reduced p95
+  from about `8.507196ms` to about `8.062479ms` and reduced measured
+  bounded-profile allocs after warmup from about `14835` to `11483`, but it did
+  not make the release benchmark pass and max latency regressed from about
+  `8.739947ms` to `8.986186ms` in this sample.
+
+Independent review:
+
+- Subagent `019eeeb3-46c9-7ca1-a4a1-355c3155b06a` independently audited the
+  current speed report and found the same primary bucket: raw body evaluation
+  inside indexed followup recompute. The reviewer explicitly pointed at
+  `apply_indexed_row_commit_followups`,
+  `recompute_generic_derived_dirty_row_keys`,
+  `can_skip_generic_derived_key_for_changed_reads`, and
+  `recompute_generic_derived_key_value`.
+
+Current conclusion:
+
+- TASK-0804A should not be called solved. The benchmark still fails.
+- The real remaining fix is likely architectural inside indexed derived
+  dependency currentness: a safe dependency signature / reusable-value skip for
+  list-field formula dependencies, or a compiled formula/dependency plan that
+  avoids re-running the whole raw body when only a provably irrelevant or
+  stable dependency changed.
+- The existing numeric-stability guard is not enough for this path. It records
+  scalar-root stability for numeric indexed filters; blindly extending it to
+  formula list-field changes would risk stale cell values.
+- Further work should design and test a generic value/dependency signature
+  rather than adding more Cells-specific shortcuts or weakening the budget.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_runtime --quiet` | Pass | Focused compile after the runtime cache-key patch. |
+| `cargo test -p boon_runtime user_function_cache_ -- --nocapture --test-threads=1` | Pass | `3 passed`, `306 filtered out`; existing AST cache-key tests still pass. |
+| `cargo build -p boon_cli --quiet && target/debug/boon_cli run examples/cells.bn --scenario examples/cells.scn --engine compare --report target/reports/bytes-plan/cells-plan-compare-after-runtime-cache-key.json` | Pass | Cells compare semantics remain valid after the cache-key patch. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-plan-compare-after-runtime-cache-key.json` | Pass | Schema accepted the focused compare report. |
+| `cargo fmt --all -- --check` | Fail, then Pass | First run found rustfmt-only diffs in the new runtime walkers. Passed after `cargo fmt --all`. |
+| `cargo fmt --all` | Pass | Applied formatting only. |
+| `cargo check -p boon_runtime -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 cargo build --release -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `env BOON_RUNTIME_FUNCTION_PROFILING=1 BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES=1 BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS=1 CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 3 --report target/reports/bytes-plan/cells-release-benchmark-profiled.json --speed-report target/reports/bytes-plan/cells-release-benchmark-profiled-speed.json` | Fail as expected | Diagnostic profiling run; speed budget failure expected and not used as readiness evidence. It showed nested formula helper calls inside indexed followup recompute. |
+| `env CARGO_BUILD_JOBS=1 nice -n 19 target/release/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json` | Fail | Current release speed report still fails `latency_p95_budget` and `latency_max_budget`. |
+
+## 2026-06-22 - Phase 9 Aggregate Refresh After Runtime Cache-Key Work
+
+Status: partial Phase 9 verification evidence; complete for refreshing the
+current aggregate proof set after the runtime-generic cache-key experiment.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Rebuilt current debug `boon_cli` and `xtask`, then replayed stale child
+  reports from their recorded `command_argv` values instead of reconstructing
+  commands manually.
+- Refreshed 39 stale `boon_cli` child reports, then 8 stale `xtask` reports.
+- Refreshed the TodoMVC release benchmark pair because the reproduction proof
+  depended on stale release `xtask` speed-report hashes.
+- Reran dependent `bytes-negative` and `bytes-machine-plan-adversarial` gates
+  after their child reports changed so artifact hashes were ordered correctly.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `required_report_count=49`
+  - `checked_report_count=49`
+  - `proof_report_count=42`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=35`
+  - `no_fallback_plan_executor_count=35`
+  - `blocker_count=0`
+  - the current `worktree_fingerprint` is recorded in the report itself
+- `target/reports/bytes-plan/goal-readiness.json` still reports
+  `status=fail`, but the stale aggregate blocker is gone. Remaining blockers:
+  - `8 phases are still partial in the progress ledger`
+  - `1 phases are still not started in the progress ledger`
+  - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+  - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+- TodoMVC release benchmark refresh:
+  - `target/reports/bytes-plan/todomvc-release-benchmark.json`: 20 iterations
+    in `1264.827ms`, `63.241ms/iteration`.
+  - `target/reports/bytes-plan/todomvc-release-benchmark-repeat.json`: 20
+    iterations in `1321.143ms`, `66.057ms/iteration`.
+
+Independent review:
+
+- Subagent `019eeebf-7845-7713-b801-ed939b1246cb` independently recommended
+  the Phase 9 aggregate refresh as the next task because the stale aggregate
+  proof was a mechanical readiness blocker, while the missing Cells release
+  wrapper remains explicitly blocked by `TASK-0804A`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt current debug binaries; existing native GPU dead-code warnings only. |
+| replay 39 stale `boon_cli` child reports from `/tmp/boon_stale_reports.txt` using each report's `.command_argv` | Pass | Logs under `target/reports/bytes-plan/logs/replay-stale-children-current/`. |
+| `./target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | First refresh passed, then later rerun after child artifacts changed. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | Failed first on stale debug `xtask` child report hashes, then on dependent artifact order; passed after replaying and rerunning dependent reports. |
+| replay 8 stale `xtask` reports from `/tmp/boon_stale_xtask_reports.txt` using each report's `.command_argv` | Partial | First 7 replayed directly; `todomvc-release-benchmark-reproduction.json` required refreshing its underlying release benchmark reports before passing. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-speed.json` | Pass | 20 iterations in `1264.827ms`, `63.241ms/iteration`. |
+| `target/release/xtask bench-todomvc --iterations 20 --report target/reports/bytes-plan/todomvc-release-benchmark-repeat.json --speed-report target/reports/bytes-plan/todomvc-release-benchmark-repeat-speed.json` | Pass | 20 iterations in `1321.143ms`, `66.057ms/iteration`. |
+| `./target/debug/xtask verify-bytes-release-benchmark-reproduction --report target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json` | Fail, then Pass | Failed before benchmark refresh because child speed reports had stale release `xtask` hashes; passed after refresh. |
+| `./target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Rerun after `bytes-source-payload-large-route-run-plan.json` changed so artifact hashes were current. |
+| `./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Schema accepted the refreshed aggregate report. |
+| `./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Stale aggregate blocker is gone; remaining blockers are partial phases, missing Cells release wrapper, and Phase 10 default switch. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Final freshness rerun after this ledger update: aggregate and schema pass; readiness fails only on the remaining roadmap blockers. |
+
+Open findings:
+
+- This slice does not complete Phase 9. Cells release benchmark evidence remains
+  blocked by `TASK-0804A`.
+- This slice does not start Phase 10. The default `boon_cli run` path remains
+  legacy.
+- The aggregate report is the authoritative freshness artifact for the current
+  worktree fingerprint; readiness is expected to remain failed until the
+  remaining roadmap blockers are resolved.
+
+## 2026-06-22 - Phase 7 Root and Indexed Fixed-BYTES Warm-Tick Byte-Buffer Proof
+
+Status: partial Phase 7 runtime/storage and Phase 9 verification evidence;
+complete for focused root fixed-BYTES warm-tick byte-buffer proof and focused
+indexed source-payload/readback fixed-BYTES warm-tick proof. This does not
+complete Phase 7 because broad indexed warm-tick coverage and the remaining
+runtime hardening families are still open.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+
+What changed:
+
+- Added a standalone `verify-bytes-fixed-warm-tick` xtask gate and extended it
+  with root and indexed proof sections.
+- The gate runs `examples/bytes_set_numeric_write_bank_plan_ops.bn` with
+  selected source-event steps `patch-bytes`, `write-unsigned`, `write-signed`,
+  and `inspect-written` through the CPU PlanExecutor with legacy comparison.
+- The indexed half runs `examples/bytes_indexed_source_payload_plan_ops.bn`
+  with selected source-event steps `receive-beta-bytes` and
+  `inspect-beta-bytes` through the CPU PlanExecutor with legacy comparison.
+- The report explicitly records that the measured window is after PlanExecutor
+  initial root/list state, indexed/list/source binding setup, and fixed
+  byte-bank preparation.
+- The report-schema verifier now rejects missing warm-up metadata, missing
+  required measured steps, nonzero measured byte-buffer helper counters, and
+  missing borrowed `root_fixed_byte_bank` or `indexed_fixed_byte_bank` access
+  evidence.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+  - `status=pass`
+  - root selected step count: `4`
+  - root aggregate `bytes_storage_no_copy=true`
+  - every root measured step has:
+    - `copy_from_slice_count=0`, `copy_from_slice_bytes=0`
+    - `vec_clone_count=0`, `vec_clone_bytes=0`
+    - `vec_alloc_count=0`, `vec_alloc_bytes=0`
+    - `zero_fill_count=0`, `zero_fill_bytes=0`
+    - `bytes_storage_no_copy=true`
+    - `fixed_bank_access_pass=true`
+  - indexed selected step count: `2`
+  - indexed aggregate execution counts:
+    - `selected_step_count=2`
+    - `executed_update_branch_count=3`
+    - `executed_indexed_update_count=3`
+  - indexed `receive-beta-bytes`:
+    - `executed_indexed_update_count=1`
+    - byte-buffer helper counters are all zero
+    - `inline_value_count=1`, `inline_value_bytes=3`
+    - commits a BYTES source payload into `row.payload`
+  - indexed `inspect-beta-bytes`:
+    - `executed_indexed_update_count=2`
+    - byte-buffer helper counters are all zero
+    - `Bytes/length` writes `row.payload_len=3` from borrowed
+      `indexed_fixed_byte_bank` access
+    - `Bytes/get(index: 1)` writes `row.payload_second=254` from borrowed
+      `indexed_fixed_byte_bank` access
+- Negative forged-counter check:
+  - Mutating
+    `fixed_bytes_warm_tick.measured_steps[1].bytes_storage_counters.vec_alloc_count`
+    to `1` was rejected by `verify-report-schema` with:
+    `verify-bytes-fixed-warm-tick write-unsigned counter vec_alloc_count is nonzero: 1`.
+- Negative indexed forged-counter check:
+  - Mutating
+    `indexed_fixed_bytes_warm_tick.measured_steps[1].bytes_storage_counters.vec_alloc_count`
+    to `1` was rejected by `verify-report-schema` with:
+    `verify-bytes-fixed-warm-tick inspect-beta-bytes counter vec_alloc_count is nonzero: 1`.
+- Negative indexed access check:
+  - Mutating the indexed inspect-step `bytes_access.access_source` away from
+    `indexed_fixed_byte_bank` was rejected by `verify-report-schema` with:
+    `verify-bytes-fixed-warm-tick indexed inspect step did not prove borrowed fixed-bank reads`.
+
+Independent review:
+
+- Subagent `019eeedc-4853-77a1-a87e-224198f1fe0c` independently recommended
+  this bounded Phase 7 slice as the next non-0804A task after the aggregate
+  refresh. It identified the warm-tick zero byte-buffer proof as an explicit
+  remaining Phase 7 gap and warned to keep the claim limited to byte-buffer
+  helper counters rather than total heap allocation.
+- Subagent `019eeef2-542e-7be3-bec2-a42d3620819e` independently reviewed the
+  indexed extension and recommended the focused
+  `bytes_indexed_source_payload_plan_ops` receive/readback proof. The reviewer
+  explicitly warned not to require zero `inline_value_count` for the source
+  payload receive step and to require borrowed `indexed_fixed_byte_bank` access
+  on the later `Bytes/length` and `Bytes/get` reads.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Fail, then Pass | First run found rustfmt-only diffs in the new verifier/schema code. Passed after `cargo fmt --all`. |
+| `cargo fmt --all` | Pass | Formatting only. |
+| `cargo check -p boon_runtime -p boon_report_schema -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_source_payload_plan_ops.bn --scenario examples/bytes_indexed_source_payload_plan_ops.scn --steps receive-beta-bytes,inspect-beta-bytes --compare-legacy --report /tmp/bytes-indexed-warm-tick-probe.json` | Pass | Probe confirmed the focused indexed receive/readback shape before wiring schema checks. |
+| `cargo build -p xtask --quiet && ./target/debug/xtask verify-bytes-fixed-warm-tick --report target/reports/bytes-plan/bytes-fixed-warm-tick.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-fixed-warm-tick.json` | Pass | New standalone fixed-BYTES warm-tick report passes and schema validates. |
+| `jq '.fixed_bytes_warm_tick.measured_steps[1].bytes_storage_counters.vec_alloc_count = 1' target/reports/bytes-plan/bytes-fixed-warm-tick.json > target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-forged-vec-alloc.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-forged-vec-alloc.json` | Expected Fail | Schema rejected the forged nonzero warm-tick byte-buffer allocation counter. |
+| `jq '.indexed_fixed_bytes_warm_tick.measured_steps[1].bytes_storage_counters.vec_alloc_count = 1' target/reports/bytes-plan/bytes-fixed-warm-tick.json > target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-indexed-forged-vec-alloc.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-indexed-forged-vec-alloc.json` | Expected Fail | Schema rejected the forged nonzero indexed warm-tick byte-buffer allocation counter. |
+| `jq '.indexed_fixed_bytes_warm_tick.measured_steps[1].indexed_updates[0].bytes_access.access_source = "inline"' target/reports/bytes-plan/bytes-fixed-warm-tick.json > target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-indexed-forged-access.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/_negative-bytes-fixed-warm-tick-indexed-forged-access.json` | Expected Fail | Schema rejected forged indexed read evidence that no longer proved borrowed fixed-bank access. |
+| `cargo test -p boon_runtime fixed_bank -- --nocapture --test-threads=1` | Pass, but no matched tests | Compiled the runtime test target; `0 passed`, `309 filtered out`. The verifier report is the useful evidence for this slice. |
+| `cargo test -p boon_report_schema bytes_storage_profile -- --nocapture` | Pass, but no matched tests | Compiled the report-schema test target; `0 passed`, `29 filtered out`. |
+| replay 9 stale `xtask` aggregate child reports after the new gate/schema edit | Pass | Refreshed `build-bytes-boundary`, `bytes-byte-bank-layout`, `bytes-file-read-plan`, `bytes-file-write-plan`, `bytes-source-payload-large-route-run-plan`, `bytes-storage-profile`, `bytes-negative`, `todomvc-release-benchmark-reproduction`, and `bytes-machine-plan-adversarial` in dependency order. Logs under `target/reports/bytes-plan/logs/replay-after-fixed-warm-tick/`. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Aggregate and schema pass; readiness fails on the remaining roadmap blockers. |
+
+Open findings:
+
+- This proof is intentionally scoped to runtime BYTES byte-buffer helper
+  counters. It does not claim zero total heap allocation.
+- The indexed proof intentionally allows source-payload receive accounting as
+  `inline_value_count=1`, `inline_value_bytes=3`; the zero-copy claim applies
+  to the measured runtime byte-buffer helper counters and later fixed-bank
+  readback.
+- This proof covers root fixed-BYTES warm ticks plus one focused indexed
+  source-payload receive/readback shape. Broader indexed warm-tick shapes,
+  dynamic byte mutation beyond the inline sidecar, byte source payload
+  hardening, broad malformed private-state runtime tests, broad borrowed
+  execution for remaining BYTES ops, and broad no-panic/OOB coverage remain
+  open Phase 7 work.
+- This standalone report was not added to the aggregate in this slice. A later
+  Phase 9 aggregate refresh promoted it to an aggregate-required child report.
+- `TASK-0804A`, Cells release benchmark evidence, broad Phase 9 performance
+  evidence, and Phase 10 default switch remain open.
+
+## 2026-06-22 - Phase 9 Aggregate Refresh After Indexed Warm-Tick Proof
+
+Status: partial Phase 9 verification evidence; complete for refreshing the
+focused BYTES/MachinePlan aggregate after extending the standalone fixed-BYTES
+warm-tick verifier with indexed receive/readback evidence.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- Refreshed `target/reports/bytes-plan/bytes-fixed-warm-tick.json` after the
+  indexed warm-tick verifier/schema extension.
+- Added guarded `BOON_TRACE_BYTES_FILE_WRITE_PLAN=1` progress tracing to
+  `verify-bytes-file-write-plan` while diagnosing a suspected replay hang. The
+  diagnosis showed no infinite loop: the gate completed, but the live,
+  fabricated, and mutated-report negative matrix is expensive.
+- Refreshed stale xtask-generated child reports whose `binary_hash` changed
+  after rebuilding `target/debug/xtask`.
+- Regenerated the aggregate report and readiness report.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+  - `status=pass`
+  - root and indexed warm-tick sections both schema-validated.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `checked_report_count=49`
+  - `required_report_count=49`
+  - `proof_report_count=42`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=35`
+  - `no_fallback_plan_executor_count=35`
+  - no failing `per_step_pass_fail` entries.
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | Formatting was clean after the ledger update. |
+| `cargo build -p xtask --quiet && ./target/debug/xtask verify-bytes-fixed-warm-tick --report target/reports/bytes-plan/bytes-fixed-warm-tick.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-fixed-warm-tick.json` | Pass | Focused standalone root/indexed warm-tick report and schema passed. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Fail, then Expected Fail | First run failed because nine xtask-generated child reports had stale `binary_hash` values after rebuilding xtask. Final rerun passed aggregate and schema, then failed readiness only on the known roadmap blockers. |
+| replay stale aggregate child reports under `target/reports/bytes-plan/logs/replay-after-indexed-warm-tick/` | Interrupted/Partial | The first replay was stopped when `verify-bytes-file-write-plan` looked CPU-bound; later traced evidence showed it was slow but finite. A second replay refreshed several reports but skipped missing `bytes-storage-profile.json`; remaining affected reports were regenerated directly. |
+| `env BOON_TRACE_BYTES_FILE_WRITE_PLAN=1 timeout 45s target/debug/xtask verify-bytes-file-write-plan --report /tmp/bytes-file-write-plan-trace.json` | Timeout | Trace reached the mutated-report negative matrix, proving the earlier 20s timeout was too short and the dynamic PlanExecutor run itself was not the long-running phase. |
+| `env BOON_TRACE_BYTES_FILE_WRITE_PLAN=1 timeout 180s target/debug/xtask verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json` | Pass | Completed in the final `write-and-schema` stage; no infinite loop. |
+| `target/debug/xtask verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json && target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json && target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Directly regenerated the missing/stale storage, negative, and adversarial reports. |
+
+Open findings:
+
+- `verify-bytes-file-write-plan` is slow because it executes live negative
+  cases, fabricated MachinePlan negatives, and 19 full mutated-report schema
+  rejection cases. It is not an infinite loop, but it is a verifier-cost smell.
+  A later Phase 9 cleanup should reduce duplicate full-report cloning/schema
+  work without weakening the negative coverage.
+- Superseded by the later warm-tick aggregate promotion: the fixed warm-tick
+  report is now aggregate-required.
+- Readiness remains intentionally failed on partial phases, postponed
+  `TASK-0804A`, missing Cells release benchmark wrapper evidence, and Phase 10
+  default-switch work.
+
+## 2026-06-22 - Phase 9 Fixed Warm-Tick Aggregate Promotion
+
+Status: partial Phase 9 verification evidence; complete for making the
+fixed-BYTES warm-tick proof an aggregate-required child report.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- Added `bytes-fixed-warm-tick` to `bytes_machine_plan_required_reports()` in
+  xtask.
+- Added the matching `bytes-fixed-warm-tick` child contract to
+  `expected_bytes_machine_plan_child_reports()` in `boon_report_schema`.
+- Refreshed every affected xtask-generated child report after rebuilding
+  `target/debug/xtask`.
+- Regenerated the aggregate report so missing/stale/forged warm-tick proof is
+  now an aggregate failure instead of only standalone evidence.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `checked_report_count=50`
+  - `required_report_count=50`
+  - `proof_report_count=43`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=35`
+  - `no_fallback_plan_executor_count=35`
+  - no failing `per_step_pass_fail` entries
+  - child `bytes-fixed-warm-tick`:
+    - `status=pass`
+    - `schema_valid=true`
+    - `artifact_hashes_fresh=true`
+    - `command=verify-bytes-fixed-warm-tick`
+    - `measurement_mode=proof`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check && cargo check -p boon_report_schema -p xtask --quiet && cargo build -p xtask --quiet` | Pass | Existing native GPU dead-code warnings only. |
+| replay affected xtask child reports under `target/reports/bytes-plan/logs/replay-after-warm-tick-aggregate/` | Pass | Regenerated build boundary, byte-bank layout, file read/write, storage profile, fixed warm tick, negative, release benchmark reproduction, and adversarial reports with the current xtask binary. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Aggregate and schema pass at `50/50`; readiness fails only on known roadmap blockers. |
+
+Open findings:
+
+- Phase 9 remains partial. This promotes one useful storage proof into the
+  aggregate, but it does not add Cells release benchmark evidence, stricter
+  repeated-performance policy, broad parity beyond the current aggregate, or
+  final performance claims.
+- `verify-bytes-file-read-plan`, `verify-bytes-file-write-plan`, and
+  `verify-bytes-storage-profile` are still expensive verification gates. The
+  current run proves they are bounded enough to refresh evidence, not that their
+  verifier cost is acceptable.
+- Readiness remains intentionally failed until the known roadmap blockers are
+  closed.
+
+## 2026-06-22 - Phase 7/9 Missing BYTES Source-Payload Negative Proof
+
+Status: partial Phase 7 runtime/source-payload hardening and partial Phase 9
+negative verification evidence; complete for the focused malformed source event
+case where a BYTES source route is invoked without the required `bytes` payload.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `target/reports/bytes-plan/bytes-negative.json`
+- `target/reports/bytes-plan/build-bytes-boundary.json`
+- `target/reports/bytes-plan/bytes-byte-bank-layout.json`
+- `target/reports/bytes-plan/bytes-file-read-plan.json`
+- `target/reports/bytes-plan/bytes-file-write-plan.json`
+- `target/reports/bytes-plan/bytes-storage-profile.json`
+- `target/reports/bytes-plan/bytes-fixed-warm-tick.json`
+- `target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json`
+- `target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+- `target/reports/bytes-plan/goal-readiness.json`
+
+What changed:
+
+- Added the `source-payload-missing-bytes-payload` negative source-route case to
+  `verify-bytes-negative`.
+- Extended the negative source-route case runner so it can intentionally omit
+  the BYTES `bytes` payload instead of always sending a byte vector.
+- Added the new negative case ID to the report-schema required negative case
+  list.
+- Refreshed stale xtask-generated aggregate child reports after rebuilding
+  `target/debug/xtask`.
+- Regenerated the aggregate and readiness reports for the current worktree.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=89`
+  - `required_negative_cases` contains
+    `source-payload-missing-bytes-payload`
+  - the negative case is category `plan-source-route`
+  - the case detail is
+    `source event is missing `bytes` BYTES payload`
+  - the corresponding `per_step_pass_fail` entry has `pass=true`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `aggregate_checks_pass=true`
+  - `checked_report_count=50`
+  - `required_report_count=50`
+  - `proof_report_count=43`
+  - `diagnostic_report_count=7`
+  - `plan_executor_report_count=35`
+  - `no_fallback_plan_executor_count=35`
+  - no failing `per_step_pass_fail` entries
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo build -p xtask --quiet && target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Focused negative report and schema passed after adding the missing-payload case to the schema-required case list. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Expected Fail | Identified eight xtask-generated child reports with stale `binary_hash` values after rebuilding `target/debug/xtask`. |
+| replay affected xtask child reports under `target/reports/bytes-plan/logs/replay-after-source-payload-missing-bytes/` | Pass | Regenerated `build-bytes-boundary`, `bytes-byte-bank-layout`, `bytes-file-read-plan`, `bytes-file-write-plan`, `bytes-storage-profile`, `bytes-fixed-warm-tick`, `todomvc-release-benchmark-reproduction`, and `bytes-machine-plan-adversarial`. |
+| `./target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json && ./target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Aggregate and schema pass at `50/50`; readiness fails only on the known roadmap blockers. |
+
+Open findings:
+
+- This closes only one malformed BYTES source-payload case. Broader source
+  payload hardening, malformed private-state runtime tests, and broad no-panic
+  coverage remain open.
+- Phase 9 remains partial. This slice strengthens the negative gate and
+  refreshes the aggregate, but it does not add Cells release benchmark evidence,
+  broader parity gates, repeated-performance policy, or final speed claims.
+- Phase 10 remains not started. `boon_cli run` still defaults to legacy.
+
+## 2026-06-22 - Phase 3/4 Folded Static BYTES Scalar Arguments
+
+Status: partial Phase 3 type-system and Phase 4 semantic-IR progress with
+focused Phase 9 proof; complete for the narrow static integer expression subset
+used by selected root-scalar BYTES arguments.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/boon_ir/src/lib.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `examples/bytes_constant_expr_plan_ops.bn`
+- `examples/bytes_constant_expr_plan_ops.scn`
+- `target/reports/bytes-plan/bytes-constant-expr-dump-plan.json`
+- `target/reports/bytes-plan/bytes-constant-expr-run-plan.json`
+
+What changed:
+
+- Added a shared static integer folder for integer literals plus checked `+`,
+  `-`, and `*`.
+- Reused that folder in `static_usize_literal`, `static_integer_literal`, and
+  `resolved_constant_table`, so BYTES static bounds and semantic IR lowering see
+  the same folded values.
+- Kept the fold narrow: no identifiers, field reads, function calls, division,
+  modulo, comparisons, or dynamic values.
+- Updated BYTES IR branch recognizers for selected BYTES ops to resolve the
+  selected `THEN` output expression against the full field AST. This avoids
+  losing nested argument expressions when the routed branch line slice is too
+  narrow, while still using the routed branch to choose the active `THEN`.
+- Added `examples/bytes_constant_expr_plan_ops.bn` and `.scn` to prove folded
+  args for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and
+  `Bytes/write_unsigned`.
+- Documented the folded static subset in
+  `docs/architecture/BYTES_SEMANTICS.md`.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-constant-expr-dump-plan.json`
+  - `status=pass`
+  - `typed_lowering_executable=true`
+  - `typecheck_report.resolved_constant_table` includes folded unsigned
+    constants for `0`, `1`, `2`, `4`, and `258`.
+  - MachinePlan update branches lower to `bytes_get`, `bytes_slice`,
+    `bytes_read_unsigned`, and `bytes_write_unsigned`.
+- `target/reports/bytes-plan/bytes-constant-expr-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - `executed_update_branch_count=4`
+  - semantic deltas:
+    - `FieldSet:store.folded_byte`
+    - `FieldSet:store.folded_slice`
+    - `FieldSet:store.folded_read`
+    - `FieldSet:store.folded_write`
+  - final state:
+    - `store.folded_byte=2`
+    - `store.folded_read=16909060`
+    - `store.folded_slice` has `byte_len=2` and digest
+      `0ce3940bebf2b22a5d2108ecf0c368a0541c7e3c45703f8540921b4eafc82947`
+    - `store.folded_write` has `byte_len=4` and digest
+      `30ace33963fd17c4816fce834fd7f47ea5ffb8235734f58e2ed78422bb24436f`
+
+Subagent review:
+
+- `019eef32-5a0c-7890-86af-9c1812e16ddd` independently inspected the current
+  constant-expression slice and agreed with the narrow shape: one pure checked
+  integer folder shared by the typechecker static helpers and
+  `resolved_constant_table`, with proof through a focused fixture and no
+  default-execution or TASK-0804A changes.
+- The reviewer flagged oversized folded integers as a remaining hardening gap:
+  today, values too large for the report/lowering integer type can disappear
+  from the resolved table. A later negative case should make that failure
+  explicit for BYTES scalar args.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all && cargo test -p boon_typecheck resolved_constant_table_exports_literal_values_for_ir -- --nocapture && cargo check -p boon_typecheck -p boon_ir -p boon_cli --quiet && cargo build -p boon_cli -p xtask --quiet` | Pass | Focused typechecker test passed; existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan examples/bytes_constant_expr_plan_ops.bn --report target/reports/bytes-plan/bytes-constant-expr-dump-plan.json` | Pass | Dump-plan report proves folded constants are in the resolved constant table and selected branches lower to typed BYTES ops. |
+| `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_constant_expr_plan_ops.bn --scenario examples/bytes_constant_expr_plan_ops.scn --steps inspect-folded-args --compare-legacy --report target/reports/bytes-plan/bytes-constant-expr-run-plan.json` | Pass | PlanExecutor replayed all four folded-arg BYTES branches with matching legacy state/deltas and zero fallback counters. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-constant-expr-dump-plan.json target/reports/bytes-plan/bytes-constant-expr-run-plan.json` | Pass | Focused dump/run reports schema-validated. |
+| `cargo test -p boon_plan bytes_slice_take_drop_updates_lower_to_typed_executable_plan_ops -- --nocapture` | Pass | Existing literal slice/take/drop typed-lowering proof still passes. |
+| `cargo test -p boon_plan bytes_numeric_updates_lower_to_ordered_typed_executable_plan_ops -- --nocapture` | Pass | Existing numeric typed-lowering proof still passes. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain -- --nocapture` | Pass | Existing slice/take/drop PlanExecutor proof still passes. |
+| `cargo test -p boon_runtime root_scalar_plan_executor_replays_bytes_numeric_updates -- --nocapture` | Pass | Existing numeric PlanExecutor proof still passes. |
+| `cargo fmt --all -- --check && cargo check -p boon_typecheck -p boon_ir -p boon_plan -p boon_runtime -p boon_cli --quiet` | Pass | Final focused formatting/check pass for touched crates. |
+
+Open findings:
+
+- This does not complete broad constant-evaluation policy. The accepted subset
+  is intentionally only integer literals plus checked `+`, `-`, and `*`.
+- Oversized folded integers need a future explicit negative case and diagnostic
+  contract rather than silently disappearing from the resolved constant table.
+- During fixture development, a multi-line `THEN { ... }` body with the output
+  expression on a following line lowered as a generic `ReadPath`. This is a
+  parser/IR branch-output limitation separate from constant folding. The
+  focused fixture uses the existing one-line `THEN { expression }` form used by
+  current BYTES plan fixtures; a later parser slice should decide whether
+  multi-line `THEN` output bodies are part of the supported surface.
+- Superseded by the following slice: these focused reports are now
+  aggregate-required children.
+
+## 2026-06-22 - Phase 3/9 Folded Static Integer Overflow and Aggregate Promotion
+
+Status: partial Phase 3 type-system hardening and partial Phase 9 verification
+evidence; complete for making folded BYTES scalar integer overflow/range
+diagnostics and the folded constant-expression proof part of the required
+aggregate evidence.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added explicit typechecker diagnostics for folded static integer expressions
+  that overflow Boon's supported integer range while checking BYTES scalar
+  arguments.
+- Added an explicit MachinePlan range diagnostic for folded static BYTES scalar
+  arguments that fit `i128` but do not fit the current MachinePlan numeric
+  representation. Nonnegative BYTES indexes, offsets, counts, and unsigned
+  values must fit `0..=i64::MAX`; `Bytes/write_signed(value:)` may use the
+  signed `i64` range.
+- Kept the static folder narrow: integer literals plus checked `+`, `-`, and
+  `*`. Unsupported dynamic expressions are not folded or guessed.
+- Added schema-required negative cases:
+  `typecheck-bytes-folded-static-integer-overflow` and
+  `typecheck-bytes-folded-static-integer-plan-range`.
+- Promoted `bytes-constant-expr-dump-plan` and
+  `bytes-constant-expr-scenario` into both the xtask aggregate required-child
+  list and the report-schema expected-child list.
+- Guarded `Bytes/concat` fixed-length type refinement with `checked_add`, so an
+  impossible enormous fixed-length pair cannot panic the typechecker in debug
+  builds.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=91`
+  - includes both folded static integer negative IDs with `rejected=true`
+- `target/reports/bytes-plan/bytes-constant-expr-dump-plan.json`
+  - `status=pass`
+  - proves folded constants are exported through
+    `typecheck_report.resolved_constant_table`
+- `target/reports/bytes-plan/bytes-constant-expr-run-plan.json`
+  - `status=pass`
+  - `legacy_comparison.passed=true`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - expression kinds: `bytes_get`, `bytes_slice`, `bytes_read_unsigned`,
+    `bytes_write_unsigned`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=52`
+  - `required_report_count=52`
+  - `proof_report_count=44`
+  - `diagnostic_report_count=8`
+  - `plan_executor_report_count=36`
+  - `no_fallback_plan_executor_count=36`
+  - no failing `per_step_pass_fail` entries
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- `019eef4b-5e9c-71c1-a5ea-011ebd121bac` independently reviewed the dirty
+  slice and confirmed the folded static integer overflow/range diagnostics were
+  wired through the typechecker, `verify-bytes-negative`, and aggregate-required
+  evidence. The reviewer correctly warned not to claim aggregate success until
+  all stale child binary hashes were refreshed.
+- The reviewer also flagged the unchecked `Bytes/concat` fixed-length addition;
+  this slice replaced it with `checked_add`.
+- The reviewer noted that the adversarial gate now uses targeted child
+  rejection checks for some tamper cases rather than rerunning the full
+  aggregate for every mutation. This remains acceptable for this slice because
+  `verify-bytes-machine-plan-adversarial` is still an aggregate-required proof
+  and the final full aggregate passed against its refreshed report, but broader
+  adversarial end-to-end coverage remains Phase 9 work.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check && cargo test -p boon_typecheck bytes_builtin_argument_validation_rejects_missing_and_bad_args -- --nocapture && cargo test -p boon_typecheck static_text_to_bytes_refines_only_literal_inputs -- --nocapture && cargo test -p boon_typecheck resolved_constant_table_exports_literal_values_for_ir -- --nocapture && cargo check -p boon_typecheck -p boon_ir -p boon_runtime -p boon_report_schema -p xtask --quiet` | Pass | Focused typechecker tests and touched-crate check passed; existing native GPU dead-code warnings only. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt current binaries so report binary hashes bind to the current source. Existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed negative report with 91 required cases including both folded static integer diagnostics. |
+| `target/debug/boon_cli dump-plan examples/bytes_constant_expr_plan_ops.bn --report target/reports/bytes-plan/bytes-constant-expr-dump-plan.json` | Pass | Refreshed focused folded-constant dump-plan proof. |
+| `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_constant_expr_plan_ops.bn --scenario examples/bytes_constant_expr_plan_ops.scn --steps inspect-folded-args --compare-legacy --report target/reports/bytes-plan/bytes-constant-expr-run-plan.json` | Pass | Refreshed focused folded-constant PlanExecutor proof with zero fallback counters. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-constant-expr-dump-plan.json target/reports/bytes-plan/bytes-constant-expr-run-plan.json` | Pass | Focused reports schema-validated. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Expected Fail, then Pass | First runs correctly failed on stale child `binary_hash` values after rebuilding `boon_cli` and `xtask`; all stale children were replayed from their own `command_argv`, with `bytes-machine-plan-adversarial` replayed last, then the final aggregate passed at `52/52`. |
+| replay stale child reports under `target/reports/bytes-plan/logs/current-slice/replay-after-concat-guard/` | Pass | Regenerated all aggregate children made stale by the final rebuild. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate schema-validated against current binary hashes. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial phases, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Slow-path observation:
+
+- `verify-bytes-file-write-plan` is slow in debug builds. A traced run showed
+  runtime execution and negative-case generation complete before the delay; the
+  slow section is the final `write-and-schema` phase, specifically schema
+  validation of the generated file-write report. This is a verifier/report
+  validation cost, not an infinite loop in `File/write_bytes` execution.
+
+Open findings:
+
+- Phase 3 remains partial: broader constant evaluation policy, runtime-body
+  audit, and final Phase 3 gate coverage remain open.
+- Phase 9 remains partial: Cells release benchmark evidence, broader parity
+  gates, stricter repeated-performance policy, and performance claims remain
+  open.
+- Phase 10 remains not started: default `boon_cli run` still uses legacy unless
+  an explicit plan/compare engine is requested.
+
+## 2026-06-22 - Phase 3/9 Broader Folded BYTES Scalar Diagnostics
+
+Status: partial Phase 3 type-system hardening and partial Phase 9 negative
+verification evidence; complete for requiring folded static integer
+overflow/range diagnostics across representative non-index BYTES scalar
+arguments.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Extended the focused typechecker fixture and `verify-bytes-negative` gate
+  from the earlier `Bytes/get(index:)` folded integer proof to representative
+  non-index scalar arguments:
+  - `Bytes/slice(offset:)` checked arithmetic overflow;
+  - `Bytes/zeros(byte_count:)` checked arithmetic overflow;
+  - `Bytes/zeros(byte_count:)` MachinePlan `i64` range overflow;
+  - `Bytes/write_unsigned(value:)` negative value rejection for unsigned
+    MachinePlan arguments;
+  - `Bytes/write_signed(value:)` signed lower-bound MachinePlan range overflow.
+- Added the new case IDs to the report-schema required negative case list so
+  the report cannot pass if the cases disappear.
+- Kept this deliberately below a full matrix. The goal is to prove index,
+  offset, count, unsigned value, and signed value branches; broad per-function
+  matrix testing remains future Phase 3/9 hardening.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-negative.json`
+  - `status=pass`
+  - `negative_case_count=96`
+  - folded static integer cases all have `rejected=true`:
+    - `typecheck-bytes-folded-static-integer-overflow`
+    - `typecheck-bytes-folded-static-integer-plan-range`
+    - `typecheck-bytes-folded-slice-offset-overflow`
+    - `typecheck-bytes-folded-zeros-count-overflow`
+    - `typecheck-bytes-folded-zeros-count-plan-range`
+    - `typecheck-bytes-folded-write-unsigned-value-negative-plan-range`
+    - `typecheck-bytes-folded-write-signed-value-plan-range`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=52`
+  - `required_report_count=52`
+  - `proof_report_count=44`
+  - `diagnostic_report_count=8`
+  - `plan_executor_report_count=36`
+  - `no_fallback_plan_executor_count=36`
+  - no failing `per_step_pass_fail` entries
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- `019eef77-c73b-7851-9608-365a52258c9d` independently reviewed the planned
+  hardening and recommended proving non-index scalar coverage through
+  `Bytes/zeros(byte_count:)` and `Bytes/write_unsigned(value:)` rather than only
+  `Bytes/get(index:)`. This slice includes those recommendations and also keeps
+  the additional `Bytes/slice(offset:)` and signed lower-bound cases.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo fmt --all -- --check && cargo test -p boon_typecheck bytes_builtin_argument_validation_rejects_missing_and_bad_args -- --nocapture && cargo check -p boon_typecheck -p boon_report_schema -p xtask --quiet` | Pass | Focused typechecker test and touched-crate check passed; existing native GPU dead-code warnings only. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt report-producing binaries so refreshed reports bind to current code. Existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed negative report with 96 cases and all seven folded scalar cases rejected. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Negative report schema-validated. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Expected Fail, then Pass | First run found stale child binary hashes after rebuilding; stale children were replayed from their own `command_argv`, with adversarial proof last, then aggregate passed at `52/52`. |
+| replay stale child reports under `target/reports/bytes-plan/logs/current-slice-broad-scalar/replay/` | Pass | Refreshed aggregate children made stale by the rebuild. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate schema-validated. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails only on partial phases, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- Phase 3 remains partial. This proves representative scalar branches, not a
+  complete constant-evaluation policy or full runtime-body audit.
+- Phase 9 remains partial. This strengthens negative coverage, but does not
+  solve `TASK-0804A`, Cells release benchmark evidence, broader performance
+  policy, or final default-switch readiness.
+
+## 2026-06-22 - Phase 4/5/9 Fixed-Bank Conversion MachinePlan Evidence
+
+Status: partial Phase 4 semantic-IR, Phase 5 MachinePlan lowering, and Phase 9
+verification evidence; complete for the focused fixed-bank
+`Bytes/set` -> `Bytes/to_text` / `Bytes/to_hex` / `Bytes/to_base64` proof.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_ir/src/lib.rs`
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added an IR regression for `examples/bytes_set_conversion_bank_plan_ops.bn`
+  proving:
+  - `store.patched` lowers to `UpdateExpression::BytesSet`;
+  - `store.text` lowers to `BytesToText { path: "store.patched", encoding:
+    "Utf8" }`;
+  - `store.hex` lowers to `BytesToHex { path: "store.patched" }`;
+  - `store.base64` lowers to `BytesToBase64 { path: "store.patched" }`.
+- Added a MachinePlan regression proving the same fixture lowers to typed
+  executable update ops with ordered typed operands:
+  - `BytesSet` reads `State(left_payload)` plus typed number/byte constants;
+  - `BytesToText` reads `State(store.patched)` plus the UTF-8 text constant;
+  - `BytesToHex` and `BytesToBase64` read `State(store.patched)`.
+- Promoted the existing storage-profile fixture to first-class aggregate
+  evidence by adding:
+  - `target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json`;
+  - `target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json`.
+- Added those two reports to both the xtask aggregate required-report list and
+  the report-schema expected-child list.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json`
+  - `status=pass`
+  - `command=dump-plan`
+  - `capability_summary.cpu_plan_executor_complete=true`
+  - `capability_summary.executable_string_path_count=0`
+  - `capability_summary.runtime_ast_dependency_count=0`
+  - `capability_summary.unknown_plan_op_count=0`
+  - update-branch expression kinds include `bytes_set`, `bytes_to_text`,
+    `bytes_to_hex`, and `bytes_to_base64`
+- `target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json`
+  - `status=pass`
+  - `command=run-plan-root-scalar-scenario`
+  - selected steps: `patch-bytes`, `inspect-conversions`
+  - `legacy_comparison.passed=true`
+  - `plan_executor.runtime_ast_eval_count=0`
+  - `plan_executor.executable_string_path_count=0`
+  - `plan_executor.unknown_plan_op_count=0`
+  - `plan_executor.graph_rebuild_count=0`
+  - `plan_executor.graph_clones_per_item=0`
+  - `plan_executor.bytes_storage_no_copy=true`
+  - conversion updates read from `root_fixed_byte_bank` with `cow_kind=borrowed`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=54`
+  - `required_report_count=54`
+  - `proof_report_count=45`
+  - `diagnostic_report_count=9`
+  - `plan_executor_report_count=37`
+  - `no_fallback_plan_executor_count=37`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- `019eef90-cc40-7ed2-8550-0e3d7cf5d4fc` identified this fixed-bank
+  conversion fixture as the smallest useful Phase 4/5/9 evidence gap because
+  runtime/storage profiling already covered the behavior, but the aggregate had
+  no standalone dump-plan or MachinePlan scenario proof for it.
+- `019eef93-116b-7ba2-99fb-9b3af30172a7` confirmed that existing
+  `run-plan-root-scalar-scenario` schema validation already source-replays and
+  compares exact `expression_kind` values, and warned that the aggregate needed
+  to be refreshed from 52 to 54 required children after adding the two reports.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_report_schema run_plan_root_scalar_scenario_accepts_bytes -- --nocapture` | Pass | Existing schema tests for BYTES expression-kind replay passed: 10 tests. |
+| `cargo test -p boon_ir bytes_set_conversion_bank_update_expressions_lower_from_fixed_bank_fixture -- --nocapture` | Pass | Focused IR regression passed. |
+| `cargo test -p boon_plan bytes_set_conversion_bank_updates_lower_to_typed_executable_plan_ops -- --nocapture` | Pass | Focused MachinePlan regression passed. |
+| `cargo fmt --all -- --check` | Fail, then Pass | First run found rustfmt line wrapping in the new plan test; after `cargo fmt --all`, the check passed. |
+| `cargo run -q -p boon_cli -- dump-plan examples/bytes_set_conversion_bank_plan_ops.bn --report target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json` | Pass | Generated the new aggregate diagnostic child report. |
+| `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_set_conversion_bank_plan_ops.bn --scenario examples/bytes_set_conversion_bank_plan_ops.scn --steps patch-bytes,inspect-conversions --compare-legacy --report target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json` | Pass | Generated the new aggregate proof child report. |
+| `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json` | Pass | New dump-plan report schema-validated. Existing native GPU dead-code warnings only. |
+| `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json` | Pass | New scenario report schema-validated. Existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First aggregate run wrote a blocked 54-child report because most old child reports had stale `boon_cli`/`xtask` binary hashes. Replayed stale children from their recorded `command_argv`, reran adversarial after the aggregate changed, then the aggregate passed at `54/54`. |
+| replay stale child reports from their recorded `command_argv` | Pass | Logs were written under `target/reports/bytes-plan/logs/replay-*.log`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after the aggregate report changed. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate schema-validated. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails only on partial phases, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This closes only the focused fixed-bank conversion evidence gap. It does not
+  complete Phase 4 source-payload typing, broad Phase 5 lowering coverage,
+  Phase 9 performance coverage, `TASK-0804A`, or Phase 10 default execution.
+
+## 2026-06-22 - Phase 9 Aggregate BYTES Expression-Kind Coverage Summary
+
+Status: partial Phase 9 verification hardening; complete for schema-required
+aggregate expression-kind coverage summaries on the focused BYTES operation
+child reports.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- `verify-bytes-machine-plan-all` now records a sorted unique
+  `expression_kinds` array for every child report by extracting all
+  `expression_kind` fields from each child JSON.
+- The report schema now requires selected Phase 4/9 BYTES aggregate children
+  to include expected operation-kind sets:
+  - `bytes-search-scenario`: `bytes_concat`, `bytes_find`,
+    `bytes_starts_with`, `bytes_ends_with`;
+  - `bytes-encoding-scenario`: `bytes_concat`, `bytes_to_hex`,
+    `bytes_to_base64`, `bytes_zeros`, `bytes_from_hex`,
+    `bytes_from_base64`, `bytes_length`, `bytes_get`;
+  - `bytes-numeric-scenario`: `bytes_read_unsigned`, `bytes_read_signed`,
+    `bytes_write_unsigned`, `bytes_write_signed`, `bytes_to_hex`;
+  - fixed-bank conversion dump/run reports: `bytes_set`, `bytes_to_text`,
+    `bytes_to_hex`, `bytes_to_base64`;
+  - folded constant dump/run reports: `bytes_get`, `bytes_slice`,
+    `bytes_read_unsigned`, `bytes_write_unsigned`;
+  - root and indexed same-event dependency reports: `bytes_set`,
+    `bytes_get`, `bytes_length`, plus `source_payload` for the indexed case.
+- This avoids relying only on broad aggregate counters when checking whether
+  the aggregate still contains concrete BYTES operation evidence.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=54`
+  - `required_report_count=54`
+  - `proof_report_count=45`
+  - `diagnostic_report_count=9`
+  - `plan_executor_report_count=37`
+  - `no_fallback_plan_executor_count=37`
+  - selected child reports now include `expression_kinds` arrays validated by
+    the aggregate report schema.
+- Sampled aggregate coverage:
+  - `bytes-search-scenario`: `bytes_concat`, `bytes_ends_with`,
+    `bytes_find`, `bytes_starts_with`
+  - `bytes-set-conversion-bank-scenario`: `bytes_set`,
+    `bytes_to_base64`, `bytes_to_hex`, `bytes_to_text`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p xtask -p boon_report_schema --quiet` | Pass | Touched-crate check passed. Existing native GPU dead-code warnings only. |
+| `cargo fmt --all` | Pass | Applied rustfmt after the schema helper edit. |
+| `cargo build -p xtask` | Pass | Rebuilt the runnable `target/debug/xtask` binary; `cargo check` alone was insufficient because it did not update the binary used by the gates. Existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Fail, then Pass | First updated-binary run exposed ten xtask-produced child reports with stale `target/debug/xtask` binary hashes. After replaying those reports and rerunning adversarial after the aggregate changed, the final aggregate passed. |
+| replay schema-invalid child reports from recorded `command_argv` | Pass | Refreshed the large source-payload route plus xtask static gates; logs were written under `target/reports/bytes-plan/logs/replay-expression-kinds-*.log`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after the aggregate changed. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate schema-validated, including expression-kind coverage requirements. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails only on partial phases, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+| `cargo fmt --all -- --check && git diff --check` | Pass | Formatting and whitespace checks passed. |
+
+Open findings:
+
+- Aggregate coverage is now explicit for selected BYTES operation reports, but
+  this is still not a full semantic coverage model for every possible
+  MachinePlan op or every future BYTES fixture.
+- Phase 9 remains partial because performance coverage, Cells benchmark wrapper
+  evidence, stricter repeated-performance policy, and final default-switch
+  readiness remain open.
+
+## 2026-06-22 - Phase 3/4/9 Inline HOLD/LATEST BYTES Static-Argument Bug
+
+Status: partial Phase 3 type-system, Phase 4 semantic-IR, and Phase 9
+negative/aggregate hardening; complete for the focused inline
+`HOLD { LATEST { source |> THEN { ... } } }` BYTES scalar-argument bug.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_parser/src/lib.rs`
+- `crates/boon_ir/src/lib.rs`
+- `crates/boon_typecheck/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `docs/architecture/BYTES_SEMANTICS.md`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Found the real cause of the bad zero-branch reproducer: inline `HOLD`
+  parsing kept only the initial expression and did not retain inline `LATEST`
+  update-body expressions. Multiline `LATEST` bodies worked because they were
+  represented as child statements.
+- Parser now records inline `LATEST` and inline update-body expressions inside
+  `HOLD` blocks.
+- IR field extraction now includes same-line expression trees for a field
+  statement, so inline `LATEST/THEN` source branches are visible to the same
+  branch extraction path as multiline branches.
+- Added an IR regression proving inline
+  `store.measure |> THEN { bytes |> Bytes/get(index: 2) }` lowers a real
+  `UpdateExpression::BytesGet` branch, and inline
+  `Bytes/get(index: 4 / 2)` is rejected instead of disappearing into a passing
+  zero-update plan.
+- Narrowed the new BYTES static-scalar diagnostic: unsupported literal-only
+  static formulas such as `4 / 2` are compiler errors, but dynamic identifiers
+  such as Cells' `inner_length` are not rejected merely because they are not
+  folded constants. This keeps existing dynamic Boon code valid while still
+  rejecting literal formulas the compiler cannot fold safely.
+- Removed the over-strict negative/schema case that treated an identifier
+  scalar argument as a compiler error.
+
+Evidence:
+
+- Original inline reproducer now exits nonzero through `boon_cli dump-plan`:
+  `typecheck failed with 1 diagnostic(s): line 4: \`Bytes/get\` argument
+  \`index\` requires a static integer expression using integer literals and
+  checked \`+\`, \`-\`, or \`*\``.
+- `target/reports/bytes-plan/cells-dump-plan.json`
+  - `status=pass`
+  - `exit_status=0`
+  - `machine_plan.commit_plan.update_branch_count=15`
+  - `machine_plan.capability_summary.operation_count=49`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=54`
+  - `required_report_count=54`
+  - `proof_report_count=45`
+  - `diagnostic_report_count=9`
+  - `plan_executor_report_count=37`
+  - `no_fallback_plan_executor_count=37`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_parser builds_hierarchical_statement_and_expression_ast -- --nocapture` | Pass | Existing parser AST regression still passed after retaining inline `HOLD` update expressions. |
+| `cargo test -p boon_typecheck bytes_builtin_argument_validation_rejects_missing_and_bad_args -- --nocapture` | Pass | Focused BYTES argument validation test passed with division still rejected and identifier-as-dynamic no longer rejected. |
+| `cargo test -p boon_ir inline_latest_then_bytes_update_lowers_or_rejects_like_multiline -- --nocapture` | Fail, then Pass | The new regression first reproduced the zero-branch inline bug, then passed after parser/IR fixes. |
+| `cargo check -p xtask -p boon_report_schema --quiet` | Pass | Touched-crate check passed. Existing native GPU dead-code warnings only. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt the runnable binaries used by the CLI reproducer and report gates. Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan <inline-reproducer> --report /tmp/bytes-div-inline-fixed-report.json` | Expected Fail | The inline unsupported static formula now fails with the intended typecheck diagnostic instead of producing a passing zero-branch plan. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan.json` | Fail, then Pass | First run exposed the over-strict identifier rejection for Cells `inner_length`; after narrowing the rule, Cells dump-plan passed again. |
+| `target/debug/xtask verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-negative.json` | Pass | Refreshed the negative report with the corrected required case set. |
+| replay schema-invalid aggregate child reports from recorded `command_argv` | Fail, then Pass | First replay correctly exposed the Cells `inner_length` regression; after the rule correction, all stale children replayed successfully. Logs were written under `target/reports/bytes-plan/logs/replay-inline-hold-*.log` and `replay-inline-hold-narrowed-*.log`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after the aggregate report changed. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema passed at `54/54`. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails only on partial phases, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This fixes the inline `HOLD/LATEST` branch-loss bug and the over-strict
+  literal/static diagnostic. It does not complete broad dynamic BYTES scalar
+  lowering, Phase 9 performance coverage, `TASK-0804A`, or Phase 10 default
+  execution.
+
+## 2026-06-22 - Phase 4/5/9 Typed Source-Payload Descriptors
+
+Status: partial Phase 4 semantic-IR, Phase 5 MachinePlan verification, and
+Phase 9 aggregate/report-schema hardening; complete for the focused root and
+indexed BYTES source-payload descriptor contract.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_ir/src/lib.rs`
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- `SourcePayloadSchema` now carries `typed_fields` descriptors in addition to
+  the historical field-name list. `Bytes` payload fields are tagged as
+  `value_type=bytes`; address, key, text, and named textual payload fields are
+  tagged as `value_type=text`.
+- MachinePlan verification now checks that every executable
+  `ValueRef::SourcePayload` operand is backed by a declared typed source-route
+  payload descriptor, and that the descriptor value type matches the output
+  plan storage type.
+- Aggregate reports now summarize source-payload typing for every child report,
+  including payload route counts, source-payload update counts, operand fields,
+  typed descriptor counts, and typed field/value-type pairs.
+- Report-schema validation now requires the focused root and indexed BYTES
+  source-payload dump-plan children to prove the `Bytes -> bytes` descriptor is
+  present and used by source-payload update operands.
+- Added a tamper regression that rejects a BYTES source-payload route when the
+  descriptor is forged to `text`.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json`
+  contains source route `store.receive` with `typed_fields=[{field: Bytes,
+  value_type: bytes}]`.
+- `target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json`
+  contains indexed source route `row.receive` with `typed_fields=[{field:
+  Bytes, value_type: bytes}]`.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=54`
+  - `required_report_count=54`
+  - root and indexed source-payload children include
+    `typed_payload_summary_complete=true`, `typed_fields=[{field: "Bytes",
+    value_type: "bytes"}]`, and nonzero source-payload route/update/operand
+    counts.
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- `019eeff2-6d73-7161-8dcb-fca37fa3286d` recommended strengthening the
+  source-payload contract by making the payload type visible in child reports,
+  asserting descriptor/value-type consistency in plan verification, and adding
+  aggregate/schema checks for both root and indexed BYTES payload routes.
+- `019eeff2-6e94-7c92-80a6-b6f7b635eedc` identified dynamic BYTES scalar
+  argument lowering, especially `Bytes/slice(byte_count: inner_length)`, as the
+  next useful Phase 3/4/5 continuation after this descriptor slice.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo test -p boon_plan source_payload -- --nocapture` | Pass | Five focused source-payload plan tests passed, including the forged descriptor-type negative. |
+| `cargo check -p xtask -p boon_report_schema -p boon_ir -p boon_plan --quiet` | Pass | Touched-crate check passed. Existing native GPU dead-code warnings only. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt runnable binaries used by report gates. Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan examples/bytes_source_payload_plan_ops.bn --report target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json` | Pass | Regenerated root BYTES source-payload dump-plan with `typed_fields`. |
+| `target/debug/boon_cli dump-plan examples/bytes_indexed_source_payload_plan_ops.bn --report target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json` | Pass | Regenerated indexed BYTES source-payload dump-plan with `typed_fields`. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json` | Pass | Focused source-payload reports schema-validated. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed child reports whose embedded MachinePlan schema/report shape was stale after adding typed source-payload descriptors. Logs were written under `target/reports/bytes-plan/logs/replay-typed-source-payload-*.log`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after aggregate/schema changes. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `54/54`. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on the existing partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This closes the focused root/indexed BYTES source-payload descriptor gap. It
+  does not complete broad source payload hardening for every payload shape,
+  dynamic BYTES scalar lowering, broad Phase 5 operation semantics, Cells
+  release benchmark evidence, or Phase 10 default execution.
+
+## 2026-06-22 - Phase 3/4/5/6/9 Dynamic BYTES Scalar Operands
+
+Status: partial Phase 3 type/runtime hardening, partial Phase 4 semantic-IR,
+partial Phase 5 MachinePlan lowering, partial Phase 6 PlanExecutor execution,
+and partial Phase 9 report/aggregate evidence; complete for root scalar
+`Bytes/slice`, `Bytes/take`, and `Bytes/drop` count operands sourced from typed
+`NUMBER` state.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_ir/src/lib.rs`
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `examples/bytes_dynamic_slice_plan_ops.bn`
+- `examples/bytes_dynamic_slice_plan_ops.scn`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- The IR now represents selected BYTES scalar operands with `BytesScalarArg`,
+  either `Static(u64)` or `Path(String)`, instead of forcing every
+  `Bytes/slice`, `Bytes/take`, and `Bytes/drop` count operand to be a static
+  integer.
+- Root MachinePlan lowering now preserves dynamic count dependencies as typed
+  `ValueRef::State(NUMBER)` operands. A dynamic slice can lower to ordered
+  operands like `[State(payload), Constant(offset), State(store.slice_count)]`
+  without falling back to string paths, unknown plan operations, or AST runtime
+  evaluation.
+- MachinePlan verification accepts BYTES numeric operands only when they are
+  constants or typed `NUMBER` state operands already present in the operation
+  inputs. Fixed-length BYTES outputs still require constant counts; dynamic
+  counts require dynamic BYTES outputs.
+- The root PlanExecutor now resolves dynamic BYTES scalar operands from
+  `ValueRef::State(NUMBER)` at runtime. Legacy scalar comparison also carries
+  `BytesScalarArg`, so parity checks exercise the same dynamic count contract
+  instead of silently marking the legacy branch unsupported.
+- Report evidence for dynamic BYTES scalar operands now emits operand refs such
+  as `{"kind":"constant","constant_id":5}` and
+  `{"kind":"state","state_id":1,"state":"store.slice_count"}` rather than
+  pretending every non-input scalar operand is a constant.
+- Report-schema and aggregate checks now include focused dynamic-slice dump and
+  scenario reports, and require expression-kind coverage for `bytes_slice`,
+  `bytes_length`, and `bytes_get`.
+
+Evidence:
+
+- `target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json`
+  - `status=pass`
+  - `expression_kinds=["bytes_get","bytes_length","bytes_slice"]`
+  - `schema_valid=true` in the aggregate
+  - `artifact_hashes_fresh=true` in the aggregate
+- `target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json`
+  - `status=pass`
+  - `runtime_ast_eval_count=0`
+  - `executable_string_path_count=0`
+  - `unknown_plan_op_count=0`
+  - `graph_rebuild_count=0`
+  - `graph_clones_per_item=0`
+  - `bytes_storage_no_copy=true`
+  - final dynamic slice state has byte length `3`, dynamic length `3`, and
+    dynamic byte `19`.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=56`
+  - `required_report_count=56`
+  - dynamic slice dump/scenario children have fresh artifacts and valid schema.
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- A new subagent for this focused slice could not be started because the agent
+  thread limit was reached, so this slice was completed locally.
+- Earlier subagent `019eeff2-6e94-7c92-80a6-b6f7b635eedc` had identified
+  dynamic BYTES scalar lowering, especially
+  `Bytes/slice(byte_count: inner_length)`, as the next useful Phase 3/4/5
+  continuation after typed source-payload descriptors.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_ir -p boon_plan -p boon_runtime --quiet` | Pass | Core IR/plan/runtime check passed. |
+| `cargo check -p boon_report_schema --quiet` | Pass | Report-schema check passed. |
+| `cargo check -p xtask -p boon_report_schema -p boon_ir -p boon_plan -p boon_runtime --quiet` | Pass | Touched-crate check passed. Existing native GPU dead-code warnings only. |
+| `cargo test -p boon_plan bytes_slice_take_drop_updates_lower_to_typed_executable_plan_ops -- --nocapture` | Pass | Existing typed BYTES slice/take/drop lowering regression still passed. |
+| `cargo test -p boon_plan bytes_dynamic_slice_count_lowers_to_typed_number_state_operand -- --nocapture` | Pass | New regression proved dynamic count lowers to a typed `NUMBER` state operand and rejects forged `TEXT` state. |
+| `target/debug/boon_cli dump-plan examples/bytes_dynamic_slice_plan_ops.bn --report target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json` | Pass | Generated focused dynamic BYTES scalar dump-plan report. |
+| `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_dynamic_slice_plan_ops.bn --scenario examples/bytes_dynamic_slice_plan_ops.scn --steps split-dynamic-bytes,inspect-dynamic-slice --compare-legacy --report target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json` | Pass | Dynamic BYTES slice executed through PlanExecutor with legacy parity and no fallback counters. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json` | Pass | Focused dynamic BYTES reports schema-validated. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed child reports whose embedded binary/schema hashes were stale after dynamic operand and schema changes. Logs were written under `target/reports/bytes-plan/logs/replay-dynamic-slice-*.log`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after aggregate/schema changes. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `56/56`. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This proves the root scalar dynamic count path for `Bytes/slice`,
+  `Bytes/take`, and `Bytes/drop`. It does not complete broad Cells
+  function-body BYTES lowering, dynamic slice offsets, dynamic read/write byte
+  counts, `TASK-0804A`, or Phase 10 default execution.
+
+## 2026-06-22 - Phase 4/5/6/8/9 Typed Row `Bytes/slice` For Cells Formula
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, partial Phase 8 Cells example integration, and partial Phase 9
+aggregate evidence; complete for replacing generic row/function-body
+`BuiltinCall("Bytes/slice")` nodes with typed `PlanRowExpression::BytesSlice`.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesSlice { input, offset, byte_count }`.
+- Row/function-body lowering now special-cases `Bytes/slice` into that typed
+  row expression instead of preserving a stringly generic
+  `BuiltinCall { function: "Bytes/slice" }`.
+- Plan verification, runtime row evaluation, report-schema expected replay,
+  dependency walkers, and row-expression CPU support now recurse through the
+  typed `BytesSlice` node.
+- The BYTES/MachinePlan aggregate expression-kind collector now records typed
+  row-expression `kind` values that start with `bytes_`, not only
+  update-branch `expression_kind` fields.
+- Report-schema aggregate validation now requires `cells-dump-plan` to prove
+  `bytes_slice` expression-kind coverage.
+- No Cells Boon source was changed.
+
+Evidence:
+
+- `target/reports/bytes-plan/cells-dump-plan.json`
+  - `status=pass`
+  - `capability_summary.typed_lowering_executable=true`
+  - `capability_summary.cpu_plan_executor_unsupported_op_count=0`
+  - `capability_summary.unknown_plan_op_count=0`
+  - `generic_bytes_slice_builtin_count=0` by focused `jq` query
+  - `typed_bytes_slice_count=52` by focused `jq` query
+  - `typed_dynamic_byte_count_count=52` by focused `jq` query
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=56`
+  - `required_report_count=56`
+  - `cells-dump-plan.schema_valid=true`
+  - `cells-dump-plan.artifact_hashes_fresh=true`
+  - `cells-dump-plan.expression_kinds` includes `bytes_slice`
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- `019ef035-4f7d-71b2-b61e-f7ed60f3d1d3` independently inspected the current
+  code and reports after this slice. It confirmed that
+  `examples/cells/formula.bn` still has the source-level `Bytes/slice` calls,
+  but they now lower to typed `PlanRowExpression::BytesSlice`, direct runtime
+  evaluation exists, the fresh Cells dump-plan has `bytes_slice_kind_count=52`,
+  and `bytes_slice_builtin_call_count=0`.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_plan -p boon_runtime -p boon_report_schema --quiet` | Pass | Core typed row-expression crates compile after adding `PlanRowExpression::BytesSlice`. |
+| `cargo test -p boon_plan cells_formula_byte_scan_offsets_lower_as_numeric_infix -- --nocapture` | Pass | Existing Cells formula regression now also asserts typed `BytesSlice` with dynamic numeric byte_count and no generic `Bytes/slice` row builtin. |
+| `cargo build -p boon_cli --quiet` | Pass | Rebuilt `boon_cli` for fresh report binary hashes. Existing native GPU dead-code warnings may appear in dependent builds. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan.json` | Pass | Refreshed Cells dump-plan with typed row `bytes_slice` nodes. |
+| `jq '{generic_bytes_slice_builtin_count: ([.. | objects | select(.kind? == "builtin_call" and .function? == "Bytes/slice")] | length), typed_bytes_slice_count: ([.. | objects | select(.kind? == "bytes_slice")] | length), typed_dynamic_byte_count_count: ([.. | objects | select(.kind? == "bytes_slice" and (.byte_count.kind? == "number_infix"))] | length)}' target/reports/bytes-plan/cells-dump-plan.json` | Pass | Returned `0`, `52`, and `52`. |
+| `cargo build -p xtask --quiet` | Pass | Rebuilt schema/aggregate verifier binary. Existing native GPU dead-code warnings only. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-dump-plan.json` | Pass | Schema validates the new typed row-expression variant. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed all child reports whose embedded `boon_cli`/`xtask` binary hashes were stale after the typed row-expression and aggregate-extractor changes. Logs were written under `target/reports/bytes-plan/logs/replay-row-bytes-slice/`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after aggregate/schema changes. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `56/56`; `cells-dump-plan.expression_kinds` includes `bytes_slice`. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+| `cargo fmt --all -- --check && git diff --check` | Pass | Formatting and whitespace checks are clean after running `cargo fmt --all`. |
+
+Open findings:
+
+- This closes the concrete Cells formula `Bytes/slice` row-expression lowering
+  gap. It does not complete a broad audit of every BYTES builtin in every
+  function-body/list-row context, the Cells release benchmark wrapper,
+  full Phase 9 performance evidence, or Phase 10 default execution.
+
+## 2026-06-22 - Phase 4/5/6/8/9 Typed Row Byte Scanner Ops For Cells Formula
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, partial Phase 8 Cells example integration, and partial Phase 9
+aggregate/adversarial evidence; complete for replacing Cells row/function-body
+`Text/to_bytes`, `Bytes/find`, `Bytes/starts_with`, and `Bytes/slice` scanner
+calls with typed row expressions and making the old generic byte-scanner row
+`BuiltinCall` shape non-executable by verifier capability checks.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `crates/xtask/src/main.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added typed row expression coverage for `TextToBytes`, `BytesFind`, and
+  `BytesStartsWith` alongside the earlier typed `BytesSlice` row node.
+- Row/function-body lowering now accepts piped and direct named-input forms for
+  these scanner operations and emits typed row expressions instead of generic
+  `BuiltinCall { function: ... }` nodes for the Cells formula scanner path.
+- Plan row-expression type inference, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, runtime row evaluation, expected
+  report-schema replay, and aggregate expression-kind extraction now understand
+  the typed scanner nodes.
+- Generic row `BuiltinCall` support remains only for older generic row builtins
+  that still lack typed row nodes. `Text/to_bytes`, `Bytes/slice`,
+  `Bytes/find`, and `Bytes/starts_with` generic row calls no longer count as
+  CPU-executable support after lowering, so a tampered/imported MachinePlan
+  cannot keep the old byte-scanner shape while still matching executable
+  capability counts.
+- Row `Text/to_bytes` now requires an explicit encoding expression and reports
+  an error for unsupported encodings or non-ASCII input with `Ascii`, instead
+  of silently defaulting to UTF-8 or returning empty BYTES. The schema expected
+  replay mirrors that behavior.
+- The Cells formula regression now tampers a typed scanner row node back to a
+  generic byte-scanner `BuiltinCall` and verifies the plan capability summary
+  check fails.
+
+Evidence:
+
+- `target/reports/bytes-plan/cells-dump-plan.json`
+  - `status=pass`
+  - focused `jq` counts:
+    - `generic_text_to_bytes=0`
+    - `generic_bytes_find=0`
+    - `generic_bytes_starts_with=0`
+    - `generic_bytes_slice=0`
+    - `typed_text_to_bytes=1092`
+    - `typed_bytes_find=540`
+    - `typed_bytes_starts_with=4`
+    - `typed_bytes_slice=52`
+  - `plan_hash=e678069a099ffabf881f2835a4fe513ff02b76ae50805ca2193338a894c2f730`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=56`
+  - `required_report_count=56`
+  - `proof_report_count=46`
+  - `diagnostic_report_count=10`
+  - no stale schema child reports
+  - no stale artifact-hash child reports
+  - `cells-dump-plan.expression_kinds` includes `text_to_bytes`,
+    `bytes_find`, `bytes_starts_with`, and `bytes_slice`.
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- Explorer subagent `019ef059-325c-76c2-ba6e-f28c516081dd` independently
+  reviewed the row byte-scanner slice. It confirmed the fresh Cells dump-plan
+  had typed `text_to_bytes`, `bytes_find`, `bytes_starts_with`, and
+  `bytes_slice` nodes with zero generic builtin calls for those functions.
+- The same subagent found two high-severity issues before this fix:
+  - Generic byte-scanner row `BuiltinCall` nodes were still verifier-admissible
+    through `row_expression_cpu_evaluable` and row value-type inference.
+  - Row `Text/to_bytes` runtime/schema behavior silently defaulted missing
+    encoding to UTF-8 and converted non-ASCII `Ascii` input to empty BYTES,
+    unlike root BYTES runtime behavior.
+- Both findings were resolved in this slice with stricter verifier capability
+  support and explicit row `Text/to_bytes` runtime/schema errors.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_plan -p boon_runtime -p boon_report_schema --quiet` | Pass | Core plan/runtime/schema crates compile after typed scanner and stricter row encoding changes. |
+| `cargo test -p boon_plan cells_formula_byte_scan_offsets_lower_as_numeric_infix -- --nocapture` | Pass | Cells formula regression proves typed byte scanner lowering, no generic scanner builtins, and verifier rejection of a tampered generic scanner row builtin. |
+| `cargo test -p boon_runtime cells_formula_scans_with_ascii_bytes_after_text_boundary -- --nocapture` | Pass | Cells formula source still uses one explicit `Text/to_bytes(encoding: Ascii)` boundary and remains accepted under stricter row encoding semantics. |
+| report-schema filtered tests for BYTES search, encoding, text/bytes conversion, and slice/take/drop expression-kind reports | Pass | Ran each `cargo test -p boon_report_schema <filter> -- --nocapture` separately because Cargo accepts one test filter per invocation. |
+| invalid combined `cargo test -p boon_report_schema <four filters> -- --nocapture` | Expected Fail | Cargo rejected multiple test filters as an invalid command shape; rerun as separate filters passed. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt runnable binaries. Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan.json` plus focused `jq` scanner counts | Pass | Regenerated Cells dump-plan with zero generic scanner builtins and typed counts `1092/540/4/52`. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-dump-plan.json` | Pass | Focused Cells dump-plan schema validates. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed child reports after binary/schema and formatting changes. Logs were written under `target/reports/bytes-plan/logs/replay-typed-byte-scanners/`, `target/reports/bytes-plan/logs/replay-typed-byte-scanners-strict/`, and `target/reports/bytes-plan/logs/replay-typed-byte-scanners-after-fmt/`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after child report replay. |
+| `cargo fmt --all -- --check && git diff --check` | Pass | Formatting and whitespace checks are clean after running `cargo fmt --all`. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `56/56`; no stale schema or stale artifact hashes. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This closes the concrete Cells formula byte-scanner row-expression lowering
+  and verifier-admissibility gap for `Text/to_bytes`, `Bytes/find`,
+  `Bytes/starts_with`, and `Bytes/slice`.
+- It does not complete a broad audit of every BYTES builtin in every
+  function-body/list-row context, non-ASCII dynamic Cells formula UX policy,
+  the Cells release benchmark wrapper, full Phase 9 performance evidence,
+  `TASK-0804A`, or Phase 10 default execution.
+
+## 2026-06-22 - Phase 4/5/6/9 Typed Row `Bytes/length` And `Bytes/get`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for replacing the
+remaining row-enabled generic BYTES builtins `Bytes/length` and `Bytes/get`
+with typed row expressions and removing generic row BYTES execution support.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesLength` and
+  `PlanRowExpression::BytesGet` variants.
+- Row/function-body lowering now emits typed row expressions for
+  `Bytes/length` and `Bytes/get` in piped or direct named-input form.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, runtime row evaluation, runtime
+  same-event state detection, expected report-schema replay, and schema state
+  walking now understand the typed length/get row nodes.
+- Generic row `BuiltinCall` CPU-executable support now has no `Bytes/*` or
+  `Text/to_bytes` entries. It remains only for non-BYTES generic row helpers
+  such as `Text/empty`, `Error/new`, and `Error/text`.
+- Runtime and report-schema generic row builtin evaluators no longer execute
+  old generic BYTES/Text-to-bytes row calls; typed nodes are the accepted path.
+- Added a focused row/list fixture regression that proves typed
+  `bytes_length=1`, typed `bytes_get=1`, generic `Bytes/length=0`, generic
+  `Bytes/get=0`, plus verifier rejection after tampering a typed length/get
+  node back into a generic row `BuiltinCall`.
+- Refreshed the stale diagnostic
+  `target/reports/bytes-plan/cells-dump-plan-debug.json`; it now matches the
+  current typed Cells dump-plan and no longer contains old generic scanner row
+  builtins.
+
+Evidence:
+
+- Focused test fixture in
+  `cargo test -p boon_plan row_bytes_length_and_get_lower_to_typed_expressions -- --nocapture`
+  proved:
+  - `bytes_length=1`
+  - `bytes_get=1`
+  - `generic Bytes/length=0`
+  - `generic Bytes/get=0`
+  - tampered generic `Bytes/length`/`Bytes/get` row builtin fails verifier
+    capability-summary validation.
+- Current dump-plan generic BYTES/Text-to-bytes row builtin queries:
+  - `target/reports/bytes-plan/cells-dump-plan.json`: `[]`
+  - `target/reports/bytes-plan/cells-dump-plan-debug.json`: `[]`
+  - `target/reports/bytes-plan/todomvc-dump-plan.json`: `[]`
+- Current typed Cells scanner counts in both Cells dump reports:
+  - `text_to_bytes=1092`
+  - `bytes_find=540`
+  - `bytes_starts_with=4`
+  - `bytes_slice=52`
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=56`
+  - `required_report_count=56`
+  - `proof_report_count=46`
+  - `diagnostic_report_count=10`
+  - no stale schema child reports
+  - no stale artifact-hash child reports
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- Explorer subagent `019ef092-4b78-75b0-a8d8-024f657baca0` independently
+  audited remaining generic BYTES row/function-body gaps. After this slice was
+  in progress, it confirmed the current source has typed variants/lowering for
+  all six row-enabled BYTES/Text-to-bytes operations:
+  `Text/to_bytes`, `Bytes/length`, `Bytes/get`, `Bytes/slice`, `Bytes/find`,
+  and `Bytes/starts_with`.
+- The same subagent found that current aggregate dump reports no longer contain
+  generic BYTES/Text-to-bytes row `BuiltinCall` nodes, and flagged
+  `cells-dump-plan-debug.json` as stale because it still showed the old
+  generic scanner calls. That diagnostic report was regenerated in this slice.
+- The subagent identified `Bytes/ends_with` as the next small symmetric
+  row/function-body candidate if we continue broadening row BYTES support
+  beyond the current row-enabled allowlist.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_plan -p boon_runtime -p boon_report_schema --quiet` | Pass | Core plan/runtime/schema crates compile after adding typed row length/get and removing generic row BYTES replay support. |
+| `cargo test -p boon_plan row_bytes_length_and_get_lower_to_typed_expressions -- --nocapture` | Pass | New focused regression proves typed length/get row lowering and verifier rejection of tampered generic row length/get builtins. |
+| `cargo test -p boon_plan cells_formula_byte_scan_offsets_lower_as_numeric_infix -- --nocapture` | Pass | Existing Cells scanner regression still passes after adding length/get row variants. |
+| `cargo test -p boon_runtime cells_formula_scans_with_ascii_bytes_after_text_boundary -- --nocapture` | Pass | Cells formula runtime source check still passes. |
+| `cargo fmt --all -- --check && git diff --check` | Pass | Formatting and whitespace checks are clean after running `cargo fmt --all`. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt runnable binaries. Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan.json` | Pass | Refreshed current Cells dump-plan. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan-debug.json` | Pass | Refreshed stale diagnostic Cells dump-plan so it no longer contains old generic scanner row builtins. |
+| `target/debug/boon_cli dump-plan examples/todomvc.bn --report target/reports/bytes-plan/todomvc-dump-plan.json` | Pass | Refreshed current TodoMVC dump-plan. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-dump-plan.json target/reports/bytes-plan/cells-dump-plan-debug.json target/reports/bytes-plan/todomvc-dump-plan.json` | Pass | Focused regenerated dump reports schema-validate. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed child reports after binary/schema changes. Logs were written under `target/reports/bytes-plan/logs/replay-row-bytes-length-get/`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after child report replay. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `56/56`; no stale schema or stale artifact hashes. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This closes the remaining row-enabled generic BYTES builtin gap for
+  `Bytes/length` and `Bytes/get`, so current row-enabled BYTES/Text-to-bytes
+  operations all have typed row expression paths.
+- It does not add new row/function-body support for BYTES operations that were
+  not already on the row allowlist, such as `Bytes/ends_with`, `Bytes/equal`,
+  `Bytes/is_empty`, `Bytes/concat`, conversions, numeric reads/writes, or
+  mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-22 - Phase 4/5/6/9 Typed Row `Bytes/ends_with`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for the symmetric `Bytes/ends_with` operation and
+preventing it from remaining executable as a generic row `BuiltinCall`.
+
+Base/current commit: `6494b54e488dc63cfb39d0e1d50830f1283b80dc`
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- refreshed reports under `target/reports/bytes-plan/`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesEndsWith { input, suffix }`.
+- Row/function-body lowering now recognizes `Bytes/ends_with` in piped and
+  named-input form and emits the typed row node instead of falling back to a
+  generic row `BuiltinCall`.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, and CPU-evaluable capability checks now understand
+  `BytesEndsWith`.
+- Runtime row evaluation and same-event state detection now evaluate typed
+  row `BytesEndsWith` through `bytes.ends_with(&suffix)`.
+- Report-schema expected replay and state walking mirror runtime behavior for
+  typed row `BytesEndsWith`.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_ends_with=1`, generic `Bytes/ends_with=0`, and verifier rejection
+  after tampering the typed node back into a generic row `BuiltinCall`.
+- Updated existing Cells scanner and row-lookup test helper walkers so they
+  traverse `BytesEndsWith` explicitly instead of hiding it behind wildcards.
+
+Evidence:
+
+- Focused test fixture in
+  `cargo test -p boon_plan row_bytes_length_get_and_ends_with_lower_to_typed_expressions -- --nocapture`
+  proved:
+  - `bytes_length=1`
+  - `bytes_get=1`
+  - `bytes_ends_with=1`
+  - `generic Bytes/length=0`
+  - `generic Bytes/get=0`
+  - `generic Bytes/ends_with=0`
+  - tampered generic `Bytes/length`, `Bytes/get`, or `Bytes/ends_with` row
+    builtin fails verifier capability-summary validation.
+- Current dump-plan generic BYTES/Text-to-bytes row builtin queries:
+  - `target/reports/bytes-plan/cells-dump-plan.json`: `[]`
+  - `target/reports/bytes-plan/cells-dump-plan-debug.json`: `[]`
+  - `target/reports/bytes-plan/todomvc-dump-plan.json`: `[]`
+- Current typed row `bytes_ends_with` counts in the same dump reports:
+  - `target/reports/bytes-plan/cells-dump-plan.json`: `0`
+  - `target/reports/bytes-plan/cells-dump-plan-debug.json`: `0`
+  - `target/reports/bytes-plan/todomvc-dump-plan.json`: `0`
+  These examples do not currently use row `Bytes/ends_with`; the focused
+  regression covers the new lowering/evaluation shape.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`
+  - `status=pass`
+  - `checked_report_count=56`
+  - `required_report_count=56`
+  - `proof_report_count=46`
+  - `diagnostic_report_count=10`
+  - no stale schema child reports
+  - no stale artifact-hash child reports
+- `target/reports/bytes-plan/goal-readiness.json`
+  - `status=fail`
+  - expected remaining blockers:
+    - `8 phases are still partial in the progress ledger`
+    - `1 phases are still not started in the progress ledger`
+    - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+    - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Subagent review:
+
+- Explorer subagent `019ef0b2-9c10-7f21-9433-4ee0dca2d2c2` independently
+  audited the row `Bytes/ends_with` gap. It confirmed the production mirror
+  sites needed typed enum/lowering/type/ref/list-field/CPU/runtime/schema
+  support and identified the exact eight test-local helper walkers that had to
+  be updated after the new enum variant.
+- The same subagent warned that reports containing row
+  `{ "kind": "bytes_ends_with" }` need both runtime and report-schema replay
+  support, and that aggregate reports would be stale after the schema/binary
+  change. The focused runtime/schema branches and aggregate replay addressed
+  those findings.
+
+Commands run:
+
+| Command | Status | Notes |
+| --- | --- | --- |
+| `cargo check -p boon_plan -p boon_runtime -p boon_report_schema --quiet` | Pass | Core plan/runtime/schema crates compile after typed row `BytesEndsWith` support. |
+| `cargo test -p boon_plan row_bytes_length_get_and_ends_with_lower_to_typed_expressions -- --nocapture` | Pass | Focused regression proves typed length/get/ends_with row lowering and verifier rejection of tampered generic row builtins. |
+| `cargo test -p boon_plan cells_formula_byte_scan_offsets_lower_as_numeric_infix -- --nocapture` | Pass | Existing Cells scanner regression still passes after adding `BytesEndsWith` traversal to helper walkers. |
+| `cargo test -p boon_plan cells_row_lookup_field_ids_must_belong_to_referenced_list -- --nocapture` | Pass | Existing row-lookup ownership tamper regression still passes after adding `BytesEndsWith` traversal. |
+| `cargo test -p boon_plan --lib --no-run` | Pass | Broader `boon_plan` lib tests compile after the new enum variant. |
+| `cargo fmt --all -- --check && git diff --check` | Pass | Formatting and whitespace checks are clean after running `cargo fmt --all`. |
+| `cargo build -p boon_cli -p xtask --quiet` | Pass | Rebuilt runnable report-producing binaries. Existing native GPU dead-code warnings only. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan.json` | Pass | Refreshed current Cells dump-plan. |
+| `target/debug/boon_cli dump-plan examples/cells.bn --report target/reports/bytes-plan/cells-dump-plan-debug.json` | Pass | Refreshed diagnostic Cells dump-plan. |
+| `target/debug/boon_cli dump-plan examples/todomvc.bn --report target/reports/bytes-plan/todomvc-dump-plan.json` | Pass | Refreshed current TodoMVC dump-plan. |
+| `target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-dump-plan.json target/reports/bytes-plan/cells-dump-plan-debug.json target/reports/bytes-plan/todomvc-dump-plan.json` | Pass | Focused regenerated dump reports schema-validate. |
+| first `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json` | Expected Fail | Stale schema validation blocked after the new plan enum/report-shape change; artifact hashes were fresh. |
+| replay stale aggregate child reports from recorded `command_argv` | Pass | Refreshed stale child reports after binary/schema changes. Logs were written under `target/reports/bytes-plan/logs/replay-row-bytes-ends-with/`. |
+| `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json` | Pass | Refreshed adversarial proof after child report replay. |
+| `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json && target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json` | Pass | Final aggregate and schema validation passed at `56/56`; no stale schema or stale artifact hashes. |
+| `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json` | Expected Fail | Readiness still fails on partial/not-started phase blockers, missing Cells release benchmark wrapper, and Phase 10 default switch. |
+
+Open findings:
+
+- This closes the row/function-body gap for `Bytes/ends_with`, which was the
+  symmetric missing row operation after typed `Bytes/starts_with`.
+- It does not add row/function-body support for BYTES operations that still
+  lack typed row nodes, such as `Bytes/equal`, `Bytes/is_empty`,
+  `Bytes/concat`, conversions, numeric reads/writes, or mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.

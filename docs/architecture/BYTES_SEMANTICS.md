@@ -76,6 +76,22 @@ non-ASCII `TEXT`, and decoding rejects any byte above `0x7F`; this keeps byte
 offsets equal to Boon text positions for examples such as Cells formula
 operator scanning.
 
+When conversion input is a static `TEXT` literal, the typechecker may refine the
+result to a fixed `BYTES[N]` length and reject malformed static data before
+lowering:
+
+- `Text/to_bytes(encoding: Utf8)` uses the literal's UTF-8 byte length;
+- `Text/to_bytes(encoding: Ascii)` uses the literal byte length only when every
+  byte is ASCII, otherwise it is a typechecker diagnostic;
+- `Bytes/from_hex` uses the decoded byte length for valid static hex and
+  rejects odd-length or invalid static hex text;
+- `Bytes/from_base64` uses the decoded byte length for valid static base64 and
+  rejects invalid static base64 text.
+
+Non-literal `TEXT` values remain dynamic `BYTES` conversions. Malformed dynamic
+data is checked by the runtime/PlanExecutor boundary, not guessed by the
+compiler.
+
 ## Endian And Numeric Access
 
 Multi-byte numeric operations must specify endian explicitly:
@@ -85,10 +101,19 @@ bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
 bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Big, value: 1)
 ```
 
-`byte_count` is limited to `1`, `2`, `4`, or `8` in v1. The current typechecker
-registers these builtin signatures and checks literal `byte_count` values plus
-`endian: Little|Big`. Runtime operation bodies and non-literal constant
-resolution remain Phase 7/9 work.
+`byte_count` is limited to `1`, `2`, `4`, or `8` in v1. The typechecker
+registers these builtin signatures and checks static `byte_count` values plus
+`endian: Little|Big`.
+
+BYTES scalar arguments may use a narrow static integer expression subset:
+integer literals and checked `+`, `-`, and `*` over integer literals. This
+subset is folded by the typechecker and emitted in the resolved constant table
+so semantic IR and MachinePlan lowering still receive typed constants, not AST
+or string expressions. Unsupported literal-only static formulas such as
+division and modulo are compiler errors. Calls, identifiers, field reads,
+comparisons, and other dynamic values are not folded constants; they remain
+dynamic Boon values and must be handled by runtime/lowering rather than being
+rejected merely because they are not static.
 
 ## Bounds And Conversion Failures
 
@@ -96,6 +121,8 @@ Use the existing Boon recoverable-error convention rather than Rust panics:
 
 - malformed literals are parser diagnostics;
 - incompatible constructor items are typechecker diagnostics;
+- fixed-size BYTES operations with statically known out-of-bounds indexes or
+  ranges are typechecker diagnostics;
 - out-of-bounds runtime reads/writes produce deterministic Boon errors;
 - decoding failures produce deterministic Boon errors with the requested
   encoding named;
@@ -106,11 +133,15 @@ memory, or depend on the host machine endian.
 
 ## Current Implementation Notes
 
-The legacy runtime can currently carry inline, blob-ref, and page-ref runtime
-bytes from bridge paths. Source-language BYTES literals currently lower through
-the legacy evaluator as inline runtime bytes. Blob/page-backed concatenation in
-constructors is intentionally rejected in the legacy evaluator until Phase 7
-adds measured dynamic byte storage and operation bodies.
+The legacy runtime can currently carry inline, shared, blob-ref, and page-ref
+runtime bytes from bridge paths and source/runtime execution paths.
+Source-language BYTES literals currently lower through the legacy evaluator as
+inline runtime bytes. Runtime-owned dynamic payloads larger than the
+source-event inline limit use shared executable storage: public summaries still
+expose only storage kind, digest, and byte length, while byte operations borrow
+the shared payload through the private runtime representation. Blob/page-backed
+concatenation in constructors is intentionally rejected in the legacy evaluator
+until a resolver exists for descriptor-only external byte references.
 
 The final PlanExecutor path must not execute parser AST or string paths for
 BYTES. It must use typed IDs, typed storage layout, typed operation regions,

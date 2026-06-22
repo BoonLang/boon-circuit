@@ -1187,7 +1187,7 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
-                self.check_bytes_builtin_arguments(expr.id, function, args, false);
+                self.check_bytes_builtin_arguments(expr.id, function, args, None);
                 self.check_builtin_call_compatibility(function, None, args);
                 self.check_user_function_arguments(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
@@ -1212,6 +1212,8 @@ impl<'a> Checker<'a> {
                     true_false_type()
                 } else if self.render_contracts.is_render_constructor(function) {
                     self.render_constructor_type_for_args(function, None, args)
+                } else if let Some(ty) = self.contextual_bytes_result_type(function, None, args) {
+                    ty
                 } else {
                     self.type_for_call_expr(expr.id, function)
                 }
@@ -1222,7 +1224,7 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
-                self.check_bytes_builtin_arguments(expr.id, op, args, true);
+                self.check_bytes_builtin_arguments(expr.id, op, args, Some(*input));
                 self.check_builtin_call_compatibility(op, Some(*input), args);
                 if !op.starts_with("Field/") {
                     self.check_user_function_arguments(expr.id, op, Some(*input), args);
@@ -1313,6 +1315,8 @@ impl<'a> Checker<'a> {
                         self.check_true_false_input(expr, op, &arg_flow);
                     }
                     true_false_type()
+                } else if let Some(ty) = self.contextual_bytes_result_type(op, Some(*input), args) {
+                    ty
                 } else {
                     self.type_for_call_expr(expr.id, op)
                 }
@@ -1464,11 +1468,12 @@ impl<'a> Checker<'a> {
         expr_id: usize,
         function: &str,
         args: &[AstCallArg],
-        piped: bool,
+        piped_input: Option<usize>,
     ) {
         if !is_bytes_boundary_builtin(function) {
             return;
         }
+        let piped = piped_input.is_some();
         self.check_bytes_builtin_allowed_args(expr_id, function, args, piped);
         self.check_bytes_builtin_required_args(expr_id, function, args, piped);
 
@@ -1485,6 +1490,9 @@ impl<'a> Checker<'a> {
         ) {
             self.check_bytes_numeric_arguments(expr_id, args);
         }
+        self.check_bytes_static_integer_argument_overflow(function, args);
+        self.check_bytes_static_bounds(expr_id, function, piped_input, args);
+        self.check_bytes_static_text_conversion(expr_id, function, piped_input, args);
     }
 
     fn check_bytes_builtin_allowed_args(
@@ -1496,6 +1504,12 @@ impl<'a> Checker<'a> {
     ) {
         for arg in args {
             let Some(name) = arg.name.as_deref() else {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!(
+                        "`{function}` requires named arguments; positional BYTES builtin arguments are ambiguous"
+                    ),
+                ));
                 continue;
             };
             if bytes_builtin_arg_allowed(function, name, piped) {
@@ -1507,9 +1521,10 @@ impl<'a> Checker<'a> {
             ));
         }
         if function == "Bytes/zeros"
-            && args
-                .iter()
-                .any(|arg| arg.name.as_deref().is_some_and(|name| name == "input"))
+            && (piped
+                || args
+                    .iter()
+                    .any(|arg| arg.name.as_deref().is_some_and(|name| name == "input")))
         {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
@@ -1694,20 +1709,7 @@ impl<'a> Checker<'a> {
         }
 
         match named_arg_expr(args, "byte_count").and_then(|arg| self.program.expressions.get(arg)) {
-            Some(AstExpr {
-                kind: AstExprKind::Number(value),
-                id,
-                ..
-            }) => match value.parse::<usize>() {
-                Ok(1 | 2 | 4 | 8) => {}
-                _ => self.diagnostics.push(
-                    self.diagnostic_for_expr(
-                        *id,
-                        "`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8 in v1"
-                            .to_owned(),
-                    ),
-                ),
-            },
+            Some(expr) if matches!(self.static_integer_literal(expr.id), Some(1 | 2 | 4 | 8)) => {}
             Some(expr) => self.diagnostics.push(self.diagnostic_for_expr(
                 expr.id,
                 "`byte_count` for BYTES numeric operations must be 1, 2, 4, or 8 in v1".to_owned(),
@@ -1716,6 +1718,209 @@ impl<'a> Checker<'a> {
                 expr_id,
                 "BYTES numeric operations require explicit `byte_count`".to_owned(),
             )),
+        }
+    }
+
+    fn check_bytes_static_integer_argument_overflow(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+    ) {
+        for arg in args {
+            let Some(name) = arg.name.as_deref() else {
+                continue;
+            };
+            if !matches!(
+                (function, name),
+                ("Bytes/get", "index")
+                    | ("Bytes/set", "index")
+                    | (
+                        "Bytes/slice",
+                        "offset" | "start" | "byte_count" | "length" | "count"
+                    )
+                    | (
+                        "Bytes/take" | "Bytes/drop" | "Bytes/zeros",
+                        "byte_count" | "length" | "count"
+                    )
+                    | (
+                        "Bytes/read_unsigned"
+                            | "Bytes/read_signed"
+                            | "Bytes/write_unsigned"
+                            | "Bytes/write_signed",
+                        "offset" | "byte_count" | "value"
+                    )
+            ) {
+                continue;
+            }
+            match static_integer_expr_checked(self.program, arg.value) {
+                Err(StaticIntegerExprError::Overflow) => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        arg.value,
+                        format!(
+                            "`{function}` argument `{name}` static integer expression overflows Boon's supported integer range"
+                        ),
+                    ));
+                }
+                Ok(None) if unsupported_literal_static_integer_expr(self.program, arg.value) => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        arg.value,
+                        format!(
+                            "`{function}` argument `{name}` requires a static integer expression using integer literals and checked `+`, `-`, or `*`"
+                        ),
+                    ));
+                }
+                Ok(Some(value))
+                    if bytes_static_integer_arg_is_out_of_plan_range(function, name, value) =>
+                {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        arg.value,
+                        format!(
+                            "`{function}` argument `{name}` static integer value {value} is outside MachinePlan's supported integer range"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_bytes_static_bounds(
+        &mut self,
+        _expr_id: usize,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
+        let Some(Type::Bytes(BytesType::Fixed(len))) =
+            self.bytes_named_input_type(piped_input, args)
+        else {
+            return;
+        };
+        let len = len as i128;
+
+        match function {
+            "Bytes/get" | "Bytes/set" => {
+                let Some((index_expr, index)) = self.static_integer_arg(args, &["index"]) else {
+                    return;
+                };
+                if index < 0 || index >= len {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        index_expr,
+                        format!(
+                            "`{function}` index {index} is out of bounds for fixed BYTES[{len}]"
+                        ),
+                    ));
+                }
+            }
+            "Bytes/slice" => {
+                let Some((_offset_expr, offset)) =
+                    self.static_integer_arg(args, &["offset", "start"])
+                else {
+                    return;
+                };
+                let Some((count_expr, count)) =
+                    self.static_integer_arg(args, &["byte_count", "length", "count"])
+                else {
+                    return;
+                };
+                self.check_bytes_static_range(count_expr, function, len, offset, count);
+            }
+            "Bytes/take" | "Bytes/drop" => {
+                let Some((count_expr, count)) =
+                    self.static_integer_arg(args, &["byte_count", "length", "count"])
+                else {
+                    return;
+                };
+                self.check_bytes_static_range(count_expr, function, len, 0, count);
+            }
+            "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed" => {
+                let Some((_offset_expr, offset)) = self.static_integer_arg(args, &["offset"])
+                else {
+                    return;
+                };
+                let Some((count_expr, count)) = self.static_integer_arg(args, &["byte_count"])
+                else {
+                    return;
+                };
+                self.check_bytes_static_range(count_expr, function, len, offset, count);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_bytes_static_range(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        len: i128,
+        offset: i128,
+        count: i128,
+    ) {
+        let end = offset.checked_add(count);
+        if offset < 0 || count < 0 || !end.is_some_and(|end| end <= len) {
+            let range_end = end
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "overflow".to_owned());
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` byte range {offset}..{range_end} is out of bounds for fixed BYTES[{len}]"
+                ),
+            ));
+        }
+    }
+
+    fn check_bytes_static_text_conversion(
+        &mut self,
+        _expr_id: usize,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
+        match function {
+            "Text/to_bytes" => {
+                let Some((input_expr, text)) = self.static_text_input(piped_input, args) else {
+                    return;
+                };
+                let Some(encoding) = self.static_encoding_arg(args) else {
+                    return;
+                };
+                if encoding == "Ascii" && !text.is_ascii() {
+                    self.diagnostics.push(
+                        self.diagnostic_for_expr(
+                            input_expr,
+                            "`Text/to_bytes` with `encoding: Ascii` requires ASCII input text"
+                                .to_owned(),
+                        ),
+                    );
+                }
+            }
+            "Bytes/from_hex" => {
+                let Some((input_expr, text)) = self.static_text_input(piped_input, args) else {
+                    return;
+                };
+                if static_hex_decoded_len(&text).is_none() {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        input_expr,
+                        "`Bytes/from_hex` requires static hex text with an even number of valid hex digits".to_owned(),
+                    ));
+                }
+            }
+            "Bytes/from_base64" => {
+                let Some((input_expr, text)) = self.static_text_input(piped_input, args) else {
+                    return;
+                };
+                if static_base64_decoded_len(&text).is_none() {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        input_expr,
+                        "`Bytes/from_base64` requires valid static base64 text".to_owned(),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1866,6 +2071,214 @@ impl<'a> Checker<'a> {
             format!("unknown function or operator `{function}`"),
         ));
         self.expr_type_var(expr_id)
+    }
+
+    fn contextual_bytes_result_type(
+        &mut self,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        match function {
+            "Bytes/set" | "Bytes/write_unsigned" | "Bytes/write_signed" => Some(
+                self.bytes_input_type(piped_input, args)
+                    .unwrap_or(Type::Bytes(BytesType::Dynamic)),
+            ),
+            "Bytes/slice" | "Bytes/take" => Some(Type::Bytes(
+                self.static_bytes_count(args)
+                    .map(BytesType::Fixed)
+                    .unwrap_or(BytesType::Dynamic),
+            )),
+            "Bytes/drop" => Some(Type::Bytes(
+                match (
+                    self.bytes_input_type(piped_input, args),
+                    self.static_bytes_count(args),
+                ) {
+                    (Some(Type::Bytes(BytesType::Fixed(len))), Some(count)) if count <= len => {
+                        BytesType::Fixed(len - count)
+                    }
+                    _ => BytesType::Dynamic,
+                },
+            )),
+            "Bytes/concat" => Some(Type::Bytes(
+                match (
+                    self.bytes_pair_left_type(piped_input, args),
+                    self.bytes_pair_right_type(args),
+                ) {
+                    (
+                        Some(Type::Bytes(BytesType::Fixed(left))),
+                        Some(Type::Bytes(BytesType::Fixed(right))),
+                    ) => left
+                        .checked_add(right)
+                        .map(BytesType::Fixed)
+                        .unwrap_or(BytesType::Dynamic),
+                    _ => BytesType::Dynamic,
+                },
+            )),
+            "Bytes/zeros" => Some(Type::Bytes(
+                self.static_bytes_count(args)
+                    .map(BytesType::Fixed)
+                    .unwrap_or(BytesType::Dynamic),
+            )),
+            "Text/to_bytes" => Some(Type::Bytes(
+                self.static_text_to_bytes_len(piped_input, args)
+                    .map(BytesType::Fixed)
+                    .unwrap_or(BytesType::Dynamic),
+            )),
+            "Bytes/from_hex" => Some(Type::Bytes(
+                self.static_text_input(piped_input, args)
+                    .and_then(|(_, text)| static_hex_decoded_len(&text))
+                    .map(BytesType::Fixed)
+                    .unwrap_or(BytesType::Dynamic),
+            )),
+            "Bytes/from_base64" => Some(Type::Bytes(
+                self.static_text_input(piped_input, args)
+                    .and_then(|(_, text)| static_base64_decoded_len(&text))
+                    .map(BytesType::Fixed)
+                    .unwrap_or(BytesType::Dynamic),
+            )),
+            _ => None,
+        }
+    }
+
+    fn bytes_input_type(
+        &mut self,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        if let Some(input) = piped_input {
+            return Some(self.ensure_expr(input).ty);
+        }
+        self.arg_expr_for_names_or_unnamed(args, &["input", "left"])
+            .map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn bytes_named_input_type(
+        &mut self,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        if let Some(input) = piped_input {
+            return Some(self.ensure_expr(input).ty);
+        }
+        ["input", "left"]
+            .iter()
+            .find_map(|name| named_arg_expr(args, name))
+            .map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn bytes_pair_left_type(
+        &mut self,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        if let Some(input) = piped_input {
+            return Some(self.ensure_expr(input).ty);
+        }
+        self.arg_expr_for_names_or_unnamed_at(args, &["left", "input"], 0)
+            .map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn bytes_pair_right_type(&mut self, args: &[AstCallArg]) -> Option<Type> {
+        self.arg_expr_for_names_or_unnamed_at(args, &["right", "with"], 1)
+            .map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn arg_expr_for_names_or_unnamed(&self, args: &[AstCallArg], names: &[&str]) -> Option<usize> {
+        self.arg_expr_for_names_or_unnamed_at(args, names, 0)
+    }
+
+    fn arg_expr_for_names_or_unnamed_at(
+        &self,
+        args: &[AstCallArg],
+        names: &[&str],
+        unnamed_index: usize,
+    ) -> Option<usize> {
+        args.iter()
+            .find(|arg| {
+                arg.name
+                    .as_deref()
+                    .is_some_and(|name| names.contains(&name))
+            })
+            .or_else(|| {
+                args.iter()
+                    .filter(|arg| arg.name.is_none())
+                    .nth(unnamed_index)
+            })
+            .map(|arg| arg.value)
+    }
+
+    fn static_bytes_count(&self, args: &[AstCallArg]) -> Option<usize> {
+        ["byte_count", "length", "count"].iter().find_map(|name| {
+            named_arg_expr(args, name).and_then(|expr_id| self.static_usize_literal(expr_id))
+        })
+    }
+
+    fn static_text_to_bytes_len(
+        &self,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<usize> {
+        let (_, text) = self.static_text_input(piped_input, args)?;
+        match self.static_encoding_arg(args)?.as_str() {
+            "Utf8" => Some(text.len()),
+            "Ascii" if text.is_ascii() => Some(text.len()),
+            _ => None,
+        }
+    }
+
+    fn static_text_input(
+        &self,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<(usize, String)> {
+        let expr_id = piped_input.or_else(|| {
+            ["input", "text"]
+                .iter()
+                .find_map(|name| named_arg_expr(args, name))
+        })?;
+        self.static_text_literal(expr_id)
+            .map(|text| (expr_id, text.to_owned()))
+    }
+
+    fn static_text_literal(&self, expr_id: usize) -> Option<&str> {
+        match &self.program.expressions.get(expr_id)?.kind {
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn static_encoding_arg(&self, args: &[AstCallArg]) -> Option<String> {
+        let expr = self
+            .program
+            .expressions
+            .get(named_arg_expr(args, "encoding")?)?;
+        match &expr.kind {
+            AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value)
+                if value == "Utf8" || value == "Ascii" =>
+            {
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn static_integer_arg(&self, args: &[AstCallArg], names: &[&str]) -> Option<(usize, i128)> {
+        names.iter().find_map(|name| {
+            named_arg_expr(args, name).and_then(|expr_id| {
+                self.static_integer_literal(expr_id)
+                    .map(|value| (expr_id, value))
+            })
+        })
+    }
+
+    fn static_usize_literal(&self, expr_id: usize) -> Option<usize> {
+        let value = static_integer_expr(self.program, expr_id)?;
+        usize::try_from(value).ok()
+    }
+
+    fn static_integer_literal(&self, expr_id: usize) -> Option<i128> {
+        static_integer_expr(self.program, expr_id)
     }
 
     fn render_constructor_type_for_args(
@@ -4230,29 +4643,7 @@ fn resolved_constant_table(program: &ParsedProgram) -> ResolvedConstantTable {
         .expressions
         .iter()
         .filter_map(|expr| {
-            let value = match &expr.kind {
-                AstExprKind::Number(value) => {
-                    let value = value.parse::<i64>().ok()?;
-                    if value >= 0 {
-                        ResolvedConstantValue::UnsignedInteger {
-                            value: u64::try_from(value).ok()?,
-                        }
-                    } else {
-                        ResolvedConstantValue::SignedInteger { value }
-                    }
-                }
-                AstExprKind::ByteLiteral { value, .. } => {
-                    ResolvedConstantValue::Byte { value: *value }
-                }
-                AstExprKind::Enum(value) | AstExprKind::Tag(value)
-                    if matches!(value.as_str(), "Little" | "Big" | "Utf8" | "Ascii") =>
-                {
-                    ResolvedConstantValue::Symbol {
-                        value: value.clone(),
-                    }
-                }
-                _ => return None,
-            };
+            let value = resolved_constant_value_for_expr(program, expr.id)?;
             Some(ResolvedConstantEntry {
                 expr_id: expr.id,
                 value,
@@ -4260,6 +4651,115 @@ fn resolved_constant_table(program: &ParsedProgram) -> ResolvedConstantTable {
         })
         .collect();
     ResolvedConstantTable { entries }
+}
+
+fn resolved_constant_value_for_expr(
+    program: &ParsedProgram,
+    expr_id: usize,
+) -> Option<ResolvedConstantValue> {
+    let expr = program.expressions.get(expr_id)?;
+    match &expr.kind {
+        AstExprKind::Number(_) | AstExprKind::Infix { .. } => {
+            let value = static_integer_expr(program, expr_id)?;
+            if value >= 0 {
+                Some(ResolvedConstantValue::UnsignedInteger {
+                    value: u64::try_from(value).ok()?,
+                })
+            } else {
+                Some(ResolvedConstantValue::SignedInteger {
+                    value: i64::try_from(value).ok()?,
+                })
+            }
+        }
+        AstExprKind::ByteLiteral { value, .. } => {
+            Some(ResolvedConstantValue::Byte { value: *value })
+        }
+        AstExprKind::Enum(value) | AstExprKind::Tag(value)
+            if matches!(value.as_str(), "Little" | "Big" | "Utf8" | "Ascii") =>
+        {
+            Some(ResolvedConstantValue::Symbol {
+                value: value.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn static_integer_expr(program: &ParsedProgram, expr_id: usize) -> Option<i128> {
+    static_integer_expr_checked(program, expr_id).ok().flatten()
+}
+
+fn bytes_static_integer_arg_is_out_of_plan_range(function: &str, name: &str, value: i128) -> bool {
+    let allows_negative = function == "Bytes/write_signed" && name == "value";
+    let min = if allows_negative { i64::MIN as i128 } else { 0 };
+    value < min || value > i64::MAX as i128
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticIntegerExprError {
+    Overflow,
+}
+
+fn static_integer_expr_checked(
+    program: &ParsedProgram,
+    expr_id: usize,
+) -> Result<Option<i128>, StaticIntegerExprError> {
+    let Some(expr) = program.expressions.get(expr_id) else {
+        return Ok(None);
+    };
+    match &expr.kind {
+        AstExprKind::Number(value) => value
+            .parse::<i128>()
+            .map(Some)
+            .map_err(|_| StaticIntegerExprError::Overflow),
+        AstExprKind::Infix { left, op, right } => {
+            let Some(left) = static_integer_expr_checked(program, *left)? else {
+                return Ok(None);
+            };
+            let Some(right) = static_integer_expr_checked(program, *right)? else {
+                return Ok(None);
+            };
+            match op.as_str() {
+                "+" => left.checked_add(right),
+                "-" => left.checked_sub(right),
+                "*" => left.checked_mul(right),
+                _ => return Ok(None),
+            }
+            .map(Some)
+            .ok_or(StaticIntegerExprError::Overflow)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn unsupported_literal_static_integer_expr(program: &ParsedProgram, expr_id: usize) -> bool {
+    let Some(expr) = program.expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Infix { left, op, right } => {
+            if !matches!(op.as_str(), "+" | "-" | "*") {
+                return literal_integer_expr_tree(program, *left)
+                    && literal_integer_expr_tree(program, *right);
+            }
+            unsupported_literal_static_integer_expr(program, *left)
+                || unsupported_literal_static_integer_expr(program, *right)
+        }
+        _ => false,
+    }
+}
+
+fn literal_integer_expr_tree(program: &ParsedProgram, expr_id: usize) -> bool {
+    let Some(expr) = program.expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Number(_) => true,
+        AstExprKind::Infix { left, right, .. } => {
+            literal_integer_expr_tree(program, *left) && literal_integer_expr_tree(program, *right)
+        }
+        _ => false,
+    }
 }
 
 fn collect_statement_expr_ids(statement: &AstStatement, expr_ids: &mut Vec<usize>) {
@@ -6415,6 +6915,56 @@ fn bytes_builtin_arg_allowed(function: &str, name: &str, piped: bool) -> bool {
         }
         _ => true,
     }
+}
+
+fn static_hex_decoded_len(text: &str) -> Option<usize> {
+    let mut digits = 0usize;
+    for byte in text.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+        digits = digits.checked_add(1)?;
+    }
+    (digits % 2 == 0).then_some(digits / 2)
+}
+
+fn static_base64_decoded_len(text: &str) -> Option<usize> {
+    let input = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if input.is_empty() {
+        return Some(0);
+    }
+    if input.len() % 4 != 0 {
+        return None;
+    }
+    let chunk_count = input.len() / 4;
+    let mut decoded_len = 0usize;
+    for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+        let final_chunk = chunk_index == chunk_count - 1;
+        if chunk[0] == b'=' || chunk[1] == b'=' {
+            return None;
+        }
+        let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
+        if padding > 2 || (!final_chunk && padding > 0) {
+            return None;
+        }
+        if padding == 1 && chunk[2] == b'=' {
+            return None;
+        }
+        for byte in &chunk[..4 - padding] {
+            if !static_base64_digit(*byte) {
+                return None;
+            }
+        }
+        decoded_len = decoded_len.checked_add(3usize.checked_sub(padding)?)?;
+    }
+    Some(decoded_len)
+}
+
+fn static_base64_digit(byte: u8) -> bool {
+    matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
 }
 
 fn render_arg_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
@@ -9126,11 +9676,16 @@ found: bytes |> Bytes/find(needle: BYTES[2] { 16u02, 16u03 })
 starts: bytes |> Bytes/starts_with(prefix: BYTES[2] { 16u01, 16u02 })
 ends: bytes |> Bytes/ends_with(suffix: BYTES[2] { 16u03, 16u04 })
 hex: bytes |> Bytes/to_hex
+base64: bytes |> Bytes/to_base64
 decoded: TEXT { 01020304 } |> Bytes/from_hex
+decoded64: TEXT { AQIDBA== } |> Bytes/from_base64
 encoded: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
+encoded_ascii_fixed: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
 text: bytes |> Bytes/to_text(encoding: Utf8)
 read: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
+read_signed: bytes |> Bytes/read_signed(offset: 0, byte_count: 4, endian: Big)
 written: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 1)
+written_signed: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Big, value: -1)
 zeros: Bytes/zeros(byte_count: 4)
 file_bytes: TEXT { ./asset.svg } |> File/read_bytes()
 file_text: TEXT { ./asset.svg } |> File/read_text()
@@ -9172,19 +9727,19 @@ document: []
         assert_eq!(type_for_function("Bytes/get"), &Type::Byte);
         assert!(matches!(
             type_for_function("Bytes/slice"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(2))
         ));
         assert!(matches!(
             type_for_function("Bytes/take"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(2))
         ));
         assert!(matches!(
             type_for_function("Bytes/drop"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(2))
         ));
         assert!(matches!(
             type_for_function("Bytes/concat"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(5))
         ));
         assert!(type_accepts_true_false(type_for_function("Bytes/equal")));
         assert_eq!(type_for_function("Bytes/find"), &Type::Number);
@@ -9195,23 +9750,33 @@ document: []
             "Bytes/ends_with"
         )));
         assert_eq!(type_for_function("Bytes/to_hex"), &Type::Text);
+        assert_eq!(type_for_function("Bytes/to_base64"), &Type::Text);
         assert!(matches!(
             type_for_function("Bytes/from_hex"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(4))
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/from_base64"),
+            Type::Bytes(BytesType::Fixed(4))
         ));
         assert!(matches!(
             type_for_function("Text/to_bytes"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(2))
         ));
         assert_eq!(type_for_function("Bytes/to_text"), &Type::Text);
         assert_eq!(type_for_function("Bytes/read_unsigned"), &Type::Number);
+        assert_eq!(type_for_function("Bytes/read_signed"), &Type::Number);
         assert!(matches!(
             type_for_function("Bytes/write_unsigned"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(4))
+        ));
+        assert!(matches!(
+            type_for_function("Bytes/write_signed"),
+            Type::Bytes(BytesType::Fixed(4))
         ));
         assert!(matches!(
             type_for_function("Bytes/zeros"),
-            Type::Bytes(BytesType::Dynamic)
+            Type::Bytes(BytesType::Fixed(4))
         ));
         assert!(matches!(
             type_for_function("File/read_bytes"),
@@ -9238,7 +9803,36 @@ bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
 missing_decode_encoding: bytes |> Bytes/to_text
 bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
 missing_encode_encoding: TEXT { hi } |> Text/to_bytes
+bad_ascii_static_text: TEXT { č } |> Text/to_bytes(encoding: Ascii)
+bad_static_hex_odd: TEXT { 123 } |> Bytes/from_hex
+bad_static_hex_digit: TEXT { 12XX } |> Bytes/from_hex
+bad_static_base64_length: TEXT { AQI } |> Bytes/from_base64
+bad_static_base64_digit: TEXT { AQ*D } |> Bytes/from_base64
 unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
+bad_zeros_input: Bytes/zeros(input: bytes, byte_count: 4)
+bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)
+missing_zeros_count: Bytes/zeros()
+bad_positional_slice: Bytes/slice(TEXT { bad }, offset: 0, byte_count: 2)
+bad_positional_bytes_slice: Bytes/slice(BYTES[4] { 16u01, 16u02, 16u03, 16u04 }, offset: 1, byte_count: 4)
+bad_get_bounds: bytes |> Bytes/get(index: 4)
+bad_get_negative_bounds: bytes |> Bytes/get(index: -1)
+bad_set_bounds: bytes |> Bytes/set(index: 4, value: 16u01)
+bad_slice_bounds: bytes |> Bytes/slice(offset: 3, byte_count: 2)
+bad_slice_negative_bounds: bytes |> Bytes/slice(offset: -1, byte_count: 2)
+bad_take_bounds: bytes |> Bytes/take(byte_count: 5)
+bad_drop_bounds: bytes |> Bytes/drop(byte_count: 5)
+bad_read_bounds: bytes |> Bytes/read_unsigned(offset: 2, byte_count: 4, endian: Little)
+bad_write_bounds: bytes |> Bytes/write_unsigned(offset: 2, byte_count: 4, endian: Little, value: 1)
+bad_read_signed_bounds: bytes |> Bytes/read_signed(offset: 2, byte_count: 4, endian: Little)
+bad_write_signed_bounds: bytes |> Bytes/write_signed(offset: 2, byte_count: 4, endian: Little, value: 1)
+bad_folded_static_integer_overflow: bytes |> Bytes/get(index: 170141183460469231731687303715884105727 + 1)
+bad_folded_static_integer_plan_range: bytes |> Bytes/get(index: 9223372036854775807 + 1)
+bad_folded_slice_offset_overflow: bytes |> Bytes/slice(offset: 170141183460469231731687303715884105727 + 1, byte_count: 2)
+bad_folded_zeros_count_overflow: Bytes/zeros(byte_count: 170141183460469231731687303715884105727 + 1)
+bad_folded_zeros_count_plan_range: Bytes/zeros(byte_count: 9223372036854775807 + 1)
+bad_folded_write_unsigned_value_negative_plan_range: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 0 - 1)
+bad_folded_write_signed_value_plan_range: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Little, value: 0 - 9223372036854775808 * 2)
+bad_unsupported_static_integer_division: bytes |> Bytes/get(index: 4 / 2)
 document: []
 "#,
         )
@@ -9257,13 +9851,123 @@ document: []
             "`encoding` must be `Utf8` or `Ascii`",
             "`Bytes/to_text` requires explicit `encoding: Utf8|Ascii`",
             "`Text/to_bytes` requires explicit `encoding: Utf8|Ascii`",
+            "`Text/to_bytes` with `encoding: Ascii` requires ASCII input text",
+            "`Bytes/from_hex` requires static hex text with an even number of valid hex digits",
+            "`Bytes/from_base64` requires valid static base64 text",
             "`Bytes/find` does not accept argument `surprise`",
+            "`Bytes/zeros` creates BYTES and does not accept an input BYTES value",
+            "`Bytes/zeros` requires `byte_count`",
+            "`Bytes/slice` requires named arguments; positional BYTES builtin arguments are ambiguous",
+            "`Bytes/get` index 4 is out of bounds for fixed BYTES[4]",
+            "`Bytes/get` index -1 is out of bounds for fixed BYTES[4]",
+            "`Bytes/set` index 4 is out of bounds for fixed BYTES[4]",
+            "`Bytes/slice` byte range 3..5 is out of bounds for fixed BYTES[4]",
+            "`Bytes/slice` byte range -1..1 is out of bounds for fixed BYTES[4]",
+            "`Bytes/take` byte range 0..5 is out of bounds for fixed BYTES[4]",
+            "`Bytes/drop` byte range 0..5 is out of bounds for fixed BYTES[4]",
+            "`Bytes/read_unsigned` byte range 2..6 is out of bounds for fixed BYTES[4]",
+            "`Bytes/write_unsigned` byte range 2..6 is out of bounds for fixed BYTES[4]",
+            "`Bytes/read_signed` byte range 2..6 is out of bounds for fixed BYTES[4]",
+            "`Bytes/write_signed` byte range 2..6 is out of bounds for fixed BYTES[4]",
+            "`Bytes/get` argument `index` static integer expression overflows Boon's supported integer range",
+            "`Bytes/get` argument `index` static integer value 9223372036854775808 is outside MachinePlan's supported integer range",
+            "`Bytes/slice` argument `offset` static integer expression overflows Boon's supported integer range",
+            "`Bytes/zeros` argument `byte_count` static integer expression overflows Boon's supported integer range",
+            "`Bytes/zeros` argument `byte_count` static integer value 9223372036854775808 is outside MachinePlan's supported integer range",
+            "`Bytes/write_unsigned` argument `value` static integer value -1 is outside MachinePlan's supported integer range",
+            "`Bytes/write_signed` argument `value` static integer value -18446744073709551616 is outside MachinePlan's supported integer range",
+            "`Bytes/get` argument `index` requires a static integer expression using integer literals and checked `+`, `-`, or `*`",
         ] {
             assert!(
                 messages.contains(expected),
                 "missing `{expected}` in diagnostics:\n{messages}"
             );
         }
+        assert!(
+            !messages.contains("`Bytes/slice` byte range 1..5 is out of bounds for fixed BYTES[4]"),
+            "positional BYTES input should not cascade into static-bounds diagnostics:\n{messages}"
+        );
+    }
+
+    #[test]
+    fn static_text_to_bytes_refines_only_literal_inputs() {
+        let parsed = boon_parser::parse_source(
+            "static-text-to-bytes-refinement.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+hex_input: TEXT { 01020304 } |> HOLD hex_input { LATEST {} }
+base64_input: TEXT { AQIDBA== } |> HOLD base64_input { LATEST {} }
+static_hex: TEXT { 01 02 03 04 } |> Bytes/from_hex
+static_base64: TEXT { AQIDBA== } |> Bytes/from_base64
+static_utf8: TEXT { č } |> Text/to_bytes(encoding: Utf8)
+static_ascii: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
+dynamic_hex: hex_input |> Bytes/from_hex
+dynamic_base64: base64_input |> Bytes/from_base64
+dynamic_utf8: hex_input |> Text/to_bytes(encoding: Utf8)
+document: []
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let type_for_statement = |name: &str| {
+            let statement = parsed
+                .ast
+                .statements
+                .iter()
+                .find(|statement| {
+                    matches!(
+                        &statement.kind,
+                        AstStatementKind::Field { name: field_name } if field_name == name
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing statement {name}"));
+            let expr_id = statement
+                .expr
+                .unwrap_or_else(|| panic!("statement {name} should have an expression"));
+            report
+                .expr_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.expr_id == expr_id)
+                .map(|entry| &entry.flow_type.ty)
+                .unwrap_or_else(|| panic!("{name} should be typed"))
+        };
+        assert_eq!(
+            type_for_statement("static_hex"),
+            &Type::Bytes(BytesType::Fixed(4))
+        );
+        assert_eq!(
+            type_for_statement("static_base64"),
+            &Type::Bytes(BytesType::Fixed(4))
+        );
+        assert_eq!(
+            type_for_statement("static_utf8"),
+            &Type::Bytes(BytesType::Fixed("č".len()))
+        );
+        assert_eq!(
+            type_for_statement("static_ascii"),
+            &Type::Bytes(BytesType::Fixed(2))
+        );
+        assert_eq!(
+            type_for_statement("dynamic_hex"),
+            &Type::Bytes(BytesType::Dynamic)
+        );
+        assert_eq!(
+            type_for_statement("dynamic_base64"),
+            &Type::Bytes(BytesType::Dynamic)
+        );
+        assert_eq!(
+            type_for_statement("dynamic_utf8"),
+            &Type::Bytes(BytesType::Dynamic)
+        );
     }
 
     #[test]
@@ -9280,6 +9984,9 @@ number_arg: bytes |> Bytes/get(index: 2)
 byte_arg: bytes |> Bytes/set(index: 1, value: 16uFE)
 encoding_arg: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
 endian_arg: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Big)
+folded_index: bytes |> Bytes/get(index: 1 + 1)
+folded_slice: bytes |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1)
+folded_numeric: bytes |> Bytes/read_unsigned(offset: 2 - 2, byte_count: 2 * 2, endian: Little)
 document: []
 "#,
         )
@@ -9302,6 +10009,31 @@ document: []
                 .iter()
                 .find(|expr| predicate(&expr.kind))
                 .expect("fixture expression should exist");
+            constants
+                .get(&expr.id)
+                .unwrap_or_else(|| panic!("missing resolved constant for expr {}", expr.id))
+        };
+        let value_for_infix = |operator: &str, left_value: &str, right_value: &str| {
+            let expr = parsed
+                .expressions
+                .iter()
+                .find(|expr| {
+                    let AstExprKind::Infix { left, op, right } = &expr.kind else {
+                        return false;
+                    };
+                    op == operator
+                        && matches!(
+                            parsed.expressions.get(*left).map(|expr| &expr.kind),
+                            Some(AstExprKind::Number(value)) if value == left_value
+                        )
+                        && matches!(
+                            parsed.expressions.get(*right).map(|expr| &expr.kind),
+                            Some(AstExprKind::Number(value)) if value == right_value
+                        )
+                })
+                .unwrap_or_else(|| {
+                    panic!("fixture should contain infix `{left_value} {operator} {right_value}`")
+                });
             constants
                 .get(&expr.id)
                 .unwrap_or_else(|| panic!("missing resolved constant for expr {}", expr.id))
@@ -9332,6 +10064,18 @@ document: []
             &&ResolvedConstantValue::Symbol {
                 value: "Big".to_owned()
             }
+        );
+        assert_eq!(
+            value_for_infix("+", "1", "1"),
+            &&ResolvedConstantValue::UnsignedInteger { value: 2 }
+        );
+        assert_eq!(
+            value_for_infix("-", "2", "2"),
+            &&ResolvedConstantValue::UnsignedInteger { value: 0 }
+        );
+        assert_eq!(
+            value_for_infix("*", "2", "2"),
+            &&ResolvedConstantValue::UnsignedInteger { value: 4 }
         );
         assert!(
             !report
@@ -11223,6 +11967,41 @@ document: []
                         .contains(&format!("unknown function or operator `{function}`"))
                 }),
                 "missing diagnostic for {function}: {:?}",
+                report.diagnostics
+            );
+        }
+
+        for (field, source_line) in [
+            (
+                "bad_zeros_input",
+                "bad_zeros_input: Bytes/zeros(input: bytes, byte_count: 4)",
+            ),
+            (
+                "bad_zeros_pipe",
+                "bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)",
+            ),
+        ] {
+            let source = format!(
+                r#"
+SOURCE
+HOLD
+LATEST
+LIST {{}}
+bytes: BYTES[4] {{ 16u01, 16u02, 16u03, 16u04 }}
+{source_line}
+document: []
+"#
+            );
+            let parsed = boon_parser::parse_source(format!("{field}.bn"), &source).unwrap();
+            let report = check(&parsed);
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(
+                        "`Bytes/zeros` creates BYTES and does not accept an input BYTES value"
+                    )),
+                "{field} should independently reject Bytes/zeros input: {:?}",
                 report.diagnostics
             );
         }

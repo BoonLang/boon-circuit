@@ -7,11 +7,12 @@ use boon_bridge::{BridgeBlobRef, BridgePageRef, BridgeTaskCompletion, BridgeValu
 #[cfg(test)]
 use boon_ir::lower;
 use boon_ir::{
-    DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListAppendFieldValue, ListId,
-    ListInitialRecord, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind,
-    ScopeId, SourceId, SourcePayloadField, StateId, TypedProgram, UpdateExpression, UpdateGuard,
-    UpdateMatchArm, UpdateValueExpression, UpdateValueMatchArm, ViewBindingKind, debug_tables,
-    lower_profiled, lower_runtime_profiled, verify_hidden_identity, verify_static_schedule,
+    BytesScalarArg, DerivedValueKind, FieldId, FunctionDefinition, InitialValue,
+    ListAppendFieldValue, ListId, ListInitialRecord, ListInitializer, ListOperationKind,
+    ListPredicate, ListProjectionKind, ScopeId, SourceId, SourcePayloadField, StateId,
+    TypedProgram, UpdateExpression, UpdateGuard, UpdateMatchArm, UpdateValueExpression,
+    UpdateValueMatchArm, ViewBindingKind, debug_tables, lower_profiled, lower_runtime_profiled,
+    verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
@@ -630,6 +631,24 @@ pub struct LiveRuntimeStepProfile {
     #[serde(default)]
     pub source_action_eval_ms: f64,
     #[serde(default)]
+    pub source_action_indexed_text_commit_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_value_commit_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_bool_commit_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_invalidation_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_row_recompute_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_root_transform_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_triggered_transform_ms: f64,
+    #[serde(default)]
+    pub source_action_indexed_followup_row_materialization_count: usize,
+    #[serde(default)]
     pub source_action_root_flush_ms: f64,
     #[serde(default)]
     pub source_action_root_final_flush_ms: f64,
@@ -666,7 +685,17 @@ pub struct LiveRuntimeStepProfile {
     #[serde(default)]
     pub source_action_root_dirty_pop_ms: f64,
     #[serde(default)]
+    pub source_action_root_dirty_ready_refresh_ms: f64,
+    #[serde(default)]
     pub source_action_root_skip_check_ms: f64,
+    #[serde(default)]
+    pub source_action_root_record_sample_ms: f64,
+    #[serde(default)]
+    pub source_action_root_record_sample_cpu_ms: f64,
+    #[serde(default)]
+    pub source_action_root_record_sample_wall_minus_cpu_ms: f64,
+    #[serde(default)]
+    pub source_action_root_prune_structured_ms: f64,
     #[serde(default)]
     pub source_action_root_dependent_lookup_ms: f64,
     #[serde(default)]
@@ -891,6 +920,73 @@ fn runtime_profile_dirty_frontier_enabled() -> bool {
     })
 }
 
+fn runtime_profile_root_materialization_samples_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(test)]
+        {
+            return true;
+        }
+        #[cfg(not(test))]
+        std::env::var("BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn runtime_profile_root_materialization_details_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(test)]
+        {
+            return true;
+        }
+        #[cfg(not(test))]
+        std::env::var("BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn runtime_root_list_view_profile_enabled() -> bool {
+    runtime_profile_root_materialization_samples_enabled()
+        || runtime_profile_root_materialization_details_enabled()
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct RuntimeTimespec {
+    tv_sec: std::os::raw::c_long,
+    tv_nsec: std::os::raw::c_long,
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_thread_cpu_ms() -> Option<f64> {
+    const CLOCK_THREAD_CPUTIME_ID: std::os::raw::c_int = 3;
+    unsafe extern "C" {
+        fn clock_gettime(
+            clk_id: std::os::raw::c_int,
+            tp: *mut RuntimeTimespec,
+        ) -> std::os::raw::c_int;
+    }
+
+    let mut time = RuntimeTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let status = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    if status == 0 {
+        Some((time.tv_sec as f64 * 1000.0) + (time.tv_nsec as f64 / 1_000_000.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_thread_cpu_ms() -> Option<f64> {
+    None
+}
+
 fn extend_bounded_profile_samples<T>(target: &mut Vec<T>, source: Vec<T>, limit: usize) {
     let remaining = limit.saturating_sub(target.len());
     target.extend(source.into_iter().take(remaining));
@@ -951,6 +1047,21 @@ impl LiveRuntimeStepProfile {
         self.source_actions_ms += other.source_actions_ms;
         self.source_action_route_setup_ms += other.source_action_route_setup_ms;
         self.source_action_eval_ms += other.source_action_eval_ms;
+        self.source_action_indexed_text_commit_ms += other.source_action_indexed_text_commit_ms;
+        self.source_action_indexed_value_commit_ms += other.source_action_indexed_value_commit_ms;
+        self.source_action_indexed_bool_commit_ms += other.source_action_indexed_bool_commit_ms;
+        self.source_action_indexed_followup_ms += other.source_action_indexed_followup_ms;
+        self.source_action_indexed_followup_invalidation_ms +=
+            other.source_action_indexed_followup_invalidation_ms;
+        self.source_action_indexed_followup_row_recompute_ms +=
+            other.source_action_indexed_followup_row_recompute_ms;
+        self.source_action_indexed_followup_root_transform_ms +=
+            other.source_action_indexed_followup_root_transform_ms;
+        self.source_action_indexed_followup_triggered_transform_ms +=
+            other.source_action_indexed_followup_triggered_transform_ms;
+        self.source_action_indexed_followup_row_materialization_count = self
+            .source_action_indexed_followup_row_materialization_count
+            .saturating_add(other.source_action_indexed_followup_row_materialization_count);
         self.source_action_root_flush_ms += other.source_action_root_flush_ms;
         self.source_action_root_final_flush_ms += other.source_action_root_final_flush_ms;
         self.source_action_root_flush_count = self
@@ -987,7 +1098,15 @@ impl LiveRuntimeStepProfile {
         self.source_action_root_dirty_retain_ms += other.source_action_root_dirty_retain_ms;
         self.source_action_root_dirty_ready_ms += other.source_action_root_dirty_ready_ms;
         self.source_action_root_dirty_pop_ms += other.source_action_root_dirty_pop_ms;
+        self.source_action_root_dirty_ready_refresh_ms +=
+            other.source_action_root_dirty_ready_refresh_ms;
         self.source_action_root_skip_check_ms += other.source_action_root_skip_check_ms;
+        self.source_action_root_record_sample_ms += other.source_action_root_record_sample_ms;
+        self.source_action_root_record_sample_cpu_ms +=
+            other.source_action_root_record_sample_cpu_ms;
+        self.source_action_root_record_sample_wall_minus_cpu_ms +=
+            other.source_action_root_record_sample_wall_minus_cpu_ms;
+        self.source_action_root_prune_structured_ms += other.source_action_root_prune_structured_ms;
         self.source_action_root_dependent_lookup_ms += other.source_action_root_dependent_lookup_ms;
         self.source_action_root_dependent_enqueue_ms +=
             other.source_action_root_dependent_enqueue_ms;
@@ -1111,6 +1230,16 @@ impl LiveRuntimeStepProfile {
             "source_actions_ms": self.source_actions_ms,
             "source_action_route_setup_ms": self.source_action_route_setup_ms,
             "source_action_eval_ms": self.source_action_eval_ms,
+            "source_action_eval_unattributed_ms": self.source_action_eval_unattributed_ms(),
+            "source_action_indexed_text_commit_ms": self.source_action_indexed_text_commit_ms,
+            "source_action_indexed_value_commit_ms": self.source_action_indexed_value_commit_ms,
+            "source_action_indexed_bool_commit_ms": self.source_action_indexed_bool_commit_ms,
+            "source_action_indexed_followup_ms": self.source_action_indexed_followup_ms,
+            "source_action_indexed_followup_invalidation_ms": self.source_action_indexed_followup_invalidation_ms,
+            "source_action_indexed_followup_row_recompute_ms": self.source_action_indexed_followup_row_recompute_ms,
+            "source_action_indexed_followup_root_transform_ms": self.source_action_indexed_followup_root_transform_ms,
+            "source_action_indexed_followup_triggered_transform_ms": self.source_action_indexed_followup_triggered_transform_ms,
+            "source_action_indexed_followup_row_materialization_count": self.source_action_indexed_followup_row_materialization_count,
             "source_action_root_flush_ms": self.source_action_root_flush_ms,
             "source_action_root_final_flush_ms": self.source_action_root_final_flush_ms,
             "source_action_root_flush_count": self.source_action_root_flush_count,
@@ -1129,7 +1258,12 @@ impl LiveRuntimeStepProfile {
             "source_action_root_dirty_retain_ms": self.source_action_root_dirty_retain_ms,
             "source_action_root_dirty_ready_ms": self.source_action_root_dirty_ready_ms,
             "source_action_root_dirty_pop_ms": self.source_action_root_dirty_pop_ms,
+            "source_action_root_dirty_ready_refresh_ms": self.source_action_root_dirty_ready_refresh_ms,
             "source_action_root_skip_check_ms": self.source_action_root_skip_check_ms,
+            "source_action_root_record_sample_ms": self.source_action_root_record_sample_ms,
+            "source_action_root_record_sample_cpu_ms": self.source_action_root_record_sample_cpu_ms,
+            "source_action_root_record_sample_wall_minus_cpu_ms": self.source_action_root_record_sample_wall_minus_cpu_ms,
+            "source_action_root_prune_structured_ms": self.source_action_root_prune_structured_ms,
             "source_action_root_dependent_lookup_ms": self.source_action_root_dependent_lookup_ms,
             "source_action_root_dependent_enqueue_ms": self.source_action_root_dependent_enqueue_ms,
             "source_action_root_dirty_scheduler_unattributed_ms": self.source_action_root_dirty_scheduler_unattributed_ms(),
@@ -1189,12 +1323,25 @@ impl LiveRuntimeStepProfile {
         )
     }
 
+    pub fn source_action_eval_unattributed_ms(&self) -> f64 {
+        saturating_f64_sub(
+            self.source_action_eval_ms,
+            self.source_action_indexed_text_commit_ms
+                + self.source_action_indexed_value_commit_ms
+                + self.source_action_indexed_bool_commit_ms
+                + self.source_action_indexed_followup_ms,
+        )
+    }
+
     pub fn source_action_root_dirty_scheduler_unattributed_ms(&self) -> f64 {
         saturating_f64_sub(
             self.source_action_root_dirty_scheduler_ms,
             self.source_action_root_changed_cache_invalidation_ms
                 + self.source_action_root_dirty_pop_ms
+                + self.source_action_root_dirty_ready_refresh_ms
                 + self.source_action_root_skip_check_ms
+                + self.source_action_root_record_sample_ms
+                + self.source_action_root_prune_structured_ms
                 + self.source_action_root_dependent_lookup_ms
                 + self.source_action_root_dependent_enqueue_ms,
         )
@@ -1594,6 +1741,32 @@ pub struct LiveRuntimeRootListViewDirectFindProfile {
     pub row_snapshot_ms: f64,
     pub source_column_reads_ms: f64,
     pub root_read_commit_ms: f64,
+    #[serde(default)]
+    pub root_read_commit_changed: bool,
+    #[serde(default)]
+    pub root_read_replace_total_ms: f64,
+    #[serde(default)]
+    pub root_read_previous_count: usize,
+    #[serde(default)]
+    pub root_read_new_count: usize,
+    #[serde(default)]
+    pub root_read_removed_count: usize,
+    #[serde(default)]
+    pub root_read_added_count: usize,
+    #[serde(default)]
+    pub root_read_compare_ms: f64,
+    #[serde(default)]
+    pub root_read_diff_ms: f64,
+    #[serde(default)]
+    pub root_read_edge_update_ms: f64,
+    #[serde(default)]
+    pub root_read_store_ms: f64,
+    #[serde(default)]
+    pub root_value_cache_insert_ms: f64,
+    #[serde(default)]
+    pub root_value_cache_insert_changed: bool,
+    #[serde(default)]
+    pub root_numeric_guard_remove_ms: f64,
     pub previous_snapshot_ms: f64,
     pub diff_ms: f64,
     pub replace_ms: f64,
@@ -4044,7 +4217,7 @@ fn execute_machine_plan_root_scenario_inner(
             .as_ref()
             .is_none_or(|required| event.key.as_deref() == Some(required.as_str()));
 
-        let route_ops = plan
+        let mut route_ops = plan
             .regions
             .iter()
             .filter(|region| region.kind == RegionKind::UpdateBranches)
@@ -4055,6 +4228,7 @@ fn execute_machine_plan_root_scenario_inner(
                     .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
             })
             .collect::<Vec<_>>();
+        sort_plan_ops_for_same_event_root_reads(&mut route_ops);
         let route_has_list_remove = plan
             .regions
             .iter()
@@ -4081,6 +4255,10 @@ fn execute_machine_plan_root_scenario_inner(
         let mut touched_states = serde_json::Map::new();
         let mut touched_updates: BTreeMap<usize, (ExecutedRootUpdate, Vec<usize>)> =
             BTreeMap::new();
+        let mut touched_update_order = Vec::new();
+        let mut staged_root_state = root_state.clone();
+        let mut staged_root_bytes_state = root_bytes_state.clone();
+        let mut staged_root_fixed_bytes_banks = root_fixed_bytes_banks.clone();
         let mut step_signatures = Vec::new();
         let mut step_deltas = Vec::new();
         let mut updates = Vec::new();
@@ -4265,9 +4443,9 @@ fn execute_machine_plan_root_scenario_inner(
                 source_id,
                 source_route_slot,
                 &event,
-                &root_state,
-                &root_bytes_state,
-                &root_fixed_bytes_banks,
+                &staged_root_state,
+                &staged_root_bytes_state,
+                &staged_root_fixed_bytes_banks,
                 host_file_root,
             )?
             else {
@@ -4290,30 +4468,36 @@ fn execute_machine_plan_root_scenario_inner(
                     .into());
                 }
                 None => {
+                    apply_executed_root_update_to_state(
+                        &mut staged_root_state,
+                        &mut staged_root_bytes_state,
+                        &mut staged_root_fixed_bytes_banks,
+                        plan,
+                        state_id.0,
+                        &executed,
+                        op.id.0,
+                    )?;
+                    touched_update_order.push(state_id.0);
                     touched_updates.insert(state_id.0, (executed, vec![op.id.0]));
                 }
             }
         }
 
-        for (state_id, (executed, op_ids)) in touched_updates {
+        for state_id in touched_update_order {
+            let Some((executed, op_ids)) = touched_updates.remove(&state_id) else {
+                continue;
+            };
             let target_label = plan_state_label(plan, state_id);
             let changed = root_state.get(&target_label) != Some(&executed.value);
-            root_state.insert(target_label.clone(), executed.value.clone());
-            if let Some(mutation) = &executed.fixed_bytes_mutation {
-                apply_root_fixed_bytes_mutation(
-                    &root_bytes_state,
-                    &mut root_fixed_bytes_banks,
-                    mutation,
-                    op_ids[0],
-                )?;
-                root_bytes_state.remove(&state_id);
-            } else if let Some(bytes) = executed.bytes_value.clone() {
-                root_bytes_state.insert(state_id, bytes);
-                root_fixed_bytes_banks.remove(&state_id);
-            } else {
-                root_bytes_state.remove(&state_id);
-                root_fixed_bytes_banks.remove(&state_id);
-            }
+            apply_executed_root_update_to_state(
+                &mut root_state,
+                &mut root_bytes_state,
+                &mut root_fixed_bytes_banks,
+                plan,
+                state_id,
+                &executed,
+                op_ids[0],
+            )?;
             if changed {
                 touched_states.insert(target_label.clone(), executed.value.clone());
                 let signature = format!("FieldSet:{target_label}");
@@ -4738,6 +4922,30 @@ fn root_plan_semantic_delta_value(value: &JsonValue) -> JsonValue {
     value.clone()
 }
 
+fn apply_executed_root_update_to_state(
+    root_state: &mut serde_json::Map<String, JsonValue>,
+    root_bytes_state: &mut RootBytesState,
+    root_fixed_bytes_banks: &mut RootFixedBytesBanks,
+    plan: &MachinePlan,
+    state_id: usize,
+    executed: &ExecutedRootUpdate,
+    op_id: usize,
+) -> RuntimeResult<()> {
+    let target_label = plan_state_label(plan, state_id);
+    root_state.insert(target_label, executed.value.clone());
+    if let Some(mutation) = &executed.fixed_bytes_mutation {
+        apply_root_fixed_bytes_mutation(root_bytes_state, root_fixed_bytes_banks, mutation, op_id)?;
+        root_bytes_state.remove(&state_id);
+    } else if let Some(bytes) = executed.bytes_value.clone() {
+        root_bytes_state.insert(state_id, bytes);
+        root_fixed_bytes_banks.remove(&state_id);
+    } else {
+        root_bytes_state.remove(&state_id);
+        root_fixed_bytes_banks.remove(&state_id);
+    }
+    Ok(())
+}
+
 struct ExecutedRootUpdate {
     value: JsonValue,
     bytes_value: Option<RuntimeBytes>,
@@ -4761,6 +4969,53 @@ struct RootBytesView<'a> {
     bytes: Cow<'a, [u8]>,
     access_source: &'static str,
     cow_kind: &'static str,
+}
+
+fn root_update_output_state_id(op: &boon_plan::PlanOp) -> Option<StateId> {
+    if op.indexed {
+        return None;
+    }
+    match op.output.as_ref()? {
+        ValueRef::State(state_id) => Some(*state_id),
+        _ => None,
+    }
+}
+
+fn root_update_state_inputs(op: &boon_plan::PlanOp) -> Vec<StateId> {
+    let output = root_update_output_state_id(op);
+    let mut inputs = Vec::new();
+    for input in &op.inputs {
+        if let ValueRef::State(state_id) = input
+            && Some(*state_id) != output
+            && !inputs.contains(state_id)
+        {
+            inputs.push(*state_id);
+        }
+    }
+    inputs
+}
+
+fn sort_plan_ops_for_same_event_root_reads(ops: &mut Vec<&boon_plan::PlanOp>) {
+    let target_state_ids = ops
+        .iter()
+        .filter_map(|op| root_update_output_state_id(op))
+        .collect::<Vec<_>>();
+    let mut pending = std::mem::take(ops);
+    let mut sorted = Vec::with_capacity(pending.len());
+    let mut settled = BTreeSet::new();
+    while !pending.is_empty() {
+        let ready_position = pending.iter().position(|candidate| {
+            root_update_state_inputs(candidate)
+                .iter()
+                .all(|input| !target_state_ids.contains(input) || settled.contains(&input.0))
+        });
+        let next = pending.remove(ready_position.unwrap_or(0));
+        if let Some(state_id) = root_update_output_state_id(next) {
+            settled.insert(state_id.0);
+        }
+        sorted.push(next);
+    }
+    *ops = sorted;
 }
 
 fn root_bytes_view_access_json(
@@ -6288,6 +6543,7 @@ fn execute_indexed_update_branch(
         _ => JsonValue::Null,
     };
     let mut bytes_access = JsonValue::Null;
+    let mut bytes_storage = JsonValue::Null;
     let mut host_effect = JsonValue::Null;
     let mut update_constant_id = JsonValue::Null;
     let mut update_constant_value = JsonValue::Null;
@@ -6435,6 +6691,75 @@ fn execute_indexed_update_branch(
             (json!(i64::from(*byte)), None, "bytes_get")
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::BytesSet,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, index, byte_value, index_constant_id, value_constant_id) =
+                indexed_bytes_set_operands(plan, op)?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes_view = indexed_row_state_bytes_view(plan, row, input_state_id, op.id.0)?;
+            if let boon_plan::PlanValueType::Bytes {
+                fixed_len: Some(fixed_len),
+            } = &output_slot.value_type
+                && *fixed_len != bytes_view.bytes.as_ref().len() as u64
+            {
+                return Err(format!(
+                    "indexed Bytes/set update branch {} output fixed length {} does not match input length {}",
+                    op.id.0,
+                    fixed_len,
+                    bytes_view.bytes.as_ref().len()
+                )
+                .into());
+            }
+            let value = root_fixed_bytes_report_json_with_patches(
+                bytes_view.bytes.as_ref(),
+                &[(index, byte_value)],
+                "Bytes/set",
+                op.id.0,
+                &input_name,
+            )?;
+            let mut output = bytes_view.bytes.as_ref().to_vec();
+            let Some(slot) = output.get_mut(index) else {
+                return Err(format!(
+                    "indexed Bytes/set update branch {} index {index} is out of bounds for `{input_name}`",
+                    op.id.0
+                )
+                .into());
+            };
+            *slot = byte_value;
+            let bytes = RuntimeBytes::inline(Bytes::from(output));
+            bytes_access = json!({
+                "read_only": false,
+                "input_state_id": input_state_id.0,
+                "access_source": bytes_view.access_source,
+                "cow_kind": bytes_view.cow_kind,
+                "byte_len": bytes_view.bytes.as_ref().len(),
+                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, input_state_id),
+                "byte_bank_used": bytes_view.access_source == "indexed_fixed_byte_bank",
+                "index": index,
+                "value": byte_value,
+            });
+            bytes_storage = json!({
+                "storage": if indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_bank_used": indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_len": bytes.byte_len,
+            });
+            update_constant_id = json!([index_constant_id.0, value_constant_id.0]);
+            update_constant_value = json!({
+                "index": index,
+                "value": byte_value,
+            });
+            (value, Some(bytes), "bytes_set")
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::FileReadBytes,
             source_payload_field: None,
             update_constant_id: None,
@@ -6502,7 +6827,7 @@ fn execute_indexed_update_branch(
                 "File/read_bytes",
                 op.id.0,
             )?;
-            let bytes = RuntimeBytes::inline(Bytes::from(bytes));
+            let bytes = RuntimeBytes::dynamic(Bytes::from(bytes));
             bytes_access = json!({
                 "read_only": true,
                 "output_state_id": output_state_id.0,
@@ -6736,14 +7061,25 @@ fn execute_indexed_update_branch(
     }
     let _ = row;
     let derived_deltas = if indexed_state_feeds_indexed_derived_expression(plan, output_state_id) {
-        refresh_indexed_derived_fields_for_row(
-            plan,
-            list_slot,
-            &plan_list_label(plan, list_slot.list_id.0),
-            list_state,
-            row_index,
-            false,
-        )?
+        if changed {
+            refresh_indexed_derived_fields_after_state_change(
+                plan,
+                list_slot,
+                &plan_list_label(plan, list_slot.list_id.0),
+                list_state,
+                row_index,
+            )?
+        } else {
+            refresh_indexed_derived_fields_for_row(
+                plan,
+                list_slot,
+                &plan_list_label(plan, list_slot.list_id.0),
+                list_state,
+                row_index,
+                false,
+                true,
+            )?
+        }
     } else if changed && source_has_later_indexed_state_feeding_derived(plan, source_id, op.id.0) {
         stale_empty_text_indexed_derived_deltas(
             plan,
@@ -6792,6 +7128,7 @@ fn execute_indexed_update_branch(
             "update_constant_id": update_constant_id,
             "update_constant_value": update_constant_value,
             "bytes_access": bytes_access,
+            "bytes_storage": bytes_storage,
             "host_effect": host_effect,
             "selected_op_indexed": true,
             "selected_op_unresolved_executable_ref_count": 0,
@@ -7429,10 +7766,85 @@ fn root_bytes_set_operands(
     Ok((*input, index, value, *index_constant_id, *value_constant_id))
 }
 
-fn root_bytes_slice_operands(
+fn indexed_bytes_set_operands(
     plan: &MachinePlan,
     op: &boon_plan::PlanOp,
-) -> RuntimeResult<(StateId, usize, usize, PlanConstantId, PlanConstantId)> {
+) -> RuntimeResult<(StateId, usize, u8, PlanConstantId, PlanConstantId)> {
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "indexed Bytes/set update branch {} is not an update branch",
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        ValueRef::State(input),
+        ValueRef::Constant(index_constant_id),
+        ValueRef::Constant(value_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "indexed Bytes/set update branch {} expected state, index constant, and value constant operands, found {}",
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&ValueRef::State(*input)) {
+        return Err(format!(
+            "indexed Bytes/set update branch {} state operand is not declared as an op input",
+            op.id.0
+        )
+        .into());
+    }
+    let index_constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *index_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "indexed Bytes/set update branch {} references missing index constant {}",
+                op.id.0, index_constant_id.0
+            )
+        })?;
+    let PlanConstantValue::Number { value: index } = &index_constant.value else {
+        return Err(format!(
+            "indexed Bytes/set update branch {} index constant {} is not a number",
+            op.id.0, index_constant_id.0
+        )
+        .into());
+    };
+    let index = usize::try_from(*index).map_err(|_| {
+        format!(
+            "indexed Bytes/set update branch {} index constant {} is negative or too large",
+            op.id.0, index_constant_id.0
+        )
+    })?;
+    let value_constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *value_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "indexed Bytes/set update branch {} references missing value constant {}",
+                op.id.0, value_constant_id.0
+            )
+        })?;
+    let PlanConstantValue::Byte { value } = value_constant.value else {
+        return Err(format!(
+            "indexed Bytes/set update branch {} value constant {} is not a BYTE",
+            op.id.0, value_constant_id.0
+        )
+        .into());
+    };
+    Ok((*input, index, value, *index_constant_id, *value_constant_id))
+}
+
+fn root_bytes_slice_operands(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    op: &boon_plan::PlanOp,
+) -> RuntimeResult<(StateId, usize, usize, JsonValue, JsonValue)> {
     let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "root Bytes/slice update branch {} is not an update branch",
@@ -7440,14 +7852,9 @@ fn root_bytes_slice_operands(
         )
         .into());
     };
-    let [
-        ValueRef::State(input),
-        ValueRef::Constant(offset_constant_id),
-        ValueRef::Constant(byte_count_constant_id),
-    ] = ordered_inputs.as_slice()
-    else {
+    let [ValueRef::State(input), offset_ref, byte_count_ref] = ordered_inputs.as_slice() else {
         return Err(format!(
-            "root Bytes/slice update branch {} expected state, offset constant, and byte_count constant operands, found {}",
+            "root Bytes/slice update branch {} expected state, offset, and byte_count operands, found {}",
             op.id.0,
             ordered_inputs.len()
         )
@@ -7460,11 +7867,12 @@ fn root_bytes_slice_operands(
         )
         .into());
     }
-    let offset =
-        root_usize_number_constant(plan, *offset_constant_id, "Bytes/slice", "offset", op)?;
-    let byte_count = root_usize_number_constant(
+    let (offset, offset_ref_json) =
+        root_usize_number_operand(plan, root_state, offset_ref, "Bytes/slice", "offset", op)?;
+    let (byte_count, byte_count_ref_json) = root_usize_number_operand(
         plan,
-        *byte_count_constant_id,
+        root_state,
+        byte_count_ref,
         "Bytes/slice",
         "byte_count",
         op,
@@ -7473,16 +7881,17 @@ fn root_bytes_slice_operands(
         *input,
         offset,
         byte_count,
-        *offset_constant_id,
-        *byte_count_constant_id,
+        offset_ref_json,
+        byte_count_ref_json,
     ))
 }
 
 fn root_bytes_count_operand(
     plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
     op: &boon_plan::PlanOp,
     operation: &str,
-) -> RuntimeResult<(StateId, usize, PlanConstantId)> {
+) -> RuntimeResult<(StateId, usize, JsonValue)> {
     let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "root {operation} update branch {} is not an update branch",
@@ -7490,13 +7899,9 @@ fn root_bytes_count_operand(
         )
         .into());
     };
-    let [
-        ValueRef::State(input),
-        ValueRef::Constant(byte_count_constant_id),
-    ] = ordered_inputs.as_slice()
-    else {
+    let [ValueRef::State(input), byte_count_ref] = ordered_inputs.as_slice() else {
         return Err(format!(
-            "root {operation} update branch {} expected state and byte_count constant operands, found {}",
+            "root {operation} update branch {} expected state and byte_count operands, found {}",
             op.id.0,
             ordered_inputs.len()
         )
@@ -7509,9 +7914,15 @@ fn root_bytes_count_operand(
         )
         .into());
     }
-    let byte_count =
-        root_usize_number_constant(plan, *byte_count_constant_id, operation, "byte_count", op)?;
-    Ok((*input, byte_count, *byte_count_constant_id))
+    let (byte_count, byte_count_ref_json) = root_usize_number_operand(
+        plan,
+        root_state,
+        byte_count_ref,
+        operation,
+        "byte_count",
+        op,
+    )?;
+    Ok((*input, byte_count, byte_count_ref_json))
 }
 
 fn root_bytes_zeros_operand(
@@ -7962,6 +8373,54 @@ fn root_usize_number_constant(
         )
         .into()
     })
+}
+
+fn root_usize_number_operand(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    value_ref: &ValueRef,
+    operation: &str,
+    label: &str,
+    op: &boon_plan::PlanOp,
+) -> RuntimeResult<(usize, JsonValue)> {
+    match value_ref {
+        ValueRef::Constant(constant_id) => Ok((
+            root_usize_number_constant(plan, *constant_id, operation, label, op)?,
+            json!({"kind": "constant", "constant_id": constant_id.0}),
+        )),
+        ValueRef::State(state_id) => {
+            if !op.inputs.contains(&ValueRef::State(*state_id)) {
+                return Err(format!(
+                    "root {operation} update branch {} {label} state operand {} is not declared as an op input",
+                    op.id.0, state_id.0
+                )
+                .into());
+            }
+            let state_label = plan_state_label(plan, state_id.0);
+            let value = root_state_value(plan, root_state, *state_id, op.id.0)?;
+            let number = value.as_i64().ok_or_else(|| {
+                format!(
+                    "root {operation} update branch {} {label} state `{state_label}` is not NUMBER",
+                    op.id.0
+                )
+            })?;
+            let number = usize::try_from(number).map_err(|_| {
+                format!(
+                    "root {operation} update branch {} {label} state `{state_label}` is negative or too large",
+                    op.id.0
+                )
+            })?;
+            Ok((
+                number,
+                json!({"kind": "state", "state_id": state_id.0, "state": state_label}),
+            ))
+        }
+        other => Err(format!(
+            "root {operation} update branch {} {label} operand must be a number constant or NUMBER state, got {other:?}",
+            op.id.0
+        )
+        .into()),
+    }
 }
 
 fn root_i64_number_constant(
@@ -8785,6 +9244,37 @@ fn refresh_row_bool_not_fields(
     Ok(deltas)
 }
 
+fn refresh_indexed_derived_fields_after_state_change(
+    plan: &MachinePlan,
+    changed_list_slot: &boon_plan::ListStorageSlot,
+    changed_list_label: &str,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    changed_row_index: usize,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = refresh_indexed_derived_fields_for_row(
+        plan,
+        changed_list_slot,
+        changed_list_label,
+        list_state,
+        changed_row_index,
+        false,
+        true,
+    )?;
+    if deltas
+        .iter()
+        .any(|delta| plan_delta_reports_cycle_error(delta))
+    {
+        return Ok(deltas);
+    }
+    deltas.extend(refresh_other_indexed_derived_fields(
+        plan,
+        list_state,
+        changed_list_slot.list_id.0,
+        changed_row_index,
+    )?);
+    Ok(deltas)
+}
+
 fn refresh_indexed_derived_fields_for_row(
     plan: &MachinePlan,
     list_slot: &boon_plan::ListStorageSlot,
@@ -8792,6 +9282,7 @@ fn refresh_indexed_derived_fields_for_row(
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     row_index: usize,
     suppress_recursive_cycle_values: bool,
+    sort_cycle_error_first: bool,
 ) -> RuntimeResult<Vec<JsonValue>> {
     let mut row_eval = list_state
         .get(&list_slot.list_id.0)
@@ -8832,7 +9323,7 @@ fn refresh_indexed_derived_fields_for_row(
     if changed_fields.is_empty() {
         return Ok(Vec::new());
     }
-    if suppress_recursive_cycle_values {
+    if sort_cycle_error_first {
         changed_fields.sort_by_key(|(field_name, _)| {
             if field_name == "error" {
                 0
@@ -8928,9 +9419,54 @@ fn stale_empty_text_indexed_derived_deltas(
     Ok(deltas)
 }
 
+fn refresh_other_indexed_derived_fields(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    skipped_list_id: usize,
+    skipped_row_index: usize,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = Vec::new();
+    for list_slot in &plan.storage_layout.list_slots {
+        let row_count = list_state
+            .get(&list_slot.list_id.0)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let list_label = plan_list_label(plan, list_slot.list_id.0);
+        for row_index in 0..row_count {
+            if list_slot.list_id.0 == skipped_list_id && row_index == skipped_row_index {
+                continue;
+            }
+            deltas.extend(refresh_indexed_derived_fields_for_row(
+                plan,
+                list_slot,
+                &list_label,
+                list_state,
+                row_index,
+                true,
+                true,
+            )?);
+        }
+    }
+    Ok(deltas)
+}
+
+fn plan_delta_reports_cycle_error(delta: &JsonValue) -> bool {
+    delta.get("field_path").and_then(JsonValue::as_str) == Some("error")
+        && delta.get("value").is_some_and(row_value_is_cycle_error)
+}
+
 fn refresh_all_indexed_derived_fields(
     plan: &MachinePlan,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+) -> RuntimeResult<Vec<JsonValue>> {
+    refresh_all_indexed_derived_fields_with_options(plan, list_state, true, true)
+}
+
+fn refresh_all_indexed_derived_fields_with_options(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    suppress_recursive_cycle_values: bool,
+    sort_cycle_error_first: bool,
 ) -> RuntimeResult<Vec<JsonValue>> {
     let mut deltas = Vec::new();
     for list_slot in &plan.storage_layout.list_slots {
@@ -8946,7 +9482,8 @@ fn refresh_all_indexed_derived_fields(
                 &list_label,
                 list_state,
                 row_index,
-                true,
+                suppress_recursive_cycle_values,
+                sort_cycle_error_first,
             )?);
         }
     }
@@ -9068,6 +9605,47 @@ fn plan_row_expression_contains_state(expression: &PlanRowExpression, state_id: 
             plan_row_expression_contains_state(input, state_id)
                 || plan_row_expression_contains_state(start, state_id)
                 || plan_row_expression_contains_state(length, state_id)
+        }
+        PlanRowExpression::TextToBytes { input, encoding } => {
+            plan_row_expression_contains_state(input, state_id)
+                || encoding
+                    .as_deref()
+                    .is_some_and(|encoding| plan_row_expression_contains_state(encoding, state_id))
+        }
+        PlanRowExpression::BytesIsEmpty { input } => {
+            plan_row_expression_contains_state(input, state_id)
+        }
+        PlanRowExpression::BytesLength { input } => {
+            plan_row_expression_contains_state(input, state_id)
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(index, state_id)
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(offset, state_id)
+                || plan_row_expression_contains_state(byte_count, state_id)
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(needle, state_id)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(prefix, state_id)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(suffix, state_id)
+        }
+        PlanRowExpression::BytesEqual { left, right } => {
+            plan_row_expression_contains_state(left, state_id)
+                || plan_row_expression_contains_state(right, state_id)
         }
         PlanRowExpression::NumberInfix { left, right, .. } => {
             plan_row_expression_contains_state(left, state_id)
@@ -9543,8 +10121,8 @@ fn execute_root_scalar_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let (input_state_id, offset, byte_count, offset_constant_id, byte_count_constant_id) =
-                root_bytes_slice_operands(plan, op)?;
+            let (input_state_id, offset, byte_count, offset_ref, byte_count_ref) =
+                root_bytes_slice_operands(plan, root_state, op)?;
             let input_label = plan_state_label(plan, input_state_id.0);
             let bytes = root_state_inline_bytes(
                 plan,
@@ -9587,7 +10165,7 @@ fn execute_root_scalar_update_branch(
                 Some(bytes),
                 "bytes_slice",
                 JsonValue::Null,
-                json!([offset_constant_id.0, byte_count_constant_id.0]),
+                json!([offset_ref, byte_count_ref]),
                 json!({"offset": offset, "byte_count": byte_count}),
             )
         }
@@ -9597,8 +10175,8 @@ fn execute_root_scalar_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let (input_state_id, byte_count, byte_count_constant_id) =
-                root_bytes_count_operand(plan, op, "Bytes/take")?;
+            let (input_state_id, byte_count, byte_count_ref) =
+                root_bytes_count_operand(plan, root_state, op, "Bytes/take")?;
             let input_label = plan_state_label(plan, input_state_id.0);
             let bytes = root_state_inline_bytes(
                 plan,
@@ -9641,7 +10219,7 @@ fn execute_root_scalar_update_branch(
                 Some(bytes),
                 "bytes_take",
                 JsonValue::Null,
-                json!(byte_count_constant_id.0),
+                byte_count_ref,
                 json!(byte_count),
             )
         }
@@ -9651,8 +10229,8 @@ fn execute_root_scalar_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let (input_state_id, byte_count, byte_count_constant_id) =
-                root_bytes_count_operand(plan, op, "Bytes/drop")?;
+            let (input_state_id, byte_count, byte_count_ref) =
+                root_bytes_count_operand(plan, root_state, op, "Bytes/drop")?;
             let input_label = plan_state_label(plan, input_state_id.0);
             let bytes = root_state_inline_bytes(
                 plan,
@@ -9690,7 +10268,7 @@ fn execute_root_scalar_update_branch(
                 Some(bytes),
                 "bytes_drop",
                 JsonValue::Null,
-                json!(byte_count_constant_id.0),
+                byte_count_ref,
                 json!(byte_count),
             )
         }
@@ -10332,7 +10910,7 @@ fn execute_root_scalar_update_branch(
                 "File/read_bytes",
                 op.id.0,
             )?;
-            let bytes = RuntimeBytes::inline(Bytes::from(bytes));
+            let bytes = RuntimeBytes::dynamic(Bytes::from(bytes));
             (
                 bytes.report_json(),
                 Some(bytes),
@@ -11429,6 +12007,76 @@ fn eval_plan_row_expression_with_stack(
                 text.chars().skip(start).take(length).collect(),
             ))
         }
+        PlanRowExpression::TextToBytes { input, encoding } => {
+            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
+            let encoding = match encoding.as_deref() {
+                Some(encoding) => {
+                    eval_plan_row_text_with_stack(plan, list_state, row, encoding, stack)?
+                }
+                None => return Err("row Text/to_bytes requires explicit encoding".into()),
+            };
+            let bytes = row_text_to_bytes(&text, &encoding)?;
+            Ok(row_private_bytes_json(&bytes))
+        }
+        PlanRowExpression::BytesIsEmpty { input } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            Ok(JsonValue::Bool(bytes.is_empty()))
+        }
+        PlanRowExpression::BytesLength { input } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            i64::try_from(bytes.len())
+                .map(JsonValue::from)
+                .map_err(|_| "row Bytes/length exceeds Boon NUMBER".into())
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let index = eval_plan_row_number_with_stack(plan, list_state, row, index, stack)?.max(0)
+                as usize;
+            bytes
+                .get(index)
+                .copied()
+                .map(JsonValue::from)
+                .ok_or_else(|| format!("row Bytes/get index {index} is out of bounds").into())
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
+                .max(0) as usize;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let slice = bytes
+                .get(offset..offset.saturating_add(byte_count))
+                .ok_or_else(|| "row Bytes/slice out of bounds".to_owned())?
+                .to_vec();
+            Ok(row_private_bytes_json(&slice))
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            let haystack = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let needle = eval_plan_row_bytes_with_stack(plan, list_state, row, needle, stack)?;
+            Ok(bytes_find(&haystack, &needle)
+                .map(|index| json!(index as i64))
+                .unwrap_or_else(|| JsonValue::String("NaN".to_owned())))
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let prefix = eval_plan_row_bytes_with_stack(plan, list_state, row, prefix, stack)?;
+            Ok(JsonValue::Bool(bytes.starts_with(&prefix)))
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let suffix = eval_plan_row_bytes_with_stack(plan, list_state, row, suffix, stack)?;
+            Ok(JsonValue::Bool(bytes.ends_with(&suffix)))
+        }
+        PlanRowExpression::BytesEqual { left, right } => {
+            let left = eval_plan_row_bytes_with_stack(plan, list_state, row, left, stack)?;
+            let right = eval_plan_row_bytes_with_stack(plan, list_state, row, right, stack)?;
+            Ok(JsonValue::Bool(left == right))
+        }
         PlanRowExpression::NumberInfix { op, left, right } => {
             let left_value =
                 eval_plan_row_expression_with_stack(plan, list_state, row, left, stack)?;
@@ -11809,60 +12457,6 @@ fn eval_plan_row_builtin_call(
 ) -> RuntimeResult<JsonValue> {
     match function {
         "Text/empty" => Ok(JsonValue::String(String::new())),
-        "Text/to_bytes" => {
-            let text =
-                eval_plan_row_text_input_or_arg(plan, list_state, row, input, args, "text", stack)?;
-            let encoding = eval_plan_row_text_arg(plan, list_state, row, args, "encoding", stack)
-                .unwrap_or_else(|_| "Utf8".to_owned());
-            let bytes = row_text_to_bytes(&text, &encoding);
-            Ok(row_private_bytes_json(&bytes))
-        }
-        "Bytes/length" => {
-            let bytes =
-                eval_plan_row_bytes_input_or_arg(plan, list_state, row, input, args, stack)?;
-            i64::try_from(bytes.len())
-                .map(JsonValue::from)
-                .map_err(|_| "row Bytes/length exceeds Boon NUMBER".into())
-        }
-        "Bytes/get" => {
-            let bytes =
-                eval_plan_row_bytes_input_or_arg(plan, list_state, row, input, args, stack)?;
-            let index = eval_plan_row_number_arg(plan, list_state, row, args, "index", stack)?
-                .max(0) as usize;
-            bytes
-                .get(index)
-                .copied()
-                .map(JsonValue::from)
-                .ok_or_else(|| format!("row Bytes/get index {index} is out of bounds").into())
-        }
-        "Bytes/slice" => {
-            let bytes =
-                eval_plan_row_bytes_input_or_arg(plan, list_state, row, input, args, stack)?;
-            let offset = eval_plan_row_number_arg(plan, list_state, row, args, "offset", stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_arg(plan, list_state, row, args, "byte_count", stack)?.max(0)
-                    as usize;
-            let slice = bytes
-                .get(offset..offset.saturating_add(byte_count))
-                .ok_or_else(|| "row Bytes/slice out of bounds".to_owned())?
-                .to_vec();
-            Ok(row_private_bytes_json(&slice))
-        }
-        "Bytes/find" => {
-            let haystack =
-                eval_plan_row_bytes_input_or_arg(plan, list_state, row, input, args, stack)?;
-            let needle = eval_plan_row_bytes_arg(plan, list_state, row, args, "needle", stack)?;
-            Ok(bytes_find(&haystack, &needle)
-                .map(|index| json!(index as i64))
-                .unwrap_or_else(|| JsonValue::String("NaN".to_owned())))
-        }
-        "Bytes/starts_with" => {
-            let bytes =
-                eval_plan_row_bytes_input_or_arg(plan, list_state, row, input, args, stack)?;
-            let prefix = eval_plan_row_bytes_arg(plan, list_state, row, args, "prefix", stack)?;
-            Ok(JsonValue::Bool(bytes.starts_with(&prefix)))
-        }
         "Error/new" => {
             let code = eval_plan_row_text_arg(plan, list_state, row, args, "code", stack)
                 .unwrap_or_else(|_| "error".to_owned());
@@ -11898,11 +12492,12 @@ fn eval_plan_row_builtin_call(
     }
 }
 
-fn row_text_to_bytes(text: &str, encoding: &str) -> Vec<u8> {
+fn row_text_to_bytes(text: &str, encoding: &str) -> RuntimeResult<Vec<u8>> {
     match encoding.to_ascii_lowercase().as_str() {
-        "ascii" if text.is_ascii() => text.as_bytes().to_vec(),
-        "ascii" => Vec::new(),
-        _ => text.as_bytes().to_vec(),
+        "utf8" => Ok(text.as_bytes().to_vec()),
+        "ascii" if text.is_ascii() => Ok(text.as_bytes().to_vec()),
+        "ascii" => Err("row Text/to_bytes input is not ASCII for Ascii encoding".into()),
+        _ => Err(format!("row Text/to_bytes unsupported encoding `{encoding}`").into()),
     }
 }
 
@@ -12533,7 +13128,7 @@ fn generic_source_payload_runtime_bytes(
     event
         .payload_bytes
         .get(field_name)
-        .map(|bytes| RuntimeBytes::inline(Bytes::copy_from_slice(bytes)))
+        .map(|bytes| RuntimeBytes::dynamic(Bytes::from(bytes.clone())))
         .ok_or_else(|| format!("source event is missing `{field_name}` BYTES payload").into())
 }
 
@@ -12545,7 +13140,7 @@ fn source_payload_runtime_bytes(
     event
         .payload_bytes
         .get(field_name)
-        .map(|bytes| RuntimeBytes::inline(Bytes::copy_from_slice(bytes)))
+        .map(|bytes| RuntimeBytes::dynamic(Bytes::from(bytes.clone())))
         .ok_or_else(|| format!("source event is missing `{field_name}` BYTES payload").into())
 }
 
@@ -12939,7 +13534,7 @@ fn source_event_payload_bytes_report(
     let mut payload = serde_json::Map::new();
     let mut artifacts = Vec::new();
     for (field, bytes) in payload_bytes {
-        let runtime_bytes = RuntimeBytes::inline(Bytes::copy_from_slice(bytes));
+        let runtime_bytes = RuntimeBytes::dynamic(Bytes::from(bytes.clone()));
         if bytes.len() <= SOURCE_EVENT_INLINE_BYTES_LIMIT {
             let mut artifact = runtime_bytes.artifact_json();
             if let JsonValue::Object(object) = &mut artifact {
@@ -20391,16 +20986,28 @@ impl ScalarUpdateExpression {
             }),
             "bytes_slice" => Ok(Self::BytesSlice {
                 path: artifact_string_field(object, "path", context)?,
-                offset: artifact_u64_field(object, "offset", context)?,
-                byte_count: artifact_u64_field(object, "byte_count", context)?,
+                offset: BytesScalarArg::Static(artifact_u64_field(object, "offset", context)?),
+                byte_count: BytesScalarArg::Static(artifact_u64_field(
+                    object,
+                    "byte_count",
+                    context,
+                )?),
             }),
             "bytes_take" => Ok(Self::BytesTake {
                 path: artifact_string_field(object, "path", context)?,
-                byte_count: artifact_u64_field(object, "byte_count", context)?,
+                byte_count: BytesScalarArg::Static(artifact_u64_field(
+                    object,
+                    "byte_count",
+                    context,
+                )?),
             }),
             "bytes_drop" => Ok(Self::BytesDrop {
                 path: artifact_string_field(object, "path", context)?,
-                byte_count: artifact_u64_field(object, "byte_count", context)?,
+                byte_count: BytesScalarArg::Static(artifact_u64_field(
+                    object,
+                    "byte_count",
+                    context,
+                )?),
             }),
             "bytes_zeros" => Ok(Self::BytesZeros {
                 byte_count: artifact_u64_field(object, "byte_count", context)?,
@@ -27921,6 +28528,7 @@ struct RuntimeBytes {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeBytesPayload {
     Inline(Bytes),
+    Shared(Bytes),
     BlobRef {
         media_type: String,
         storage: String,
@@ -28019,6 +28627,44 @@ impl RuntimeBytes {
         }
     }
 
+    fn dynamic(bytes: impl Into<Bytes>) -> Self {
+        let bytes = bytes.into();
+        if bytes.len() <= SOURCE_EVENT_INLINE_BYTES_LIMIT {
+            return Self::inline(bytes);
+        }
+        Self {
+            digest: sha256_bytes(bytes.as_ref()),
+            byte_len: bytes.len() as u64,
+            payload: RuntimeBytesPayload::Shared(bytes),
+        }
+    }
+
+    fn dynamic_with_digest(
+        digest: impl Into<String>,
+        byte_len: u64,
+        bytes: Bytes,
+    ) -> RuntimeResult<Self> {
+        if byte_len != bytes.len() as u64 {
+            return Err(format!(
+                "runtime bytes declare byte_len {byte_len} but carry {} byte(s)",
+                bytes.len()
+            )
+            .into());
+        }
+        if bytes.len() <= SOURCE_EVENT_INLINE_BYTES_LIMIT {
+            return Self::inline_with_digest(digest, byte_len, bytes);
+        }
+        let digest = digest.into();
+        if digest.trim().is_empty() {
+            return Err("runtime bytes must carry a digest".into());
+        }
+        Ok(Self {
+            digest,
+            byte_len,
+            payload: RuntimeBytesPayload::Shared(bytes),
+        })
+    }
+
     fn inline_with_digest(
         digest: impl Into<String>,
         byte_len: u64,
@@ -28093,6 +28739,7 @@ impl RuntimeBytes {
     fn storage_kind(&self) -> &'static str {
         match self.payload {
             RuntimeBytesPayload::Inline(_) => "inline",
+            RuntimeBytesPayload::Shared(_) => "shared",
             RuntimeBytesPayload::BlobRef { .. } => "blob_ref",
             RuntimeBytesPayload::PageRef { .. } => "page_ref",
         }
@@ -28100,7 +28747,7 @@ impl RuntimeBytes {
 
     fn report_json(&self) -> JsonValue {
         match &self.payload {
-            RuntimeBytesPayload::Inline(_) => json!({
+            RuntimeBytesPayload::Inline(_) | RuntimeBytesPayload::Shared(_) => json!({
                 "$boon_type": "BYTES",
                 "storage": self.storage_kind(),
                 "digest": self.digest,
@@ -28157,8 +28804,10 @@ impl RuntimeBytes {
 
     fn artifact_json(&self) -> JsonValue {
         let mut value = self.report_json();
-        if let (RuntimeBytesPayload::Inline(bytes), JsonValue::Object(object)) =
-            (&self.payload, &mut value)
+        if let (
+            RuntimeBytesPayload::Inline(bytes) | RuntimeBytesPayload::Shared(bytes),
+            JsonValue::Object(object),
+        ) = (&self.payload, &mut value)
         {
             object.insert(
                 "inline_bytes".to_owned(),
@@ -28170,7 +28819,7 @@ impl RuntimeBytes {
 
     fn inline_bytes(&self) -> RuntimeResult<&Bytes> {
         match &self.payload {
-            RuntimeBytesPayload::Inline(bytes) => Ok(bytes),
+            RuntimeBytesPayload::Inline(bytes) | RuntimeBytesPayload::Shared(bytes) => Ok(bytes),
             RuntimeBytesPayload::BlobRef { .. } | RuntimeBytesPayload::PageRef { .. } => Err(
                 "BYTES operation requires inline storage until Phase 7 dynamic byte storage lands"
                     .into(),
@@ -28198,6 +28847,21 @@ impl RuntimeBytes {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Self::inline_with_digest(digest, byte_len, Bytes::from(bytes))
+            }
+            "shared" => {
+                let bytes = artifact_array_field(object, "inline_bytes", context)?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let byte = value.as_u64().ok_or_else(|| {
+                            format!("{context}.inline_bytes[{index}] must be a byte")
+                        })?;
+                        u8::try_from(byte).map_err(|_| {
+                            format!("{context}.inline_bytes[{index}] must be in 0..=255")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::dynamic_with_digest(digest, byte_len, Bytes::from(bytes))
             }
             "blob_ref" => Ok(Self {
                 digest,
@@ -28461,6 +29125,31 @@ impl RuntimeListStore {
             && source_identities.iter().all(Option::is_some)
             && source_identities.len() == slot.memory.len()
             && slot.root_source_identities == source_identities)
+    }
+
+    fn root_source_identities_changed(
+        &self,
+        name: &str,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+    ) -> RuntimeResult<bool> {
+        let slot = self
+            .slot(name)
+            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        Ok(slot.root_source_identities != source_identities)
+    }
+
+    fn root_source_identity(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> RuntimeResult<Option<&RootListViewFieldSourceIdentity>> {
+        let slot = self
+            .slot(name)
+            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        Ok(slot
+            .root_source_identities
+            .get(index)
+            .and_then(Option::as_ref))
     }
 
     fn root_identity_epoch(&self, name: &str) -> RuntimeResult<u64> {
@@ -29123,13 +29812,18 @@ impl GenericScheduledRuntime {
         if emitted_mutation {
             stats.emitted_mutation_count = stats.emitted_mutation_count.saturating_add(1);
         }
-        stats.by_path.entry(path.clone()).or_default().record(
-            elapsed_ms,
-            changed,
-            emitted_mutation,
-            changed_read_count,
-            list_view_profile.as_ref(),
-        );
+        if runtime_profile_root_materialization_details_enabled() {
+            stats.by_path.entry(path.clone()).or_default().record(
+                elapsed_ms,
+                changed,
+                emitted_mutation,
+                changed_read_count,
+                list_view_profile.as_ref(),
+            );
+        }
+        if !runtime_profile_root_materialization_samples_enabled() {
+            return;
+        }
         let sample = LiveRuntimeRootMaterializationSample {
             path,
             kind: derived_value_kind_label(kind).to_owned(),
@@ -30534,6 +31228,7 @@ impl GenericScheduledRuntime {
                     };
                     if let Some(index) = input.index {
                         if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
+                            let commit_started = Instant::now();
                             let commit = self.storage.commit_indexed_previous_text_target_source(
                                 &self.scalar_equations,
                                 list,
@@ -30541,6 +31236,8 @@ impl GenericScheduledRuntime {
                                 target,
                                 input.source,
                             )?;
+                            source_action_profile.source_action_indexed_text_commit_ms +=
+                                runtime_elapsed_ms(commit_started);
                             insert_changed_list_field_read_keys(
                                 &mut root_derived_changed_reads,
                                 list,
@@ -30560,6 +31257,7 @@ impl GenericScheduledRuntime {
                                 &mut root_derived_changed_reads,
                                 &mut protected_source_event_root_targets,
                                 &mut observe,
+                                &mut source_action_profile,
                             )?;
                             if mode.materializes_derived() {
                                 materialize_root_derived_after_actions = true;
@@ -30574,6 +31272,7 @@ impl GenericScheduledRuntime {
                             target,
                             input.source,
                         ) {
+                            let commit_started = Instant::now();
                             if let Some(commit) = self.storage.commit_indexed_bytes_source(
                                 &self.scalar_equations,
                                 list,
@@ -30583,6 +31282,8 @@ impl GenericScheduledRuntime {
                                 &input.payload_bytes,
                                 input.seq,
                             )? {
+                                source_action_profile.source_action_indexed_value_commit_ms +=
+                                    runtime_elapsed_ms(commit_started);
                                 insert_changed_list_field_read_keys(
                                     &mut root_derived_changed_reads,
                                     list,
@@ -30603,6 +31304,7 @@ impl GenericScheduledRuntime {
                                         &mut root_derived_changed_reads,
                                         &mut protected_source_event_root_targets,
                                         &mut observe,
+                                        &mut source_action_profile,
                                     )?;
                                 if mode.materializes_derived() {
                                     materialize_root_derived_after_actions = true;
@@ -30611,42 +31313,50 @@ impl GenericScheduledRuntime {
                                     materialize_root_derived_after_actions = true;
                                 }
                             }
-                        } else if let Some(commit) = self.storage.commit_indexed_text_source(
-                            &self.scalar_equations,
-                            list,
-                            index,
-                            target,
-                            input.source,
-                            input.key,
-                            input.text,
-                            input.address,
-                            &input.payload,
-                        )? {
-                            insert_changed_list_field_read_keys(
-                                &mut root_derived_changed_reads,
+                        } else {
+                            let commit_started = Instant::now();
+                            let commit = self.storage.commit_indexed_text_source(
+                                &self.scalar_equations,
                                 list,
                                 index,
-                                row_local_field_name(target),
-                            );
-                            let row_key = commit.key;
-                            let row_generation = commit.generation;
-                            let field = commit.field.clone();
-                            observe(GenericSourceMutation::TextField(commit))?;
-                            let root_transform_changed = self.apply_indexed_row_commit_followups(
-                                &input,
-                                list,
-                                row_key,
-                                row_generation,
-                                &field,
-                                &mut root_derived_changed_reads,
-                                &mut protected_source_event_root_targets,
-                                &mut observe,
+                                target,
+                                input.source,
+                                input.key,
+                                input.text,
+                                input.address,
+                                &input.payload,
                             )?;
-                            if mode.materializes_derived() {
-                                materialize_root_derived_after_actions = true;
-                            }
-                            if root_transform_changed && mode.materializes_derived() {
-                                materialize_root_derived_after_actions = true;
+                            source_action_profile.source_action_indexed_text_commit_ms +=
+                                runtime_elapsed_ms(commit_started);
+                            if let Some(commit) = commit {
+                                insert_changed_list_field_read_keys(
+                                    &mut root_derived_changed_reads,
+                                    list,
+                                    index,
+                                    row_local_field_name(target),
+                                );
+                                let row_key = commit.key;
+                                let row_generation = commit.generation;
+                                let field = commit.field.clone();
+                                observe(GenericSourceMutation::TextField(commit))?;
+                                let root_transform_changed = self
+                                    .apply_indexed_row_commit_followups(
+                                        &input,
+                                        list,
+                                        row_key,
+                                        row_generation,
+                                        &field,
+                                        &mut root_derived_changed_reads,
+                                        &mut protected_source_event_root_targets,
+                                        &mut observe,
+                                        &mut source_action_profile,
+                                    )?;
+                                if mode.materializes_derived() {
+                                    materialize_root_derived_after_actions = true;
+                                }
+                                if root_transform_changed && mode.materializes_derived() {
+                                    materialize_root_derived_after_actions = true;
+                                }
                             }
                         }
                     } else if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none()
@@ -30703,6 +31413,7 @@ impl GenericScheduledRuntime {
                                 target,
                                 input.source,
                             ) {
+                                let commit_started = Instant::now();
                                 if let Some(commit) = self.storage.commit_indexed_bytes_source(
                                     &self.scalar_equations,
                                     list,
@@ -30712,6 +31423,8 @@ impl GenericScheduledRuntime {
                                     &input.payload_bytes,
                                     input.seq,
                                 )? {
+                                    source_action_profile.source_action_indexed_value_commit_ms +=
+                                        runtime_elapsed_ms(commit_started);
                                     rows_touched = rows_touched.saturating_add(1);
                                     insert_changed_list_field_read_keys(
                                         &mut root_derived_changed_reads,
@@ -30733,30 +31446,37 @@ impl GenericScheduledRuntime {
                                             &mut root_derived_changed_reads,
                                             &mut protected_source_event_root_targets,
                                             &mut observe,
+                                            &mut source_action_profile,
                                         )?;
                                     if root_transform_changed && mode.materializes_derived() {
                                         materialize_root_derived_after_actions = true;
                                     }
                                 }
-                            } else if let Some(commit) = self.storage.commit_indexed_text_source(
-                                &self.scalar_equations,
-                                list,
-                                index,
-                                target,
-                                input.source,
-                                input.key,
-                                input.text,
-                                input.address,
-                                &input.payload,
-                            )? {
-                                rows_touched = rows_touched.saturating_add(1);
-                                insert_changed_list_field_read_keys(
-                                    &mut root_derived_changed_reads,
+                            } else {
+                                let commit_started = Instant::now();
+                                let commit = self.storage.commit_indexed_text_source(
+                                    &self.scalar_equations,
                                     list,
                                     index,
-                                    row_local_field_name(target),
-                                );
-                                observe(GenericSourceMutation::TextField(commit))?;
+                                    target,
+                                    input.source,
+                                    input.key,
+                                    input.text,
+                                    input.address,
+                                    &input.payload,
+                                )?;
+                                source_action_profile.source_action_indexed_text_commit_ms +=
+                                    runtime_elapsed_ms(commit_started);
+                                if let Some(commit) = commit {
+                                    rows_touched = rows_touched.saturating_add(1);
+                                    insert_changed_list_field_read_keys(
+                                        &mut root_derived_changed_reads,
+                                        list,
+                                        index,
+                                        row_local_field_name(target),
+                                    );
+                                    observe(GenericSourceMutation::TextField(commit))?;
+                                }
                             }
                         }
                         route_execution.push_scan_sample(
@@ -30788,6 +31508,7 @@ impl GenericScheduledRuntime {
                         .into());
                     }
                     if let Some(index) = input.index {
+                        let commit_started = Instant::now();
                         if let Some(commit) = self.storage.commit_indexed_value_source(
                             &self.scalar_equations,
                             list,
@@ -30797,6 +31518,8 @@ impl GenericScheduledRuntime {
                             &input.payload_bytes,
                             input.seq,
                         )? {
+                            source_action_profile.source_action_indexed_value_commit_ms +=
+                                runtime_elapsed_ms(commit_started);
                             insert_changed_list_field_read_keys(
                                 &mut root_derived_changed_reads,
                                 list,
@@ -30816,6 +31539,7 @@ impl GenericScheduledRuntime {
                                 &mut root_derived_changed_reads,
                                 &mut protected_source_event_root_targets,
                                 &mut observe,
+                                &mut source_action_profile,
                             )?;
                             if mode.materializes_derived() {
                                 materialize_root_derived_after_actions = true;
@@ -30834,6 +31558,7 @@ impl GenericScheduledRuntime {
                         rows_scanned = rows_scanned.saturating_add(row_count);
                         let mut rows_touched = 0usize;
                         for index in 0..row_count {
+                            let commit_started = Instant::now();
                             if let Some(commit) = self.storage.commit_indexed_value_source(
                                 &self.scalar_equations,
                                 list,
@@ -30843,6 +31568,8 @@ impl GenericScheduledRuntime {
                                 &input.payload_bytes,
                                 input.seq,
                             )? {
+                                source_action_profile.source_action_indexed_value_commit_ms +=
+                                    runtime_elapsed_ms(commit_started);
                                 rows_touched = rows_touched.saturating_add(1);
                                 insert_changed_list_field_read_keys(
                                     &mut root_derived_changed_reads,
@@ -30883,6 +31610,7 @@ impl GenericScheduledRuntime {
                     }
                     let source_row_text_values = self.source_row_text_values_for_input(&input)?;
                     if let Some(index) = input.index {
+                        let commit_started = Instant::now();
                         let commit = self.storage.commit_indexed_bool_source(
                             &self.scalar_equations,
                             list,
@@ -30895,6 +31623,8 @@ impl GenericScheduledRuntime {
                             read_extra_bool,
                             |path| source_row_text_values.get(path).cloned(),
                         )?;
+                        source_action_profile.source_action_indexed_bool_commit_ms +=
+                            runtime_elapsed_ms(commit_started);
                         self.invalidate_count_cache_for_list(list);
                         insert_changed_list_field_read_keys(
                             &mut root_derived_changed_reads,
@@ -30912,6 +31642,7 @@ impl GenericScheduledRuntime {
                             input.source,
                             "bool action",
                         )?;
+                        let commit_started = Instant::now();
                         let row_count = self.storage.commit_each_indexed_bool_source(
                             &self.scalar_equations,
                             list,
@@ -30927,6 +31658,8 @@ impl GenericScheduledRuntime {
                                 Ok(())
                             },
                         )?;
+                        source_action_profile.source_action_indexed_bool_commit_ms +=
+                            runtime_elapsed_ms(commit_started);
                         self.invalidate_count_cache_for_list(list);
                         rows_scanned = rows_scanned.saturating_add(row_count);
                         route_execution.push_scan_sample(
@@ -31306,12 +32039,18 @@ impl GenericScheduledRuntime {
         root_derived_changed_reads: &mut BTreeSet<GenericReadKey>,
         protected_source_event_root_targets: &mut BTreeSet<String>,
         observe: &mut impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+        source_action_profile: &mut LiveRuntimeStepProfile,
     ) -> RuntimeResult<bool> {
+        let followup_started = Instant::now();
         if let Some(index) = self.storage.bound_index(list, key, generation)? {
+            let invalidation_started = Instant::now();
             let mut changed_reads = BTreeSet::new();
             insert_changed_list_field_read_keys(&mut changed_reads, list, index, changed_field);
             self.invalidate_derived_value_caches_for_reads(changed_reads);
+            source_action_profile.source_action_indexed_followup_invalidation_ms +=
+                runtime_elapsed_ms(invalidation_started);
         }
+        let root_transform_started = Instant::now();
         let mut changed = self.apply_row_field_root_source_event_transforms(
             input,
             changed_field,
@@ -31319,6 +32058,9 @@ impl GenericScheduledRuntime {
             protected_source_event_root_targets,
             observe,
         )?;
+        source_action_profile.source_action_indexed_followup_root_transform_ms +=
+            runtime_elapsed_ms(root_transform_started);
+        let triggered_transform_started = Instant::now();
         changed |= self.apply_triggered_indexed_source_event_root_transforms(
             input,
             list,
@@ -31328,8 +32070,23 @@ impl GenericScheduledRuntime {
             protected_source_event_root_targets,
             observe,
         )?;
+        source_action_profile.source_action_indexed_followup_triggered_transform_ms +=
+            runtime_elapsed_ms(triggered_transform_started);
         let last_recomputed_before = self.generic_derived_state.last_recomputed.len();
-        let row_materializations = self.recompute_generic_derived_for_row(list, key, generation)?;
+        let row_recompute_started = Instant::now();
+        let row_materializations = self.recompute_generic_derived_for_row_after_field_change(
+            input,
+            list,
+            key,
+            generation,
+            changed_field,
+        )?;
+        source_action_profile.source_action_indexed_followup_row_recompute_ms +=
+            runtime_elapsed_ms(row_recompute_started);
+        source_action_profile.source_action_indexed_followup_row_materialization_count =
+            source_action_profile
+                .source_action_indexed_followup_row_materialization_count
+                .saturating_add(row_materializations.len());
         self.last_source_action_recomputed_keys.extend(
             self.generic_derived_state.last_recomputed[last_recomputed_before..]
                 .iter()
@@ -31349,6 +32106,8 @@ impl GenericScheduledRuntime {
                 observe,
             )?;
         }
+        source_action_profile.source_action_indexed_followup_ms +=
+            runtime_elapsed_ms(followup_started);
         Ok(changed)
     }
 
@@ -31445,6 +32204,132 @@ impl GenericScheduledRuntime {
             if let (Some(materialization), _) =
                 self.recompute_generic_derived_key_value(&key, &[])?
             {
+                materializations.push(materialization);
+            }
+        }
+        Ok(materializations)
+    }
+
+    fn recompute_generic_derived_for_row_after_field_change(
+        &mut self,
+        input: &GenericSourceActionInput<'_>,
+        list: &str,
+        key: u64,
+        generation: u64,
+        changed_field: &str,
+    ) -> RuntimeResult<Vec<GenericValueFieldMaterialization<'static>>> {
+        let Some(index) = self.storage.bound_index(list, key, generation)? else {
+            return Ok(Vec::new());
+        };
+        let mut changed_reads = BTreeSet::new();
+        insert_changed_list_field_read_keys(&mut changed_reads, list, index, changed_field);
+        self.invalidate_derived_value_caches_for_reads(changed_reads.iter().cloned());
+        if !self.indexed_row_dependency_state_complete(list, index) {
+            return self.recompute_generic_derived_for_row(list, key, generation);
+        }
+        let dirty = self
+            .generic_derived_state
+            .dependents_for_reads(changed_reads.iter().cloned())
+            .into_iter()
+            .filter(|candidate| candidate.list == list && candidate.index == index)
+            .collect::<BTreeSet<_>>();
+        let mut dirty = dirty;
+        dirty.extend(self.triggered_indexed_source_event_keys_for_row(input, list, index));
+        self.recompute_generic_derived_dirty_row_keys(dirty, &changed_reads)
+    }
+
+    fn indexed_row_dependency_state_complete(&self, list: &str, index: usize) -> bool {
+        let fields = self
+            .generic_derived
+            .indexed_fields
+            .iter()
+            .filter(|field| {
+                field.list == list && field.kind != DerivedValueKind::SourceEventTransform
+            })
+            .map(|field| field.field.as_str())
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return true;
+        }
+        fields.into_iter().all(|field| {
+            self.generic_derived_state
+                .reads_by_field
+                .contains_key(&GenericDerivedKey {
+                    list: list.to_owned(),
+                    index,
+                    field: field.to_owned(),
+                })
+        })
+    }
+
+    fn triggered_indexed_source_event_keys_for_row(
+        &self,
+        input: &GenericSourceActionInput<'_>,
+        list: &str,
+        index: usize,
+    ) -> Vec<GenericDerivedKey> {
+        self.generic_derived
+            .indexed_fields
+            .iter()
+            .filter(|field| {
+                field.list == list && field.kind == DerivedValueKind::SourceEventTransform
+            })
+            .filter(|field| {
+                let exprs =
+                    statement_ast_exprs(&field.statement, &self.generic_derived.expressions);
+                source_event_transform_triggered_by_input(
+                    &exprs,
+                    input.source,
+                    input.key,
+                    input.text,
+                    input.address,
+                    &input.payload,
+                )
+            })
+            .map(|field| GenericDerivedKey {
+                list: list.to_owned(),
+                index,
+                field: field.field.clone(),
+            })
+            .collect()
+    }
+
+    fn recompute_generic_derived_dirty_row_keys(
+        &mut self,
+        mut dirty: BTreeSet<GenericDerivedKey>,
+        changed_reads_for_skip: &BTreeSet<GenericReadKey>,
+    ) -> RuntimeResult<Vec<GenericValueFieldMaterialization<'static>>> {
+        let mut materializations = Vec::new();
+        let mut guard = 0usize;
+        while let Some(key) = dirty.iter().next().cloned() {
+            dirty.remove(&key);
+            if self
+                .storage
+                .list_len(&key.list)
+                .is_ok_and(|len| key.index >= len)
+            {
+                continue;
+            }
+            guard += 1;
+            if guard > 20_000 {
+                return Err("generic derived row recompute budget exhausted".into());
+            }
+            if self.can_skip_generic_derived_key_for_changed_reads(&key, changed_reads_for_skip) {
+                continue;
+            }
+            let (materialization, _) = self.recompute_generic_derived_key_value(&key, &[])?;
+            if let Some(materialization) = materialization {
+                self.invalidate_derived_value_caches_for_reads(
+                    materialization.changed_reads.iter().cloned(),
+                );
+                for dependent in self
+                    .generic_derived_state
+                    .dependents_for_reads(materialization.changed_reads.iter().cloned())
+                {
+                    if dependent != key {
+                        dirty.insert(dependent);
+                    }
+                }
                 materializations.push(materialization);
             }
         }
@@ -32092,7 +32977,13 @@ impl GenericScheduledRuntime {
         let mut materializations = Vec::new();
         let mut guard = 0usize;
         loop {
+            let ready_refresh_started = source_action_profile.as_ref().map(|_| Instant::now());
             self.remove_structured_child_ready_roots(&dirty, &mut ready_dirty);
+            if let Some(profile) = source_action_profile.as_deref_mut()
+                && let Some(started) = ready_refresh_started
+            {
+                profile.source_action_root_dirty_ready_refresh_ms += runtime_elapsed_ms(started);
+            }
             let pop_started = source_action_profile.as_ref().map(|_| Instant::now());
             let next_path = self.generic_derived_state.pop_next_root_dirty(
                 &mut dirty,
@@ -32205,6 +33096,9 @@ impl GenericScheduledRuntime {
                             entry.unchanged_materialization_count.saturating_add(1);
                     }
                 }
+                let record_sample_started = source_action_profile
+                    .as_ref()
+                    .map(|_| (Instant::now(), runtime_thread_cpu_ms()));
                 self.record_root_materialization_sample(
                     path.clone(),
                     &field.kind,
@@ -32212,8 +33106,22 @@ impl GenericScheduledRuntime {
                     changed,
                     false,
                     changed_read_count,
-                    Some(result.profile),
+                    result.profile,
                 );
+                if let Some(profile) = source_action_profile.as_deref_mut()
+                    && let Some((started, cpu_started)) = record_sample_started
+                {
+                    let wall_ms = runtime_elapsed_ms(started);
+                    profile.source_action_root_record_sample_ms += wall_ms;
+                    if let Some(cpu_ms) = cpu_started
+                        .zip(runtime_thread_cpu_ms())
+                        .map(|(start, end)| saturating_f64_sub(end, start))
+                    {
+                        profile.source_action_root_record_sample_cpu_ms += cpu_ms;
+                        profile.source_action_root_record_sample_wall_minus_cpu_ms +=
+                            saturating_f64_sub(wall_ms, cpu_ms);
+                    }
+                }
                 if changed {
                     if let Some(profile) = source_action_profile.as_deref_mut() {
                         profile.source_action_root_changed_materialization_count = profile
@@ -32231,12 +33139,20 @@ impl GenericScheduledRuntime {
                         profile.source_action_root_cache_invalidation_ms += elapsed_ms;
                         profile.source_action_root_changed_cache_invalidation_ms += elapsed_ms;
                     }
-                    for pruned in self.prune_structured_child_dirty_roots_for_changed_reads(
+                    let prune_started = source_action_profile.as_ref().map(|_| Instant::now());
+                    let pruned_roots = self.prune_structured_child_dirty_roots_for_changed_reads(
                         &mut dirty,
                         &mut dirty_root_read_key_counts,
                         &mut ready_dirty,
                         &changed_reads,
-                    ) {
+                    );
+                    if let Some(profile) = source_action_profile.as_deref_mut()
+                        && let Some(started) = prune_started
+                    {
+                        profile.source_action_root_prune_structured_ms +=
+                            runtime_elapsed_ms(started);
+                    }
+                    for pruned in pruned_roots {
                         removed_root_value_cache.remove(&pruned);
                         self.generic_derived_state.root_value_cache.remove(&pruned);
                         self.generic_derived_state
@@ -32522,6 +33438,9 @@ impl GenericScheduledRuntime {
                         entry.unchanged_materialization_count.saturating_add(1);
                 }
             }
+            let record_sample_started = source_action_profile
+                .as_ref()
+                .map(|_| (Instant::now(), runtime_thread_cpu_ms()));
             self.record_root_materialization_sample(
                 path.clone(),
                 &field.kind,
@@ -32531,6 +33450,20 @@ impl GenericScheduledRuntime {
                 changed_read_count,
                 None,
             );
+            if let Some(profile) = source_action_profile.as_deref_mut()
+                && let Some((started, cpu_started)) = record_sample_started
+            {
+                let wall_ms = runtime_elapsed_ms(started);
+                profile.source_action_root_record_sample_ms += wall_ms;
+                if let Some(cpu_ms) = cpu_started
+                    .zip(runtime_thread_cpu_ms())
+                    .map(|(start, end)| saturating_f64_sub(end, start))
+                {
+                    profile.source_action_root_record_sample_cpu_ms += cpu_ms;
+                    profile.source_action_root_record_sample_wall_minus_cpu_ms +=
+                        saturating_f64_sub(wall_ms, cpu_ms);
+                }
+            }
             let Some(materialization) = materialization else {
                 continue;
             };
@@ -32556,12 +33489,19 @@ impl GenericScheduledRuntime {
                 profile.source_action_root_cache_invalidation_ms += elapsed_ms;
                 profile.source_action_root_changed_cache_invalidation_ms += elapsed_ms;
             }
-            for pruned in self.prune_structured_child_dirty_roots_for_changed_reads(
+            let prune_started = source_action_profile.as_ref().map(|_| Instant::now());
+            let pruned_roots = self.prune_structured_child_dirty_roots_for_changed_reads(
                 &mut dirty,
                 &mut dirty_root_read_key_counts,
                 &mut ready_dirty,
                 &materialization_changed_reads,
-            ) {
+            );
+            if let Some(profile) = source_action_profile.as_deref_mut()
+                && let Some(started) = prune_started
+            {
+                profile.source_action_root_prune_structured_ms += runtime_elapsed_ms(started);
+            }
+            for pruned in pruned_roots {
                 removed_root_value_cache.remove(&pruned);
                 self.generic_derived_state.root_value_cache.remove(&pruned);
                 self.generic_derived_state
@@ -34158,7 +35098,7 @@ impl GenericScheduledRuntime {
         Ok(RootListViewFieldOnlyOutcome::Applied(
             RootListViewMaterializationResult {
                 changed_reads,
-                profile,
+                profile: Some(profile),
             },
         ))
     }
@@ -34424,7 +35364,7 @@ impl GenericScheduledRuntime {
         };
         Ok(Some(RootListViewMaterializationResult {
             changed_reads,
-            profile,
+            profile: Some(profile),
         }))
     }
 
@@ -34587,14 +35527,17 @@ impl GenericScheduledRuntime {
         );
         let source_column_reads_ms = runtime_elapsed_ms(source_column_reads_started);
         let root_read_commit_started = Instant::now();
-        self.generic_derived_state
-            .replace_root_reads(field.path.clone(), reads);
-        self.generic_derived_state.root_value_cache.insert(
-            field.path.clone(),
-            BoonValue::ListRef(target_list.to_owned()),
-        );
+        let root_read_replace_started = Instant::now();
+        let root_read_replacement_profile = self
+            .generic_derived_state
+            .replace_root_reads_profiled(field.path.clone(), reads);
+        let root_read_replace_total_ms = runtime_elapsed_ms(root_read_replace_started);
+        let root_value_cache_insert_ms = 0.0;
+        let root_value_cache_insert_changed = false;
+        let root_numeric_guard_remove_started = Instant::now();
         self.generic_derived_state
             .remove_root_numeric_stability_guards(&field.path);
+        let root_numeric_guard_remove_ms = runtime_elapsed_ms(root_numeric_guard_remove_started);
         let root_read_commit_ms = runtime_elapsed_ms(root_read_commit_started);
 
         let previous_snapshot_started = Instant::now();
@@ -34604,6 +35547,37 @@ impl GenericScheduledRuntime {
         let changed =
             self.root_list_view_changed_reads(&field.path, target_list, &previous_rows, &rows);
         let diff_ms = runtime_elapsed_ms(diff_started);
+        let source_identity_changed = self
+            .storage
+            .root_source_identities_changed(target_list, &source_identities)?;
+        if !runtime_root_list_view_profile_enabled() {
+            if changed.changed_reads.is_empty() && !source_identity_changed {
+                return Ok(Some(RootListViewMaterializationResult {
+                    changed_reads: BTreeSet::new(),
+                    profile: None,
+                }));
+            }
+            let changed_reads = if source_identity_changed && changed.changed_reads.is_empty() {
+                self.root_list_view_broad_changed_read_keys(&field.path, target_list)
+            } else {
+                changed.changed_reads
+            };
+            self.clear_indexed_lookup_cache();
+            let patched_in_place = self
+                .storage
+                .replace_or_patch_list_rows_with_root_source_identities(
+                    target_list,
+                    rows,
+                    source_identities,
+                )?;
+            if !patched_in_place {
+                self.rebind_list_sources(target_list)?;
+            }
+            return Ok(Some(RootListViewMaterializationResult {
+                changed_reads,
+                profile: None,
+            }));
+        }
         let (
             current_dirty_root_read_count,
             current_dirty_list_read_count,
@@ -34708,6 +35682,19 @@ impl GenericScheduledRuntime {
                 row_snapshot_ms: row_materialize_ms,
                 source_column_reads_ms,
                 root_read_commit_ms,
+                root_read_commit_changed: root_read_replacement_profile.changed,
+                root_read_replace_total_ms,
+                root_read_previous_count: root_read_replacement_profile.previous_read_count,
+                root_read_new_count: root_read_replacement_profile.new_read_count,
+                root_read_removed_count: root_read_replacement_profile.removed_count,
+                root_read_added_count: root_read_replacement_profile.added_count,
+                root_read_compare_ms: root_read_replacement_profile.compare_ms,
+                root_read_diff_ms: root_read_replacement_profile.diff_ms,
+                root_read_edge_update_ms: root_read_replacement_profile.edge_update_ms,
+                root_read_store_ms: root_read_replacement_profile.store_ms,
+                root_value_cache_insert_ms,
+                root_value_cache_insert_changed,
+                root_numeric_guard_remove_ms,
                 previous_snapshot_ms,
                 diff_ms,
                 replace_ms: 0.0,
@@ -34722,12 +35709,17 @@ impl GenericScheduledRuntime {
             }),
             field_profiles: Vec::new(),
         };
-        if changed.changed_reads.is_empty() {
+        if changed.changed_reads.is_empty() && !source_identity_changed {
             return Ok(Some(RootListViewMaterializationResult {
                 changed_reads: BTreeSet::new(),
-                profile,
+                profile: Some(profile),
             }));
         }
+        let changed_reads = if source_identity_changed && changed.changed_reads.is_empty() {
+            self.root_list_view_broad_changed_read_keys(&field.path, target_list)
+        } else {
+            changed.changed_reads
+        };
         let replace_started = Instant::now();
         self.clear_indexed_lookup_cache();
         let patched_in_place = self
@@ -34753,8 +35745,8 @@ impl GenericScheduledRuntime {
             profile.in_place_patch_row_count = profile.row_count;
         }
         Ok(Some(RootListViewMaterializationResult {
-            changed_reads: changed.changed_reads,
-            profile,
+            changed_reads,
+            profile: Some(profile),
         }))
     }
 
@@ -34958,6 +35950,9 @@ impl GenericScheduledRuntime {
         } else {
             root_source_identities
         };
+        let source_identity_changed = self
+            .storage
+            .root_source_identities_changed(&list, &root_source_identities)?;
         let (
             current_dirty_root_read_count,
             current_dirty_list_read_count,
@@ -35062,12 +36057,17 @@ impl GenericScheduledRuntime {
             direct_find_profile: None,
             field_profiles,
         };
-        if changed.changed_reads.is_empty() {
+        if changed.changed_reads.is_empty() && !source_identity_changed {
             return Ok(RootListViewMaterializationResult {
                 changed_reads: BTreeSet::new(),
-                profile,
+                profile: Some(profile),
             });
         }
+        let changed_reads = if source_identity_changed && changed.changed_reads.is_empty() {
+            self.root_list_view_broad_changed_read_keys(&field.path, &list)
+        } else {
+            changed.changed_reads
+        };
         let replace_started = Instant::now();
         self.clear_indexed_lookup_cache();
         let patched_in_place = self
@@ -35087,8 +36087,8 @@ impl GenericScheduledRuntime {
             profile.in_place_patch_row_count = profile.row_count;
         }
         Ok(RootListViewMaterializationResult {
-            changed_reads: changed.changed_reads,
-            profile,
+            changed_reads,
+            profile: Some(profile),
         })
     }
 
@@ -36746,8 +37746,16 @@ impl GenericScheduledRuntime {
             profile.user_function_arg_eval_ms += runtime_elapsed_ms(arg_eval_started);
         });
         let cache_key_started = Instant::now();
-        let cache_key =
-            runtime_generic_function_cache_key(&definition, frame, input.as_ref(), &resolved_args);
+        let free_names = self.runtime_function_free_env_names(&definition);
+        let arg_accesses = self.runtime_function_arg_accesses(&definition);
+        let cache_key = self.runtime_generic_function_cache_key(
+            &definition,
+            frame,
+            input.as_ref(),
+            &resolved_args,
+            &free_names,
+            &arg_accesses,
+        )?;
         with_root_list_view_attribution(frame, |profile| {
             profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
         });
@@ -42177,6 +43185,45 @@ impl GenericScheduledRuntime {
         free
     }
 
+    fn runtime_function_free_env_names(
+        &mut self,
+        definition: &RuntimeGenericFunction,
+    ) -> BTreeSet<String> {
+        if let Some(names) = self
+            .generic_derived_state
+            .runtime_function_free_names_cache
+            .get(&definition.name)
+        {
+            return names.clone();
+        }
+        let mut visiting = BTreeSet::new();
+        let names = self.runtime_function_free_env_names_uncached(definition, &mut visiting);
+        self.generic_derived_state
+            .runtime_function_free_names_cache
+            .insert(definition.name.clone(), names.clone());
+        names
+    }
+
+    fn runtime_function_free_env_names_uncached(
+        &self,
+        definition: &RuntimeGenericFunction,
+        visiting: &mut BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        if !visiting.insert(definition.name.clone()) {
+            return BTreeSet::new();
+        }
+        let mut bound = definition.args.iter().cloned().collect::<BTreeSet<_>>();
+        let mut free = BTreeSet::new();
+        self.collect_runtime_statement_free_names(
+            &definition.statement,
+            &mut bound,
+            &mut free,
+            visiting,
+        );
+        visiting.remove(&definition.name);
+        free
+    }
+
     fn function_arg_accesses(
         &mut self,
         definition: &FunctionDefinition,
@@ -42206,6 +43253,43 @@ impl GenericScheduledRuntime {
             .map(|arg| (arg.clone(), FunctionArgAccess::default()))
             .collect::<BTreeMap<_, _>>();
         self.collect_statement_arg_accesses(
+            &definition.statement,
+            &args,
+            &mut shadowed,
+            &mut accesses,
+        );
+        accesses
+    }
+
+    fn runtime_function_arg_accesses(
+        &mut self,
+        definition: &RuntimeGenericFunction,
+    ) -> BTreeMap<String, FunctionArgAccess> {
+        if let Some(accesses) = self
+            .generic_derived_state
+            .runtime_function_arg_accesses_cache
+            .get(&definition.name)
+        {
+            return accesses.clone();
+        }
+        let accesses = self.runtime_function_arg_accesses_uncached(definition);
+        self.generic_derived_state
+            .runtime_function_arg_accesses_cache
+            .insert(definition.name.clone(), accesses.clone());
+        accesses
+    }
+
+    fn runtime_function_arg_accesses_uncached(
+        &self,
+        definition: &RuntimeGenericFunction,
+    ) -> BTreeMap<String, FunctionArgAccess> {
+        let args = definition.args.iter().cloned().collect::<BTreeSet<_>>();
+        let mut shadowed = BTreeSet::new();
+        let mut accesses = args
+            .iter()
+            .map(|arg| (arg.clone(), FunctionArgAccess::default()))
+            .collect::<BTreeMap<_, _>>();
+        self.collect_runtime_statement_arg_accesses(
             &definition.statement,
             &args,
             &mut shadowed,
@@ -42384,6 +43468,176 @@ impl GenericScheduledRuntime {
         }
     }
 
+    fn collect_runtime_statement_arg_accesses(
+        &self,
+        statement: &RuntimeGenericStatement,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+    ) {
+        match statement {
+            RuntimeGenericStatement::Empty => {}
+            RuntimeGenericStatement::Expr(expr) => {
+                self.collect_runtime_expr_arg_accesses(expr, args, shadowed, accesses);
+            }
+            RuntimeGenericStatement::Binding { name, value } => {
+                self.collect_runtime_statement_arg_accesses(value, args, shadowed, accesses);
+                if args.contains(name) {
+                    shadowed.insert(name.clone());
+                }
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                self.collect_runtime_expr_arg_accesses(expr, args, shadowed, accesses);
+                for child in children {
+                    self.collect_runtime_statement_arg_accesses(child, args, shadowed, accesses);
+                }
+            }
+            RuntimeGenericStatement::Block(statements)
+            | RuntimeGenericStatement::List(statements)
+            | RuntimeGenericStatement::Latest(statements) => {
+                for child in statements {
+                    self.collect_runtime_statement_arg_accesses(child, args, shadowed, accesses);
+                    if let RuntimeGenericStatement::Binding { name, .. } = child
+                        && args.contains(name)
+                    {
+                        shadowed.insert(name.clone());
+                    }
+                }
+            }
+            RuntimeGenericStatement::Record(fields) => {
+                for field in fields {
+                    self.collect_runtime_statement_arg_accesses(
+                        &field.value,
+                        args,
+                        shadowed,
+                        accesses,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_runtime_expr_arg_accesses(
+        &self,
+        expr: &RuntimeGenericExpr,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+    ) {
+        match expr {
+            RuntimeGenericExpr::Identifier(value) => {
+                if args.contains(value)
+                    && !shadowed.contains(value)
+                    && let Some(access) = accesses.get_mut(value)
+                {
+                    access.whole_value = true;
+                }
+            }
+            RuntimeGenericExpr::Path(parts) => {
+                if let Some(first) = parts.first()
+                    && args.contains(first)
+                    && !shadowed.contains(first)
+                    && let Some(access) = accesses.get_mut(first)
+                {
+                    if parts.len() == 1 {
+                        access.whole_value = true;
+                    } else {
+                        access.fields.insert(parts[1..].join("."));
+                    }
+                }
+            }
+            RuntimeGenericExpr::TaggedObject { fields, .. }
+            | RuntimeGenericExpr::Record(fields) => {
+                for field in fields {
+                    self.collect_runtime_expr_arg_accesses(&field.value, args, shadowed, accesses);
+                }
+            }
+            RuntimeGenericExpr::Call {
+                function,
+                args: call_args,
+            } => {
+                self.collect_runtime_call_arg_accesses(
+                    function, None, call_args, args, shadowed, accesses,
+                );
+            }
+            RuntimeGenericExpr::Pipe {
+                input,
+                op,
+                args: call_args,
+            } => {
+                self.collect_runtime_call_arg_accesses(
+                    op,
+                    Some(input),
+                    call_args,
+                    args,
+                    shadowed,
+                    accesses,
+                );
+            }
+            RuntimeGenericExpr::Infix { left, right, .. } => {
+                self.collect_runtime_expr_arg_accesses(left, args, shadowed, accesses);
+                self.collect_runtime_expr_arg_accesses(right, args, shadowed, accesses);
+            }
+            RuntimeGenericExpr::List(items) | RuntimeGenericExpr::Bytes { items, .. } => {
+                for item in items {
+                    self.collect_runtime_expr_arg_accesses(item, args, shadowed, accesses);
+                }
+            }
+            RuntimeGenericExpr::Then { input, output } => {
+                self.collect_runtime_expr_arg_accesses(input, args, shadowed, accesses);
+                if let Some(output) = output {
+                    self.collect_runtime_expr_arg_accesses(output, args, shadowed, accesses);
+                }
+            }
+            RuntimeGenericExpr::When { input } => {
+                self.collect_runtime_expr_arg_accesses(input, args, shadowed, accesses);
+            }
+            RuntimeGenericExpr::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    self.collect_runtime_expr_arg_accesses(output, args, shadowed, accesses);
+                }
+            }
+            RuntimeGenericExpr::Text(_)
+            | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::Bool(_)
+            | RuntimeGenericExpr::Enum(_)
+            | RuntimeGenericExpr::Delimiter => {}
+        }
+    }
+
+    fn collect_runtime_call_arg_accesses(
+        &self,
+        function: &str,
+        input: Option<&RuntimeGenericExpr>,
+        call_args: &[RuntimeGenericArg],
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+    ) {
+        if let Some(input) = input {
+            self.collect_runtime_expr_arg_accesses(input, args, shadowed, accesses);
+        }
+        let binding = runtime_list_call_binding(function, call_args);
+        let inserted_shadow = binding
+            .as_ref()
+            .filter(|binding| args.contains(*binding))
+            .cloned();
+        if let Some(binding) = &inserted_shadow {
+            shadowed.insert(binding.clone());
+        }
+        for arg in call_args {
+            if binding.as_ref().is_some_and(|binding| {
+                arg.name.is_none() && runtime_generic_raw_arg_name(arg).as_ref() == Some(binding)
+            }) {
+                continue;
+            }
+            self.collect_runtime_expr_arg_accesses(&arg.value, args, shadowed, accesses);
+        }
+        if let Some(binding) = inserted_shadow {
+            shadowed.remove(&binding);
+        }
+    }
+
     fn generic_function_cache_key(
         &mut self,
         definition: &FunctionDefinition,
@@ -42400,6 +43654,51 @@ impl GenericScheduledRuntime {
                 + args.len(),
         );
         parts.push(format!("fn:{}", definition.name));
+        if let Some(row) = &frame.row
+            && free_names.contains(&row.row_scope)
+        {
+            parts.push(format!("row:{}:{}", row.list, row.index));
+        }
+        for (name, value) in &frame.env {
+            if free_names.contains(name) {
+                parts.push(format!("env:{name}:{}", boon_value_cache_fragment(value)));
+            }
+        }
+        if let Some(input) = input {
+            let access = definition
+                .args
+                .first()
+                .and_then(|name| arg_accesses.get(name));
+            parts.push(format!(
+                "input:{}",
+                self.function_arg_cache_fragment(input, access, frame)?
+            ));
+        }
+        for (name, value) in args {
+            parts.push(format!(
+                "arg:{name}:{}",
+                self.function_arg_cache_fragment(value, arg_accesses.get(name), frame)?
+            ));
+        }
+        Ok(parts.join("\u{1f}"))
+    }
+
+    fn runtime_generic_function_cache_key(
+        &mut self,
+        definition: &RuntimeGenericFunction,
+        frame: &mut GenericEvalFrame,
+        input: Option<&BoonValue>,
+        args: &[(String, BoonValue)],
+        free_names: &BTreeSet<String>,
+        arg_accesses: &BTreeMap<String, FunctionArgAccess>,
+    ) -> RuntimeResult<String> {
+        let mut parts = Vec::with_capacity(
+            2 + usize::from(frame.row.is_some())
+                + free_names.len()
+                + usize::from(input.is_some())
+                + args.len(),
+        );
+        parts.push(format!("rt-fn:{}", definition.name));
         if let Some(row) = &frame.row
             && free_names.contains(&row.row_scope)
         {
@@ -42618,6 +43917,143 @@ impl GenericScheduledRuntime {
         }
         if let Some(callee) = self.user_function_definition(function) {
             for name in self.function_free_env_names_uncached(&callee, visiting) {
+                if !bound.contains(&name) {
+                    free.insert(name);
+                }
+            }
+        }
+    }
+
+    fn collect_runtime_statement_free_names(
+        &self,
+        statement: &RuntimeGenericStatement,
+        bound: &mut BTreeSet<String>,
+        free: &mut BTreeSet<String>,
+        visiting: &mut BTreeSet<String>,
+    ) {
+        match statement {
+            RuntimeGenericStatement::Empty => {}
+            RuntimeGenericStatement::Expr(expr) => {
+                self.collect_runtime_expr_free_names(expr, bound, free, visiting);
+            }
+            RuntimeGenericStatement::Binding { name, value } => {
+                self.collect_runtime_statement_free_names(value, bound, free, visiting);
+                bound.insert(name.clone());
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                self.collect_runtime_expr_free_names(expr, bound, free, visiting);
+                for child in children {
+                    self.collect_runtime_statement_free_names(child, bound, free, visiting);
+                }
+            }
+            RuntimeGenericStatement::Block(statements)
+            | RuntimeGenericStatement::List(statements)
+            | RuntimeGenericStatement::Latest(statements) => {
+                for child in statements {
+                    self.collect_runtime_statement_free_names(child, bound, free, visiting);
+                    if let RuntimeGenericStatement::Binding { name, .. } = child {
+                        bound.insert(name.clone());
+                    }
+                }
+            }
+            RuntimeGenericStatement::Record(fields) => {
+                for field in fields {
+                    self.collect_runtime_statement_free_names(&field.value, bound, free, visiting);
+                }
+            }
+        }
+    }
+
+    fn collect_runtime_expr_free_names(
+        &self,
+        expr: &RuntimeGenericExpr,
+        bound: &BTreeSet<String>,
+        free: &mut BTreeSet<String>,
+        visiting: &mut BTreeSet<String>,
+    ) {
+        match expr {
+            RuntimeGenericExpr::Identifier(value) => {
+                if !bound.contains(value) {
+                    free.insert(value.clone());
+                }
+            }
+            RuntimeGenericExpr::Path(parts) => {
+                if let Some(first) = parts.first()
+                    && !bound.contains(first)
+                {
+                    free.insert(first.clone());
+                }
+            }
+            RuntimeGenericExpr::TaggedObject { fields, .. }
+            | RuntimeGenericExpr::Record(fields) => {
+                for field in fields {
+                    self.collect_runtime_expr_free_names(&field.value, bound, free, visiting);
+                }
+            }
+            RuntimeGenericExpr::Call { function, args } => {
+                self.collect_runtime_call_free_names(function, None, args, bound, free, visiting);
+            }
+            RuntimeGenericExpr::Pipe { input, op, args } => {
+                self.collect_runtime_call_free_names(op, Some(input), args, bound, free, visiting);
+            }
+            RuntimeGenericExpr::Infix { left, right, .. } => {
+                self.collect_runtime_expr_free_names(left, bound, free, visiting);
+                self.collect_runtime_expr_free_names(right, bound, free, visiting);
+            }
+            RuntimeGenericExpr::List(items) | RuntimeGenericExpr::Bytes { items, .. } => {
+                for item in items {
+                    self.collect_runtime_expr_free_names(item, bound, free, visiting);
+                }
+            }
+            RuntimeGenericExpr::Then { input, output } => {
+                self.collect_runtime_expr_free_names(input, bound, free, visiting);
+                if let Some(output) = output {
+                    self.collect_runtime_expr_free_names(output, bound, free, visiting);
+                }
+            }
+            RuntimeGenericExpr::When { input } => {
+                self.collect_runtime_expr_free_names(input, bound, free, visiting);
+            }
+            RuntimeGenericExpr::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    self.collect_runtime_expr_free_names(output, bound, free, visiting);
+                }
+            }
+            RuntimeGenericExpr::Text(_)
+            | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::Bool(_)
+            | RuntimeGenericExpr::Enum(_)
+            | RuntimeGenericExpr::Delimiter => {}
+        }
+    }
+
+    fn collect_runtime_call_free_names(
+        &self,
+        function: &str,
+        input: Option<&RuntimeGenericExpr>,
+        args: &[RuntimeGenericArg],
+        bound: &BTreeSet<String>,
+        free: &mut BTreeSet<String>,
+        visiting: &mut BTreeSet<String>,
+    ) {
+        if let Some(input) = input {
+            self.collect_runtime_expr_free_names(input, bound, free, visiting);
+        }
+        let mut call_bound = bound.clone();
+        let binding = runtime_list_call_binding(function, args);
+        if let Some(binding) = binding.as_ref() {
+            call_bound.insert(binding.clone());
+        }
+        for arg in args {
+            if binding.as_ref().is_some_and(|binding| {
+                arg.name.is_none() && runtime_generic_raw_arg_name(arg).as_ref() == Some(binding)
+            }) {
+                continue;
+            }
+            self.collect_runtime_expr_free_names(&arg.value, &call_bound, free, visiting);
+        }
+        if let Some(callee) = self.generic_derived_runtime.function(function) {
+            for name in self.runtime_function_free_env_names_uncached(callee, visiting) {
                 if !bound.contains(&name) {
                     free.insert(name);
                 }
@@ -43714,14 +45150,17 @@ impl GenericScheduledRuntime {
         ancestor_root_stack: &[String],
     ) -> RuntimeResult<()> {
         self.ensure_root_current(&field.path, RuntimeRootCurrentnessReason::RootDerived)?;
-        let mut needs_materialization = !self
+        let storage_backed_list_view = self.storage.list_name_for_path(&field.path).is_some();
+        let has_root_reads = self
+            .generic_derived_state
+            .root_reads_by_field
+            .contains_key(&field.path);
+        let has_root_value_cache = self
             .generic_derived_state
             .root_value_cache
-            .contains_key(&field.path)
-            || !self
-                .generic_derived_state
-                .root_reads_by_field
-                .contains_key(&field.path);
+            .contains_key(&field.path);
+        let mut needs_materialization =
+            !has_root_reads || (!storage_backed_list_view && !has_root_value_cache);
         if !needs_materialization {
             let reads = self
                 .generic_derived_state
@@ -44064,6 +45503,11 @@ impl GenericScheduledRuntime {
             .collect::<Vec<_>>();
         let mut values = Vec::new();
         for field in fields {
+            if matches!(field.kind, DerivedValueKind::ListView)
+                && self.storage.list_name_for_path(&field.path).is_some()
+            {
+                continue;
+            }
             let mut frame = GenericEvalFrame::root();
             let value = self
                 .root_derived_boon_value(&field.path, &mut frame)
@@ -44694,7 +46138,15 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<serde_json::Map<String, JsonValue>> {
         let mut row = serde_json::Map::new();
         let identity = self.storage.row_identity(&summary.list, index);
-        if let Ok((key, generation)) = identity {
+        let source_identity = self.storage.root_source_identity(&summary.list, index)?;
+        let public_identity = source_identity
+            .map(|identity| (identity.list.as_str(), identity.key, identity.generation))
+            .or_else(|| {
+                identity
+                    .ok()
+                    .map(|(key, generation)| (summary.list.as_str(), key, generation))
+            });
+        if let Some((_, key, generation)) = public_identity {
             row.insert(
                 "$boon".to_owned(),
                 json!({
@@ -44752,11 +46204,11 @@ impl GenericScheduledRuntime {
                 insert_nested_json(&mut row, field, json_value);
             }
         }
-        if let Ok((key, generation)) = identity {
+        if let Some((binding_list, key, generation)) = public_identity {
             let prefix = format!("{}.", summary.row_scope);
             for binding in self
                 .storage
-                .row_source_bindings(&summary.list, key, generation)
+                .row_source_bindings(binding_list, key, generation)
             {
                 let Some(path) = binding.source_path.strip_prefix(&prefix) else {
                     continue;
@@ -46492,6 +47944,23 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<bool> {
         self.lists
             .root_source_identities_match(list, source_identities)
+    }
+
+    fn root_source_identities_changed(
+        &self,
+        list: &str,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+    ) -> RuntimeResult<bool> {
+        self.lists
+            .root_source_identities_changed(list, source_identities)
+    }
+
+    fn root_source_identity(
+        &self,
+        list: &str,
+        index: usize,
+    ) -> RuntimeResult<Option<&RootListViewFieldSourceIdentity>> {
+        self.lists.root_source_identity(list, index)
     }
 
     fn list_visible_snapshots(&self, list: &str) -> RuntimeResult<Vec<RuntimeRowSnapshot>> {
@@ -49413,16 +50882,16 @@ enum ScalarUpdateExpression {
     },
     BytesSlice {
         path: String,
-        offset: u64,
-        byte_count: u64,
+        offset: BytesScalarArg,
+        byte_count: BytesScalarArg,
     },
     BytesTake {
         path: String,
-        byte_count: u64,
+        byte_count: BytesScalarArg,
     },
     BytesDrop {
         path: String,
-        byte_count: u64,
+        byte_count: BytesScalarArg,
     },
     BytesZeros {
         byte_count: u64,
@@ -49511,6 +50980,32 @@ enum ScalarUpdateExpression {
     Unsupported,
 }
 
+fn static_bytes_scalar_arg(arg: &BytesScalarArg) -> Option<u64> {
+    match arg {
+        BytesScalarArg::Static(value) => Some(*value),
+        BytesScalarArg::Path(_) => None,
+    }
+}
+
+fn runtime_bytes_scalar_arg_usize(
+    arg: &BytesScalarArg,
+    read_textlike: impl Fn(&str) -> Option<String> + Copy,
+    operation: &str,
+    label: &str,
+) -> RuntimeResult<usize> {
+    let value = match arg {
+        BytesScalarArg::Static(value) => i64::try_from(*value).map_err(|_| {
+            format!("{operation} {label} static value {value} exceeds supported integer range")
+        })?,
+        BytesScalarArg::Path(path) => read_textlike(path)
+            .ok_or_else(|| format!("{operation} {label} path `{path}` is missing"))?
+            .parse::<i64>()
+            .map_err(|_| format!("{operation} {label} path `{path}` is not NUMBER"))?,
+    };
+    usize::try_from(value)
+        .map_err(|_| format!("{operation} {label} value {value} is negative or too large").into())
+}
+
 impl ScalarUpdateExpression {
     fn is_root_text_expression(&self) -> bool {
         matches!(
@@ -49579,7 +51074,10 @@ impl ScalarUpdateExpression {
     }
 
     fn is_indexed_value_expression(&self) -> bool {
-        matches!(self, Self::BytesLength(_) | Self::BytesGet { .. })
+        matches!(
+            self,
+            Self::BytesLength(_) | Self::BytesGet { .. } | Self::BytesSet { .. }
+        )
     }
 
     fn prefers_settled_root_derived_reads(&self) -> bool {
@@ -51671,7 +53169,7 @@ struct GenericRootDerivedMaterialization<'a> {
 #[derive(Default)]
 struct RootListViewMaterializationResult {
     changed_reads: BTreeSet<GenericReadKey>,
-    profile: LiveRuntimeRootListViewProfile,
+    profile: Option<LiveRuntimeRootListViewProfile>,
 }
 
 #[derive(Clone, Debug)]
@@ -52469,6 +53967,8 @@ struct GenericDerivedState {
     function_value_cache: BTreeMap<String, GenericFunctionValueCacheEntry>,
     function_free_names_cache: BTreeMap<String, BTreeSet<String>>,
     function_arg_accesses_cache: BTreeMap<String, BTreeMap<String, FunctionArgAccess>>,
+    runtime_function_free_names_cache: BTreeMap<String, BTreeSet<String>>,
+    runtime_function_arg_accesses_cache: BTreeMap<String, BTreeMap<String, FunctionArgAccess>>,
     statement_free_names_cache: BTreeMap<(usize, usize, usize), BTreeSet<String>>,
     root_list_view_field_cache: BTreeMap<RootListViewFieldCacheKey, RootListViewFieldCacheEntry>,
     root_list_map_output_cache: BTreeMap<RootListMapOutputCacheKey, RootListMapOutputCacheEntry>,
@@ -52484,6 +53984,19 @@ struct GenericDerivedState {
     profile_candidate_defer_materializing_root: RefCell<Option<String>>,
     last_recomputed: Vec<GenericDerivedKey>,
     last_candidate_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RootReadReplacementProfile {
+    changed: bool,
+    previous_read_count: usize,
+    new_read_count: usize,
+    removed_count: usize,
+    added_count: usize,
+    compare_ms: f64,
+    diff_ms: f64,
+    edge_update_ms: f64,
+    store_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -53685,7 +55198,7 @@ fn push_bytes_constructor_value(target: &mut Vec<u8>, value: BoonValue) -> Runti
         )
         .into()),
         BoonValue::Bytes(value) => match value.payload {
-            RuntimeBytesPayload::Inline(bytes) => {
+            RuntimeBytesPayload::Inline(bytes) | RuntimeBytesPayload::Shared(bytes) => {
                 target.extend_from_slice(bytes.as_ref());
                 Ok(())
             }
@@ -53812,6 +55325,18 @@ fn runtime_generic_raw_arg_name(arg: &RuntimeGenericArg) -> Option<String> {
         RuntimeGenericExpr::Text(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn runtime_list_call_binding(function: &str, args: &[RuntimeGenericArg]) -> Option<String> {
+    if !matches!(
+        function,
+        "List/map" | "List/retain" | "List/every" | "List/any"
+    ) {
+        return None;
+    }
+    args.iter()
+        .find(|arg| arg.name.is_none())
+        .and_then(runtime_generic_raw_arg_name)
 }
 
 fn runtime_generic_expr_path(expr: &RuntimeGenericExpr) -> Option<String> {
@@ -55026,19 +56551,19 @@ impl ScalarEquationPlan {
                         byte_count,
                     } => ScalarUpdateExpression::BytesSlice {
                         path: path.clone(),
-                        offset: *offset,
-                        byte_count: *byte_count,
+                        offset: offset.clone(),
+                        byte_count: byte_count.clone(),
                     },
                     UpdateExpression::BytesTake { path, byte_count } => {
                         ScalarUpdateExpression::BytesTake {
                             path: path.clone(),
-                            byte_count: *byte_count,
+                            byte_count: byte_count.clone(),
                         }
                     }
                     UpdateExpression::BytesDrop { path, byte_count } => {
                         ScalarUpdateExpression::BytesDrop {
                             path: path.clone(),
-                            byte_count: *byte_count,
+                            byte_count: byte_count.clone(),
                         }
                     }
                     UpdateExpression::BytesZeros { byte_count } => {
@@ -55651,9 +57176,7 @@ impl ScalarEquationPlan {
                 let bytes = payload_bytes.get("bytes").ok_or_else(|| {
                     format!("source `{source}` for `{target}` is missing `bytes` BYTES payload")
                 })?;
-                Ok(Some(RuntimeBytes::inline(runtime_bytes_copy_from_slice(
-                    bytes,
-                ))))
+                Ok(Some(RuntimeBytes::dynamic(Bytes::from(bytes.clone()))))
             }
             ScalarUpdateExpression::TextToBytes { path, encoding } => {
                 let text = read_textlike(path).ok_or_else(|| {
@@ -55727,15 +57250,19 @@ impl ScalarEquationPlan {
                         "source `{source}` for `{target}` cannot read inline bytes path `{path}`: {error}"
                     )
                 })?;
-                let offset = usize::try_from(*offset).map_err(|_| {
-                    format!(
-                        "source `{source}` for `{target}` bytes path `{path}` offset exceeds host usize"
-                    )
-                })?;
-                let byte_count = usize::try_from(*byte_count).map_err(|_| {
-                    format!(
-                        "source `{source}` for `{target}` bytes path `{path}` byte_count exceeds host usize"
-                    )
+                let offset =
+                    runtime_bytes_scalar_arg_usize(offset, read_textlike, "Bytes/slice", "offset")
+                        .map_err(|error| {
+                            format!("source `{source}` for `{target}` bytes path `{path}` {error}")
+                        })?;
+                let byte_count = runtime_bytes_scalar_arg_usize(
+                    byte_count,
+                    read_textlike,
+                    "Bytes/slice",
+                    "byte_count",
+                )
+                .map_err(|error| {
+                    format!("source `{source}` for `{target}` bytes path `{path}` {error}")
                 })?;
                 let output = checked_runtime_bytes_slice(
                     data,
@@ -55763,10 +57290,14 @@ impl ScalarEquationPlan {
                         "source `{source}` for `{target}` cannot read inline bytes path `{path}`: {error}"
                     )
                 })?;
-                let byte_count = usize::try_from(*byte_count).map_err(|_| {
-                    format!(
-                        "source `{source}` for `{target}` bytes path `{path}` byte_count exceeds host usize"
-                    )
+                let byte_count = runtime_bytes_scalar_arg_usize(
+                    byte_count,
+                    read_textlike,
+                    "Bytes/take",
+                    "byte_count",
+                )
+                .map_err(|error| {
+                    format!("source `{source}` for `{target}` bytes path `{path}` {error}")
                 })?;
                 let output = checked_runtime_bytes_slice(
                     data,
@@ -55794,10 +57325,14 @@ impl ScalarEquationPlan {
                         "source `{source}` for `{target}` cannot read inline bytes path `{path}`: {error}"
                     )
                 })?;
-                let byte_count = usize::try_from(*byte_count).map_err(|_| {
-                    format!(
-                        "source `{source}` for `{target}` bytes path `{path}` byte_count exceeds host usize"
-                    )
+                let byte_count = runtime_bytes_scalar_arg_usize(
+                    byte_count,
+                    read_textlike,
+                    "Bytes/drop",
+                    "byte_count",
+                )
+                .map_err(|error| {
+                    format!("source `{source}` for `{target}` bytes path `{path}` {error}")
                 })?;
                 let output = checked_runtime_bytes_drop(data, byte_count, || {
                     format!(
@@ -57778,11 +59313,34 @@ impl GenericDerivedState {
     }
 
     fn replace_root_reads(&mut self, field: String, reads: BTreeSet<GenericReadKey>) -> bool {
-        if let Some(previous) = self.root_reads_by_field.get(&field).cloned() {
-            if previous == reads {
-                return false;
+        self.replace_root_reads_profiled(field, reads).changed
+    }
+
+    fn replace_root_reads_profiled(
+        &mut self,
+        field: String,
+        reads: BTreeSet<GenericReadKey>,
+    ) -> RootReadReplacementProfile {
+        let mut profile = RootReadReplacementProfile {
+            new_read_count: reads.len(),
+            ..RootReadReplacementProfile::default()
+        };
+        if let Some(previous) = self.root_reads_by_field.get(&field) {
+            profile.previous_read_count = previous.len();
+            let compare_started = Instant::now();
+            if previous == &reads {
+                profile.compare_ms = runtime_elapsed_ms(compare_started);
+                return profile;
             }
-            for read in previous.difference(&reads) {
+            profile.compare_ms = runtime_elapsed_ms(compare_started);
+            let diff_started = Instant::now();
+            let removed = previous.difference(&reads).cloned().collect::<Vec<_>>();
+            let added = reads.difference(previous).cloned().collect::<Vec<_>>();
+            profile.removed_count = removed.len();
+            profile.added_count = added.len();
+            profile.diff_ms = runtime_elapsed_ms(diff_started);
+            let edge_update_started = Instant::now();
+            for read in removed {
                 if let Some(dependents) = self.root_dependents_by_read.get_mut(&read) {
                     dependents.remove(&field);
                     if dependents.is_empty() {
@@ -57790,23 +59348,33 @@ impl GenericDerivedState {
                     }
                 }
             }
-            for read in reads.difference(&previous) {
+            for read in added {
                 self.root_dependents_by_read
-                    .entry(read.clone())
+                    .entry(read)
                     .or_default()
                     .insert(field.clone());
             }
+            profile.edge_update_ms = runtime_elapsed_ms(edge_update_started);
+            let store_started = Instant::now();
             self.root_reads_by_field.insert(field, reads);
-            return true;
+            profile.store_ms = runtime_elapsed_ms(store_started);
+            profile.changed = true;
+            return profile;
         }
+        profile.added_count = reads.len();
+        let edge_update_started = Instant::now();
         for read in &reads {
             self.root_dependents_by_read
                 .entry(read.clone())
                 .or_default()
                 .insert(field.clone());
         }
+        profile.edge_update_ms = runtime_elapsed_ms(edge_update_started);
+        let store_started = Instant::now();
         self.root_reads_by_field.insert(field, reads);
-        true
+        profile.store_ms = runtime_elapsed_ms(store_started);
+        profile.changed = true;
+        profile
     }
 
     fn dependents_for_reads(
@@ -58185,11 +59753,14 @@ fn eval_bytes_builtin(
     input: Option<BoonValue>,
     args: &[EvaluatedCallArg],
 ) -> RuntimeResult<BoonValue> {
+    if let Some(error) = bytes_runtime_contract_error(function, input.is_some(), args) {
+        return Ok(error);
+    }
     let piped = input.is_some();
     let shifted = |position: usize| if piped { position } else { position + 1 };
     match function {
         "Text/to_bytes" => {
-            let value = bytes_input_or_first(input, args)?;
+            let value = bytes_text_input(input, args)?;
             let text = match bytes_text_value(value) {
                 Ok(value) => value,
                 Err(error) => return Ok(error),
@@ -58330,16 +59901,16 @@ fn eval_bytes_builtin(
             }
         }
         "Bytes/concat" => {
-            let left = match bytes_input_bytes(input, args)? {
+            let left = match bytes_input_bytes_for_pair_builtin(input, args)? {
                 Ok(value) => value,
                 Err(error) => return Ok(error),
             };
-            let right = match bytes_named_or_positional_arg(args, &["with"], shifted(0)) {
-                Ok(value) => match bytes_value(value) {
+            let right = match bytes_named_arg(args, &["with", "right"]).cloned() {
+                Some(value) => match bytes_value(value) {
                     Ok(value) => value,
                     Err(error) => return Ok(error),
                 },
-                Err(error) => return Err(error),
+                None => return Err("BYTES operation requires `with|right`".into()),
             };
             let left = match bytes_inline_slice(&left) {
                 Ok(value) => value,
@@ -58355,16 +59926,16 @@ fn eval_bytes_builtin(
             Ok(BoonValue::Bytes(RuntimeBytes::inline(Bytes::from(output))))
         }
         "Bytes/equal" => {
-            let left = match bytes_input_bytes(input, args)? {
+            let left = match bytes_input_bytes_for_pair_builtin(input, args)? {
                 Ok(value) => value,
                 Err(error) => return Ok(error),
             };
-            let right = match bytes_named_or_positional_arg(args, &["with"], shifted(0)) {
-                Ok(value) => match bytes_value(value) {
+            let right = match bytes_named_arg(args, &["with", "right"]).cloned() {
+                Some(value) => match bytes_value(value) {
                     Ok(value) => value,
                     Err(error) => return Ok(error),
                 },
-                Err(error) => return Err(error),
+                None => return Err("BYTES operation requires `with|right`".into()),
             };
             let left = match bytes_inline_slice(&left) {
                 Ok(value) => value,
@@ -58495,7 +60066,7 @@ fn eval_bytes_builtin(
             Ok(BoonValue::Text(bytes_encode_hex(data)))
         }
         "Bytes/from_hex" => {
-            let value = bytes_input_or_first(input, args)?;
+            let value = bytes_text_input(input, args)?;
             let text = match bytes_text_value(value) {
                 Ok(value) => value,
                 Err(error) => return Ok(error),
@@ -58517,7 +60088,7 @@ fn eval_bytes_builtin(
             Ok(BoonValue::Text(bytes_encode_base64(data)))
         }
         "Bytes/from_base64" => {
-            let value = bytes_input_or_first(input, args)?;
+            let value = bytes_text_input(input, args)?;
             let text = match bytes_text_value(value) {
                 Ok(value) => value,
                 Err(error) => return Ok(error),
@@ -58674,6 +60245,19 @@ fn bytes_input_bytes(
     })
 }
 
+fn bytes_input_bytes_for_pair_builtin(
+    input: Option<BoonValue>,
+    args: &[EvaluatedCallArg],
+) -> RuntimeResult<Result<RuntimeBytes, BoonValue>> {
+    if let Some(value) = input {
+        return Ok(bytes_value(value));
+    }
+    if let Some(value) = bytes_named_arg(args, &["left"]) {
+        return Ok(bytes_value(value.clone()));
+    }
+    bytes_input_bytes(None, args)
+}
+
 fn bytes_input_or_first(
     input: Option<BoonValue>,
     args: &[EvaluatedCallArg],
@@ -58688,6 +60272,101 @@ fn bytes_input_or_first(
         .find(|arg| arg.name.is_none())
         .map(|arg| arg.value.clone())
         .ok_or_else(|| "BYTES operation requires input".into())
+}
+
+fn bytes_text_input(
+    input: Option<BoonValue>,
+    args: &[EvaluatedCallArg],
+) -> RuntimeResult<BoonValue> {
+    if let Some(value) = input {
+        return Ok(value);
+    }
+    if let Some(value) = bytes_named_arg(args, &["input", "text"]) {
+        return Ok(value.clone());
+    }
+    Err("BYTES operation requires input".into())
+}
+
+fn bytes_runtime_contract_error(
+    function: &str,
+    piped: bool,
+    args: &[EvaluatedCallArg],
+) -> Option<BoonValue> {
+    if args.iter().any(|arg| arg.name.is_none()) {
+        return Some(BoonValue::Error(
+            "bytes_positional_args_unsupported".to_owned(),
+        ));
+    }
+    if matches!(function, "Text/to_bytes" | "Bytes/to_text")
+        && bytes_named_arg(args, &["encoding"]).is_none()
+    {
+        return Some(BoonValue::Error("bytes_missing_encoding".to_owned()));
+    }
+    if matches!(
+        function,
+        "Bytes/read_unsigned" | "Bytes/read_signed" | "Bytes/write_unsigned" | "Bytes/write_signed"
+    ) && bytes_named_arg(args, &["endian"]).is_none()
+    {
+        return Some(BoonValue::Error("bytes_missing_endian".to_owned()));
+    }
+    for arg in args {
+        let Some(name) = arg.name.as_deref() else {
+            continue;
+        };
+        if !bytes_runtime_builtin_arg_allowed(function, name, piped) {
+            return Some(BoonValue::Error("bytes_unexpected_arg".to_owned()));
+        }
+    }
+    if function == "Bytes/zeros"
+        && (piped
+            || args
+                .iter()
+                .any(|arg| arg.name.as_deref().is_some_and(|name| name == "input")))
+    {
+        return Some(BoonValue::Error("bytes_unexpected_input_arg".to_owned()));
+    }
+    if piped
+        && args
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .any(|name| matches!(name, "input" | "text" | "left" | "right"))
+    {
+        return Some(BoonValue::Error("bytes_unexpected_input_arg".to_owned()));
+    }
+    None
+}
+
+fn bytes_runtime_builtin_arg_allowed(function: &str, name: &str, piped: bool) -> bool {
+    if piped && matches!(name, "input" | "text" | "left" | "right") {
+        return false;
+    }
+    match function {
+        "Text/to_bytes" => matches!(name, "input" | "text" | "encoding"),
+        "Bytes/length" | "Bytes/is_empty" | "Bytes/to_hex" | "Bytes/to_base64" => name == "input",
+        "Bytes/get" => matches!(name, "input" | "index"),
+        "Bytes/set" => matches!(name, "input" | "index" | "value"),
+        "Bytes/slice" => matches!(
+            name,
+            "input" | "offset" | "start" | "byte_count" | "length" | "count"
+        ),
+        "Bytes/take" | "Bytes/drop" => {
+            matches!(name, "input" | "byte_count" | "length" | "count")
+        }
+        "Bytes/concat" | "Bytes/equal" => matches!(name, "input" | "with" | "left" | "right"),
+        "Bytes/find" => matches!(name, "input" | "needle"),
+        "Bytes/starts_with" => matches!(name, "input" | "prefix"),
+        "Bytes/ends_with" => matches!(name, "input" | "suffix"),
+        "Bytes/zeros" => matches!(name, "byte_count" | "length" | "count"),
+        "Bytes/to_text" => matches!(name, "input" | "encoding"),
+        "Bytes/from_hex" | "Bytes/from_base64" => matches!(name, "input" | "text"),
+        "Bytes/read_unsigned" | "Bytes/read_signed" => {
+            matches!(name, "input" | "offset" | "byte_count" | "endian")
+        }
+        "Bytes/write_unsigned" | "Bytes/write_signed" => {
+            matches!(name, "input" | "offset" | "byte_count" | "endian" | "value")
+        }
+        _ => true,
+    }
 }
 
 fn bytes_named_arg<'a>(args: &'a [EvaluatedCallArg], names: &[&str]) -> Option<&'a BoonValue> {
@@ -58711,19 +60390,6 @@ fn bytes_named_or_positional_arg(
         .nth(position)
         .map(|arg| arg.value.clone())
         .ok_or_else(|| format!("BYTES operation requires `{}`", names.join("|")).into())
-}
-
-fn bytes_optional_named_or_positional_arg(
-    args: &[EvaluatedCallArg],
-    names: &[&str],
-    position: usize,
-) -> Option<BoonValue> {
-    bytes_named_arg(args, names).cloned().or_else(|| {
-        args.iter()
-            .filter(|arg| arg.name.is_none())
-            .nth(position)
-            .map(|arg| arg.value.clone())
-    })
 }
 
 fn bytes_value(value: BoonValue) -> Result<RuntimeBytes, BoonValue> {
@@ -58788,31 +60454,27 @@ fn bytes_byte_arg(
     u8::try_from(value).map_err(|_| BoonValue::Error("bytes_byte_out_of_range".to_owned()))
 }
 
-fn bytes_encoding_arg(args: &[EvaluatedCallArg], position: usize) -> Result<String, BoonValue> {
-    let value = bytes_optional_named_or_positional_arg(args, &["encoding"], position)
+fn bytes_encoding_arg(args: &[EvaluatedCallArg], _position: usize) -> Result<String, BoonValue> {
+    let value = bytes_named_arg(args, &["encoding"])
+        .cloned()
         .map(bytes_text_value)
         .transpose()?
-        .unwrap_or_else(|| "Utf8".to_owned());
-    match value
-        .trim()
-        .trim_matches('"')
-        .replace(['-', '_'], "")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "utf8" => Ok("utf8".to_owned()),
-        "ascii" => Ok("ascii".to_owned()),
+        .ok_or_else(|| BoonValue::Error("bytes_missing_encoding".to_owned()))?;
+    match value.trim().trim_matches('"') {
+        "Utf8" => Ok("utf8".to_owned()),
+        "Ascii" => Ok("ascii".to_owned()),
         _ => Err(BoonValue::Error("bytes_unsupported_encoding".to_owned())),
     }
 }
 
-fn bytes_endian_arg(args: &[EvaluatedCallArg], position: usize) -> Result<BytesEndian, BoonValue> {
-    let value = bytes_named_or_positional_arg(args, &["endian"], position)
-        .map_err(|_| BoonValue::Error("bytes_missing_endian".to_owned()))
+fn bytes_endian_arg(args: &[EvaluatedCallArg], _position: usize) -> Result<BytesEndian, BoonValue> {
+    let value = bytes_named_arg(args, &["endian"])
+        .cloned()
+        .ok_or_else(|| BoonValue::Error("bytes_missing_endian".to_owned()))
         .and_then(bytes_text_value)?;
     match value.trim().trim_matches('"') {
-        "Little" | "little" | "LE" | "le" => Ok(BytesEndian::Little),
-        "Big" | "big" | "BE" | "be" => Ok(BytesEndian::Big),
+        "Little" => Ok(BytesEndian::Little),
+        "Big" => Ok(BytesEndian::Big),
         _ => Err(BoonValue::Error("bytes_invalid_endian".to_owned())),
     }
 }
@@ -58821,12 +60483,7 @@ fn bytes_numeric_byte_count(
     args: &[EvaluatedCallArg],
     position: usize,
 ) -> Result<usize, BoonValue> {
-    let byte_count = bytes_usize_arg(
-        args,
-        &["byte_count", "count"],
-        position,
-        "bytes_invalid_byte_count",
-    )?;
+    let byte_count = bytes_usize_arg(args, &["byte_count"], position, "bytes_invalid_byte_count")?;
     match byte_count {
         1 | 2 | 4 | 8 => Ok(byte_count),
         _ => Err(BoonValue::Error("bytes_invalid_byte_count".to_owned())),
@@ -58891,6 +60548,12 @@ fn bytes_zeroed(byte_count: usize) -> RuntimeResult<BoonValue> {
 fn bytes_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
+    }
+    if let [byte] = needle {
+        return haystack.iter().position(|candidate| candidate == byte);
+    }
+    if needle.len() > haystack.len() {
+        return None;
     }
     haystack
         .windows(needle.len())
@@ -67247,6 +68910,139 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     }
 
     #[test]
+    fn document_summary_uses_source_identity_for_filtered_todomvc_rows() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime =
+            LiveRuntime::from_source("todomvc-filtered-document-source-identity", source).unwrap();
+        for event in [
+            LiveSourceEvent {
+                source: "store.sources.new_todo_input.change".to_owned(),
+                text: Some("Test todo".to_owned()),
+                ..LiveSourceEvent::default()
+            },
+            LiveSourceEvent {
+                source: "store.sources.new_todo_input.key_down".to_owned(),
+                key: Some("Enter".to_owned()),
+                ..LiveSourceEvent::default()
+            },
+            LiveSourceEvent {
+                source: "store.sources.toggle_all_checkbox.click".to_owned(),
+                ..LiveSourceEvent::default()
+            },
+            LiveSourceEvent {
+                source: "store.sources.toggle_all_checkbox.click".to_owned(),
+                ..LiveSourceEvent::default()
+            },
+            LiveSourceEvent {
+                source: "todo.sources.todo_checkbox.click".to_owned(),
+                target_text: Some("Buy groceries".to_owned()),
+                ..LiveSourceEvent::default()
+            },
+            LiveSourceEvent {
+                source: "store.sources.filter_active.press".to_owned(),
+                ..LiveSourceEvent::default()
+            },
+        ] {
+            runtime
+                .apply_source_event_turn(event)
+                .expect("TodoMVC setup event should apply");
+        }
+
+        let summary = runtime.document_state_summary();
+        let visible = summary["store"]["visible_todos"]
+            .as_array()
+            .expect("visible_todos should be a document-summary array");
+        let test_todo = visible
+            .iter()
+            .find(|row| row.get("title").and_then(JsonValue::as_str) == Some("Test todo"))
+            .expect("filtered visible_todos should contain Test todo");
+        assert_eq!(
+            test_todo
+                .pointer("/$boon/row_key")
+                .and_then(JsonValue::as_u64),
+            Some(5),
+            "document-facing projected rows must expose the source todos key"
+        );
+        assert_eq!(
+            test_todo
+                .pointer("/sources/todo_checkbox/click/target_key")
+                .and_then(JsonValue::as_u64),
+            Some(5),
+            "row-scoped source binding must also point at the source todos key"
+        );
+        assert_eq!(
+            test_todo
+                .pointer("/sources/todo_checkbox/click/list_id")
+                .and_then(JsonValue::as_str),
+            Some("todos"),
+            "document source bindings should route to the source list, not the projection list"
+        );
+    }
+
+    #[test]
+    fn root_list_view_identity_only_change_updates_document_identity() {
+        let source = r#"
+store: [
+    elements: [
+        show_second: SOURCE
+    ]
+    selected:
+        TEXT { first } |> HOLD selected {
+            LATEST {
+                elements.show_second.event.press |> THEN { TEXT { second } }
+            }
+        }
+    rows:
+        LIST {
+            [title: TEXT { Duplicate }, group: TEXT { first }]
+            [title: TEXT { Duplicate }, group: TEXT { second }]
+        }
+    visible:
+        rows
+        |> List/retain(row, if: row.group == selected)
+        |> List/map(row, new: [title: row.title])
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-identity-only-change", source).unwrap();
+        let first_summary = runtime.document_state_summary();
+        let first_visible = first_summary["store"]["visible"]
+            .as_array()
+            .expect("visible should be an array before source identity switch");
+        assert_eq!(first_visible.len(), 1);
+        assert_eq!(
+            first_visible[0]
+                .pointer("/$boon/row_key")
+                .and_then(JsonValue::as_u64),
+            Some(1),
+            "initial duplicate-looking projected row should expose first source key"
+        );
+        assert_eq!(first_visible[0]["title"], "Duplicate");
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.show_second".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("selector switch should apply");
+        let second_summary = runtime.document_state_summary();
+        let second_visible = second_summary["store"]["visible"]
+            .as_array()
+            .expect("visible should be an array after source identity switch");
+        assert_eq!(second_visible.len(), 1);
+        assert_eq!(second_visible[0]["title"], "Duplicate");
+        assert_eq!(
+            second_visible[0]
+                .pointer("/$boon/row_key")
+                .and_then(JsonValue::as_u64),
+            Some(2),
+            "identity-only projection changes must update the document-facing source key"
+        );
+    }
+
+    #[test]
     fn live_runtime_keeps_one_todomvc_row_in_edit_mode() {
         let source = include_str!("../../../examples/todomvc.bn");
         let mut runtime = LiveRuntime::new(
@@ -71289,7 +73085,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let materialization = generic
             .materialize_root_list_view_field(&field, &BTreeSet::new())
             .expect("identity root list should rematerialize");
-        let profile = materialization.profile;
+        let profile = materialization
+            .profile
+            .expect("tests should keep root list-view profiles enabled");
         assert_eq!(
             profile.list_storage_mode, "generic_vec_with_row_index_source",
             "identity ListRef root list should keep the source as a row-index view: {profile:?}"
@@ -72393,37 +74191,45 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let forced = generic
             .materialize_root_list_view_field(&field, &dirty_reads)
             .expect("dirty-read guarded materialization should succeed");
+        let forced_profile = forced
+            .profile
+            .as_ref()
+            .expect("tests should keep root list-view profiles enabled");
         assert!(
-            forced.profile.field_cache_dirty_forced_miss_count >= 2,
+            forced_profile.field_cache_dirty_forced_miss_count >= 2,
             "dirty root reads should force stale field entries to miss before reuse: {:?}",
-            forced.profile
+            forced_profile
         );
         assert!(
-            forced.profile.field_cache_dirty_forced_miss_read_key_count
-                >= forced.profile.field_cache_dirty_forced_miss_count,
+            forced_profile.field_cache_dirty_forced_miss_read_key_count
+                >= forced_profile.field_cache_dirty_forced_miss_count,
             "forced misses should report the dirty read intersections: {:?}",
-            forced.profile
+            forced_profile
         );
         assert!(
-            forced.profile.field_cache_misses >= forced.profile.field_cache_dirty_forced_miss_count,
+            forced_profile.field_cache_misses >= forced_profile.field_cache_dirty_forced_miss_count,
             "forced misses should still flow through normal miss accounting: {:?}",
-            forced.profile
+            forced_profile
         );
 
         generic.generic_derived_state.clear_function_value_cache();
         let clean = generic
             .materialize_root_list_view_field(&field, &BTreeSet::new())
             .expect("clean materialization should reuse the refreshed entries");
+        let clean_profile = clean
+            .profile
+            .as_ref()
+            .expect("tests should keep root list-view profiles enabled");
         assert_eq!(
-            clean.profile.field_cache_dirty_forced_miss_count, 0,
+            clean_profile.field_cache_dirty_forced_miss_count, 0,
             "clean materialization should not trigger the dirty guard: {:?}",
-            clean.profile
+            clean_profile
         );
         assert!(
-            clean.profile.field_cache_hits >= 2
-                || clean.profile.list_map_output_cache_hit_count >= clean.profile.row_count,
+            clean_profile.field_cache_hits >= 2
+                || clean_profile.list_map_output_cache_hit_count >= clean_profile.row_count,
             "refreshed stable rows or fields should be reusable on a clean pass: {:?}",
-            clean.profile
+            clean_profile
         );
     }
 
@@ -72828,6 +74634,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let materialization = generic
             .materialize_root_list_view_field_with_cache_state(&field, &BTreeSet::new(), true, &[])
             .expect("prevalidated list-view materialization should refresh deferred reads");
+        let materialization_profile = materialization
+            .profile
+            .as_ref()
+            .expect("tests should keep root list-view profiles enabled");
         assert_eq!(
             field_ref_to_boon(
                 generic
@@ -72839,9 +74649,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "prevalidated previous-pass hits must still demand deferred dirty roots before reuse"
         );
         assert!(
-            materialization.profile.field_cache_misses >= 2,
+            materialization_profile.field_cache_misses >= 2,
             "both label fields should miss after deferred currentness refresh invalidates stale entries: {:?}",
-            materialization.profile
+            materialization_profile
         );
     }
 
@@ -72925,17 +74735,21 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let materialization = generic
             .materialize_root_list_view_field(&field, &dirty_reads)
             .expect("numeric-guarded materialization should succeed");
+        let materialization_profile = materialization
+            .profile
+            .as_ref()
+            .expect("tests should keep root list-view profiles enabled");
         assert_eq!(
-            materialization.profile.field_cache_dirty_forced_miss_count, 0,
+            materialization_profile.field_cache_dirty_forced_miss_count, 0,
             "same-interval numeric root changes should keep guarded field-cache entries reusable: {:?}",
-            materialization.profile
+            materialization_profile
         );
         assert!(
-            materialization.profile.field_cache_hits > 0
-                || materialization.profile.user_function_cache_hit_count > 0
-                || materialization.profile.list_map_output_cache_hit_count > 0,
+            materialization_profile.field_cache_hits > 0
+                || materialization_profile.user_function_cache_hit_count > 0
+                || materialization_profile.list_map_output_cache_hit_count > 0,
             "same-interval numeric root changes should reuse cached root-list work: {:?}",
-            materialization.profile
+            materialization_profile
         );
         assert_eq!(
             field_ref_to_boon(
@@ -80185,6 +81999,149 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn large_dynamic_bytes_use_shared_storage_without_public_inline_payload() {
+        let small = RuntimeBytes::dynamic(Bytes::from(vec![1; SOURCE_EVENT_INLINE_BYTES_LIMIT]));
+        assert_eq!(small.report_json()["storage"], "inline");
+
+        let payload = vec![7; SOURCE_EVENT_INLINE_BYTES_LIMIT + 1];
+        let bytes = RuntimeBytes::dynamic(Bytes::from(payload.clone()));
+        let summary = bytes.report_json();
+
+        assert_eq!(summary["$boon_type"], "BYTES");
+        assert_eq!(summary["storage"], "shared");
+        assert_eq!(
+            summary["byte_len"],
+            (SOURCE_EVENT_INLINE_BYTES_LIMIT + 1) as u64
+        );
+        assert_eq!(summary["digest"], sha256_bytes(&payload));
+        assert!(
+            summary.get("inline_bytes").is_none(),
+            "public summaries must not expose shared bytes: {summary:#?}"
+        );
+        assert_eq!(
+            bytes
+                .inline_bytes()
+                .expect("shared runtime bytes should be executable")
+                .as_ref(),
+            payload.as_slice()
+        );
+
+        let artifact = bytes.artifact_json();
+        assert_eq!(artifact["storage"], "shared");
+        assert_eq!(
+            RuntimeBytes::from_artifact(&artifact, "test.shared_bytes")
+                .expect("shared bytes artifact should restore"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn runtime_bytes_from_artifact_rejects_malformed_private_state() {
+        let cases = [
+            (
+                "missing-inline-bytes",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "abc",
+                    "byte_len": 1
+                }),
+                "missing `inline_bytes`",
+            ),
+            (
+                "non-array-inline-bytes",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "abc",
+                    "byte_len": 1,
+                    "inline_bytes": "not-array"
+                }),
+                "inline_bytes is not an array",
+            ),
+            (
+                "non-byte-inline-entry",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "abc",
+                    "byte_len": 1,
+                    "inline_bytes": ["x"]
+                }),
+                "inline_bytes[0] must be a byte",
+            ),
+            (
+                "out-of-range-inline-entry",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "abc",
+                    "byte_len": 1,
+                    "inline_bytes": [300]
+                }),
+                "inline_bytes[0] must be in 0..=255",
+            ),
+            (
+                "byte-len-mismatch",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "abc",
+                    "byte_len": 2,
+                    "inline_bytes": [1]
+                }),
+                "declare byte_len 2 but carry 1 byte(s)",
+            ),
+            (
+                "empty-digest",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "inline",
+                    "digest": "",
+                    "byte_len": 1,
+                    "inline_bytes": [1]
+                }),
+                "runtime bytes must carry a digest",
+            ),
+            (
+                "unsupported-storage",
+                json!({
+                    "$boon_type": "BYTES",
+                    "storage": "mystery",
+                    "digest": "abc",
+                    "byte_len": 1,
+                    "inline_bytes": [1]
+                }),
+                "storage has unsupported value `mystery`",
+            ),
+        ];
+
+        for (id, artifact, expected) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                RuntimeBytes::from_artifact(&artifact, id)
+            }));
+            match result {
+                Ok(Err(error)) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(expected),
+                        "case {id} returned wrong structured error: {error}"
+                    );
+                }
+                Ok(Ok(value)) => panic!("case {id} accepted malformed artifact: {value:#?}"),
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+                    panic!("case {id} panicked while rejecting malformed artifact: {message}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fixed_source_bytes_constructor_zero_fills_empty_body() {
         let BoonValue::Bytes(bytes) =
             finish_bytes_constructor(&BytesSizeSyntax::Fixed(4), 0, Vec::new())
@@ -80433,6 +82390,230 @@ document: Document/new(root: Element/label(element: [], label: store.hex))
             ],
             "bytes_numeric_overflow",
         );
+    }
+
+    #[test]
+    fn bytes_runtime_builtins_reject_compiler_rejected_arg_shapes() {
+        let runtime_bytes = Some(BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
+            b"\x01\x02\x03\x04",
+        ))));
+
+        let assert_error = |function: &str,
+                            input: Option<BoonValue>,
+                            args: Vec<EvaluatedCallArg>,
+                            expected: &str| {
+            let value = eval_bytes_builtin(function, input, &args)
+                .unwrap_or_else(|error| panic!("{function} should be recoverable: {error}"));
+            assert_eq!(value, BoonValue::Error(expected.to_owned()));
+        };
+
+        assert_error(
+            "Bytes/get",
+            runtime_bytes.clone(),
+            vec![EvaluatedCallArg {
+                name: None,
+                value: BoonValue::Number(0),
+            }],
+            "bytes_positional_args_unsupported",
+        );
+        assert_error(
+            "Bytes/slice",
+            None,
+            vec![
+                EvaluatedCallArg {
+                    name: None,
+                    value: BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
+                        b"\x01\x02\x03\x04",
+                    ))),
+                },
+                EvaluatedCallArg {
+                    name: Some("offset".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+                EvaluatedCallArg {
+                    name: Some("byte_count".to_owned()),
+                    value: BoonValue::Number(2),
+                },
+            ],
+            "bytes_positional_args_unsupported",
+        );
+        assert_error(
+            "Text/to_bytes",
+            Some(BoonValue::Text("hi".to_owned())),
+            Vec::new(),
+            "bytes_missing_encoding",
+        );
+        assert_error(
+            "Bytes/to_text",
+            runtime_bytes.clone(),
+            Vec::new(),
+            "bytes_missing_encoding",
+        );
+        assert_error(
+            "Text/to_bytes",
+            Some(BoonValue::Text("hi".to_owned())),
+            vec![EvaluatedCallArg {
+                name: Some("encoding".to_owned()),
+                value: BoonValue::Text("utf8".to_owned()),
+            }],
+            "bytes_unsupported_encoding",
+        );
+        assert_error(
+            "Bytes/read_unsigned",
+            runtime_bytes.clone(),
+            vec![
+                EvaluatedCallArg {
+                    name: Some("offset".to_owned()),
+                    value: BoonValue::Number(0),
+                },
+                EvaluatedCallArg {
+                    name: Some("byte_count".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+                EvaluatedCallArg {
+                    name: Some("endian".to_owned()),
+                    value: BoonValue::Text("LE".to_owned()),
+                },
+            ],
+            "bytes_invalid_endian",
+        );
+        assert_error(
+            "Bytes/read_unsigned",
+            runtime_bytes.clone(),
+            vec![
+                EvaluatedCallArg {
+                    name: Some("offset".to_owned()),
+                    value: BoonValue::Number(0),
+                },
+                EvaluatedCallArg {
+                    name: Some("byte_count".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+            ],
+            "bytes_missing_endian",
+        );
+        assert_error(
+            "Bytes/read_unsigned",
+            runtime_bytes.clone(),
+            vec![
+                EvaluatedCallArg {
+                    name: Some("offset".to_owned()),
+                    value: BoonValue::Number(0),
+                },
+                EvaluatedCallArg {
+                    name: Some("count".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+                EvaluatedCallArg {
+                    name: Some("endian".to_owned()),
+                    value: BoonValue::Text("Little".to_owned()),
+                },
+            ],
+            "bytes_unexpected_arg",
+        );
+        assert_error(
+            "Bytes/get",
+            runtime_bytes.clone(),
+            vec![
+                EvaluatedCallArg {
+                    name: Some("index".to_owned()),
+                    value: BoonValue::Number(0),
+                },
+                EvaluatedCallArg {
+                    name: Some("surprise".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+            ],
+            "bytes_unexpected_arg",
+        );
+        assert_error(
+            "Bytes/zeros",
+            runtime_bytes.clone(),
+            vec![EvaluatedCallArg {
+                name: Some("byte_count".to_owned()),
+                value: BoonValue::Number(1),
+            }],
+            "bytes_unexpected_input_arg",
+        );
+        assert_error(
+            "Bytes/zeros",
+            None,
+            vec![
+                EvaluatedCallArg {
+                    name: Some("input".to_owned()),
+                    value: BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(b"\x01"))),
+                },
+                EvaluatedCallArg {
+                    name: Some("byte_count".to_owned()),
+                    value: BoonValue::Number(1),
+                },
+            ],
+            "bytes_unexpected_arg",
+        );
+    }
+
+    #[test]
+    fn bytes_runtime_builtins_accept_compiler_allowed_named_pair_args() {
+        let left = RuntimeBytes::inline(Bytes::from_static(b"\x01\x02"));
+        let right = RuntimeBytes::inline(Bytes::from_static(b"\x03"));
+        let same = RuntimeBytes::inline(Bytes::from_static(b"\x01\x02"));
+
+        let concat = eval_bytes_builtin(
+            "Bytes/concat",
+            None,
+            &[
+                EvaluatedCallArg {
+                    name: Some("left".to_owned()),
+                    value: BoonValue::Bytes(left.clone()),
+                },
+                EvaluatedCallArg {
+                    name: Some("right".to_owned()),
+                    value: BoonValue::Bytes(right),
+                },
+            ],
+        )
+        .expect("named pair concat should be recoverable");
+        let BoonValue::Bytes(concat) = concat else {
+            panic!("named pair concat should return BYTES, got {concat:#?}");
+        };
+        assert_eq!(concat.inline_bytes().unwrap().as_ref(), b"\x01\x02\x03");
+
+        let equal = eval_bytes_builtin(
+            "Bytes/equal",
+            None,
+            &[
+                EvaluatedCallArg {
+                    name: Some("left".to_owned()),
+                    value: BoonValue::Bytes(left),
+                },
+                EvaluatedCallArg {
+                    name: Some("right".to_owned()),
+                    value: BoonValue::Bytes(same),
+                },
+            ],
+        )
+        .expect("named pair equal should be recoverable");
+        assert_eq!(equal, BoonValue::Bool(true));
+
+        let encoded = eval_bytes_builtin(
+            "Text/to_bytes",
+            None,
+            &[
+                EvaluatedCallArg {
+                    name: Some("text".to_owned()),
+                    value: BoonValue::Text("hi".to_owned()),
+                },
+                EvaluatedCallArg {
+                    name: Some("encoding".to_owned()),
+                    value: BoonValue::Text("Utf8".to_owned()),
+                },
+            ],
+        )
+        .expect("named text conversion should be recoverable");
+        let BoonValue::Bytes(encoded) = encoded else {
+            panic!("named Text/to_bytes should return BYTES, got {encoded:#?}");
+        };
+        assert_eq!(encoded.inline_bytes().unwrap().as_ref(), b"hi");
     }
 
     #[test]
@@ -81105,7 +83286,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         );
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
-            3
+            5
         );
         let indexed_update = &output.report["plan_executor"]["per_step"][0]["indexed_updates"][0];
         assert_eq!(indexed_update["expression_kind"], "source_payload");
@@ -81147,6 +83328,131 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             .expect("beta row should be present in PlanExecutor list summary");
         assert_eq!(beta["fields"]["payload_len"], json!(3));
         assert_eq!(beta["fields"]["payload_second"], json!(254));
+        for key in [
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"][key], 0,
+                "fallback counter {key} must stay zero"
+            );
+        }
+    }
+
+    #[test]
+    fn root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency() {
+        let steps = vec!["receive-beta-bytes-and-read".to_owned()];
+        let output = run_plan_root_scalar_scenario(
+            Path::new("../../examples/bytes_indexed_same_event_dependency_plan_ops.bn"),
+            Path::new("../../examples/bytes_indexed_same_event_dependency_plan_ops.scn"),
+            TargetProfile::SoftwareDefault,
+            &steps,
+            true,
+            None,
+        )
+        .expect("indexed same-event BYTES dependency fixture should execute through PlanExecutor");
+
+        assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
+        assert_eq!(
+            output.report["legacy_comparison"]["semantic_delta_match"],
+            true
+        );
+        assert_eq!(
+            output.report["plan_executor"]["executed_indexed_update_count"],
+            5
+        );
+        assert_eq!(
+            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"],
+            true
+        );
+
+        let updates = output.report["plan_executor"]["per_step"][0]["indexed_updates"]
+            .as_array()
+            .expect("same-event step should expose indexed updates");
+        assert_eq!(updates.len(), 5);
+        assert_eq!(updates[0]["expression_kind"], "source_payload");
+        assert_eq!(updates[0]["source_payload_field"], "Bytes");
+        assert_eq!(updates[0]["field_path"], "payload");
+        assert_eq!(
+            updates[0]["value"]["digest"],
+            "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
+        );
+
+        let set_update = updates
+            .iter()
+            .find(|update| update["expression_kind"] == "bytes_set")
+            .expect("same-event indexed Bytes/set update should execute");
+        assert_eq!(set_update["field_path"], "patched");
+        assert_eq!(set_update["value"]["byte_len"], 3);
+        assert_eq!(
+            set_update["value"]["digest"],
+            "9a82810e040052967f7d74664630d0f6f1665873bfffa36fd4ffe40be1241b73"
+        );
+        assert_eq!(
+            set_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(set_update["bytes_access"]["byte_bank_used"], true);
+        assert_eq!(
+            set_update["bytes_storage"]["storage"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(set_update["bytes_storage"]["byte_bank_used"], true);
+
+        let length_update = updates
+            .iter()
+            .find(|update| update["expression_kind"] == "bytes_length")
+            .expect("same-event indexed Bytes/length update should execute");
+        assert_eq!(length_update["field_path"], "payload_len");
+        assert_eq!(length_update["value"], 3);
+        assert_eq!(
+            length_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(length_update["bytes_access"]["byte_bank_used"], true);
+
+        let get_update = updates
+            .iter()
+            .find(|update| update["expression_kind"] == "bytes_get")
+            .expect("same-event indexed Bytes/get update should execute");
+        assert_eq!(get_update["field_path"], "payload_second");
+        assert_eq!(get_update["value"], 254);
+        assert_eq!(
+            get_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(get_update["bytes_access"]["byte_bank_used"], true);
+        assert_eq!(get_update["bytes_access"]["index"], 1);
+
+        let patched_get_update = updates
+            .iter()
+            .find(|update| update["field_path"] == "patched_first")
+            .expect("same-event indexed Bytes/get from patched output should execute");
+        assert_eq!(patched_get_update["expression_kind"], "bytes_get");
+        assert_eq!(patched_get_update["value"], 170);
+        assert_eq!(
+            patched_get_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(patched_get_update["bytes_access"]["byte_bank_used"], true);
+        assert_eq!(patched_get_update["bytes_access"]["index"], 0);
+
+        for key in [
+            "copy_from_slice_bytes",
+            "vec_clone_bytes",
+            "vec_alloc_bytes",
+            "zero_fill_bytes",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
+                "same-event indexed fixed-bank dependency tick should keep {key}=0"
+            );
+        }
         for key in [
             "runtime_ast_eval_count",
             "executable_string_path_count",
@@ -82319,7 +84625,7 @@ expected_source_event = {{ source = "store.slice" }}
         };
         let error = error.to_string();
         assert!(
-            error.contains("MachinePlan verification failed"),
+            error.contains("`Bytes/slice` byte range 2..4 is out of bounds for fixed BYTES[3]"),
             "unexpected static out-of-bounds slice error: {error}"
         );
 
@@ -82506,6 +84812,89 @@ expected_source_event = {{ source = "store.decode" }}
             assert_eq!(
                 output.report["plan_executor"][key], 0,
                 "fallback counter {key} must stay zero"
+            );
+        }
+    }
+
+    #[test]
+    fn root_scalar_plan_executor_replays_same_event_bytes_dependency() {
+        let steps = vec!["patch-and-read-bytes".to_owned()];
+        let output = run_plan_root_scalar_scenario(
+            Path::new("../../examples/bytes_same_event_dependency_plan_ops.bn"),
+            Path::new("../../examples/bytes_same_event_dependency_plan_ops.scn"),
+            TargetProfile::SoftwareDefault,
+            &steps,
+            true,
+            None,
+        )
+        .expect("same-event Bytes/set dependency fixture should execute through PlanExecutor");
+
+        let patched_summary = json!({
+            "$boon_type": "BYTES",
+            "storage": "inline",
+            "digest": "9c5ec9570d8bf71994dfc97037803d9a280ba40f6dab32591c949310e0d9fdd8",
+            "byte_len": 4
+        });
+
+        assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.state_summary["store.patched"], patched_summary);
+        assert_eq!(output.state_summary["store.patched_byte"], 170);
+        assert_eq!(output.state_summary["store.patched_len"], 4);
+        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
+        assert_eq!(
+            output.report["legacy_comparison"]["semantic_delta_match"],
+            true
+        );
+
+        let updates = output.report["plan_executor"]["per_step"][0]["updates"]
+            .as_array()
+            .expect("same-event step should expose updates");
+        let update_for = |target: &str| {
+            updates
+                .iter()
+                .find(|update| update["target_state"] == target)
+                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
+        };
+        assert_eq!(updates.len(), 3);
+        assert_eq!(update_for("store.patched")["expression_kind"], "bytes_set");
+        assert_eq!(update_for("store.patched")["value"], patched_summary);
+        assert_eq!(update_for("store.patched_byte")["value"], 170);
+        assert_eq!(update_for("store.patched_len")["value"], 4);
+        assert_eq!(
+            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"], true,
+            "same-event fixed-bank Bytes/set/read path should avoid measured byte-buffer copies"
+        );
+        for key in [
+            "copy_from_slice_bytes",
+            "vec_clone_bytes",
+            "vec_alloc_bytes",
+            "zero_fill_bytes",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
+                "same-event fixed-bank dependency tick should keep {key}=0"
+            );
+        }
+        for key in [
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"][key], 0,
+                "fallback counter {key} must stay zero"
+            );
+        }
+        for value in [
+            &output.state_summary["store.patched"],
+            &update_for("store.patched")["value"],
+        ] {
+            assert!(
+                value.get("inline_bytes").is_none(),
+                "public BYTES summaries must not expose inline bytes: {value:#?}"
             );
         }
     }

@@ -177,6 +177,20 @@ pub enum DocumentPatch {
     RemoveNode {
         id: DocumentNodeId,
     },
+    InsertChild {
+        parent: DocumentNodeId,
+        child: DocumentNodeId,
+        index: usize,
+    },
+    RemoveChild {
+        parent: DocumentNodeId,
+        child: DocumentNodeId,
+    },
+    MoveChild {
+        child: DocumentNodeId,
+        new_parent: DocumentNodeId,
+        index: usize,
+    },
     SetText {
         id: DocumentNodeId,
         text: TextValue,

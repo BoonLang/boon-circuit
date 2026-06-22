@@ -384,6 +384,38 @@ pub struct DocumentState {
     frame: DocumentFrame,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentHotNodeId(pub u32);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentDebugNameTable {
+    pub node_names: BTreeMap<DocumentHotNodeId, DocumentNodeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentHotIdTable {
+    pub root: DocumentHotNodeId,
+    pub ids_by_node: BTreeMap<DocumentNodeId, DocumentHotNodeId>,
+    pub debug_names: DocumentDebugNameTable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentChangeBatch {
+    pub patches: Vec<DocumentPatch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DocumentChangeSet {
+    pub patch_count: usize,
+    pub reports: Vec<PatchApplyReport>,
+    pub targets: Vec<DocumentNodeId>,
+    pub invalidation: Vec<PatchInvalidationClass>,
+    pub removed_nodes: Vec<DocumentNodeId>,
+    pub node_count_before: usize,
+    pub node_count_after: usize,
+    pub materialization: Vec<MaterializationReport>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatchInvalidationClass {
@@ -442,6 +474,11 @@ pub enum PatchApplyError {
         child: DocumentNodeId,
         actual_parent: Option<DocumentNodeId>,
     },
+    ChildIndexOutOfBounds {
+        parent: DocumentNodeId,
+        index: usize,
+        child_count: usize,
+    },
     OrphanedNode {
         id: DocumentNodeId,
         parent: Option<DocumentNodeId>,
@@ -488,6 +525,15 @@ impl fmt::Display for PatchApplyError {
                 child.0,
                 actual_parent.as_ref().map(|id| id.0.as_str())
             ),
+            Self::ChildIndexOutOfBounds {
+                parent,
+                index,
+                child_count,
+            } => write!(
+                f,
+                "node `{}` cannot insert child at index {} with {} children",
+                parent.0, index, child_count
+            ),
             Self::OrphanedNode { id, parent } => write!(
                 f,
                 "node `{}` has parent {:?} but is not reachable from the root",
@@ -504,6 +550,37 @@ impl fmt::Display for PatchApplyError {
 
 impl std::error::Error for PatchApplyError {}
 
+impl DocumentHotIdTable {
+    pub fn from_frame(frame: &DocumentFrame) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        let mut ids_by_node = BTreeMap::new();
+        let mut node_names = BTreeMap::new();
+        let root = DocumentHotNodeId(0);
+        ids_by_node.insert(frame.root.clone(), root);
+        node_names.insert(root, frame.root.clone());
+        let mut next = 1_u32;
+        for id in frame.nodes.keys().filter(|id| *id != &frame.root) {
+            let hot = DocumentHotNodeId(next);
+            next = next.saturating_add(1);
+            ids_by_node.insert(id.clone(), hot);
+            node_names.insert(hot, id.clone());
+        }
+        Ok(Self {
+            root,
+            ids_by_node,
+            debug_names: DocumentDebugNameTable { node_names },
+        })
+    }
+
+    pub fn hot_id(&self, id: &DocumentNodeId) -> Option<DocumentHotNodeId> {
+        self.ids_by_node.get(id).copied()
+    }
+
+    pub fn debug_name(&self, id: DocumentHotNodeId) -> Option<&DocumentNodeId> {
+        self.debug_names.node_names.get(&id)
+    }
+}
+
 impl DocumentState {
     pub fn new(root: impl Into<String>) -> Self {
         Self {
@@ -511,146 +588,276 @@ impl DocumentState {
         }
     }
 
+    pub fn from_frame(frame: DocumentFrame) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(&frame)?;
+        Ok(Self { frame })
+    }
+
     pub fn frame(&self) -> &DocumentFrame {
         &self.frame
+    }
+
+    pub fn into_frame(self) -> DocumentFrame {
+        self.frame
     }
 
     pub fn apply_patch(
         &mut self,
         patch: DocumentPatch,
     ) -> Result<PatchApplyReport, PatchApplyError> {
+        let change_set = self.apply_batch(DocumentChangeBatch {
+            patches: vec![patch],
+        })?;
+        Ok(change_set
+            .reports
+            .into_iter()
+            .next()
+            .expect("single patch batch must produce one report"))
+    }
+
+    pub fn apply_batch(
+        &mut self,
+        batch: DocumentChangeBatch,
+    ) -> Result<DocumentChangeSet, PatchApplyError> {
         validate_frame_integrity(&self.frame)?;
-        let report = match patch {
-            DocumentPatch::UpsertNode(node) => {
-                let target = node.id.clone();
-                apply_upsert_node(&mut self.frame, node)?;
-                PatchApplyReport {
-                    patch_kind: "upsert_node",
-                    target: Some(target),
-                    invalidation: vec![
-                        PatchInvalidationClass::Structure,
-                        PatchInvalidationClass::ListStructure,
-                        PatchInvalidationClass::ConditionalStructure,
-                        PatchInvalidationClass::Layout,
-                        PatchInvalidationClass::LayoutOnly,
-                        PatchInvalidationClass::HitRegion,
-                        PatchInvalidationClass::FullDocument,
-                    ],
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
+        let node_count_before = self.frame.nodes.len();
+        let mut next_frame = self.frame.clone();
+        let mut reports = Vec::with_capacity(batch.patches.len());
+        for patch in batch.patches {
+            reports.push(apply_document_patch_unchecked(&mut next_frame, patch)?);
+        }
+        validate_frame_integrity(&next_frame)?;
+        let change_set =
+            document_change_set_from_reports(reports, node_count_before, next_frame.nodes.len());
+        self.frame = next_frame;
+        Ok(change_set)
+    }
+}
+
+fn apply_document_patch_unchecked(
+    frame: &mut DocumentFrame,
+    patch: DocumentPatch,
+) -> Result<PatchApplyReport, PatchApplyError> {
+    match patch {
+        DocumentPatch::UpsertNode(node) => {
+            let target = node.id.clone();
+            apply_upsert_node(frame, node)?;
+            Ok(PatchApplyReport {
+                patch_kind: "upsert_node",
+                target: Some(target),
+                invalidation: vec![
+                    PatchInvalidationClass::Structure,
+                    PatchInvalidationClass::ListStructure,
+                    PatchInvalidationClass::ConditionalStructure,
+                    PatchInvalidationClass::Layout,
+                    PatchInvalidationClass::LayoutOnly,
+                    PatchInvalidationClass::HitRegion,
+                    PatchInvalidationClass::FullDocument,
+                ],
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::RemoveNode { id } => {
+            let removed_nodes = remove_subtree(frame, &id)?;
+            Ok(PatchApplyReport {
+                patch_kind: "remove_node",
+                target: Some(id),
+                invalidation: vec![
+                    PatchInvalidationClass::Structure,
+                    PatchInvalidationClass::ListStructure,
+                    PatchInvalidationClass::Binding,
+                    PatchInvalidationClass::SourceBinding,
+                    PatchInvalidationClass::Scroll,
+                    PatchInvalidationClass::ScrollOffsetOnly,
+                    PatchInvalidationClass::Materialization,
+                    PatchInvalidationClass::MaterializationOnly,
+                    PatchInvalidationClass::Layout,
+                    PatchInvalidationClass::LayoutOnly,
+                    PatchInvalidationClass::HitRegion,
+                    PatchInvalidationClass::FullDocument,
+                ],
+                removed_nodes,
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::InsertChild {
+            parent,
+            child,
+            index,
+        } => {
+            reorder_child(frame, &parent, &child, index, "insert_child")?;
+            Ok(PatchApplyReport {
+                patch_kind: "insert_child",
+                target: Some(parent),
+                invalidation: structural_child_invalidation(),
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::RemoveChild { parent, child } => {
+            validate_parent_child_link(frame, &parent, &child, "remove_child")?;
+            let removed_nodes = remove_subtree(frame, &child)?;
+            Ok(PatchApplyReport {
+                patch_kind: "remove_child",
+                target: Some(parent),
+                invalidation: structural_child_invalidation(),
+                removed_nodes,
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::MoveChild {
+            child,
+            new_parent,
+            index,
+        } => {
+            move_child(frame, &child, &new_parent, index)?;
+            Ok(PatchApplyReport {
+                patch_kind: "move_child",
+                target: Some(new_parent),
+                invalidation: structural_child_invalidation(),
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetText { id, text } => {
+            let node = required_node_mut(frame, "set_text", &id)?;
+            node.text = Some(text);
+            Ok(PatchApplyReport {
+                patch_kind: "set_text",
+                target: Some(id),
+                invalidation: vec![
+                    PatchInvalidationClass::Text,
+                    PatchInvalidationClass::PaintOnly,
+                    PatchInvalidationClass::Layout,
+                    PatchInvalidationClass::LayoutOnly,
+                    PatchInvalidationClass::HitRegion,
+                ],
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetStyle { id, patch } => {
+            let node = required_node_mut(frame, "set_style", &id)?;
+            let changed_keys = apply_style_patch(&mut node.style, patch);
+            let invalidation = style_patch_invalidation(&changed_keys);
+            Ok(PatchApplyReport {
+                patch_kind: "set_style",
+                target: Some(id),
+                invalidation,
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetBinding { id, binding } => {
+            let node = required_node_mut(frame, "set_binding", &id)?;
+            node.source_binding = Some(binding);
+            Ok(PatchApplyReport {
+                patch_kind: "set_binding",
+                target: Some(id),
+                invalidation: vec![
+                    PatchInvalidationClass::Binding,
+                    PatchInvalidationClass::SourceBinding,
+                    PatchInvalidationClass::HitRegion,
+                ],
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetScroll { id, scroll } => {
+            let node = required_node_mut(frame, "set_scroll", &id)?;
+            node.scroll = Some(scroll);
+            Ok(PatchApplyReport {
+                patch_kind: "set_scroll",
+                target: Some(id),
+                invalidation: vec![
+                    PatchInvalidationClass::Scroll,
+                    PatchInvalidationClass::ScrollOffsetOnly,
+                    PatchInvalidationClass::Layout,
+                    PatchInvalidationClass::LayoutOnly,
+                ],
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetListMaterialization { id, materialized } => {
+            let node = required_node_mut(frame, "set_list_materialization", &id)?;
+            let report = materialization_report(node, &materialized);
+            node.materialized.push(materialized);
+            Ok(PatchApplyReport {
+                patch_kind: "set_list_materialization",
+                target: Some(id),
+                invalidation: vec![
+                    PatchInvalidationClass::Materialization,
+                    PatchInvalidationClass::MaterializationOnly,
+                    PatchInvalidationClass::Layout,
+                    PatchInvalidationClass::LayoutOnly,
+                    PatchInvalidationClass::HitRegion,
+                ],
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: Some(report),
+            })
+        }
+    }
+}
+
+fn structural_child_invalidation() -> Vec<PatchInvalidationClass> {
+    vec![
+        PatchInvalidationClass::Structure,
+        PatchInvalidationClass::ListStructure,
+        PatchInvalidationClass::ConditionalStructure,
+        PatchInvalidationClass::Layout,
+        PatchInvalidationClass::LayoutOnly,
+        PatchInvalidationClass::HitRegion,
+    ]
+}
+
+fn document_change_set_from_reports(
+    reports: Vec<PatchApplyReport>,
+    node_count_before: usize,
+    node_count_after: usize,
+) -> DocumentChangeSet {
+    let mut targets = Vec::new();
+    let mut invalidation = Vec::new();
+    let mut removed_nodes = Vec::new();
+    let mut materialization = Vec::new();
+    for report in &reports {
+        if let Some(target) = &report.target
+            && !targets.contains(target)
+        {
+            targets.push(target.clone());
+        }
+        for class in &report.invalidation {
+            push_unique_invalidation(&mut invalidation, class.clone());
+        }
+        for removed in &report.removed_nodes {
+            if !removed_nodes.contains(removed) {
+                removed_nodes.push(removed.clone());
             }
-            DocumentPatch::RemoveNode { id } => {
-                let removed_nodes = remove_subtree(&mut self.frame, &id)?;
-                PatchApplyReport {
-                    patch_kind: "remove_node",
-                    target: Some(id),
-                    invalidation: vec![
-                        PatchInvalidationClass::Structure,
-                        PatchInvalidationClass::ListStructure,
-                        PatchInvalidationClass::Binding,
-                        PatchInvalidationClass::SourceBinding,
-                        PatchInvalidationClass::Scroll,
-                        PatchInvalidationClass::ScrollOffsetOnly,
-                        PatchInvalidationClass::Materialization,
-                        PatchInvalidationClass::MaterializationOnly,
-                        PatchInvalidationClass::Layout,
-                        PatchInvalidationClass::LayoutOnly,
-                        PatchInvalidationClass::HitRegion,
-                        PatchInvalidationClass::FullDocument,
-                    ],
-                    removed_nodes,
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
-            }
-            DocumentPatch::SetText { id, text } => {
-                let node = required_node_mut(&mut self.frame, "set_text", &id)?;
-                node.text = Some(text);
-                PatchApplyReport {
-                    patch_kind: "set_text",
-                    target: Some(id),
-                    invalidation: vec![
-                        PatchInvalidationClass::Text,
-                        PatchInvalidationClass::PaintOnly,
-                        PatchInvalidationClass::Layout,
-                        PatchInvalidationClass::LayoutOnly,
-                        PatchInvalidationClass::HitRegion,
-                    ],
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
-            }
-            DocumentPatch::SetStyle { id, patch } => {
-                let node = required_node_mut(&mut self.frame, "set_style", &id)?;
-                let changed_keys = apply_style_patch(&mut node.style, patch);
-                let invalidation = style_patch_invalidation(&changed_keys);
-                PatchApplyReport {
-                    patch_kind: "set_style",
-                    target: Some(id),
-                    invalidation,
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
-            }
-            DocumentPatch::SetBinding { id, binding } => {
-                let node = required_node_mut(&mut self.frame, "set_binding", &id)?;
-                node.source_binding = Some(binding);
-                PatchApplyReport {
-                    patch_kind: "set_binding",
-                    target: Some(id),
-                    invalidation: vec![
-                        PatchInvalidationClass::Binding,
-                        PatchInvalidationClass::SourceBinding,
-                        PatchInvalidationClass::HitRegion,
-                    ],
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
-            }
-            DocumentPatch::SetScroll { id, scroll } => {
-                let node = required_node_mut(&mut self.frame, "set_scroll", &id)?;
-                node.scroll = Some(scroll);
-                PatchApplyReport {
-                    patch_kind: "set_scroll",
-                    target: Some(id),
-                    invalidation: vec![
-                        PatchInvalidationClass::Scroll,
-                        PatchInvalidationClass::ScrollOffsetOnly,
-                        PatchInvalidationClass::Layout,
-                        PatchInvalidationClass::LayoutOnly,
-                    ],
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: None,
-                }
-            }
-            DocumentPatch::SetListMaterialization { id, materialized } => {
-                let node = required_node_mut(&mut self.frame, "set_list_materialization", &id)?;
-                let report = materialization_report(node, &materialized);
-                node.materialized.push(materialized);
-                PatchApplyReport {
-                    patch_kind: "set_list_materialization",
-                    target: Some(id),
-                    invalidation: vec![
-                        PatchInvalidationClass::Materialization,
-                        PatchInvalidationClass::MaterializationOnly,
-                        PatchInvalidationClass::Layout,
-                        PatchInvalidationClass::LayoutOnly,
-                        PatchInvalidationClass::HitRegion,
-                    ],
-                    removed_nodes: Vec::new(),
-                    node_count_after: self.frame.nodes.len(),
-                    materialization: Some(report),
-                }
-            }
-        };
-        validate_frame_integrity(&self.frame)?;
-        Ok(report)
+        }
+        if let Some(report) = &report.materialization {
+            materialization.push(report.clone());
+        }
+    }
+    DocumentChangeSet {
+        patch_count: reports.len(),
+        reports,
+        targets,
+        invalidation,
+        removed_nodes,
+        node_count_before,
+        node_count_after,
+        materialization,
     }
 }
 
@@ -768,6 +975,148 @@ fn remove_subtree(
         frame.focus = None;
     }
     Ok(removed)
+}
+
+fn reorder_child(
+    frame: &mut DocumentFrame,
+    parent: &DocumentNodeId,
+    child: &DocumentNodeId,
+    index: usize,
+    patch_kind: &'static str,
+) -> Result<(), PatchApplyError> {
+    validate_parent_child_link(frame, parent, child, patch_kind)?;
+    let parent_node =
+        frame
+            .nodes
+            .get_mut(parent)
+            .ok_or_else(|| PatchApplyError::MissingTarget {
+                patch_kind,
+                id: parent.clone(),
+            })?;
+    parent_node.children.retain(|candidate| candidate != child);
+    if index > parent_node.children.len() {
+        return Err(PatchApplyError::ChildIndexOutOfBounds {
+            parent: parent.clone(),
+            index,
+            child_count: parent_node.children.len(),
+        });
+    }
+    parent_node.children.insert(index, child.clone());
+    Ok(())
+}
+
+fn move_child(
+    frame: &mut DocumentFrame,
+    child: &DocumentNodeId,
+    new_parent: &DocumentNodeId,
+    index: usize,
+) -> Result<(), PatchApplyError> {
+    if child == &frame.root {
+        return Err(PatchApplyError::CannotRemoveRoot { id: child.clone() });
+    }
+    if !frame.nodes.contains_key(child) {
+        return Err(PatchApplyError::MissingTarget {
+            patch_kind: "move_child",
+            id: child.clone(),
+        });
+    }
+    if !frame.nodes.contains_key(new_parent) {
+        return Err(PatchApplyError::MissingTarget {
+            patch_kind: "move_child",
+            id: new_parent.clone(),
+        });
+    }
+    validate_move_does_not_create_cycle(frame, child, new_parent)?;
+    let old_parent = frame
+        .nodes
+        .get(child)
+        .and_then(|node| node.parent.clone())
+        .ok_or_else(|| PatchApplyError::OrphanedNode {
+            id: child.clone(),
+            parent: None,
+        })?;
+    if let Some(parent_node) = frame.nodes.get_mut(&old_parent) {
+        parent_node.children.retain(|candidate| candidate != child);
+    }
+    let new_parent_node =
+        frame
+            .nodes
+            .get_mut(new_parent)
+            .ok_or_else(|| PatchApplyError::MissingTarget {
+                patch_kind: "move_child",
+                id: new_parent.clone(),
+            })?;
+    if index > new_parent_node.children.len() {
+        return Err(PatchApplyError::ChildIndexOutOfBounds {
+            parent: new_parent.clone(),
+            index,
+            child_count: new_parent_node.children.len(),
+        });
+    }
+    new_parent_node.children.insert(index, child.clone());
+    if let Some(child_node) = frame.nodes.get_mut(child) {
+        child_node.parent = Some(new_parent.clone());
+    }
+    Ok(())
+}
+
+fn validate_parent_child_link(
+    frame: &DocumentFrame,
+    parent: &DocumentNodeId,
+    child: &DocumentNodeId,
+    patch_kind: &'static str,
+) -> Result<(), PatchApplyError> {
+    let parent_node = frame
+        .nodes
+        .get(parent)
+        .ok_or_else(|| PatchApplyError::MissingTarget {
+            patch_kind,
+            id: parent.clone(),
+        })?;
+    let child_node = frame
+        .nodes
+        .get(child)
+        .ok_or_else(|| PatchApplyError::MissingTarget {
+            patch_kind,
+            id: child.clone(),
+        })?;
+    if child_node.parent.as_ref() != Some(parent) || !parent_node.children.contains(child) {
+        return Err(PatchApplyError::InvalidParentChildLink {
+            parent: parent.clone(),
+            child: child.clone(),
+            actual_parent: child_node.parent.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_move_does_not_create_cycle(
+    frame: &DocumentFrame,
+    child: &DocumentNodeId,
+    new_parent: &DocumentNodeId,
+) -> Result<(), PatchApplyError> {
+    let mut current = new_parent.clone();
+    loop {
+        if &current == child {
+            return Err(PatchApplyError::Cycle { id: child.clone() });
+        }
+        if current == frame.root {
+            return Ok(());
+        }
+        let Some(node) = frame.nodes.get(&current) else {
+            return Err(PatchApplyError::MissingTarget {
+                patch_kind: "move_child",
+                id: current,
+            });
+        };
+        let Some(parent) = node.parent.clone() else {
+            return Err(PatchApplyError::OrphanedNode {
+                id: node.id.clone(),
+                parent: None,
+            });
+        };
+        current = parent;
+    }
 }
 
 fn collect_subtree(
@@ -1931,6 +2280,128 @@ mod tests {
     }
 
     #[test]
+    fn document_batch_commits_atomically_and_merges_dirty_facts() {
+        let mut state = DocumentState::new("root");
+        let mut style = StylePatch::new();
+        style.insert(
+            "color".to_owned(),
+            Some(StyleValue::Text("blue".to_owned())),
+        );
+
+        let change_set = state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::UpsertNode(node("label", DocumentNodeKind::Text, Some("root"))),
+                    DocumentPatch::SetText {
+                        id: DocumentNodeId("label".to_owned()),
+                        text: TextValue {
+                            text: "Ready".to_owned(),
+                        },
+                    },
+                    DocumentPatch::SetStyle {
+                        id: DocumentNodeId("label".to_owned()),
+                        patch: style,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(change_set.patch_count, 3);
+        assert_eq!(change_set.node_count_before, 1);
+        assert_eq!(change_set.node_count_after, 2);
+        assert_eq!(change_set.targets, vec![DocumentNodeId("label".to_owned())]);
+        for class in [
+            PatchInvalidationClass::Structure,
+            PatchInvalidationClass::Text,
+            PatchInvalidationClass::Style,
+            PatchInvalidationClass::Layout,
+            PatchInvalidationClass::PaintOnly,
+            PatchInvalidationClass::HitRegion,
+            PatchInvalidationClass::FullDocument,
+        ] {
+            assert!(
+                change_set.invalidation.contains(&class),
+                "missing merged invalidation class {class:?}"
+            );
+        }
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("label".to_owned())]
+                .text
+                .as_ref()
+                .unwrap()
+                .text,
+            "Ready"
+        );
+    }
+
+    #[test]
+    fn document_batch_rolls_back_when_later_patch_fails() {
+        let mut state = DocumentState::new("root");
+        let error = state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::UpsertNode(node("label", DocumentNodeKind::Text, Some("root"))),
+                    DocumentPatch::SetText {
+                        id: DocumentNodeId("missing".to_owned()),
+                        text: TextValue {
+                            text: "Should not commit".to_owned(),
+                        },
+                    },
+                ],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchApplyError::MissingTarget {
+                patch_kind: "set_text",
+                id
+            } if id.0 == "missing"
+        ));
+        assert!(
+            !state
+                .frame()
+                .nodes
+                .contains_key(&DocumentNodeId("label".to_owned())),
+            "the successful first patch must not commit when a later patch fails"
+        );
+        assert_eq!(state.frame().nodes.len(), 1);
+    }
+
+    #[test]
+    fn document_hot_id_table_is_numeric_stable_and_debuggable() {
+        let mut state = DocumentState::new("root");
+        state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::UpsertNode(node("zeta", DocumentNodeKind::Text, Some("root"))),
+                    DocumentPatch::UpsertNode(node("alpha", DocumentNodeKind::Text, Some("root"))),
+                    DocumentPatch::UpsertNode(node("panel", DocumentNodeKind::Stack, Some("root"))),
+                ],
+            })
+            .unwrap();
+
+        let table = DocumentHotIdTable::from_frame(state.frame()).unwrap();
+        assert_eq!(table.root, DocumentHotNodeId(0));
+        assert_eq!(
+            table.hot_id(&DocumentNodeId("root".to_owned())),
+            Some(DocumentHotNodeId(0))
+        );
+        assert_eq!(
+            table.hot_id(&DocumentNodeId("alpha".to_owned())),
+            Some(DocumentHotNodeId(1)),
+            "non-root IDs should be assigned deterministically by stable node ID"
+        );
+        assert_eq!(
+            table.debug_name(DocumentHotNodeId(3)),
+            Some(&DocumentNodeId("zeta".to_owned()))
+        );
+        let encoded = serde_json::to_value(&table).expect("hot ID table should serialize");
+        assert_eq!(encoded["root"], 0);
+        assert_eq!(encoded["debug_names"]["node_names"]["0"], "root");
+    }
+
+    #[test]
     fn style_identity_splits_layout_paint_material_font_and_pseudo_state() {
         let mut base = StyleMap::new();
         base.insert("width".to_owned(), StyleValue::Number(120.0));
@@ -2370,6 +2841,143 @@ mod tests {
             state.frame().nodes[&DocumentNodeId("root".to_owned())]
                 .children
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn structural_child_patches_reorder_move_and_remove_precisely() {
+        let mut state = DocumentState::new("root");
+        for (id, kind, parent) in [
+            ("left", DocumentNodeKind::Stack, "root"),
+            ("right", DocumentNodeKind::Stack, "root"),
+            ("a", DocumentNodeKind::Text, "left"),
+            ("b", DocumentNodeKind::Text, "left"),
+            ("c", DocumentNodeKind::Text, "left"),
+            ("nested", DocumentNodeKind::Text, "c"),
+        ] {
+            state
+                .apply_patch(DocumentPatch::UpsertNode(node(id, kind, Some(parent))))
+                .unwrap();
+        }
+
+        let reorder = state
+            .apply_patch(DocumentPatch::InsertChild {
+                parent: DocumentNodeId("left".to_owned()),
+                child: DocumentNodeId("c".to_owned()),
+                index: 0,
+            })
+            .unwrap();
+        assert_eq!(reorder.patch_kind, "insert_child");
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("left".to_owned())].children,
+            vec![
+                DocumentNodeId("c".to_owned()),
+                DocumentNodeId("a".to_owned()),
+                DocumentNodeId("b".to_owned()),
+            ]
+        );
+        assert!(
+            reorder
+                .invalidation
+                .contains(&PatchInvalidationClass::Structure)
+        );
+        assert!(
+            !reorder
+                .invalidation
+                .contains(&PatchInvalidationClass::FullDocument),
+            "precise child reorders should not force full-document invalidation"
+        );
+
+        let moved = state
+            .apply_patch(DocumentPatch::MoveChild {
+                child: DocumentNodeId("b".to_owned()),
+                new_parent: DocumentNodeId("right".to_owned()),
+                index: 0,
+            })
+            .unwrap();
+        assert_eq!(moved.patch_kind, "move_child");
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("b".to_owned())].parent,
+            Some(DocumentNodeId("right".to_owned()))
+        );
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("right".to_owned())].children,
+            vec![DocumentNodeId("b".to_owned())]
+        );
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("left".to_owned())].children,
+            vec![
+                DocumentNodeId("c".to_owned()),
+                DocumentNodeId("a".to_owned())
+            ]
+        );
+
+        let removed = state
+            .apply_patch(DocumentPatch::RemoveChild {
+                parent: DocumentNodeId("left".to_owned()),
+                child: DocumentNodeId("c".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(removed.patch_kind, "remove_child");
+        assert_eq!(
+            removed.removed_nodes,
+            vec![
+                DocumentNodeId("c".to_owned()),
+                DocumentNodeId("nested".to_owned())
+            ]
+        );
+        assert!(
+            !state
+                .frame()
+                .nodes
+                .contains_key(&DocumentNodeId("nested".to_owned()))
+        );
+    }
+
+    #[test]
+    fn structural_child_patches_reject_cycles_and_bad_indices() {
+        let mut state = DocumentState::new("root");
+        for (id, kind, parent) in [
+            ("panel", DocumentNodeKind::Stack, "root"),
+            ("child", DocumentNodeKind::Stack, "panel"),
+            ("leaf", DocumentNodeKind::Text, "child"),
+        ] {
+            state
+                .apply_patch(DocumentPatch::UpsertNode(node(id, kind, Some(parent))))
+                .unwrap();
+        }
+
+        let cycle = state
+            .apply_patch(DocumentPatch::MoveChild {
+                child: DocumentNodeId("panel".to_owned()),
+                new_parent: DocumentNodeId("leaf".to_owned()),
+                index: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            cycle,
+            PatchApplyError::Cycle { id } if id.0 == "panel"
+        ));
+
+        let bad_index = state
+            .apply_patch(DocumentPatch::InsertChild {
+                parent: DocumentNodeId("panel".to_owned()),
+                child: DocumentNodeId("child".to_owned()),
+                index: 9,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            bad_index,
+            PatchApplyError::ChildIndexOutOfBounds {
+                parent,
+                index: 9,
+                child_count: 0
+            } if parent.0 == "panel"
+        ));
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("panel".to_owned())].children,
+            vec![DocumentNodeId("child".to_owned())],
+            "failed reorders must not mutate committed state"
         );
     }
 

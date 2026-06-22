@@ -38529,6 +38529,60 @@ fn document_style_value_from_state_value(value: &Value) -> boon_document_model::
     }
 }
 
+fn document_patch_for_data_binding_target(
+    frame: &boon_document_model::DocumentFrame,
+    target: &DocumentDataBindingTarget,
+    value: &Value,
+) -> Result<Option<boon_document_model::DocumentPatch>, String> {
+    let node = frame
+        .nodes
+        .get(&target.node)
+        .ok_or_else(|| format!("stale_target_node:{}", target.node.0))?;
+    if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
+        let Some(binding) = node.source_binding.as_ref() else {
+            return Ok(None);
+        };
+        if binding.intent != intent {
+            return Ok(None);
+        }
+        return Ok(Some(boon_document_model::DocumentPatch::SetBinding {
+            id: target.node.clone(),
+            binding: boon_document_model::SourceBinding {
+                id: binding.id.clone(),
+                source_path: json_value_to_document_source_path(value),
+                intent: binding.intent.clone(),
+            },
+        }));
+    }
+    if target.attr == "text" || matches!(target.attr.as_str(), "label" | "value" | "display_value")
+    {
+        return Ok(Some(boon_document_model::DocumentPatch::SetText {
+            id: target.node.clone(),
+            text: boon_document_model::TextValue {
+                text: json_value_to_document_text(value),
+            },
+        }));
+    }
+    let mut patch = boon_document_model::StylePatch::new();
+    let style_value = document_style_value_from_state_value(value);
+    if target.attr == "size"
+        && matches!(
+            node.kind,
+            boon_document_model::DocumentNodeKind::Button
+                | boon_document_model::DocumentNodeKind::Checkbox
+                | boon_document_model::DocumentNodeKind::Stack
+                | boon_document_model::DocumentNodeKind::TableCell
+        )
+    {
+        patch.insert("box_size".to_owned(), Some(style_value.clone()));
+    }
+    patch.insert(target.attr.clone(), Some(style_value));
+    Ok(Some(boon_document_model::DocumentPatch::SetStyle {
+        id: target.node.clone(),
+        patch,
+    }))
+}
+
 fn layout_frame_for_document_frame(
     frame: &boon_document_model::DocumentFrame,
     viewport: (f32, f32),
@@ -39267,6 +39321,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
     let mut targetless_patch_count = 0usize;
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
+    let mut document_patches = Vec::new();
     let document_frame_patch_started = Instant::now();
     for patch in patches {
         let Some((path, value)) = document_data_patch_value(patch) else {
@@ -39292,7 +39347,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
                 ));
                 return Ok(None);
             }
-            let Some(node) = frame.nodes.get_mut(&target.node) else {
+            let Some(node) = frame.nodes.get(&target.node) else {
                 record_preview_paint_space_patch_reject("stale_target_node");
                 return Ok(None);
             };
@@ -39304,10 +39359,17 @@ fn preview_try_patch_paint_space_for_root_deltas(
                     cloned
                 });
                 let source_path = json_value_to_document_source_path(&value);
-                if let Some(binding) = node.source_binding.as_mut()
+                if let Some(binding) = node.source_binding.as_ref()
                     && binding.intent == intent
                 {
-                    binding.source_path = source_path.clone();
+                    document_patches.push(boon_document_model::DocumentPatch::SetBinding {
+                        id: target.node.clone(),
+                        binding: boon_document_model::SourceBinding {
+                            id: binding.id.clone(),
+                            source_path: source_path.clone(),
+                            intent: binding.intent.clone(),
+                        },
+                    });
                 }
                 for source_intent in source_intents {
                     let Some(object) = source_intent.as_object_mut() else {
@@ -39325,23 +39387,15 @@ fn preview_try_patch_paint_space_for_root_deltas(
                         object.insert("source_path".to_owned(), json!(source_path.clone()));
                     }
                 }
-            } else if target.attr == "text"
-                || matches!(target.attr.as_str(), "label" | "value" | "display_value")
-            {
-                node.text = Some(boon_document_model::TextValue {
-                    text: json_value_to_document_text(&value),
-                });
-            } else if matches!(target.attr.as_str(), "width" | "height" | "size") {
-                insert_dimension_style(
-                    node,
-                    &target.attr,
-                    document_style_value_from_state_value(&value),
-                );
             } else {
-                node.style.insert(
-                    target.attr.clone(),
-                    document_style_value_from_state_value(&value),
-                );
+                match document_patch_for_data_binding_target(&frame, target, &value) {
+                    Ok(Some(patch)) => document_patches.push(patch),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        record_preview_paint_space_patch_reject(reason);
+                        return Ok(None);
+                    }
+                }
             }
             direct_patch_targets.push(DocumentDirectLayoutPatchTarget {
                 target: target.clone(),
@@ -39349,6 +39403,13 @@ fn preview_try_patch_paint_space_for_root_deltas(
             });
             patched_targets = patched_targets.saturating_add(1);
         }
+    }
+    if !document_patches.is_empty() {
+        let mut document_state = boon_document::DocumentState::from_frame(frame)?;
+        document_state.apply_batch(boon_document::DocumentChangeBatch {
+            patches: document_patches,
+        })?;
+        frame = document_state.into_frame();
     }
     if direct_patch_targets.is_empty() {
         record_preview_paint_space_patch_reject("targetless_patch_set");
@@ -39495,6 +39556,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let mut patched_target_samples = Vec::new();
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
+    let mut document_patches = Vec::new();
     let collect_patch_samples = full_proof || !preview_compact_timing_enabled();
     let document_frame_patch_started = Instant::now();
     for patch in patches {
@@ -39512,7 +39574,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
         layout_hash_patches.push(patch.clone());
         let mut patched_this_path = false;
         for target in targets {
-            let Some(node) = frame.nodes.get_mut(&target.node) else {
+            let Some(node) = frame.nodes.get(&target.node) else {
                 return Err(format!(
                     "document patch fast path stale target node `{}` for data path `{path}`",
                     target.node.0
@@ -39525,10 +39587,17 @@ fn preview_try_patch_document_layout_for_root_deltas(
             });
             if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
                 let source_path = json_value_to_document_source_path(&value);
-                if let Some(binding) = node.source_binding.as_mut()
+                if let Some(binding) = node.source_binding.as_ref()
                     && binding.intent == intent
                 {
-                    binding.source_path = source_path.clone();
+                    document_patches.push(boon_document_model::DocumentPatch::SetBinding {
+                        id: target.node.clone(),
+                        binding: boon_document_model::SourceBinding {
+                            id: binding.id.clone(),
+                            source_path: source_path.clone(),
+                            intent: binding.intent.clone(),
+                        },
+                    });
                 }
                 for source_intent in &mut source_intents {
                     let Some(object) = source_intent.as_object_mut() else {
@@ -39546,23 +39615,18 @@ fn preview_try_patch_document_layout_for_root_deltas(
                         object.insert("source_path".to_owned(), json!(source_path.clone()));
                     }
                 }
-            } else if target.attr == "text"
-                || matches!(target.attr.as_str(), "label" | "value" | "display_value")
-            {
-                node.text = Some(boon_document_model::TextValue {
-                    text: json_value_to_document_text(&value),
-                });
-            } else if matches!(target.attr.as_str(), "width" | "height" | "size") {
-                insert_dimension_style(
-                    node,
-                    &target.attr,
-                    document_style_value_from_state_value(&value),
-                );
             } else {
-                node.style.insert(
-                    target.attr.clone(),
-                    document_style_value_from_state_value(&value),
-                );
+                match document_patch_for_data_binding_target(&frame, target, &value) {
+                    Ok(Some(patch)) => document_patches.push(patch),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        return Err(format!(
+                            "document patch fast path target lowering failed for `{}`: {reason}",
+                            target.node.0
+                        )
+                        .into());
+                    }
+                }
             }
             patched_this_path = true;
             patched_targets = patched_targets.saturating_add(1);
@@ -39578,6 +39642,13 @@ fn preview_try_patch_document_layout_for_root_deltas(
         if !patched_this_path {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
         }
+    }
+    if !document_patches.is_empty() {
+        let mut document_state = boon_document::DocumentState::from_frame(frame)?;
+        document_state.apply_batch(boon_document::DocumentChangeBatch {
+            patches: document_patches,
+        })?;
+        frame = document_state.into_frame();
     }
     layout_patch_profile.document_frame_patch_ms = elapsed_ms(document_frame_patch_started);
     if patched_targets == 0 {
@@ -39933,21 +40004,8 @@ fn preview_document_patch_fast_path_rejection_for_layout_hash(
         {
             return Some(format!("structural_data_overlap:{path}:{structural_path}"));
         }
-        if !document_snapshot_has_data_binding_target(&snapshot, &path) {
-            return Some(format!("targetless_data_binding:{path}"));
-        }
     }
     None
-}
-
-fn document_snapshot_has_data_binding_target(
-    snapshot: &DocumentRenderSnapshot,
-    path: &str,
-) -> bool {
-    document_snapshot_data_binding_targets(snapshot, path)
-        .into_iter()
-        .next()
-        .is_some()
 }
 
 fn document_snapshot_data_binding_targets<'a>(
@@ -44741,6 +44799,86 @@ mod tests {
         let patch = test_root_field_patch("store.title");
 
         assert!(preview_document_patch_fast_path_allowed(&proof, &[patch]));
+    }
+
+    #[test]
+    fn data_binding_targets_lower_to_atomic_document_change_batch() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        let mut button = dev_node(
+            "button",
+            boon_document_model::DocumentNodeKind::Button,
+            Some("Old".to_owned()),
+            &[("width", "80"), ("size", "14")],
+        );
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
+            source_path: "old.press".to_owned(),
+            intent: "press".to_owned(),
+        });
+        append_child(&mut frame, root, button);
+
+        let targets = [
+            (
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("button".to_owned()),
+                    attr: "text".to_owned(),
+                },
+                json!("New"),
+            ),
+            (
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("button".to_owned()),
+                    attr: "size".to_owned(),
+                },
+                json!(20),
+            ),
+            (
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("button".to_owned()),
+                    attr: "__source_intent:press".to_owned(),
+                },
+                json!("new.press"),
+            ),
+        ];
+        let patches = targets
+            .iter()
+            .filter_map(|(target, value)| {
+                document_patch_for_data_binding_target(&frame, target, value)
+                    .expect("test target should lower")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(patches.len(), 3);
+
+        let mut state = boon_document::DocumentState::from_frame(frame)
+            .expect("test document frame should validate");
+        let change_set = state
+            .apply_batch(boon_document::DocumentChangeBatch { patches })
+            .expect("typed document batch should apply");
+        let frame = state.frame();
+        let button = &frame.nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
+        assert_eq!(change_set.patch_count, 3);
+        assert_eq!(change_set.targets.len(), 1);
+        assert_eq!(
+            button.text.as_ref().map(|text| text.text.as_str()),
+            Some("New")
+        );
+        assert_eq!(
+            button.style.get("size"),
+            Some(&boon_document_model::StyleValue::Number(20.0))
+        );
+        assert_eq!(
+            button.style.get("box_size"),
+            Some(&boon_document_model::StyleValue::Number(20.0)),
+            "typed lowering must preserve existing size -> box_size normalization"
+        );
+        assert_eq!(
+            button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("new.press")
+        );
     }
 
     #[test]

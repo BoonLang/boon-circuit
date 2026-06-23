@@ -140,6 +140,8 @@ pub struct HitSideTableEntry {
     pub source_binding_id: Option<SourceBindingId>,
     pub source_path: Option<String>,
     pub source_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_binding_refs: Vec<DocumentTypedBindingRef>,
     pub bounds: Rect,
     pub z_depth: u32,
     pub scroll_root: Option<ScrollRootId>,
@@ -187,6 +189,7 @@ impl HitSideTable {
                 source_binding_id: binding.map(|binding| binding.id.clone()),
                 source_path: binding.map(|binding| binding.source_path.clone()),
                 source_intent: binding.map(|binding| binding.intent.clone()),
+                source_binding_refs: Vec::new(),
                 bounds: hit.bounds,
                 z_depth: index as u32,
                 scroll_root: scroll_root_for_node(document, &hit.node),
@@ -206,16 +209,83 @@ impl HitSideTable {
                 }),
                 spatial_bucket,
             };
-            for bucket in buckets_for_rect(hit.bounds, bucket_size) {
-                table
-                    .buckets
-                    .entry(hit_bucket_key(bucket))
-                    .or_default()
-                    .push(entry_index);
-            }
-            table.entries.push(entry);
+            table.push_entry(entry, entry_index);
         }
         table
+    }
+
+    pub fn try_from_document_layout_with_typed_bindings(
+        document: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        typed_bindings: &DocumentTypedBindingIndex,
+        layout: &LayoutFrame,
+        bucket_size: f32,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(document)?;
+        let bucket_size = if bucket_size.is_finite() && bucket_size > 0.0 {
+            bucket_size
+        } else {
+            Self::DEFAULT_BUCKET_SIZE
+        };
+        let mut table = Self {
+            bucket_size,
+            entries: Vec::with_capacity(layout.hit_regions.len()),
+            buckets: BTreeMap::new(),
+        };
+        for (index, hit) in layout.hit_regions.iter().enumerate() {
+            let node =
+                document
+                    .nodes
+                    .get(&hit.node)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hit_region_node",
+                        id: hit.node.clone(),
+                    })?;
+            let hot = hot_ids
+                .hot_id(&hit.node)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "hot_id_table",
+                    id: hit.node.clone(),
+                })?;
+            let bindings = typed_bindings.bindings_for_node(hot);
+            let primary = bindings.first();
+            let spatial_bucket = hit_bucket_for_point(hit.bounds.x, hit.bounds.y, bucket_size);
+            let entry_index = table.entries.len();
+            let entry = HitSideTableEntry {
+                hit_id: hit.id.clone(),
+                node: hit.node.clone(),
+                source_binding_id: primary.map(|binding| binding.binding_id.clone()),
+                source_path: primary.map(|binding| binding.route.source_path.clone()),
+                source_intent: primary.map(|binding| binding.route.intent.clone()),
+                source_binding_refs: bindings.iter().map(|binding| binding.reference).collect(),
+                bounds: hit.bounds,
+                z_depth: index as u32,
+                scroll_root: scroll_root_for_node(document, &hit.node),
+                row_key: style_u64_any(&node.style, &["row_key", "target_key", "__row_key"]),
+                row_generation: style_u64_any(
+                    &node.style,
+                    &[
+                        "row_generation",
+                        "target_generation",
+                        "generation",
+                        "__row_generation",
+                    ],
+                ),
+                spatial_bucket,
+            };
+            table.push_entry(entry, entry_index);
+        }
+        Ok(table)
+    }
+
+    fn push_entry(&mut self, entry: HitSideTableEntry, entry_index: usize) {
+        for bucket in buckets_for_rect(entry.bounds, self.bucket_size) {
+            self.buckets
+                .entry(hit_bucket_key(bucket))
+                .or_default()
+                .push(entry_index);
+        }
+        self.entries.push(entry);
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<&HitSideTableEntry> {
@@ -387,6 +457,15 @@ pub struct DocumentState {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DocumentHotNodeId(pub u32);
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentHotNodeGeneration(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentHotNodeRef {
+    pub id: DocumentHotNodeId,
+    pub generation: DocumentHotNodeGeneration,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocumentDebugNameTable {
     pub node_names: BTreeMap<DocumentHotNodeId, DocumentNodeId>,
@@ -396,7 +475,277 @@ pub struct DocumentDebugNameTable {
 pub struct DocumentHotIdTable {
     pub root: DocumentHotNodeId,
     pub ids_by_node: BTreeMap<DocumentNodeId, DocumentHotNodeId>,
+    pub generations: BTreeMap<DocumentHotNodeId, DocumentHotNodeGeneration>,
     pub debug_names: DocumentDebugNameTable,
+    pub next_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentInternId(pub u32);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentInternTable {
+    pub ids_by_key: BTreeMap<String, DocumentInternId>,
+    pub keys_by_id: BTreeMap<DocumentInternId, String>,
+    pub next_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentInternedNode {
+    pub node: DocumentHotNodeRef,
+    pub text: Option<DocumentInternId>,
+    pub layout_style: DocumentInternId,
+    pub paint_style: DocumentInternId,
+    pub text_style: DocumentInternId,
+    pub material: DocumentInternId,
+    pub clip: DocumentInternId,
+    pub source_binding: Option<DocumentInternId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentInternIndex {
+    pub texts: DocumentInternTable,
+    pub layout_styles: DocumentInternTable,
+    pub paint_styles: DocumentInternTable,
+    pub text_styles: DocumentInternTable,
+    pub materials: DocumentInternTable,
+    pub clips: DocumentInternTable,
+    pub source_bindings: DocumentInternTable,
+    pub nodes: BTreeMap<DocumentHotNodeId, DocumentInternedNode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentMaterializationWindowKey {
+    pub axis: Axis,
+    pub visible: Range<u64>,
+    pub overscan: Range<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutKey {
+    pub kind: DocumentNodeKind,
+    pub layout_style: DocumentInternId,
+    pub text_style: DocumentInternId,
+    pub text: Option<DocumentInternId>,
+    pub children: Vec<DocumentHotNodeId>,
+    pub materialized: Vec<DocumentMaterializationWindowKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutEntry {
+    pub node: DocumentHotNodeRef,
+    pub key: DocumentRetainedLayoutKey,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutKeyTable {
+    pub entries: BTreeMap<DocumentHotNodeId, DocumentRetainedLayoutEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentRetainedLayoutDirtyReason {
+    Added,
+    Removed,
+    Kind,
+    LayoutStyle,
+    TextStyle,
+    Text,
+    Children,
+    Materialization,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutDirtyEntry {
+    pub node: DocumentHotNodeId,
+    pub previous: Option<DocumentHotNodeRef>,
+    pub current: Option<DocumentHotNodeRef>,
+    pub reasons: Vec<DocumentRetainedLayoutDirtyReason>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutDelta {
+    pub reused: Vec<DocumentHotNodeRef>,
+    pub dirty: Vec<DocumentRetainedLayoutDirtyEntry>,
+    pub removed: Vec<DocumentRetainedLayoutDirtyEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutGeometry {
+    pub bounds: Rect,
+    pub display_index: usize,
+    pub hit_region_count: usize,
+    pub scroll_region_count: usize,
+    pub materialization_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutCacheEntry {
+    pub node: DocumentHotNodeRef,
+    pub key: DocumentRetainedLayoutKey,
+    pub geometry: DocumentRetainedLayoutGeometry,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutCache {
+    pub entries: BTreeMap<DocumentHotNodeId, DocumentRetainedLayoutCacheEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutCacheUpdate {
+    pub cache: DocumentRetainedLayoutCache,
+    pub delta: DocumentRetainedLayoutDelta,
+    pub refreshed: Vec<DocumentHotNodeRef>,
+    pub patch: DocumentRetainedLayoutPatch,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRetainedLayoutPatch {
+    pub operations: Vec<DocumentRetainedLayoutPatchOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DocumentRetainedLayoutPatchOperation {
+    ReuseGeometry {
+        node: DocumentHotNodeRef,
+    },
+    UpsertGeometry {
+        node: DocumentHotNodeRef,
+        key: DocumentRetainedLayoutKey,
+        geometry: DocumentRetainedLayoutGeometry,
+        reasons: Vec<DocumentRetainedLayoutDirtyReason>,
+    },
+    RemoveGeometry {
+        node: DocumentHotNodeRef,
+        reasons: Vec<DocumentRetainedLayoutDirtyReason>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocumentStyleDimension {
+    Px { value: f32 },
+    Fill,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedEdgeSpacing {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedLayoutStyle {
+    pub width: Option<DocumentStyleDimension>,
+    pub height: Option<DocumentStyleDimension>,
+    pub min_width: Option<DocumentStyleDimension>,
+    pub max_width: Option<DocumentStyleDimension>,
+    pub min_height: Option<DocumentStyleDimension>,
+    pub max_height: Option<DocumentStyleDimension>,
+    pub gap: Option<f32>,
+    pub size: Option<f32>,
+    pub box_size: Option<f32>,
+    pub auto_padding: Option<f32>,
+    pub center: bool,
+    pub align_x: Option<String>,
+    pub overlay_children: bool,
+    pub placeholder: Option<String>,
+    pub padding: DocumentTypedEdgeSpacing,
+    pub clip: Option<Rect>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedPaintStyle {
+    pub color: Option<String>,
+    pub background: Option<String>,
+    pub background_color: Option<String>,
+    pub border_color: Option<String>,
+    pub opacity: Option<f32>,
+    pub relief: Option<String>,
+    pub depth: Option<f32>,
+    pub shadow: Option<String>,
+    pub outline: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedTextStyle {
+    pub size: Option<f32>,
+    pub font: Option<String>,
+    pub font_family: Option<String>,
+    pub font_weight: Option<String>,
+    pub font_style: Option<String>,
+    pub line_height: Option<f32>,
+    pub letter_spacing: Option<f32>,
+    pub text_align: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedMaterialStyle {
+    pub material: Option<String>,
+    pub texture: Option<String>,
+    pub image: Option<String>,
+    pub shader: Option<String>,
+    pub border_radius: Option<f32>,
+    pub clip: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedPseudoStyle {
+    pub hover_scope: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedStyleRecord {
+    pub node: DocumentHotNodeRef,
+    pub identity: ComputedStyleIdentity,
+    pub layout: DocumentTypedLayoutStyle,
+    pub paint: DocumentTypedPaintStyle,
+    pub text: DocumentTypedTextStyle,
+    pub material: DocumentTypedMaterialStyle,
+    pub pseudo: DocumentTypedPseudoStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedStyleIndex {
+    pub records: BTreeMap<DocumentHotNodeId, DocumentTypedStyleRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentTypedBindingRef {
+    pub node: DocumentHotNodeId,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentTypedBindingRoute {
+    pub source_path: String,
+    pub intent: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedBinding {
+    pub node: DocumentHotNodeRef,
+    pub reference: DocumentTypedBindingRef,
+    pub binding_id: SourceBindingId,
+    pub route: DocumentTypedBindingRoute,
+    pub intern_id: DocumentInternId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedBindingNode {
+    pub node: DocumentHotNodeRef,
+    pub bindings: Vec<DocumentTypedBinding>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentTypedBindingIndex {
+    pub nodes: BTreeMap<DocumentHotNodeId, DocumentTypedBindingNode>,
+    pub by_binding_id: BTreeMap<SourceBindingId, Vec<DocumentTypedBindingRef>>,
+    pub by_route: BTreeMap<DocumentTypedBindingRoute, Vec<DocumentTypedBindingRef>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -555,20 +904,109 @@ impl DocumentHotIdTable {
         validate_frame_integrity(frame)?;
         let mut ids_by_node = BTreeMap::new();
         let mut node_names = BTreeMap::new();
+        let mut generations = BTreeMap::new();
         let root = DocumentHotNodeId(0);
         ids_by_node.insert(frame.root.clone(), root);
         node_names.insert(root, frame.root.clone());
+        generations.insert(root, DocumentHotNodeGeneration(1));
         let mut next = 1_u32;
         for id in frame.nodes.keys().filter(|id| *id != &frame.root) {
             let hot = DocumentHotNodeId(next);
             next = next.saturating_add(1);
             ids_by_node.insert(id.clone(), hot);
             node_names.insert(hot, id.clone());
+            generations.insert(hot, DocumentHotNodeGeneration(1));
         }
         Ok(Self {
             root,
             ids_by_node,
+            generations,
             debug_names: DocumentDebugNameTable { node_names },
+            next_id: next,
+        })
+    }
+
+    pub fn from_previous_frames(
+        previous: &Self,
+        previous_frame: &DocumentFrame,
+        frame: &DocumentFrame,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(previous_frame)?;
+        validate_frame_integrity(frame)?;
+
+        let mut ids_by_node = BTreeMap::new();
+        let mut node_names = BTreeMap::new();
+        let mut generations = BTreeMap::new();
+        let root = DocumentHotNodeId(0);
+        let mut next = previous.next_id.max(
+            previous
+                .debug_names
+                .node_names
+                .keys()
+                .map(|id| id.0.saturating_add(1))
+                .max()
+                .unwrap_or(1),
+        );
+
+        let assign =
+            |id: &DocumentNodeId,
+             hot: DocumentHotNodeId,
+             next: &mut u32,
+             ids_by_node: &mut BTreeMap<DocumentNodeId, DocumentHotNodeId>,
+             node_names: &mut BTreeMap<DocumentHotNodeId, DocumentNodeId>,
+             generations: &mut BTreeMap<DocumentHotNodeId, DocumentHotNodeGeneration>| {
+                let current_node = frame
+                    .nodes
+                    .get(id)
+                    .expect("validated frame node key should resolve");
+                let previous_generation = previous
+                    .generations
+                    .get(&hot)
+                    .copied()
+                    .unwrap_or(DocumentHotNodeGeneration(1));
+                let generation = match previous_frame.nodes.get(id) {
+                    Some(previous_node) if previous_node == current_node => previous_generation,
+                    Some(_) => DocumentHotNodeGeneration(previous_generation.0.saturating_add(1)),
+                    None => DocumentHotNodeGeneration(1),
+                };
+
+                ids_by_node.insert(id.clone(), hot);
+                node_names.insert(hot, id.clone());
+                generations.insert(hot, generation);
+                *next = (*next).max(hot.0.saturating_add(1));
+            };
+
+        assign(
+            &frame.root,
+            root,
+            &mut next,
+            &mut ids_by_node,
+            &mut node_names,
+            &mut generations,
+        );
+
+        for id in frame.nodes.keys().filter(|id| *id != &frame.root) {
+            let hot = previous.ids_by_node.get(id).copied().unwrap_or_else(|| {
+                let hot = DocumentHotNodeId(next);
+                next = next.saturating_add(1);
+                hot
+            });
+            assign(
+                id,
+                hot,
+                &mut next,
+                &mut ids_by_node,
+                &mut node_names,
+                &mut generations,
+            );
+        }
+
+        Ok(Self {
+            root,
+            ids_by_node,
+            generations,
+            debug_names: DocumentDebugNameTable { node_names },
+            next_id: next,
         })
     }
 
@@ -576,8 +1014,507 @@ impl DocumentHotIdTable {
         self.ids_by_node.get(id).copied()
     }
 
+    pub fn hot_ref(&self, id: &DocumentNodeId) -> Option<DocumentHotNodeRef> {
+        let id = self.hot_id(id)?;
+        let generation = self.generation(id)?;
+        Some(DocumentHotNodeRef { id, generation })
+    }
+
+    pub fn generation(&self, id: DocumentHotNodeId) -> Option<DocumentHotNodeGeneration> {
+        self.generations.get(&id).copied()
+    }
+
     pub fn debug_name(&self, id: DocumentHotNodeId) -> Option<&DocumentNodeId> {
         self.debug_names.node_names.get(&id)
+    }
+}
+
+impl DocumentInternTable {
+    pub fn intern(&mut self, key: String) -> DocumentInternId {
+        if let Some(id) = self.ids_by_key.get(&key) {
+            return *id;
+        }
+        let id = DocumentInternId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        self.ids_by_key.insert(key.clone(), id);
+        self.keys_by_id.insert(id, key);
+        id
+    }
+
+    pub fn key(&self, id: DocumentInternId) -> Option<&str> {
+        self.keys_by_id.get(&id).map(String::as_str)
+    }
+}
+
+impl DocumentInternIndex {
+    pub fn from_frame(
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+    ) -> Result<Self, PatchApplyError> {
+        Self::from_seeded_frame(Self::default(), frame, hot_ids)
+    }
+
+    pub fn from_previous_frame(
+        previous: &Self,
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+    ) -> Result<Self, PatchApplyError> {
+        let mut index = previous.clone();
+        index.nodes.clear();
+        Self::from_seeded_frame(index, frame, hot_ids)
+    }
+
+    fn from_seeded_frame(
+        mut index: Self,
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        for (node_id, node) in &frame.nodes {
+            let hot_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            let text = node
+                .text
+                .as_ref()
+                .map(|text| index.texts.intern(text.text.clone()));
+            let layout_style = index.layout_styles.intern(stable_style_intern_key(
+                &node.style,
+                StyleHashCategory::Layout,
+            ));
+            let paint_style = index.paint_styles.intern(stable_style_intern_key(
+                &node.style,
+                StyleHashCategory::Paint,
+            ));
+            let text_style = index.text_styles.intern(stable_style_intern_key(
+                &node.style,
+                StyleHashCategory::Font,
+            ));
+            let material = index.materials.intern(stable_style_intern_key(
+                &node.style,
+                StyleHashCategory::Material,
+            ));
+            let clip = index.clips.intern(stable_style_intern_key(
+                &node.style,
+                StyleHashCategory::Clip,
+            ));
+            let source_binding = node.source_binding.as_ref().map(|binding| {
+                index.source_bindings.intern(stable_source_binding_key(
+                    &binding.id.0,
+                    &binding.source_path,
+                    &binding.intent,
+                ))
+            });
+            index.nodes.insert(
+                hot_ref.id,
+                DocumentInternedNode {
+                    node: hot_ref,
+                    text,
+                    layout_style,
+                    paint_style,
+                    text_style,
+                    material,
+                    clip,
+                    source_binding,
+                },
+            );
+        }
+        Ok(index)
+    }
+}
+
+impl DocumentRetainedLayoutKeyTable {
+    pub fn from_frame(
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        intern_index: &DocumentInternIndex,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        let mut table = Self::default();
+        for (node_id, node) in &frame.nodes {
+            let node_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            let interned = intern_index.nodes.get(&node_ref.id).ok_or_else(|| {
+                PatchApplyError::StaleReference {
+                    reference_kind: "document_intern_index",
+                    id: node_id.clone(),
+                }
+            })?;
+            let mut children = Vec::with_capacity(node.children.len());
+            for child in &node.children {
+                children.push(hot_ids.hot_id(child).ok_or_else(|| {
+                    PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table_child",
+                        id: child.clone(),
+                    }
+                })?);
+            }
+            let materialized = node
+                .materialized
+                .iter()
+                .map(|range| DocumentMaterializationWindowKey {
+                    axis: range.axis,
+                    visible: range.visible.clone(),
+                    overscan: range.overscan.clone(),
+                })
+                .collect();
+            table.entries.insert(
+                node_ref.id,
+                DocumentRetainedLayoutEntry {
+                    node: node_ref,
+                    key: DocumentRetainedLayoutKey {
+                        kind: node.kind.clone(),
+                        layout_style: interned.layout_style,
+                        text_style: interned.text_style,
+                        text: interned.text,
+                        children,
+                        materialized,
+                    },
+                },
+            );
+        }
+        Ok(table)
+    }
+
+    pub fn entry(&self, id: DocumentHotNodeId) -> Option<&DocumentRetainedLayoutEntry> {
+        self.entries.get(&id)
+    }
+
+    pub fn diff_from(&self, previous: &Self) -> DocumentRetainedLayoutDelta {
+        let mut delta = DocumentRetainedLayoutDelta::default();
+        for (id, current) in &self.entries {
+            match previous.entries.get(id) {
+                Some(previous_entry) => {
+                    let reasons = retained_layout_dirty_reasons(&previous_entry.key, &current.key);
+                    if reasons.is_empty() {
+                        delta.reused.push(current.node);
+                    } else {
+                        delta.dirty.push(DocumentRetainedLayoutDirtyEntry {
+                            node: *id,
+                            previous: Some(previous_entry.node),
+                            current: Some(current.node),
+                            reasons,
+                        });
+                    }
+                }
+                None => delta.dirty.push(DocumentRetainedLayoutDirtyEntry {
+                    node: *id,
+                    previous: None,
+                    current: Some(current.node),
+                    reasons: vec![DocumentRetainedLayoutDirtyReason::Added],
+                }),
+            }
+        }
+        for (id, previous_entry) in &previous.entries {
+            if !self.entries.contains_key(id) {
+                delta.removed.push(DocumentRetainedLayoutDirtyEntry {
+                    node: *id,
+                    previous: Some(previous_entry.node),
+                    current: None,
+                    reasons: vec![DocumentRetainedLayoutDirtyReason::Removed],
+                });
+            }
+        }
+        delta
+    }
+}
+
+fn retained_layout_dirty_reasons(
+    previous: &DocumentRetainedLayoutKey,
+    current: &DocumentRetainedLayoutKey,
+) -> Vec<DocumentRetainedLayoutDirtyReason> {
+    let mut reasons = Vec::new();
+    if previous.kind != current.kind {
+        reasons.push(DocumentRetainedLayoutDirtyReason::Kind);
+    }
+    if previous.layout_style != current.layout_style {
+        reasons.push(DocumentRetainedLayoutDirtyReason::LayoutStyle);
+    }
+    if previous.text_style != current.text_style {
+        reasons.push(DocumentRetainedLayoutDirtyReason::TextStyle);
+    }
+    if previous.text != current.text {
+        reasons.push(DocumentRetainedLayoutDirtyReason::Text);
+    }
+    if previous.children != current.children {
+        reasons.push(DocumentRetainedLayoutDirtyReason::Children);
+    }
+    if previous.materialized != current.materialized {
+        reasons.push(DocumentRetainedLayoutDirtyReason::Materialization);
+    }
+    reasons
+}
+
+impl DocumentRetainedLayoutCache {
+    pub fn from_layout_frame(
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        key_table: &DocumentRetainedLayoutKeyTable,
+        layout: &LayoutFrame,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        let mut cache = Self::default();
+        for (index, item) in layout.display_list.iter().enumerate() {
+            let node_id = &item.node;
+            let node = frame
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "layout_frame_display_item",
+                    id: node_id.clone(),
+                })?;
+            let node_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            let key_entry =
+                key_table
+                    .entry(node_ref.id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "retained_layout_key_table",
+                        id: node_id.clone(),
+                    })?;
+            cache.entries.insert(
+                node_ref.id,
+                DocumentRetainedLayoutCacheEntry {
+                    node: node_ref,
+                    key: key_entry.key.clone(),
+                    geometry: DocumentRetainedLayoutGeometry {
+                        bounds: item.bounds,
+                        display_index: index,
+                        hit_region_count: layout
+                            .hit_regions
+                            .iter()
+                            .filter(|hit| hit.node == node.id)
+                            .count(),
+                        scroll_region_count: layout
+                            .scroll_regions
+                            .iter()
+                            .filter(|scroll| scroll.node == node.id)
+                            .count(),
+                        materialization_count: layout
+                            .materialization
+                            .iter()
+                            .filter(|report| report.node == node.id)
+                            .count(),
+                    },
+                },
+            );
+        }
+        Ok(cache)
+    }
+
+    pub fn update_from_layout_frame(
+        &self,
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        key_table: &DocumentRetainedLayoutKeyTable,
+        layout: &LayoutFrame,
+    ) -> Result<DocumentRetainedLayoutCacheUpdate, PatchApplyError> {
+        let previous_keys = self.key_table();
+        let measured = Self::from_layout_frame(frame, hot_ids, key_table, layout)?;
+        let delta = measured.key_table().diff_from(&previous_keys);
+        let mut cache = Self::default();
+        let mut refreshed = Vec::new();
+        let mut patch = DocumentRetainedLayoutPatch::default();
+        for (id, measured_entry) in measured.entries {
+            if delta.reused.iter().any(|entry| entry.id == id) {
+                if let Some(previous_entry) = self.entries.get(&id) {
+                    patch
+                        .operations
+                        .push(DocumentRetainedLayoutPatchOperation::ReuseGeometry {
+                            node: measured_entry.node,
+                        });
+                    cache.entries.insert(
+                        id,
+                        DocumentRetainedLayoutCacheEntry {
+                            node: measured_entry.node,
+                            key: measured_entry.key,
+                            geometry: previous_entry.geometry.clone(),
+                        },
+                    );
+                    continue;
+                }
+            }
+            let reasons = delta
+                .dirty
+                .iter()
+                .find(|entry| entry.node == id)
+                .map(|entry| entry.reasons.clone())
+                .unwrap_or_default();
+            refreshed.push(measured_entry.node);
+            patch
+                .operations
+                .push(DocumentRetainedLayoutPatchOperation::UpsertGeometry {
+                    node: measured_entry.node,
+                    key: measured_entry.key.clone(),
+                    geometry: measured_entry.geometry.clone(),
+                    reasons,
+                });
+            cache.entries.insert(id, measured_entry);
+        }
+        for removed in &delta.removed {
+            if let Some(previous) = removed.previous {
+                patch
+                    .operations
+                    .push(DocumentRetainedLayoutPatchOperation::RemoveGeometry {
+                        node: previous,
+                        reasons: removed.reasons.clone(),
+                    });
+            }
+        }
+        Ok(DocumentRetainedLayoutCacheUpdate {
+            cache,
+            delta,
+            refreshed,
+            patch,
+        })
+    }
+
+    pub fn key_table(&self) -> DocumentRetainedLayoutKeyTable {
+        DocumentRetainedLayoutKeyTable {
+            entries: self
+                .entries
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        *id,
+                        DocumentRetainedLayoutEntry {
+                            node: entry.node,
+                            key: entry.key.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DocumentTypedStyleIndex {
+    pub fn from_frame(
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        let mut index = Self::default();
+        for (node_id, node) in &frame.nodes {
+            let node_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            index.records.insert(
+                node_ref.id,
+                DocumentTypedStyleRecord {
+                    node: node_ref,
+                    identity: computed_style_identity(&node.style),
+                    layout: typed_layout_style(&node.style),
+                    paint: typed_paint_style(&node.style),
+                    text: typed_text_style(&node.style),
+                    material: typed_material_style(&node.style),
+                    pseudo: typed_pseudo_style(&node.style),
+                },
+            );
+        }
+        Ok(index)
+    }
+
+    pub fn record(&self, id: DocumentHotNodeId) -> Option<&DocumentTypedStyleRecord> {
+        self.records.get(&id)
+    }
+}
+
+impl DocumentTypedBindingIndex {
+    pub fn from_frame(
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        intern_index: &DocumentInternIndex,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        let mut index = Self::default();
+        for (node_id, node) in &frame.nodes {
+            let node_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            let Some(binding) = &node.source_binding else {
+                continue;
+            };
+            let interned = intern_index.nodes.get(&node_ref.id).ok_or_else(|| {
+                PatchApplyError::StaleReference {
+                    reference_kind: "document_intern_index",
+                    id: node_id.clone(),
+                }
+            })?;
+            let intern_id =
+                interned
+                    .source_binding
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "document_intern_index_source_binding",
+                        id: node_id.clone(),
+                    })?;
+            let reference = DocumentTypedBindingRef {
+                node: node_ref.id,
+                ordinal: 0,
+            };
+            let route = DocumentTypedBindingRoute {
+                source_path: binding.source_path.clone(),
+                intent: binding.intent.clone(),
+            };
+            let typed = DocumentTypedBinding {
+                node: node_ref,
+                reference,
+                binding_id: binding.id.clone(),
+                route: route.clone(),
+                intern_id,
+            };
+            index.nodes.insert(
+                node_ref.id,
+                DocumentTypedBindingNode {
+                    node: node_ref,
+                    bindings: vec![typed],
+                },
+            );
+            index
+                .by_binding_id
+                .entry(binding.id.clone())
+                .or_default()
+                .push(reference);
+            index.by_route.entry(route).or_default().push(reference);
+        }
+        Ok(index)
+    }
+
+    pub fn bindings_for_node(&self, node: DocumentHotNodeId) -> &[DocumentTypedBinding] {
+        self.nodes
+            .get(&node)
+            .map(|entry| entry.bindings.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn refs_for_binding_id(&self, id: &SourceBindingId) -> &[DocumentTypedBindingRef] {
+        self.by_binding_id.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn refs_for_route(&self, route: &DocumentTypedBindingRoute) -> &[DocumentTypedBindingRef] {
+        self.by_route.get(route).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -1794,6 +2731,115 @@ fn style_dimension_is_fill(style: &BTreeMap<String, StyleValue>, key: &str) -> b
     )
 }
 
+fn typed_layout_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedLayoutStyle {
+    DocumentTypedLayoutStyle {
+        width: typed_style_dimension(style, "width"),
+        height: typed_style_dimension(style, "height"),
+        min_width: typed_style_dimension(style, "min_width"),
+        max_width: typed_style_dimension(style, "max_width"),
+        min_height: typed_style_dimension(style, "min_height"),
+        max_height: typed_style_dimension(style, "max_height"),
+        gap: style_spacing(style, "gap"),
+        size: style_spacing(style, "size"),
+        box_size: style_spacing(style, "box_size"),
+        auto_padding: style_spacing(style, "auto_padding"),
+        center: style_bool(style, "center").unwrap_or(false),
+        align_x: style_text(style, "align_x").map(str::to_owned),
+        overlay_children: style_bool(style, "overlay_children").unwrap_or(false),
+        placeholder: style_text(style, "placeholder").map(str::to_owned),
+        padding: typed_edge_spacing(style, "padding"),
+        clip: typed_clip_rect(style),
+    }
+}
+
+fn typed_paint_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedPaintStyle {
+    DocumentTypedPaintStyle {
+        color: style_text(style, "color").map(str::to_owned),
+        background: style_text(style, "background").map(str::to_owned),
+        background_color: style_text(style, "background_color").map(str::to_owned),
+        border_color: style_text(style, "border_color").map(str::to_owned),
+        opacity: style_spacing(style, "opacity"),
+        relief: style_text(style, "relief").map(str::to_owned),
+        depth: style_spacing(style, "depth"),
+        shadow: style_text(style, "shadow").map(str::to_owned),
+        outline: style_text(style, "outline").map(str::to_owned),
+    }
+}
+
+fn typed_text_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedTextStyle {
+    DocumentTypedTextStyle {
+        size: style_spacing(style, "size"),
+        font: style_text(style, "font").map(str::to_owned),
+        font_family: style_text(style, "font_family").map(str::to_owned),
+        font_weight: style_text(style, "font_weight").map(str::to_owned),
+        font_style: style_text(style, "font_style").map(str::to_owned),
+        line_height: style_spacing(style, "line_height"),
+        letter_spacing: style_spacing(style, "letter_spacing"),
+        text_align: style_text(style, "text_align").map(str::to_owned),
+    }
+}
+
+fn typed_material_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedMaterialStyle {
+    DocumentTypedMaterialStyle {
+        material: style_text(style, "material").map(str::to_owned),
+        texture: style_text(style, "texture").map(str::to_owned),
+        image: style_text(style, "image").map(str::to_owned),
+        shader: style_text(style, "shader").map(str::to_owned),
+        border_radius: style_spacing(style, "border_radius"),
+        clip: style_text(style, "clip").map(str::to_owned),
+    }
+}
+
+fn typed_pseudo_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedPseudoStyle {
+    DocumentTypedPseudoStyle {
+        hover_scope: style_bool(style, "__hover_scope").unwrap_or(false),
+    }
+}
+
+fn typed_style_dimension(
+    style: &BTreeMap<String, StyleValue>,
+    key: &str,
+) -> Option<DocumentStyleDimension> {
+    match style.get(key)? {
+        StyleValue::Number(value) => Some(DocumentStyleDimension::Px {
+            value: *value as f32,
+        }),
+        StyleValue::Text(value) if value.eq_ignore_ascii_case("fill") => {
+            Some(DocumentStyleDimension::Fill)
+        }
+        StyleValue::Text(value) if value.eq_ignore_ascii_case("auto") => {
+            Some(DocumentStyleDimension::Auto)
+        }
+        StyleValue::Text(value) => value
+            .parse::<f32>()
+            .ok()
+            .map(|value| DocumentStyleDimension::Px { value }),
+        StyleValue::Bool(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
+    }
+}
+
+fn typed_edge_spacing(
+    style: &BTreeMap<String, StyleValue>,
+    prefix: &str,
+) -> DocumentTypedEdgeSpacing {
+    let spacing = style_edges(style, prefix);
+    DocumentTypedEdgeSpacing {
+        top: spacing.top,
+        right: spacing.right,
+        bottom: spacing.bottom,
+        left: spacing.left,
+    }
+}
+
+fn typed_clip_rect(style: &BTreeMap<String, StyleValue>) -> Option<Rect> {
+    Some(Rect {
+        x: style_spacing(style, "__clip_x")?,
+        y: style_spacing(style, "__clip_y")?,
+        width: style_spacing(style, "__clip_width")?,
+        height: style_spacing(style, "__clip_height")?,
+    })
+}
+
 fn preferred_row_child_width(node: &DocumentNode, text: &mut dyn TextMeasurer) -> Option<f32> {
     let padding = style_edges(&node.style, "padding");
     let box_size = match node.kind {
@@ -2008,6 +3054,7 @@ enum StyleHashCategory {
     Material,
     Font,
     PseudoState,
+    Clip,
 }
 
 fn stable_style_hash(style: &BTreeMap<String, StyleValue>, category: StyleHashCategory) -> u64 {
@@ -2083,6 +3130,123 @@ fn stable_hash_optional_text(hash: &mut u64, value: Option<&str>) {
     }
 }
 
+fn stable_style_intern_key(
+    style: &BTreeMap<String, StyleValue>,
+    category: StyleHashCategory,
+) -> String {
+    let mut key = String::new();
+    key.push_str("boon-style-v1:");
+    key.push_str(style_hash_category_name(category));
+    key.push(':');
+    for (name, value) in style {
+        if !style_key_in_hash_category(name, category) {
+            continue;
+        }
+        push_key_text(&mut key, name);
+        key.push('=');
+        push_style_value_key(&mut key, value);
+        key.push(';');
+    }
+    key
+}
+
+fn stable_source_binding_key(id: &str, source_path: &str, intent: &str) -> String {
+    let mut key = String::from("boon-binding-v1:");
+    push_key_text(&mut key, id);
+    key.push('|');
+    push_key_text(&mut key, source_path);
+    key.push('|');
+    push_key_text(&mut key, intent);
+    key
+}
+
+fn style_hash_category_name(category: StyleHashCategory) -> &'static str {
+    match category {
+        StyleHashCategory::All => "all",
+        StyleHashCategory::Layout => "layout",
+        StyleHashCategory::Paint => "paint",
+        StyleHashCategory::Material => "material",
+        StyleHashCategory::Font => "font",
+        StyleHashCategory::PseudoState => "pseudo_state",
+        StyleHashCategory::Clip => "clip",
+    }
+}
+
+fn push_key_text(key: &mut String, value: &str) {
+    key.push_str(&value.len().to_string());
+    key.push(':');
+    key.push_str(value);
+}
+
+fn push_style_value_key(key: &mut String, value: &StyleValue) {
+    match value {
+        StyleValue::Text(value) => {
+            key.push_str("text(");
+            push_key_text(key, value);
+            key.push(')');
+        }
+        StyleValue::Number(value) => {
+            key.push_str("number(");
+            key.push_str(&format!("{:016x}", value.to_bits()));
+            key.push(')');
+        }
+        StyleValue::Bool(value) => {
+            key.push_str("bool(");
+            key.push_str(if *value { "1" } else { "0" });
+            key.push(')');
+        }
+        StyleValue::RichTextSpans(spans) => {
+            key.push_str("rich_text_spans(");
+            key.push_str(&spans.len().to_string());
+            for span in spans {
+                key.push('|');
+                push_key_text(key, &span.text);
+                key.push('|');
+                push_optional_key_text(key, span.source_text.as_deref());
+                key.push('|');
+                push_optional_key_text(key, span.color.as_deref());
+                key.push('|');
+                push_optional_key_text(key, span.font_style.as_deref());
+                key.push('|');
+                push_optional_key_text(key, span.font_weight.as_deref());
+            }
+            key.push(')');
+        }
+        StyleValue::EditorTypeHints(hints) => {
+            key.push_str("editor_type_hints(");
+            key.push_str(&hints.len().to_string());
+            for hint in hints {
+                key.push('|');
+                key.push_str(&hint.line.to_string());
+                key.push(',');
+                key.push_str(&hint.start.to_string());
+                key.push(',');
+                key.push_str(&hint.end.to_string());
+                key.push(',');
+                key.push_str(&hint.anchor_column.to_string());
+                key.push(',');
+                push_key_text(key, &hint.category);
+                key.push(',');
+                push_key_text(key, &hint.compact_label);
+                key.push(',');
+                push_key_text(key, &hint.detail_label);
+            }
+            key.push(')');
+        }
+    }
+}
+
+fn push_optional_key_text(key: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            key.push_str("some(");
+            push_key_text(key, value);
+            key.push(')');
+        }
+        None => key.push_str("none"),
+    }
+}
+
 fn style_key_in_hash_category(key: &str, category: StyleHashCategory) -> bool {
     match category {
         StyleHashCategory::All => true,
@@ -2091,6 +3255,7 @@ fn style_key_in_hash_category(key: &str, category: StyleHashCategory) -> bool {
         StyleHashCategory::Material => style_key_affects_material(key),
         StyleHashCategory::Font => style_key_affects_font(key),
         StyleHashCategory::PseudoState => style_key_affects_pseudo_state(key),
+        StyleHashCategory::Clip => style_key_affects_clip(key),
     }
 }
 
@@ -2141,6 +3306,10 @@ fn style_key_affects_material(key: &str) -> bool {
         || key == "shader"
         || key == "border_radius"
         || key == "clip"
+}
+
+fn style_key_affects_clip(key: &str) -> bool {
+    key == "clip" || key.starts_with("__clip_")
 }
 
 fn style_key_affects_font(key: &str) -> bool {
@@ -2402,6 +3571,710 @@ mod tests {
     }
 
     #[test]
+    fn document_hot_id_table_carries_ids_and_generations_across_frames() {
+        let mut state = DocumentState::new("root");
+        state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::UpsertNode(node("zeta", DocumentNodeKind::Text, Some("root"))),
+                    DocumentPatch::UpsertNode(node("alpha", DocumentNodeKind::Text, Some("root"))),
+                ],
+            })
+            .unwrap();
+        let previous_frame = state.frame().clone();
+        let previous_table = DocumentHotIdTable::from_frame(&previous_frame).unwrap();
+        let root_ref = previous_table
+            .hot_ref(&DocumentNodeId("root".to_owned()))
+            .unwrap();
+        let alpha_ref = previous_table
+            .hot_ref(&DocumentNodeId("alpha".to_owned()))
+            .unwrap();
+        let zeta_ref = previous_table
+            .hot_ref(&DocumentNodeId("zeta".to_owned()))
+            .unwrap();
+
+        state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::SetText {
+                        id: DocumentNodeId("alpha".to_owned()),
+                        text: TextValue {
+                            text: "changed".to_owned(),
+                        },
+                    },
+                    DocumentPatch::RemoveNode {
+                        id: DocumentNodeId("zeta".to_owned()),
+                    },
+                    DocumentPatch::UpsertNode(node("beta", DocumentNodeKind::Button, Some("root"))),
+                ],
+            })
+            .unwrap();
+
+        let next_table = DocumentHotIdTable::from_previous_frames(
+            &previous_table,
+            &previous_frame,
+            state.frame(),
+        )
+        .unwrap();
+        let next_root_ref = next_table
+            .hot_ref(&DocumentNodeId("root".to_owned()))
+            .unwrap();
+        let next_alpha_ref = next_table
+            .hot_ref(&DocumentNodeId("alpha".to_owned()))
+            .unwrap();
+        let beta_ref = next_table
+            .hot_ref(&DocumentNodeId("beta".to_owned()))
+            .unwrap();
+
+        assert_eq!(next_root_ref.id, root_ref.id);
+        assert_eq!(
+            next_root_ref.generation,
+            DocumentHotNodeGeneration(root_ref.generation.0 + 1)
+        );
+        assert_eq!(next_alpha_ref.id, alpha_ref.id);
+        assert_eq!(
+            next_alpha_ref.generation,
+            DocumentHotNodeGeneration(alpha_ref.generation.0 + 1)
+        );
+        assert!(beta_ref.id.0 >= previous_table.next_id);
+        assert_eq!(beta_ref.generation, DocumentHotNodeGeneration(1));
+        assert_eq!(next_table.hot_id(&DocumentNodeId("zeta".to_owned())), None);
+        assert_eq!(next_table.debug_name(zeta_ref.id), None);
+    }
+
+    #[test]
+    fn document_intern_index_deduplicates_text_styles_materials_clips_and_bindings() {
+        let mut alpha = node("alpha", DocumentNodeKind::Text, Some("root"));
+        alpha.text = Some(TextValue {
+            text: "shared".to_owned(),
+        });
+        alpha
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        alpha
+            .style
+            .insert("color".to_owned(), StyleValue::Text("red".to_owned()));
+        alpha
+            .style
+            .insert("material".to_owned(), StyleValue::Text("flat".to_owned()));
+        alpha.style.insert(
+            "__clip_rect".to_owned(),
+            StyleValue::Text("viewport".to_owned()),
+        );
+        alpha.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("title-binding".to_owned()),
+            source_path: "todos[0].title".to_owned(),
+            intent: "edit".to_owned(),
+        });
+
+        let mut beta = node("beta", DocumentNodeKind::Text, Some("root"));
+        beta.text = Some(TextValue {
+            text: "shared".to_owned(),
+        });
+        beta.style = alpha.style.clone();
+        beta.style
+            .insert("color".to_owned(), StyleValue::Text("blue".to_owned()));
+        beta.source_binding = alpha.source_binding.clone();
+
+        let mut state = DocumentState::new("root");
+        state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::UpsertNode(alpha),
+                    DocumentPatch::UpsertNode(beta),
+                ],
+            })
+            .unwrap();
+
+        let hot_ids = DocumentHotIdTable::from_frame(state.frame()).unwrap();
+        let index = DocumentInternIndex::from_frame(state.frame(), &hot_ids).unwrap();
+        let alpha_hot = hot_ids.hot_id(&DocumentNodeId("alpha".to_owned())).unwrap();
+        let beta_hot = hot_ids.hot_id(&DocumentNodeId("beta".to_owned())).unwrap();
+        let alpha_refs = index.nodes.get(&alpha_hot).unwrap();
+        let beta_refs = index.nodes.get(&beta_hot).unwrap();
+
+        assert_eq!(alpha_refs.text, beta_refs.text);
+        assert_eq!(index.texts.keys_by_id.len(), 1);
+        assert_eq!(alpha_refs.layout_style, beta_refs.layout_style);
+        assert_ne!(alpha_refs.paint_style, beta_refs.paint_style);
+        assert_eq!(alpha_refs.material, beta_refs.material);
+        assert_eq!(alpha_refs.clip, beta_refs.clip);
+        assert_eq!(alpha_refs.source_binding, beta_refs.source_binding);
+        assert_eq!(index.source_bindings.keys_by_id.len(), 1);
+
+        let previous_hot_ids =
+            DocumentHotIdTable::from_frame(&DocumentFrame::empty("root")).unwrap();
+        let err = DocumentInternIndex::from_frame(state.frame(), &previous_hot_ids).unwrap_err();
+        assert!(matches!(
+            err,
+            PatchApplyError::StaleReference {
+                reference_kind: "hot_id_table",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retained_layout_keys_ignore_paint_only_changes_but_track_layout_inputs() {
+        let mut alpha = node("alpha", DocumentNodeKind::Text, Some("root"));
+        alpha.text = Some(TextValue {
+            text: "shared".to_owned(),
+        });
+        alpha
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        alpha
+            .style
+            .insert("color".to_owned(), StyleValue::Text("red".to_owned()));
+
+        let mut state = DocumentState::new("root");
+        state.apply_patch(DocumentPatch::UpsertNode(alpha)).unwrap();
+        let initial_frame = state.frame().clone();
+        let initial_hot = DocumentHotIdTable::from_frame(&initial_frame).unwrap();
+        let initial_intern = DocumentInternIndex::from_frame(&initial_frame, &initial_hot).unwrap();
+        let initial_keys = DocumentRetainedLayoutKeyTable::from_frame(
+            &initial_frame,
+            &initial_hot,
+            &initial_intern,
+        )
+        .unwrap();
+        let alpha_hot = initial_hot
+            .hot_id(&DocumentNodeId("alpha".to_owned()))
+            .unwrap();
+        let initial_alpha = initial_keys.entry(alpha_hot).unwrap().clone();
+
+        state
+            .apply_patch(DocumentPatch::SetStyle {
+                id: DocumentNodeId("alpha".to_owned()),
+                patch: BTreeMap::from([(
+                    "color".to_owned(),
+                    Some(StyleValue::Text("blue".to_owned())),
+                )]),
+            })
+            .unwrap();
+        let paint_frame = state.frame().clone();
+        let paint_hot =
+            DocumentHotIdTable::from_previous_frames(&initial_hot, &initial_frame, &paint_frame)
+                .unwrap();
+        let paint_intern =
+            DocumentInternIndex::from_previous_frame(&initial_intern, &paint_frame, &paint_hot)
+                .unwrap();
+        let paint_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(&paint_frame, &paint_hot, &paint_intern)
+                .unwrap();
+        let paint_alpha = paint_keys.entry(alpha_hot).unwrap();
+
+        assert_eq!(paint_alpha.node.id, initial_alpha.node.id);
+        assert_ne!(paint_alpha.node.generation, initial_alpha.node.generation);
+        assert_eq!(
+            paint_alpha.key, initial_alpha.key,
+            "paint-only style changes must not invalidate the retained layout key"
+        );
+        let paint_delta = paint_keys.diff_from(&initial_keys);
+        assert!(
+            paint_delta.reused.iter().any(|entry| entry.id == alpha_hot),
+            "paint-only changes should reuse the retained layout entry"
+        );
+        assert!(
+            paint_delta
+                .dirty
+                .iter()
+                .all(|entry| entry.node != alpha_hot),
+            "paint-only changes should not dirty the retained layout entry"
+        );
+
+        state
+            .apply_patch(DocumentPatch::SetStyle {
+                id: DocumentNodeId("alpha".to_owned()),
+                patch: BTreeMap::from([("width".to_owned(), Some(StyleValue::Number(180.0)))]),
+            })
+            .unwrap();
+        let layout_frame = state.frame().clone();
+        let layout_hot =
+            DocumentHotIdTable::from_previous_frames(&paint_hot, &paint_frame, &layout_frame)
+                .unwrap();
+        let layout_intern =
+            DocumentInternIndex::from_previous_frame(&paint_intern, &layout_frame, &layout_hot)
+                .unwrap();
+        let layout_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(&layout_frame, &layout_hot, &layout_intern)
+                .unwrap();
+
+        assert_ne!(
+            layout_keys.entry(alpha_hot).unwrap().key,
+            initial_alpha.key,
+            "layout-affecting style changes must update the retained layout key"
+        );
+        let layout_delta = layout_keys.diff_from(&paint_keys);
+        let layout_dirty = layout_delta
+            .dirty
+            .iter()
+            .find(|entry| entry.node == alpha_hot)
+            .expect("layout-affecting style change should dirty alpha");
+        assert_eq!(
+            layout_dirty.reasons,
+            vec![DocumentRetainedLayoutDirtyReason::LayoutStyle]
+        );
+
+        state
+            .apply_patch(DocumentPatch::UpsertNode(node(
+                "child",
+                DocumentNodeKind::Button,
+                Some("alpha"),
+            )))
+            .unwrap();
+        let child_frame = state.frame().clone();
+        let child_hot =
+            DocumentHotIdTable::from_previous_frames(&layout_hot, &layout_frame, &child_frame)
+                .unwrap();
+        let child_intern =
+            DocumentInternIndex::from_previous_frame(&layout_intern, &child_frame, &child_hot)
+                .unwrap();
+        let child_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(&child_frame, &child_hot, &child_intern)
+                .unwrap();
+        let child_id = child_hot
+            .hot_id(&DocumentNodeId("child".to_owned()))
+            .unwrap();
+        assert!(
+            child_keys
+                .entry(alpha_hot)
+                .unwrap()
+                .key
+                .children
+                .contains(&child_id),
+            "structural child changes must be represented in the retained layout key"
+        );
+        let child_delta = child_keys.diff_from(&layout_keys);
+        let child_dirty = child_delta
+            .dirty
+            .iter()
+            .find(|entry| entry.node == alpha_hot)
+            .expect("child insertion should dirty the parent layout entry");
+        assert_eq!(
+            child_dirty.reasons,
+            vec![DocumentRetainedLayoutDirtyReason::Children]
+        );
+        let child_added = child_delta
+            .dirty
+            .iter()
+            .find(|entry| entry.node == child_id)
+            .expect("new child should be an added layout entry");
+        assert_eq!(
+            child_added.reasons,
+            vec![DocumentRetainedLayoutDirtyReason::Added]
+        );
+
+        state
+            .apply_patch(DocumentPatch::RemoveNode {
+                id: DocumentNodeId("child".to_owned()),
+            })
+            .unwrap();
+        let removed_frame = state.frame().clone();
+        let removed_hot =
+            DocumentHotIdTable::from_previous_frames(&child_hot, &child_frame, &removed_frame)
+                .unwrap();
+        let removed_intern =
+            DocumentInternIndex::from_previous_frame(&child_intern, &removed_frame, &removed_hot)
+                .unwrap();
+        let removed_keys = DocumentRetainedLayoutKeyTable::from_frame(
+            &removed_frame,
+            &removed_hot,
+            &removed_intern,
+        )
+        .unwrap();
+        let removed_delta = removed_keys.diff_from(&child_keys);
+        let removed_child = removed_delta
+            .removed
+            .iter()
+            .find(|entry| entry.node == child_id)
+            .expect("removed child should be reported as removed");
+        assert_eq!(
+            removed_child.reasons,
+            vec![DocumentRetainedLayoutDirtyReason::Removed]
+        );
+
+        let stale_err =
+            DocumentRetainedLayoutKeyTable::from_frame(&child_frame, &initial_hot, &initial_intern)
+                .unwrap_err();
+        assert!(matches!(
+            stale_err,
+            PatchApplyError::StaleReference {
+                reference_kind: "document_intern_index" | "hot_id_table" | "hot_id_table_child",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retained_layout_cache_reuses_paint_only_geometry_and_refreshes_layout_dirty_nodes() {
+        let mut alpha = node("alpha", DocumentNodeKind::Text, Some("root"));
+        alpha.text = Some(TextValue {
+            text: "shared".to_owned(),
+        });
+        alpha
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        alpha
+            .style
+            .insert("color".to_owned(), StyleValue::Text("red".to_owned()));
+
+        let mut state = DocumentState::new("root");
+        state.apply_patch(DocumentPatch::UpsertNode(alpha)).unwrap();
+
+        let initial_frame = state.frame().clone();
+        let initial_hot = DocumentHotIdTable::from_frame(&initial_frame).unwrap();
+        let initial_intern = DocumentInternIndex::from_frame(&initial_frame, &initial_hot).unwrap();
+        let initial_keys = DocumentRetainedLayoutKeyTable::from_frame(
+            &initial_frame,
+            &initial_hot,
+            &initial_intern,
+        )
+        .unwrap();
+        let mut text = SimpleTextMeasurer;
+        let initial_layout = layout(LayoutInput {
+            document: &initial_frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 500.0,
+                height: 300.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let initial_cache = DocumentRetainedLayoutCache::from_layout_frame(
+            &initial_frame,
+            &initial_hot,
+            &initial_keys,
+            &initial_layout,
+        )
+        .unwrap();
+        let alpha_hot = initial_hot
+            .hot_id(&DocumentNodeId("alpha".to_owned()))
+            .unwrap();
+        let initial_geometry = initial_cache
+            .entries
+            .get(&alpha_hot)
+            .unwrap()
+            .geometry
+            .clone();
+
+        state
+            .apply_patch(DocumentPatch::SetStyle {
+                id: DocumentNodeId("alpha".to_owned()),
+                patch: BTreeMap::from([(
+                    "color".to_owned(),
+                    Some(StyleValue::Text("blue".to_owned())),
+                )]),
+            })
+            .unwrap();
+        let paint_frame = state.frame().clone();
+        let paint_hot =
+            DocumentHotIdTable::from_previous_frames(&initial_hot, &initial_frame, &paint_frame)
+                .unwrap();
+        let paint_intern =
+            DocumentInternIndex::from_previous_frame(&initial_intern, &paint_frame, &paint_hot)
+                .unwrap();
+        let paint_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(&paint_frame, &paint_hot, &paint_intern)
+                .unwrap();
+        let mut text = SimpleTextMeasurer;
+        let paint_layout = layout(LayoutInput {
+            document: &paint_frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 500.0,
+                height: 300.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let paint_update = initial_cache
+            .update_from_layout_frame(&paint_frame, &paint_hot, &paint_keys, &paint_layout)
+            .unwrap();
+        assert!(
+            paint_update.refreshed.is_empty(),
+            "paint-only changes should not refresh retained layout geometry"
+        );
+        assert_eq!(
+            paint_update.cache.entries.get(&alpha_hot).unwrap().geometry,
+            initial_geometry
+        );
+        assert_eq!(paint_update.patch.operations.len(), 1);
+        assert!(matches!(
+            &paint_update.patch.operations[0],
+            DocumentRetainedLayoutPatchOperation::ReuseGeometry { node }
+                if node.id == alpha_hot
+        ));
+
+        state
+            .apply_patch(DocumentPatch::SetStyle {
+                id: DocumentNodeId("alpha".to_owned()),
+                patch: BTreeMap::from([("width".to_owned(), Some(StyleValue::Number(180.0)))]),
+            })
+            .unwrap();
+        let layout_frame = state.frame().clone();
+        let layout_hot =
+            DocumentHotIdTable::from_previous_frames(&paint_hot, &paint_frame, &layout_frame)
+                .unwrap();
+        let layout_intern =
+            DocumentInternIndex::from_previous_frame(&paint_intern, &layout_frame, &layout_hot)
+                .unwrap();
+        let layout_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(&layout_frame, &layout_hot, &layout_intern)
+                .unwrap();
+        let mut text = SimpleTextMeasurer;
+        let measured_layout = layout(LayoutInput {
+            document: &layout_frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 500.0,
+                height: 300.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let layout_update = paint_update
+            .cache
+            .update_from_layout_frame(&layout_frame, &layout_hot, &layout_keys, &measured_layout)
+            .unwrap();
+        assert!(
+            layout_update
+                .refreshed
+                .iter()
+                .any(|entry| entry.id == alpha_hot),
+            "layout-affecting changes should refresh retained layout geometry"
+        );
+        let upsert = layout_update
+            .patch
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                DocumentRetainedLayoutPatchOperation::UpsertGeometry {
+                    node,
+                    geometry,
+                    reasons,
+                    ..
+                } if node.id == alpha_hot => Some((geometry, reasons)),
+                _ => None,
+            })
+            .expect("layout-affecting update should emit an upsert geometry patch");
+        assert_eq!(upsert.0.bounds.width, 180.0);
+        assert_eq!(
+            upsert.1,
+            &vec![DocumentRetainedLayoutDirtyReason::LayoutStyle]
+        );
+        assert_eq!(
+            layout_update
+                .cache
+                .entries
+                .get(&alpha_hot)
+                .unwrap()
+                .geometry
+                .bounds
+                .width,
+            180.0
+        );
+    }
+
+    #[test]
+    fn typed_style_index_extracts_known_hot_style_properties() {
+        let mut alpha = node("alpha", DocumentNodeKind::Text, Some("root"));
+        alpha
+            .style
+            .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+        alpha
+            .style
+            .insert("height".to_owned(), StyleValue::Text("auto".to_owned()));
+        alpha
+            .style
+            .insert("min_width".to_owned(), StyleValue::Text("120".to_owned()));
+        alpha
+            .style
+            .insert("gap".to_owned(), StyleValue::Number(8.0));
+        alpha
+            .style
+            .insert("padding".to_owned(), StyleValue::Number(4.0));
+        alpha
+            .style
+            .insert("padding_left".to_owned(), StyleValue::Number(10.0));
+        alpha
+            .style
+            .insert("center".to_owned(), StyleValue::Bool(true));
+        alpha
+            .style
+            .insert("align_x".to_owned(), StyleValue::Text("right".to_owned()));
+        alpha
+            .style
+            .insert("color".to_owned(), StyleValue::Text("red".to_owned()));
+        alpha
+            .style
+            .insert("opacity".to_owned(), StyleValue::Number(0.5));
+        alpha.style.insert(
+            "font_weight".to_owned(),
+            StyleValue::Text("bold".to_owned()),
+        );
+        alpha
+            .style
+            .insert("line_height".to_owned(), StyleValue::Number(18.0));
+        alpha
+            .style
+            .insert("material".to_owned(), StyleValue::Text("flat".to_owned()));
+        alpha
+            .style
+            .insert("border_radius".to_owned(), StyleValue::Number(6.0));
+        alpha
+            .style
+            .insert("__hover_scope".to_owned(), StyleValue::Bool(true));
+        alpha
+            .style
+            .insert("__clip_x".to_owned(), StyleValue::Number(1.0));
+        alpha
+            .style
+            .insert("__clip_y".to_owned(), StyleValue::Number(2.0));
+        alpha
+            .style
+            .insert("__clip_width".to_owned(), StyleValue::Number(3.0));
+        alpha
+            .style
+            .insert("__clip_height".to_owned(), StyleValue::Number(4.0));
+
+        let mut state = DocumentState::new("root");
+        state.apply_patch(DocumentPatch::UpsertNode(alpha)).unwrap();
+        let hot_ids = DocumentHotIdTable::from_frame(state.frame()).unwrap();
+        let alpha_hot = hot_ids.hot_id(&DocumentNodeId("alpha".to_owned())).unwrap();
+        let typed = DocumentTypedStyleIndex::from_frame(state.frame(), &hot_ids).unwrap();
+        let record = typed.record(alpha_hot).unwrap();
+
+        assert_eq!(record.layout.width, Some(DocumentStyleDimension::Fill));
+        assert_eq!(record.layout.height, Some(DocumentStyleDimension::Auto));
+        assert_eq!(
+            record.layout.min_width,
+            Some(DocumentStyleDimension::Px { value: 120.0 })
+        );
+        assert_eq!(record.layout.gap, Some(8.0));
+        assert_eq!(
+            record.layout.padding,
+            DocumentTypedEdgeSpacing {
+                top: 4.0,
+                right: 4.0,
+                bottom: 4.0,
+                left: 10.0,
+            }
+        );
+        assert!(record.layout.center);
+        assert_eq!(record.layout.align_x.as_deref(), Some("right"));
+        assert_eq!(
+            record.layout.clip,
+            Some(Rect {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            })
+        );
+        assert_eq!(record.paint.color.as_deref(), Some("red"));
+        assert_eq!(record.paint.opacity, Some(0.5));
+        assert_eq!(record.text.font_weight.as_deref(), Some("bold"));
+        assert_eq!(record.text.line_height, Some(18.0));
+        assert_eq!(record.material.material.as_deref(), Some("flat"));
+        assert_eq!(record.material.border_radius, Some(6.0));
+        assert!(record.pseudo.hover_scope);
+
+        let previous_hot_ids =
+            DocumentHotIdTable::from_frame(&DocumentFrame::empty("root")).unwrap();
+        let err =
+            DocumentTypedStyleIndex::from_frame(state.frame(), &previous_hot_ids).unwrap_err();
+        assert!(matches!(
+            err,
+            PatchApplyError::StaleReference {
+                reference_kind: "hot_id_table",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn typed_binding_index_exposes_current_single_binding_as_multi_binding_shape() {
+        let mut button = node("button", DocumentNodeKind::Button, Some("root"));
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("source:button:press".to_owned()),
+            source_path: "todos[0].done".to_owned(),
+            intent: "toggle".to_owned(),
+        });
+
+        let mut state = DocumentState::new("root");
+        state
+            .apply_patch(DocumentPatch::UpsertNode(button))
+            .unwrap();
+        let hot_ids = DocumentHotIdTable::from_frame(state.frame()).unwrap();
+        let intern_index = DocumentInternIndex::from_frame(state.frame(), &hot_ids).unwrap();
+        let bindings =
+            DocumentTypedBindingIndex::from_frame(state.frame(), &hot_ids, &intern_index).unwrap();
+        let button_hot = hot_ids
+            .hot_id(&DocumentNodeId("button".to_owned()))
+            .unwrap();
+        let binding = bindings
+            .bindings_for_node(button_hot)
+            .first()
+            .expect("button should expose its compatibility source binding");
+
+        assert_eq!(binding.reference.node, button_hot);
+        assert_eq!(binding.reference.ordinal, 0);
+        assert_eq!(binding.binding_id.0, "source:button:press");
+        assert_eq!(binding.route.source_path, "todos[0].done");
+        assert_eq!(binding.route.intent, "toggle");
+        assert_eq!(
+            Some(binding.intern_id),
+            intern_index.nodes.get(&button_hot).unwrap().source_binding
+        );
+        assert_eq!(
+            bindings.refs_for_binding_id(&SourceBindingId("source:button:press".to_owned())),
+            &[binding.reference]
+        );
+        assert_eq!(
+            bindings.refs_for_route(&DocumentTypedBindingRoute {
+                source_path: "todos[0].done".to_owned(),
+                intent: "toggle".to_owned(),
+            }),
+            &[binding.reference]
+        );
+        assert!(
+            bindings
+                .bindings_for_node(DocumentHotNodeId(999))
+                .is_empty()
+        );
+
+        let stale_hot = DocumentHotIdTable::from_frame(&DocumentFrame::empty("root")).unwrap();
+        let stale_hot_err =
+            DocumentTypedBindingIndex::from_frame(state.frame(), &stale_hot, &intern_index)
+                .unwrap_err();
+        assert!(matches!(
+            stale_hot_err,
+            PatchApplyError::StaleReference {
+                reference_kind: "hot_id_table",
+                ..
+            }
+        ));
+
+        let stale_intern =
+            DocumentInternIndex::from_frame(&DocumentFrame::empty("root"), &stale_hot).unwrap();
+        let stale_intern_err =
+            DocumentTypedBindingIndex::from_frame(state.frame(), &hot_ids, &stale_intern)
+                .unwrap_err();
+        assert!(matches!(
+            stale_intern_err,
+            PatchApplyError::StaleReference {
+                reference_kind: "document_intern_index",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn style_identity_splits_layout_paint_material_font_and_pseudo_state() {
         let mut base = StyleMap::new();
         base.insert("width".to_owned(), StyleValue::Number(120.0));
@@ -2497,17 +4370,38 @@ mod tests {
             text: &mut measurer,
             capabilities: RenderCapabilities::fake_portable(),
         });
-        let table = HitSideTable::from_document_layout_with_bucket_size(&frame, &layout, 64.0);
+        let hot_ids = DocumentHotIdTable::from_frame(&frame).unwrap();
+        let intern_index = DocumentInternIndex::from_frame(&frame, &hot_ids).unwrap();
+        let typed_bindings =
+            DocumentTypedBindingIndex::from_frame(&frame, &hot_ids, &intern_index).unwrap();
+        let table = HitSideTable::try_from_document_layout_with_typed_bindings(
+            &frame,
+            &hot_ids,
+            &typed_bindings,
+            &layout,
+            64.0,
+        )
+        .unwrap();
 
         let entry = table
             .entry_for_source_path("rows.press")
             .expect("source path should have a typed hit entry");
+        let row_button_hot = hot_ids
+            .hot_id(&DocumentNodeId("row-button".to_owned()))
+            .unwrap();
         assert_eq!(entry.node, DocumentNodeId("row-button".to_owned()));
         assert_eq!(
             entry.source_binding_id,
             Some(SourceBindingId("source:row-button:press".to_owned()))
         );
         assert_eq!(entry.source_intent.as_deref(), Some("press"));
+        assert_eq!(
+            entry.source_binding_refs,
+            vec![DocumentTypedBindingRef {
+                node: row_button_hot,
+                ordinal: 0,
+            }]
+        );
         assert_eq!(entry.scroll_root, Some(ScrollRootId("scroll".to_owned())));
         assert_eq!(entry.row_key, Some(42));
         assert_eq!(entry.row_generation, Some(7));
@@ -2521,6 +4415,7 @@ mod tests {
             .hit_test(entry.bounds.x + 1.0, entry.bounds.y + 1.0)
             .expect("typed hit side table should route by point");
         assert_eq!(hit.source_path.as_deref(), Some("rows.press"));
+        assert_eq!(hit.source_binding_refs, entry.source_binding_refs);
     }
 
     #[test]

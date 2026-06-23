@@ -1,3 +1,4 @@
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -76,12 +77,16 @@ impl Serialize for StyleValue {
             StyleValue::Number(value) => serializer.serialize_f64(*value),
             StyleValue::Bool(value) => serializer.serialize_bool(*value),
             StyleValue::RichTextSpans(spans) => {
-                let value = serde_json::to_string(spans).map_err(serde::ser::Error::custom)?;
-                serializer.serialize_str(&value)
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "rich_text_spans")?;
+                map.serialize_entry("spans", spans)?;
+                map.end()
             }
             StyleValue::EditorTypeHints(hints) => {
-                let value = serde_json::to_string(hints).map_err(serde::ser::Error::custom)?;
-                serializer.serialize_str(&value)
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "editor_type_hints")?;
+                map.serialize_entry("hints", hints)?;
+                map.end()
             }
         }
     }
@@ -99,10 +104,45 @@ impl<'de> Deserialize<'de> for StyleValue {
                 .map(StyleValue::Number)
                 .ok_or_else(|| serde::de::Error::custom("style number must fit f64")),
             serde_json::Value::Bool(value) => Ok(StyleValue::Bool(value)),
+            serde_json::Value::Object(mut value) => {
+                let kind = value
+                    .remove("kind")
+                    .and_then(|kind| kind.as_str().map(str::to_owned))
+                    .ok_or_else(|| serde::de::Error::custom("typed style value needs kind"))?;
+                match kind.as_str() {
+                    "rich_text_spans" => {
+                        serde_json::from_value(value.remove("spans").ok_or_else(|| {
+                            serde::de::Error::custom("rich_text_spans needs spans")
+                        })?)
+                        .map(StyleValue::RichTextSpans)
+                        .map_err(serde::de::Error::custom)
+                    }
+                    "editor_type_hints" => {
+                        serde_json::from_value(value.remove("hints").ok_or_else(|| {
+                            serde::de::Error::custom("editor_type_hints needs hints")
+                        })?)
+                        .map(StyleValue::EditorTypeHints)
+                        .map_err(serde::de::Error::custom)
+                    }
+                    _ => Err(serde::de::Error::custom(format!(
+                        "unknown typed style value kind `{kind}`"
+                    ))),
+                }
+            }
             _ => Err(serde::de::Error::custom(
-                "style value must be a string, number, or bool",
+                "style value must be a string, number, bool, or typed style object",
             )),
         }
+    }
+}
+
+impl StyleValue {
+    pub fn from_legacy_rich_text_spans_json(payload: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<Vec<StyleRichTextSpan>>(payload).map(Self::RichTextSpans)
+    }
+
+    pub fn from_legacy_editor_type_hints_json(payload: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<Vec<StyleEditorTypeHint>>(payload).map(Self::EditorTypeHints)
     }
 }
 
@@ -241,25 +281,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_style_payloads_serialize_as_legacy_json_strings() {
-        let value = StyleValue::RichTextSpans(vec![StyleRichTextSpan {
+    fn typed_style_payloads_round_trip_as_typed_objects() {
+        let rich_text = StyleValue::RichTextSpans(vec![StyleRichTextSpan {
             text: "SOURCE".to_owned(),
             source_text: Some("SOURCE".to_owned()),
             color: Some("#ff0000".to_owned()),
             font_style: Some("italic".to_owned()),
             font_weight: Some("bold".to_owned()),
         }]);
+        let hints = StyleValue::EditorTypeHints(vec![StyleEditorTypeHint {
+            line: 2,
+            start: 4,
+            end: 8,
+            anchor_column: 12,
+            category: "return".to_owned(),
+            compact_label: "TEXT".to_owned(),
+            detail_label: "TEXT value".to_owned(),
+        }]);
 
-        let encoded = serde_json::to_value(&value).expect("style value should serialize");
-        let encoded_text = encoded
-            .as_str()
-            .expect("typed style payloads must keep legacy string JSON shape");
-        let decoded_payload: Vec<StyleRichTextSpan> =
-            serde_json::from_str(encoded_text).expect("legacy payload string should be valid JSON");
-        assert_eq!(decoded_payload[0].text, "SOURCE");
+        for value in [rich_text, hints] {
+            let encoded = serde_json::to_value(&value).expect("style value should serialize");
+            assert!(
+                encoded.get("kind").is_some(),
+                "typed style payloads must use tagged objects"
+            );
+            let decoded: StyleValue =
+                serde_json::from_value(encoded).expect("typed style value should deserialize");
+            assert_eq!(decoded, value);
+        }
+    }
 
-        let decoded_value: StyleValue =
-            serde_json::from_value(encoded).expect("legacy style value should deserialize");
-        assert!(matches!(decoded_value, StyleValue::Text(_)));
+    #[test]
+    fn legacy_typed_style_payload_strings_decode_only_through_explicit_helpers() {
+        let rich_text_payload = serde_json::to_string(&vec![StyleRichTextSpan {
+            text: "SOURCE".to_owned(),
+            source_text: Some("SOURCE".to_owned()),
+            color: Some("#ff0000".to_owned()),
+            font_style: Some("italic".to_owned()),
+            font_weight: Some("bold".to_owned()),
+        }])
+        .unwrap();
+        let decoded_scalar: StyleValue =
+            serde_json::from_value(serde_json::Value::String(rich_text_payload.clone()))
+                .expect("legacy scalar string should remain a text style");
+        assert!(matches!(decoded_scalar, StyleValue::Text(_)));
+
+        let decoded_rich_text =
+            StyleValue::from_legacy_rich_text_spans_json(&rich_text_payload).unwrap();
+        assert!(matches!(decoded_rich_text, StyleValue::RichTextSpans(_)));
+
+        let hint_payload = serde_json::to_string(&vec![StyleEditorTypeHint {
+            line: 2,
+            start: 4,
+            end: 8,
+            anchor_column: 12,
+            category: "return".to_owned(),
+            compact_label: "TEXT".to_owned(),
+            detail_label: "TEXT value".to_owned(),
+        }])
+        .unwrap();
+        let decoded_hints = StyleValue::from_legacy_editor_type_hints_json(&hint_payload).unwrap();
+        assert!(matches!(decoded_hints, StyleValue::EditorTypeHints(_)));
     }
 }

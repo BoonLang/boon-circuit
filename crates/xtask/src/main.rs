@@ -46222,6 +46222,8 @@ fn verify_native_cells_interaction_speed(
     let role_output = if build.success() && profile_ok && generic_source_ok {
         Some(
             Command::new(&binary_path)
+                .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+                .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
                 .args([
                     "--role",
                     "interaction-speed",
@@ -46400,6 +46402,31 @@ fn verify_native_cells_interaction_speed(
     } else {
         Vec::new()
     };
+    let click_interaction_timing = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("click_interaction_timing_ms"))
+        .cloned()
+        .unwrap_or_else(|| json!(null));
+    let click_native_input_timing = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("click_native_input_timing_ms"))
+        .cloned()
+        .unwrap_or_else(|| json!(null));
+    let interaction_timing_samples = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("interaction_timing_samples"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let native_input_timing_samples = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("native_input_timing_samples"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let native_input_reject_counts = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("native_input_reject_counts"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     write_native_gate_report(
         args,
         "verify-native-cells-interaction-speed",
@@ -46428,6 +46455,21 @@ fn verify_native_cells_interaction_speed(
             "preview_shared_render_update_count": render_update_count,
             "max_p95_ms": max_p95_ms,
             "max_max_ms": max_max_ms,
+            "click_interaction_timing_ms": click_interaction_timing,
+            "click_native_input_timing_ms": click_native_input_timing,
+            "interaction_timing_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("interaction_timing_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            "interaction_timing_samples": interaction_timing_samples,
+            "native_input_timing_count": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("native_input_timing_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            "native_input_timing_samples": native_input_timing_samples,
+            "native_input_reject_counts": native_input_reject_counts,
             "targets": {
                 "debug": {
                     "focus_p95_ms": 120.0,

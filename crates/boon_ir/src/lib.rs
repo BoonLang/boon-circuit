@@ -6951,9 +6951,7 @@ fn derived_values(
                 id: FieldId(id),
                 indexed,
                 scope_id,
-                startup_recompute: derived_value_startup_recompute(
-                    &kind, field, row_scopes, scope_id,
-                ),
+                startup_recompute: derived_value_startup_recompute(&kind),
                 kind,
                 path: field.path.clone(),
                 sources,
@@ -6963,47 +6961,14 @@ fn derived_values(
         .collect()
 }
 
-fn derived_value_startup_recompute(
-    kind: &DerivedValueKind,
-    field: &FieldDef,
-    row_scopes: &[RowScope],
-    scope_id: Option<ScopeId>,
-) -> bool {
+fn derived_value_startup_recompute(kind: &DerivedValueKind) -> bool {
     match kind {
         DerivedValueKind::SourceEventTransform => true,
-        DerivedValueKind::Pure => scope_id.is_some_and(|scope_id| {
-            row_scopes.get(scope_id.as_usize()).is_some_and(|scope| {
-                field_parent_is_below_row_scope(field, &scope.row_scope)
-                    || !field_is_simple_row_projection(field, &scope.row_scope)
-            })
-        }),
+        DerivedValueKind::Pure => false,
         DerivedValueKind::ListView | DerivedValueKind::Aggregate | DerivedValueKind::Unknown => {
             false
         }
     }
-}
-
-fn field_is_simple_row_projection(field: &FieldDef, row_scope: &str) -> bool {
-    if !field.statement.children.is_empty() {
-        return false;
-    }
-    let Some(expr_id) = field.statement.expr else {
-        return false;
-    };
-    let Some(expr) = field.ast_exprs.iter().find(|expr| expr.id == expr_id) else {
-        return false;
-    };
-    match &expr.kind {
-        AstExprKind::Path(parts) if parts.len() == 2 => parts[0] == row_scope,
-        _ => false,
-    }
-}
-
-fn field_parent_is_below_row_scope(field: &FieldDef, row_scope: &str) -> bool {
-    field
-        .parent_path
-        .strip_prefix(row_scope)
-        .is_some_and(|tail| tail.starts_with('.'))
 }
 
 fn field_is_list_memory_path(field: &FieldDef, program: &ParsedProgram) -> bool {
@@ -16155,8 +16120,8 @@ FUNCTION new_row(row) {
         assert_eq!(computed_label.kind, DerivedValueKind::Pure);
         assert!(computed_label.indexed);
         assert!(
-            computed_label.startup_recompute,
-            "nontrivial direct row pure fields must recompute on startup instead of preserving same-named list initializer fields"
+            !computed_label.startup_recompute,
+            "pure row fields are demand-current and should not force full-list startup recompute"
         );
 
         let display = ir
@@ -16167,8 +16132,8 @@ FUNCTION new_row(row) {
         assert_eq!(display.kind, DerivedValueKind::Pure);
         assert!(display.indexed);
         assert!(
-            display.startup_recompute,
-            "structured row children are below the row scope in AST ancestry and need startup recompute"
+            !display.startup_recompute,
+            "nested pure row children are demand-current and should not force full-list startup recompute"
         );
 
         let selected = ir

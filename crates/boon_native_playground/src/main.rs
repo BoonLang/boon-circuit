@@ -558,11 +558,15 @@ fn run_cells_interaction_speed(
         Path::new(&entry.scenario),
     )?));
     let mut input_state = PreviewNativeInputState::default();
+    let _ = take_preview_interaction_timings();
+    let _ = take_preview_native_input_timings();
+    let _ = take_preview_native_input_reject_counts();
     let mut latencies_ms = Vec::new();
     let started = Instant::now();
     for index in 0..event_count {
         let input = deterministic_click_input_from_index(index, x, y);
         let click_started = Instant::now();
+        preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
         preview_apply_real_window_input(
             &input,
             &source_path,
@@ -573,7 +577,11 @@ fn run_cells_interaction_speed(
         )?;
         latencies_ms.push(click_started.elapsed().as_secs_f64() * 1000.0);
     }
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_UNSPECIFIED);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let interaction_timings = take_preview_interaction_timings();
+    let native_input_timings = take_preview_native_input_timings();
+    let native_input_reject_counts = take_preview_native_input_reject_counts();
     let (state_summary, update_count, layout_hash, last_error) = {
         let mut runtime = live_runtime
             .lock()
@@ -652,6 +660,27 @@ fn run_cells_interaction_speed(
     report_value["expected_formula_bar_text"] = json!(expected_formula_bar);
     report_value["layout_frame_hash"] = layout_hash;
     report_value["preview_last_error"] = json!(last_error);
+    report_value["interaction_timing_count"] = json!(interaction_timings.len());
+    report_value["interaction_timing_samples"] = json!(
+        interaction_timings
+            .iter()
+            .take(128)
+            .map(preview_interaction_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["native_input_timing_count"] = json!(native_input_timings.len());
+    report_value["native_input_timing_samples"] = json!(
+        native_input_timings
+            .iter()
+            .take(128)
+            .map(preview_native_input_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["native_input_reject_counts"] = json!(native_input_reject_counts);
+    report_value["click_interaction_timing_ms"] =
+        interaction_timing_scope_summary_json(&interaction_timings, PREVIEW_TIMING_SCOPE_CLICK);
+    report_value["click_native_input_timing_ms"] =
+        native_input_timing_scope_summary_json(&native_input_timings, PREVIEW_TIMING_SCOPE_CLICK);
     report_value["per_step_pass_fail"] = json!([
         {
             "id": "cells-interaction-speed:target-resolved",

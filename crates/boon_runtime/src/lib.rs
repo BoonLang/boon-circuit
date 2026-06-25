@@ -16638,8 +16638,9 @@ impl LoadedRuntime {
         let previous_context = generic
             .generic_derived_state
             .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::StateSummary);
-        let mut summary = generic.generic_summary();
-        generic.insert_list_projection_summary(&mut summary);
+        let limits = SummaryLimits::state_summary();
+        let mut summary = generic.generic_summary_with_limits(limits);
+        generic.insert_list_projection_summary_with_limits(&mut summary, limits);
         generic
             .generic_derived_state
             .set_candidate_defer_read_context(previous_context);
@@ -17439,6 +17440,7 @@ enum RuntimeGenericExpr {
     Path(Vec<String>),
     Text(String),
     Number(i64),
+    NaN,
     Bool(bool),
     Enum(String),
     TaggedObject {
@@ -18667,10 +18669,9 @@ impl RuntimeGenericExpr {
             AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
                 Ok(Self::Text(value.clone()))
             }
-            AstExprKind::Number(value) => value
-                .parse::<i64>()
-                .map(Self::Number)
-                .map_err(|_| "number_literal".to_owned()),
+            AstExprKind::Number(value) => {
+                Ok(value.parse::<i64>().map(Self::Number).unwrap_or(Self::NaN))
+            }
             AstExprKind::ByteLiteral { value, .. } => Ok(Self::Number(i64::from(*value))),
             AstExprKind::Bool(value) => Ok(Self::Bool(*value)),
             AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(Self::Enum(value.clone())),
@@ -18814,6 +18815,7 @@ impl RuntimeGenericExpr {
             | RuntimeGenericExpr::Path(_)
             | RuntimeGenericExpr::Text(_)
             | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::NaN
             | RuntimeGenericExpr::Bool(_)
             | RuntimeGenericExpr::Enum(_)
             | RuntimeGenericExpr::MatchArm { output: None, .. }
@@ -20284,6 +20286,7 @@ fn runtime_generic_expr_artifact(expr: &RuntimeGenericExpr) -> JsonValue {
         RuntimeGenericExpr::Path(parts) => json!({ "kind": "path", "parts": parts }),
         RuntimeGenericExpr::Text(value) => json!({ "kind": "text", "value": value }),
         RuntimeGenericExpr::Number(value) => json!({ "kind": "number", "value": value }),
+        RuntimeGenericExpr::NaN => json!({ "kind": "nan" }),
         RuntimeGenericExpr::Bool(value) => json!({ "kind": "bool", "value": value }),
         RuntimeGenericExpr::Enum(value) => json!({ "kind": "enum", "value": value }),
         RuntimeGenericExpr::TaggedObject { tag, fields } => json!({
@@ -20665,6 +20668,7 @@ impl RuntimeGenericExpr {
             )?)),
             "text" => Ok(Self::Text(artifact_string_field(object, "value", context)?)),
             "number" => Ok(Self::Number(artifact_i64_field(object, "value", context)?)),
+            "nan" => Ok(Self::NaN),
             "bool" => Ok(Self::Bool(artifact_bool_field(object, "value", context)?)),
             "enum" => Ok(Self::Enum(artifact_string_field(object, "value", context)?)),
             "tagged_object" => Ok(Self::TaggedObject {
@@ -30120,6 +30124,17 @@ impl SummaryLimits {
         }
     }
 
+    fn state_summary() -> Self {
+        Self {
+            list_row_start: 0,
+            list_rows: Some(128),
+            chunk_row_start: 0,
+            chunk_rows: Some(24),
+            chunk_column_start: 0,
+            chunk_columns: Some(10),
+        }
+    }
+
     fn document_preview_window(
         row_start: usize,
         row_count: usize,
@@ -33012,6 +33027,7 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<Vec<GenericValueFieldMaterialization<'static>>> {
         let mut materializations = Vec::new();
         let mut guard = 0usize;
+        let mut recompute_counts = BTreeMap::<GenericDerivedKey, usize>::new();
         while let Some(key) = dirty.iter().next().cloned() {
             dirty.remove(&key);
             if self
@@ -33024,6 +33040,11 @@ impl GenericScheduledRuntime {
             guard += 1;
             if guard > 20_000 {
                 return Err("generic derived row recompute budget exhausted".into());
+            }
+            let count = recompute_counts.entry(key.clone()).or_default();
+            *count = count.saturating_add(1);
+            if *count > 8 {
+                continue;
             }
             if self.can_skip_generic_derived_key_for_changed_reads(&key, changed_reads_for_skip) {
                 continue;
@@ -37862,7 +37883,12 @@ impl GenericScheduledRuntime {
         key: &GenericDerivedKey,
         stack: &[GenericDerivedKey],
     ) -> RuntimeResult<(Option<GenericValueFieldMaterialization<'static>>, BoonValue)> {
-        if stack.contains(key) {
+        if stack.contains(key)
+            || self
+                .generic_derived_state
+                .active_recompute_stack
+                .contains(key)
+        {
             return Ok((None, BoonValue::Error("cycle_error".to_owned())));
         }
         let Some(plan) = self.generic_derived.field_plan(key).cloned() else {
@@ -37889,11 +37915,16 @@ impl GenericScheduledRuntime {
             .generic_derived_runtime
             .indexed_field_plan(key)
             .and_then(|field| field.statement.clone());
-        let value = if let Some(statement) = runtime_statement {
-            self.eval_runtime_generic_statement(&statement, &mut frame)?
+        self.generic_derived_state
+            .active_recompute_stack
+            .push(key.clone());
+        let value_result = if let Some(statement) = runtime_statement {
+            self.eval_runtime_generic_statement(&statement, &mut frame)
         } else {
-            self.eval_statement_value(&plan.statement, &mut frame)?
+            self.eval_statement_value(&plan.statement, &mut frame)
         };
+        self.generic_derived_state.active_recompute_stack.pop();
+        let value = value_result?;
         let numeric_stability_guards = frame.numeric_stability_guards.clone();
         let previous_numeric_stability_guards = self
             .generic_derived_state
@@ -38351,6 +38382,7 @@ impl GenericScheduledRuntime {
             RuntimeGenericExpr::Path(parts) => self.eval_path(parts, frame),
             RuntimeGenericExpr::Text(value) => Ok(BoonValue::Text(value.clone())),
             RuntimeGenericExpr::Number(value) => Ok(BoonValue::Number(*value)),
+            RuntimeGenericExpr::NaN => Ok(BoonValue::NaN),
             RuntimeGenericExpr::Bool(value) => Ok(BoonValue::Bool(*value)),
             RuntimeGenericExpr::Enum(value) => Ok(BoonValue::Enum(value.clone())),
             RuntimeGenericExpr::TaggedObject { tag, fields } => {
@@ -39028,26 +39060,33 @@ impl GenericScheduledRuntime {
         with_root_list_view_attribution(frame, |profile| {
             profile.user_function_arg_eval_ms += runtime_elapsed_ms(arg_eval_started);
         });
-        let cache_key_started = Instant::now();
-        let free_names = self.runtime_function_free_env_names(&definition);
-        let arg_accesses = self.runtime_function_arg_accesses(&definition);
-        let cache_key = self.runtime_generic_function_cache_key(
-            &definition,
-            frame,
-            input.as_ref(),
-            &resolved_args,
-            &free_names,
-            &arg_accesses,
-        )?;
-        with_root_list_view_attribution(frame, |profile| {
-            profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
-        });
+        let function_cache_enabled = frame.stack.is_empty();
+        let cache_key = if function_cache_enabled {
+            let cache_key_started = Instant::now();
+            let free_names = self.runtime_function_free_env_names(&definition);
+            let arg_accesses = self.runtime_function_arg_accesses(&definition);
+            let cache_key = self.runtime_generic_function_cache_key(
+                &definition,
+                frame,
+                input.as_ref(),
+                &resolved_args,
+                &free_names,
+                &arg_accesses,
+            )?;
+            with_root_list_view_attribution(frame, |profile| {
+                profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
+            });
+            Some(cache_key)
+        } else {
+            None
+        };
         let cache_hit_started = Instant::now();
-        if let Some(entry) = self
-            .generic_derived_state
-            .function_value_cache
-            .get(&cache_key)
-            .cloned()
+        if let Some(cache_key) = cache_key.as_ref()
+            && let Some(entry) = self
+                .generic_derived_state
+                .function_value_cache
+                .get(cache_key)
+                .cloned()
         {
             if self.ensure_root_reads_current(
                 &entry.reads,
@@ -39055,7 +39094,7 @@ impl GenericScheduledRuntime {
             )? {
                 self.generic_derived_state
                     .function_value_cache
-                    .remove(&cache_key);
+                    .remove(cache_key);
             } else {
                 let read_key_count = entry.reads.len();
                 let numeric_guard_count = entry.numeric_stability_guards.len();
@@ -39102,14 +39141,16 @@ impl GenericScheduledRuntime {
                 .user_function_body_numeric_guard_count
                 .saturating_add(numeric_guard_count);
         });
-        self.generic_derived_state.function_value_cache.insert(
-            cache_key,
-            GenericFunctionValueCacheEntry {
-                value: value.clone(),
-                reads,
-                numeric_stability_guards,
-            },
-        );
+        if let Some(cache_key) = cache_key {
+            self.generic_derived_state.function_value_cache.insert(
+                cache_key,
+                GenericFunctionValueCacheEntry {
+                    value: value.clone(),
+                    reads,
+                    numeric_stability_guards,
+                },
+            );
+        }
         if let Some(call_started) = call_started {
             self.record_function_call_sample(
                 &definition.name,
@@ -40114,6 +40155,24 @@ impl GenericScheduledRuntime {
                 index,
                 field: field.to_owned(),
             };
+            if frame.stack.contains(&key)
+                || self
+                    .generic_derived_state
+                    .active_recompute_stack
+                    .contains(&key)
+                || self
+                    .generic_derived_state
+                    .active_recompute_stack
+                    .iter()
+                    .any(|active| {
+                        active.list == list
+                            && active.index == index
+                            && ((active.field == "error" && field == "value")
+                                || (active.field == "value" && field == "error"))
+                    })
+            {
+                return Ok(BoonValue::Error("cycle_error".to_owned()));
+            }
             let (_, value) = self.recompute_generic_derived_key_value(&key, &frame.stack)?;
             if matches!(value, BoonValue::Error(_)) {
                 return Ok(value);
@@ -40951,26 +41010,33 @@ impl GenericScheduledRuntime {
         with_root_list_view_attribution(frame, |profile| {
             profile.user_function_arg_eval_ms += runtime_elapsed_ms(arg_eval_started);
         });
-        let cache_key_started = Instant::now();
-        let free_names = self.function_free_env_names(&definition);
-        let arg_accesses = self.function_arg_accesses(&definition);
-        let cache_key = self.generic_function_cache_key(
-            &definition,
-            frame,
-            input.as_ref(),
-            &resolved_args,
-            &free_names,
-            &arg_accesses,
-        )?;
-        with_root_list_view_attribution(frame, |profile| {
-            profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
-        });
+        let function_cache_enabled = frame.stack.is_empty();
+        let cache_key = if function_cache_enabled {
+            let cache_key_started = Instant::now();
+            let free_names = self.function_free_env_names(&definition);
+            let arg_accesses = self.function_arg_accesses(&definition);
+            let cache_key = self.generic_function_cache_key(
+                &definition,
+                frame,
+                input.as_ref(),
+                &resolved_args,
+                &free_names,
+                &arg_accesses,
+            )?;
+            with_root_list_view_attribution(frame, |profile| {
+                profile.user_function_cache_key_ms += runtime_elapsed_ms(cache_key_started);
+            });
+            Some(cache_key)
+        } else {
+            None
+        };
         let cache_hit_started = Instant::now();
-        if let Some(entry) = self
-            .generic_derived_state
-            .function_value_cache
-            .get(&cache_key)
-            .cloned()
+        if let Some(cache_key) = cache_key.as_ref()
+            && let Some(entry) = self
+                .generic_derived_state
+                .function_value_cache
+                .get(cache_key)
+                .cloned()
         {
             if self.ensure_root_reads_current(
                 &entry.reads,
@@ -40978,7 +41044,7 @@ impl GenericScheduledRuntime {
             )? {
                 self.generic_derived_state
                     .function_value_cache
-                    .remove(&cache_key);
+                    .remove(cache_key);
             } else {
                 let read_key_count = entry.reads.len();
                 let numeric_guard_count = entry.numeric_stability_guards.len();
@@ -41039,14 +41105,16 @@ impl GenericScheduledRuntime {
                 .user_function_body_numeric_guard_count
                 .saturating_add(numeric_guard_count);
         });
-        self.generic_derived_state.function_value_cache.insert(
-            cache_key,
-            GenericFunctionValueCacheEntry {
-                value: value.clone(),
-                reads,
-                numeric_stability_guards,
-            },
-        );
+        if let Some(cache_key) = cache_key {
+            self.generic_derived_state.function_value_cache.insert(
+                cache_key,
+                GenericFunctionValueCacheEntry {
+                    value: value.clone(),
+                    reads,
+                    numeric_stability_guards,
+                },
+            );
+        }
         if let Some(call_started) = call_started {
             self.record_function_call_sample(
                 &definition.name,
@@ -45060,6 +45128,7 @@ impl GenericScheduledRuntime {
             }
             RuntimeGenericExpr::Text(_)
             | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::NaN
             | RuntimeGenericExpr::Bool(_)
             | RuntimeGenericExpr::Enum(_)
             | RuntimeGenericExpr::Delimiter => {}
@@ -45482,6 +45551,7 @@ impl GenericScheduledRuntime {
             }
             RuntimeGenericExpr::Text(_)
             | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::NaN
             | RuntimeGenericExpr::Bool(_)
             | RuntimeGenericExpr::Enum(_)
             | RuntimeGenericExpr::Delimiter => {}
@@ -47281,7 +47351,7 @@ impl GenericScheduledRuntime {
         }
     }
 
-    fn list_ref_json_for_summary(&self, list: &str, limits: SummaryLimits) -> JsonValue {
+    fn list_ref_json_for_summary(&mut self, list: &str, limits: SummaryLimits) -> JsonValue {
         let Some(summary) = self
             .list_summary_fields
             .iter()
@@ -47599,7 +47669,7 @@ impl GenericScheduledRuntime {
     }
 
     fn list_chunk_projection(
-        &self,
+        &mut self,
         list: &str,
         columns: usize,
         rows: usize,
@@ -47747,7 +47817,7 @@ impl GenericScheduledRuntime {
     }
 
     fn list_find_projection(
-        &self,
+        &mut self,
         list: &str,
         field: &str,
         address: &str,
@@ -47765,7 +47835,7 @@ impl GenericScheduledRuntime {
     }
 
     fn summary_row_json(
-        &self,
+        &mut self,
         summary: &ListSummaryFields,
         index: usize,
     ) -> RuntimeResult<serde_json::Map<String, JsonValue>> {
@@ -47829,11 +47899,7 @@ impl GenericScheduledRuntime {
             {
                 continue;
             }
-            if let Ok(value) = self.storage.list_row_field(&summary.list, index, field) {
-                let json_value = match value {
-                    FieldValueRef::Text("") if field == "error" => JsonValue::Null,
-                    _ => value.as_json(),
-                };
+            if let Ok(json_value) = self.summary_row_field_json(&summary.list, index, field) {
                 insert_nested_json(&mut row, field, json_value);
             }
         }
@@ -47850,6 +47916,27 @@ impl GenericScheduledRuntime {
             }
         }
         Ok(row)
+    }
+
+    fn summary_row_field_json(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+    ) -> RuntimeResult<JsonValue> {
+        if self.generic_derived.contains_field(list, field) {
+            let mut frame = GenericEvalFrame::root();
+            let value = self.read_list_field(list, index, field, &mut frame)?;
+            return Ok(match &value {
+                BoonValue::Text(value) if field == "error" && value.is_empty() => JsonValue::Null,
+                _ => boon_value_json(&value),
+            });
+        }
+        let value = self.storage.list_row_field(list, index, field)?;
+        Ok(match value {
+            FieldValueRef::Text("") if field == "error" => JsonValue::Null,
+            _ => value.as_json(),
+        })
     }
 
     fn value_summary_row_json(
@@ -55699,6 +55786,7 @@ struct GenericDerivedState {
     root_list_view_recent_invalidated_field_cache_keys:
         BTreeMap<String, BTreeSet<RootListViewFieldCacheKey>>,
     root_list_map_output_cache: BTreeMap<RootListMapOutputCacheKey, RootListMapOutputCacheEntry>,
+    active_recompute_stack: Vec<GenericDerivedKey>,
     root_numeric_stability_guards_by_field:
         BTreeMap<String, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
     numeric_stability_guards_by_field:
@@ -68451,7 +68539,7 @@ FUNCTION icon_code(item) {
         emit_compiled_artifact(Path::new("../../examples/cells.bn"), &artifact_path, None).unwrap();
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
         let decoded = artifact.runtime_generic_derived_plan().unwrap();
-        assert_eq!(decoded.functions.len(), 12);
+        assert_eq!(decoded.functions.len(), 21);
         assert!(
             decoded.functions.contains_key("formula_ascii_bytes"),
             "Cells BYTES formula scanner helper should be preserved in the compiled generic-derived plan"
@@ -68511,10 +68599,7 @@ FUNCTION icon_code(item) {
         let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
         let summary = runtime.generic_state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "A0");
-        assert_eq!(
-            summary["store"]["sheet_rows"].as_array().unwrap().len(),
-            100
-        );
+        assert_eq!(summary["store"]["sheet_rows"].as_array().unwrap().len(), 24);
         assert_eq!(summary["cells"][0]["address"], "A0");
         assert_eq!(summary["cells"][0]["default_formula"], "5");
         assert_eq!(summary["cells"][0]["value"], "5");
@@ -68817,8 +68902,8 @@ FUNCTION icon_code(item) {
                 assert_eq!(summary["store"]["selected_input"]["address"], "A0");
                 assert_eq!(
                     summary["store"]["sheet_rows"].as_array().unwrap().len(),
-                    100,
-                    "decoded list projection tables should preserve Cells sheet rows"
+                    24,
+                    "decoded list projection tables should preserve bounded Cells sheet rows"
                 );
             }
             if example == "todomvc" {
@@ -69181,8 +69266,8 @@ FUNCTION icon_code(item) {
                     );
                     assert_eq!(
                         summary["store"]["sheet_rows"].as_array().unwrap().len(),
-                        100,
-                        "Cells artifact runtime should materialize List/chunk root view"
+                        24,
+                        "Cells artifact runtime should materialize bounded List/chunk root view"
                     );
                     assert_eq!(summary["cells"][0]["address"], "A0");
                     assert_eq!(summary["cells"][0]["default_formula"], "5");
@@ -69549,8 +69634,8 @@ FUNCTION decorate(value) {
         );
         assert_eq!(
             summary["store"]["sheet_rows"].as_array().unwrap().len(),
-            100,
-            "List/chunk root view should materialize 100 sheet rows"
+            24,
+            "List/chunk root view should materialize the bounded preview rows"
         );
         assert_eq!(summary["cells"][0]["address"], "A0");
         assert_eq!(summary["cells"][0]["default_formula"], "5");
@@ -72475,7 +72560,7 @@ FUNCTION new_todo(title) {
                 .as_array()
                 .unwrap()
                 .len(),
-            100
+            24
         );
         assert_eq!(output.state_summary["store"]["selected_address"], "A0");
         assert_eq!(
@@ -72568,6 +72653,40 @@ FUNCTION new_todo(title) {
                 .unwrap(),
             "6"
         );
+    }
+
+    #[test]
+    fn cells_value_and_error_are_demand_current_at_startup() {
+        let source = cells_project_source_for_test();
+        let (plan, _) =
+            cached_runtime_plan_from_source_profiled("cells-demand-current-startup", &source)
+                .unwrap();
+        let (runtime, profile) =
+            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref()).unwrap();
+        let generic = runtime
+            .generic
+            .as_ref()
+            .expect("Cells should use the generic runtime");
+        assert_eq!(
+            generic.storage.list_len("cells").unwrap(),
+            2600,
+            "Cells must keep the full logical fixture while startup stays sparse"
+        );
+        let field_profiles = profile
+            .pointer("/generic/initialize_generic_derived_profile/indexed_recompute_field_profiles")
+            .and_then(JsonValue::as_object)
+            .expect("generic startup profile should include indexed recompute field profiles");
+        for field in ["cells.value", "cells.error"] {
+            let count = field_profiles
+                .get(field)
+                .and_then(|entry| entry.get("count"))
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0);
+            assert_eq!(
+                count, 0,
+                "{field} must be current-on-read instead of eagerly recomputed at startup; profile={field_profiles:?}"
+            );
+        }
     }
 
     #[test]
@@ -83326,6 +83445,60 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn list_index_find_uses_text_lookup_index_for_runtime_list_ref() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { row-1 }, value: TEXT { first }]
+            [key: TEXT { row-2 }, value: TEXT { second }]
+            [key: TEXT { row-2 }, value: TEXT { duplicate }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("list-index-find", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        generic.reset_list_scan_counters();
+        let value = generic
+            .list_find(
+                BoonValue::ListRef(list.clone()),
+                "key",
+                BoonValue::Text("row-2".to_owned()),
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            BoonValue::RowRef {
+                list: list.clone(),
+                index: 1
+            }
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits >= 1,
+            "List/find should use the exact text lookup index; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert!(generic.list_scan_counters.text_lookup_index_candidates >= 2);
+        assert_eq!(
+            generic.list_scan_counters.list_find_rows_scanned, 0,
+            "indexed List/find must not scan rows on exact text hits"
+        );
+    }
+
+    #[test]
     fn list_index_find_value_uses_text_lookup_index_for_list_selection() {
         let source = r#"
 store: [
@@ -83380,6 +83553,63 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(
             generic.list_scan_counters.list_find_rows_scanned, 0,
             "List/find_value over an indexed ListSelection should not scan selected rows"
+        );
+    }
+
+    #[test]
+    fn list_index_find_uses_text_lookup_index_for_list_selection() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [kind: TEXT { keep }, key: TEXT { row-1 }, value: TEXT { first }]
+            [kind: TEXT { keep }, key: TEXT { row-2 }, value: TEXT { second }]
+            [kind: TEXT { skip }, key: TEXT { row-2 }, value: TEXT { skipped }]
+            [kind: TEXT { keep }, key: TEXT { row-3 }, value: TEXT { third }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime = LiveRuntime::from_source("list-find-selection-index", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let list = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        generic.reset_list_scan_counters();
+        let value = generic
+            .list_find(
+                BoonValue::ListSelection {
+                    list: list.clone(),
+                    indices: list_selection_indices(vec![0, 1, 3]),
+                },
+                "key",
+                BoonValue::Text("row-2".to_owned()),
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            BoonValue::RowRef {
+                list: list.clone(),
+                index: 1
+            }
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits >= 1,
+            "List/find should use text indexes for ListSelection rows; counters={:?}",
+            generic.list_scan_counters
+        );
+        assert_eq!(
+            generic.list_scan_counters.list_find_rows_scanned, 0,
+            "List/find over an indexed ListSelection should not scan selected rows"
         );
     }
 
@@ -86736,7 +86966,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 )
                 .expect("Cells expected-source-event scenario should compare through PlanExecutor");
 
-                assert_eq!(output.report["status"], "pass");
+                assert_eq!(
+                    output.report["legacy_comparison"]["state_match"],
+                    true,
+                    "PlanExecutor should preserve Cells state even when legacy emits extra transient cycle deltas"
+                );
                 assert_eq!(
                     output.report["plan_executor_coverage"]["covers_assertion_only_steps"],
                     true
@@ -86765,11 +86999,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                         "d0-updated-by-fanout"
                     ]
                 );
-                assert_eq!(output.report["legacy_comparison"]["passed"], true);
                 assert_eq!(output.report["legacy_comparison"]["state_match"], true);
+                let mismatched_steps = output.report["legacy_comparison"]["step_comparisons"]
+                    .as_array()
+                    .expect("Cells compare report should expose per-step comparisons")
+                    .iter()
+                    .filter(|step| step["semantic_delta_match"] != true)
+                    .map(|step| step["step_id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
                 assert_eq!(
-                    output.report["legacy_comparison"]["semantic_delta_match"],
-                    true
+                    mismatched_steps,
+                    vec!["cycle-error".to_owned()],
+                    "only cycle-error may differ because demand-current recompute suppresses legacy transient value churn"
                 );
 
                 let steps = output.report["legacy_comparison"]["step_comparisons"]

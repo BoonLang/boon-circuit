@@ -1,0 +1,77 @@
+-- Parametric Car 3D - first generic manufacturing car assembly.
+--
+-- This first slice uses the Solid constructors currently supported by the
+-- runtime/manufacturing path. It proves stable part/instance identity, shared
+-- wheel prototype reuse, visual-only windows, and material-separated printable
+-- output without using visual meshes as manufacturing evidence.
+
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { parametric_car }
+
+    parts: LIST {
+        Part/new(
+            id: TEXT { body }
+            geometry: Solid/rounded_box(size: [x: 118, y: 38, z: 18], radius: 3)
+            appearance: TEXT { red_paint }
+            physical_material: TEXT { PETG }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { wheel_prototype }
+            geometry: Solid/cylinder(radius: 6, height: 8)
+            appearance: TEXT { tire_rubber }
+            physical_material: TEXT { TPU }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { windows }
+            geometry: Solid/rounded_box(size: [x: 52, y: 32, z: 6], radius: 2)
+            appearance: TEXT { blue_glass }
+            manufacturing_role: VisualOnly
+        )
+    }
+
+    instances: LIST {
+        Part/instance(
+            id: TEXT { body_instance }
+            part: TEXT { body }
+            label: TEXT { Car body }
+        )
+        Part/instance(
+            id: TEXT { windows_instance }
+            part: TEXT { windows }
+            transform: Solid/translate(by: [x: 0, y: 0, z: 12])
+            label: TEXT { Visual-only windows }
+        )
+        Part/instance(
+            id: TEXT { front_left_wheel }
+            part: TEXT { wheel_prototype }
+            transform: Solid/translate(by: [x: -36, y: -30, z: -6])
+            label: TEXT { Front-left wheel }
+        )
+        Part/instance(
+            id: TEXT { front_right_wheel }
+            part: TEXT { wheel_prototype }
+            transform: Solid/translate(by: [x: -36, y: 30, z: -6])
+            label: TEXT { Front-right wheel }
+        )
+        Part/instance(
+            id: TEXT { rear_left_wheel }
+            part: TEXT { wheel_prototype }
+            transform: Solid/translate(by: [x: 36, y: -30, z: -6])
+            label: TEXT { Rear-left wheel }
+        )
+        Part/instance(
+            id: TEXT { rear_right_wheel }
+            part: TEXT { wheel_prototype }
+            transform: Solid/translate(by: [x: 36, y: 30, z: -6])
+            label: TEXT { Rear-right wheel }
+        )
+    }
+)

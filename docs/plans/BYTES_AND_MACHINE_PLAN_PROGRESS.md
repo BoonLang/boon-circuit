@@ -24,8 +24,8 @@ MachinePlan migration.
 | Phase 6 - CPU PlanExecutor and Parity | Partial | Added explicit `run-plan` initial-state CPU PlanExecutor proof for scalar constants and typed list initial storage, `run-plan-route` for one unscoped source-payload update route plus one unscoped const update route, a four-step TodoMVC root-scalar scenario subset, a narrow TodoMVC submit root/list slice, TodoMVC retain-backed `store.visible_todos` materialization, and root-scalar BYTES op parity for `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. `examples/list_initial_plan_ops.bn` proves `run-plan` can initialize one typed list slot and report row fields without fallback counters. `examples/bytes_concat_chain_plan_ops.bn` proves committed-step chaining from `Bytes/concat`; `examples/bytes_set_plan_ops.bn` proves committed-step chaining from `Bytes/set` into later `Bytes/get`, `Bytes/length`, and `Bytes/concat`; `examples/bytes_file_read_plan_ops.bn` proves file-read BYTES state can be consumed by later `Bytes/length` and `Bytes/get` through typed PlanExecutor state. `examples/bytes_initial.bn`, `examples/list_initial_plan_ops.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, TodoMVC `store.sources.new_todo_input.change -> store.new_todo_text`, TodoMVC `store.sources.filter_active.press -> store.selected_filter`, TodoMVC selected steps `add-test-todo-type,filter-active,filter-completed,filter-all`, TodoMVC `add-test-todo-type,add-test-todo-submit`, TodoMVC `add-test-todo-type,add-test-todo-submit,filter-active,toggle-dynamic-test-todo-under-active-filter`, and whitespace submit rejection prove zero fallback counters on their selected surfaces. TodoMVC and Cells full scenario compare reports now pass on the current aggregate surface, but broader conflict/error/source-binding coverage, generic dependency-frontier scheduling, and final default-switch readiness remain open. |
 | Phase 7 - BYTES Runtime/Storage | Partial | Legacy runtime can evaluate source-language BYTES constructors and v1 BYTES builtins into existing inline `RuntimeBytes`; root-scalar PlanExecutor can initialize inline BYTES and replay `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. PlanExecutor now carries a private root BYTES sidecar state initialized from typed constants and updated by BYTES-producing branches, so committed BYTES outputs can be consumed by later BYTES operations while public reports still expose only digest/length summaries. Fixed root BYTES now have preallocated byte-bank metadata, fixed root `Bytes/set` can mutate the private destination bank with zero measured runtime copy/alloc counters, and focused patch-then-read/write storage-profile cases prove later `Bytes/get`, `Bytes/length`, `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, `Bytes/ends_with`, `Bytes/read_unsigned`, `Bytes/read_signed`, `Bytes/to_text`, `Bytes/to_hex`, `Bytes/to_base64`, `Bytes/write_unsigned`, and `Bytes/write_signed` use `root_fixed_byte_bank` borrowed views or patch mutations without measured byte copies. Root-scalar `Bytes/slice`, `Bytes/take`, and `Bytes/drop` now have schema-enforced view-backed output evidence with zero measured byte-buffer copy/clone/alloc/fill counters. The standalone `verify-bytes-fixed-warm-tick` gate now proves selected root fixed-BYTES warm ticks and a focused indexed source-payload receive/readback warm tick after PlanExecutor initial state, indexed/list/source binding setup, and fixed byte-bank preparation have zero measured byte-buffer helper copy/clone/alloc/zero-fill counters. `Bytes/concat` still has a root BYTES commit path for exact legacy semantic-delta parity but remains a measured-copy operation. Static `File/read_bytes` reads a sandboxed source-relative host file into dynamic BYTES with digest/length report evidence. Static-path typed MachinePlan `File/write_bytes` writes private BYTES state to a sandboxed host file and reports digest/length host-effect evidence. Root-scalar dynamic-path `File/write_bytes` now lowers and verifies `[State(BYTES), State(TEXT path)]`, resolves the path through PlanExecutor state, writes through the same sandboxed host boundary, and rejects a dynamic `../` path-state negative at runtime. Root-scalar dynamic-path `File/read_bytes` now lowers and verifies `[State(TEXT path)]`, resolves the path through PlanExecutor state, reads through the same sandboxed host boundary, feeds later `Bytes/length` and `Bytes/get`, and rejects a dynamic `../` path-state negative at runtime. Indexed row `File/write_bytes` now writes fixed indexed row byte-bank state and reports `indexed_fixed_byte_bank` / `byte_bank_used=true` borrowed host-boundary evidence for the indexed source-payload file-write slice. Indexed row-field dynamic-path `File/write_bytes` now accepts `[State(BYTES), Field(TEXT path)]`, resolves the path from the current row, writes through the same sandboxed host boundary, and preserves zero byte-copy counters in the storage-profile proof. Indexed row-field dynamic-path `File/read_bytes` now accepts `[Field(TEXT path)]`, resolves the path from the current row, reads through the same sandboxed host boundary, stores the result in a fixed indexed byte bank, and proves a later `Bytes/get` reads from `indexed_fixed_byte_bank` with borrowed access and zero measured byte-copy counters. Indexed row-field dynamic-path read/write gates now reject parent-directory paths, missing indexed target rows, unknown row path fields, non-TEXT row path fields, missing files/parents, fixed-output length mismatch for read, fabricated malformed row-field path operand shapes, mixed row-shape dynamic paths, and foreign-list row-field dynamic paths. Storage-profile schema now binds indexed row BYTES public summaries to private indexed byte-bank evidence and aggregate adversarial checks reject forged nested row summary digests. Source-payload negative coverage now includes missing required `bytes` payload rejection for BYTES source routes. Dynamic byte mutation storage beyond inline sidecar, broad indexed warm-tick coverage beyond the focused source-payload/readback shape, broader byte source payload hardening, broad malformed private-state runtime tests, broad borrowed execution for remaining BYTES ops, complete fixed indexed byte-bank coverage beyond the proven file-write/read/length/get and focused warm-tick slices, and broad no-panic/OOB coverage beyond the focused negative cases remain open. |
 | Phase 8 - Examples | Partial | Added `examples/bytes_initial.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, `examples/bytes_concat_chain_plan_ops.bn`, and `examples/bytes_file_read_plan_ops.bn` as stable focused BYTES fixtures. `examples/todo_mvc_physical/BUILD.bn` and `examples/novywave/BUILD.bn` now use `File/read_bytes() |> Bytes/to_text(encoding: Utf8)` at the asset ingestion boundary. `examples/cells/formula.bn` keeps `formula_text` as TEXT but scans formula grammar through an explicit `Text/to_bytes(encoding: Ascii)` boundary and BYTES search operations. Final BYTES-backed asset descriptors and full example behavior parity remain open. |
-| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, folded static-integer BYTES scalar argument proof for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and `Bytes/write_unsigned`, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields plus folded static integer overflow/range diagnostics and missing required BYTES source-payload rejection, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence, and the aggregate-required `verify-bytes-fixed-warm-tick` gate with focused root/indexed fixed-BYTES warm-tick byte-buffer evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 54/54 required reports checked, 45 proof reports, 9 diagnostic reports, and 37 no-fallback PlanExecutor reports, including root and indexed same-event BYTES dependency scenarios, folded static integer BYTES scalar argument reports, fixed-bank conversion MachinePlan proof reports, and fixed warm-tick storage evidence. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, the TodoMVC release benchmark reproduction proof, and the fixed warm-tick proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
-| Phase 10 - Default Switch | Not started | Pending. |
+| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, folded static-integer BYTES scalar argument proof for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and `Bytes/write_unsigned`, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields plus folded static integer overflow/range diagnostics and missing required BYTES source-payload rejection, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence, and the aggregate-required `verify-bytes-fixed-warm-tick` gate with focused root/indexed fixed-BYTES warm-tick byte-buffer evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 56/56 required reports checked, 46 proof reports, 10 diagnostic reports, and 38 no-fallback PlanExecutor reports, including root and indexed same-event BYTES dependency scenarios, folded static integer BYTES scalar argument reports, fixed-bank conversion MachinePlan proof reports, and fixed warm-tick storage evidence. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, the TodoMVC release benchmark reproduction proof, and the fixed warm-tick proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
+| Phase 10 - Default Switch | Blocked | Readiness was rechecked on 2026-06-25. `boon_cli run` still defaults to legacy, and this must not be switched yet because Phase 10 explicitly requires all parity, negative, no-fallback, performance/regression, report-schema, readiness/finality, and existing example gates to pass first. Current blockers include partial BYTES phases, missing Cells release benchmark evidence, and the demand-driven Cells path. |
 
 ## Current Baseline
 
@@ -21497,3 +21497,673 @@ Open findings:
 - It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
   release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
   or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/concat`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/concat` and preventing it from remaining
+executable as a generic row `BuiltinCall`.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesConcat { left, right }`.
+- Fixed the row builtin classifier so `Bytes/concat` routes through
+  `lower_row_builtin_call` instead of falling through to non-row lowering.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/concat` and emits the typed row node.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand `BytesConcat`.
+- Runtime row evaluation now concatenates private row BYTES and returns the
+  same private `row_inline` BYTES summary shape used by row `Text/to_bytes` and
+  `Bytes/slice`.
+- Report-schema expected replay and state walking mirror runtime behavior for
+  typed row `BytesConcat`.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_concat=1`, generic `Bytes/concat=0`, and verifier rejection after
+  tampering the typed node back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass. The test now proves typed row `Bytes/is_empty`, `Bytes/length`,
+  `Bytes/get`, `Bytes/ends_with`, `Bytes/equal`, and `Bytes/concat` all lower
+  without generic row builtins, and tampered generic row builtins fail verifier
+  capability-summary validation.
+- `cargo test -p boon_runtime typed_row_bytes_concat_evaluates_private_bytes_and_feeds_length -- --nocapture`:
+  pass. The test directly evaluates typed row `BytesConcat` over private row
+  BYTES and proves the output can feed typed row `BytesLength`.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+
+Open findings:
+
+- This supersedes the previous open finding that `Bytes/concat` still lacked a
+  typed row node.
+- It does not add row/function-body support for remaining BYTES operations such
+  as conversions beyond existing `Text/to_bytes`, numeric reads/writes, or
+  mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/to_text`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/to_text` and preventing it from remaining
+executable as a generic row `BuiltinCall`.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesToText { input, encoding }`.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/to_text` and emits the typed row node.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand `BytesToText`.
+- Runtime row evaluation decodes private row BYTES through the same
+  `runtime_bytes_to_text` helper used by root scalar `Bytes/to_text`.
+- Report-schema expected replay and state walking mirror runtime behavior for
+  typed row `BytesToText`.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_to_text=1`, generic `Bytes/to_text=0`, and verifier rejection after
+  tampering the typed node back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass.
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+
+Open findings:
+
+- This closes the row/function-body `Bytes/to_text` conversion gap and pairs
+  with existing typed row `Text/to_bytes`.
+- It does not add row/function-body support for remaining BYTES operations such
+  as numeric reads/writes or mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/to_hex` And `Bytes/to_base64`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/to_hex` and `Bytes/to_base64` and
+preventing them from remaining executable as generic row `BuiltinCall`s.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesToHex { input }` and
+  `PlanRowExpression::BytesToBase64 { input }`.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/to_hex` and `Bytes/to_base64` and emits typed row nodes.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand both text-producing BYTES conversion nodes.
+- Runtime row evaluation encodes private row BYTES through the same hex/base64
+  helpers used by the existing runtime BYTES paths.
+- Report-schema expected replay and state walking mirror runtime behavior for
+  typed row `BytesToHex` and `BytesToBase64`.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_to_hex=1`, `bytes_to_base64=1`, generic `Bytes/to_hex=0`, generic
+  `Bytes/to_base64=0`, and verifier rejection after tampering either typed
+  node back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass. The direct runtime test now also evaluates typed row `Bytes/to_hex`
+  and `Bytes/to_base64` over private row BYTES.
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+
+Open findings:
+
+- This closes the row/function-body `Bytes/to_hex` and `Bytes/to_base64`
+  conversion gaps.
+- It does not add row/function-body support for remaining BYTES operations such
+  as `Bytes/from_hex`, `Bytes/from_base64`, `Bytes/take`, `Bytes/drop`,
+  `Bytes/zeros`, numeric reads/writes, or mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/from_hex` And `Bytes/from_base64`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/from_hex` and `Bytes/from_base64` and
+preventing them from remaining executable as generic row `BuiltinCall`s.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesFromHex { input }` and
+  `PlanRowExpression::BytesFromBase64 { input }`.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/from_hex` and `Bytes/from_base64` and emits typed row nodes.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand both text-to-BYTES conversion nodes.
+- Runtime row evaluation decodes text to private row BYTES through the existing
+  runtime hex/base64 decode helpers.
+- Report-schema expected replay and state walking mirror runtime behavior with
+  row-specific diagnostic wording for invalid hex/base64 input.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_from_hex=1`, `bytes_from_base64=1`, generic `Bytes/from_hex=0`,
+  generic `Bytes/from_base64=0`, and verifier rejection after tampering either
+  typed node back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass. The direct runtime test now also evaluates typed row `Bytes/from_hex`
+  and `Bytes/from_base64` into private row BYTES.
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+
+Open findings:
+
+- This closes the row/function-body `Bytes/from_hex` and
+  `Bytes/from_base64` conversion gaps.
+- It does not add row/function-body support for remaining BYTES operations such
+  as `Bytes/take`, `Bytes/drop`, `Bytes/zeros`, numeric reads/writes, or
+  mutation operations.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/take`, `Bytes/drop`, And `Bytes/zeros`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/take`, `Bytes/drop`, and `Bytes/zeros`
+and preventing them from remaining executable as generic row `BuiltinCall`s.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesTake { input, byte_count }`,
+  `PlanRowExpression::BytesDrop { input, byte_count }`, and
+  `PlanRowExpression::BytesZeros { byte_count }`.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/take`, piped and named-input `Bytes/drop`, and standalone
+  `Bytes/zeros`, then emits typed row nodes.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand the three row BYTES range/allocation nodes.
+- Runtime row evaluation returns private row BYTES for take, drop, and zero-fill
+  construction.
+- Report-schema expected replay and state walking mirror runtime behavior,
+  including bounds checking and allocation failure diagnostics.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_take=1`, `bytes_drop=1`, `bytes_zeros=1`, generic `Bytes/take=0`,
+  generic `Bytes/drop=0`, generic `Bytes/zeros=0`, and verifier rejection
+  after tampering any of the typed nodes back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass. The direct runtime test now also evaluates typed row `Bytes/take`,
+  `Bytes/drop`, and `Bytes/zeros` into private row BYTES.
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+
+Open findings:
+
+- This closes the row/function-body `Bytes/take`, `Bytes/drop`, and
+  `Bytes/zeros` conversion gaps.
+- It does not add row/function-body support for numeric reads/writes or
+  mutation operations such as `Bytes/set`, `Bytes/write_unsigned`,
+  `Bytes/write_signed`, `Bytes/read_unsigned`, and `Bytes/read_signed`.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/read_unsigned` And `Bytes/read_signed`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/read_unsigned` and `Bytes/read_signed`
+and preventing them from remaining executable as generic row `BuiltinCall`s.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesReadUnsigned { input, offset,
+  byte_count, endian }` and `PlanRowExpression::BytesReadSigned { input,
+  offset, byte_count, endian }`.
+- Row/function-body lowering now recognizes piped and named-input
+  `Bytes/read_unsigned` and `Bytes/read_signed`.
+- Row lowering now treats `endian` like `encoding`: enum/symbol arguments such
+  as `Big` and `Little` become typed text constants, while offset and
+  byte-count arguments remain numeric.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand both numeric BYTES read nodes.
+- Runtime row evaluation reads numbers from private row BYTES through the
+  existing numeric read helpers and rejects unsupported endian, invalid byte
+  count, out-of-bounds ranges, and unsigned values that overflow Boon NUMBER.
+- Report-schema expected replay mirrors the runtime numeric read behavior for
+  row expressions.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_read_unsigned=1`, `bytes_read_signed=1`, generic
+  `Bytes/read_unsigned=0`, generic `Bytes/read_signed=0`, and verifier
+  rejection after tampering either typed node back into a generic row
+  `BuiltinCall`.
+
+Evidence:
+
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass. The direct runtime test now also evaluates typed row
+  `Bytes/read_unsigned` and `Bytes/read_signed` over private row BYTES.
+
+Open findings:
+
+- This closes the row/function-body `Bytes/read_unsigned` and
+  `Bytes/read_signed` conversion gaps.
+- It does not add row/function-body support for BYTES-producing mutation/write
+  operations such as `Bytes/set`, `Bytes/write_unsigned`, and
+  `Bytes/write_signed`.
+- It does not resolve non-ASCII dynamic Cells formula UX policy, the Cells
+  release benchmark wrapper, full Phase 9 performance evidence, `TASK-0804A`,
+  or Phase 10 default execution.
+
+## 2026-06-23 - Phase 4/5/6/9 Typed Row `Bytes/set`, `Bytes/write_unsigned`, And `Bytes/write_signed`
+
+Status: partial Phase 4 semantic-IR/MachinePlan expression-shape hardening,
+partial Phase 5 row-expression lowering, partial Phase 6 PlanExecutor/schema
+execution, and partial Phase 9 verifier evidence; complete for adding typed
+row/function-body support for `Bytes/set`, `Bytes/write_unsigned`, and
+`Bytes/write_signed` and preventing them from remaining executable as generic
+row `BuiltinCall`s.
+
+Files changed in this slice:
+
+- `crates/boon_plan/src/lib.rs`
+- `crates/boon_report_schema/src/lib.rs`
+- `crates/boon_runtime/src/lib.rs`
+- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Added typed `PlanRowExpression::BytesSet { input, index, value }`,
+  `PlanRowExpression::BytesWriteUnsigned { input, offset, byte_count, endian,
+  value }`, and `PlanRowExpression::BytesWriteSigned { input, offset,
+  byte_count, endian, value }`.
+- Row/function-body lowering now recognizes piped and named-input `Bytes/set`,
+  `Bytes/write_unsigned`, and `Bytes/write_signed`.
+- Row numeric argument lowering now accepts byte literals in numeric BYTES
+  argument positions, so `value: 16uFF` lowers without changing Boon syntax.
+- Plan row-expression value typing, reference walking, list-field ownership
+  walking, CPU-evaluable capability checks, and test-local adversarial walkers
+  now understand all three BYTES-producing row nodes.
+- Runtime row evaluation mutates private row BYTES through the existing BYTES
+  write helpers and rejects out-of-range byte values, unsupported endian,
+  invalid byte counts, numeric overflow, and out-of-bounds ranges.
+- Report-schema expected replay mirrors runtime row mutation/write behavior.
+- Extended the focused row/list BYTES fixture regression to prove
+  `bytes_set=1`, `bytes_write_unsigned=1`, `bytes_write_signed=1`, generic
+  `Bytes/set=0`, generic `Bytes/write_unsigned=0`, generic
+  `Bytes/write_signed=0`, and verifier rejection after tampering any typed
+  write node back into a generic row `BuiltinCall`.
+
+Evidence:
+
+- `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo check -p boon_plan -p boon_runtime -p boon_report_schema`: pass.
+- `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`:
+  pass. The direct runtime test now also evaluates typed row `Bytes/set`,
+  `Bytes/write_unsigned`, and `Bytes/write_signed` over private row BYTES.
+
+Open findings:
+
+- This closes the planned row/function-body BYTES mutation/write conversion
+  gaps for `Bytes/set`, `Bytes/write_unsigned`, and `Bytes/write_signed`.
+- It does not regenerate the full BYTES aggregate, resolve Cells benchmark
+  evidence, close `TASK-0804A`, or switch Phase 10 default execution to the
+  PlanExecutor.
+
+## 2026-06-23 - Phase 9 Aggregate Refresh After Typed Row BYTES Writes
+
+Status: Phase 9 aggregate evidence refreshed for current HEAD after typed row
+`Bytes/set`, `Bytes/write_unsigned`, and `Bytes/write_signed` landed. Overall
+goal readiness remains blocked by non-aggregate issues.
+
+What changed:
+
+- Replayed all 55 stale required BYTES/MachinePlan child reports from their
+  embedded `command_argv` values after the typed row BYTES write slice changed
+  the current commit/report freshness boundary.
+- Reran dependent meta-gates `verify-bytes-negative` and
+  `verify-bytes-machine-plan-adversarial` after their child artifact hashes
+  changed.
+- Reran the aggregate check and schema validation.
+
+Evidence:
+
+- `cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass after replay.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  `status=pass`, `checked_report_count=56`, `required_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`,
+  `no_fallback_plan_executor_count=38`, `blockers=null`.
+- `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail.
+- `cargo xtask verify-report-schema target/reports/bytes-plan/goal-readiness.json target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+
+Current readiness blockers:
+
+- `8 phases are still partial in the progress ledger`.
+- `1 phases are still not started in the progress ledger`.
+- Cells release benchmark wrapper report is still missing because `TASK-0804A`
+  remains blocked by speed budgets.
+- `target/reports/runtime-production-hardening.json` is stale for current HEAD.
+- `target/reports/runtime-finality.json` is stale for current HEAD.
+- `target/reports/debug/machine-readiness.json` is stale for current HEAD.
+- `target/reports/schema.json` is stale for current HEAD.
+- Phase 10 default switch has not happened; `boon_cli run` still defaults to
+  legacy.
+
+## 2026-06-23 - Phase 9 Aggregate Refresh After NovyWave Artifact Isolation
+
+Status: Phase 9 aggregate evidence is fresh and passing again after the
+NovyWave verifier artifact-isolation fix changed the worktree fingerprint and
+the `xtask` binary hash. Overall goal readiness remains blocked by the larger
+roadmap items listed below.
+
+What changed:
+
+- Reran the BYTES aggregate and found ten child reports stale for the rebuilt
+  `target/debug/xtask` binary hash.
+- Refreshed the stale required children:
+  `bytes-source-payload-large-route-run-plan`, `bytes-negative`,
+  `bytes-machine-plan-adversarial`, `todomvc-release-benchmark-reproduction`,
+  `bytes-file-read-plan`, `bytes-file-write-plan`, `bytes-storage-profile`,
+  `bytes-fixed-warm-tick`, `bytes-byte-bank-layout`, and
+  `build-bytes-boundary`.
+- Reran `verify-bytes-machine-plan-adversarial` after refreshed child artifact
+  hashes changed.
+- Observed that long-running BYTES report refresh commands can keep a verifier
+  process alive after writing a passing report; this run explicitly checked and
+  left no matching `verify-bytes`, `boon_cli`, `xtask`, or `cargo xtask`
+  process running.
+
+Evidence:
+
+- `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/bytes-storage-profile.json target/reports/bytes-plan/bytes-file-read-plan.json target/reports/bytes-plan/bytes-file-write-plan.json`:
+  pass.
+- `cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  `status=pass`, `checked_report_count=56`, `required_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`,
+  `no_fallback_plan_executor_count=38`, `blockers=null`.
+- `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail.
+
+Current readiness blockers:
+
+- `8 phases are still partial in the progress ledger`.
+- `1 phases are still not started in the progress ledger`.
+- Cells release benchmark wrapper report is still missing because `TASK-0804A`
+  remains blocked by speed budgets.
+- `target/reports/schema.json` is stale for current HEAD.
+- Phase 10 default switch has not happened; `boon_cli run` still defaults to
+  legacy.
+
+## 2026-06-23 - Readiness Refresh And NovyWave Speed Report Artifact Fix
+
+Status: readiness evidence was refreshed after the BYTES row write slice, and
+one verifier reliability issue was fixed. Overall goal readiness is still
+blocked.
+
+What changed:
+
+- Refreshed `runtime-production-hardening`, `runtime-finality`, and
+  `machine-readiness` reports after the earlier aggregate run showed them
+  stale.
+- Found and fixed a NovyWave speed verifier artifact collision:
+  `novywave-interaction-speed.json` and
+  `novywave-interaction-speed-debug.json` previously both referenced
+  `target/artifacts/native-gpu/novywave-interaction-speed-role.json`, so
+  refreshing one report made the other stale.
+- `verify-native-gpu-novywave-interaction-speed` now derives the child role
+  artifact name from the parent report file stem. The normal report keeps
+  `target/artifacts/native-gpu/novywave-interaction-speed-role.json`; the
+  debug report uses
+  `target/artifacts/native-gpu/novywave-interaction-speed-debug-role.json`.
+- Refreshed both NovyWave interaction-speed reports. Both remain expected
+  failures because the strict release p95 budgets are still exceeded, but they
+  are now independently schema-checkable.
+
+Evidence:
+
+- `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`:
+  expected fail; current p95 blockers include `input-to-visible` and
+  `click-to-cursor` over the `16.7ms` budget.
+- `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed-debug.json`:
+  expected fail; uses an independent debug child artifact.
+- `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json target/reports/native-gpu/novywave-interaction-speed-debug.json`:
+  pass.
+- Broad `cargo xtask verify-report-schema` is intentionally not claimed after
+  the `xtask` verifier change because older reports now have stale
+  `binary_hash` values for the rebuilt `target/debug/xtask`.
+- `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail with current blockers listed below.
+
+Current readiness blockers:
+
+- `8 phases are still partial in the progress ledger`.
+- `1 phases are still not started in the progress ledger`.
+- BYTES/MachinePlan aggregate is stale again for the current worktree
+  fingerprint after the verifier fix.
+- Cells release benchmark wrapper report is still missing because `TASK-0804A`
+  remains blocked by speed budgets.
+- `target/reports/schema.json` is stale for current HEAD.
+- Phase 10 default switch has not happened; `boon_cli run` still defaults to
+  legacy.
+
+## 2026-06-23 - Recursive Schema And Aggregate Freshness Restored
+
+Status: report freshness is no longer the active blocker. The recursive schema
+scan, BYTES/MachinePlan aggregate, and readiness audit were rerun for current
+HEAD `b624d01` after the NovyWave speed verifier artifact isolation fix.
+Readiness remains blocked only by unfinished roadmap work.
+
+What changed:
+
+- Refreshed stale top-level reports discovered by the recursive schema scan,
+  including bytecode, machine-readiness, native GPU architecture/preview/TodoMVC
+  parity/content reports, NovyWave bridge scenario, playground genericity, and
+  runtime finality/production hardening.
+- Reran `cargo xtask verify-report-schema` until it passed and wrote a fresh
+  `target/reports/schema.json` for current HEAD `b624d01` and xtask binary hash
+  `8eb5f2e6186464a5b1c9c59eb8939abbfdf0d285ca166ee2e67b8514de151cae`.
+- Reran the BYTES/MachinePlan aggregate after schema refresh changed the
+  worktree fingerprint.
+- Checked for leftover `verify-bytes`, `boon_cli`, `boon_native_playground`,
+  `xtask`, or `cargo xtask` processes after the refresh loop; none were
+  running.
+
+Evidence:
+
+- `cargo xtask verify-report-schema`:
+  pass; `target/reports/schema.json` has `status=pass`,
+  `git_commit=b624d01`, and binary hash
+  `8eb5f2e6186464a5b1c9c59eb8939abbfdf0d285ca166ee2e67b8514de151cae`.
+- `cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  `status=pass`, `checked_report_count=56`, `required_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`,
+  `no_fallback_plan_executor_count=38`, `blockers=null`.
+- `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail.
+
+Current readiness blockers:
+
+- `8 phases are still partial in the progress ledger`.
+- `1 phases are still not started in the progress ledger`.
+- Cells release benchmark wrapper report is still missing because `TASK-0804A`
+  remains blocked by speed budgets.
+- Phase 10 default switch has not happened; `boon_cli run` still defaults to
+  legacy.
+
+Decision:
+
+- Treat stale report-schema and stale BYTES aggregate blockers as resolved for
+  this checkpoint.
+- Do not return to stale-report cleanup unless a later code/report change makes
+  a specific report stale again.
+- Continue with real implementation work: Phase 10 default-switch preparation
+  or the remaining partial BYTES/MachinePlan phases, while keeping
+  `TASK-0804A` as an unresolved speed-budget blocker.
+
+## 2026-06-25 - Phase 10 Default Switch Blocked, Not Not-Started
+
+Status: Phase 10 is now explicitly blocked. The default executor was not
+changed.
+
+What changed:
+
+- Rechecked the default switch contract against
+  `docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md`.
+- Confirmed the implementation plan requires switching default execution to
+  PlanExecutor only after all required parity, negative, no-fallback,
+  performance/regression, report-schema, readiness/finality, and existing
+  example gates pass.
+- Updated the Phase Status table from `Not started` to `Blocked` for Phase 10
+  because the work has a current blocker and a documented decision, not because
+  the switch is ready.
+
+Evidence:
+
+- `crates/boon_cli/src/main.rs` still initializes `boon_cli run` with
+  `engine = "legacy"`.
+- `cargo build -q -p xtask`
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail before this ledger update, with blockers:
+  - `8 phases are still partial in the progress ledger`
+  - `1 phases are still not started in the progress ledger`
+  - `Cells release benchmark wrapper report is missing because TASK-0804A remains blocked by speed budgets`
+  - `Phase 10 default switch has not happened; boon_cli run still defaults to legacy`
+
+Decision:
+
+- Do not switch `boon_cli run` default to PlanExecutor while Cells benchmark
+  evidence and broader partial-phase work are still open.
+- Keep the readiness audit's default-switch failure intact. This ledger update
+  only removes the inaccurate “not started” classification.
+
+## 2026-06-25 - BYTES Aggregate Refresh Loop Postponed Again
+
+Status: unfinished and intentionally postponed. The stale BYTES aggregate /
+default-switch readiness loop is no longer the active work item.
+
+What happened:
+
+- A replay loop was started to refresh schema-invalid BYTES/MachinePlan child
+  reports after rebuilding `boon_cli` and `xtask`.
+- The loop reached another Cells command:
+  `target/debug/boon_cli run examples/cells.bn --scenario examples/cells.scn --report target/reports/bytes-plan/cells-ascii-formula-run.json`.
+- Per current direction, the loop was stopped instead of spending more time on
+  the Cells/aggregate/default-switch path.
+
+Decision:
+
+- Keep `TASK-0804A`, the missing Cells release benchmark wrapper, stale
+  aggregate evidence caused by later edits, and the Phase 10 default switch as
+  unfinished blockers.
+- Do not claim Phase 10, final BYTES/MachinePlan readiness, or the global
+  default executor switch complete.
+- Continue with other non-Cells architectural work. Return to this path only
+  after later runtime/document/layout/render work may have removed the cost, or
+  as one of the final remaining goal blockers.
+
+Evidence:
+
+- The stale child replay was interrupted before a passing aggregate was
+  produced for the current dirty worktree.
+- Matching replay/Cells `boon_cli` processes were terminated after the stop
+  decision so the machine is not left running background benchmark work.

@@ -2,7 +2,9 @@ use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -194,7 +196,45 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn sha256_file(path: &Path) -> RuntimeResult<String> {
-    Ok(sha256_bytes(&fs::read(path)?))
+    if fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        >= 8 * 1024 * 1024
+    {
+        if let Some(hash) = sha256_file_with_system_tool(path) {
+            return Ok(hash);
+        }
+    }
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_file_with_system_tool(path: &Path) -> Option<String> {
+    let tool = ["/usr/bin/sha256sum", "/bin/sha256sum"]
+        .into_iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())?;
+    let output = Command::new(tool).arg("--").arg(path).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let hash = stdout.split_whitespace().next()?.to_ascii_lowercase();
+    if is_sha256_hex(&hash) {
+        Some(hash)
+    } else {
+        None
+    }
 }
 
 fn cached_report_binary_hash(path: &Path) -> RuntimeResult<String> {
@@ -2022,6 +2062,9 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-multiwindow"
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
+                | "verify-browser-webgpu-world-scene"
+                | "verify-native-web-render-comparison"
+                | "verify-native-web-render-parity"
                 | "verify-native-gpu-idle-wake"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
@@ -16666,6 +16709,18 @@ fn expected_plan_row_expression_contains_state(
                     expected_plan_row_expression_contains_state(encoding, state_id)
                 })
         }
+        boon_plan::PlanRowExpression::BytesToText { input, encoding } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || encoding.as_deref().is_some_and(|encoding| {
+                    expected_plan_row_expression_contains_state(encoding, state_id)
+                })
+        }
+        boon_plan::PlanRowExpression::BytesToHex { input }
+        | boon_plan::PlanRowExpression::BytesToBase64 { input }
+        | boon_plan::PlanRowExpression::BytesFromHex { input }
+        | boon_plan::PlanRowExpression::BytesFromBase64 { input } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+        }
         boon_plan::PlanRowExpression::BytesIsEmpty { input } => {
             expected_plan_row_expression_contains_state(input, state_id)
         }
@@ -16685,6 +16740,60 @@ fn expected_plan_row_expression_contains_state(
                 || expected_plan_row_expression_contains_state(offset, state_id)
                 || expected_plan_row_expression_contains_state(byte_count, state_id)
         }
+        boon_plan::PlanRowExpression::BytesTake { input, byte_count }
+        | boon_plan::PlanRowExpression::BytesDrop { input, byte_count } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(byte_count, state_id)
+        }
+        boon_plan::PlanRowExpression::BytesZeros { byte_count } => {
+            expected_plan_row_expression_contains_state(byte_count, state_id)
+        }
+        boon_plan::PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | boon_plan::PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(offset, state_id)
+                || expected_plan_row_expression_contains_state(byte_count, state_id)
+                || expected_plan_row_expression_contains_state(endian, state_id)
+        }
+        boon_plan::PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(index, state_id)
+                || expected_plan_row_expression_contains_state(value, state_id)
+        }
+        boon_plan::PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | boon_plan::PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            expected_plan_row_expression_contains_state(input, state_id)
+                || expected_plan_row_expression_contains_state(offset, state_id)
+                || expected_plan_row_expression_contains_state(byte_count, state_id)
+                || expected_plan_row_expression_contains_state(endian, state_id)
+                || expected_plan_row_expression_contains_state(value, state_id)
+        }
         boon_plan::PlanRowExpression::BytesFind { input, needle } => {
             expected_plan_row_expression_contains_state(input, state_id)
                 || expected_plan_row_expression_contains_state(needle, state_id)
@@ -16696,6 +16805,10 @@ fn expected_plan_row_expression_contains_state(
         boon_plan::PlanRowExpression::BytesEndsWith { input, suffix } => {
             expected_plan_row_expression_contains_state(input, state_id)
                 || expected_plan_row_expression_contains_state(suffix, state_id)
+        }
+        boon_plan::PlanRowExpression::BytesConcat { left, right } => {
+            expected_plan_row_expression_contains_state(left, state_id)
+                || expected_plan_row_expression_contains_state(right, state_id)
         }
         boon_plan::PlanRowExpression::BytesEqual { left, right } => {
             expected_plan_row_expression_contains_state(left, state_id)
@@ -19033,6 +19146,81 @@ fn expected_eval_plan_row_expression_with_stack(
             let bytes = expected_row_text_to_bytes(&text, &encoding, report_path)?;
             Ok(expected_row_private_bytes_json(&bytes))
         }
+        boon_plan::PlanRowExpression::BytesToText { input, encoding } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let encoding = match encoding.as_deref() {
+                Some(encoding) => expected_eval_plan_row_text_with_stack(
+                    plan,
+                    list_state,
+                    row,
+                    encoding,
+                    report_path,
+                    stack,
+                )?,
+                None => {
+                    return Err(format!(
+                        "{} row Bytes/to_text requires explicit encoding",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            };
+            let text = expected_row_bytes_to_text(&bytes, &encoding, report_path)?;
+            Ok(JsonValue::String(text))
+        }
+        boon_plan::PlanRowExpression::BytesToHex { input } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            Ok(JsonValue::String(expected_bytes_encode_hex(&bytes)))
+        }
+        boon_plan::PlanRowExpression::BytesToBase64 { input } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            Ok(JsonValue::String(expected_bytes_encode_base64(&bytes)))
+        }
+        boon_plan::PlanRowExpression::BytesFromHex { input } => {
+            let text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let bytes = expected_row_bytes_decode_hex(&text, report_path)?;
+            Ok(expected_row_private_bytes_json(&bytes))
+        }
+        boon_plan::PlanRowExpression::BytesFromBase64 { input } => {
+            let text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let bytes = expected_row_bytes_decode_base64(&text, report_path)?;
+            Ok(expected_row_private_bytes_json(&bytes))
+        }
         boon_plan::PlanRowExpression::BytesIsEmpty { input } => {
             let bytes = expected_eval_plan_row_bytes_with_stack(
                 plan,
@@ -19130,6 +19318,330 @@ fn expected_eval_plan_row_expression_with_stack(
                 .to_vec();
             Ok(expected_row_private_bytes_json(&slice))
         }
+        boon_plan::PlanRowExpression::BytesTake { input, byte_count } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let slice = bytes
+                .get(0..byte_count)
+                .ok_or_else(|| format!("{} row Bytes/take out of bounds", report_path.display()))?
+                .to_vec();
+            Ok(expected_row_private_bytes_json(&slice))
+        }
+        boon_plan::PlanRowExpression::BytesDrop { input, byte_count } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            if byte_count > bytes.len() {
+                return Err(
+                    format!("{} row Bytes/drop out of bounds", report_path.display()).into(),
+                );
+            }
+            Ok(expected_row_private_bytes_json(&bytes[byte_count..]))
+        }
+        boon_plan::PlanRowExpression::BytesZeros { byte_count } => {
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let mut output = Vec::new();
+            output.try_reserve_exact(byte_count).map_err(|_| {
+                format!(
+                    "{} row Bytes/zeros could not allocate {byte_count} bytes",
+                    report_path.display()
+                )
+            })?;
+            output.resize(byte_count, 0);
+            Ok(expected_row_private_bytes_json(&output))
+        }
+        boon_plan::PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let offset = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                offset,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let endian_text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                endian,
+                report_path,
+                stack,
+            )?;
+            let endian = expected_row_bytes_endian(&endian_text, report_path)?;
+            let value =
+                expected_row_bytes_read_unsigned(&bytes, offset, byte_count, endian, report_path)?;
+            Ok(json!(value))
+        }
+        boon_plan::PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let offset = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                offset,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let endian_text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                endian,
+                report_path,
+                stack,
+            )?;
+            let endian = expected_row_bytes_endian(&endian_text, report_path)?;
+            let value =
+                expected_row_bytes_read_signed(&bytes, offset, byte_count, endian, report_path)?;
+            Ok(json!(value))
+        }
+        boon_plan::PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            let mut bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let index = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                index,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let value = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                value,
+                report_path,
+                stack,
+            )?;
+            let value = u8::try_from(value).map_err(|_| {
+                format!(
+                    "{} row Bytes/set value {value} is outside BYTE range",
+                    report_path.display()
+                )
+            })?;
+            let slot = bytes.get_mut(index).ok_or_else(|| {
+                format!(
+                    "{} row Bytes/set index {index} is out of bounds",
+                    report_path.display()
+                )
+            })?;
+            *slot = value;
+            Ok(expected_row_private_bytes_json(&bytes))
+        }
+        boon_plan::PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let offset = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                offset,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let endian_text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                endian,
+                report_path,
+                stack,
+            )?;
+            let endian = expected_row_bytes_endian(&endian_text, report_path)?;
+            let value = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                value,
+                report_path,
+                stack,
+            )?;
+            let output = expected_row_bytes_write_unsigned(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                value,
+                report_path,
+            )?;
+            Ok(expected_row_private_bytes_json(&output))
+        }
+        boon_plan::PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            let bytes = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                input,
+                report_path,
+                stack,
+            )?;
+            let offset = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                offset,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let byte_count = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                byte_count,
+                report_path,
+                stack,
+            )?
+            .max(0) as usize;
+            let endian_text = expected_eval_plan_row_text_with_stack(
+                plan,
+                list_state,
+                row,
+                endian,
+                report_path,
+                stack,
+            )?;
+            let endian = expected_row_bytes_endian(&endian_text, report_path)?;
+            let value = expected_eval_plan_row_number_with_stack(
+                plan,
+                list_state,
+                row,
+                value,
+                report_path,
+                stack,
+            )?;
+            let output = expected_row_bytes_write_signed(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                value,
+                report_path,
+            )?;
+            Ok(expected_row_private_bytes_json(&output))
+        }
         boon_plan::PlanRowExpression::BytesFind { input, needle } => {
             let haystack = expected_eval_plan_row_bytes_with_stack(
                 plan,
@@ -19188,6 +19700,26 @@ fn expected_eval_plan_row_expression_with_stack(
                 stack,
             )?;
             Ok(JsonValue::Bool(bytes.ends_with(&suffix)))
+        }
+        boon_plan::PlanRowExpression::BytesConcat { left, right } => {
+            let mut left = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                left,
+                report_path,
+                stack,
+            )?;
+            let right = expected_eval_plan_row_bytes_with_stack(
+                plan,
+                list_state,
+                row,
+                right,
+                report_path,
+                stack,
+            )?;
+            left.extend_from_slice(&right);
+            Ok(expected_row_private_bytes_json(&left))
         }
         boon_plan::PlanRowExpression::BytesEqual { left, right } => {
             let left = expected_eval_plan_row_bytes_with_stack(
@@ -19842,6 +20374,358 @@ fn expected_row_text_to_bytes(
         )
         .into()),
     }
+}
+
+fn expected_row_bytes_to_text(
+    bytes: &[u8],
+    encoding: &str,
+    report_path: &Path,
+) -> RuntimeResult<String> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "utf8" => String::from_utf8(bytes.to_vec()).map_err(|error| {
+            format!(
+                "{} row Bytes/to_text input is not valid UTF-8: {error}",
+                report_path.display()
+            )
+            .into()
+        }),
+        "ascii" if bytes.is_ascii() => String::from_utf8(bytes.to_vec()).map_err(|error| {
+            format!(
+                "{} row Bytes/to_text input is not valid ASCII text: {error}",
+                report_path.display()
+            )
+            .into()
+        }),
+        "ascii" => Err(format!(
+            "{} row Bytes/to_text input is not ASCII for Ascii encoding",
+            report_path.display()
+        )
+        .into()),
+        _ => Err(format!(
+            "{} row Bytes/to_text unsupported encoding `{encoding}`",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_row_bytes_decode_hex(text: &str, report_path: &Path) -> RuntimeResult<Vec<u8>> {
+    let digits = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if digits.len() % 2 != 0 {
+        return Err(format!(
+            "{} row Bytes/from_hex input has odd hex digit count",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut output = Vec::with_capacity(digits.len() / 2);
+    for chunk in digits.chunks_exact(2) {
+        let high = expected_bytes_hex_value(chunk[0]).ok_or_else(|| {
+            format!(
+                "{} row Bytes/from_hex input has invalid hex digit",
+                report_path.display()
+            )
+        })?;
+        let low = expected_bytes_hex_value(chunk[1]).ok_or_else(|| {
+            format!(
+                "{} row Bytes/from_hex input has invalid hex digit",
+                report_path.display()
+            )
+        })?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn expected_row_bytes_decode_base64(text: &str, report_path: &Path) -> RuntimeResult<Vec<u8>> {
+    let input = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.len() % 4 != 0 {
+        return Err(expected_row_base64_error(report_path));
+    }
+    let mut output = Vec::with_capacity((input.len() / 4).saturating_mul(3));
+    for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+        let final_chunk = chunk_index == input.len() / 4 - 1;
+        if chunk[0] == b'=' || chunk[1] == b'=' {
+            return Err(expected_row_base64_error(report_path));
+        }
+        let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
+        if padding > 2 || (!final_chunk && padding > 0) {
+            return Err(expected_row_base64_error(report_path));
+        }
+        if padding == 1 && chunk[2] == b'=' {
+            return Err(expected_row_base64_error(report_path));
+        }
+        let a = expected_row_bytes_base64_value(chunk[0], report_path)?;
+        let b = expected_row_bytes_base64_value(chunk[1], report_path)?;
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            expected_row_bytes_base64_value(chunk[2], report_path)?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            expected_row_bytes_base64_value(chunk[3], report_path)?
+        };
+        let packed = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
+        output.push(((packed >> 16) & 0xff) as u8);
+        if padding < 2 {
+            output.push(((packed >> 8) & 0xff) as u8);
+        }
+        if padding < 1 {
+            output.push((packed & 0xff) as u8);
+        }
+    }
+    Ok(output)
+}
+
+fn expected_row_bytes_base64_value(byte: u8, report_path: &Path) -> RuntimeResult<u8> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(expected_row_base64_error(report_path)),
+    }
+}
+
+fn expected_row_base64_error(report_path: &Path) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "{} row Bytes/from_base64 input is invalid base64",
+        report_path.display()
+    )
+    .into()
+}
+
+fn expected_row_bytes_endian(text: &str, report_path: &Path) -> RuntimeResult<ExpectedBytesEndian> {
+    match text {
+        "Little" => Ok(ExpectedBytesEndian::Little),
+        "Big" => Ok(ExpectedBytesEndian::Big),
+        _ => Err(format!(
+            "{} row BYTES endian `{text}` is unsupported",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn expected_row_checked_numeric_range<'a>(
+    data: &'a [u8],
+    offset: usize,
+    byte_count: usize,
+    operation: &str,
+    report_path: &Path,
+) -> RuntimeResult<&'a [u8]> {
+    if !matches!(byte_count, 1 | 2 | 4 | 8) {
+        return Err(format!(
+            "{} row {operation} byte_count {byte_count} is not supported",
+            report_path.display()
+        )
+        .into());
+    }
+    let end = offset.checked_add(byte_count).ok_or_else(|| {
+        format!(
+            "{} row {operation} byte range overflows",
+            report_path.display()
+        )
+    })?;
+    data.get(offset..end).ok_or_else(|| {
+        format!(
+            "{} row {operation} byte range {offset}..{end} is out of bounds for length {}",
+            report_path.display(),
+            data.len()
+        )
+        .into()
+    })
+}
+
+fn expected_row_bytes_read_unsigned(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    report_path: &Path,
+) -> RuntimeResult<i64> {
+    let slice = expected_row_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/read_unsigned",
+        report_path,
+    )?;
+    let mut bytes = [0u8; 8];
+    let value = match endian {
+        ExpectedBytesEndian::Little => {
+            bytes[..byte_count].copy_from_slice(slice);
+            u64::from_le_bytes(bytes)
+        }
+        ExpectedBytesEndian::Big => {
+            bytes[8 - byte_count..].copy_from_slice(slice);
+            u64::from_be_bytes(bytes)
+        }
+    };
+    if value > i64::MAX as u64 {
+        return Err(format!(
+            "{} row Bytes/read_unsigned overflows Boon NUMBER",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(value as i64)
+}
+
+fn expected_row_bytes_read_signed(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    report_path: &Path,
+) -> RuntimeResult<i64> {
+    let slice = expected_row_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/read_signed",
+        report_path,
+    )?;
+    Ok(match (byte_count, endian) {
+        (1, _) => i8::from_ne_bytes([slice[0]]) as i64,
+        (2, ExpectedBytesEndian::Little) => i16::from_le_bytes([slice[0], slice[1]]) as i64,
+        (2, ExpectedBytesEndian::Big) => i16::from_be_bytes([slice[0], slice[1]]) as i64,
+        (4, ExpectedBytesEndian::Little) => {
+            i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
+        }
+        (4, ExpectedBytesEndian::Big) => {
+            i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
+        }
+        (8, ExpectedBytesEndian::Little) => i64::from_le_bytes([
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ]),
+        (8, ExpectedBytesEndian::Big) => i64::from_be_bytes([
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ]),
+        _ => unreachable!("validated numeric byte count"),
+    })
+}
+
+fn expected_row_bytes_write_unsigned(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    if value < 0 {
+        return Err(format!(
+            "{} row Bytes/write_unsigned numeric overflow",
+            report_path.display()
+        )
+        .into());
+    }
+    let _ = expected_row_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/write_unsigned",
+        report_path,
+    )?;
+    let max = if byte_count == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (byte_count * 8)) - 1
+    };
+    let value = value as u64;
+    if value > max {
+        return Err(format!(
+            "{} row Bytes/write_unsigned numeric overflow",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut output = data.to_vec();
+    let bytes = match endian {
+        ExpectedBytesEndian::Little => value.to_le_bytes()[..byte_count].to_vec(),
+        ExpectedBytesEndian::Big => value.to_be_bytes()[8 - byte_count..].to_vec(),
+    };
+    output[offset..offset + byte_count].copy_from_slice(&bytes);
+    Ok(output)
+}
+
+fn expected_row_bytes_write_signed(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    match byte_count {
+        1 if !(i8::MIN as i64..=i8::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} row Bytes/write_signed numeric overflow",
+                report_path.display()
+            )
+            .into());
+        }
+        2 if !(i16::MIN as i64..=i16::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} row Bytes/write_signed numeric overflow",
+                report_path.display()
+            )
+            .into());
+        }
+        4 if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
+            return Err(format!(
+                "{} row Bytes/write_signed numeric overflow",
+                report_path.display()
+            )
+            .into());
+        }
+        1 | 2 | 4 | 8 => {}
+        _ => {
+            return Err(format!(
+                "{} row Bytes/write_signed byte_count {byte_count} is not supported",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let _ = expected_row_checked_numeric_range(
+        data,
+        offset,
+        byte_count,
+        "Bytes/write_signed",
+        report_path,
+    )?;
+    let mut bytes = [0u8; 8];
+    match (byte_count, endian) {
+        (1, _) => bytes[0] = value as i8 as u8,
+        (2, ExpectedBytesEndian::Little) => {
+            bytes[..2].copy_from_slice(&(value as i16).to_le_bytes())
+        }
+        (2, ExpectedBytesEndian::Big) => bytes[..2].copy_from_slice(&(value as i16).to_be_bytes()),
+        (4, ExpectedBytesEndian::Little) => {
+            bytes[..4].copy_from_slice(&(value as i32).to_le_bytes())
+        }
+        (4, ExpectedBytesEndian::Big) => bytes[..4].copy_from_slice(&(value as i32).to_be_bytes()),
+        (8, ExpectedBytesEndian::Little) => bytes.copy_from_slice(&value.to_le_bytes()),
+        (8, ExpectedBytesEndian::Big) => bytes.copy_from_slice(&value.to_be_bytes()),
+        _ => unreachable!("validated byte count"),
+    }
+    let mut output = data.to_vec();
+    output[offset..offset + byte_count].copy_from_slice(&bytes[..byte_count]);
+    Ok(output)
 }
 
 fn expected_row_private_bytes_json(bytes: &[u8]) -> JsonValue {

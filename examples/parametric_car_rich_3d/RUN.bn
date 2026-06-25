@@ -1,0 +1,84 @@
+-- Parametric Car Rich 3D - first richer generic manufacturing car assembly.
+--
+-- This keeps the older parametric_car_3d supported-subset example stable and
+-- exercises the richer Solid constructors through the generic Boon-facing
+-- manufacturing path: lofted body, revolved wheel prototype, and shell-based
+-- visual cabin/windows.
+
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { parametric_car_rich }
+
+    parts: LIST {
+        Part/new(
+            id: TEXT { lofted_body }
+            geometry: Solid/loft(
+                bottom_size: [x: 118, y: 38, z: 0]
+                top_size: [x: 92, y: 30, z: 0]
+                height: 18
+            )
+            appearance: TEXT { red_paint }
+            physical_material: TEXT { PETG }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { revolved_wheel_prototype }
+            geometry: Solid/revolve(inner_radius: 3, outer_radius: 7, height: 8)
+            appearance: TEXT { tire_rubber }
+            physical_material: TEXT { TPU }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { shell_windows }
+            geometry: Solid/shell(
+                child: Solid/rounded_box(size: [x: 54, y: 28, z: 10], radius: 2)
+                thickness: 1
+            )
+            appearance: TEXT { blue_glass }
+            manufacturing_role: VisualOnly
+        )
+    }
+
+    instances: LIST {
+        Part/instance(
+            id: TEXT { body_instance }
+            part: TEXT { lofted_body }
+            label: TEXT { Lofted car body }
+        )
+        Part/instance(
+            id: TEXT { windows_instance }
+            part: TEXT { shell_windows }
+            transform: Solid/translate(by: [x: 0, y: 0, z: 12])
+            label: TEXT { Shell visual-only windows }
+        )
+        Part/instance(
+            id: TEXT { front_left_wheel }
+            part: TEXT { revolved_wheel_prototype }
+            transform: Solid/translate(by: [x: -36, y: -30, z: -6])
+            label: TEXT { Front-left revolved wheel }
+        )
+        Part/instance(
+            id: TEXT { front_right_wheel }
+            part: TEXT { revolved_wheel_prototype }
+            transform: Solid/translate(by: [x: -36, y: 30, z: -6])
+            label: TEXT { Front-right revolved wheel }
+        )
+        Part/instance(
+            id: TEXT { rear_left_wheel }
+            part: TEXT { revolved_wheel_prototype }
+            transform: Solid/translate(by: [x: 36, y: -30, z: -6])
+            label: TEXT { Rear-left revolved wheel }
+        )
+        Part/instance(
+            id: TEXT { rear_right_wheel }
+            part: TEXT { revolved_wheel_prototype }
+            transform: Solid/translate(by: [x: 36, y: 30, z: -6])
+            label: TEXT { Rear-right revolved wheel }
+        )
+    }
+)

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use app_window::coordinates::{Position, Size};
 use app_window::input::keyboard::{Keyboard, key::KeyboardKey};
 use app_window::input::mouse::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT, Mouse};
@@ -6,6 +8,7 @@ use app_window::{WGPU_SURFACE_STRATEGY, WGPUStrategy};
 use boon_host::{PhysicalSize, SurfaceId, Viewport, WindowId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +73,425 @@ pub fn app_window_contract() -> AppWindowContract {
             "{:?}",
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
         ),
+    }
+}
+
+#[derive(Debug)]
+pub struct NativeAccessibilitySnapshot {
+    pub tree_update: accesskit::TreeUpdate,
+    pub metrics: NativeAccessibilityMetrics,
+    pub semantic_node_ids: Vec<NativeAccessibilityNodeMapping>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeAccessibilityNodeMapping {
+    pub semantic_id: String,
+    pub accesskit_node_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeAccessibilityActionRequest {
+    pub target_node_id: u64,
+    pub action: NativeAccessibilityAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeWorldEditorSessionActionReport {
+    pub dispatch: boon_document::SemanticSourceDispatch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_report: Option<boon_scene_model::WorldEditorSessionActionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAccessibilityAction {
+    Focus,
+    Blur,
+    Click,
+    SetValue,
+    ReplaceSelectedText,
+    Increment,
+    Decrement,
+    ScrollIntoView,
+    Other(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeAccessibilityMetrics {
+    pub semantic_node_count: usize,
+    pub accesskit_node_count: usize,
+    pub interactive_node_count: usize,
+    pub focusable_node_count: usize,
+    pub text_input_node_count: usize,
+    pub checked_node_count: usize,
+    pub node_id_collision_count: usize,
+    pub root_present: bool,
+    pub focus_present: bool,
+}
+
+pub fn accesskit_tree_update_from_semantic_scene(
+    scene: &boon_document::SemanticScene,
+    toolkit_name: impl Into<String>,
+    toolkit_version: impl Into<String>,
+) -> NativeAccessibilitySnapshot {
+    let id_map = accesskit_node_id_map(scene);
+    let root = scene
+        .root
+        .as_ref()
+        .and_then(|id| id_map.get(id))
+        .copied()
+        .or_else(|| {
+            scene
+                .nodes
+                .keys()
+                .next()
+                .and_then(|id| id_map.get(id).copied())
+        })
+        .unwrap_or(accesskit::NodeId(1));
+    let focus = scene
+        .focused
+        .as_ref()
+        .and_then(|id| id_map.get(id))
+        .copied()
+        .unwrap_or(root);
+    let mut nodes = Vec::with_capacity(scene.nodes.len());
+    for semantic in scene.nodes.values() {
+        let node_id = id_map
+            .get(&semantic.id)
+            .copied()
+            .unwrap_or_else(|| accesskit_node_id_for_semantic_id(&semantic.id));
+        let mut node = accesskit_node_from_semantic_node(semantic, &id_map);
+        let child_ids = semantic
+            .relations
+            .children
+            .iter()
+            .filter_map(|child| id_map.get(child).copied())
+            .collect::<Vec<_>>();
+        if !child_ids.is_empty() {
+            node.set_children(child_ids);
+        }
+        nodes.push((node_id, node));
+    }
+    let tree_update = accesskit::TreeUpdate {
+        nodes,
+        tree: Some(accesskit::Tree {
+            root,
+            toolkit_name: Some(toolkit_name.into()),
+            toolkit_version: Some(toolkit_version.into()),
+        }),
+        tree_id: accesskit::TreeId::ROOT,
+        focus,
+    };
+    let semantic_node_ids = scene
+        .nodes
+        .keys()
+        .filter_map(|id| {
+            id_map
+                .get(id)
+                .map(|node_id| NativeAccessibilityNodeMapping {
+                    semantic_id: id.0.clone(),
+                    accesskit_node_id: node_id.0,
+                })
+        })
+        .collect::<Vec<_>>();
+    let unique_ids = id_map.values().copied().collect::<BTreeSet<_>>().len();
+    let metrics = NativeAccessibilityMetrics {
+        semantic_node_count: scene.nodes.len(),
+        accesskit_node_count: tree_update.nodes.len(),
+        interactive_node_count: scene
+            .nodes
+            .values()
+            .filter(|node| node.actions.press || node.actions.set_text)
+            .count(),
+        focusable_node_count: scene
+            .nodes
+            .values()
+            .filter(|node| node.actions.focus || node.state.focused)
+            .count(),
+        text_input_node_count: scene
+            .nodes
+            .values()
+            .filter(|node| node.actions.set_text)
+            .count(),
+        checked_node_count: scene
+            .nodes
+            .values()
+            .filter(|node| node.state.checked == Some(true))
+            .count(),
+        node_id_collision_count: scene.nodes.len().saturating_sub(unique_ids),
+        root_present: scene
+            .root
+            .as_ref()
+            .is_some_and(|id| id_map.contains_key(id)),
+        focus_present: scene
+            .focused
+            .as_ref()
+            .is_some_and(|id| id_map.contains_key(id)),
+    };
+    NativeAccessibilitySnapshot {
+        tree_update,
+        metrics,
+        semantic_node_ids,
+    }
+}
+
+fn accesskit_node_id_map(
+    scene: &boon_document::SemanticScene,
+) -> BTreeMap<boon_document::SemanticId, accesskit::NodeId> {
+    scene
+        .nodes
+        .keys()
+        .map(|id| (id.clone(), accesskit_node_id_for_semantic_id(id)))
+        .collect()
+}
+
+fn accesskit_node_id_for_semantic_id(id: &boon_document::SemanticId) -> accesskit::NodeId {
+    let digest = Sha256::digest(id.0.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let mut value = u64::from_le_bytes(bytes);
+    if value == 0 {
+        value = 1;
+    }
+    accesskit::NodeId(value)
+}
+
+pub fn native_accessibility_action_requests_from_accesskit(
+    requests: Vec<accesskit::ActionRequest>,
+) -> Vec<NativeAccessibilityActionRequest> {
+    requests
+        .into_iter()
+        .map(|request| NativeAccessibilityActionRequest {
+            target_node_id: request.target_node.0,
+            action: native_accessibility_action_from_accesskit(request.action),
+            value: native_accessibility_action_value_from_accesskit(request.data),
+        })
+        .collect()
+}
+
+pub fn native_accessibility_source_dispatches_from_requests(
+    scene: &boon_document::SemanticScene,
+    requests: &[NativeAccessibilityActionRequest],
+) -> Vec<boon_document::SemanticSourceDispatch> {
+    let native_to_semantic = accesskit_node_id_map(scene)
+        .into_iter()
+        .map(|(semantic_id, node_id)| (node_id.0, semantic_id))
+        .collect::<BTreeMap<_, _>>();
+    requests
+        .iter()
+        .filter_map(|request| {
+            let semantic_id = native_to_semantic.get(&request.target_node_id)?.clone();
+            let event = native_accessibility_semantic_input_event(semantic_id, request)?;
+            scene.source_dispatch_for_event(event)
+        })
+        .collect()
+}
+
+pub fn native_accessibility_world_editor_session_reports_from_requests(
+    scene: &boon_document::SemanticScene,
+    requests: &[NativeAccessibilityActionRequest],
+    session: &mut boon_scene_model::WorldEditorSession,
+    bundle: &boon_solid_model::SolidModelBundle,
+) -> Vec<NativeWorldEditorSessionActionReport> {
+    native_accessibility_source_dispatches_from_requests(scene, requests)
+        .into_iter()
+        .map(|dispatch| {
+            let action = boon_scene_model::WorldEditorSourceAction {
+                source_path: dispatch.source_path.clone(),
+                source_intent: dispatch.source_intent.clone(),
+            };
+            match session.handle_source_action(bundle, &action) {
+                Ok(session_report) => NativeWorldEditorSessionActionReport {
+                    dispatch,
+                    session_report: Some(session_report),
+                    error: None,
+                },
+                Err(error) => NativeWorldEditorSessionActionReport {
+                    dispatch,
+                    session_report: None,
+                    error: Some(error),
+                },
+            }
+        })
+        .collect()
+}
+
+fn native_accessibility_semantic_input_event(
+    semantic_id: boon_document::SemanticId,
+    request: &NativeAccessibilityActionRequest,
+) -> Option<boon_document::SemanticInputEvent> {
+    match request.action {
+        NativeAccessibilityAction::Focus => {
+            Some(boon_document::SemanticInputEvent::Focus { semantic_id })
+        }
+        NativeAccessibilityAction::Click => {
+            Some(boon_document::SemanticInputEvent::Press { semantic_id })
+        }
+        NativeAccessibilityAction::SetValue => Some(boon_document::SemanticInputEvent::SetText {
+            semantic_id,
+            text: request.value.clone().unwrap_or_default(),
+        }),
+        NativeAccessibilityAction::ReplaceSelectedText => {
+            Some(boon_document::SemanticInputEvent::ReplaceSelectedText {
+                semantic_id,
+                text: request.value.clone().unwrap_or_default(),
+            })
+        }
+        NativeAccessibilityAction::Increment => {
+            Some(boon_document::SemanticInputEvent::Increment { semantic_id })
+        }
+        NativeAccessibilityAction::Decrement => {
+            Some(boon_document::SemanticInputEvent::Decrement { semantic_id })
+        }
+        NativeAccessibilityAction::Blur
+        | NativeAccessibilityAction::ScrollIntoView
+        | NativeAccessibilityAction::Other(_) => None,
+    }
+}
+
+fn native_accessibility_action_from_accesskit(
+    action: accesskit::Action,
+) -> NativeAccessibilityAction {
+    match action {
+        accesskit::Action::Focus => NativeAccessibilityAction::Focus,
+        accesskit::Action::Blur => NativeAccessibilityAction::Blur,
+        accesskit::Action::Click => NativeAccessibilityAction::Click,
+        accesskit::Action::SetValue => NativeAccessibilityAction::SetValue,
+        accesskit::Action::ReplaceSelectedText => NativeAccessibilityAction::ReplaceSelectedText,
+        accesskit::Action::Increment => NativeAccessibilityAction::Increment,
+        accesskit::Action::Decrement => NativeAccessibilityAction::Decrement,
+        accesskit::Action::ScrollIntoView => NativeAccessibilityAction::ScrollIntoView,
+        other => NativeAccessibilityAction::Other(format!("{other:?}")),
+    }
+}
+
+fn native_accessibility_action_value_from_accesskit(
+    data: Option<accesskit::ActionData>,
+) -> Option<String> {
+    match data? {
+        accesskit::ActionData::Value(value) => Some(value.into_string()),
+        accesskit::ActionData::NumericValue(value) => Some(value.to_string()),
+        accesskit::ActionData::CustomAction(value) => Some(value.to_string()),
+        accesskit::ActionData::ScrollUnit(value) => Some(format!("{value:?}")),
+        accesskit::ActionData::ScrollHint(value) => Some(format!("{value:?}")),
+        accesskit::ActionData::ScrollToPoint(value) => Some(format!("{value:?}")),
+        accesskit::ActionData::SetScrollOffset(value) => Some(format!("{value:?}")),
+        accesskit::ActionData::SetTextSelection(value) => Some(format!("{value:?}")),
+    }
+}
+
+fn accesskit_node_from_semantic_node(
+    semantic: &boon_document::SemanticNode,
+    id_map: &BTreeMap<boon_document::SemanticId, accesskit::NodeId>,
+) -> accesskit::Node {
+    let mut node = accesskit::Node::new(accesskit_role_for_semantic_role(&semantic.role));
+    if let Some(name) = &semantic.name {
+        node.set_label(name.clone());
+    }
+    if let Some(description) = &semantic.description {
+        node.set_description(description.clone());
+    }
+    if let Some(value) = accesskit_value_for_semantic_value(semantic.value.as_ref()) {
+        node.set_value(value);
+    }
+    if let Some(bounds) = semantic.bounds {
+        node.set_bounds(accesskit::Rect::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            (bounds.x + bounds.width) as f64,
+            (bounds.y + bounds.height) as f64,
+        ));
+    }
+    if semantic.state.disabled {
+        node.set_disabled();
+    }
+    if semantic.state.selected {
+        node.set_selected(true);
+    }
+    if let Some(checked) = semantic.state.checked {
+        node.set_toggled(accesskit::Toggled::from(checked));
+    }
+    if let Some(language) = &semantic.language {
+        node.set_language(language.clone());
+    }
+    if let Some(level) = semantic.heading_level {
+        node.set_level(level as usize);
+    }
+    if let Some(href) = &semantic.href {
+        node.set_url(href.clone());
+    }
+    if semantic.actions.focus {
+        node.add_action(accesskit::Action::Focus);
+    }
+    if semantic.actions.press {
+        node.add_action(accesskit::Action::Click);
+    }
+    if semantic.actions.set_text {
+        node.add_action(accesskit::Action::SetValue);
+        node.add_action(accesskit::Action::ReplaceSelectedText);
+    }
+    if semantic.actions.increment {
+        node.add_action(accesskit::Action::Increment);
+    }
+    if semantic.actions.decrement {
+        node.add_action(accesskit::Action::Decrement);
+    }
+    let labelled_by = semantic
+        .relations
+        .labelled_by
+        .iter()
+        .filter_map(|id| id_map.get(id).copied())
+        .collect::<Vec<_>>();
+    if !labelled_by.is_empty() {
+        node.set_labelled_by(labelled_by);
+    }
+    let described_by = semantic
+        .relations
+        .described_by
+        .iter()
+        .filter_map(|id| id_map.get(id).copied())
+        .collect::<Vec<_>>();
+    if !described_by.is_empty() {
+        node.set_described_by(described_by);
+    }
+    let controls = semantic
+        .relations
+        .controls
+        .iter()
+        .filter_map(|id| id_map.get(id).copied())
+        .collect::<Vec<_>>();
+    if !controls.is_empty() {
+        node.set_controls(controls);
+    }
+    node
+}
+
+fn accesskit_role_for_semantic_role(role: &boon_document::SemanticRole) -> accesskit::Role {
+    match role {
+        boon_document::SemanticRole::Application => accesskit::Role::Application,
+        boon_document::SemanticRole::Group => accesskit::Role::Group,
+        boon_document::SemanticRole::Row => accesskit::Role::Row,
+        boon_document::SemanticRole::Text => accesskit::Role::TextRun,
+        boon_document::SemanticRole::Button => accesskit::Role::Button,
+        boon_document::SemanticRole::Checkbox => accesskit::Role::CheckBox,
+        boon_document::SemanticRole::TextInput => accesskit::Role::TextInput,
+        boon_document::SemanticRole::Table => accesskit::Role::Table,
+        boon_document::SemanticRole::Cell => accesskit::Role::Cell,
+        boon_document::SemanticRole::ScrollRegion => accesskit::Role::ScrollView,
+    }
+}
+
+fn accesskit_value_for_semantic_value(
+    value: Option<&boon_document::SemanticValue>,
+) -> Option<String> {
+    match value? {
+        boon_document::SemanticValue::Text { text } => Some(text.clone()),
+        boon_document::SemanticValue::Bool { value } => Some(value.to_string()),
+        boon_document::SemanticValue::Number { value } => Some(value.to_string()),
     }
 }
 
@@ -258,6 +680,16 @@ pub struct NativeRenderLoopState {
     pub rendered_frame_count: u64,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
+    pub idle_poll_size_scale_total_us: u64,
+    pub idle_poll_input_sample_total_us: u64,
+    pub idle_poll_accessibility_total_us: u64,
+    pub idle_poll_hook_total_us: u64,
+    pub idle_poll_bookkeeping_total_us: u64,
+    pub last_idle_poll_size_scale_us: u64,
+    pub last_idle_poll_input_sample_us: u64,
+    pub last_idle_poll_accessibility_us: u64,
+    pub last_idle_poll_hook_us: u64,
+    pub last_idle_poll_bookkeeping_us: u64,
     pub idle_wait_count: u64,
     pub idle_wait_total_ms: u64,
     pub last_idle_wait_timeout_ms: u64,
@@ -270,6 +702,15 @@ pub struct NativeRenderLoopState {
     pub last_role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub current_scheduler_reason: Option<NativeSchedulerReason>,
     pub current_role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub last_poll_started_elapsed_ms: Option<f64>,
+    pub last_dirty_poll_elapsed_ms: Option<f64>,
+    pub last_external_wake_generation: u64,
+    pub last_external_wake_observed_elapsed_ms: Option<f64>,
+    pub last_render_started_elapsed_ms: Option<f64>,
+    pub last_surface_acquired_elapsed_ms: Option<f64>,
+    pub last_render_hook_completed_elapsed_ms: Option<f64>,
+    pub last_queue_submitted_elapsed_ms: Option<f64>,
+    pub last_present_completed_elapsed_ms: Option<f64>,
     #[serde(skip)]
     pub next_wake_at: Option<Instant>,
 }
@@ -284,6 +725,16 @@ impl NativeRenderLoopState {
             rendered_frame_count: 0,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
+            idle_poll_size_scale_total_us: 0,
+            idle_poll_input_sample_total_us: 0,
+            idle_poll_accessibility_total_us: 0,
+            idle_poll_hook_total_us: 0,
+            idle_poll_bookkeeping_total_us: 0,
+            last_idle_poll_size_scale_us: 0,
+            last_idle_poll_input_sample_us: 0,
+            last_idle_poll_accessibility_us: 0,
+            last_idle_poll_hook_us: 0,
+            last_idle_poll_bookkeeping_us: 0,
             idle_wait_count: 0,
             idle_wait_total_ms: 0,
             last_idle_wait_timeout_ms: 0,
@@ -296,6 +747,15 @@ impl NativeRenderLoopState {
             last_role_dirty_reason: None,
             current_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
             current_role_dirty_reason: None,
+            last_poll_started_elapsed_ms: None,
+            last_dirty_poll_elapsed_ms: None,
+            last_external_wake_generation: 0,
+            last_external_wake_observed_elapsed_ms: None,
+            last_render_started_elapsed_ms: None,
+            last_surface_acquired_elapsed_ms: None,
+            last_render_hook_completed_elapsed_ms: None,
+            last_queue_submitted_elapsed_ms: None,
+            last_present_completed_elapsed_ms: None,
             next_wake_at: None,
         }
     }
@@ -349,6 +809,72 @@ impl NativeRenderLoopState {
 
     pub fn note_input_poll(&mut self) {
         self.input_poll_count = self.input_poll_count.saturating_add(1);
+    }
+
+    pub fn note_idle_poll_substeps(
+        &mut self,
+        size_scale: Duration,
+        input_sample: Duration,
+        accessibility: Duration,
+        hook: Duration,
+        bookkeeping: Duration,
+    ) {
+        let size_scale_us = duration_micros_u64(size_scale);
+        let input_sample_us = duration_micros_u64(input_sample);
+        let accessibility_us = duration_micros_u64(accessibility);
+        let hook_us = duration_micros_u64(hook);
+        let bookkeeping_us = duration_micros_u64(bookkeeping);
+        self.idle_poll_size_scale_total_us = self
+            .idle_poll_size_scale_total_us
+            .saturating_add(size_scale_us);
+        self.idle_poll_input_sample_total_us = self
+            .idle_poll_input_sample_total_us
+            .saturating_add(input_sample_us);
+        self.idle_poll_accessibility_total_us = self
+            .idle_poll_accessibility_total_us
+            .saturating_add(accessibility_us);
+        self.idle_poll_hook_total_us = self.idle_poll_hook_total_us.saturating_add(hook_us);
+        self.idle_poll_bookkeeping_total_us = self
+            .idle_poll_bookkeeping_total_us
+            .saturating_add(bookkeeping_us);
+        self.last_idle_poll_size_scale_us = size_scale_us;
+        self.last_idle_poll_input_sample_us = input_sample_us;
+        self.last_idle_poll_accessibility_us = accessibility_us;
+        self.last_idle_poll_hook_us = hook_us;
+        self.last_idle_poll_bookkeeping_us = bookkeeping_us;
+    }
+
+    pub fn note_poll_started(&mut self, elapsed_ms: f64) {
+        self.last_poll_started_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_dirty_poll(&mut self, elapsed_ms: f64) {
+        self.last_dirty_poll_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_external_wake_observed(&mut self, generation: u64, elapsed_ms: f64) {
+        self.last_external_wake_generation = generation;
+        self.last_external_wake_observed_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_render_started(&mut self, elapsed_ms: f64) {
+        self.last_render_started_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_surface_acquired(&mut self, elapsed_ms: f64) {
+        self.last_surface_acquired_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_render_hook_completed(&mut self, elapsed_ms: f64) {
+        self.last_render_hook_completed_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_queue_submitted(&mut self, elapsed_ms: f64) {
+        self.last_queue_submitted_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_present_completed(&mut self, elapsed_ms: f64) {
+        self.last_present_completed_elapsed_ms = Some(elapsed_ms);
     }
 
     pub fn note_idle_wait(
@@ -448,6 +974,8 @@ pub struct NativePollResult {
     pub next_wake_after_ms: Option<u64>,
     pub wants_animation_frame: bool,
     pub cursor_icon: NativeCursorIcon,
+    #[serde(skip)]
+    pub accessibility_update: Option<accesskit::TreeUpdate>,
 }
 
 impl NativePollResult {
@@ -460,6 +988,7 @@ impl NativePollResult {
             next_wake_after_ms: None,
             wants_animation_frame: false,
             cursor_icon: NativeCursorIcon::Default,
+            accessibility_update: None,
         }
     }
 }
@@ -825,6 +1354,7 @@ pub struct NativePollContext {
     pub height: u32,
     pub scale: f32,
     pub input_delta: NativeInputAdapterProof,
+    pub accessibility_actions: Vec<NativeAccessibilityActionRequest>,
     pub now: Instant,
     pub forced_frame: bool,
 }
@@ -1121,6 +1651,9 @@ async fn run_surface_probe_inner(
 
     for frame_index in 0..total_frame_count {
         let input = empty_input_adapter_proof(false);
+        let accessibility_actions = native_accessibility_action_requests_from_accesskit(
+            app_surface.take_accessibility_action_requests(),
+        );
         if let Some(poll_result) = poll_native_window_hooks(
             &mut hooks,
             NativePollContext {
@@ -1131,11 +1664,15 @@ async fn run_surface_probe_inner(
                 height,
                 scale: scale as f32,
                 input_delta: input.clone(),
+                accessibility_actions,
                 now: Instant::now(),
                 forced_frame: true,
             },
         )? {
             apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
+            if let Some(update) = poll_result.accessibility_update.clone() {
+                app_surface.update_accessibility_if_active(update);
+            }
             if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                 render_loop_state
                     .schedule_wake_after(Instant::now(), Duration::from_millis(next_wake_after_ms));
@@ -1350,6 +1887,9 @@ async fn run_surface_probe_inner(
             } else {
                 sample_input_adapter(&mut mouse, &keyboard, false)
             };
+            let accessibility_actions = native_accessibility_action_requests_from_accesskit(
+                app_surface.take_accessibility_action_requests(),
+            );
             merge_input_adapter_proof(&mut input_adapter, &frame_input);
             if let Some(poll_result) = poll_native_window_hooks(
                 &mut hooks,
@@ -1361,11 +1901,15 @@ async fn run_surface_probe_inner(
                     height,
                     scale: scale as f32,
                     input_delta: frame_input.clone(),
+                    accessibility_actions,
                     now: Instant::now(),
                     forced_frame: true,
                 },
             )? {
                 apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
+                if let Some(update) = poll_result.accessibility_update.clone() {
+                    app_surface.update_accessibility_if_active(update);
+                }
                 if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                     render_loop_state.schedule_wake_after(
                         Instant::now(),
@@ -1563,7 +2107,7 @@ async fn run_surface_probe_inner(
         frame_timing,
         post_input_frame_timing,
         input_adapter,
-        external_render_proof,
+        external_render_proof: external_render_proof.clone(),
         readback_artifact,
     };
     let _ = ready_sender.send(Ok(proof));
@@ -1580,7 +2124,9 @@ async fn run_surface_probe_inner(
             render_loop_state.note_loop_exit(reason);
             break;
         }
+        let size_scale_started = Instant::now();
         let (current_size, current_scale) = app_surface.size_scale().await;
+        let size_scale_elapsed = size_scale_started.elapsed();
         let raw_width = (current_size.width() * current_scale).round();
         let raw_height = (current_size.height() * current_scale).round();
         if raw_width <= 0.0 || raw_height <= 0.0 {
@@ -1596,6 +2142,12 @@ async fn run_surface_probe_inner(
                 last_wake_generation,
                 completed_generation,
             );
+            if completed_generation != last_wake_generation {
+                render_loop_state.note_external_wake_observed(
+                    completed_generation,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             last_wake_generation = completed_generation;
             continue;
         }
@@ -1615,10 +2167,19 @@ async fn run_surface_probe_inner(
             render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
         }
         let poll_started_at = Instant::now();
+        render_loop_state.note_poll_started(hold_started.elapsed().as_secs_f64() * 1000.0);
         render_loop_state.consume_due_wake(poll_started_at);
+        let input_sample_started = Instant::now();
         let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        let input_sample_elapsed = input_sample_started.elapsed();
+        let accessibility_started = Instant::now();
+        let accessibility_actions = native_accessibility_action_requests_from_accesskit(
+            app_surface.take_accessibility_action_requests(),
+        );
+        let accessibility_elapsed = accessibility_started.elapsed();
         merge_input_adapter_proof(&mut observed_input_adapter, &input);
         render_loop_state.note_input_poll();
+        let hook_started = Instant::now();
         let poll_result = poll_native_window_hooks(
             &mut hooks,
             NativePollContext {
@@ -1629,12 +2190,18 @@ async fn run_surface_probe_inner(
                 height,
                 scale: current_scale as f32,
                 input_delta: input.clone(),
+                accessibility_actions,
                 now: poll_started_at,
                 forced_frame: false,
             },
         )?;
+        let hook_elapsed = hook_started.elapsed();
+        let bookkeeping_started = Instant::now();
         if let Some(poll_result) = poll_result {
             apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
+            if let Some(update) = poll_result.accessibility_update.clone() {
+                app_surface.update_accessibility_if_active(update);
+            }
             if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                 render_loop_state.schedule_wake_after(
                     poll_started_at,
@@ -1642,20 +2209,36 @@ async fn run_surface_probe_inner(
                 );
             }
             render_loop_state.apply_poll_result(&poll_result, input.real_os_events_observed);
+            if poll_result.dirty {
+                render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
+            }
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         } else if input.real_os_events_observed {
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
+            render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
         }
         let wake_generation = wake_handle.generation();
         let wake_generation_changed = wake_generation != last_wake_generation;
         if wake_generation_changed {
             last_wake_generation = wake_generation;
+            render_loop_state.note_external_wake_observed(
+                wake_generation,
+                hold_started.elapsed().as_secs_f64() * 1000.0,
+            );
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::ExternalWake);
             render_loop_state.scheduled_wake_count =
                 render_loop_state.scheduled_wake_count.saturating_add(1);
             continue;
         }
         if !render_loop_state.should_render(Instant::now(), false) {
+            let bookkeeping_elapsed = bookkeeping_started.elapsed();
+            render_loop_state.note_idle_poll_substeps(
+                size_scale_elapsed,
+                input_sample_elapsed,
+                accessibility_elapsed,
+                hook_elapsed,
+                bookkeeping_elapsed,
+            );
             render_loop_state.note_idle_poll();
             let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
             let wait_started = Instant::now();
@@ -1667,6 +2250,12 @@ async fn run_surface_probe_inner(
                 last_wake_generation,
                 completed_generation,
             );
+            if completed_generation != last_wake_generation {
+                render_loop_state.note_external_wake_observed(
+                    completed_generation,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             last_wake_generation = completed_generation;
             continue;
         }
@@ -1674,6 +2263,7 @@ async fn run_surface_probe_inner(
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         }
         let rendered_revision = render_loop_state.dirty_revision;
+        render_loop_state.note_render_started(hold_started.elapsed().as_secs_f64() * 1000.0);
         let Some(frame) = acquire_surface_texture_for_present(
             &surface,
             &device,
@@ -1685,6 +2275,7 @@ async fn run_surface_probe_inner(
         else {
             continue;
         };
+        render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1745,6 +2336,9 @@ async fn run_surface_probe_inner(
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 );
+                external_render_proof = Some(render_result.proof);
+                render_loop_state
+                    .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
             None => {
                 let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1763,6 +2357,8 @@ async fn run_surface_probe_inner(
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                render_loop_state
+                    .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
         }
         let interactive_readback = if options.role == NativeWindowRole::Preview {
@@ -1789,8 +2385,10 @@ async fn run_surface_probe_inner(
             None
         };
         queue.submit(Some(encoder.finish()));
+        render_loop_state.note_queue_submitted(hold_started.elapsed().as_secs_f64() * 1000.0);
         frame.present();
         render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
+        render_loop_state.note_present_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
                 Path::new(report),
@@ -1807,7 +2405,8 @@ async fn run_surface_probe_inner(
                     resize_wake_count.load(Ordering::Relaxed),
                     &app_surface,
                     Some(&observed_input_adapter),
-                ),
+                )
+                .with_external_render_proof(external_render_proof.as_ref()),
                 None,
             )?;
         }
@@ -1833,7 +2432,8 @@ async fn run_surface_probe_inner(
                         resize_wake_count.load(Ordering::Relaxed),
                         &app_surface,
                         Some(&observed_input_adapter),
-                    ),
+                    )
+                    .with_external_render_proof(external_render_proof.as_ref()),
                     None,
                 )?;
             }
@@ -1858,7 +2458,8 @@ async fn run_surface_probe_inner(
                 resize_wake_count.load(Ordering::Relaxed),
                 &app_surface,
                 Some(&observed_input_adapter),
-            ),
+            )
+            .with_external_render_proof(external_render_proof.as_ref()),
             None,
         )?;
     }
@@ -1977,6 +2578,14 @@ struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
+    external_render_proof: Option<serde_json::Value>,
+}
+
+impl NativeRenderLoopReportExtras {
+    fn with_external_render_proof(mut self, proof: Option<&serde_json::Value>) -> Self {
+        self.external_render_proof = proof.cloned();
+        self
+    }
 }
 
 fn render_loop_report_extras(
@@ -1988,6 +2597,7 @@ fn render_loop_report_extras(
         resize_wake_count,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
+        external_render_proof: None,
     }
 }
 
@@ -2059,6 +2669,7 @@ fn write_render_loop_state_report(
     let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
     let input_polls_per_second = state.input_poll_count as f64 / elapsed_seconds;
     let renders_per_second = state.rendered_frame_count as f64 / elapsed_seconds;
+    let idle_poll_count = state.skipped_idle_poll_count.max(1) as f64;
     let active_timer_reason = state.next_wake_at.map(|_| {
         if state.current_scheduler_reason == Some(NativeSchedulerReason::Timer) {
             "timer_due"
@@ -2085,11 +2696,41 @@ fn write_render_loop_state_report(
         "skipped_idle_poll_count": state.skipped_idle_poll_count,
         "input_poll_count": state.input_poll_count,
         "input_polls_per_second": input_polls_per_second,
+        "idle_poll_substep_total_us": {
+            "size_scale": state.idle_poll_size_scale_total_us,
+            "input_sample": state.idle_poll_input_sample_total_us,
+            "accessibility": state.idle_poll_accessibility_total_us,
+            "hook_poll": state.idle_poll_hook_total_us,
+            "bookkeeping": state.idle_poll_bookkeeping_total_us
+        },
+        "idle_poll_substep_avg_us": {
+            "size_scale": state.idle_poll_size_scale_total_us as f64 / idle_poll_count,
+            "input_sample": state.idle_poll_input_sample_total_us as f64 / idle_poll_count,
+            "accessibility": state.idle_poll_accessibility_total_us as f64 / idle_poll_count,
+            "hook_poll": state.idle_poll_hook_total_us as f64 / idle_poll_count,
+            "bookkeeping": state.idle_poll_bookkeeping_total_us as f64 / idle_poll_count
+        },
+        "last_idle_poll_substep_us": {
+            "size_scale": state.last_idle_poll_size_scale_us,
+            "input_sample": state.last_idle_poll_input_sample_us,
+            "accessibility": state.last_idle_poll_accessibility_us,
+            "hook_poll": state.last_idle_poll_hook_us,
+            "bookkeeping": state.last_idle_poll_bookkeeping_us
+        },
         "idle_wait_count": state.idle_wait_count,
         "idle_wait_total_ms": state.idle_wait_total_ms,
         "last_idle_wait_timeout_ms": state.last_idle_wait_timeout_ms,
         "last_idle_wait_actual_ms": state.last_idle_wait_actual_ms,
         "last_idle_wait_wake_reason": state.last_idle_wait_wake_reason,
+        "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
+        "last_dirty_poll_elapsed_ms": state.last_dirty_poll_elapsed_ms,
+        "last_external_wake_generation": state.last_external_wake_generation,
+        "last_external_wake_observed_elapsed_ms": state.last_external_wake_observed_elapsed_ms,
+        "last_render_started_elapsed_ms": state.last_render_started_elapsed_ms,
+        "last_surface_acquired_elapsed_ms": state.last_surface_acquired_elapsed_ms,
+        "last_render_hook_completed_elapsed_ms": state.last_render_hook_completed_elapsed_ms,
+        "last_queue_submitted_elapsed_ms": state.last_queue_submitted_elapsed_ms,
+        "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
         "loop_exit_reason": state.loop_exit_reason,
         "forced_frame_count": state.forced_frame_count,
         "renders_per_second": renders_per_second,
@@ -2099,6 +2740,7 @@ fn write_render_loop_state_report(
         "resize_wake_count": extras.resize_wake_count,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
+        "last_external_render_proof": extras.external_render_proof,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
         "current_scheduler_reason": state.current_scheduler_reason,
@@ -2249,6 +2891,10 @@ fn align_to(value: u32, alignment: u32) -> u32 {
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn percentile(values: &[f64], percentile: f64) -> f64 {
@@ -2875,6 +3521,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                accessibility_update: None,
             },
             false,
         );
@@ -2888,6 +3535,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                accessibility_update: None,
             },
             false,
         );
@@ -2896,6 +3544,250 @@ mod tests {
             state.last_role_dirty_reason,
             Some(NativeRoleDirtyReason::SourcePayloadAccepted)
         );
+    }
+
+    #[test]
+    fn accessibility_action_requests_lower_without_leaking_accesskit_types() {
+        let requests = native_accessibility_action_requests_from_accesskit(vec![
+            accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: accesskit::NodeId(41),
+                data: None,
+            },
+            accesskit::ActionRequest {
+                action: accesskit::Action::SetValue,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: accesskit::NodeId(42),
+                data: Some(accesskit::ActionData::Value("hello".into())),
+            },
+            accesskit::ActionRequest {
+                action: accesskit::Action::ScrollLeft,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: accesskit::NodeId(43),
+                data: None,
+            },
+        ]);
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].target_node_id, 41);
+        assert_eq!(requests[0].action, NativeAccessibilityAction::Focus);
+        assert_eq!(requests[1].action, NativeAccessibilityAction::SetValue);
+        assert_eq!(requests[1].value.as_deref(), Some("hello"));
+        assert_eq!(
+            requests[2].action,
+            NativeAccessibilityAction::Other("ScrollLeft".to_owned())
+        );
+    }
+
+    #[test]
+    fn accessibility_action_requests_route_to_semantic_source_dispatch() {
+        let root_id = boon_document::SemanticId("semantic:world-editor:root".to_owned());
+        let export_id =
+            boon_document::SemanticId("semantic:world-editor:manufacturing:export-3mf".to_owned());
+        let mut scene = boon_document::SemanticScene {
+            root: Some(root_id.clone()),
+            focused: Some(export_id.clone()),
+            ..boon_document::SemanticScene::default()
+        };
+        scene.nodes.insert(
+            root_id.clone(),
+            boon_document::SemanticNode {
+                id: root_id.clone(),
+                node: boon_document::DocumentNodeId("world:world-editor:root".to_owned()),
+                role: boon_document::SemanticRole::Application,
+                name: Some("Car editor".to_owned()),
+                description: None,
+                value: None,
+                state: boon_document::SemanticState::default(),
+                actions: boon_document::SemanticActions::default(),
+                relations: boon_document::SemanticRelations {
+                    children: vec![export_id.clone()],
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+        scene.nodes.insert(
+            export_id.clone(),
+            boon_document::SemanticNode {
+                id: export_id.clone(),
+                node: boon_document::DocumentNodeId(
+                    "world:world-editor:manufacturing:export-3mf".to_owned(),
+                ),
+                role: boon_document::SemanticRole::Button,
+                name: Some("Export 3MF".to_owned()),
+                description: None,
+                value: None,
+                state: boon_document::SemanticState {
+                    focused: true,
+                    ..boon_document::SemanticState::default()
+                },
+                actions: boon_document::SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: boon_document::SemanticRelations {
+                    parent: Some(root_id),
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(boon_document::SourceBindingId(
+                    "source:world.manufacturing.export_3mf".to_owned(),
+                )),
+                source_path: Some("world.manufacturing.export_3mf".to_owned()),
+                source_intent: Some("press".to_owned()),
+            },
+        );
+        let snapshot =
+            accesskit_tree_update_from_semantic_scene(&scene, "boon-native", "test-version");
+        let export_node_id = snapshot
+            .semantic_node_ids
+            .iter()
+            .find(|mapping| mapping.semantic_id == export_id.0)
+            .expect("export semantic node should map to AccessKit")
+            .accesskit_node_id;
+        let requests =
+            native_accessibility_action_requests_from_accesskit(vec![accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: accesskit::NodeId(export_node_id),
+                data: None,
+            }]);
+
+        let dispatches = native_accessibility_source_dispatches_from_requests(&scene, &requests);
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].semantic_id, export_id);
+        assert_eq!(dispatches[0].source_path, "world.manufacturing.export_3mf");
+        assert_eq!(dispatches[0].source_intent.as_deref(), Some("press"));
+        assert_eq!(dispatches[0].text, None);
+    }
+
+    #[test]
+    fn accessibility_action_requests_drive_world_editor_session_actions() {
+        let bundle = boon_solid_model::SolidModelBundle::parametric_car_fixture();
+        let visual =
+            boon_scene_model::WorldScene::visual_proxy_with_chunks_from_solid_model(&bundle)
+                .expect("car fixture should compile to visual proxy scene");
+        let mut session = boon_scene_model::WorldEditorSession::new(visual.scene);
+        let scene_for_session = |session: &boon_scene_model::WorldEditorSession| {
+            let tree = session
+                .semantic_editor_tree(&bundle, "Car editor")
+                .expect("world editor semantic tree");
+            boon_document::SemanticScene::from_world_editor_tree(&tree)
+        };
+        let node_id_for_name =
+            |scene: &boon_document::SemanticScene, name: &str| -> accesskit::NodeId {
+                let semantic_id = scene
+                    .nodes
+                    .values()
+                    .find(|node| node.name.as_deref() == Some(name))
+                    .expect("semantic node by name")
+                    .id
+                    .clone();
+                let node_id =
+                    accesskit_tree_update_from_semantic_scene(scene, "boon-native", "test-version")
+                        .semantic_node_ids
+                        .iter()
+                        .find(|mapping| mapping.semantic_id == semantic_id.0)
+                        .expect("semantic node should map to AccessKit")
+                        .accesskit_node_id;
+                accesskit::NodeId(node_id)
+            };
+
+        let scene = scene_for_session(&session);
+        let wheel_node_id = node_id_for_name(&scene, "Front-left wheel");
+        let select_requests =
+            native_accessibility_action_requests_from_accesskit(vec![accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: wheel_node_id,
+                data: None,
+            }]);
+        let select_reports = native_accessibility_world_editor_session_reports_from_requests(
+            &scene,
+            &select_requests,
+            &mut session,
+            &bundle,
+        );
+
+        assert_eq!(select_reports.len(), 1);
+        assert_eq!(select_reports[0].error, None);
+        let select_report = select_reports[0]
+            .session_report
+            .as_ref()
+            .expect("selection session report");
+        assert!(matches!(
+            select_report.outcome.action,
+            boon_scene_model::WorldEditorActionKind::SelectInstance { .. }
+        ));
+        assert_eq!(
+            select_report
+                .patch_report
+                .as_ref()
+                .map(|report| report.selection_update_count),
+            Some(1)
+        );
+        assert_eq!(select_report.selected_instance_count, 1);
+
+        let selected_scene = scene_for_session(&session);
+        assert_eq!(
+            selected_scene
+                .nodes
+                .values()
+                .filter(|node| node.state.selected)
+                .count(),
+            1
+        );
+        let export_node_id = node_id_for_name(&selected_scene, "Export 3MF");
+        let export_requests =
+            native_accessibility_action_requests_from_accesskit(vec![accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: export_node_id,
+                data: None,
+            }]);
+        let export_reports = native_accessibility_world_editor_session_reports_from_requests(
+            &selected_scene,
+            &export_requests,
+            &mut session,
+            &bundle,
+        );
+
+        assert_eq!(export_reports.len(), 1);
+        assert_eq!(export_reports[0].error, None);
+        let export_report = export_reports[0]
+            .session_report
+            .as_ref()
+            .expect("export session report");
+        let preparation = export_report
+            .outcome
+            .export_preparation
+            .as_ref()
+            .expect("export preparation");
+        assert_eq!(
+            export_report.outcome.action,
+            boon_scene_model::WorldEditorActionKind::Export3Mf
+        );
+        assert_eq!(
+            preparation.status,
+            boon_scene_model::WorldManufacturingExportStatus::ReadySelectedPrintable
+        );
+        assert!(preparation.selected_part_exportable);
+        assert_eq!(preparation.excluded_visual_only_instance_count, 1);
     }
 
     #[test]
@@ -2960,6 +3852,7 @@ mod tests {
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
+            accessibility_update: None,
         };
 
         state.apply_poll_result(&poll, false);
@@ -2991,6 +3884,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                accessibility_update: None,
             },
             true,
         );
@@ -3014,6 +3908,7 @@ mod tests {
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
+            accessibility_update: None,
         };
 
         state.apply_poll_result(&poll, false);
@@ -3043,6 +3938,7 @@ mod tests {
             next_wake_after_ms: Some(16),
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: true,
+            accessibility_update: None,
         };
 
         state.apply_poll_result(&poll, false);
@@ -3227,6 +4123,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                accessibility_update: None,
             },
             false,
         );
@@ -3242,6 +4139,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                accessibility_update: None,
             },
             true,
         );
@@ -3313,5 +4211,223 @@ mod tests {
         assert_eq!(cursor.last_mouse_button_sequence, 7);
         assert_eq!(cursor.last_keyboard_sequence, 11);
         assert_eq!(cursor.last_mouse_scroll_event_count, 3);
+    }
+
+    #[test]
+    fn semantic_scene_lowers_to_accesskit_tree_update_with_stable_ids() {
+        let root_id = boon_document::SemanticId("semantic:root".to_owned());
+        let button_id = boon_document::SemanticId("semantic:save".to_owned());
+        let checkbox_id = boon_document::SemanticId("semantic:done".to_owned());
+        let input_id = boon_document::SemanticId("semantic:filter".to_owned());
+        let mut scene = boon_document::SemanticScene {
+            root: Some(root_id.clone()),
+            focused: Some(input_id.clone()),
+            ..boon_document::SemanticScene::default()
+        };
+        scene.nodes.insert(
+            root_id.clone(),
+            boon_document::SemanticNode {
+                id: root_id.clone(),
+                node: boon_document::DocumentNodeId("root".to_owned()),
+                role: boon_document::SemanticRole::Application,
+                name: Some("Boon app".to_owned()),
+                description: None,
+                value: None,
+                state: boon_document::SemanticState::default(),
+                actions: boon_document::SemanticActions::default(),
+                relations: boon_document::SemanticRelations {
+                    children: vec![button_id.clone(), checkbox_id.clone(), input_id.clone()],
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: Some(boon_document::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 180.0,
+                }),
+                language: Some("en".to_owned()),
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+        scene.nodes.insert(
+            button_id.clone(),
+            boon_document::SemanticNode {
+                id: button_id.clone(),
+                node: boon_document::DocumentNodeId("save".to_owned()),
+                role: boon_document::SemanticRole::Button,
+                name: Some("Save".to_owned()),
+                description: None,
+                value: None,
+                state: boon_document::SemanticState::default(),
+                actions: boon_document::SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: boon_document::SemanticRelations {
+                    parent: Some(root_id.clone()),
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: Some(boon_document::Rect {
+                    x: 8.0,
+                    y: 8.0,
+                    width: 80.0,
+                    height: 28.0,
+                }),
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(boon_document::SourceBindingId("source:save".to_owned())),
+                source_path: Some("toolbar.save".to_owned()),
+                source_intent: Some("press".to_owned()),
+            },
+        );
+        scene.nodes.insert(
+            checkbox_id.clone(),
+            boon_document::SemanticNode {
+                id: checkbox_id.clone(),
+                node: boon_document::DocumentNodeId("done".to_owned()),
+                role: boon_document::SemanticRole::Checkbox,
+                name: Some("Done".to_owned()),
+                description: None,
+                value: Some(boon_document::SemanticValue::Bool { value: true }),
+                state: boon_document::SemanticState {
+                    checked: Some(true),
+                    ..boon_document::SemanticState::default()
+                },
+                actions: boon_document::SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: boon_document::SemanticRelations {
+                    parent: Some(root_id.clone()),
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+        scene.nodes.insert(
+            input_id.clone(),
+            boon_document::SemanticNode {
+                id: input_id.clone(),
+                node: boon_document::DocumentNodeId("filter".to_owned()),
+                role: boon_document::SemanticRole::TextInput,
+                name: Some("Filter".to_owned()),
+                description: None,
+                value: Some(boon_document::SemanticValue::Text {
+                    text: "abc".to_owned(),
+                }),
+                state: boon_document::SemanticState {
+                    focused: true,
+                    ..boon_document::SemanticState::default()
+                },
+                actions: boon_document::SemanticActions {
+                    focus: true,
+                    press: false,
+                    set_text: true,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: boon_document::SemanticRelations {
+                    parent: Some(root_id.clone()),
+                    ..boon_document::SemanticRelations::default()
+                },
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+
+        let snapshot =
+            accesskit_tree_update_from_semantic_scene(&scene, "boon-native", "test-version");
+        let repeat =
+            accesskit_tree_update_from_semantic_scene(&scene, "boon-native", "test-version");
+
+        assert_eq!(snapshot.metrics.semantic_node_count, 4);
+        assert_eq!(snapshot.metrics.accesskit_node_count, 4);
+        assert_eq!(snapshot.metrics.interactive_node_count, 3);
+        assert_eq!(snapshot.metrics.focusable_node_count, 3);
+        assert_eq!(snapshot.metrics.text_input_node_count, 1);
+        assert_eq!(snapshot.metrics.checked_node_count, 1);
+        assert_eq!(snapshot.metrics.node_id_collision_count, 0);
+        assert!(snapshot.metrics.root_present);
+        assert!(snapshot.metrics.focus_present);
+        assert_eq!(snapshot.semantic_node_ids, repeat.semantic_node_ids);
+        assert_eq!(
+            snapshot.tree_update.tree.as_ref().unwrap().root,
+            snapshot
+                .semantic_node_ids
+                .iter()
+                .find(|mapping| mapping.semantic_id == "semantic:root")
+                .map(|mapping| accesskit::NodeId(mapping.accesskit_node_id))
+                .unwrap()
+        );
+        assert_eq!(
+            snapshot.tree_update.focus,
+            snapshot
+                .semantic_node_ids
+                .iter()
+                .find(|mapping| mapping.semantic_id == "semantic:filter")
+                .map(|mapping| accesskit::NodeId(mapping.accesskit_node_id))
+                .unwrap()
+        );
+
+        let root = snapshot
+            .tree_update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == accesskit::Role::Application)
+            .expect("root application node should exist");
+        assert_eq!(root.1.children().len(), 3);
+
+        let button = snapshot
+            .tree_update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == accesskit::Role::Button)
+            .expect("button node should exist");
+        assert!(button.1.supports_action(accesskit::Action::Click));
+        assert!(button.1.supports_action(accesskit::Action::Focus));
+
+        let text_input = snapshot
+            .tree_update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == accesskit::Role::TextInput)
+            .expect("text input node should exist");
+        assert!(text_input.1.supports_action(accesskit::Action::SetValue));
+        assert!(
+            text_input
+                .1
+                .supports_action(accesskit::Action::ReplaceSelectedText)
+        );
+
+        let checkbox = snapshot
+            .tree_update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == accesskit::Role::CheckBox)
+            .expect("checkbox node should exist");
+        assert!(checkbox.1.supports_action(accesskit::Action::Click));
+        assert_eq!(checkbox.1.toggled(), Some(accesskit::Toggled::True));
     }
 }

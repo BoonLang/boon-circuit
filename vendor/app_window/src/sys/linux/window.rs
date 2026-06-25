@@ -17,6 +17,7 @@ use super::buffer::{AllocatedBuffer, create_shm_buffer_decor};
 use super::cursor::CursorRequest;
 use super::main_thread::MAIN_THREAD_INFO;
 use super::{App, AppState, Configure, FullscreenError, Surface, SurfaceEvents};
+use accesskit::{ActionRequest, TreeUpdate};
 use crate::coordinates::{Position, Size};
 use crate::surface::SurfaceContentReport;
 
@@ -48,6 +49,8 @@ pub(super) struct WindowInternal {
     pub drawable_buffer: Option<AllocatedBuffer>,
     pub requested_maximize: bool,
     pub adapter: Option<accesskit_unix::Adapter>,
+    pub latest_accessibility_tree_update: Option<TreeUpdate>,
+    pub accessibility_action_requests: Vec<ActionRequest>,
     pub size_update_notify: Option<DebugWrapper>,
     pub decor_subsurface: Option<WlSubsurface>,
     pub title: String,
@@ -103,6 +106,8 @@ impl WindowInternal {
             requested_maximize: false,
             drawable_buffer: None,
             adapter: None,
+            latest_accessibility_tree_update: None,
+            accessibility_action_requests: Vec::new(),
             size_update_notify: None,
             decor_subsurface: None,
             xdg_surface: None,

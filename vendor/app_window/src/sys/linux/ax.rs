@@ -107,6 +107,11 @@ impl AX {
 
 impl accesskit::ActivationHandler for AX {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+        if let Ok(window) = self.window_internal.lock()
+            && let Some(update) = window.latest_accessibility_tree_update.clone()
+        {
+            return Some(update);
+        }
         Some(build_tree_update(
             self.inner.title.clone(),
             self.inner.window_size,
@@ -121,33 +126,52 @@ impl accesskit::ActionHandler for AX {
                 Action::Click => {
                     self.window_internal.lock().unwrap().close_window();
                 }
-                _ => unimplemented!(),
+                _ => {
+                    self.window_internal
+                        .lock()
+                        .unwrap()
+                        .accessibility_action_requests
+                        .push(request);
+                }
             }
         } else if request.target_node == MAXIMIZE_ID {
             match request.action {
                 Action::Click => {
                     self.window_internal.lock().unwrap().maximize();
                 }
-                _ => unimplemented!(),
+                _ => {
+                    self.window_internal
+                        .lock()
+                        .unwrap()
+                        .accessibility_action_requests
+                        .push(request);
+                }
             }
         } else if request.target_node == MINIMIZE_ID {
             match request.action {
                 Action::Click => {
                     self.window_internal.lock().unwrap().minimize();
                 }
-                _ => unimplemented!(),
+                _ => {
+                    self.window_internal
+                        .lock()
+                        .unwrap()
+                        .accessibility_action_requests
+                        .push(request);
+                }
             }
         } else {
-            unimplemented!(
-                "Unknown action target: {target:?}",
-                target = request.target_node
-            );
+            self.window_internal
+                .lock()
+                .unwrap()
+                .accessibility_action_requests
+                .push(request);
         }
     }
 }
 
 impl accesskit::DeactivationHandler for AX {
     fn deactivate_accessibility(&mut self) {
-        todo!()
+        // Keep the last tree so a later activation can return real app content.
     }
 }

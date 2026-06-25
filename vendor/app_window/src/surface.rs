@@ -306,6 +306,16 @@ impl Surface {
     pub fn set_cursor_icon(&self, icon: SurfaceCursorIcon) {
         self.sys.set_cursor_icon(icon)
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn update_accessibility_if_active(&self, update: accesskit::TreeUpdate) {
+        self.sys.update_accessibility_if_active(update)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn take_accessibility_action_requests(&self) -> Vec<accesskit::ActionRequest> {
+        self.sys.take_accessibility_action_requests()
+    }
 }
 
 #[cfg(test)]

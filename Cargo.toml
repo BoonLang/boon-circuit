@@ -14,6 +14,12 @@ members = [
     "crates/boon_driver",
     "crates/boon_host",
     "crates/boon_document",
+    "crates/boon_scene_model",
+    "crates/boon_solid_model",
+    "crates/boon_manufacturing",
+    "crates/boon_3mf",
+    "crates/boon_mesh_export",
+    "crates/boon_web_host",
     "crates/boon_native_gpu",
     "crates/boon_native_app_window",
     "crates/boon_native_playground",
@@ -40,8 +46,15 @@ boon_editor = { path = "crates/boon_editor" }
 boon_driver = { path = "crates/boon_driver" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
+boon_scene_model = { path = "crates/boon_scene_model" }
+boon_solid_model = { path = "crates/boon_solid_model" }
+boon_manufacturing = { path = "crates/boon_manufacturing" }
+boon_3mf = { path = "crates/boon_3mf" }
+boon_mesh_export = { path = "crates/boon_mesh_export" }
+boon_web_host = { path = "crates/boon_web_host" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
+accesskit = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smallvec = "1.15"
@@ -49,6 +62,7 @@ toml = "0.9"
 sha2 = "0.10"
 chumsky = "0.9"
 ena = "0.14"
+earcutr = "0.5"
 bitvec = "1.0"
 bytes = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
@@ -56,6 +70,7 @@ ropey = "1.6"
 unicode-segmentation = "1.13"
 arboard = "3.6"
 image = { version = "0.24.9", default-features = false, features = ["png"] }
+flate2 = "1.1"
 resvg = { version = "0.47.0", default-features = false }
 ply-engine = { version = "1.1.1", default-features = false }
 wgpu = "=29.0.1"

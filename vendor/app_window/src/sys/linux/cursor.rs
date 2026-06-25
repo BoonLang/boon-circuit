@@ -178,24 +178,23 @@ impl ActiveCursor {
                             .send(next_present_time)
                             .expect("Can't send next present time");
                     });
-                    let next_present_time =
-                        receiver.recv().expect("Can't receive next present time");
+                    let next_present_time = match receiver.recv() {
+                        Ok(next_present_time) => next_present_time,
+                        Err(_) => break,
+                    };
                     let request = match next_present_time {
                         Some(next_present_time) => {
                             let sleep_time = next_present_time.saturating_sub(start_time.elapsed());
                             match cursor_request_receiver.recv_timeout(sleep_time) {
                                 Ok(request) => Some(request),
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    panic!("Cursor request channel disconnected");
-                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                             }
                         }
-                        None => Some(
-                            cursor_request_receiver
-                                .recv()
-                                .expect("Cursor request channel disconnected"),
-                        ),
+                        None => match cursor_request_receiver.recv() {
+                            Ok(request) => Some(request),
+                            Err(_) => break,
+                        },
                     };
                     if let Some(request) = request {
                         *move_active_request.lock().unwrap() = request;

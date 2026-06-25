@@ -1,0 +1,7 @@
+name = "parametric_car_rich_3d"
+source = "examples/parametric_car_rich_3d/RUN.bn"
+
+[[step]]
+id = "initial-rich-car-manufacturing-output"
+  [step.expect_root_text]
+  "manufacturing" = "Assembly"

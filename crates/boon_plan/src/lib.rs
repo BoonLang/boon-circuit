@@ -489,6 +489,23 @@ pub enum PlanRowExpression {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encoding: Option<Box<PlanRowExpression>>,
     },
+    BytesToText {
+        input: Box<PlanRowExpression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoding: Option<Box<PlanRowExpression>>,
+    },
+    BytesToHex {
+        input: Box<PlanRowExpression>,
+    },
+    BytesToBase64 {
+        input: Box<PlanRowExpression>,
+    },
+    BytesFromHex {
+        input: Box<PlanRowExpression>,
+    },
+    BytesFromBase64 {
+        input: Box<PlanRowExpression>,
+    },
     BytesIsEmpty {
         input: Box<PlanRowExpression>,
     },
@@ -504,6 +521,48 @@ pub enum PlanRowExpression {
         offset: Box<PlanRowExpression>,
         byte_count: Box<PlanRowExpression>,
     },
+    BytesTake {
+        input: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+    },
+    BytesDrop {
+        input: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+    },
+    BytesZeros {
+        byte_count: Box<PlanRowExpression>,
+    },
+    BytesReadUnsigned {
+        input: Box<PlanRowExpression>,
+        offset: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+        endian: Box<PlanRowExpression>,
+    },
+    BytesReadSigned {
+        input: Box<PlanRowExpression>,
+        offset: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+        endian: Box<PlanRowExpression>,
+    },
+    BytesSet {
+        input: Box<PlanRowExpression>,
+        index: Box<PlanRowExpression>,
+        value: Box<PlanRowExpression>,
+    },
+    BytesWriteUnsigned {
+        input: Box<PlanRowExpression>,
+        offset: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+        endian: Box<PlanRowExpression>,
+        value: Box<PlanRowExpression>,
+    },
+    BytesWriteSigned {
+        input: Box<PlanRowExpression>,
+        offset: Box<PlanRowExpression>,
+        byte_count: Box<PlanRowExpression>,
+        endian: Box<PlanRowExpression>,
+        value: Box<PlanRowExpression>,
+    },
     BytesFind {
         input: Box<PlanRowExpression>,
         needle: Box<PlanRowExpression>,
@@ -515,6 +574,10 @@ pub enum PlanRowExpression {
     BytesEndsWith {
         input: Box<PlanRowExpression>,
         suffix: Box<PlanRowExpression>,
+    },
+    BytesConcat {
+        left: Box<PlanRowExpression>,
+        right: Box<PlanRowExpression>,
     },
     BytesEqual {
         left: Box<PlanRowExpression>,
@@ -4726,13 +4789,27 @@ fn row_expression_value_type(
         PlanRowExpression::Constant { .. } => None,
         PlanRowExpression::TextTrim { .. }
         | PlanRowExpression::TextSubstring { .. }
-        | PlanRowExpression::TextConcat { .. } => Some(PlanValueType::Text),
-        PlanRowExpression::TextToBytes { .. } | PlanRowExpression::BytesSlice { .. } => {
+        | PlanRowExpression::TextConcat { .. }
+        | PlanRowExpression::BytesToText { .. }
+        | PlanRowExpression::BytesToHex { .. }
+        | PlanRowExpression::BytesToBase64 { .. } => Some(PlanValueType::Text),
+        PlanRowExpression::TextToBytes { .. }
+        | PlanRowExpression::BytesSlice { .. }
+        | PlanRowExpression::BytesTake { .. }
+        | PlanRowExpression::BytesDrop { .. }
+        | PlanRowExpression::BytesZeros { .. }
+        | PlanRowExpression::BytesSet { .. }
+        | PlanRowExpression::BytesWriteUnsigned { .. }
+        | PlanRowExpression::BytesWriteSigned { .. }
+        | PlanRowExpression::BytesConcat { .. }
+        | PlanRowExpression::BytesFromHex { .. }
+        | PlanRowExpression::BytesFromBase64 { .. } => {
             Some(PlanValueType::Bytes { fixed_len: None })
         }
-        PlanRowExpression::BytesLength { .. } | PlanRowExpression::BytesFind { .. } => {
-            Some(PlanValueType::Number)
-        }
+        PlanRowExpression::BytesLength { .. }
+        | PlanRowExpression::BytesFind { .. }
+        | PlanRowExpression::BytesReadUnsigned { .. }
+        | PlanRowExpression::BytesReadSigned { .. } => Some(PlanValueType::Number),
         PlanRowExpression::BytesGet { .. } => Some(PlanValueType::Byte),
         PlanRowExpression::BytesIsEmpty { .. }
         | PlanRowExpression::BytesStartsWith { .. }
@@ -4780,6 +4857,15 @@ fn lower_row_number_expr(
     expr_id: usize,
 ) -> Option<PlanRowExpression> {
     let expr = expr_by_id(program, expr_id)?;
+    if let AstExprKind::ByteLiteral { value, .. } = &expr.kind {
+        return Some(row_constant_expression(
+            constants,
+            inputs,
+            PlanConstantValue::Number {
+                value: i64::from(*value),
+            },
+        ));
+    }
     if let AstExprKind::Infix { left, op, right } = &expr.kind {
         if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
             return Some(PlanRowExpression::NumberInfix {
@@ -5044,13 +5130,27 @@ fn row_generic_builtin(function: &str) -> bool {
         function,
         "Text/empty"
             | "Text/to_bytes"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/to_base64"
+            | "Bytes/from_hex"
+            | "Bytes/from_base64"
             | "Bytes/is_empty"
             | "Bytes/length"
             | "Bytes/get"
             | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/zeros"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/set"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
             | "Bytes/find"
             | "Bytes/starts_with"
             | "Bytes/ends_with"
+            | "Bytes/concat"
             | "Bytes/equal"
             | "Error/new"
             | "Error/text"
@@ -5305,7 +5405,7 @@ fn lower_row_builtin_call(
     let args = args
         .iter()
         .map(|arg| {
-            let value = if matches!(arg.name.as_deref(), Some("encoding")) {
+            let value = if row_builtin_arg_expects_symbol(function, arg.name.as_deref()) {
                 lower_row_symbol_or_expr(
                     program,
                     derived,
@@ -5357,6 +5457,43 @@ fn lower_row_builtin_call(
             encoding,
         }));
     }
+    if function == "Bytes/to_text" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
+        let encoding = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("encoding"))
+            .map(|arg| Box::new(arg.value.clone()));
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToText {
+            input: Box::new(input),
+            encoding,
+        }));
+    }
+    if function == "Bytes/to_hex" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToHex {
+            input: Box::new(input),
+        }));
+    }
+    if function == "Bytes/to_base64" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToBase64 {
+            input: Box::new(input),
+        }));
+    }
+    if function == "Bytes/from_hex" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesFromHex {
+            input: Box::new(input),
+        }));
+    }
+    if function == "Bytes/from_base64" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesFromBase64 {
+                input: Box::new(input),
+            },
+        ));
+    }
     if function == "Bytes/is_empty" {
         let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
         return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesIsEmpty {
@@ -5404,6 +5541,98 @@ fn lower_row_builtin_call(
             byte_count: Box::new(byte_count),
         }));
     }
+    if function == "Bytes/take" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesTake {
+            input: Box::new(input),
+            byte_count: Box::new(byte_count),
+        }));
+    }
+    if function == "Bytes/drop" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesDrop {
+            input: Box::new(input),
+            byte_count: Box::new(byte_count),
+        }));
+    }
+    if function == "Bytes/zeros" && input.is_none() {
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesZeros {
+            byte_count: Box::new(byte_count),
+        }));
+    }
+    if function == "Bytes/read_unsigned" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let offset = row_call_arg_value(&args, &["offset", "start"])?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        let endian = row_call_arg_value(&args, &["endian"])?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesReadUnsigned {
+                input: Box::new(input),
+                offset: Box::new(offset),
+                byte_count: Box::new(byte_count),
+                endian: Box::new(endian),
+            },
+        ));
+    }
+    if function == "Bytes/read_signed" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let offset = row_call_arg_value(&args, &["offset", "start"])?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        let endian = row_call_arg_value(&args, &["endian"])?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesReadSigned {
+                input: Box::new(input),
+                offset: Box::new(offset),
+                byte_count: Box::new(byte_count),
+                endian: Box::new(endian),
+            },
+        ));
+    }
+    if function == "Bytes/set" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let index = row_call_arg_value(&args, &["index"])?;
+        let value = row_call_arg_value(&args, &["value"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesSet {
+            input: Box::new(input),
+            index: Box::new(index),
+            value: Box::new(value),
+        }));
+    }
+    if function == "Bytes/write_unsigned" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let offset = row_call_arg_value(&args, &["offset", "start"])?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        let endian = row_call_arg_value(&args, &["endian"])?;
+        let value = row_call_arg_value(&args, &["value"])?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesWriteUnsigned {
+                input: Box::new(input),
+                offset: Box::new(offset),
+                byte_count: Box::new(byte_count),
+                endian: Box::new(endian),
+                value: Box::new(value),
+            },
+        ));
+    }
+    if function == "Bytes/write_signed" {
+        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
+        let offset = row_call_arg_value(&args, &["offset", "start"])?;
+        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
+        let endian = row_call_arg_value(&args, &["endian"])?;
+        let value = row_call_arg_value(&args, &["value"])?;
+        return Some(LoweredRowValue::Scalar(
+            PlanRowExpression::BytesWriteSigned {
+                input: Box::new(input),
+                offset: Box::new(offset),
+                byte_count: Box::new(byte_count),
+                endian: Box::new(endian),
+                value: Box::new(value),
+            },
+        ));
+    }
     if function == "Bytes/find" {
         let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
         let needle = args
@@ -5439,6 +5668,14 @@ fn lower_row_builtin_call(
             suffix: Box::new(suffix),
         }));
     }
+    if function == "Bytes/concat" {
+        let left = input.or_else(|| row_call_arg_value(&args, &["left", "input"]))?;
+        let right = row_call_arg_value(&args, &["right", "with"])?;
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesConcat {
+            left: Box::new(left),
+            right: Box::new(right),
+        }));
+    }
     if function == "Bytes/equal" {
         let left = input.or_else(|| row_call_arg_value(&args, &["left", "input"]))?;
         let right = row_call_arg_value(&args, &["right", "with"])?;
@@ -5471,6 +5708,40 @@ fn row_builtin_arg_expects_number(function: &str, arg_name: Option<&str>) -> boo
         ("Bytes/get", Some("index"))
             | ("Bytes/slice", Some("offset"))
             | ("Bytes/slice", Some("byte_count"))
+            | ("Bytes/take", Some("byte_count" | "length" | "count"))
+            | ("Bytes/drop", Some("byte_count" | "length" | "count"))
+            | ("Bytes/zeros", Some("byte_count" | "length" | "count"))
+            | (
+                "Bytes/read_unsigned",
+                Some("offset" | "start" | "byte_count" | "length" | "count")
+            )
+            | (
+                "Bytes/read_signed",
+                Some("offset" | "start" | "byte_count" | "length" | "count")
+            )
+            | ("Bytes/set", Some("index" | "value"))
+            | (
+                "Bytes/write_unsigned",
+                Some("offset" | "start" | "byte_count" | "length" | "count" | "value")
+            )
+            | (
+                "Bytes/write_signed",
+                Some("offset" | "start" | "byte_count" | "length" | "count" | "value")
+            )
+    )
+}
+
+fn row_builtin_arg_expects_symbol(function: &str, arg_name: Option<&str>) -> bool {
+    matches!(
+        (function, arg_name),
+        (_, Some("encoding"))
+            | (
+                "Bytes/read_unsigned"
+                    | "Bytes/read_signed"
+                    | "Bytes/write_unsigned"
+                    | "Bytes/write_signed",
+                Some("endian")
+            )
     )
 }
 
@@ -8303,6 +8574,16 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
                     .as_deref()
                     .is_none_or(|encoding| row_expression_refs_resolve(op, encoding))
         }
+        PlanRowExpression::BytesToText { input, encoding } => {
+            row_expression_refs_resolve(op, input)
+                && encoding
+                    .as_deref()
+                    .is_none_or(|encoding| row_expression_refs_resolve(op, encoding))
+        }
+        PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input } => row_expression_refs_resolve(op, input),
         PlanRowExpression::BytesIsEmpty { input } => row_expression_refs_resolve(op, input),
         PlanRowExpression::BytesLength { input } => row_expression_refs_resolve(op, input),
         PlanRowExpression::BytesGet { input, index } => {
@@ -8317,6 +8598,57 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
                 && row_expression_refs_resolve(op, offset)
                 && row_expression_refs_resolve(op, byte_count)
         }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, byte_count)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => row_expression_refs_resolve(op, byte_count),
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_refs_resolve(op, input)
+                && row_expression_refs_resolve(op, offset)
+                && row_expression_refs_resolve(op, byte_count)
+                && row_expression_refs_resolve(op, endian)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_refs_resolve(op, input)
+                && row_expression_refs_resolve(op, index)
+                && row_expression_refs_resolve(op, value)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_refs_resolve(op, input)
+                && row_expression_refs_resolve(op, offset)
+                && row_expression_refs_resolve(op, byte_count)
+                && row_expression_refs_resolve(op, endian)
+                && row_expression_refs_resolve(op, value)
+        }
         PlanRowExpression::BytesFind { input, needle } => {
             row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, needle)
         }
@@ -8325,6 +8657,9 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
         }
         PlanRowExpression::BytesEndsWith { input, suffix } => {
             row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, suffix)
+        }
+        PlanRowExpression::BytesConcat { left, right } => {
+            row_expression_refs_resolve(op, left) && row_expression_refs_resolve(op, right)
         }
         PlanRowExpression::BytesEqual { left, right } => {
             row_expression_refs_resolve(op, left) && row_expression_refs_resolve(op, right)
@@ -8432,6 +8767,18 @@ fn row_expression_list_fields_resolve_inner(
                     .as_deref()
                     .is_none_or(|encoding| row_expression_list_fields_resolve_inner(plan, encoding))
         }
+        PlanRowExpression::BytesToText { input, encoding } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && encoding
+                    .as_deref()
+                    .is_none_or(|encoding| row_expression_list_fields_resolve_inner(plan, encoding))
+        }
+        PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+        }
         PlanRowExpression::BytesIsEmpty { input } => {
             row_expression_list_fields_resolve_inner(plan, input)
         }
@@ -8451,6 +8798,60 @@ fn row_expression_list_fields_resolve_inner(
                 && row_expression_list_fields_resolve_inner(plan, offset)
                 && row_expression_list_fields_resolve_inner(plan, byte_count)
         }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, byte_count)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => {
+            row_expression_list_fields_resolve_inner(plan, byte_count)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, offset)
+                && row_expression_list_fields_resolve_inner(plan, byte_count)
+                && row_expression_list_fields_resolve_inner(plan, endian)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, index)
+                && row_expression_list_fields_resolve_inner(plan, value)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_list_fields_resolve_inner(plan, input)
+                && row_expression_list_fields_resolve_inner(plan, offset)
+                && row_expression_list_fields_resolve_inner(plan, byte_count)
+                && row_expression_list_fields_resolve_inner(plan, endian)
+                && row_expression_list_fields_resolve_inner(plan, value)
+        }
         PlanRowExpression::BytesFind { input, needle } => {
             row_expression_list_fields_resolve_inner(plan, input)
                 && row_expression_list_fields_resolve_inner(plan, needle)
@@ -8462,6 +8863,10 @@ fn row_expression_list_fields_resolve_inner(
         PlanRowExpression::BytesEndsWith { input, suffix } => {
             row_expression_list_fields_resolve_inner(plan, input)
                 && row_expression_list_fields_resolve_inner(plan, suffix)
+        }
+        PlanRowExpression::BytesConcat { left, right } => {
+            row_expression_list_fields_resolve_inner(plan, left)
+                && row_expression_list_fields_resolve_inner(plan, right)
         }
         PlanRowExpression::BytesEqual { left, right } => {
             row_expression_list_fields_resolve_inner(plan, left)
@@ -8569,6 +8974,16 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                     .as_deref()
                     .is_some_and(row_expression_cpu_evaluable)
         }
+        PlanRowExpression::BytesToText { input, encoding } => {
+            row_expression_cpu_evaluable(input)
+                && encoding
+                    .as_deref()
+                    .is_some_and(row_expression_cpu_evaluable)
+        }
+        PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input } => row_expression_cpu_evaluable(input),
         PlanRowExpression::BytesIsEmpty { input } => row_expression_cpu_evaluable(input),
         PlanRowExpression::BytesLength { input } => row_expression_cpu_evaluable(input),
         PlanRowExpression::BytesGet { input, index } => {
@@ -8583,6 +8998,57 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                 && row_expression_cpu_evaluable(offset)
                 && row_expression_cpu_evaluable(byte_count)
         }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(byte_count)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => row_expression_cpu_evaluable(byte_count),
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_cpu_evaluable(input)
+                && row_expression_cpu_evaluable(offset)
+                && row_expression_cpu_evaluable(byte_count)
+                && row_expression_cpu_evaluable(endian)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_cpu_evaluable(input)
+                && row_expression_cpu_evaluable(index)
+                && row_expression_cpu_evaluable(value)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_cpu_evaluable(input)
+                && row_expression_cpu_evaluable(offset)
+                && row_expression_cpu_evaluable(byte_count)
+                && row_expression_cpu_evaluable(endian)
+                && row_expression_cpu_evaluable(value)
+        }
         PlanRowExpression::BytesFind { input, needle } => {
             row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(needle)
         }
@@ -8591,6 +9057,9 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         }
         PlanRowExpression::BytesEndsWith { input, suffix } => {
             row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(suffix)
+        }
+        PlanRowExpression::BytesConcat { left, right } => {
+            row_expression_cpu_evaluable(left) && row_expression_cpu_evaluable(right)
         }
         PlanRowExpression::BytesEqual { left, right } => {
             row_expression_cpu_evaluable(left) && row_expression_cpu_evaluable(right)
@@ -12617,6 +13086,200 @@ payload:
                     };
                     true
                 }
+                PlanRowExpression::BytesTake { input, byte_count } if function == "Bytes/take" => {
+                    let input = (**input).clone();
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesDrop { input, byte_count } if function == "Bytes/drop" => {
+                    let input = (**input).clone();
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesZeros { byte_count } if function == "Bytes/zeros" => {
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: None,
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } if function == "Bytes/read_unsigned" => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } if function == "Bytes/read_signed" => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } if function == "Bytes/set" => {
+                    let input = (**input).clone();
+                    let index = (**index).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("index".to_owned()),
+                                value: index,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } if function == "Bytes/write_unsigned" => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } if function == "Bytes/write_signed" => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
+                            },
+                        ],
+                    };
+                    true
+                }
                 PlanRowExpression::BytesEndsWith { input, suffix }
                     if function == "Bytes/ends_with" =>
                 {
@@ -12629,6 +13292,74 @@ payload:
                             name: Some("suffix".to_owned()),
                             value: suffix,
                         }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesConcat { left, right } if function == "Bytes/concat" => {
+                    let left = (**left).clone();
+                    let right = (**right).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(left)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("with".to_owned()),
+                            value: right,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesToText { input, encoding }
+                    if function == "Bytes/to_text" =>
+                {
+                    let input = (**input).clone();
+                    let args = encoding
+                        .as_deref()
+                        .map(|encoding| PlanRowCallArg {
+                            name: Some("encoding".to_owned()),
+                            value: encoding.clone(),
+                        })
+                        .into_iter()
+                        .collect();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args,
+                    };
+                    true
+                }
+                PlanRowExpression::BytesToHex { input } if function == "Bytes/to_hex" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesToBase64 { input } if function == "Bytes/to_base64" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesFromHex { input } if function == "Bytes/from_hex" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesFromBase64 { input } if function == "Bytes/from_base64" => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: function.to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
                     };
                     true
                 }
@@ -12677,6 +13408,18 @@ payload:
                             replace_first_row_bytes_builtin(encoding, function)
                         })
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || encoding.as_deref_mut().is_some_and(|encoding| {
+                            replace_first_row_bytes_builtin(encoding, function)
+                        })
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => {
+                    replace_first_row_bytes_builtin(input, function)
+                }
                 PlanRowExpression::BytesGet { input, index } => {
                     replace_first_row_bytes_builtin(input, function)
                         || replace_first_row_bytes_builtin(index, function)
@@ -12690,6 +13433,60 @@ payload:
                         || replace_first_row_bytes_builtin(offset, function)
                         || replace_first_row_bytes_builtin(byte_count, function)
                 }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(byte_count, function)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    replace_first_row_bytes_builtin(byte_count, function)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(offset, function)
+                        || replace_first_row_bytes_builtin(byte_count, function)
+                        || replace_first_row_bytes_builtin(endian, function)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(index, function)
+                        || replace_first_row_bytes_builtin(value, function)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    replace_first_row_bytes_builtin(input, function)
+                        || replace_first_row_bytes_builtin(offset, function)
+                        || replace_first_row_bytes_builtin(byte_count, function)
+                        || replace_first_row_bytes_builtin(endian, function)
+                        || replace_first_row_bytes_builtin(value, function)
+                }
                 PlanRowExpression::BytesFind { input, needle } => {
                     replace_first_row_bytes_builtin(input, function)
                         || replace_first_row_bytes_builtin(needle, function)
@@ -12701,6 +13498,10 @@ payload:
                 PlanRowExpression::BytesEndsWith { input, suffix } => {
                     replace_first_row_bytes_builtin(input, function)
                         || replace_first_row_bytes_builtin(suffix, function)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    replace_first_row_bytes_builtin(left, function)
+                        || replace_first_row_bytes_builtin(right, function)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     replace_first_row_bytes_builtin(left, function)
@@ -12764,7 +13565,7 @@ store: [
         }
     rows:
         LIST {
-            [payload: BYTES[3] { 16u01, 16u02, 16u03 }]
+            [payload: BYTES[3] { 16u41, 16u42, 16u43 }]
             [payload: BYTES[0] {}]
         }
         |> List/map(row, new: row_summary(row: row))
@@ -12773,12 +13574,26 @@ store: [
 FUNCTION row_summary(row) {
     [
         payload: row.payload
-        suffix: BYTES[2] { 16u02, 16u03 }
+        suffix: BYTES[2] { 16u42, 16u43 }
         empty: row.payload |> Bytes/is_empty
         len: row.payload |> Bytes/length
         second: row.payload |> Bytes/get(index: 1)
-        ends: row.payload |> Bytes/ends_with(suffix: BYTES[2] { 16u02, 16u03 })
+        taken: row.payload |> Bytes/take(byte_count: 2)
+        dropped: row.payload |> Bytes/drop(byte_count: 1)
+        zeroed: Bytes/zeros(byte_count: 2)
+        read_u16_be: row.payload |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Big)
+        read_i8: row.payload |> Bytes/read_signed(offset: 0, byte_count: 1, endian: Little)
+        patched: row.payload |> Bytes/set(index: 1, value: 16uFF)
+        write_u16_be: row.payload |> Bytes/write_unsigned(offset: 0, byte_count: 2, endian: Big, value: 258)
+        write_i8: row.payload |> Bytes/write_signed(offset: 0, byte_count: 1, endian: Little, value: -1)
+        ends: row.payload |> Bytes/ends_with(suffix: BYTES[2] { 16u42, 16u43 })
         same: row.payload |> Bytes/equal(with: row.payload)
+        joined: row.payload |> Bytes/concat(with: BYTES[1] { 16u04 })
+        text: row.payload |> Bytes/to_text(encoding: Utf8)
+        hex: row.payload |> Bytes/to_hex
+        base64: row.payload |> Bytes/to_base64
+        decoded_hex: TEXT { 414243 } |> Bytes/from_hex
+        decoded_base64: TEXT { QUJD } |> Bytes/from_base64
     ]
 }
 
@@ -12793,13 +13608,41 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
         assert_eq!(count_kind(&plan_json, "bytes_is_empty"), 1);
         assert_eq!(count_kind(&plan_json, "bytes_length"), 1);
         assert_eq!(count_kind(&plan_json, "bytes_get"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_take"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_drop"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_zeros"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_read_unsigned"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_read_signed"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_set"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_write_unsigned"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_write_signed"), 1);
         assert_eq!(count_kind(&plan_json, "bytes_ends_with"), 1);
         assert_eq!(count_kind(&plan_json, "bytes_equal"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_concat"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_to_text"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_to_hex"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_to_base64"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_from_hex"), 1);
+        assert_eq!(count_kind(&plan_json, "bytes_from_base64"), 1);
         assert_eq!(count_generic_builtin(&plan_json, "Bytes/is_empty"), 0);
         assert_eq!(count_generic_builtin(&plan_json, "Bytes/length"), 0);
         assert_eq!(count_generic_builtin(&plan_json, "Bytes/get"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/take"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/drop"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/zeros"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/read_unsigned"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/read_signed"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/set"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/write_unsigned"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/write_signed"), 0);
         assert_eq!(count_generic_builtin(&plan_json, "Bytes/ends_with"), 0);
         assert_eq!(count_generic_builtin(&plan_json, "Bytes/equal"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/concat"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/to_text"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/to_hex"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/to_base64"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/from_hex"), 0);
+        assert_eq!(count_generic_builtin(&plan_json, "Bytes/from_base64"), 0);
 
         let verification = verify_plan(&plan).unwrap();
         assert_eq!(verification.status, "pass");
@@ -12808,8 +13651,22 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
             "Bytes/is_empty",
             "Bytes/length",
             "Bytes/get",
+            "Bytes/take",
+            "Bytes/drop",
+            "Bytes/zeros",
+            "Bytes/read_unsigned",
+            "Bytes/read_signed",
+            "Bytes/set",
+            "Bytes/write_unsigned",
+            "Bytes/write_signed",
             "Bytes/ends_with",
             "Bytes/equal",
+            "Bytes/concat",
+            "Bytes/to_text",
+            "Bytes/to_hex",
+            "Bytes/to_base64",
+            "Bytes/from_hex",
+            "Bytes/from_base64",
         ] {
             let mut tampered = plan.clone();
             let replaced = tampered
@@ -12854,6 +13711,29 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             expression_contains_function(encoding, function_name)
                         })
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    function_name == "Bytes/to_text"
+                        || expression_contains_function(input, function_name)
+                        || encoding.as_deref().is_some_and(|encoding| {
+                            expression_contains_function(encoding, function_name)
+                        })
+                }
+                PlanRowExpression::BytesToHex { input } => {
+                    function_name == "Bytes/to_hex"
+                        || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesToBase64 { input } => {
+                    function_name == "Bytes/to_base64"
+                        || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesFromHex { input } => {
+                    function_name == "Bytes/from_hex"
+                        || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesFromBase64 { input } => {
+                    function_name == "Bytes/from_base64"
+                        || expression_contains_function(input, function_name)
+                }
                 PlanRowExpression::BytesFind { input, needle } => {
                     function_name == "Bytes/find"
                         || expression_contains_function(input, function_name)
@@ -12872,6 +13752,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 PlanRowExpression::BytesIsEmpty { input } => {
                     function_name == "Bytes/is_empty"
                         || expression_contains_function(input, function_name)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    function_name == "Bytes/concat"
+                        || expression_contains_function(left, function_name)
+                        || expression_contains_function(right, function_name)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     function_name == "Bytes/equal"
@@ -12932,6 +13817,77 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     expression_contains_function(input, function_name)
                         || expression_contains_function(offset, function_name)
                         || expression_contains_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    expression_contains_function(input, function_name)
+                        || expression_contains_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    expression_contains_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    (matches!(
+                        expression,
+                        PlanRowExpression::BytesReadUnsigned { .. }
+                            if function_name == "Bytes/read_unsigned"
+                    ) || matches!(
+                        expression,
+                        PlanRowExpression::BytesReadSigned { .. }
+                            if function_name == "Bytes/read_signed"
+                    )) || expression_contains_function(input, function_name)
+                        || expression_contains_function(offset, function_name)
+                        || expression_contains_function(byte_count, function_name)
+                        || expression_contains_function(endian, function_name)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    function_name == "Bytes/set"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(index, function_name)
+                        || expression_contains_function(value, function_name)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    function_name == "Bytes/write_unsigned"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(offset, function_name)
+                        || expression_contains_function(byte_count, function_name)
+                        || expression_contains_function(endian, function_name)
+                        || expression_contains_function(value, function_name)
+                }
+                PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    function_name == "Bytes/write_signed"
+                        || expression_contains_function(input, function_name)
+                        || expression_contains_function(offset, function_name)
+                        || expression_contains_function(byte_count, function_name)
+                        || expression_contains_function(endian, function_name)
+                        || expression_contains_function(value, function_name)
                 }
                 PlanRowExpression::NumberInfix { left, right, .. } => {
                     expression_contains_function(left, function_name)
@@ -13015,6 +13971,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             .as_deref()
                             .is_some_and(contains_direct_bytes_find_text_concat)
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || encoding
+                            .as_deref()
+                            .is_some_and(contains_direct_bytes_find_text_concat)
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => {
+                    contains_direct_bytes_find_text_concat(input)
+                }
                 PlanRowExpression::BytesLength { input } => {
                     contains_direct_bytes_find_text_concat(input)
                 }
@@ -13031,6 +13999,60 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                         || contains_direct_bytes_find_text_concat(offset)
                         || contains_direct_bytes_find_text_concat(byte_count)
                 }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(byte_count)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    contains_direct_bytes_find_text_concat(byte_count)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(offset)
+                        || contains_direct_bytes_find_text_concat(byte_count)
+                        || contains_direct_bytes_find_text_concat(endian)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(index)
+                        || contains_direct_bytes_find_text_concat(value)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    contains_direct_bytes_find_text_concat(input)
+                        || contains_direct_bytes_find_text_concat(offset)
+                        || contains_direct_bytes_find_text_concat(byte_count)
+                        || contains_direct_bytes_find_text_concat(endian)
+                        || contains_direct_bytes_find_text_concat(value)
+                }
                 PlanRowExpression::BytesFind { input, needle } => {
                     contains_direct_bytes_find_text_concat(input)
                         || contains_direct_bytes_find_text_concat(needle)
@@ -13045,6 +14067,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 }
                 PlanRowExpression::BytesIsEmpty { input } => {
                     contains_direct_bytes_find_text_concat(input)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    contains_direct_bytes_find_text_concat(left)
+                        || contains_direct_bytes_find_text_concat(right)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     contains_direct_bytes_find_text_concat(left)
@@ -13130,6 +14156,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             .as_deref()
                             .is_some_and(contains_bytes_find_numeric_plus)
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || encoding
+                            .as_deref()
+                            .is_some_and(contains_bytes_find_numeric_plus)
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => {
+                    contains_bytes_find_numeric_plus(input)
+                }
                 PlanRowExpression::BytesLength { input } => contains_bytes_find_numeric_plus(input),
                 PlanRowExpression::BytesGet { input, index } => {
                     contains_bytes_find_numeric_plus(input)
@@ -13143,6 +14181,60 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     contains_bytes_find_numeric_plus(input)
                         || contains_bytes_find_numeric_plus(offset)
                         || contains_bytes_find_numeric_plus(byte_count)
+                }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(byte_count)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    contains_bytes_find_numeric_plus(byte_count)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(offset)
+                        || contains_bytes_find_numeric_plus(byte_count)
+                        || contains_bytes_find_numeric_plus(endian)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(index)
+                        || contains_bytes_find_numeric_plus(value)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    contains_bytes_find_numeric_plus(input)
+                        || contains_bytes_find_numeric_plus(offset)
+                        || contains_bytes_find_numeric_plus(byte_count)
+                        || contains_bytes_find_numeric_plus(endian)
+                        || contains_bytes_find_numeric_plus(value)
                 }
                 PlanRowExpression::BytesFind { input, needle } => {
                     contains_bytes_find_numeric_plus(input)
@@ -13158,6 +14250,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 }
                 PlanRowExpression::BytesIsEmpty { input } => {
                     contains_bytes_find_numeric_plus(input)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    contains_bytes_find_numeric_plus(left)
+                        || contains_bytes_find_numeric_plus(right)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     contains_bytes_find_numeric_plus(left)
@@ -13243,9 +14339,70 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     contains_typed_bytes_slice(input)
                         || encoding.as_deref().is_some_and(contains_typed_bytes_slice)
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    contains_typed_bytes_slice(input)
+                        || encoding.as_deref().is_some_and(contains_typed_bytes_slice)
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => contains_typed_bytes_slice(input),
                 PlanRowExpression::BytesLength { input } => contains_typed_bytes_slice(input),
                 PlanRowExpression::BytesGet { input, index } => {
                     contains_typed_bytes_slice(input) || contains_typed_bytes_slice(index)
+                }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    contains_typed_bytes_slice(input) || contains_typed_bytes_slice(byte_count)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    contains_typed_bytes_slice(byte_count)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    contains_typed_bytes_slice(input)
+                        || contains_typed_bytes_slice(offset)
+                        || contains_typed_bytes_slice(byte_count)
+                        || contains_typed_bytes_slice(endian)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    contains_typed_bytes_slice(input)
+                        || contains_typed_bytes_slice(index)
+                        || contains_typed_bytes_slice(value)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    contains_typed_bytes_slice(input)
+                        || contains_typed_bytes_slice(offset)
+                        || contains_typed_bytes_slice(byte_count)
+                        || contains_typed_bytes_slice(endian)
+                        || contains_typed_bytes_slice(value)
                 }
                 PlanRowExpression::BytesFind { input, needle } => {
                     contains_typed_bytes_slice(input) || contains_typed_bytes_slice(needle)
@@ -13257,6 +14414,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     contains_typed_bytes_slice(input) || contains_typed_bytes_slice(suffix)
                 }
                 PlanRowExpression::BytesIsEmpty { input } => contains_typed_bytes_slice(input),
+                PlanRowExpression::BytesConcat { left, right } => {
+                    contains_typed_bytes_slice(left) || contains_typed_bytes_slice(right)
+                }
                 PlanRowExpression::BytesEqual { left, right } => {
                     contains_typed_bytes_slice(left) || contains_typed_bytes_slice(right)
                 }
@@ -13301,11 +14461,25 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
         fn contains_typed_byte_scanner_ops(expression: &PlanRowExpression) -> bool {
             match expression {
                 PlanRowExpression::TextToBytes { .. }
+                | PlanRowExpression::BytesToText { .. }
+                | PlanRowExpression::BytesToHex { .. }
+                | PlanRowExpression::BytesToBase64 { .. }
+                | PlanRowExpression::BytesFromHex { .. }
+                | PlanRowExpression::BytesFromBase64 { .. }
                 | PlanRowExpression::BytesFind { .. }
                 | PlanRowExpression::BytesStartsWith { .. }
                 | PlanRowExpression::BytesEndsWith { .. }
                 | PlanRowExpression::BytesIsEmpty { .. }
-                | PlanRowExpression::BytesEqual { .. } => true,
+                | PlanRowExpression::BytesConcat { .. }
+                | PlanRowExpression::BytesEqual { .. }
+                | PlanRowExpression::BytesTake { .. }
+                | PlanRowExpression::BytesDrop { .. }
+                | PlanRowExpression::BytesZeros { .. }
+                | PlanRowExpression::BytesReadUnsigned { .. }
+                | PlanRowExpression::BytesReadSigned { .. }
+                | PlanRowExpression::BytesSet { .. }
+                | PlanRowExpression::BytesWriteUnsigned { .. }
+                | PlanRowExpression::BytesWriteSigned { .. } => true,
                 PlanRowExpression::TextTrim { input }
                 | PlanRowExpression::TextIsEmpty { input }
                 | PlanRowExpression::TextLength { input }
@@ -13433,6 +14607,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             matches_generic_row_builtin_function(encoding, function_name)
                         })
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || encoding.as_deref().is_some_and(|encoding| {
+                            matches_generic_row_builtin_function(encoding, function_name)
+                        })
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                }
                 PlanRowExpression::BytesLength { input } => {
                     matches_generic_row_builtin_function(input, function_name)
                 }
@@ -13449,6 +14635,60 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                         || matches_generic_row_builtin_function(offset, function_name)
                         || matches_generic_row_builtin_function(byte_count, function_name)
                 }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    matches_generic_row_builtin_function(byte_count, function_name)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(offset, function_name)
+                        || matches_generic_row_builtin_function(byte_count, function_name)
+                        || matches_generic_row_builtin_function(endian, function_name)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(index, function_name)
+                        || matches_generic_row_builtin_function(value, function_name)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    matches_generic_row_builtin_function(input, function_name)
+                        || matches_generic_row_builtin_function(offset, function_name)
+                        || matches_generic_row_builtin_function(byte_count, function_name)
+                        || matches_generic_row_builtin_function(endian, function_name)
+                        || matches_generic_row_builtin_function(value, function_name)
+                }
                 PlanRowExpression::BytesFind { input, needle } => {
                     matches_generic_row_builtin_function(input, function_name)
                         || matches_generic_row_builtin_function(needle, function_name)
@@ -13463,6 +14703,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 }
                 PlanRowExpression::BytesIsEmpty { input } => {
                     matches_generic_row_builtin_function(input, function_name)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    matches_generic_row_builtin_function(left, function_name)
+                        || matches_generic_row_builtin_function(right, function_name)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     matches_generic_row_builtin_function(left, function_name)
@@ -13528,6 +14772,59 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     };
                     true
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    let input = (**input).clone();
+                    let args = encoding
+                        .as_deref()
+                        .map(|encoding| PlanRowCallArg {
+                            name: Some("encoding".to_owned()),
+                            value: encoding.clone(),
+                        })
+                        .into_iter()
+                        .collect();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/to_text".to_owned(),
+                        input: Some(Box::new(input)),
+                        args,
+                    };
+                    true
+                }
+                PlanRowExpression::BytesToHex { input } => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/to_hex".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesToBase64 { input } => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/to_base64".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesFromHex { input } => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/from_hex".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesFromBase64 { input } => {
+                    let input = (**input).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/from_base64".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: Vec::new(),
+                    };
+                    true
+                }
                 PlanRowExpression::BytesSlice {
                     input,
                     offset,
@@ -13547,6 +14844,200 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             PlanRowCallArg {
                                 name: Some("byte_count".to_owned()),
                                 value: byte_count,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesTake { input, byte_count } => {
+                    let input = (**input).clone();
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/take".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesDrop { input, byte_count } => {
+                    let input = (**input).clone();
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/drop".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    let byte_count = (**byte_count).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/zeros".to_owned(),
+                        input: None,
+                        args: vec![PlanRowCallArg {
+                            name: Some("byte_count".to_owned()),
+                            value: byte_count,
+                        }],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/read_unsigned".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/read_signed".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    let input = (**input).clone();
+                    let index = (**index).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/set".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("index".to_owned()),
+                                value: index,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/write_unsigned".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
+                            },
+                        ],
+                    };
+                    true
+                }
+                PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    let input = (**input).clone();
+                    let offset = (**offset).clone();
+                    let byte_count = (**byte_count).clone();
+                    let endian = (**endian).clone();
+                    let value = (**value).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/write_signed".to_owned(),
+                        input: Some(Box::new(input)),
+                        args: vec![
+                            PlanRowCallArg {
+                                name: Some("offset".to_owned()),
+                                value: offset,
+                            },
+                            PlanRowCallArg {
+                                name: Some("byte_count".to_owned()),
+                                value: byte_count,
+                            },
+                            PlanRowCallArg {
+                                name: Some("endian".to_owned()),
+                                value: endian,
+                            },
+                            PlanRowCallArg {
+                                name: Some("value".to_owned()),
+                                value,
                             },
                         ],
                     };
@@ -13597,6 +15088,19 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                         function: "Bytes/is_empty".to_owned(),
                         input: Some(Box::new(input)),
                         args: Vec::new(),
+                    };
+                    true
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    let left = (**left).clone();
+                    let right = (**right).clone();
+                    *expression = PlanRowExpression::BuiltinCall {
+                        function: "Bytes/concat".to_owned(),
+                        input: Some(Box::new(left)),
+                        args: vec![PlanRowCallArg {
+                            name: Some("with".to_owned()),
+                            value: right,
+                        }],
                     };
                     true
                 }
@@ -13808,6 +15312,18 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                             .as_deref_mut()
                             .is_some_and(|encoding| tamper_first_row_lookup(encoding, invalid))
                 }
+                PlanRowExpression::BytesToText { input, encoding } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || encoding
+                            .as_deref_mut()
+                            .is_some_and(|encoding| tamper_first_row_lookup(encoding, invalid))
+                }
+                PlanRowExpression::BytesToHex { input }
+                | PlanRowExpression::BytesToBase64 { input }
+                | PlanRowExpression::BytesFromHex { input }
+                | PlanRowExpression::BytesFromBase64 { input } => {
+                    tamper_first_row_lookup(input, invalid)
+                }
                 PlanRowExpression::BytesLength { input } => tamper_first_row_lookup(input, invalid),
                 PlanRowExpression::BytesGet { input, index } => {
                     tamper_first_row_lookup(input, invalid)
@@ -13821,6 +15337,60 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     tamper_first_row_lookup(input, invalid)
                         || tamper_first_row_lookup(offset, invalid)
                         || tamper_first_row_lookup(byte_count, invalid)
+                }
+                PlanRowExpression::BytesTake { input, byte_count }
+                | PlanRowExpression::BytesDrop { input, byte_count } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(byte_count, invalid)
+                }
+                PlanRowExpression::BytesZeros { byte_count } => {
+                    tamper_first_row_lookup(byte_count, invalid)
+                }
+                PlanRowExpression::BytesReadUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                }
+                | PlanRowExpression::BytesReadSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(offset, invalid)
+                        || tamper_first_row_lookup(byte_count, invalid)
+                        || tamper_first_row_lookup(endian, invalid)
+                }
+                PlanRowExpression::BytesSet {
+                    input,
+                    index,
+                    value,
+                } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(index, invalid)
+                        || tamper_first_row_lookup(value, invalid)
+                }
+                PlanRowExpression::BytesWriteUnsigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                }
+                | PlanRowExpression::BytesWriteSigned {
+                    input,
+                    offset,
+                    byte_count,
+                    endian,
+                    value,
+                } => {
+                    tamper_first_row_lookup(input, invalid)
+                        || tamper_first_row_lookup(offset, invalid)
+                        || tamper_first_row_lookup(byte_count, invalid)
+                        || tamper_first_row_lookup(endian, invalid)
+                        || tamper_first_row_lookup(value, invalid)
                 }
                 PlanRowExpression::BytesFind { input, needle } => {
                     tamper_first_row_lookup(input, invalid)
@@ -13836,6 +15406,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 }
                 PlanRowExpression::BytesIsEmpty { input } => {
                     tamper_first_row_lookup(input, invalid)
+                }
+                PlanRowExpression::BytesConcat { left, right } => {
+                    tamper_first_row_lookup(left, invalid)
+                        || tamper_first_row_lookup(right, invalid)
                 }
                 PlanRowExpression::BytesEqual { left, right } => {
                     tamper_first_row_lookup(left, invalid)

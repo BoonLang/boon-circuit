@@ -118,7 +118,7 @@ Every implementation task must use this exact shape:
 
 ```md
 ### TASK-0000 Short Title
-Status: pending
+Status: in-progress
 Type: implementation | gate | refactor | measurement | cleanup
 Priority: P0 | P1 | P2 | P3
 Depends on: none | TASK-0000
@@ -2998,7 +2998,7 @@ Notes:
   postponed historical evidence.
 
 ### TASK-0804C Compiled Root-List Currentness And Field Frontier
-Status: pending
+Status: in_progress
 Type: implementation
 Priority: P1
 Depends on: TASK-0804B, TASK-1001, TASK-1002
@@ -3079,6 +3079,69 @@ Notes:
   The earlier first control recorded root p95 `4.279103/1.389330/2.703999`,
   `selected_signal_lane_rows eval_ms=33.297496`, and
   `selected_cursor_pair_rows eval_ms=10.224008`.
+- 2026-06-23 TASK-0804C measurement-hardening slice: canonical
+  `verify-native-gpu-novywave-interaction-speed` now records lightweight
+  `runtime_root_materialization_stats.by_path` aggregates without enabling
+  `BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES` or
+  `BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS`, and the
+  `runtime_root_list_cause_summary` consumes those aggregates before falling
+  back to heavy samples. Fresh canonical report
+  `target/reports/native-gpu/novywave-interaction-speed.json` is for
+  `worktree_fingerprint=26190d378666ed10444f9cb802d331245f66beed0dd5b951ebb81795f46b0434`,
+  `binary_hash=f9e9820f186c03af197d175548e110d7035f809b874ce95a982cae225a9b3cf8`,
+  and
+  `playground_binary_hash=fed542d14d99a9fd409eb4c776a770025e7ab68baa35ff8bc9be2b900427f4ec`.
+  The gate still fails strict latency: `click/input.p95=29.878051ms`,
+  `runtime_apply.p95=13.598779ms`, `runtime_step_apply.p95=9.422290ms`,
+  and `layout_rebuild.p95=11.459868ms`. The report now names the hot lists:
+  `selected_signal_lane_rows` (`eval_ms=34.435977`,
+  `elapsed_ms=41.244712`, `current_dirty_read_count=1384`,
+  `field_only_patch_count=56`), `selected_cursor_pair_rows`
+  (`eval_ms=10.651333`, `elapsed_ms=12.343382`,
+  `current_dirty_read_count=1232`, `field_only_patch_count=48`), and
+  `selected_visible_items` (`eval_ms=5.752683`,
+  `elapsed_ms=14.032699`, `current_dirty_read_count=184`,
+  `field_only_patch_count=24`). This confirms the remaining work is not a
+  missing full-row fallback; `full_eval_row_count=0`,
+  `row_materialize_ms=0.0`, and the residual blocker is repeated field-only
+  patch/currentness work plus root flush/layout cost. This slice does not meet
+  TASK-0804C performance acceptance and must not be counted as the compiled
+  frontier implementation.
+- 2026-06-23 TASK-0804C follow-up: while testing a tiny dirty-structure-list
+  memoization, `cargo test -p boon_runtime --lib root_list_view_` exposed a
+  real compiler/IR shape bug: statement pipelines ending in
+  `List/join_field` after `List/retain` were classified as `ListView`, so
+  scalar roots like `selected_label` materialized as `[]`. Fixed the engine by
+  making IR derived-value classification terminal-reducer aware for top-level
+  `List/join_field` pipelines, and added
+  `terminal_list_join_field_pipeline_is_scalar_not_list_view` to preserve both
+  scalar reducer behavior and nested-list-view behavior. Also taught
+  typecheck statement-pipeline inference that `List/join_field` is `TEXT`.
+  Verification passed:
+  `cargo test -p boon_ir --lib terminal_list_join_field_pipeline_is_scalar_not_list_view -- --nocapture`,
+  `cargo test -p boon_typecheck --lib scalar_function_arg_is_not_polluted_by_same_named_row_scope -- --nocapture`,
+  and
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`.
+- 2026-06-23 tiny dirty-structure-list memoization was killed and reverted.
+  Fresh canonical speed report
+  `target/reports/native-gpu/novywave-interaction-speed.json` for
+  `worktree_fingerprint=fd24bee5e248014e96bdfac6c75c99f0a1c8aeae51c09cd3209c0cd35cd406b7`,
+  `binary_hash=968dd72be4d242c8f7aa980fe2a91c1371b53e3dedda53addba3fd7a235c474f`,
+  and
+  `playground_binary_hash=a6433f3cd35b65909d4ad315cf26b9453b509e48242d88a8109a35cd157ea08b`
+  still failed strict budgets with `click/input.p95=29.862278ms`,
+  `hover.p95=18.782625ms`, `divider.p95=19.005679ms`,
+  `runtime_apply.p95=13.855814ms`, `runtime_step_apply.p95=9.546275ms`,
+  and `layout_rebuild.p95=11.433659ms`. Click root-list totals remained
+  effectively unchanged: `current_dirty_read_count=3056`,
+  `full_eval_row_count=0`, `field_cache_hits=4768`,
+  `field_cache_misses=256`, and `field_only_patch_count=152`. Dominant click
+  list remains `selected_signal_lane_rows` with `elapsed_ms=42.848784`,
+  `eval_ms=35.804280`, `diff_ms=31.269098`, and
+  `user_function_body_ms=27.230012`. The memoization did not meet the
+  keep criteria, so the next TASK-0804C slice should target compiled
+  field/frontier metadata or user-function/diff/layout work, not this local
+  set-allocation micro-path.
 
 ## Phase 9: Low-Level Rust Experiments
 
@@ -7439,6 +7502,10408 @@ Append entries here as `/goal` executes tasks. Do not delete older entries.
 - Result: Cells release benchmark evidence remains open for BYTES Phase 9.
   Do not add the missing Cells benchmark wrapper to aggregate requirements
   until a passing, schema-valid wrapper exists.
+
+### 2026-06-23 TASK-0804B Bound-Input Summary Hot-Path Split
+
+- Scope: continued the active unified speedup goal by measuring the NovyWave
+  interaction slow path before changing behavior. This does not complete
+  `TASK-0804A` or `TASK-0804B`; it removes one measured shared-state tail cost
+  and records the remaining blockers.
+- Measurement split added to `crates/boon_native_playground/src/main.rs`:
+  `bound_input_state_summary_ms`, `shared_lock_wait_ms`, and
+  `bound_input_sync_ms` for preview interaction timing samples and scoped
+  report summaries.
+- Cause learned: after the incremental derived-index patch, normal NovyWave
+  hover/click/divider interactions still spent about `12 ms` in a redundant
+  full `document_state_summary()` call used only for bound-input sync. The
+  diagnostic report
+  `target/artifacts/native-gpu/novywave-interaction-speed-bound-sync-reason.json`
+  showed the broad fallback was triggered by stable source-intent row identity
+  bookkeeping:
+  `missing_visible_binding_path:@list:row.signals:1:1:key`, not by a changed
+  visible text-input value.
+- Kept change: patched-layout shared-state sync now reuses the existing
+  post-turn/window summary by default and falls back to a full document summary
+  only when a visible `TextInput` read cannot be resolved from that summary.
+  This is generic layout/input behavior: no Boon syntax changed, no NovyWave
+  source was rewritten, and no NovyWave filename or fixture branch was added.
+- Accepted speed evidence:
+  `target/artifacts/native-gpu/novywave-interaction-speed-bound-sync-textinput-only.json`.
+  The report still fails, but the bound-input full-summary bucket is now
+  `0.000 ms` for hover, click, and divider. Final latency moved to
+  `hover=27.303802 ms`, `click=34.574456 ms`, and
+  `divider=22.796633 ms`. Interaction apply totals moved to
+  `hover=21.112270 ms`, `click=33.382336 ms`, and
+  `divider=21.716534 ms`.
+- Remaining cause: TASK-0804B is still open because click runtime apply remains
+  high (`12.345280 ms`) and click layout rebuild remains near the frame budget
+  (`16.210959 ms`). The next slice should return to runtime/root
+  materialization and graph shape before another renderer or shared-state
+  micro-optimization.
+
+### 2026-06-23 TASK-0804B Compact Shared Snapshot Killed
+
+- Scope: tested whether moving the runtime document/window summary out of the
+  hot patched paint-space proof JSON and into `PreviewSharedRenderState` would
+  reduce proof-build or layout-wrapper overhead.
+- Experiment evidence:
+  `target/artifacts/native-gpu/novywave-interaction-speed-compact-shared-snapshot.json`.
+  Baseline evidence:
+  `target/artifacts/native-gpu/novywave-interaction-speed-bound-sync-textinput-only.json`.
+- Result: killed and backed out. The verifier still failed and got slower:
+  baseline click final/apply/proof was `34.574456 ms` / `33.382336 ms` /
+  `3.204112 ms`; experiment click final/apply/proof was `36.744741 ms` /
+  `35.776293 ms` / `3.279807 ms`. Report JSON size improved only
+  `331233 -> 330439` bytes, and the patch profile still recorded
+  `compact_hot_proof=false`.
+- Follow-up rule: do not retry this shape as a blind proof-payload
+  optimization. If compact hot proofs are revisited, first add a direct
+  verifier mode that actually exercises `compact_hot_proof=true`, then compare
+  proof-build, shared update, and final latency against the current accepted
+  bound-sync baseline.
+- TASK-0804B remains `in_progress`, with the next useful work still aimed at
+  click runtime/root materialization, layout patch/proof construction, or
+  shared update/bound sync based on fresh measurements.
+
+### 2026-06-23 TASK-0804C Field-Only Fingerprint/Compare Experiment Killed
+
+- Scope: continued the TASK-0804C root-list materialization slice after the
+  scalar reducer classifier fix. The attempted optimization was generic runtime
+  code only: share row-independent field-only env fingerprints across rows and
+  compare target row fields through direct `FieldValue` storage instead of
+  converting from `FieldValueRef`.
+- Experiment evidence:
+  `target/artifacts/native-gpu/novywave-interaction-speed-field-fingerprint-cache-killed.json`.
+- Result: killed and backed out. Focused root-list tests passed, and the hot
+  `selected_signal_lane_rows` aggregate became much smaller in the experiment
+  (`eval_ms=2.499325`, `diff_ms=2.342034`,
+  `user_function_record_env_fingerprint_ms=0.056775`), but the app-level gate
+  did not improve enough and slightly regressed the headline click/input p95:
+  `click_to_cursor.p95=30.189445ms`,
+  `input_to_visible.p95=30.189445ms`,
+  `runtime_apply.p95=13.461269ms`,
+  `runtime_step_apply.p95=9.131247ms`,
+  `layout_rebuild.p95=11.502829ms`.
+- Decision: do not keep this micro-optimization while click/input p95 is flat
+  or worse. It confirms that reducing only the already-field-only inner loop is
+  not enough; the next useful TASK-0804C slice should target graph shape,
+  compiled demand/currentness/frontier metadata, or retained layout/proof work
+  that reduces the slow click/input class end to end.
+- Status: TASK-0804C remains `in_progress`. The report artifact above is
+  historical evidence for a killed experiment. The canonical current-code
+  report was refreshed after the revert:
+  `target/reports/native-gpu/novywave-interaction-speed.json`,
+  `worktree_fingerprint=da9f2f4b153c09a19f4777446c3203118d43eaab82685cc57531f2a07095e1ae`,
+  `click_to_cursor.p95=29.570410ms`,
+  `runtime_apply.p95=13.266465ms`,
+  `layout_rebuild.p95=11.829535ms`. It still fails the strict speed budgets.
+
+### 2026-06-23 TASK-0804C Root-List Dirty Frontier Filter Killed
+
+- Scope: tested the scheduler-boundary currentness/frontier direction instead
+  of another field-only inner-loop tweak. The experiment added a generic
+  root-list dirty frontier filter from previous `root_reads_by_field` data,
+  skipped list-view materialization when the filtered frontier was empty, and
+  passed only the filtered dirty set to list-view materialization. It used no
+  Boon syntax changes and no NovyWave-specific root names.
+- Experiment evidence:
+  `target/artifacts/native-gpu/novywave-interaction-speed-root-frontier-filter-killed.json`.
+- Verification before the speed decision:
+  `cargo fmt --all -- --check`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib dirty_frontier_read_keys_preserve_list_and_root_currentness_edges -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_dirty_frontier_filters_unrelated_accumulated_reads -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_bridge -p boon_native_playground -p xtask`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib list_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib user_function_cache_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave -- --nocapture`;
+  `timeout 240 cargo xtask verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`.
+- Result: killed and backed out. The filter proved a real counter movement:
+  click `current_dirty_read_count` dropped from the post-revert current-code
+  `3056` to `656`. The actual work did not improve enough:
+  `click_to_cursor.p95=30.004319ms`,
+  `input_to_visible.p95=30.004319ms`,
+  `source_action_root_flush_ms=113.452600`,
+  `source_action_root_materialization_ms=69.272059`,
+  `root_list.elapsed_ms=108.340030`,
+  `root_list.eval_ms=52.313349`,
+  `selected_signal_lane_rows.eval_ms=35.953578`, and
+  `selected_signal_lane_rows.user_function_body_ms=27.349396`.
+  `full_eval_row_count` stayed `0` and `row_materialize_ms` stayed `0.0`.
+- Decision: do not keep this slice. It failed TASK-0804C acceptance because
+  hot root-list work and root flush did not drop by `10%` and `1.0ms`, and
+  list-view materialization count stayed `56`. Reducing the dirty-read set
+  handed to the existing materializer is not enough while the dominant cost is
+  still actual `selected_signal_lane_rows` user-function/diff work plus root
+  flush/layout.
+- Fresh current-code report after revert:
+  `target/reports/native-gpu/novywave-interaction-speed.json`,
+  `worktree_fingerprint=cc6ddb5a8c8c86f2b0086e177b0af9917c45c1aa9d5d5a103f8c1af25d498b20`,
+  `click_to_cursor.p95=30.280951ms`,
+  `runtime_apply.p95=13.780476ms`,
+  `runtime_step_apply.p95=9.441913ms`,
+  `layout_rebuild.p95=11.850769ms`,
+  `source_action_root_flush_ms=109.458742`,
+  `source_action_root_materialization_ms=68.447881`,
+  `root_list.elapsed_ms=106.822819`,
+  `root_list.eval_ms=51.148176`,
+  `root_list.diff_ms=45.832020`,
+  and `current_dirty_read_count=3056`.
+- Status: TASK-0804C remains `in_progress`. The next useful slice should avoid
+  dirty-set shrinking as the main lever and instead reduce actual
+  user-function/diff work, change graph shape/currentness enough to reduce the
+  materialization count, or switch to the retained layout/proof path if that is
+  the next dependency-ready route.
+
+### 2026-06-23 Retained Render-Scene Upload Probe Proof
+
+- Scope: moved the NovyWave interaction-speed renderer upload probe from the
+  old `LayoutFrame` compatibility renderer to the retained `RenderScene` path.
+  This follows the previous TASK-0804C decision to stop spending time on
+  dirty-set-only micro-optimizations and to gather retained layout/proof
+  evidence instead.
+- Implementation: `native_gpu_renderer_upload_probe_for_frames` now lowers the
+  initial and post-interaction frames through `preview_render_scene_for_frame`
+  and encodes them with `VisibleLayoutRenderer::encode_scene`. The report
+  records `render_scene_probe=true`,
+  `layout_frame_compatibility_renderer=false`,
+  `render_scene_lowering_modes=[cached-derived-retained-keys, ...]`, and
+  `cached_retained_key_sample_count=3`.
+- Guardrail: `xtask` now rejects NovyWave interaction-speed reports unless the
+  renderer upload probe is a passing retained `RenderScene` probe. This keeps
+  future measurements from accidentally proving the wrong renderer path.
+- Fresh verification:
+  `cargo fmt --all -- --check` passed;
+  `cargo test -p boon_native_playground --bin boon_native_playground preview_render_scene_uses_cached_derived_retained_keys -- --nocapture` passed;
+  `cargo check -p boon_native_playground -p xtask` passed with existing
+  warnings;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`
+  passed with existing warnings.
+- Note on xtask test filter: `cargo test -p xtask advertised_xtask_commands_are_unique_and_supported -- --nocapture`
+  built successfully, but the exact filter matched `0` tests in the current
+  tree, so it is not counted as behavioral coverage.
+- Fresh speed report:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  still fails the strict latency gate. Current blockers are
+  `input_to_visible.p95=32.835ms`,
+  `hover_to_overlay.p95=21.873ms`,
+  `click_to_cursor.p95=32.835ms`, and
+  `divider_drag_to_layout.p95=20.701ms`.
+- Retained renderer evidence inside the failed report is good:
+  first encode uploaded `935640` bytes;
+  same-frame encode uploaded `0` bytes with `324` retained chunk hits;
+  post-interaction encode uploaded `3600` bytes across `3` dirty chunks and
+  `4` queue writes, with `313` retained chunk hits and `11` misses.
+- Result: keep this slice as measurement hardening and retained-render proof.
+  It does not complete TASK-0804B or TASK-0804C, and it does not make the
+  NovyWave interaction speed gate pass.
+- Next direction: use the retained-scene evidence to avoid blaming GPU upload
+  volume for the current gate. The next implementation slice should target
+  actual runtime/root materialization, retained layout/proof construction,
+  currentness graph shape, or shared-state propagation enough to move p95.
+
+### 2026-06-23 Owned Document Batch Patch Slice Kept
+
+- Scope: targeted the retained layout/proof/shared publication side rather
+  than another runtime dirty-set micro-optimization. The hot native patch paths
+  already clone the cached document frame before patching, so this slice added
+  a generic owned-frame batch patch API to avoid cloning that disposable frame
+  a second time for rollback.
+- Implementation:
+  `DocumentState::apply_batch_to_owned_frame(...)` now validates an owned
+  `DocumentFrame`, applies a `DocumentChangeBatch` in place, validates the
+  result, and returns `(DocumentFrame, DocumentChangeSet)`. The native
+  paint-space and document-layout patch paths use this API after cloning their
+  cached snapshot frame.
+- Correctness guard:
+  `owned_frame_batch_matches_stateful_batch_patch_result` proves the owned API
+  produces the same frame and change set as stateful `apply_batch` for a mixed
+  text/style batch.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_document -p boon_native_playground`;
+  `cargo test -p boon_document owned_frame_batch_matches_stateful_batch_patch_result -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground source_binding_only_document_patch_reuses_retained_layout_without_clone -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground direct_layout_patch_ -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground sparse_document_patch_gate_allows_nonstructural_data_patch -- --nocapture`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Fresh speed report:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  still fails, but the blocker set shrank. Current blockers are
+  `input_to_visible.p95=28.486ms`,
+  `hover_to_overlay.p95=17.744ms`, and
+  `click_to_cursor.p95=28.486ms`; divider is not listed as a blocker in this
+  run.
+- Measured movement:
+  click `layout_patch_function_total.p95=7.526ms`,
+  `document_frame_patch.p95=1.899ms`, and
+  `layout_rebuild.p95=10.629ms`;
+  hover `layout_patch_function_total.p95=6.248ms`,
+  `document_frame_patch.p95=1.413ms`, and
+  `layout_rebuild.p95=6.967ms`;
+  divider `layout_patch_function_total.p95=7.453ms`,
+  `document_frame_patch.p95=1.443ms`, and
+  `layout_rebuild.p95=8.636ms`.
+- Renderer guard still holds: retained `RenderScene` upload probe passes with
+  post-interaction upload `3600` bytes and `3` dirty chunks.
+- Result: keep this slice. It is a generic engine improvement, not a NovyWave
+  workaround, and it improves the hot path without weakening currentness,
+  native GPU reports, or Boon syntax rules.
+- Remaining status: TASK-0804B/TASK-0804C remain incomplete. The next bounded
+  candidate from the runtime explorer is a root list-view field-cache
+  dependency index that evaluates only cache entries invalidated by exact dirty
+  reads. Kill that experiment if it does not reduce click p95 by at least
+  `0.5ms` or if it weakens currentness/numeric-guard semantics.
+
+### 2026-06-23 TASK-0804C Root List-View Invalidated-Key Worklist Kept
+
+- Scope: implemented the bounded root list-view field-cache worklist slice
+  suggested after the owned document batch patch. This is generic runtime code,
+  not a NovyWave source rewrite, not a Boon syntax change, not a fixture
+  shortcut, and not a renderer workaround.
+- Implementation:
+  `GenericDerivedState` now records root list-view field-cache keys removed by
+  dirty-read invalidation. The field-only root list-view patcher uses those
+  recently invalidated keys as an exact dirty row/field worklist for direct
+  record projectors after cache prevalidation. Clean rows are skipped before
+  child-frame/projector setup; clean fields on dirty rows are skipped before
+  env-fingerprint/cache-key work. The path is disabled for branch projectors,
+  non-cacheable fields, inherited root-stack materialization, ambiguous source
+  identity mapping, missing dirty keys, and any previous-root-read currentness
+  refresh. Numeric stability guards and same-pass row-independent dirty fields
+  keep the existing evaluator path.
+- Subagent review:
+  existing subagents `019ef2ce-6fad-7d43-bcb8-2b29d6c9cb95` and
+  `019ef2ce-729d-7d82-8c04-ac6b175de87e` both agreed the main target was the
+  field-only row/field traversal, not cache invalidation alone. The second
+  review specifically recommended skipping clean rows before projector setup
+  while keeping branch, root-stack, numeric-guard, and currentness safeguards.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_runtime`;
+  `cargo test -p boon_runtime root_list_view_field_cache_reuses_stable_fields_across_cursor_change -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_reuses_same_pass_dirty_row_independent_fields -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_forces_dirty_read_miss_before_reuse -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_rejects_root_child_reads_on_inherited_stack -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_branch_selector_dirty_falls_back_before_field_patch -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_keeps_numeric_guarded_entries -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_materializes_current_order_after_same_count_reorder -- --nocapture`.
+- Speed verification:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  still fails the strict latency gate.
+- Fresh report evidence:
+  `worktree_fingerprint=8d0876ba5607dbc5e0a94dfbfbfd17c72087cbcecff2001ca0bacc4943f30424`;
+  blockers are `input_to_visible.p95=29.230ms`,
+  `hover_to_overlay.p95=20.260ms`,
+  `click_to_cursor.p95=29.230ms`, and
+  `divider_drag_to_layout.p95=17.088ms`.
+  Click `runtime_apply.p95=14.250ms`,
+  `runtime_step_apply.p95=9.806ms`,
+  `layout_rebuild.p95=10.828ms`,
+  `layout_patch_function_total.p95=7.645ms`,
+  `shared_update.p95=2.415ms`, and
+  `total_apply.p95=28.042ms`.
+- Runtime movement:
+  the root-list hot path is much smaller than the previous current-code report.
+  Click root-list totals are now `root_list.elapsed_ms=6.292ms`,
+  `root_list.eval_ms=3.869ms`, `root_list.diff_ms=3.542ms`,
+  `field_only_evaluated_field_count=29`,
+  `field_only_skipped_field_count=228`, `field_cache_hits=316`, and
+  `field_cache_misses=26`. The dominant list sample
+  `selected_signal_lane_rows` is down to `eval_ms=2.737ms`,
+  `diff_ms=2.573ms`, and `user_function_body_ms=3.541ms`.
+- Result: keep this slice because it materially reduces the intended runtime
+  root-list work and preserves correctness guards. It does not complete
+  TASK-0804B or TASK-0804C because full interaction latency remains over
+  budget.
+- Next direction: stop looking at root-list field-cache traversal as the main
+  remaining blocker unless a fresh report proves regression. The next useful
+  slice should target retained layout/proof/shared publication, native input
+  resolve/apply composition, or a larger architecture change that prevents
+  click `total_apply` from stacking runtime, layout, shared update, and
+  resolver costs into a ~29ms path.
+
+### 2026-06-23 TASK-0804C Document Binding Row-Index Slice Kept
+
+- Scope: continued the retained layout/proof/shared-publication investigation
+  by removing one generic O(binding-paths) scan from the paint-space document
+  patch path. This is engine/runtime infrastructure only: no Boon syntax
+  change, no NovyWave source rewrite, no hardcoded filename/root, and no
+  verifier weakening.
+- Implementation:
+  `DocumentRenderSnapshot` now stores `DocumentDataBindingSnapshotIndex`, a
+  wrapper around the existing data-binding map with precomputed row-field and
+  collection-level indexes. Existing map-style callers still use `.len()`,
+  `.values()`, `.get()`, and map iteration. `document_snapshot_data_binding_targets`
+  now resolves row-field patch paths through exact aliases, same
+  key/generation row-field buckets, and same-list collection bindings; other
+  path shapes still use the previous full overlap scan.
+- Correctness guard:
+  debug builds compare indexed row lookup results with the old full-scan
+  resolver and panic if they diverge. The new focused regression
+  `row_data_binding_target_lookup_uses_projected_row_identity_index` covers
+  projected list names, unscoped `@row` targets, and same-list collection
+  bindings.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground row_data_binding_target_lookup_uses_projected_row_identity_index -- --nocapture`;
+  `cargo test -p boon_native_playground sparse_document_patch_gate_allows_nonstructural_data_patch -- --nocapture`;
+  `cargo test -p boon_native_playground source_binding_only_document_patch_reuses_retained_layout_without_clone -- --nocapture`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Speed verification:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  still fails the strict latency gate.
+- Fresh report evidence:
+  `worktree_fingerprint=b85865b5d6c8264bbdafc00496eabc324df007a0dcf00b70d8e32bfd84eb9a42`;
+  blockers are `input_to_visible.p95=27.649ms`,
+  `hover_to_overlay.p95=17.546ms`, and
+  `click_to_cursor.p95=27.649ms`. Divider is under budget in this run at
+  `divider_drag_to_layout.p95=16.260ms`.
+- Hot-path movement:
+  click `runtime_apply.p95=13.498ms`, `layout_rebuild.p95=10.156ms`,
+  `layout_patch_function_total.p95=7.220ms`,
+  `document_frame_patch.p95=1.559ms`,
+  `direct_layout_patch_total.p95=1.870ms`, and
+  `proof_build.p95=1.753ms`. Hover `layout_patch_function_total.p95=6.173ms`
+  and `document_frame_patch.p95=1.414ms`.
+- Result: keep this slice because it removes a real retained-document
+  anti-pattern and modestly moves the official report in the right direction.
+  It does not complete TASK-0804B or TASK-0804C. Remaining click latency is
+  still dominated by stacked runtime apply plus layout/proof/shared work, not a
+  single data-binding lookup scan.
+- Next direction: stop spending more time on tiny binding lookup scans unless a
+  fresh report shows regression. The next bounded candidate should target
+  synchronous click composition: split/defer non-visible click work, reduce
+  paint-space proof/shared publication, or change the architecture so runtime,
+  layout, shared state, and native input resolve are not all on one visible
+  interaction path.
+
+### 2026-06-23 TASK-0804C Focus Overlay Cache Experiment Rejected
+
+- Scope: tried to reduce hover/focus overlay work by caching the previously
+  focused display nodes and revisiting only the old/current focus nodes on
+  stable frames.
+- Result: rejected and backed out. The cache is unsafe for virtualized table
+  cells because a retained node id can be reused after scroll while stale
+  `focused` / `__focused` state still points at the previous cell identity.
+- Correctness evidence:
+  `cargo test -p boon_native_playground cells_scroll_does_not_move_focused_grid_cell_to_reused_node -- --nocapture`
+  fails during the experiment with focused node diagnostics like
+  `("doc-node-270", Some("B0"), None, Some(Bool(true)))`.
+- Finding: the real problem is not just O(display-list) focus overlay scanning.
+  The focus model mixes host focus identity, Boon-declared focus style, source
+  intent address/target metadata, and virtualized retained node ids. Optimizing
+  the scan before fixing that identity model risks visible correctness bugs.
+- Status: postponed. Do not spend more TASK-0804 time on focus overlay caching
+  until there is a separate correctness task for virtualized focus identity and
+  stale `__focused` cleanup. The speed roadmap should continue with other
+  unfinished slices that do not weaken focus correctness.
+
+### 2026-06-23 TASK-0804C Source-Intent Hit-Index Experiment Rejected
+
+- Scope: tried to reduce native input source bubbling by precomputing source
+  intent hit indexes inside `PreviewHitRouteTable`. The experiment kept a debug
+  parity oracle against the previous full hit-table scan and changed no Boon
+  syntax, examples, verifier budgets, or source intent semantics.
+- Verification while the experiment was applied:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: rejected and backed out. The indexed route-table path passed the
+  focused correctness test but did not improve the release speed signal. The
+  experiment run still failed the strict gate with `input_to_visible.p95=29.702ms`,
+  `click_to_cursor.p95=29.702ms`, `hover_to_overlay.p95=18.180ms`, and
+  `divider_drag_to_layout.p95=16.109ms`; native input route resolve was
+  effectively neutral to slightly worse.
+- Current post-revert report:
+  `worktree_fingerprint=33af24b0e897ff409fad44b8901aa563bf8c42fc65231b68dd1b371add8f2f3b`;
+  `input_to_visible.p95=28.042ms`,
+  `click_to_cursor.p95=28.042ms`,
+  `hover_to_overlay.p95=18.051ms`, and
+  `divider_drag_to_layout.p95=16.236ms`.
+  Click `total_apply.p95=26.088ms`, `runtime_apply.p95=13.664ms`,
+  `layout_patch_function_total.p95=7.407ms`,
+  `layout_rebuild.p95=10.362ms`, and `shared_update.p95=1.977ms`.
+- Hygiene after backing out:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json -- --nocapture`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`;
+  `git diff --check`.
+- Finding: source bubbling is not the next dominant blocker. Avoid more
+  route-table micro-indexing unless a future profile proves route resolution
+  has become a large p95 component. Continue with larger synchronous-path
+  changes: split/defer non-visible click work, retained proof/shared
+  publication, runtime/list representation, or MachinePlan/native UI
+  composition.
+
+### 2026-06-23 TASK-0804C Cached Binding Sync Tables Experiment Rejected
+
+- Scope: tried a small retained-state publication prep slice by moving
+  `source_intent_binding_updates_for_state` and `text_binding_paths_by_node`
+  lookup construction into cached `DocumentRenderSnapshot` fields. The goal was
+  to reduce the synchronous `preview_sync_bound_text_inputs_in_shared_state`
+  work inside the shared-update bucket. This was generic native preview
+  infrastructure only: no Boon syntax change, no NovyWave source rewrite, and
+  no verifier weakening.
+- Review context:
+  read-only explorer `019ef31c-2c3e-70e1-a358-eb193b1ef688` identified the
+  larger correct direction as splitting minimal visible-frame publication from
+  deferred proof/debug JSON publication. Read-only explorer
+  `019ef31c-5698-76d1-ac84-cafedcacc426` identified the larger retained layout
+  direction as transaction-scoped `DocumentChangeSet` driven layout/proof
+  deltas. This experiment was intentionally smaller than both suggestions.
+- Verification while the experiment was applied:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground source_binding_only_document_patch_reuses_retained_layout_without_clone -- --nocapture`;
+  `cargo test -p boon_native_playground row_data_binding_target_lookup_uses_projected_row_identity_index -- --nocapture`;
+  `cargo test -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: rejected and backed out. The focused tests passed, but the release
+  report did not improve the intended bucket. The experiment run still failed
+  with `input_to_visible.p95=27.991ms`, `click_to_cursor.p95=27.991ms`,
+  `hover_to_overlay.p95=18.715ms`, `divider_drag_to_layout.p95=15.954ms`,
+  click `shared_update.p95=2.045ms`, and hover
+  `shared_update.p95=2.032ms`. Compared with the previous current-code report,
+  shared update was neutral to worse, so keeping cached lookup tables would add
+  maintenance without fixing the hot path.
+- Current post-revert report:
+  `worktree_fingerprint=39042b9bdffb5fc7dca11227be87b32c3c920156c9e472e8893d2cee7d311eed`;
+  `input_to_visible.p95=27.846ms`,
+  `click_to_cursor.p95=27.846ms`,
+  `hover_to_overlay.p95=17.871ms`, and
+  `divider_drag_to_layout.p95=16.617ms`.
+  Click `total_apply.p95=26.342ms`, `runtime_apply.p95=13.695ms`,
+  `layout_patch_function_total.p95=7.178ms`,
+  `layout_rebuild.p95=10.276ms`, and `shared_update.p95=1.956ms`.
+- Hygiene after backing out:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Finding: stop spending TASK-0804 time on tiny shared-sync lookup caches.
+  The next useful implementation should be one of the larger generic slices:
+  split visible frame publication from proof/debug JSON publication, or promote
+  `DocumentChangeSet` into transaction-scoped retained layout/proof deltas with
+  clear renderer-retained proof and speed kill criteria.
+
+### 2026-06-23 TASK-0804B/C Visible Render Snapshot Split Kept
+
+- Scope: implemented the first generic visible-frame/proof publication split.
+  `PreviewSharedRenderState` still owns full `layout_proof` for input routing,
+  debug/report paths, native GPU evidence, and verifier output, but the preview
+  render closure now passes a compact `PreviewVisibleRenderState` into
+  `native_gpu_app_owned_render_hook`. The render hook consumes only status,
+  artifact metadata, layout-frame hash, scroll transform, and the shared
+  `Arc<LayoutFrame>`. Retained render-scene selection now has hash-based helper
+  functions, and the NovyWave upload-probe render path uses the same hash-based
+  API instead of constructing a proof-shaped JSON value.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground preview_render_scene -- --nocapture`;
+  `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep this slice as architectural progress, but do not mark the speed
+  task complete. The strict NovyWave gate still fails. Current report:
+  `worktree_fingerprint=25f5a0dab52d2c5b56e10809589639127eb7a782bdff7034bf77e08fbf0689c2`;
+  `input_to_visible.p95=27.966ms`,
+  `click_to_cursor.p95=27.966ms`,
+  `hover_to_overlay.p95=17.922ms`,
+  `divider_drag_to_layout.p95=15.699ms`, and
+  `resize_to_present.p95=11.479ms`.
+  Click `total_apply.p95=26.367ms`, `runtime_apply.p95=13.645ms`,
+  `layout_patch_function_total.p95=7.220ms`,
+  `layout_rebuild.p95=10.369ms`, `shared_update.p95=1.951ms`, and
+  `layout_proof_clone.p95=0.007ms`.
+- Finding: the split confirms that full proof cloning is no longer a meaningful
+  click/hover hot-path cause in the current verifier. The remaining blocker is
+  still the stacked synchronous runtime/list plus retained layout/proof path.
+  Continue with runtime apply, layout patch, retained proof/layout delta, or
+  MachinePlan/native UI composition work. Do not spend more TASK-0804 time on
+  proof-clone, route lookup, or small shared-sync map micro-optimizations unless
+  a fresh report shows one of those buckets has become dominant.
+
+### 2026-06-23 TASK-0804B/C Targeted Retained Layout Cache Update Kept
+
+- Scope: implemented a generic targeted retained-layout cache update for direct
+  document-layout patches. `DocumentRetainedLayoutCache` can now refresh a
+  bounded changed-node set from a new `LayoutFrame`, report geometry-only dirty
+  reasons, and fall back to the full retained-cache update when the touched
+  nodes cannot be applied safely. The native direct-patch path now carries
+  explicit touched node IDs through document-frame patching into retained-cache
+  publication.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_document -p boon_native_playground`;
+  `cargo test -p boon_document retained_layout_cache -- --nocapture`;
+  `cargo test -p boon_native_playground direct_layout_patch_ -- --nocapture`;
+  `cargo test -p boon_native_playground source_binding_only_document_patch_reuses_retained_layout_without_clone -- --nocapture`;
+  `cargo test -p boon_native_playground direct_document_patch_uses_targeted_retained_layout_cache_update -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep this slice as a bounded layout improvement, but do not mark the
+  speed task complete. The strict NovyWave gate still fails. Current report:
+  `worktree_fingerprint=2ceefdb9350b1ffb89b4a9d1012ead71d2222a69cb15ac714b8dccab0f1fa89d`;
+  `input_to_visible.p95=26.830ms`,
+  `click_to_cursor.p95=26.830ms`,
+  `hover_to_overlay.p95=17.226ms`,
+  `divider_drag_to_layout.p95=15.779ms`, and
+  `resize_to_present.p95=12.371ms`.
+  Click `total_apply.p95=25.555ms`, `runtime_apply.p95=13.685ms`,
+  `layout_patch_function_total.p95=6.577ms`,
+  `retained_layout_cache_update.p95=0.074ms`,
+  `layout_rebuild.p95=9.426ms`, `shared_update.p95=1.963ms`, and
+  `layout_proof_clone.p95=0.008ms`.
+- Decision: this clears the keep threshold for a bounded retained-layout slice:
+  compared with the previous visible-snapshot report, click layout patch p95
+  dropped by about `0.64ms`, click layout rebuild p95 by about `0.94ms`, and
+  click total apply p95 by about `0.81ms`. TASK-0804B/TASK-0804C remain
+  unfinished because click/input p95 is still well above the `16.7ms` target.
+  The next slice should target the larger runtime/list apply cost or a bigger
+  layout delta/persistent-frame design instead of another retained-cache
+  microchange.
+
+### 2026-06-23 TASK-0804B/C Layout Fast-Path Precheck Alias Index Kept
+
+- Scope: added missing layout-wrapper timing splits and then optimized the
+  measured hot precheck. The speed report now exposes
+  `layout_fast_path_precheck`, `layout_paint_space_patch_outer`, and
+  `layout_document_patch_outer`. `DocumentRenderSnapshot` now stores
+  precomputed structural data-read aliases so sparse paint/document patch
+  eligibility checks do not rebuild `store.` aliases inside every
+  changed-path by structural-read comparison. The canonical
+  `structural_data_reads` set remains in the snapshot and report surface.
+- Subagent review:
+  layout explorer `019ef33f-145b-70e0-8f1c-b39d8dca4fb4` recommended a larger
+  persistent/chunked layout-frame path after retained-cache cost became small.
+  Runtime explorer `019ef33e-f895-7f62-92c8-bb71d4f7f6b3` recommended a
+  generic cached/indexed list-pipeline scalar result path for the remaining
+  root-list dirty-field evaluation cost. The local measurement showed a smaller
+  immediate layout blocker first: fast-path precheck was the old wrapper
+  unknown.
+- Verification:
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground direct_layout_patch_ -- --nocapture`;
+  `cargo test -p boon_native_playground sparse_document_patch_gate -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep this slice, but do not mark the speed task complete. Current
+  report:
+  `worktree_fingerprint=53ad0572b67f5243050dc43d5d3ce2d6fcddab685dd2a1c13633994c110124cf`;
+  `input_to_visible.p95=21.071ms`,
+  `click_to_cursor.p95=21.071ms`,
+  `hover_to_overlay.p95=15.337ms`,
+  `divider_drag_to_layout.p95=13.444ms`, and
+  `resize_to_present.p95=10.488ms`.
+  Click `runtime_apply.p95=10.648ms`, `layout_rebuild.p95=6.627ms`,
+  `layout_fast_path_precheck.p95=0.312ms`,
+  `layout_patch_function_total.p95=6.365ms`,
+  `layout_wrapper_unaccounted.p95=0.001ms`, and
+  `total_apply.p95=19.769ms`.
+- Decision: the alias index materially moved the canonical gate. The
+  intermediate measurement showed `layout_fast_path_precheck.p95=3.292ms`;
+  after alias precomputation it is `0.312ms`, and click/input p95 dropped from
+  the previous retained-cache checkpoint's `26.830ms` to `21.071ms`. TASK-0804B
+  and TASK-0804C remain unfinished. The next implementation target should be
+  the runtime explorer's generic cached/indexed list-pipeline scalar result
+  path, or, if runtime evidence changes, the layout explorer's persistent frame
+  design. Do not spend another slice on retained-cache lookup or wrapper
+  attribution unless a fresh report shows those buckets regressed.
+
+### 2026-06-23 TASK-0804B/C Runtime/List Diagnostic Reclassification
+
+- Scope: ran a profiler-flavored NovyWave interaction-speed diagnostic before
+  implementing the previously suggested generic cached/indexed list-pipeline
+  scalar-result slice. This was a measurement-only slice; no Boon syntax,
+  example code, or runtime behavior was changed.
+- Verification:
+  `BOON_PROFILE_ROOT_DEMAND=1 BOON_PROFILE_DIRTY_FRONTIER=1 BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES=1 BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed-debug.json`;
+  focused source review of `selected_cursor_value_for_signal`,
+  `try_eval_indexed_pipeline_selection`, `try_eval_map_join_field`, and the
+  dirty-root scheduler.
+- Finding: do not implement the generic list-pipeline scalar-result cache as
+  the next slice unless a fresh report contradicts this diagnostic. The exact
+  NovyWave cursor-value pipeline already goes through generic indexed text
+  filters, numeric retain, and map/join fusion: the debug report still shows
+  `filter_field_rows_scanned=0`, `retain_rows_scanned=0`,
+  `text_lookup_index_misses=0`, `numeric_lookup_index_misses=0`, and active
+  `map_join_field_fusions`. In the slow debug click sample,
+  `selected_signal_lane_rows` costs about `1.413ms` total and
+  `selected_cursor_pair_rows` costs about `0.541ms` total; the list pipeline is
+  no longer the large standalone problem.
+- Current culprit: click latency is now dominated by stacked synchronous
+  phases. The debug sample reports `runtime_apply_ms=13.041581`,
+  `source_actions_ms=6.596188`, `source_action_root_flush_ms=5.664979`,
+  `source_action_root_dirty_scheduler_ms=2.334583`, and list-view
+  materialization count `2`. Aggregate dirty-frontier work remains shaped by
+  `candidate_unobserved_source_free_pure` fanout plus blocked visible
+  list-view roots. The two hot list roots are still real, but they are not
+  wasting time on row scans; they are paying field-cache/function/read
+  bookkeeping inside the broader root-flush transaction.
+- Decision: keep TASK-0804B/TASK-0804C unfinished, but reclassify the next
+  useful implementation away from list-pipeline caching. The next slice should
+  be either a real demand-frontier architecture that defers safe
+  `candidate_unobserved_source_free_pure` roots while preserving semantic
+  deltas and visible-list dependencies, or the retained/persistent layout-frame
+  design that can remove several milliseconds from the remaining layout path.
+  Do not spend another slice on filter/retain/map/join fusion, retained-cache
+  lookup, route lookup, or shared-sync table micro-optimizations without a new
+  report showing those buckets regressed.
+
+### 2026-06-23 TASK-0804B/C Paint-Space Compact Hot Proof Kept
+
+- Scope: implemented a compact paint-space patch proof builder for the native
+  preview hot path. The patch path now avoids cloning/mutating the full previous
+  proof when compact timing is enabled, while preserving route-critical fields
+  and relying on the cached `DocumentRenderSnapshot` for hit/source routing.
+  Heavy arrays such as `runtime_document_state_snapshot`,
+  `display_item_samples`, `hit_target_assertions`, and
+  `source_intent_assertions` are omitted from the hot proof.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground compact_paint_space_patch_proof_omits_heavy_arrays_but_keeps_route_snapshot -- --nocapture`;
+  `cargo test -p boon_native_playground direct_document_patch_ -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep the compact-proof slice, but do not mark TASK-0804B/TASK-0804C
+  complete. The strict NovyWave speed gate still fails. Current report:
+  `worktree_fingerprint=f65c1d95461ff1a737e6df2c9f4f38d7f406136a737cd8bccd6eed43c28819d7`;
+  `input_to_visible.p95=30.277ms`,
+  `click_to_cursor.p95=30.277ms`,
+  `hover_to_overlay.p95=24.138ms`,
+  `divider_drag_to_layout.p95=21.264ms`, and
+  `resize_to_present.p95=7.968ms`.
+  Click `runtime_apply.p95=22.426ms`,
+  `runtime_state_summary.p95=12.282ms`,
+  `runtime_step_apply.p95=9.903ms`,
+  `layout_patch_function_total.p95=5.323ms`,
+  `layout_rebuild.p95=5.662ms`, `proof_build.p95=0.436ms`, and
+  `total_apply.p95=29.437ms`.
+  Divider `proof_build.p95=0.015ms`, confirming that proof build is no longer
+  the next dominant paint-space problem.
+- Decision: the compact proof removed a bad hot-path shape and keeps routing
+  correct, so it stays. The next TASK-0804 work should target runtime state
+  summary publication, runtime source-action/root flush work, or the larger
+  persistent/chunked layout-frame design. Do not spend another slice on proof
+  JSON clone/build unless a new report shows it regressed.
+
+### 2026-06-23 TASK-0804B/C Runtime State Snapshot Side Cache Kept
+
+- Scope: fixed the compact-proof regression without reintroducing heavy proof
+  snapshots. Added a bounded side cache keyed by `layout_frame_hash` for the
+  current window runtime state snapshot, and taught
+  `layout_proof_runtime_state_snapshot` to use it when compact proofs omit
+  `runtime_document_state_snapshot`. The cache is populated when initial
+  NovyWave layout, scroll-window layout, patched layout, and full fallback
+  layout are published.
+- Verification:
+  `cargo fmt --all`;
+  `cargo test -p boon_native_playground compact_layout_proof_state_snapshot_uses_side_cache_by_layout_hash -- --nocapture`;
+  `cargo test -p boon_native_playground compact_paint_space_patch_proof_omits_heavy_arrays_but_keeps_route_snapshot -- --nocapture`;
+  `cargo check -p boon_native_playground`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep the side cache, but do not mark TASK-0804B/TASK-0804C complete.
+  The strict NovyWave speed gate still fails only the click/input latency
+  budgets. Current report:
+  `worktree_fingerprint=a7f8025d1b1cc7c2f83fda767cd2334fc92f33889e41a0c85e63b3d8360c5fa3`;
+  `input_to_visible.p95=22.812ms`,
+  `click_to_cursor.p95=22.812ms`,
+  `hover_to_overlay.p95=15.248ms`,
+  `divider_drag_to_layout.p95=11.993ms`, and
+  `resize_to_present.p95=7.139ms`.
+  Summary source distribution is `patched_previous_window=97`, aggregate
+  `runtime_state_summary.p95=1.267ms`, click
+  `runtime_state_summary.p95=1.375ms`, and divider
+  `runtime_state_summary.p95=0.815ms`. This fixes the prior compact-proof run
+  where every sample rebuilt `post_turn_window` and aggregate
+  `runtime_state_summary.p95=12.356ms`.
+- Decision: the remaining blocker is click-side runtime step apply plus the
+  roughly `5.6ms` layout patch path: click `runtime_apply.p95=10.623ms`,
+  `runtime_step_apply.p95=9.083ms`,
+  `layout_patch_function_total.p95=5.567ms`,
+  `layout_rebuild.p95=5.774ms`, and `proof_build.p95=0.313ms`.
+  Next work should target source-action/root flush or the persistent/chunked
+  layout-frame design, not proof JSON or state-summary publication.
+
+### 2026-06-23 TASK-0804B/C Root-List Field Attribution Kept
+
+- Scope: kept a behavior-neutral measurement/reporting improvement in
+  `boon_native_playground`. The NovyWave
+  `runtime_root_list_cause_summary` now preserves root-list field-only counters
+  already emitted by `boon_runtime`: field-profile totals,
+  eval-minus-field-profile time, field-cache read-key counts, function-cache
+  read-key counts, record env-fingerprint time, record field-loop time, and
+  value/record insert counters.
+- Verification:
+  `cargo fmt --all -- --check`;
+  `cargo check -p boon_native_playground`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`;
+  diagnostic
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES=1 BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-field-profile.json`.
+- Result: keep the measurement change, but do not mark TASK-0804B/TASK-0804C
+  complete. The canonical speed report still fails only the strict click/input
+  latency budgets:
+  `input_to_visible.p95=22.342ms`,
+  `click_to_cursor.p95=22.342ms`,
+  `runtime_step_apply.p95=8.693ms`, and
+  `layout_rebuild.p95=5.533ms`.
+  It now exposes the hidden root-list field-only cause:
+  `selected_signal_lane_rows.eval_ms=33.647ms`,
+  `diff_ms=29.242ms`, `field_profile_total_ms=7.089ms`,
+  `eval_minus_field_profiles_ms=26.558ms`,
+  `user_function_record_field_loop_ms=24.238ms`,
+  `field_cache_field_value_hit_count=4768`,
+  `field_cache_hit_read_key_count=30792`, and
+  `field_cache_miss_read_key_count=2272`. `selected_cursor_pair_rows` reports
+  `eval_ms=10.831ms`, `diff_ms=9.193ms`,
+  `field_profile_total_ms=8.353ms`,
+  `user_function_record_field_loop_ms=8.784ms`,
+  `field_cache_misses=96`, and no field-cache hits.
+- Diagnostic field profile:
+  `RUN/selected_cursor_pair_row.label=8.248ms` with `96` misses and `0` hits;
+  `RUN/new_signal_lane_variable_row.current_value=3.469ms` with `96` misses and
+  `0` hits; next selected-lane fields are
+  `RUN/new_signal_lane_variable_row.page_refs=2.129ms` and
+  `RUN/new_signal_lane_group_row.page_refs=1.495ms`.
+- Follow-up: do not retry broad root scheduling, broad read-fingerprint,
+  broad function-cache preservation, or unbacked list-view materialization as
+  standalone speed paths. The next bounded implementation target should be a
+  narrow generic value-projection/shared-field mechanism so sibling root list
+  views can share the already computed cursor value for the same source row and
+  formatter, or an equally narrow field-only reuse path for stable `page_refs`.
+  Promotion requires the bridge proof to stay green and either click/input p95
+  or the documented hot field/root totals to move materially toward budget.
+
+### 2026-06-23 TASK-0804B/C Clean Currentness Memo Experiment Killed
+
+- Scope: tried a local `boon_runtime` microcache for repeated clean
+  `ensure_root_reads_current` answers during root-list field-cache/function-cache
+  hits. The implementation used a deferred-dirty-root generation and a
+  per-root-list-materialization cache keyed by read set, and included a focused
+  test proving a clean answer expires when a new matching deferred dirty root is
+  inserted.
+- Verification while present:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime root_list_view_clean_currentness_cache_expires_on_new_deferred_root -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_prevalidated_clean_hit_still_refreshes_deferred_dirty_root -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_reuses_stable_fields_across_cursor_change -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache_keeps_numeric_guarded_entries -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground`;
+  canonical NovyWave interaction-speed verifier;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: killed and reverted. The strict speed gate still failed:
+  `input_to_visible.p95=22.118ms` and `click_to_cursor.p95=22.118ms`.
+  The intended root-list cause did not improve:
+  `selected_signal_lane_rows.eval_ms=33.934ms` versus the prior `33.647ms`,
+  `diff_ms=29.508ms` versus `29.242ms`, and
+  `user_function_record_field_loop_ms=24.404ms` versus `24.238ms`.
+  `runtime_step_apply.p95=8.944ms` was also slightly worse than the prior
+  `8.693ms`. The small p95 movement is treated as noise/insufficient because
+  the target bucket did not move in the right direction.
+- Verification after revert:
+  `cargo fmt -p boon_runtime`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture` passed with `25`
+  tests;
+  `cargo check -p boon_runtime -p boon_native_playground` passed with existing
+  warnings.
+- Follow-up: do not retry per-materialization clean-currentness memoization as
+  a standalone TASK-0804B/C path unless a future report exposes currentness
+  checking itself as a dominant measured bucket. Continue toward generic
+  value-projection/shared-field reuse for duplicate cursor-value work, or the
+  larger retained runtime/layout architecture.
+
+### 2026-06-23 TASK-0804B/C Current Baseline And Function Diagnostic Refresh
+
+- Scope: refreshed the canonical NovyWave speed report after reverting the
+  killed clean-currentness memo, then ran one diagnostic-only function-profile
+  report under `target/diagnostics`.
+- Verification:
+  current-code canonical
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`;
+  diagnostic
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS BOON_RUNTIME_FUNCTION_PROFILING=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-function-profile.json`.
+- Current canonical result: report status `fail`, worktree fingerprint
+  `828d12d4000abeba007ae4c5ea175d1ce59e2a450c544b4c5c11dd7288908fb2`,
+  `input_to_visible.p95=22.310ms`,
+  `click_to_cursor.p95=22.310ms`,
+  `runtime_step_apply.p95=8.675ms`,
+  `runtime_apply.p95=10.267ms`, and
+  `layout_rebuild.p95=5.549ms`.
+- Current hot root-list result:
+  `selected_signal_lane_rows.eval_ms=33.496ms`,
+  `diff_ms=29.054ms`,
+  `user_function_record_field_loop_ms=24.059ms`,
+  `field_cache_hits=4768`,
+  `field_cache_misses=160`;
+  `selected_cursor_pair_rows.eval_ms=10.834ms`,
+  `diff_ms=9.197ms`,
+  `user_function_record_field_loop_ms=8.798ms`,
+  `field_cache_misses=96`, and no field-cache hits.
+- Function diagnostic result:
+  `RUN/selected_cursor_value_for_signal` remains the dominant user function:
+  `call_count=468`, `cache_hit_count=184`, `total_ms=41.489ms`.
+  The hottest context is the cursor-pair label field:
+  `call_count=100`, `cache_hit_count=50`, `total_ms=8.614ms`; the sibling
+  signal-lane current-value field reports `call_count=100`,
+  `cache_hit_count=66`, `total_ms=2.972ms`.
+- Follow-up: the existing function cache already shares some cursor-value work,
+  so do not spend the next slice on tiny cache-key or currentness microcaches.
+  The next code target should be a generic shared projection/value column for
+  equivalent source identity plus formatter, or a pivot to the retained layout
+  frame path that attacks the separate `~5.5ms` layout budget.
+
+### 2026-06-23 TASK-0804B/C Constant AST Cache Experiment Killed
+
+- Scope: tried a generic immutable AST constant-value cache in `boon_runtime`.
+  The cache accepted only values that could be proven static from AST shape
+  alone: scalar literals, constant records/lists, tagged objects, and inline
+  BYTES constructors. It intentionally rejected identifiers, paths, SOURCE,
+  HOLD/LATEST, calls, pipes, infix expressions, WHEN/THEN, match arms, and
+  unknown expressions.
+- Verification while present:
+  `cargo test -p boon_runtime generic_eval_caches_static_ast_constants_only -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture`;
+  `cargo fmt -p boon_runtime`;
+  canonical NovyWave interaction-speed verifier;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: killed and reverted. The strict speed gate still failed and the
+  measured p95 moved slightly in the wrong direction:
+  `input_to_visible.p95=22.653ms` and
+  `click_to_cursor.p95=22.653ms` versus the pre-experiment current baseline of
+  `22.310ms`.
+- Runtime buckets did not show the desired movement:
+  `runtime_step_apply.p95=8.845ms` versus `8.675ms`,
+  `runtime_apply.p95=10.191ms` versus `10.267ms`.
+- Hot root-list totals remained dominated by the same field/user-function work:
+  `selected_signal_lane_rows.eval_ms=34.254ms`,
+  `diff_ms=29.797ms`,
+  `user_function_record_field_loop_ms=24.639ms`;
+  `selected_cursor_pair_rows.eval_ms=11.242ms`,
+  `diff_ms=9.583ms`,
+  `user_function_record_field_loop_ms=9.171ms`.
+- Follow-up: do not retry generic AST constant caching as a standalone speed
+  path unless a future profile exposes literal evaluation/number parsing as a
+  dominant measured bucket. The next TASK-0804B/C implementation target should
+  be a larger architectural fix: compiled row/field dependency frontier or
+  generic shared projection/value columns for sibling root list views. The
+  retained layout-frame path remains the separate target for the `~5.5ms`
+  layout budget.
+- Post-revert verification refreshed the canonical report path again:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`
+  failed the same strict budget, and
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`
+  passed.
+- Current post-revert report:
+  worktree fingerprint
+  `02cc91198468bac06b06d01ac86aa62453aedfae7965a3200cb082954d3fa41f`,
+  `input_to_visible.p95=23.046ms`,
+  `click_to_cursor.p95=23.046ms`,
+  `runtime_step_apply.p95=8.990ms`,
+  `runtime_apply.p95=10.610ms`,
+  and `layout_rebuild.p95=5.730ms`.
+- Current hot roots keep the same shape:
+  `selected_signal_lane_rows.eval_ms=34.318ms`,
+  `diff_ms=29.851ms`,
+  `user_function_record_field_loop_ms=24.723ms`;
+  `selected_cursor_pair_rows.eval_ms=10.922ms`,
+  `diff_ms=9.264ms`,
+  `user_function_record_field_loop_ms=8.858ms`.
+
+### 2026-06-23 TASK-0804C Compiled Frontier Diagnostic Kept
+
+- Scope: kept a behavior-neutral diagnostic slice in `boon_runtime` and
+  `boon_native_playground`. Root list-view field-only plans now carry compiled
+  frontier counters for direct record projectors, including classifiable vs
+  unclassified field counts, row-dependent vs whole-row-dependent fields,
+  row-field dependency counts, and predicted dirty/clean row-field work. The
+  native playground mirrors those counters into
+  `runtime_root_list_cause_summary`.
+- Verification:
+  `cargo test -p boon_runtime root_list_view_compiled_frontier_profiles_direct_projector_dependencies -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep the diagnostic, but do not mark TASK-0804B/TASK-0804C complete.
+  The canonical report remains a speed failure with worktree fingerprint
+  `fad43c80b47b77ffd953c6731a6f0ab2f838f28b1c31775c8bdda15cd78ed210`,
+  `input_to_visible.p95=22.933ms`,
+  `click_to_cursor.p95=22.933ms`,
+  `runtime_step_apply.p95=9.038ms`,
+  `runtime_apply.p95=10.685ms`, and
+  `layout_rebuild.p95=5.741ms`.
+- Cause now documented by the report:
+  `selected_signal_lane_rows` remains the largest list bucket
+  (`eval_ms=34.735`, `diff_ms=30.115`,
+  `user_function_record_field_loop_ms=24.949`) and its compiled frontier is
+  fully unclassified for this branch-row shape (`fields=3136`,
+  `unclassified=3136`, `predicted_dirty=9408`). The existing direct-only
+  frontier therefore cannot prune lane-row work yet.
+- Secondary cause:
+  `selected_cursor_pair_rows` is direct and fully classifiable
+  (`fields=48`, `classifiable=48`), but the collector currently marks all
+  classifiable fields as whole-row dependent (`whole_row=48`,
+  `predicted_dirty=96`, `predicted_clean=0`), so it also cannot skip row-field
+  work yet.
+- Follow-up: the next TASK-0804C slice should be branch-aware compiled
+  row/field frontier metadata plus a sharper row-arg access collector. Kill the
+  slice if the canonical report does not reduce unclassified frontier counts or
+  materially move `selected_signal_lane_rows` / `selected_cursor_pair_rows`
+  eval or diff time.
+
+### 2026-06-23 TASK-0804C Branch-Aware Compiled Frontier Kept
+
+- Scope: implemented the next diagnostic/compiler-frontier slice. Root
+  list-view branch projectors now expose selector row-arg/free-environment
+  dependencies and count branch-arm record fields as classifiable compiled
+  frontier fields. The AST row-arg access collector now projects through
+  user-function calls, so helper calls such as `format_label(row: row)` can
+  report exact row-field dependencies instead of whole-row access when the
+  callee body proves those fields.
+- Verification:
+  `cargo test -p boon_runtime root_list_view_compiled_frontier_profiles_branch_projector_dependencies -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_compiled_frontier_profiles_direct_projector_dependencies -- --nocapture`;
+  `cargo test -p boon_runtime user_function_cache -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `cargo fmt -p boon_runtime`;
+  canonical NovyWave interaction-speed verifier;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep the slice, but do not mark TASK-0804B/TASK-0804C complete. The
+  canonical report remains `fail` with worktree fingerprint
+  `a5fc6f05837c0ead909ee414827f8f169bfcae0c102ce4134164d9ef3beededd`,
+  `input_to_visible.p95=23.117ms`,
+  `click_to_cursor.p95=23.117ms`,
+  `runtime_step_apply.p95=9.687ms`,
+  `runtime_apply.p95=11.048ms`, and
+  `layout_rebuild.p95=5.548ms`.
+- Evidence: `selected_signal_lane_rows` now reports `fields=3136`,
+  `classifiable=3136`, `unclassified=0`, `row_dependent=2744`,
+  `whole_row=0`, `row_field_deps=4144`, `predicted_dirty=1104`, and
+  `predicted_clean=8304`, versus the previous branch diagnostic's
+  `unclassified=3136`. `selected_cursor_pair_rows` now reports
+  `whole_row=0` with exact row-field dependencies, but it still predicts all
+  `96` row-fields dirty for the measured click.
+- Remaining cause: the compiler can now see the frontier, but the runtime has
+  not yet used it to avoid enough work. Hot buckets remain high:
+  `selected_signal_lane_rows eval_ms=34.060 diff_ms=29.536 field_loop_ms=24.386`
+  and
+  `selected_cursor_pair_rows eval_ms=10.711 diff_ms=8.906 field_loop_ms=8.503`.
+- Next direction: move from metadata to behavior. Either use the classified
+  frontier to evaluate only predicted dirty row-fields, or build a generic
+  shared projection/value column for repeated source-identity plus formatter
+  work. Kill the next slice if field-loop/eval totals do not move materially;
+  do not continue with metadata-only TASK-0804C work.
+
+### 2026-06-23 TASK-0804C Branch Dirty-Field Runtime Skip Kept
+
+- Scope: implemented the behavior slice after branch-frontier metadata. The
+  runtime now builds a row/scope/field dirty map from
+  `recent_invalidated_root_list_view_field_cache_keys` and uses it to skip
+  clean active-arm fields in root list-view field-only materialization. Branch
+  selectors remain a correctness barrier: selector dirtiness still falls back
+  before patching, and skips are applied only after active-arm selection.
+- Subagent review: read-only agents `019ef3b9-6f12-7a63-a57b-152145cd64fa` and
+  `019ef3b9-6bf5-7010-acbc-53093941c5f6` agreed the safe shape is
+  invalidated-cache-key proof after active Branch selection, with
+  `record_scope` preserved and aggregate frontier stats not used directly as
+  execution truth.
+- Verification:
+  `cargo test -p boon_runtime root_list_view_branch_field_skip_keeps_arm_scopes_separate -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_only_patches_when_dispatched_record_rows -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_field_cache -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view_compiled_frontier_profiles_branch_projector_dependencies -- --nocapture`;
+  `cargo test -p boon_runtime user_function_cache -- --nocapture`;
+  `cargo test -p boon_runtime root_list_view -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  canonical NovyWave interaction-speed verifier;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Result: keep the slice, but do not mark TASK-0804B/TASK-0804C complete. The
+  canonical report remains `fail` with worktree fingerprint
+  `f9e9097c64b4ce81cb1f17abea0aadb69284b985a7f66178fd188ba5a7b1aa64`,
+  `input_to_visible.p95=22.313ms`,
+  `click_to_cursor.p95=22.313ms`,
+  `runtime_step_apply.p95=8.897ms`,
+  `runtime_apply.p95=10.406ms`, and
+  `layout_rebuild.p95=5.575ms`.
+- Evidence: `selected_signal_lane_rows` improved from the prior branch
+  metadata checkpoint to
+  `eval_ms=19.915`, `diff_ms=14.455`, and `field_loop_ms=9.758`
+  versus `eval_ms=34.060`, `diff_ms=29.536`, and `field_loop_ms=24.386`.
+  `selected_cursor_pair_rows` remains hot at
+  `eval_ms=10.487`, `diff_ms=8.723`, and `field_loop_ms=8.286`, with
+  `field_cache_hits=0`, `field_cache_misses=96`, and all `96` row-fields still
+  predicted dirty.
+- Next direction: stop branch-frontier work unless a new measurement says
+  otherwise. Target `selected_cursor_pair_rows` through generic shared
+  projection/value columns for repeated cursor-value formatter work, a better
+  cursor-pair dirty frontier, or the retained layout-frame path for the
+  separate layout budget.
+
+### 2026-06-23 TASK-0804C Cursor-Pair Pivot Decision
+
+- Scope: refreshed a function-profile diagnostic after the kept branch
+  dirty-field runtime skip, inspected `examples/novywave/RUN.bn`, and reviewed
+  the current user-function/field-cache behavior before attempting another
+  cursor-pair patch.
+- Verification:
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS BOON_RUNTIME_FUNCTION_PROFILING=1 cargo xtask verify-native-gpu-novywave-interaction-speed --report target/diagnostics/native-gpu/novywave-interaction-speed-function-profile.json`;
+  source/code inspection of `selected_cursor_pair_rows`,
+  `selected_cursor_pair_row`, `selected_cursor_value_for_signal`, and
+  `generic_function_cache_key`.
+- Subagent review: read-only agent `019ef3c2-ddc3-7fa2-a1ec-b04ac2d0d50c`
+  recommended pivoting away from more runtime microchanges because
+  `selected_cursor_pair_rows` is already field-only, all cursor-pair labels are
+  truly dirty on boundary-crossing cursor clicks, and layout remains
+  `~5.5ms`. Read-only agent `019ef3c2-dac0-7433-9af7-0f708dbc9881` identified a
+  possible larger generic design: read-set validated, path-projected free-env
+  cache keys for field/function caches, with strict correctness gates.
+- Decision: do not start another small cursor-pair runtime patch in this slice.
+  The next implementation should be either a planned projected-free-env
+  cache-key slice, retained layout-frame work, or a Boon/NovyWave model/API
+  change that makes cursor value lookup a shared derived field/domain primitive
+  instead of repeated generic segment filtering and formatting.
+- Kill criteria for the projected-free-env route: stop if the analyzer must
+  classify `store` as whole/dynamic for `selected_cursor_value_for_signal`, if
+  correctness requires dropping `root_path` from `RootListViewFieldCacheKey`, if
+  cache-key projection overhead exceeds saved eval time, or if semantic deltas,
+  dirty reads, or native reports diverge.
+
+### 2026-06-23 U3 Retained Layout Node Index And Bound Sync Precheck Kept
+
+- Task: U3 retained incremental layout/shared text continuation after the
+  TASK-0804C cursor-pair pivot.
+- Scope: kept two bounded native playground engine slices. First,
+  `DocumentRenderSnapshot` now has a side `DocumentLayoutNodeIndex` cache used
+  by direct paint/dimension patch helpers to avoid repeated display/hit/scroll
+  vector lookups when a cached snapshot index exists. Second,
+  `DocumentDataBindingSnapshotIndex` now precomputes text-binding paths and
+  source-intent binding targets, and
+  `preview_sync_bound_text_inputs_in_shared_state` computes text changes from
+  the immutable shared layout before calling `Arc::make_mut`.
+- Subagent review: read-only agent `019ef3c9-ad4f-7790-ab01-2ca343aa3848`
+  independently identified full document clone/patch/index refresh, full
+  layout clone, and broad layout vector scans as the retained-layout path's
+  concrete remaining costs. Read-only agent
+  `019ef3c9-c041-7b00-83a5-f9c4d9e03786` identified bound-input sync and
+  possible `Arc::make_mut` full-frame clone as a shared-update culprit, and
+  recommended cached binding lookup structures.
+- Verification:
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`4` tests);
+  `cargo test -p boon_native_playground row_data_binding_target_lookup_uses_projected_row_identity_index -- --nocapture`
+  passed;
+  `cargo check -p boon_native_playground -p xtask` passed with existing
+  dead-code warnings;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 64 --report target/reports/native-gpu/novywave-interaction-speed.json`
+  remained an expected speed failure.
+- Result: keep the slice, but do not mark TASK-0804B/TASK-0804C complete. The
+  fresh report remains `fail` with worktree fingerprint
+  `f636a872f7499264315e33cd451c48104d4c31d9e0237cba500ecf6f17da5d6c`,
+  `input_to_visible.p95=24.189ms`,
+  `click_to_cursor.p95=24.189ms`,
+  `runtime_step_apply.p95=9.237ms`,
+  `runtime_apply.p95=10.869ms`, and
+  `layout_rebuild.p95=5.351ms`.
+- Evidence: click layout patch p95 is now about `5.053ms`, with
+  `document_frame_patch.p95=1.540ms`,
+  `derived_indexes.p95=1.025ms`,
+  `direct_target_patch.p95=0.655ms`, and
+  `direct_row_group_patch.p95=0.608ms`. Shared update remains high at
+  `shared_update.p95=2.060ms` and `bound_input_sync.p95=1.295ms`; caching the
+  binding tables did not materially reduce that bucket.
+- Decision: this establishes useful retained-layout/shared-text infrastructure
+  but is not enough. The next high-leverage work should avoid full document
+  clone/patch/index refresh for cursor-safe paint patches, avoid full
+  `LayoutFrame` clone by carrying retained patch operations into renderer/shared
+  state, or return to the runtime cursor-pair/root-list dominance with a larger
+  projected-free-env/shared-value design. Kill further small shared-sync cache
+  tweaks unless a new profile isolates a specific sub-bucket.
+
+### 2026-06-23 U3 Trusted Nonstructural Document Batch Fast Path Kept
+
+- Task: U3 document/layout hot-path continuation.
+- Scope: added
+  `DocumentState::apply_nonstructural_batch_to_valid_owned_frame(...)` as a
+  guarded engine API for callers that already own a valid cached frame and are
+  applying only nonstructural patches. The API rejects structural patch kinds
+  before applying anything and otherwise reuses existing patch application and
+  `DocumentChangeSet` construction without whole-frame integrity validation.
+  The two native playground direct document-layout patch paths now use this API.
+- Verification:
+  `cargo test -p boon_document trusted_nonstructural_owned_frame_batch -- --nocapture`
+  passed (`2` tests);
+  `cargo test -p boon_document owned_frame_batch_matches_stateful_batch_patch_result -- --nocapture`
+  passed (`2` tests);
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`4` tests);
+  `cargo check -p boon_document -p boon_native_playground -p xtask` passed
+  with existing dead-code warnings;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 64 --report target/reports/native-gpu/novywave-interaction-speed.json`
+  remained an expected speed failure;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`
+  passed.
+- Result: keep the slice, but do not mark TASK-0804B/TASK-0804C complete. The
+  fresh report remains `fail` with worktree fingerprint
+  `2df615522458bf4b50f2db202dc04cdf7388db556fcbed1e44d4c5595cf8c56e`,
+  `input_to_visible.p95=23.273ms`,
+  `click_to_cursor.p95=23.273ms`,
+  `runtime_step_apply.p95=9.274ms`,
+  `runtime_apply.p95=11.042ms`, and
+  `layout_rebuild.p95=4.250ms`.
+- Evidence: the layout-side document patch bucket moved materially:
+  `document_frame_patch.p95=0.342ms` versus roughly `1.54ms` before this
+  slice, and `patch_function_total.p95=3.879ms`. The remaining layout costs are
+  `derived_indexes.p95=1.021ms`, `direct_layout_patch_total.p95=1.806ms`,
+  `shared_update.p95=2.119ms`, and `bound_input_sync.p95=1.369ms`.
+- Decision: this is a real retained-layout prerequisite and should stay. The
+  next layout-side target should avoid full `LayoutFrame` clone/direct patching
+  by carrying retained patch operations toward renderer/shared state, or reduce
+  derived-index refresh cost. Overall p95 still needs runtime work as well,
+  because `runtime_apply.p95` remains over `11ms`.
+
+### 2026-06-23 U3 Indexed Bound-Input-Sync Experiment Killed
+
+- Task: U3 retained shared-text follow-up after the trusted nonstructural batch
+  slice.
+- Scope: tried adding cached text-input display item positions to
+  `DocumentLayoutNodeIndex` so
+  `preview_sync_bound_text_inputs_in_shared_state` could visit preindexed
+  bound text nodes and text input nodes instead of scanning shared layout
+  display items. The experiment kept the already useful generic binding maps
+  and immutable `Arc<LayoutFrame>` precheck.
+- Verification: `cargo check -p boon_native_playground -p xtask` passed after
+  reverting the rejected experiment, with existing dead-code warnings;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 64 --report target/reports/native-gpu/novywave-interaction-speed.json`
+  remained an expected speed failure after the revert.
+- Experiment evidence before revert: report fingerprint
+  `0ab844b2f4d4d22ef9a261f4b80e57684a7a1d7aefb450ccf4f7f01f7ee55924`,
+  `input_to_visible.p95=23.145ms`,
+  `click_to_cursor.p95=23.145ms`,
+  `runtime_step_apply.p95=9.213ms`,
+  `runtime_apply.p95=11.110ms`,
+  `layout_rebuild.p95=4.257ms`,
+  `shared_update.p95=2.126ms`, and
+  `bound_input_sync.p95=1.441ms`.
+- Fresh evidence after revert: report fingerprint
+  `1cb5d6d80ef5adfe6f9215fec8392030d1af5727e2950558229339265ec2eeaf`,
+  `input_to_visible.p95=23.364ms`,
+  `click_to_cursor.p95=23.364ms`,
+  `runtime_apply.p95=11.157ms`,
+  `layout_rebuild.p95=4.219ms`,
+  `patch_function_total.p95=3.922ms`,
+  `document_frame_patch.p95=0.333ms`,
+  `shared_update.p95=2.057ms`, and
+  `bound_input_sync.p95=1.291ms`.
+- Decision: kill and revert the indexed text-input display-item path. It made
+  the measured bound-input bucket worse than both the previous kept slice
+  (`1.369ms`) and the post-revert report (`1.291ms`) without moving the strict
+  end-to-end p95 enough.
+- Follow-up: do not spend more TASK-0804/U3 time on small bound-input-sync
+  lookup caches unless a new report isolates a specific sub-bucket. Next useful
+  work should target retained patch operations for shared layout/renderer
+  state, derived-index refresh cost, or the larger runtime apply bucket.
+
+### 2026-06-23 TASK-0804C Projected Function-Key Diagnostic Killed
+
+- Task: TASK-0804C runtime/apply follow-up after subagent review found the
+  projected-free-env cache-key behavior change too risky without proof.
+- Scope: temporarily added a behavior-neutral projected function-key diagnostic
+  after real user-function body evaluation. It counted read-shape candidate
+  keys but did not change cache-hit behavior, root-list field-cache behavior,
+  semantic output, or verifier budgets.
+- Verification before revert:
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed;
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 64 --report target/reports/native-gpu/novywave-interaction-speed.json`
+  remained an expected strict speed failure;
+  `cargo xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`
+  passed.
+- Experiment evidence: report fingerprint
+  `d24858112b75bd2166a8f9c5475775fa2514867b695e6a3595720bf260432e9f`,
+  `input_to_visible.p95=23.741ms`,
+  `runtime_apply.p95=10.960ms`, and `layout_rebuild.p95=4.323ms`.
+  The diagnostic found no material reuse opportunity:
+  `selected_cursor_pair_rows` had `1070` projected-key probes, `1070` stores,
+  and `0` candidate hits; `selected_signal_lane_rows` had `78` probes and
+  `0` candidate hits; `selected_visible_items` had `147` probes and `0`
+  candidate hits.
+- Verification after revert:
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime user_function_cache_ -- --nocapture`
+  passed (`3` tests);
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime root_list_view_change_preserves_reusable_user_function_cache_entries -- --nocapture`
+  passed.
+- Decision: kill and revert the diagnostic. Do not implement a shallow
+  projected-free-env function cache from this evidence. Future runtime work
+  should either use compiler-backed precise free-env projection, make cursor
+  values a shared derived/page-domain value, or improve the root-list
+  currentness frontier so dirty cursor-pair labels are not repeatedly evaluated
+  in the first place.
+
+### 2026-06-23 U3/U4 Retained Render-Scene Patch Primitive Kept
+
+- Task: retained renderer/document prerequisite after the projected function-key
+  diagnostic was killed and the next bounded U3/U4 slice was identified as a
+  paint-only render-scene patch contract.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  `boon_document` now exposes `RenderScenePatch`,
+  `RenderScenePatchOperation`, `RenderScenePaintPatch`, and
+  `RenderScenePatchReport`. Patch application can update already-lowered fill
+  color and text color data, requires caller-supplied computed style identity
+  and retained chunk id, rejects stale scene references, and clears prebuilt
+  quad batches to avoid stale GPU uploads.
+- Verification:
+  `cargo test -p boon_document render_scene_patch -- --nocapture` passed
+  (`3` tests).
+  `cargo check -p boon_document -p boon_native_gpu -p boon_native_playground -p xtask`
+  passed with existing native GPU/playground dead-code warnings.
+- Caveat: this is not wired into the official NovyWave hot interaction path
+  yet. The visible path renders `RenderScene`, but app-owned readback proof
+  still renders from `LayoutFrame`, so a scene-only hot overlay would currently
+  make verifier evidence inconsistent.
+- Follow-up: carry a render-scene patch sidecar through preview visible state
+  and make app-owned proof/readback prove the same patched scene that is
+  presented. Only then use this to replace the current layout-frame clone for
+  paint-only interactions.
+
+### 2026-06-23 U3/U4 App-Owned Render-Scene Readback Kept
+
+- Task: proof-alignment follow-up for the retained render-scene patch primitive.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  `boon_native_gpu` now has `AppOwnedRenderSceneRequest` and
+  `render_app_owned_scene_pixels(...)`, which render a prelowered
+  `boon_document::RenderScene` into app-owned WGPU readback without lowering a
+  separate `LayoutFrame`. The native render hook now hashes the cached
+  `RenderScene`, renders proof from that same scene, records `render_scene_hash`
+  in the preview proof JSON, and reuses app-owned proof only when scene hash and
+  viewport match.
+- Verification:
+  `cargo test -p boon_native_gpu app_owned_scene_readback_uses_prelowered_render_scene_identity -- --nocapture`
+  passed (`1` test).
+  `cargo check -p boon_native_gpu -p boon_native_playground` passed with
+  existing native GPU/playground dead-code warnings.
+  `cargo test -p boon_native_playground app_owned_readback_reuse_requires_matching_render_frame_hash -- --nocapture`
+  passed (`1` test).
+  `cargo test -p boon_document render_scene_patch -- --nocapture` passed
+  (`3` tests).
+  `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`
+  passed.
+- Caveat: this is proof plumbing, not the final speed optimization. The
+  interaction hot path still builds the full render frame and render scene.
+- Follow-up: carry a bounded `RenderScenePatch`/scene-hash sidecar from
+  paint-only document changes through `PreviewVisibleRenderState`, apply it to
+  the cached render scene before encode/readback, and reject the path if the
+  patched scene cannot be proven through app-owned scene readback.
+
+### 2026-06-23 U3/U4 Text-Color Render-Scene Sidecar Kept
+
+- Task: first proof-consistent hot-path use of retained render-scene patches.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  `boon_document::render_scene::style_value_color_u8(...)` now exposes the same
+  hex/Oklch color parsing used by normal lowering. The playground has a bounded
+  render-scene patch sidecar cache keyed by layout-frame hash and evicted with
+  document snapshots. The paint-space fast path now detects parseable `color`
+  updates on already-visible text-like layout items, reuses the existing
+  `Arc<LayoutFrame>` and retained layout cache, caches the patched document
+  snapshot under the new layout hash, and stores a `RenderScenePatch` sidecar.
+  The render hook includes the sidecar patch hash in its render-scene cache key,
+  applies the patch before visible encode/readback, and reports
+  `render_scene_patch_hash` plus `render_scene_patch_applied`.
+- Verification:
+  `cargo test -p boon_native_playground text_color_render_scene_patch_reuses_layout_and_updates_scene_text_paint -- --nocapture`
+  passed (`1` test).
+  `cargo test -p boon_document render_scene_patch -- --nocapture` passed
+  (`3` tests).
+  `cargo check -p boon_document -p boon_native_gpu -p boon_native_playground -p xtask`
+  passed with existing native GPU/playground dead-code warnings.
+  `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`
+  passed.
+- Caveat: this is intentionally narrow. It does not cover text content, size,
+  layout-affecting styles, fill/material changes, hover overlays, or empty text
+  runs. It is a real retained-render path step, not a full NovyWave speed fix.
+- Follow-up: add measurements/report fields for render-scene patch hits and
+  rejects, then consider simple fill color only after material/primitive
+  identity can be computed without diverging from normal document lowering.
+
+### 2026-06-23 U3/U4 Render-Scene Sidecar Measurement Fields Kept
+
+- Task: U3/U4 retained render-scene sidecar observability follow-up.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  The paint-space retained path now records render-scene sidecar attempt,
+  application, operation count, and rejection reason in
+  `DocumentPatchLayoutProfile`. The text-color sidecar builder returns an
+  explicit decision instead of a silent `Option`, and NovyWave
+  interaction-speed reports now expose `render_scene_patch_counts` when compact
+  timing/profiling is enabled. The `xtask` aggregate also passes through
+  `render_scene_patch_counts`, `paint_space_patch_reject_counts`, and
+  `native_input_reject_counts` from the role report.
+- Verification:
+  `cargo test -p boon_native_playground render_scene -- --nocapture` passed
+  (`4` tests).
+  `cargo check -p boon_document -p boon_native_gpu -p boon_native_playground -p xtask`
+  passed with existing native GPU/playground dead-code warnings.
+  `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`
+  passed.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 16 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-render-scene-sidecar-counts.json`
+  wrote an expected failing speed-budget report whose schema passed and whose
+  aggregate includes `render_scene_patch_counts={"rejected:non_color_attr":49}`.
+- Caveat: this is observability and proof coverage for the narrow text-color
+  sidecar path. It does not by itself prove the NovyWave hot interactions are
+  faster, and it does not expand support to text content, fill/material,
+  layout-affecting style, hover overlays, or empty text runs.
+- Follow-up: do not add another retained-render patch class blindly. The fresh
+  NovyWave diagnostic shows no text-color sidecar hits in the measured hot
+  cursor path. Inspect the real non-color targets first; if they are text/value
+  content or layout-sensitive row updates, prioritize retained layout/shared
+  text invalidation or runtime/list currentness instead of fill-color support.
+
+### 2026-06-23 U3 Row-Child Width Delta Patch Kept
+
+- Task: U3 direct-layout patching for measured NovyWave width updates.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  The direct layout patcher now handles structurally safe row-child numeric
+  `width` updates by relayouting only the changed child subtree and shifting
+  later fixed-width sibling subtrees. The old full-row relayout remains the
+  fallback for flexible/fill sibling cases and other unsafe row shapes. Dirty
+  node reporting includes the changed subtree, moved sibling subtrees, and the
+  parent row.
+- Verification:
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`4` tests).
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-row-width-delta.json`
+  wrote an expected failing speed-budget report whose schema passed.
+- Measurement:
+  `target/diagnostics/native-gpu/novywave-row-width-delta.json` shows
+  cursor/hover/click samples now have `direct_row_group_count=0`. The remaining
+  row-group fallback samples are divider resize interactions targeting
+  `store.browser_panel_width`, `store.files_panel_height`, and
+  `store.files_panel_width`.
+- Caveat: the same diagnostic still fails the budget:
+  `input_to_visible.p95=19.596009ms` and `click_to_cursor.p95=19.596009ms`
+  against `16.700ms`. The current remaining click path is more runtime/list
+  currentness dominated (`runtime_apply.p95=10.265436ms`), while divider resize
+  still needs a separate panel-layout direct patch or retained row constraint
+  solver.
+- Follow-up: continue TASK-0804B/C from runtime/list-currentness and panel
+  layout constraints rather than adding more blind render-scene color classes.
+
+### 2026-06-23 TASK-0804B/C Field-Cache Invalidation Retain Experiment Killed
+
+- Task: TASK-0804B/C runtime micro-experiment after row-width layout split.
+- Result: killed and reverted. A one-pass `retain` rewrite of root-list
+  field-cache invalidation in `boon_runtime` preserved tests but did not improve
+  the measured NovyWave hotspot.
+- Verification:
+  `cargo test -p boon_runtime --lib root_list_view_field_cache_ -- --nocapture`
+  passed (`7` tests) during the experiment.
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed with
+  existing warnings during the experiment.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-invalidation-retain.json`
+  wrote an expected failing speed-budget report whose schema passed.
+- Kill evidence: click `source_action_root_cache_invalidation_ms` average was
+  effectively unchanged (`0.458799375ms` before, `0.45952025ms` after), and the
+  short diagnostic regressed strict p95s to
+  `input_to_visible.p95=22.816323ms` / `runtime_apply.p95=11.874356ms`.
+- Follow-up: do not retry local field-cache invalidation rewrites unless a
+  fresh profile shows that specific function as newly dominant. Continue with
+  larger source-action/root-list materialization work or compiler/runtime
+  currentness graph changes.
+
+### 2026-06-23 TASK-0804B/C Row Fill-Sibling Width Delta Patch Kept
+
+- Task: TASK-0804B/C retained layout direct-patch coverage for NovyWave divider
+  panel updates.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  The direct layout patcher now handles row child numeric `width` updates when
+  sibling width is `Fill`: it computes the Fill width delta from retained row
+  geometry, relayouts the changed fixed subtree and affected Fill subtree(s),
+  and shifts unchanged sibling subtrees by accumulated deltas. Unsafe centered
+  or clamped/invalid row shapes still fall back to the existing full relayout
+  path.
+- Verification:
+  `cargo fmt --package boon_native_playground` passed.
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`5` tests).
+  `cargo check -p boon_native_playground -p xtask` passed with existing native
+  GPU/playground dead-code warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-row-fill-delta.json`
+  wrote an expected failing speed-budget wrapper report whose schema passed.
+- Measurement:
+  divider interactions now pass the current budget
+  (`divider_drag_to_layout.p95=12.922786ms` under `16.700ms`). The divider
+  layout patch profile shows row-group relayout is effectively gone
+  (`direct_row_group_patch.p95=0.000479ms`, `fallback_full_layout.p95=0.0`).
+  The overall gate still fails on click/input latency:
+  `input_to_visible.p95=21.549428ms` and
+  `click_to_cursor.p95=21.549428ms` against `16.700ms`, with
+  `runtime_apply.p95=11.246962ms` and `layout_rebuild.p95=6.229974ms`.
+- Follow-up: stop spending time on row-group divider relayout until a fresh
+  profile makes it dominant again. Continue TASK-0804B/C from
+  runtime/list-currentness, layout-frame clone/rebuild cost, and retained
+  render-scene patch applicability.
+
+### 2026-06-23 U3/U4 Text-Content Render-Scene Sidecar Kept As Capability
+
+- Task: U3/U4 retained render-scene patch coverage after the row-fill delta
+  slice.
+- Result: keep the slice as a renderer/document capability, but do not mark
+  TASK-0804B or TASK-0804C complete and do not treat it as a measured NovyWave
+  speed win. The retained render-scene patch API now supports
+  `TextContent`, and the native playground can build text-content sidecar
+  operations for stable `text`/`label`/`value`/`display_value` paint-space
+  updates.
+- Verification:
+  `cargo fmt --package boon_document --package boon_native_playground` passed.
+  `cargo test -p boon_document render_scene_patch -- --nocapture` passed
+  (`4` tests).
+  `cargo test -p boon_native_playground render_scene -- --nocapture` passed
+  (`4` tests).
+  `cargo test -p boon_native_playground paint_space_text_patch_reuses_layout_and_updates_scene_text -- --nocapture`
+  passed (`1` test).
+  `cargo check -p boon_document -p boon_native_gpu -p boon_native_playground -p xtask`
+  passed with existing native GPU/playground warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-text-sidecar.json`
+  wrote an expected failing speed-budget wrapper report whose schema passed.
+- Measurement:
+  the strict NovyWave gate still fails
+  (`input_to_visible.p95=19.962020ms`,
+  `click_to_cursor.p95=19.962020ms`, budget `16.700ms`). The sidecar did not
+  hit the measured hot path:
+  `render_scene_patch_applied.p95=0.0` and
+  `render_scene_patch_operation_count.p95=0.0`. The rejection profile changed
+  to `rejected:non_text_like_item=25`, with target counts including
+  `target_attr:text=23`, `target_attr:width=44`, and
+  `target_attr:__source_intent:target=34`.
+- Remaining cause:
+  click cost in the same report remains runtime/layout dominated:
+  `runtime_apply.p95=11.008158ms`, `layout_rebuild.p95=3.817035ms`,
+  `layout_patch_function_total.p95=3.486908ms`,
+  `bound_input_sync.p95=0.772953ms`, and
+  `shared_update.p95=1.284878ms`.
+- Follow-up:
+  do not blindly add more isolated render-scene patch classes. First inspect
+  the actual `non_text_like_item` target shapes and decide whether the next
+  architecture should support partial render-scene patching alongside direct
+  layout patching. If that does not remove real measured work, continue
+  TASK-0804B/C from runtime/list-currentness and layout-frame rebuild costs.
+
+### 2026-06-23 TASK-0804B/C Root List-Length Cardinality Skip Kept
+
+- Task: TASK-0804B/C runtime currentness/root-list follow-up after deep
+  diagnostic showed an unchanged scalar root,
+  `store.selected_lane_materialized_row_count`, being rematerialized during
+  NovyWave cursor clicks even though its backing list cardinality did not
+  change.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  The runtime now recognizes `List/length`/`List/count` roots whose expression
+  is stored as a single child expression under a root field statement, resolves
+  local store-root aliases, and skips dependent length/count roots when an
+  upstream root list-view already materialized in the same turn with unchanged
+  row count.
+- Verification:
+  `cargo fmt --package boon_runtime` passed.
+  `cargo test -p boon_runtime --lib root_list_length_skips_row_field_only_dirty_changes -- --nocapture`
+  passed.
+  `cargo test -p boon_runtime --lib root_list_view_ -- --nocapture` passed
+  (`28` tests).
+  `cargo test -p boon_runtime --lib root_derived_ -- --nocapture` passed
+  (`6` tests).
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed with
+  existing native GPU/playground dead-code warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-list-length-skip.json`
+  wrote an expected failing speed-budget wrapper report.
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-list-length-skip.json`
+  passed.
+- Measurement:
+  strict NovyWave p95 still fails:
+  `input_to_visible.p95=19.677848ms` and
+  `click_to_cursor.p95=19.677848ms` against `16.700ms`.
+  Compared with the previous canonical text-sidecar report,
+  `input_to_visible.p95` moved from `19.962020ms` to `19.677848ms`,
+  `runtime_apply.p95` moved from `11.008158ms` to `9.858010ms`, and
+  `runtime_step_apply.p95` moved from `9.714565ms` to `8.723535ms`.
+  The worst runtime sample shows `source_action_root_skip_count=2`, so the
+  skip is active, but the remaining path still includes
+  `runtime_apply.max=13.231848ms`, `layout_rebuild.max=29.692400ms`, and
+  root-list materialization dominated by `selected_signal_lane_rows`.
+- Follow-up:
+  do not spend the next slice on more isolated scalar-root skips unless a fresh
+  report shows a scalar root is again dominant. Continue TASK-0804B/C from the
+  larger root-list materialization path (`selected_signal_lane_rows`,
+  cursor-pair/list-currentness roots), layout-frame rebuild/clone cost, or a
+  retained runtime/layout architecture that removes whole-frame work.
+
+### 2026-06-23 TASK-0804B/C Compiled Frontier Execution Experiment Killed
+
+- Task: TASK-0804B/C runtime root-list materialization follow-up after the
+  compiler/runtime diagnostic frontier became visible in reports.
+- Result: killed and reverted. The experiment tried to execute the existing
+  compiled row/field frontier inside root list-view field-only
+  materialization, guarded by the existing previous-read currentness check. It
+  did not change Boon syntax, did not hardcode NovyWave roots, and did not
+  weaken report budgets, but it made the measured hot path worse.
+- Verification while active:
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_compiled_frontier_profiles -- --nocapture`
+  passed.
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_field_cache_ -- --nocapture`
+  passed.
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave_cursor_click_splits_page_identity_from_cursor_freshness -- --nocapture`
+  passed.
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_length_skips_row_field_only_dirty_changes -- --nocapture`
+  passed.
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed with
+  existing native GPU/playground warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-frontier-exec.json`
+  wrote an expected failing speed-budget report, and
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-frontier-exec.json`
+  passed.
+- Kill evidence:
+  the experiment regressed strict p95 from the previous
+  `target/diagnostics/native-gpu/novywave-list-length-skip.json` baseline.
+  `input_to_visible.p95` and `click_to_cursor.p95` moved from
+  `19.677848ms` to `20.895587ms`.
+  `runtime_apply.p95` moved from `9.858010ms` to `11.828475ms`, and
+  `runtime_step_apply.p95` moved from `8.723535ms` to `10.556563ms`.
+  Click `selected_signal_lane_rows` got slower:
+  `eval_ms` moved from about `4.771840ms` to `6.618081ms`, and
+  `user_function_body_ms` moved from about `2.699520ms` to `4.778695ms`.
+- Cause learned:
+  the field-loop frontier is not the current lever. The measured click bucket
+  still contains broad dirty state (`current_dirty_read_count=308`,
+  `current_dirty_root_read_count=226` for `selected_cursor_pair_rows`) and
+  cursor-pair rows remain genuinely dirty at the current granularity:
+  `field_only_evaluated_field_count=24`,
+  `field_only_skipped_field_count=0`, and
+  `compiled_frontier_predicted_clean_field_count=0`.
+- Post-revert verification:
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`
+  passed (`28` tests).
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_derived_ -- --nocapture`
+  passed (`6` tests).
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_length_skips_row_field_only_dirty_changes -- --nocapture`
+  passed.
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed with
+  existing warnings.
+- Follow-up:
+  do not retry another inside-field-loop frontier wrapper without a new report
+  showing it is the dominant bottleneck. Next TASK-0804B/C work should reduce
+  the broad dirty frontier before list-view materialization, reduce
+  cursor-pair/user-function body cost, or move to a larger retained
+  runtime/layout architecture that avoids repeatedly reevaluating these roots.
+
+### 2026-06-23 U3/U4 Lazy Paint-Space Derived Index Rebuild Kept
+
+- Task: retained layout/render-scene capability follow-up after the current
+  NovyWave report showed paint-space patches still paying derived-index work
+  even though render-scene/source-binding-only reuse paths can preserve the
+  previous layout frame.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  The paint-space patch path now delays `DocumentDerivedIndexBundle`
+  recomputation until it knows a direct layout patch actually needs those
+  indexes. Render-scene-only patch reuse and source-binding-only layout reuse
+  carry forward the cached snapshot indexes.
+- Verification:
+  `cargo fmt --package boon_native_playground` passed.
+  `cargo test -p boon_native_playground paint_space_patch_reports_render_scene_sidecar_hit -- --nocapture`
+  passed and now asserts `derived_indexes_ms=0.0` for the render-scene-only
+  reuse path.
+  `cargo test -p boon_native_playground render_scene -- --nocapture` passed
+  (`4` tests).
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`5` tests).
+  `cargo check -p boon_native_playground -p boon_document -p boon_native_gpu -p xtask`
+  passed with existing native GPU/playground warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-lazy-paint-space-indexes.json`
+  wrote an expected failing speed-budget report, and
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-lazy-paint-space-indexes.json`
+  passed.
+- Measurement:
+  strict NovyWave p95 still fails:
+  `input_to_visible.p95=19.565529ms` and
+  `click_to_cursor.p95=19.565529ms` against `16.700ms`.
+  Current hot patches still reject the render-scene sidecar:
+  `render_scene_patch_counts={"rejected:non_text_like_item":25,"target_attr:__source_intent:target":34,"target_attr:text":23,"target_attr:width":44}`.
+  Click derived-index p95 remains around `0.893ms` because those click patches
+  still use the direct layout patch path rather than render-scene/source-binding
+  layout reuse.
+- Follow-up:
+  keep this as a generic retained-layout prerequisite, but do not spend more
+  time on render-scene-only bookkeeping unless hot patches start hitting that
+  path. Next useful TASK-0804B/C work should make the real `width`/`text`
+  targets cheaper or return to the runtime root-list dominance.
+
+### 2026-06-23 TASK-0804B/C Shared Root-List Field Cache Experiment Killed
+
+- Task: TASK-0804B/C runtime/root-list experiment after the current report
+  showed `root_flush_dirty_scheduler_plus_root_list_materialization` as the
+  dominant click cause.
+- Result: killed and reverted. The experiment added a generic sibling-root
+  field cache so two root list views projecting the same source row, record
+  scope, environment fingerprint, and field could share a computed field value
+  even when their target root paths differed. A synthetic runtime test proved
+  the reuse shape, but the canonical NovyWave interaction-speed report got
+  slower.
+- Verification while the experiment was applied:
+  `cargo fmt -p boon_runtime` passed.
+  `cargo test -p boon_runtime root_list_view_shared_field_cache_reuses_sibling_root_projection -- --nocapture`
+  passed.
+  `cargo test -p boon_runtime root_list_view -- --nocapture` passed (`29`
+  tests).
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask` passed with
+  existing warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-shared-root-list-field-cache.json`
+  wrote an expected failing report, and
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-shared-root-list-field-cache.json`
+  passed.
+- Measurement:
+  pre-experiment
+  `target/diagnostics/native-gpu/novywave-current-root-demand.json` had
+  `input_to_visible.p95=20.398481ms`,
+  `click_to_cursor.p95=20.398481ms`,
+  `runtime_apply.p95=10.747623ms`, and
+  `runtime_step_apply.p95=9.545465ms`.
+  The shared-cache experiment report had
+  `input_to_visible.p95=22.162654ms`,
+  `click_to_cursor.p95=22.162654ms`,
+  `runtime_apply.p95=13.826484ms`, and
+  `runtime_step_apply.p95=12.295916ms`.
+- Post-revert sanity check:
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-shared-root-list-field-cache-reverted.json`
+  wrote an expected failing strict-budget report, and
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-shared-root-list-field-cache-reverted.json`
+  passed.
+  The post-revert report had `input_to_visible.p95=26.819974ms` and
+  `click_to_cursor.p95=26.819974ms`; treat that as a noisy current-run sanity
+  sample, not as an optimization result. The cause remained
+  `root_flush_dirty_scheduler_plus_root_list_materialization`.
+- Cause learned:
+  sibling-root field sharing is not the current NovyWave lever. The dominant
+  click list `selected_signal_lane_rows` regressed from
+  `eval_ms=4.737459ms` to `5.567692ms`, `diff_ms=3.494764ms` to
+  `4.176346ms`, and `user_function_body_ms=2.759429ms` to `3.432734ms`.
+- Follow-up:
+  do not retry shared sibling-root field caching as a standalone optimization
+  unless a future report shows duplicated sibling-root work. Continue TASK-0804B/C
+  from the measured broad dirty frontier, cursor-pair/root-list body work, or
+  larger retained runtime/layout changes for the real `width`/`text` hot
+  patches.
+
+### 2026-06-23 TASK-0804B/C Mixed Paint-Space Render-Scene Sidecar Kept
+
+- Task: U3/U4 retained render/layout capability after the previous NovyWave
+  report showed mixed `width`/`text` patch batches rejecting the whole
+  render-scene sidecar path.
+- Result: keep the slice, but do not mark TASK-0804B or TASK-0804C complete.
+  Mixed paint-space patches can now split eligible fixed-box text/color targets
+  into a render-scene sidecar while leaving unsupported targets, such as
+  `width`, for direct layout patching. Fully sidecar-eligible batches still use
+  the old all-target layout-reuse path.
+- Verification:
+  `cargo fmt --package boon_native_playground` passed.
+  `cargo test -p boon_native_playground paint_space_mixed_text_and_width_patch_keeps_text_as_render_scene_sidecar -- --nocapture`
+  passed.
+  `cargo test -p boon_native_playground paint_space_text_patch_reuses_layout_and_updates_scene_text -- --nocapture`
+  passed.
+  `cargo test -p boon_native_playground direct_layout_patch -- --nocapture`
+  passed (`5` tests).
+  `cargo test -p boon_native_playground render_scene -- --nocapture` passed
+  (`5` tests).
+  `cargo check -p boon_native_playground -p boon_document -p boon_native_gpu -p xtask`
+  passed with existing native GPU/playground warnings.
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-mixed-render-scene-sidecar.json`
+  wrote an expected failing strict-budget report, and
+  `cargo xtask verify-report-schema target/diagnostics/native-gpu/novywave-mixed-render-scene-sidecar.json`
+  passed.
+- Measurement:
+  compared with
+  `target/diagnostics/native-gpu/novywave-lazy-paint-space-indexes.json`
+  (`input_to_visible.p95=19.565529ms`,
+  `click_to_cursor.p95=19.565529ms`,
+  `runtime_apply.p95=10.021891ms`,
+  `runtime_step_apply.p95=8.854756ms`,
+  `layout_rebuild.p95=6.165368ms`), the mixed-sidecar report had
+  `input_to_visible.p95=21.572239ms`,
+  `click_to_cursor.p95=21.572239ms`,
+  `runtime_apply.p95=11.470466ms`,
+  `runtime_step_apply.p95=10.059227ms`,
+  and `layout_rebuild.p95=5.995598ms`.
+- Cause learned:
+  the sidecar now genuinely hits the real NovyWave report
+  (`render_scene_patch_counts.applied=9`), but that is not enough to beat the
+  strict interaction budget. The remaining cause is still
+  `root_flush_dirty_scheduler_plus_root_list_materialization`, with
+  `selected_signal_lane_rows` dominant in the click bucket.
+- Follow-up:
+  keep the retained-render split as architecture groundwork, but do not spend
+  more TASK-0804 time on sidecar bookkeeping alone. Continue from runtime/root
+  dirty-frontier reduction, cursor-pair/root-list body cost, or larger retained
+  layout changes that make the real `width` targets cheap.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/concat` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after the BYTES
+  ledger still listed `Bytes/concat` among row/function-body gaps.
+- Result: keep the slice. `Bytes/concat` now lowers to
+  `PlanRowExpression::BytesConcat { left, right }` in row/function bodies,
+  executes through the typed runtime row evaluator, and replays through
+  report-schema expected execution. The row builtin classifier now routes
+  `Bytes/concat` through typed row lowering rather than generic fallback.
+- Verification:
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_concat=1`, generic `Bytes/concat=0`, and
+  tampered generic row `Bytes/concat` verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_concat_evaluates_private_bytes_and_feeds_length -- --nocapture`
+  passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  broader BYTES row/function-body gaps, full aggregate refresh, Cells benchmark
+  wrapper evidence, `TASK-0804`, and the Phase 10 default PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/to_text` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after typed row
+  decode still existed only for root scalar update branches and not for
+  row/function-body expressions.
+- Result: keep the slice. `Bytes/to_text` now lowers to
+  `PlanRowExpression::BytesToText { input, encoding }` in row/function bodies,
+  executes through the typed runtime row evaluator using the shared
+  `runtime_bytes_to_text` helper, and replays through report-schema expected
+  execution. Generic row `Bytes/to_text` fallback is rejected by the focused
+  verifier tamper test.
+- Verification:
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_to_text=1`, generic `Bytes/to_text=0`, and
+  tampered generic row `Bytes/to_text` verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed.
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  broader BYTES row/function-body gaps for numeric/mutation operations, full
+  aggregate refresh, Cells benchmark wrapper evidence, `TASK-0804`, and the
+  Phase 10 default PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/to_hex` And `Bytes/to_base64` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after root scalar
+  `Bytes/to_hex`/`Bytes/to_base64` existed but row/function-body expressions
+  still lacked typed MachinePlan nodes.
+- Result: keep the slice. `Bytes/to_hex` now lowers to
+  `PlanRowExpression::BytesToHex { input }`, and `Bytes/to_base64` lowers to
+  `PlanRowExpression::BytesToBase64 { input }` in row/function bodies. Both
+  execute through the typed runtime row evaluator and replay through
+  report-schema expected execution. Generic row fallback for both functions is
+  rejected by the focused verifier tamper test.
+- Verification:
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_to_hex=1`, `bytes_to_base64=1`, generic
+  `Bytes/to_hex=0`, generic `Bytes/to_base64=0`, and tampered generic row
+  verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed and now also evaluates typed row `Bytes/to_hex` and `Bytes/to_base64`
+  over private row BYTES.
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  broader BYTES row/function-body gaps for decode-from-text, take/drop/zero,
+  numeric/mutation operations, full aggregate refresh, Cells benchmark wrapper
+  evidence, `TASK-0804`, and the Phase 10 default PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/from_hex` And `Bytes/from_base64` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after root scalar
+  `Bytes/from_hex`/`Bytes/from_base64` existed but row/function-body
+  expressions still lacked typed MachinePlan nodes.
+- Result: keep the slice. `Bytes/from_hex` now lowers to
+  `PlanRowExpression::BytesFromHex { input }`, and `Bytes/from_base64` lowers
+  to `PlanRowExpression::BytesFromBase64 { input }` in row/function bodies.
+  Both execute through the typed runtime row evaluator and replay through
+  report-schema expected execution. Generic row fallback for both functions is
+  rejected by the focused verifier tamper test.
+- Verification:
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_from_hex=1`, `bytes_from_base64=1`, generic
+  `Bytes/from_hex=0`, generic `Bytes/from_base64=0`, and tampered generic row
+  verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed and now also evaluates typed row `Bytes/from_hex` and
+  `Bytes/from_base64` into private row BYTES.
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  broader BYTES row/function-body gaps for take/drop/zero, numeric/mutation
+  operations, full aggregate refresh, Cells benchmark wrapper evidence,
+  `TASK-0804`, and the Phase 10 default PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/take`, `Bytes/drop`, And `Bytes/zeros` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after root scalar
+  `Bytes/take`/`Bytes/drop`/`Bytes/zeros` existed but row/function-body
+  expressions still lacked typed MachinePlan nodes.
+- Result: keep the slice. `Bytes/take` now lowers to
+  `PlanRowExpression::BytesTake { input, byte_count }`, `Bytes/drop` lowers to
+  `PlanRowExpression::BytesDrop { input, byte_count }`, and `Bytes/zeros`
+  lowers to `PlanRowExpression::BytesZeros { byte_count }` in row/function
+  bodies. All three execute through the typed runtime row evaluator and replay
+  through report-schema expected execution. Generic row fallback for all three
+  functions is rejected by the focused verifier tamper test.
+- Verification:
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_take=1`, `bytes_drop=1`, `bytes_zeros=1`,
+  generic `Bytes/take=0`, generic `Bytes/drop=0`, generic `Bytes/zeros=0`,
+  and tampered generic row verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed and now also evaluates typed row `Bytes/take`, `Bytes/drop`, and
+  `Bytes/zeros` into private row BYTES.
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  numeric/mutation BYTES row/function-body gaps, full aggregate refresh, Cells
+  benchmark wrapper evidence, `TASK-0804`, and the Phase 10 default
+  PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/read_unsigned` And `Bytes/read_signed` Kept
+
+- Task: unified goal Phase 1 BYTES/MachinePlan continuation after root scalar
+  `Bytes/read_unsigned`/`Bytes/read_signed` existed but row/function-body
+  expressions still lacked typed MachinePlan nodes.
+- Result: keep the slice. `Bytes/read_unsigned` now lowers to
+  `PlanRowExpression::BytesReadUnsigned { input, offset, byte_count, endian }`,
+  and `Bytes/read_signed` lowers to `PlanRowExpression::BytesReadSigned {
+  input, offset, byte_count, endian }` in row/function bodies. Both execute
+  through the typed runtime row evaluator and replay through report-schema
+  expected execution. Generic row fallback for both functions is rejected by
+  the focused verifier tamper test.
+- Verification:
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_read_unsigned=1`, `bytes_read_signed=1`,
+  generic `Bytes/read_unsigned=0`, generic `Bytes/read_signed=0`, and
+  tampered generic row verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed and now also evaluates typed row `Bytes/read_unsigned` and
+  `Bytes/read_signed` over private row BYTES.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  BYTES-producing row/function-body mutation/write gaps for `Bytes/set`,
+  `Bytes/write_unsigned`, and `Bytes/write_signed`, full aggregate refresh,
+  Cells benchmark wrapper evidence, `TASK-0804`, and the Phase 10 default
+  PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Typed Row `Bytes/set`, `Bytes/write_unsigned`, And `Bytes/write_signed` Kept
+
+- Task:
+  continue unified U1 BYTES/MachinePlan migration after root scalar
+  `Bytes/set`/`Bytes/write_unsigned`/`Bytes/write_signed` existed but
+  row/function-body expressions still lacked typed MachinePlan nodes.
+- Result:
+  keep the slice. `Bytes/set` now lowers to
+  `PlanRowExpression::BytesSet { input, index, value }`,
+  `Bytes/write_unsigned` lowers to
+  `PlanRowExpression::BytesWriteUnsigned { input, offset, byte_count, endian,
+  value }`, and `Bytes/write_signed` lowers to
+  `PlanRowExpression::BytesWriteSigned { input, offset, byte_count, endian,
+  value }` in row/function bodies. All three execute through the typed runtime
+  row evaluator and replay through report-schema expected execution. Generic
+  row fallback for all three functions is rejected by the focused verifier
+  tamper test.
+- Verification:
+  `cargo fmt -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo check -p boon_plan -p boon_runtime -p boon_report_schema` passed.
+  `cargo test -p boon_plan row_bytes_predicates_lower_to_typed_expressions -- --nocapture`
+  passed and now proves `bytes_set=1`, `bytes_write_unsigned=1`,
+  `bytes_write_signed=1`, generic `Bytes/set=0`, generic
+  `Bytes/write_unsigned=0`, generic `Bytes/write_signed=0`, and tampered
+  generic row verifier rejection.
+  `cargo test -p boon_runtime typed_row_bytes_to_text_evaluates_private_bytes -- --nocapture`
+  passed and now also evaluates typed row `Bytes/set`,
+  `Bytes/write_unsigned`, and `Bytes/write_signed` over private row BYTES.
+- Follow-up:
+  do not mark BYTES/MachinePlan complete. Remaining blockers still include
+  full aggregate refresh, Cells benchmark wrapper evidence, `TASK-0804`, and
+  the Phase 10 default PlanExecutor switch.
+
+### 2026-06-23 U1 BYTES Aggregate Refresh After Typed Row Writes
+
+- Task:
+  restore BYTES/MachinePlan aggregate freshness after typed row
+  `Bytes/set`, `Bytes/write_unsigned`, and `Bytes/write_signed` changed the
+  current report boundary.
+- Result:
+  keep the slice. All 55 stale required child reports were replayed from their
+  embedded `command_argv` values. The dependent `bytes-negative` and
+  `bytes-machine-plan-adversarial` meta-gates were rerun after child artifact
+  hashes changed. The aggregate is now fresh and passing for current HEAD.
+- Verification:
+  `cargo xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`
+  passed after replay. The aggregate reports `status=pass`,
+  `checked_report_count=56`, `required_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`,
+  `no_fallback_plan_executor_count=38`, and `blockers=null`.
+  `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+  passed.
+  `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`
+  failed as expected, and
+  `cargo xtask verify-report-schema target/reports/bytes-plan/goal-readiness.json target/reports/bytes-plan/bytes-machine-plan-all.json`
+  passed.
+- Follow-up:
+  readiness remains blocked by `8` partial phases, `1` not-started phase, the
+  missing Cells release benchmark wrapper because `TASK-0804A` remains blocked
+  by speed budgets, stale `runtime-production-hardening`, `runtime-finality`,
+  `machine-readiness`, and `schema` reports, and the Phase 10 default switch
+  because `boon_cli run` still defaults to legacy.
+
+### 2026-06-23 U1 Readiness Refresh And NovyWave Speed Report Artifact Isolation
+
+- Task:
+  refresh readiness-side evidence after the BYTES row write aggregate pass and
+  diagnose the schema freshness loop around NovyWave speed reports.
+- Result:
+  keep the verifier fix. `verify-native-gpu-novywave-interaction-speed` now
+  derives its child role artifact filename from the parent report stem. The
+  regular report writes
+  `target/artifacts/native-gpu/novywave-interaction-speed-role.json`; the
+  debug report writes
+  `target/artifacts/native-gpu/novywave-interaction-speed-debug-role.json`.
+  This fixes the previous false loop where refreshing one report made the
+  other report stale because both referenced the same child artifact.
+- Verification:
+  refreshed runtime production hardening, runtime finality, TodoMVC/native
+  machine-readiness dependencies, and machine-readiness. Refreshed both
+  NovyWave interaction-speed reports; both still fail expectedly on strict
+  release p95 speed budgets. `cargo xtask verify-report-schema
+  target/reports/native-gpu/novywave-interaction-speed.json
+  target/reports/native-gpu/novywave-interaction-speed-debug.json` passed.
+  `cargo xtask audit-goal-readiness --report
+  target/reports/bytes-plan/goal-readiness.json` failed expectedly with the
+  current blockers below.
+- Follow-up:
+  do not claim readiness. Remaining blockers are `8` partial phases, `1`
+  not-started phase, stale BYTES/MachinePlan aggregate for the current
+  worktree fingerprint after the verifier fix, missing Cells release benchmark
+  wrapper because `TASK-0804A` remains blocked by speed budgets, stale
+  `target/reports/schema.json`, and the Phase 10 default switch because
+  `boon_cli run` still defaults to legacy. Broad `cargo xtask
+  verify-report-schema` is not claimed in this checkpoint because the `xtask`
+  binary changed and older reports now legitimately carry stale
+  `binary_hash` values until regenerated.
+
+### 2026-06-23 U1 BYTES Aggregate Refresh After Artifact Isolation
+
+- Task:
+  remove the stale BYTES/MachinePlan aggregate blocker introduced by the
+  NovyWave speed report artifact-isolation fix.
+- Result:
+  keep the refresh. The aggregate is fresh and passing again for the current
+  worktree. Ten stale child reports were refreshed for the rebuilt
+  `target/debug/xtask` binary hash, and `bytes-machine-plan-adversarial` was
+  rerun after refreshed child artifact hashes changed.
+- Verification:
+  `cargo xtask verify-bytes-machine-plan-all --check-existing --report
+  target/reports/bytes-plan/bytes-machine-plan-all.json` passed. The aggregate
+  reports `status=pass`, `checked_report_count=56`,
+  `required_report_count=56`, `proof_report_count=46`,
+  `diagnostic_report_count=10`, `no_fallback_plan_executor_count=38`, and no
+  blockers. `cargo xtask audit-goal-readiness --report
+  target/reports/bytes-plan/goal-readiness.json` failed expectedly.
+- Process hygiene:
+  during the refresh, long-running BYTES verifier commands were monitored
+  because some report files were written before command exit. The final process
+  scan found no matching `verify-bytes`, `boon_cli`, `xtask`, or `cargo xtask`
+  processes left running.
+- Follow-up:
+  do not claim readiness. Remaining blockers are `8` partial phases, `1`
+  not-started phase, missing Cells release benchmark wrapper because
+  `TASK-0804A` remains blocked by speed budgets, stale
+  `target/reports/schema.json`, and the Phase 10 default switch because
+  `boon_cli run` still defaults to legacy.
+
+### 2026-06-23 U1 Recursive Schema And Aggregate Freshness Restored
+
+- Task:
+  finish the broad report freshness cleanup after the NovyWave speed verifier
+  artifact-isolation fix and remove stale schema/aggregate blockers from the
+  readiness audit.
+- Result:
+  keep the refresh. The recursive schema scan now passes for HEAD `b624d01`,
+  `target/reports/schema.json` is fresh, and the BYTES/MachinePlan aggregate
+  remains fresh and passing at `56/56`. Goal readiness still fails, but only
+  on unfinished roadmap items rather than stale evidence.
+- Verification:
+  refreshed the stale top-level reports identified by recursive schema
+  validation, then ran `cargo xtask verify-report-schema` until it passed.
+  `target/reports/schema.json` reports `status=pass`, `git_commit=b624d01`,
+  and binary hash
+  `8eb5f2e6186464a5b1c9c59eb8939abbfdf0d285ca166ee2e67b8514de151cae`.
+  `cargo xtask verify-bytes-machine-plan-all --check-existing --report
+  target/reports/bytes-plan/bytes-machine-plan-all.json` passed with
+  `checked_report_count=56`, `required_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`, and
+  `no_fallback_plan_executor_count=38`. `cargo xtask audit-goal-readiness
+  --report target/reports/bytes-plan/goal-readiness.json` failed expectedly.
+- Process hygiene:
+  final process scan found no matching `verify-bytes`, `boon_cli`,
+  `boon_native_playground`, `xtask`, or `cargo xtask` processes left running.
+- Follow-up:
+  do not claim readiness. Remaining blockers are `8` partial phases, `1`
+  not-started phase, missing Cells release benchmark wrapper because
+  `TASK-0804A` remains blocked by speed budgets, and the Phase 10 default
+  switch because `boon_cli run` still defaults to legacy. Do not spend more
+  time on stale-report cleanup unless a later change makes a specific report
+  stale again.
+
+### 2026-06-23 U4/U5 Retained RenderScene Native Gate Hardened
+
+- Task:
+  harden the native verifier so retained document `RenderScene` evidence cannot
+  silently regress to the compatibility-only LayoutFrame/display-item render
+  path.
+- Result:
+  keep the xtask gate change. `require_visible_native_render_proof(...)` now
+  requires visible proofs to use a prelowered document RenderScene backend:
+  either app-owned scene readback or `encode_render_scene_to_surface`. It also
+  requires visible metrics to report `render_scene_source=document-render-scene`,
+  requires app-owned readback metrics to report
+  `app-owned-document-render-scene`, and rejects the legacy display-item
+  fallback lowering mode when that mode field is present.
+- Verification:
+  `cargo fmt -p xtask` passed. `cargo check -p xtask` passed with existing
+  native GPU dead-code warnings. `target/debug/xtask verify-report-schema
+  target/reports/native-gpu/preview-e2e-todomvc.json` passed against current
+  preview evidence.
+- Follow-up:
+  do not claim readiness or speed-budget success. This only strengthens the
+  U4/U5 retained RenderScene/WGPU contract; NovyWave p95 speed work and Phase
+  10 default execution remain blocked by the existing roadmap items.
+
+### 2026-06-23 U6 SemanticScene MVP And Adapter Foundations
+
+- Task:
+  start the shared native/browser semantic accessibility layer without creating
+  an adapter-specific shortcut or pretending AccessKit/browser bridges are
+  complete.
+- Result:
+  keep the document-layer `SemanticScene` slice. `boon_document` now exposes an
+  adapter-neutral semantic model and deterministic patch operations:
+  `SemanticId`, `SemanticRole`, `SemanticValue`, `SemanticState`,
+  `SemanticActions`, `SemanticRelations`, `SemanticNode`, `SemanticScene`,
+  `SemanticPatch`, and `SemanticPatchOperation`.
+- Runtime contract:
+  `SemanticScene::from_document_layout(...)` derives stable semantic IDs,
+  roles, names, values, checked/disabled/selected/focused state, actions,
+  parent/child relationships, bounds, focus, and source-binding identity from
+  `DocumentFrame + LayoutFrame`. `SemanticScene::diff(...)` emits deterministic
+  remove/upsert/focus patch operations.
+- Web semantic bridge:
+  `SemanticDomSnapshot`, `SemanticDomNode`, and `SemanticDomMetrics` now derive
+  a minimal static semantic DOM snapshot from the same `SemanticScene`. It
+  exposes `data-boon-id`, ARIA/native control semantics, checked/focused/value
+  state, source-binding metadata, and one text/IME endpoint for text input
+  nodes. It deliberately reports `visual_dom_node_count=0` and must not become
+  a visual DOM renderer.
+- Web semantic/IME route bridge:
+  `SemanticWebBridgeSnapshot`, `SemanticWebImeEndpoint`,
+  `SemanticWebActionRoute`, `SemanticWebInputEvent`, and
+  `SemanticWebSourceDispatch` now define a platform-neutral static DOM/IME
+  route contract. It proves that text and press events can map back to Boon
+  source-intent dispatches without importing browser runtime types or claiming a
+  live browser host exists.
+- Native semantic bridge:
+  `boon_native_app_window::accesskit_tree_update_from_semantic_scene(...)` now
+  lowers the same adapter-neutral `SemanticScene` to a deterministic AccessKit
+  `TreeUpdate`. The lowering maps stable semantic IDs to stable native node
+  IDs, roles, bounds, actions, checked/disabled/selected state, text-input
+  actions, focus, child relationships, and labelled/described/controls
+  relations without adding AccessKit types to `boon_document`.
+- Live native tree delivery:
+  `app_window::Surface::update_accessibility_if_active(...)` now passes a Boon
+  content tree to the Linux AccessKit adapter when accessibility is active. The
+  internal app_window handler retains the latest tree for activation and
+  captures unsupported/content `ActionRequest`s instead of panicking. The
+  preview role derives its update generically from cached
+  `DocumentRenderSnapshot` plus the current `LayoutFrame` override; it does not
+  use examples, renderer output, or source-name shortcuts.
+- Verification:
+  `cargo fmt -p boon_document -p xtask` passed.
+  `cargo test -p boon_document semantic_ -- --nocapture` passed. `cargo check
+  -p boon_document` passed. `cargo check -p xtask` passed with existing native
+  GPU dead-code warnings. `cargo run -p xtask -- verify-semantic-scene --report
+  target/reports/unified/semantic-scene.json` passed with a freshly rebuilt
+  xtask binary. `target/debug/xtask verify-report-schema
+  target/reports/unified/semantic-scene.json` passed.
+  `cargo test -p boon_native_app_window semantic_scene_lowers_to_accesskit_tree_update_with_stable_ids -- --nocapture`
+  passed. `cargo test -p boon_native_app_window
+  accessibility_action_requests_lower_without_leaking_accesskit_types --
+  --nocapture` passed. `cargo check -p boon_native_app_window -p boon_native_playground -p
+  xtask` passed with existing native GPU dead-code warnings and one existing
+  native playground dead-code warning. `cargo run -p xtask --
+  verify-accessibility-adapters --report
+  target/reports/unified/accessibility-adapters.json` passed with a freshly
+  rebuilt xtask binary. `target/debug/xtask verify-report-schema
+  target/reports/unified/accessibility-adapters.json` passed. Do not treat
+  `cargo check -p xtask` as proof that `target/debug/xtask` is fresh;
+  regenerate verifier reports with `cargo run -p xtask -- ...` or after
+  `cargo build -p xtask`.
+- Report facts:
+  `target/reports/unified/semantic-scene.json` reports `status=pass`,
+  `command=verify-semantic-scene`, `measurement_mode=proof`,
+  `semantic_scene_node_count=4`, `semantic_patch_operation_count=3`,
+  `semantic_dom_node_count=4`, `semantic_dom_interactive_node_count=3`,
+  `semantic_dom_text_input_endpoint_count=1`, and
+  `semantic_dom_visual_node_count=0`.
+- Follow-up:
+  U6 is not complete. The report intentionally records
+  `adapter_status=canonical-scene-plus-web-semantic-ime-bridge-snapshot`,
+  `native_accessibility_adapter_status=covered-by-verify-accessibility-adapters`, and
+  `web_semantic_adapter_status=minimal-static-dom-and-ime-route-bridge-implemented`.
+  It also records `semantic_web_ime_endpoint_count=1`,
+  `semantic_web_action_route_count=6`, and
+  `semantic_web_source_routed_action_count=2`.
+  `target/reports/unified/accessibility-adapters.json` separately records
+  `status=pass`, `command=verify-accessibility-adapters`,
+  `measurement_mode=proof`, `native_accesskit_node_count=4`,
+  `native_accesskit_interactive_node_count=3`,
+  `native_accesskit_focusable_node_count=3`,
+  `native_accesskit_text_input_node_count=1`,
+  `native_accesskit_checked_node_count=1`,
+  `native_accesskit_node_id_collision_count=0`,
+  `native_accesskit_tree_update_status=implemented`,
+  `native_accessibility_live_tree_delivery_status=implemented`,
+  `native_accessibility_live_handler_status=tree-delivery-and-action-capture-implemented`,
+  `native_accessibility_action_capture_status=implemented`,
+  `native_accessibility_action_routing_status=focus-click-text-source-intent-routing-implemented`,
+  `native_accessibility_world_editor_session_action_status=world-editor-session-source-actions`,
+  `native_accessibility_world_editor_session_selected_instance_count=1`,
+  `native_accessibility_world_editor_session_export_status=ReadySelectedPrintable`,
+  `native_accessibility_world_editor_session_export_selected_printable=true`,
+  `native_playground_world_editor_session_host_status=host-owns-session-tree-and-routes-native-actions`,
+  `native_playground_world_editor_visible_panel_status=visible-document-projected-layout-frame`,
+  `native_playground_world_editor_visible_input_route_status=visible-clicks-route-to-world-editor-session`,
+  `web_semantic_static_snapshot_status=implemented`,
+  `web_semantic_ime_bridge_status=static-dom-ime-route-contract-implemented`,
+  `web_live_dom_ime_status=browser-host-not-implemented`,
+  `semantic_web_ime_endpoint_count=1`,
+  `semantic_web_action_route_count=6`,
+  `semantic_web_source_routed_action_count=2`, and
+  `adapter_status=static-web-semantic-ime-bridge-native-accesskit-tree-update-preview-live-tree-and-action-routing`.
+  Native AccessKit action capture now drains through `app_window` into
+  `NativePollContext`, and preview routing handles focus, click, `SetValue`,
+  and `ReplaceSelectedText` through the same source-intent/runtime paths used
+  by host input. The web work is a static semantic DOM/IME route contract, not a
+  live browser host. Solid-model examples can now create an optional
+  preview-host `WorldEditorSession`, publish that session as the host
+  accessibility tree, route native action requests through it, install a
+  visible document-projected editor `LayoutFrame` in the native preview host,
+  and route visible panel mouse clicks into the session before ordinary Boon
+  runtime input fallback.
+  U6 remains open for live browser DOM/IME integration, browser artifact
+  budget/parity evidence, full 3D viewport rendering/parity, and broader
+  platform action coverage beyond those source-intent endpoints.
+
+### 2026-06-23 U7 WorldScene Model Foundation
+
+- Task:
+  start U7 without stretching `DocumentNode` into a 3D node and without
+  claiming renderer/browser/manufacturing readiness before those paths exist.
+- Result:
+  added `crates/boon_scene_model`, a platform-neutral, serde-only workspace
+  crate for the first `WorldScene` model slice. It defines stable IDs and
+  domain types for cameras, lights, geometry, appearances, model instances,
+  transforms, pick IDs, part IDs, feature IDs, physical material IDs, retained
+  `WorldPatch` operations, patch reports, pick targets, and scene metrics.
+- Runtime/scene contract:
+  `WorldScene::hello_cube_fixture()` builds one camera, one light, one shared
+  primitive cube geometry, one appearance material, one model instance, and one
+  semantic binding. `WorldScene::diff(...)` and
+  `WorldScene::apply_patch(...)` prove rotation as a transform-only patch and
+  color as a material-only patch. Both keep `geometry_rebuild_count=0`.
+  `WorldScene::pick_target(...)` maps `PickId` to stable instance, geometry,
+  geometry revision, part, feature, and semantic identity.
+- Verification:
+  read-only subagents reviewed the crate boundary and report/verifier shape.
+  `cargo fmt -p boon_scene_model -p xtask` passed.
+  `cargo test -p boon_scene_model -- --nocapture` passed with `3` tests.
+  `cargo check -p boon_scene_model -p xtask` passed with existing native GPU
+  dead-code warnings. `cargo test -p xtask advertised_xtask_commands_are_unique
+  -- --nocapture` passed. `cargo run -p xtask -- verify-world-scene --report
+  target/reports/unified/world-scene.json` passed with a freshly rebuilt xtask
+  binary. `target/debug/xtask verify-report-schema
+  target/reports/unified/world-scene.json` passed.
+- Report facts:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `command=verify-world-scene`, `measurement_mode=proof`,
+  `world_scene_status=minimal-static-model-only`,
+  `u7_status=world-scene-model-foundation-only`,
+  `world_scene_camera_count=1`, `world_scene_light_count=1`,
+  `world_scene_geometry_count=1`, `world_scene_appearance_count=1`,
+  `world_scene_instance_count=1`, `world_transform_patch_operation_count=1`,
+  `world_transform_geometry_rebuild_count=0`,
+  `world_material_patch_operation_count=1`,
+  `world_material_geometry_rebuild_count=0`, and
+  `world_pick_target_status=stable-instance-geometry-part-feature-semantic-id`.
+- Follow-up:
+  U7 is not complete. The same report intentionally records
+  `world_renderer_status=not-implemented`,
+  `hello_3d_example_status=not-implemented`,
+  `native_web_3d_parity_status=not-covered-by-this-report`, and
+  `manufacturing_source_status=not-covered-by-this-report`. Next U7 work should
+  connect typed app/world output ports or generic Boon lowering into
+  `WorldScene`, add the real `hello_3d` example, and only then add
+  renderer-owned screenshot/pick-readback evidence.
+
+### 2026-06-23 U7 Generic World Output Root Contract
+
+- Task:
+  move U7 one step beyond a standalone Rust model crate by making `world:` a
+  generic Boon output root in the compiler/IR path without changing Boon syntax
+  or routing world output through document view bindings.
+- Result:
+  the typechecker now selects a dedicated `world` render/output contract when a
+  top-level `world:` statement exists. `RuntimeRootContract::world()` registers
+  the first typed `World/*` constructor family, and static field collection no
+  longer treats `world` as ordinary app data. IR `SemanticIndex` now carries
+  `output_roots: Vec<SemanticOutputRootEntry>` so downstream runtimes can see
+  `world` as a typed generic output port.
+- Runtime/scene contract:
+  a `world:` root using `World/new`, `World/perspective_camera`,
+  `World/transform`, `World/light`, `World/material`, `World/primitive`, and
+  `World/model` typechecks as `kind=World`, records
+  `output_kind=world`, `typed_contract_known=true`, and
+  `generic_output_port=true`, and produces `0` document view bindings. This is
+  still a compiler/IR contract only; no evaluated Boon world output is lowered
+  into `boon_scene_model::WorldScene` yet.
+- Verification:
+  `cargo fmt -p boon_typecheck -p boon_ir -p xtask` passed.
+  `cargo test -p boon_typecheck world_root_uses_separate_world_contract --
+  --nocapture` passed. `cargo test -p boon_ir
+  world_root_records_generic_output_port_without_document_view_bindings --
+  --nocapture` passed. `cargo check -p boon_typecheck -p boon_ir
+  -p boon_scene_model -p xtask` passed with existing native GPU dead-code
+  warnings. `cargo test -p xtask advertised_xtask_commands_are_unique --
+  --nocapture` passed. `cargo run -p xtask -- verify-world-scene --report
+  target/reports/unified/world-scene.json` passed before this documentation
+  update.
+- Report facts:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `world_output_root_status=generic-parser-typecheck-ir-output-root-implemented`,
+  `world_output_root_count=1`,
+  `world_output_root_typed_contract_known=true`, and
+  `world_output_root_view_binding_count=0`. The same report still records
+  `world_scene_status=minimal-static-model-only`,
+  `u7_status=world-scene-model-foundation-only`,
+  `world_renderer_status=not-implemented`,
+  `hello_3d_example_status=not-implemented`,
+  `native_web_3d_parity_status=not-covered-by-this-report`, and
+  `manufacturing_source_status=not-covered-by-this-report`.
+- Follow-up:
+  U7 remains open. Next work should lower evaluated generic `world:` output into
+  `boon_scene_model::WorldScene`, add `examples/hello_3d/RUN.bn`, and then add
+  renderer-owned screenshot/readback and picking evidence. Do not treat the
+  current compiler/IR output-root proof as 3D runtime or renderer readiness.
+
+### 2026-06-23 U7 Runtime World Output Lowering
+
+- Task:
+  make the generic `world:` output root runtime-executable without putting it
+  back into ordinary root state and without adding renderer/example shortcuts.
+- Result:
+  IR now carries `output_values: Vec<OutputRootValue>` beside
+  `semantic_index.output_roots`. Runtime generic planning compiles those output
+  roots into `RuntimeGenericOutputRoot` entries, includes them in function
+  reachability checks, and serializes/deserializes them in the generic-derived
+  artifact format.
+- Runtime/scene contract:
+  `World/*` constructors are accepted by the compiled generic runtime builder.
+  Constructor child fields are merged into constructor records, fielded `LIST`
+  statements remain named bindings, and `LiveRuntime::world_scene_output()`
+  evaluates a typed `world:` output root into `boon_scene_model::WorldScene`.
+  The first lowering supports `World/new`, perspective camera, light, material,
+  primitive geometry, model instance, and transform records. Boon string IDs
+  such as `cube`, `blue`, `body`, and `cube_feature` become deterministic scene
+  IDs without hardcoded example branches.
+- Verification:
+  `cargo fmt -p boon_ir -p boon_runtime -p xtask` passed. `cargo check -p
+  boon_ir -p boon_runtime -p xtask` passed with existing native GPU dead-code
+  warnings from xtask dependencies. `cargo test -p boon_ir
+  world_root_records_generic_output_port_without_document_view_bindings --
+  --nocapture` passed. `cargo test -p boon_runtime --lib
+  world_output_lowers_generic_boon_value_to_world_scene -- --nocapture` passed.
+  `cargo run -p xtask -- verify-world-scene --report
+  target/reports/unified/world-scene.json` passed before this documentation
+  update. `target/debug/xtask verify-report-schema
+  target/reports/unified/world-scene.json` passed before this documentation
+  update.
+- Report facts:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `world_scene_status=runtime-output-lowering-with-static-model-proof`,
+  `u7_status=runtime-world-output-lowering-no-renderer`,
+  `world_output_value_count=1`,
+  `world_runtime_output_status=generic-world-output-lowered-to-worldscene`,
+  `world_runtime_scene_camera_count=1`,
+  `world_runtime_scene_light_count=1`,
+  `world_runtime_scene_geometry_count=1`,
+  `world_runtime_scene_appearance_count=1`,
+  `world_runtime_scene_instance_count=1`, and
+  `world_runtime_scene_pickable_instance_count=1`.
+- Follow-up:
+  U7 remains open. Next work should add `examples/hello_3d/RUN.bn` through the
+  generic Boon/runtime path, connect runtime `WorldScene` output to a real
+  renderer-owned 3D proof, and only then pursue native/web 3D parity. The
+  report still intentionally records `world_renderer_status=not-implemented`,
+  `hello_3d_example_status=not-implemented`,
+  `native_web_3d_parity_status=not-covered-by-this-report`, and
+  `manufacturing_source_status=not-covered-by-this-report`.
+
+### 2026-06-23 U7 Hello 3D Generic Runtime Example
+
+- Task:
+  add the first real `hello_3d` Boon example through the generic world output
+  path without implementing a renderer shortcut or pretending future aliases
+  are already supported.
+- Result:
+  added `examples/hello_3d/RUN.bn`, `examples/hello_3d.scn`, and
+  `examples/hello_3d.budget.toml`. The source uses the currently implemented
+  `World/*` constructors for a camera, point light, material, cube primitive,
+  model instance, transform, and pick ID. Registered the example in
+  `examples/manifest.toml` so it is discoverable by normal example tooling.
+- Runtime/scene contract:
+  `cargo xtask verify-world-scene` now loads `examples/hello_3d/RUN.bn`
+  through manifest-aware source units, instantiates the generic runtime,
+  evaluates `world_scene_output()`, and proves that the resulting `WorldScene`
+  has one camera, one light, one geometry, one material, one instance, one
+  pickable instance, and a resolvable `PickId(1)`.
+- Verification:
+  `cargo run -p xtask -- verify-world-scene --report
+  target/reports/unified/world-scene.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/world-scene.json` passed.
+- Report facts:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `u7_status=hello-3d-generic-runtime-world-output-no-renderer`,
+  `hello_3d_example_status=generic-runtime-world-output-pass`,
+  `hello_3d_example_path=examples/hello_3d/RUN.bn`,
+  `hello_3d_runtime_pick_status=pick-id-resolves`,
+  `hello_3d_runtime_scene_camera_count=1`,
+  `hello_3d_runtime_scene_light_count=1`,
+  `hello_3d_runtime_scene_geometry_count=1`,
+  `hello_3d_runtime_scene_appearance_count=1`,
+  `hello_3d_runtime_scene_instance_count=1`, and
+  `hello_3d_runtime_scene_pickable_instance_count=1`.
+- Follow-up:
+  U7 remains open. The verifier still intentionally records
+  `hello_3d_interaction_status=not-implemented`,
+  `hello_3d_renderer_status=not-implemented`,
+  `world_renderer_status=not-implemented`,
+  `native_web_3d_parity_status=not-covered-by-this-report`, and
+  `manufacturing_source_status=not-covered-by-this-report`. Next work should
+  connect runtime `WorldScene` output to a real renderer-owned 3D proof, then
+  add interaction deltas and native/web parity without example-specific Rust
+  branches.
+
+### 2026-06-23 U7 Native GPU WorldScene Projection Readback
+
+- Task:
+  make `WorldScene` consumable by the native GPU layer and produce renderer-owned
+  visual evidence without claiming a complete 3D engine.
+- Result:
+  added `boon_scene_model` as a dependency of `boon_native_gpu`, added
+  `AppOwnedWorldSceneRenderRequest`, and added
+  `render_app_owned_world_scene_pixels(...)`. The helper consumes
+  `boon_scene_model::WorldScene` directly, projects visible world instances into
+  a bounded renderer scene, renders through the existing generated WGPU quad
+  pipeline, and writes an app-owned PNG readback. Added
+  `cargo xtask verify-native-gpu-world-scene` to run the same path from
+  `examples/hello_3d/RUN.bn`.
+- Runtime/renderer contract:
+  `verify-native-gpu-world-scene` loads `hello_3d` through manifest-aware source
+  units, evaluates `LiveRuntime::world_scene_output()`, sends the resulting
+  `WorldScene` to `boon_native_gpu`, and checks nonblank app-owned WGPU pixels,
+  unique colors, renderer metrics, retained chunk identity, and canonical
+  `{path, sha256}` artifact binding.
+- Verification:
+  `cargo test -p boon_native_gpu --lib
+  app_owned_world_scene_readback_uses_world_scene_identity -- --nocapture`
+  passed. `cargo run -p xtask -- verify-native-gpu-world-scene --report
+  target/reports/native-gpu/world-scene.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/native-gpu/world-scene.json` passed.
+  `cargo test -p xtask advertised_xtask_commands_are_unique -- --nocapture`
+  passed.
+- Report facts:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_status=app-owned-world-scene-projection-readback-pass`,
+  `native_gpu_world_scene_evidence_tier=app-owned-wgpu-readback`,
+  `world_renderer_status=worldscene-projection-readback-pass-not-depth-3d-pipeline`,
+  `hello_3d_renderer_status=worldscene-projection-readback-pass-not-depth-3d-pipeline`,
+  and `world_3d_pipeline_status=not-implemented`. It records the PNG artifact
+  under `target/artifacts/native-gpu/world-scene/` and binds the artifact in
+  `artifact_sha256s` as `{path, sha256}`.
+- Follow-up:
+  U7 remains open. This is renderer-owned WGPU evidence, but it is still a
+  projection proof over the existing quad renderer. Next work should implement
+  a real depth-tested 3D pipeline, then wire interactive `hello_3d`
+  transform/material deltas through `WorldPatch`, and only then pursue
+  native/web 3D parity.
+
+### 2026-06-23 U8 SolidGraph and AssemblyGraph Model Foundation
+
+- Task:
+  start the authoritative printable solid model from the unified architecture
+  without using visual meshes as manufacturing proof.
+- Result:
+  added `crates/boon_solid_model` as a platform-neutral serde-only crate. It
+  defines `SolidGraph`, `SolidNode`, `SolidOp`, `AssemblyGraph`,
+  `PartDefinition`, `PartInstance`, `ManufacturingRole`, physical material IDs,
+  appearance material IDs, feature IDs, region IDs, profiles, curves,
+  tolerances, bounds, and transforms. The first fixture is a printable bracket
+  with rounded base/upright nodes, two subtractive hole cylinders, printable
+  part role, physical material, and two assembly instances sharing one solid
+  graph.
+- Validation contract:
+  `SolidModelBundle::validate()` checks graph/assembly references, records
+  printable closed-region count, keeps `visual_mesh_used_for_manufacturing=false`,
+  and reports minimum-feature violations. The negative fixture uses too-small
+  holes and reports two `minimum-feature` diagnostics while keeping both
+  subtractive cylinder features present.
+- Verification:
+  `cargo test -p boon_solid_model -- --nocapture` passed. `cargo test -p
+  xtask advertised_xtask_commands_are_unique -- --nocapture` passed.
+  `cargo run -p xtask -- verify-solid-graph --report
+  target/reports/unified/solid-graph.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `u8_status=solidgraph-assembly-model-foundation-no-visual-compiler`,
+  `solid_graph_status=model-foundation-with-validation`,
+  `assembly_graph_status=model-foundation-with-shared-instances`,
+  `printable_bracket_fixture_status=solidgraph-assembly-validation-pass`,
+  `solid_graph_subtractive_cylinder_count=2`,
+  `assembly_shared_geometry_instance_count=2`,
+  `solid_graph_negative_status=Fail`, and
+  `solid_graph_negative_minimum_feature_violation_count=2`.
+- Follow-up:
+  U8 remains open. Generic Boon `Solid/*`, `Part/*`, and `Assembly/*`
+  constructors plus runtime lowering now exist in a later checklist entry, but
+  adaptive visual compilation, retained mesh chunks, dependency-aware local
+  recompilation, native/web parity, slicing, and 3MF are still not implemented.
+  U9 remains blocked until the manufacturing compiler and 3MF export exist.
+
+### 2026-06-23 U8 Generic Boon Manufacturing Output
+
+- Task:
+  continue U8 after the SolidGraph model foundation by making `manufacturing:`
+  a real generic Boon output root instead of only a Rust fixture.
+- Result:
+  registered the `manufacturing` root in the typecheck render/runtime contract,
+  added typed IR output-root detection for `Assembly/*`, `Part/*`, and
+  `Solid/*`, added `LiveRuntime::solid_model_output()`, and lowered generic
+  Boon constructor records into `boon_solid_model::SolidModelBundle`.
+  Added checked-in `examples/printable_bracket_3d/RUN.bn`,
+  `examples/printable_bracket_3d.scn`,
+  `examples/printable_bracket_3d.budget.toml`, and a manifest entry.
+- Runtime coverage:
+  the first generic path supports `Assembly/new`, `Part/new`, `Part/instance`,
+  `Solid/box`, `Solid/rounded_box`, `Solid/sphere`, `Solid/cylinder`,
+  `Solid/union`, `Solid/difference`, and `Solid/translate`. It preserves
+  physical material IDs, manufacturing roles, transformed subtractive cylinder
+  tools, and shared part instances.
+- Model fix:
+  `SolidGraphMetrics::subtractive_cylinder_count` now looks through
+  transform/offset/shell wrappers, so a translated cylinder used as a
+  difference tool still counts as a subtractive cylinder.
+- Verification:
+  `cargo test -p boon_solid_model -- --nocapture` passed.
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract --
+  --nocapture` passed. `cargo test -p boon_ir
+  manufacturing_root_records_generic_output_port -- --nocapture` passed.
+  `cargo test -p boon_runtime
+  manufacturing_output_lowers_generic_boon_value_to_solid_model -- --nocapture`
+  passed. `cargo run -p xtask -- verify-solid-graph --report
+  target/reports/unified/solid-graph.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `u8_status=solidgraph-assembly-generic-boon-output-no-visual-compiler`,
+  `solid_output_root_status=generic-parser-typecheck-ir-output-root-implemented`,
+  `solid_runtime_output_status=generic-assembly-output-lowered-to-solidmodel`,
+  `solid_runtime_subtractive_cylinder_count=2`,
+  `solid_runtime_assembly_part_count=1`,
+  `solid_runtime_assembly_instance_count=2`, and
+  `solid_runtime_shared_geometry_instance_count=2`.
+  It also reports
+  `printable_bracket_boon_example_status=checked-in-generic-manufacturing-output-pass`,
+  `printable_bracket_boon_example_subtractive_cylinder_count=2`, and
+  `printable_bracket_boon_example_instance_count=2`.
+- Remaining limits:
+  this does not implement exact/adaptive visual mesh generation, retained mesh
+  chunks, slicing, 3MF, or native/web 3D parity. Whole-value pure root
+  references for helper constructor records are also not complete: the generic
+  plan records helper children such as `bracket_solid.base`, but not yet the
+  whole `bracket_solid` constructor value. Keep that as a future
+  compiler/runtime cleanup instead of hiding it in example-specific code.
+- Next step:
+  start exact/adaptive visual mesh generation and retained mesh chunk identity
+  from `SolidModelBundle`, using `examples/printable_bracket_3d/RUN.bn` as the
+  first checked-in manufacturing example.
+
+### 2026-06-23 U8 Solid Visual Proxy Compiler
+
+- Task:
+  continue U8 by bridging generic manufacturing output into renderable scene
+  data without pretending that exact meshing, adaptive chunks, slicing, or 3MF
+  exist.
+- Result:
+  added `WorldScene::visual_proxy_from_solid_model(...)` and
+  `SolidVisualCompileReport` in `boon_scene_model`. The compiler emits one
+  `GeometryKind::IndexedMeshSummary` proxy per solid graph, one retained
+  generated bounds-mesh chunk, one `ModelInstance` per assembly instance, one
+  material per part, semantic bindings, and pick identity. `boon_solid_model`
+  remains independent of rendering.
+- Verification:
+  `cargo test -p boon_scene_model -- --nocapture` passed. `cargo run -p xtask
+  -- verify-solid-graph --report target/reports/unified/solid-graph.json`
+  passed. `target/debug/xtask verify-report-schema
+  target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `u8_status=solidgraph-assembly-generic-boon-output-mixed-proxy-and-exact-primitive-visual`,
+  `visual_compiler_status=retained-generated-bounds-mesh-no-csg`,
+  `visual_proxy_geometry_count=1`, `visual_proxy_instance_count=2`,
+  `visual_proxy_shared_geometry_instance_count=2`,
+  `visual_proxy_pick_target_status=pass`, `visual_proxy_mesh_count=1`,
+  `visual_generated_mesh_count=1`, `visual_generated_vertex_count=8`,
+  `visual_generated_index_count=36`, `visual_retained_chunk_count=1`,
+  `visual_retained_chunk_id_count=1`, and
+  `visual_retained_chunk_source_feature_count=6`.
+  It still reports `visual_exact_mesh_count=0`,
+  `visual_adaptive_chunk_count=0`,
+  `manufacturing_compiler_status=direct-solidgraph-layer-foundation-no-3mf`, and
+  `three_mf_status=not-implemented`.
+- Remaining limits:
+  this is a visual proxy compiler only. It is useful for preserving identity and
+  feeding a future renderer path, and it now carries a concrete bounds mesh
+  payload. Exact `Box`/`Cylinder` primitive mesh generation was added later for
+  supported roots, but this path is still not exact CSG/rounded surface
+  geometry, not adaptive mesh chunks, not native/web parity, not slicing, and
+  not 3MF export.
+- Next step:
+  replace retained generated bounds-mesh chunks with exact/adaptive visual mesh
+  generation, then feed the resulting `WorldScene` through native and web
+  renderer evidence.
+
+### 2026-06-23 U8 Retained Visual Chunk Summary
+
+- Task:
+  add retained visual chunk identity, source-feature provenance, and concrete
+  generated mesh payload evidence to the U8 visual proxy path.
+- Result:
+  added `SurfaceChunkId`, `SurfaceChunk`, `SurfaceRepresentation`,
+  `IndexedMeshChunk`, `MeshVertex`, and `SolidVisualScene` in
+  `boon_scene_model`. The chunk identity follows the architecture rule
+  `GeometryLogicalId + spatial key + LOD/tolerance class`, while
+  `GeometryRevision` stays separate. The checked-in printable bracket now
+  produces one retained `IndexedMesh` chunk with bounds, an 8-vertex/36-index
+  generated bounds mesh, error bound, geometry revision, and six source feature
+  IDs.
+- Verification:
+  `cargo test -p boon_scene_model -- --nocapture` passed. `cargo run -p xtask
+  -- verify-solid-graph --report target/reports/unified/solid-graph.json`
+  passed. `target/debug/xtask verify-report-schema
+  target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_compiler_status=retained-generated-bounds-mesh-no-csg`,
+  `visual_generated_mesh_count=1`, `visual_generated_vertex_count=8`,
+  `visual_generated_index_count=36`, `visual_retained_chunk_count=1`,
+  `visual_retained_chunk_id_count=1`, and
+  `visual_retained_chunk_source_feature_count=6`. It still reports
+  `visual_exact_mesh_count=0`, `visual_adaptive_chunk_count=0`,
+  `manufacturing_compiler_status=direct-solidgraph-layer-foundation-no-3mf`, and
+  `three_mf_status=not-implemented`.
+- Remaining limits:
+  this is retained generated bounds-mesh identity and provenance only. It is not
+  real CSG/primitive surface geometry, not adaptive chunk subdivision, not
+  native/web parity, not slicing, and not 3MF export.
+- Next step:
+  replace the retained bounds mesh representation with generated exact/adaptive
+  visual mesh chunks and add chunk-local invalidation/recompile evidence.
+
+### 2026-06-23 U9 Direct Manufacturing Layer Foundation
+
+- Task:
+  start U9 with a direct SolidGraph/AssemblyGraph manufacturing compiler path
+  that does not use the disposable visual mesh as print evidence and does not
+  claim 3MF before export exists.
+- Result:
+  added the platform-neutral `boon_manufacturing` crate with typed
+  `PrintCompileRequest`, `Layer`, `MaterialRegion2D`, `PolygonWithHoles`,
+  `GridPoint2D`, diagnostics, metrics, and `PrintCompileOutput`. The crate
+  depends on `boon_solid_model`, `serde`, `serde_json`, and `sha2`, and the
+  verifier rejects dependencies on runtime/document/scene/native/browser/WGPU
+  layers. `compile_print_job(...)` now compiles supported SolidGraph operations
+  into deterministic integer-grid layer regions with holes and a stable
+  `sha256:` artifact hash.
+- Verification:
+  `cargo fmt --check` passed. `cargo test -p boon_manufacturing --
+  --nocapture` passed. `cargo run -p xtask -- verify-solid-graph --report
+  target/reports/unified/solid-graph.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `u9_status=direct-solidgraph-layer-foundation-no-3mf`,
+  `manufacturing_compiler_status=direct-solidgraph-layer-foundation-no-3mf`,
+  `manufacturing_layer_count=15`,
+  `manufacturing_material_region_count=30`,
+  `manufacturing_polygon_count=30`,
+  `manufacturing_hole_count=60`,
+  `manufacturing_unsupported_operation_count=0`,
+  `manufacturing_artifact_hash=sha256:3f7f39a167ebac7165500c55c8a53f30eca2cb8ba28762634fea85c1aa48719a`,
+  `manufacturing_negative_status=Fail`,
+  `visual_mesh_used_for_manufacturing=false`, and
+  `three_mf_status=not-implemented`.
+- Remaining limits:
+  this is a foundation slice only. It is not full manufacturing compiler
+  coverage, not adaptive interval/quadtree fallback, not robust Boolean polygon
+  regularization, not wall-thickness/clearance validation, not support/infill or
+  toolpath generation, not 3MF, and not STL compatibility export.
+- Next step:
+  add 3MF object/component/material/slice serialization, broaden supported
+  SolidOp section coverage with tolerance-aware diagnostics, and add negative
+  fixtures for visual-only parts, build volume, unsupported operations, and
+  material/region conflicts.
+
+### 2026-06-23 U9 Manufacturing Negative Fixtures
+
+- Task:
+  add honest negative manufacturing coverage for non-printable roles,
+  build-volume failures, unsupported solid operations, and overlapping
+  printable regions with conflicting physical materials.
+- Result:
+  added `SolidModelBundle::visual_only_fixture()`,
+  `SolidModelBundle::unsupported_loft_fixture()`, and
+  `SolidModelBundle::material_region_conflict_fixture()`.
+  `compile_print_job(...)` now emits `no-printable-parts` instead of silently
+  producing no layers when all parts are visual-only/non-printable, and emits
+  `material-region-conflict` when same-layer printable regions overlap in grid
+  space with different physical materials. The verifier now covers visual-only
+  output, too-small build volume, unsupported loft diagnostics, and
+  overlapping material-region diagnostics.
+- Verification:
+  `cargo test -p boon_solid_model -p boon_manufacturing -- --nocapture`
+  passed. `cargo run -p xtask -- verify-solid-graph --report
+  target/reports/unified/solid-graph.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_visual_only_status=Fail`,
+  `manufacturing_visual_only_layer_count=0`,
+  `manufacturing_visual_only_diagnostic_status=true`,
+  `manufacturing_build_volume_status=Fail`,
+  `manufacturing_build_volume_diagnostic_status=true`,
+  `manufacturing_unsupported_status=Fail`,
+  `manufacturing_unsupported_operation_diagnostic_count=50`,
+  `manufacturing_unsupported_diagnostic_status=true`,
+  `manufacturing_material_conflict_status=Fail`,
+  `manufacturing_material_conflict_diagnostic_count=105`,
+  `manufacturing_material_conflict_diagnostic_status=true`, and
+  `visual_mesh_used_for_manufacturing=false`.
+- Remaining limits:
+  the material-region conflict diagnostic is a conservative grid-bounds overlap
+  guard, not final exact Boolean region ownership. Clearance/touching semantics,
+  fused-vs-separated body intent, support/infill modifiers, and toolpath-level
+  material ownership remain open. The unsupported shape fixture proves honest
+  failure only; it does not implement analytic sections or adaptive fallback for
+  that shape.
+- Next step:
+  either broaden analytic section support or add adaptive fallback before
+  weakening unsupported-op expectations, and later replace the conservative
+  overlap guard with exact polygon/CSG ownership.
+
+### 2026-06-23 U9 3MF Entry-Set and OPC ZIP Foundation
+
+- Task:
+  add 3MF object/component/material/slice serialization evidence from the direct
+  manufacturing layer output, deterministic OPC/ZIP package bytes, and internal
+  package readback validation without pretending external 3MF
+  conformance/importer validation exists.
+- Result:
+  added the platform-neutral `boon_3mf` crate with typed `ThreeMfPackage`,
+  `ThreeMfEntry`, `ThreeMfMetrics`, and diagnostics. `export_3mf_entry_set(...)`
+  now emits deterministic XML entries for `[Content_Types].xml`, `_rels/.rels`,
+  `3D/3dmodel.model`, and `3D/Slices/boon-slices.xml`. The model entry records
+  millimetre units, base material metadata, per-instance build items, and source
+  metadata. The slice entry records manufacturing layers, material regions,
+  polygons, holes, integer-grid point lists, and source feature IDs. Failing
+  manufacturing output is rejected and emits no 3MF entries. The crate also
+  writes deterministic stored-method ZIP bytes with fixed timestamps, sorted
+  entries, CRC32, central directory, and end-of-central-directory records.
+  `validate_3mf_package(...)` reads the generated ZIP bytes back, validates
+  local and central directory records, verifies stored sizes and CRC32, confirms
+  required entries, and checks content type, relationship, model unit, material,
+  and slice metadata.
+- Verification:
+  `cargo test -p boon_3mf -- --nocapture` passed. `cargo run -p xtask --
+  verify-solid-graph --report target/reports/unified/solid-graph.json` passed.
+  `target/debug/xtask verify-report-schema
+  target/reports/unified/solid-graph.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `u9_status=direct-solidgraph-layer-and-3mf-opc-zip-foundation`,
+  `three_mf_status=deterministic-opc-zip-package-foundation`,
+  `three_mf_entry_count=4`,
+  `three_mf_component_count=2`,
+  `three_mf_material_count=1`,
+  `three_mf_slice_count=15`,
+  `three_mf_hole_count=60`,
+  `three_mf_units_metadata_present=true`,
+  `three_mf_material_metadata_present=true`,
+  `three_mf_slice_entry_present=true`,
+  `three_mf_opc_zip_container_present=true`,
+  `three_mf_opc_zip_entry_count=4`,
+  `three_mf_opc_zip_byte_count=34407`,
+  `three_mf_artifact_hash=sha256:2e15fa83c5584923405060d258a2c62fb24d6b2376f71495fb1e77aaa4556f92`,
+  `three_mf_opc_zip_hash=sha256:87437a512c3704fa76efb7e1294bb0610bfe1031af85975edb0b176557c227bf`,
+  `three_mf_validation_status=Pass`,
+  `three_mf_validation_required_entry_present_count=4`,
+  `three_mf_validation_crc_checked_count=4`,
+  `three_mf_validation_content_type_status=true`,
+  `three_mf_validation_relationship_status=true`,
+  `three_mf_validation_model_units_status=true`,
+  `three_mf_validation_material_metadata_status=true`,
+  `three_mf_validation_slice_metadata_status=true`,
+  `three_mf_negative_status=Fail`,
+  `three_mf_negative_validation_status=Fail`, and
+  `visual_mesh_used_for_manufacturing=false`.
+- Remaining limits:
+  this is a deterministic 3MF XML entry-set plus OPC/ZIP package foundation.
+  The package bytes are hash-proven and internally read back, but not yet
+  checked by an external 3MF conformance checker or importer. The model entry
+  still uses empty mesh placeholders because the authoritative printable output
+  is currently the slice entry set. Full object mesh/component packaging,
+  broader manufacturing section coverage, robust regularization, and STL
+  compatibility export remain open.
+- Next step:
+  add external importer/conformance smoke coverage, while keeping visual meshes
+  out of the normal print path.
+
+### 2026-06-23 U10 Supported-Subset Parametric Car Start
+
+- Task:
+  start U10 with a checked-in car assembly that uses the currently supported
+  Solid/runtime/manufacturing subset while preserving the architecture
+  requirements around shared wheel identity, visual-only windows, physical
+  materials, and no visual-mesh manufacturing shortcut.
+- Result:
+  added `SolidModelBundle::parametric_car_fixture()` and
+  `examples/parametric_car_3d/RUN.bn` with body, one wheel prototype, four wheel
+  instances, and visual-only windows. The manifest, scenario, and budget are
+  registered. `verify-solid-graph` now proves the car fixture, checked-in
+  generic runtime lowering, retained visual proxy identity, manufacturing layer
+  compile, and deterministic 3MF validation. `boon_3mf` no longer requires
+  `<hole>` metadata for no-hole slice packages. The retained `WorldScene` delta
+  proof now also covers paint as one material update with zero geometry
+  rebuilds, and one-wheel movement as one transform update with zero geometry
+  rebuilds while preserving shared wheel identity. Retained `WorldScene`
+  geometry-resource patching now also proves a wheel prototype revision change
+  as one geometry update/rebuild with zero instance upserts, while all four
+  wheel instances carry the new geometry revision. Body-length dependency
+  invalidation is now proven as one body geometry update/rebuild with zero
+  instance upserts, while all four wheel instances preserve the original wheel
+  geometry revision. Selection is now proven as one selection-only patch on the
+  front-left wheel. Hiding the visual-only windows is now proven as one
+  visibility-only patch that removes hidden windows from pick routing. Export
+  preparation is now proven from stable world selection into `SolidModelBundle`
+  parts: the selected wheel is printable/exportable, selected visual-only
+  windows are not exportable, and the export candidate set contains only the
+  body plus four wheel instances. A platform-neutral world semantic editor tree
+  now exposes the required car editor shape: 3D viewport, car assembly, body,
+  visual-only windows, four wheels, parameters, manufacturing status, and
+  `Export 3MF`. The car editor tree now also lowers through the shared
+  `SemanticScene`/web/native route model without coupling the scene model to
+  platform adapters: export and selected-part nodes become semantic buttons,
+  `Export 3MF` routes to `world.manufacturing.export_3mf`, part selection routes
+  to stable `world.instance.*.select` paths, the web bridge remains
+  semantic-only with zero visual DOM nodes, and native AccessKit click requests
+  on the export node map to the same source dispatch. The same tree now also
+  projects into normal source-bound document controls through
+  `document_frame_from_world_editor_tree(...)`, so export/select actions reach
+  the existing layout, typed hit-side-table, and document semantic dispatch
+  paths without a 3D-specific UI model. Build-volume preparation now proves the default car print fits
+  the default volume and that a deliberately narrow volume produces an explicit
+  X-axis split plan with two planned dowel-pin connector pairs while still
+  excluding visual-only windows. Print-preparation clearance diagnostics now
+  prove the default car has no bounded AABB printable-clearance violations and
+  that an intentionally tight front-left wheel is blocked with
+  `clearance-violation` before slicing/export. Split preparation now emits
+  typed segment and connector preparation artifacts instead of only counts: the
+  narrow-volume car has two X-axis segment AABBs and two planned dowel connector
+  placements with center, diameter, and length. The preparation path now also
+  emits deterministic `PrintPreparationArtifact` metadata: passing split
+  preparations preserve segment/connector plans and blocked clearance
+  preparations produce failing artifacts, with `visual_mesh_used=false`. The
+  3MF exporter now has an optional preparation-aware export path: the car
+  package embeds and validates `Metadata/boon-print-preparation.json`, and a
+  later U9/U10 slice extends the same metadata path into car split segment
+  packages. The plain bracket package remains preparation-metadata-free. The
+  manufacturing compiler now also has a first deterministic `SplitPrintOutput`
+  boundary for the
+  supported slice subset: the narrow-volume car partitions no-hole layers into
+  two segment outputs with a stable hash, and the bracket split preserves holes
+  that remain fully inside a segment. A later U10 slice supersedes the original
+  boundary-crossing-hole rejection with preserved boundary-crossing split
+  output and validating split 3MF package evidence. The 3MF
+  exporter now also has a deterministic split package-set boundary: the
+  narrow-volume car exports two validated per-segment OPC/ZIP 3MF packages from
+  the split manufacturing output while preserving `visual_mesh_used=false`, and
+  bracket split segment packages validate with preserved holes. The
+  manufacturing compiler now also emits a deterministic connector print-output
+  boundary for the supported dowel-pin subset: the narrow-volume car turns the
+  planned connector placements into two separate printable pin components and
+  exports a validated connector 3MF package with `visual_mesh_used=false`. The
+  preparation path now also reports connector fit status: planned pins align to
+  the split seam, have at least one diameter of per-side engagement, remain
+  inside the printable envelope, and report zero fit violations without
+  claiming Boolean cutouts. The visual compiler now has exact/adaptive mesh
+  paths for supported solid roots: the car's shared wheel prototype compiles to
+  a retained exact cylinder mesh while rounded-box body/windows compile to
+  adaptive retained rounded-box meshes with explicit error bounds. CSG shapes
+  still keep the existing bounds-mesh fallback.
+- Verification:
+  `cargo test -p boon_scene_model -- --nocapture` passed. `cargo test -p
+  boon_document semantic_scene_lowers_world_editor_tree_actions_for_accessibility -- --nocapture`
+  passed. `cargo test -p boon_document world_editor_tree_projects_to_source_bound_document_controls -- --nocapture`
+  passed. `cargo test -p boon_native_app_window accessibility_action_requests_route_to_semantic_source_dispatch -- --nocapture`
+  passed. `cargo test -p boon_solid_model -p boon_manufacturing -p boon_3mf -- --nocapture` passed.
+  `cargo run -p xtask -- verify-solid-graph --report
+  target/reports/unified/solid-graph.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/solid-graph.json` passed.
+  `cargo run -p xtask -- verify-semantic-scene --report
+  target/reports/unified/semantic-scene.json` passed. `target/debug/xtask
+  verify-report-schema target/reports/unified/semantic-scene.json` passed.
+- Report facts:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_status=supported-subset-generic-manufacturing-output-pass`,
+  `parametric_car_part_count=3`, `parametric_car_instance_count=6`,
+  `parametric_car_printable_part_count=2`,
+  `parametric_car_visual_only_part_count=1`,
+  `parametric_car_physical_material_part_count=2`,
+  `parametric_car_shared_wheel_instance_count=4`,
+  `parametric_car_visual_proxy_geometry_count=3`,
+  `parametric_car_visual_proxy_instance_count=6`,
+  `parametric_car_visual_generated_mesh_count=3`,
+  `parametric_car_visual_generated_vertex_count=170`,
+  `parametric_car_visual_generated_index_count=984`,
+  `parametric_car_visual_exact_mesh_count=1`,
+  `parametric_car_visual_adaptive_chunk_count=2`,
+  `parametric_car_manufacturing_status=Pass`,
+  `parametric_car_manufacturing_layer_count=47`,
+  `parametric_car_manufacturing_material_region_count=125`,
+  `parametric_car_manufacturing_material_conflict_count=0`,
+  `parametric_car_paint_patch_operation_count=1`,
+  `parametric_car_paint_material_update_count=1`,
+  `parametric_car_paint_geometry_rebuild_count=0`,
+  `parametric_car_wheel_patch_operation_count=1`,
+  `parametric_car_wheel_transform_update_count=1`,
+  `parametric_car_wheel_geometry_rebuild_count=0`,
+  `parametric_car_wheel_geometry_patch_operation_count=1`,
+  `parametric_car_wheel_geometry_update_count=1`,
+  `parametric_car_wheel_geometry_rebuild_count_for_radius=1`,
+  `parametric_car_wheel_geometry_instance_upsert_count=0`,
+  `parametric_car_wheel_geometry_revision_instance_count=4`,
+  `parametric_car_body_geometry_patch_operation_count=1`,
+  `parametric_car_body_geometry_update_count=1`,
+  `parametric_car_body_geometry_rebuild_count_for_length=1`,
+  `parametric_car_body_geometry_instance_upsert_count=0`,
+  `parametric_car_body_geometry_revision_instance_count=1`,
+  `parametric_car_body_preserved_wheel_revision_instance_count=4`,
+  `parametric_car_selection_patch_operation_count=1`,
+  `parametric_car_selection_update_count=1`,
+  `parametric_car_selection_geometry_rebuild_count=0`,
+  `parametric_car_selection_instance_upsert_count=0`,
+  `parametric_car_selected_instance_count=1`,
+  `parametric_car_hidden_windows_patch_operation_count=1`,
+  `parametric_car_hidden_windows_visibility_update_count=1`,
+  `parametric_car_hidden_windows_geometry_rebuild_count=0`,
+  `parametric_car_hidden_windows_instance_upsert_count=0`,
+  `parametric_car_hidden_windows_pickable_instance_count=5`,
+  `parametric_car_hidden_windows_pick_route_status=hidden-not-pickable`,
+  `parametric_car_export_no_selection_status=ReadyNoSelection`,
+  `parametric_car_export_selected_wheel_status=ReadySelectedPrintable`,
+  `parametric_car_export_selected_wheel_exportable=true`,
+  `parametric_car_export_selected_windows_status=SelectionNotPrintable`,
+  `parametric_car_export_selected_windows_material=null`,
+  `parametric_car_export_selected_windows_exportable=false`,
+  `parametric_car_export_printable_part_count=2`,
+  `parametric_car_export_printable_instance_count=5`,
+  `parametric_car_export_excluded_visual_only_instance_count=1`,
+  `parametric_car_semantic_editor_tree_status=world-scene-semantic-editor-tree`,
+  `parametric_car_semantic_editor_node_count=16`,
+  `parametric_car_semantic_editor_required_label_count=14`,
+  `parametric_car_semantic_editor_part_instance_node_count=6`,
+  `parametric_car_semantic_editor_printable_part_node_count=5`,
+  `parametric_car_semantic_editor_visual_only_part_node_count=1`,
+  `parametric_car_semantic_editor_parameter_node_count=3`,
+  `parametric_car_semantic_editor_manufacturing_node_count=3`,
+  `parametric_car_semantic_editor_selected_node_count=1`,
+  `parametric_car_semantic_editor_exportable_action_count=1`,
+  `parametric_car_semantic_scene_node_count=16`,
+  `parametric_car_semantic_scene_root_status=world-editor-root`,
+  `parametric_car_semantic_scene_export_button_status=export-press-button`,
+  `parametric_car_semantic_web_action_route_count=18`,
+  `parametric_car_semantic_web_source_routed_action_count=11`,
+  `parametric_car_semantic_web_visual_dom_node_count=0`,
+  `parametric_car_semantic_web_export_press_route_status=source-routed-export-press`,
+  `parametric_car_native_accessibility_node_count=16`,
+  `parametric_car_native_accessibility_interactive_node_count=7`,
+  `parametric_car_native_accessibility_export_press_route_status=source-routed-export-press`,
+  `parametric_car_native_accessibility_session_action_status=world-editor-session-source-actions`,
+  `parametric_car_native_accessibility_session_selected_instance_count=1`,
+  `parametric_car_native_accessibility_session_export_status=ReadySelectedPrintable`,
+  `parametric_car_native_accessibility_session_export_selected_printable=true`,
+  `parametric_car_editor_document_node_count=16`,
+  `parametric_car_editor_document_layout_node_count=16`,
+  `parametric_car_editor_document_hit_route_count=11`,
+  `parametric_car_editor_document_export_hit_route_status=source-bound-export-hit-route`,
+  `parametric_car_editor_document_select_hit_route_count=6`,
+  `parametric_car_editor_document_export_dispatch_status=source-routed-export-press`,
+  `parametric_car_editor_source_action_session_status=world-editor-session-source-actions`,
+  `parametric_car_editor_source_action_select_status=selection-patch-only`,
+  `parametric_car_editor_source_action_selected_instance_count=1`,
+  `parametric_car_editor_source_action_export_status=ReadySelectedPrintable`,
+  `parametric_car_editor_source_action_export_selected_printable=true`,
+  `parametric_car_editor_source_action_export_visual_only_excluded_count=1`,
+  `parametric_car_default_print_preparation_status=Ready`,
+  `parametric_car_default_print_fits_build_volume=true`,
+  `parametric_car_split_preparation_status=SplitRequired`,
+  `parametric_car_split_required=true`,
+  `parametric_car_split_axis=X`,
+  `parametric_car_split_suggested_segment_count=2`,
+  `parametric_car_split_connector_strategy=PlannedDowelPins`,
+  `parametric_car_split_connector_pair_count=2`,
+  `parametric_car_split_segment_plan_count=2`,
+  `parametric_car_split_segment_first_max_x=0.0`,
+  `parametric_car_split_connector_plan_count=2`,
+  `parametric_car_split_connector_first_center={x: 0.0, y: -12.0, z: -0.5}`,
+  `parametric_car_split_connector_diameter=4.0`,
+  `parametric_car_split_connector_length=12.0`,
+  `parametric_car_split_connector_fit_status=Pass`,
+  `parametric_car_split_connector_fit_violation_count=0`,
+  `parametric_car_split_preparation_artifact_status=Pass`,
+  `parametric_car_split_preparation_artifact_hash=sha256:9c8ffaacedc2d39e3719f18493f339aed76b7f6545a4e3de9e14910e2ac7fee8`,
+  `parametric_car_split_preparation_artifact_segment_count=2`,
+  `parametric_car_split_preparation_artifact_connector_count=2`,
+  `parametric_car_split_preparation_artifact_connector_fit_status=Pass`,
+  `parametric_car_split_preparation_artifact_connector_fit_violation_count=0`,
+  `parametric_car_split_preparation_artifact_visual_mesh_used=false`,
+  `parametric_car_split_print_output_status=Pass`,
+  `parametric_car_split_print_segment_count=2`,
+  `parametric_car_split_print_segment_layer_count=94`,
+  `parametric_car_split_print_segment_polygon_count=170`,
+  `parametric_car_split_print_artifact_hash=sha256:d197b9f66de32e80a919f7dc6fcda4a63f305eb33e4d89c0ae3821a79c54f496`,
+  `parametric_car_split_print_visual_mesh_used=false`,
+  `parametric_car_split_three_mf_status=Pass`,
+  `parametric_car_split_three_mf_package_status=deterministic-split-opc-zip-package-set-foundation`,
+  `parametric_car_split_three_mf_segment_package_count=2`,
+  `parametric_car_split_three_mf_validation_pass_count=2`,
+  `parametric_car_split_three_mf_preparation_metadata_count=2`,
+  `parametric_car_split_three_mf_preparation_validation_pass_count=2`,
+  `parametric_car_split_three_mf_total_entry_count=10`,
+  `parametric_car_split_three_mf_total_slice_count=94`,
+  `parametric_car_split_three_mf_total_byte_count=81132`,
+  `parametric_car_split_three_mf_artifact_hash=sha256:1ecfdfafe17981d9e089b0c7f2bbf9df7ef36f4b15df4ca378f28043f2925eb6`,
+  `parametric_car_split_three_mf_visual_mesh_used=false`,
+  `parametric_car_connector_print_status=Pass`,
+  `parametric_car_connector_print_connector_count=2`,
+  `parametric_car_connector_print_layer_count=10`,
+  `parametric_car_connector_print_polygon_count=20`,
+  `parametric_car_connector_print_artifact_hash=sha256:d8014da9676f9bbbbcc4d6b425602b028e147936c7496af6a8a71a901dc4ea14`,
+  `parametric_car_connector_print_visual_mesh_used=false`,
+  `parametric_car_connector_three_mf_status=Pass`,
+  `parametric_car_connector_three_mf_validation_status=Pass`,
+  `parametric_car_connector_three_mf_component_count=2`,
+  `parametric_car_connector_three_mf_preparation_metadata_present=true`,
+  `parametric_car_connector_three_mf_preparation_metadata_hash_present=true`,
+  `parametric_car_connector_three_mf_preparation_validation_status=true`,
+  `parametric_car_connector_three_mf_slice_count=10`,
+  `parametric_car_connector_three_mf_artifact_hash=sha256:dd053e7961426a83b55a9c9d97005d47bcb7a12a6aa4077499a262a19a547978`,
+  `parametric_car_connector_three_mf_visual_mesh_used=false`,
+  `manufacturing_split_hole_status=Pass`,
+  `manufacturing_split_hole_diagnostic_status=preserved-contained-holes`,
+  `manufacturing_split_hole_segment_count=2`,
+  `manufacturing_split_hole_count=60`,
+  `manufacturing_split_hole_three_mf_status=Pass`,
+  `manufacturing_split_hole_three_mf_validation_pass_count=2`,
+  `manufacturing_split_hole_three_mf_hole_count=60`,
+  `manufacturing_split_boundary_hole_status=Pass`,
+  `manufacturing_split_boundary_hole_diagnostic_status=preserved-boundary-crossing-holes`,
+  `manufacturing_split_boundary_hole_segment_count=2`,
+  `manufacturing_split_boundary_hole_count=75`,
+  `manufacturing_split_boundary_hole_three_mf_status=Pass`,
+  `manufacturing_split_boundary_hole_three_mf_validation_pass_count=2`,
+  `manufacturing_split_boundary_hole_three_mf_hole_count=75`,
+  `parametric_car_split_printable_instance_count=5`,
+  `parametric_car_split_visual_only_instance_count=1`,
+  `parametric_car_default_minimum_clearance=0.4`,
+  `parametric_car_default_minimum_clearance_observed=5.0`,
+  `parametric_car_default_clearance_violation_count=0`,
+  `parametric_car_tight_clearance_preparation_status=Blocked`,
+  `parametric_car_tight_clearance_violation_count=1`,
+  `parametric_car_tight_clearance_diagnostic_status=clearance-violation`,
+  `parametric_car_tight_clearance_observed=0.0`,
+  `parametric_car_tight_clearance_visual_only_instance_count=1`,
+  `parametric_car_tight_clearance_artifact_status=Fail`,
+  `parametric_car_tight_clearance_artifact_hash=sha256:f524e33a7247ccec0b8e0562874dbfdc9a37259f7cdc8d72ea717fb9bb5d53fd`,
+  `parametric_car_three_mf_status=deterministic-opc-zip-package-foundation`,
+  `parametric_car_three_mf_entry_count=5`,
+  `parametric_car_three_mf_material_count=2`,
+  `parametric_car_three_mf_component_count=5`,
+  `parametric_car_three_mf_preparation_metadata_present=true`,
+  `parametric_car_three_mf_preparation_metadata_hash=sha256:b4555c125e2c59faeb2e180c915f516fd5fe45eacef8def13126f0a3bdb84a64`,
+  `parametric_car_three_mf_validation_status=Pass`,
+  `parametric_car_three_mf_validation_preparation_metadata_status=true`,
+  `three_mf_preparation_metadata_present=false`, and
+  `three_mf_validation_preparation_metadata_status=true`.
+- Remaining limits:
+  this is a supported-subset car only. Loft/revolve/shell body and wheel
+  geometry, wheel wells, glass surfaces derived from body regions,
+  actual Boolean split/cut/cutout geometry,
+  full geometry clearance/wall-thickness/integrated connector-fit validation,
+  full exact CSG/adaptive visual meshing, native/web 3D parity, live browser
+  DOM/IME host integration, visible native/web editor integration, and the
+  desktop playground owning a visible car editor panel/session loop for real
+  window input remain open. Native AccessKit action requests now drive
+  `WorldEditorSession` in focused tests, `verify-solid-graph`, and the optional
+  native preview-host session route for solid-model examples. The native
+  preview host also installs a visible document-projected car editor layout for
+  solid-model sessions, but that is not yet full native/web 3D viewport
+  rendering parity.
+  The split print output and split 3MF package set are deterministic
+  supported-subset slice partitions, not full printable split-body artifacts.
+  Separate connector-pin 3MF packages now exist, and car segment packages now
+  embed preparation metadata, but the segment packages do not yet contain
+  mating cutouts or integrated connector/cut objects. Boundary crossing
+  bracket-hole split output now validates as a supported subset; this is still
+  not a full arbitrary split topology proof. Connector pins are exported as a
+  separate supported-subset package rather than integrated fit-checked split
+  bodies.
+- Next step:
+  add richer car constructors, visible native/web editor integration, and
+  visible export action triggering from the prepared printable assembly; turn
+  split/connector preparation into full Boolean cut bodies, connector solids,
+  richer arbitrary split topology handling, and richer per-segment 3MF model
+  objects later.
+
+### 2026-06-24 U7 Selected WorldScene Outline Readback
+
+- Task:
+  move selected-world visual state into the renderer-owned WGPU projection path
+  without claiming a full depth-tested 3D pipeline or browser parity.
+- Result:
+  `boon_native_gpu` now emits a retained `Border` visual primitive for a
+  selected visible `WorldScene` instance. The outline uses a separate
+  `chunk:world:selection:instance:*` retained chunk id, includes
+  `world:selection`, `world:selection:instance:*`, `world:selection:pick:*`,
+  instance, geometry, material, and pick dependencies, and keeps the source item
+  count stable. `verify-native-gpu-world-scene` now renders unselected and
+  selected `hello_3d` scenes through app-owned WGPU readback and binds both PNG
+  artifacts in `artifact_sha256s`.
+- Verification:
+  `cargo test -p boon_native_gpu --lib world_scene_projection_adds_retained_selection_outline -- --nocapture`;
+  `cargo run -p xtask -- verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_status=app-owned-world-scene-projection-readback-pass`,
+  `native_gpu_world_scene_selection_outline_status=selected-worldscene-renders-retained-outline`,
+  `native_gpu_world_scene_unselected_rendered_rect_count=4`,
+  `native_gpu_world_scene_selected_rendered_rect_count=5`,
+  `hello_3d_world_scene_selected_instance_count=1`, and two tracked
+  `artifact_sha256s` entries for the unselected and selected readback PNGs.
+- Remaining limits:
+  this is still a projected world-scene renderer proof, not a depth-tested mesh
+  pipeline, depth-tested GPU pick-ID attachment, feature/normal/depth target,
+  browser WebGPU host parity, or interactive `hello_3d` orbit/pick scenario.
+
+### 2026-06-24 U10 Visible Export Action 3MF Generation
+
+- Task:
+  connect visible/native world-editor export actions to real manufacturing and
+  deterministic 3MF package generation without moving 3MF concerns into the
+  platform-neutral scene model.
+- Result:
+  `boon_native_playground` now keeps a `last_export_artifact` summary on the
+  preview-owned `WorldEditorSession` state. When native accessibility-style
+  actions or visible mouse clicks trigger `Export 3MF`, the preview host uses
+  its authoritative `SolidModelBundle` to run
+  `boon_manufacturing::compile_print_job(...)`,
+  `boon_3mf::export_3mf_entry_set(...)`, and
+  `boon_3mf::validate_3mf_package(...)`. The scene model still only prepares
+  export intent and selected-printable metadata.
+- Scope:
+  the generated package summary is explicitly
+  `selected-printable-instance-from-export-action`. `PrintCompileRequest` now
+  carries a `PrintCompileScope`, and the manufacturing layer compiler applies
+  that scope before slicing, so this is not a post-filter over whole-assembly
+  3MF output.
+- Verification:
+  `cargo test -p boon_native_playground preview_host_world_editor -- --nocapture`;
+  `cargo run -p xtask -- verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/accessibility-adapters.json`.
+- Report:
+  `target/reports/unified/accessibility-adapters.json` reports
+  `native_accessibility_world_editor_session_three_mf_status=Pass`,
+  `native_accessibility_world_editor_session_three_mf_validation_status=Pass`,
+  `native_accessibility_world_editor_session_three_mf_opc_zip_byte_count > 0`,
+  `native_accessibility_world_editor_session_three_mf_printable_instance_count=1`,
+  `native_accessibility_world_editor_session_three_mf_visual_mesh_used=false`,
+  and
+  `native_accessibility_world_editor_session_three_mf_scope=selected-printable-instance-from-export-action`.
+- Remaining limits:
+  external conformance/importer validation, browser-visible editor integration,
+  and full 3D native/web parity remain open.
+
+### 2026-06-24 U7 App-Owned Projection Pick-ID Readback
+
+- Task:
+  add a Boon-owned pick-ID artifact for the current WorldScene projection path
+  without claiming a full depth-tested 3D pipeline or browser parity.
+- Result:
+  `boon_native_gpu` now exposes `WorldScenePickReadbackProof` and
+  `render_app_owned_world_scene_pick_ids(...)`. The proof reuses the same
+  projected `WorldScene` item bounds as the existing color readback and writes a
+  deterministic RGBA pick surface where each visible instance is encoded by its
+  stable `PickId`. `verify-native-gpu-world-scene` writes this pick artifact
+  beside the unselected and selected color artifacts and derives expected pick
+  IDs from visible `WorldScene` instances, not from example names or source text.
+- Verification:
+  `cargo test -p boon_native_gpu --lib world_scene_ -- --nocapture`;
+  `cargo run -p xtask -- verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_pick_target_status=app-owned-projection-pick-id-readback-pass`,
+  `native_gpu_world_scene_sampled_pick_id_count=1`,
+  `native_gpu_world_scene_unique_pick_id_count=1`,
+  `native_gpu_world_scene_sampled_pick_ids=[1]`, and three tracked
+  `artifact_sha256s` entries for unselected color, selected color, and pick-ID
+  readback artifacts.
+- Remaining limits:
+  this is an app-owned projection pick surface, not a depth-tested GPU pick-ID
+  attachment, depth target, feature/normal target, camera-matrix mesh pipeline,
+  browser WebGPU parity proof, or interactive `hello_3d` pick/orbit scenario.
+
+### 2026-06-24 U7 App-Owned Projection Feature/Depth Metadata Readback
+
+- Task:
+  add Boon-owned feature/depth metadata evidence for the current WorldScene
+  projection path without claiming a full depth-tested 3D pipeline or browser
+  parity.
+- Result:
+  `boon_native_gpu` now exposes `WorldSceneFeatureDepthReadbackProof` and
+  `render_app_owned_world_scene_feature_depth(...)`. Projected WorldScene items
+  retain `world:feature:*` dependencies, and the metadata proof writes a
+  deterministic RGBA surface where RGB encodes each visible instance's stable
+  `FeatureId` and alpha encodes the current projection-depth byte.
+  `verify-native-gpu-world-scene` writes this artifact beside unselected color,
+  selected color, and pick-ID artifacts and derives expected feature IDs from
+  visible `WorldScene` instances, not from example names or source text.
+- Verification:
+  `cargo test -p boon_native_gpu --lib world_scene_ -- --nocapture`;
+  `cargo run -p xtask -- verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_feature_depth_status=app-owned-projection-feature-depth-readback-pass`,
+  `native_gpu_world_scene_sampled_feature_id_count=1`,
+  `native_gpu_world_scene_unique_feature_id_count=1`,
+  `native_gpu_world_scene_min_projection_depth=0.0`,
+  `native_gpu_world_scene_max_projection_depth=0.0`, and four tracked
+  `artifact_sha256s` entries for unselected color, selected color, pick-ID, and
+  feature/depth metadata readback artifacts.
+- Remaining limits:
+  this is an app-owned projection metadata surface, not a depth-tested GPU depth
+  attachment, shader-written feature/normal target, camera-matrix mesh pipeline,
+  browser WebGPU parity proof, or interactive `hello_3d` pick/orbit scenario.
+
+### 2026-06-24 U7 hello_3d Interaction Delta Proof
+
+- Task:
+  prove platform-neutral interaction consequences for the checked-in
+  `examples/hello_3d/RUN.bn` runtime scene without claiming live native pointer
+  input, orbit handling, renderer hit testing, browser parity, or a full
+  depth-tested 3D pipeline.
+- Result:
+  `verify-world-scene` now derives a pickable target from the runtime-produced
+  `hello_3d` `WorldScene`, applies a pick-to-selection change through
+  `WorldScene::diff` and `WorldScene::apply_patch`, then applies a
+  transform-only rotation change to the selected runtime instance through the
+  same patch path. The report records selection and transform patch counts,
+  update counters, selected-instance count, geometry rebuild count, and whether
+  the transform preserved the original geometry revision.
+- Verification:
+  `cargo run -p xtask -- verify-world-scene --report target/reports/unified/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/world-scene.json`.
+- Report:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `hello_3d_interaction_status=pick-select-and-transform-deltas-pass`,
+  `hello_3d_selection_patch_operation_count=1`,
+  `hello_3d_selection_geometry_rebuild_count=0`,
+  `hello_3d_selection_selected_instance_count=1`,
+  `hello_3d_transform_patch_operation_count=1`,
+  `hello_3d_transform_update_count=1`,
+  `hello_3d_transform_geometry_rebuild_count=0`, and
+  `hello_3d_transform_geometry_revision_preserved=true`.
+- Remaining limits:
+  this is a checked platform-neutral `WorldScene` delta proof over the real
+  Boon `hello_3d` runtime output. It is not yet a live native host-event
+  scenario, orbit camera controller, renderer hit-test proof, depth-tested mesh
+  pipeline, browser WebGPU parity proof, or manufacturing proof.
+
+### 2026-06-24 U7 hello_3d Camera Orbit Delta Proof
+
+- Task:
+  make camera movement a first-class platform-neutral `WorldScene` patch and
+  prove the real `hello_3d` runtime scene can orbit from an operator-host
+  pointer press/drag/release sequence by updating only the camera, without
+  claiming live native preview pointer delivery.
+- Result:
+  added `WorldOrbitCameraDrag`, `WorldPointerOrbitDrag`,
+  `WorldHostPointerOrbitEvent`, `WorldHostPointerOrbitController`,
+  `WorldScene::orbit_camera_drag(camera, drag)`,
+  `WorldScene::orbit_camera_pointer_drag(camera, drag)`,
+  `WorldPatchOperation::SetCameraTransform`, and
+  `WorldPatchReport::camera_transform_update_count`. `WorldScene::diff` and
+  `WorldScene::apply_patch` now track camera transform changes explicitly.
+  `verify-world-scene` applies a three-event operator-host pointer drag to the
+  real `examples/hello_3d/RUN.bn` runtime output and checks that the patch is
+  camera-only and the controller clears state on release.
+- Verification:
+  `cargo test -p boon_scene_model pointer -- --nocapture`;
+  `cargo test -p boon_scene_model host_pointer -- --nocapture`;
+  `cargo test -p boon_scene_model orbit -- --nocapture`;
+  `cargo run -p xtask -- verify-world-scene --report target/reports/unified/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/world-scene.json`.
+- Report:
+  `target/reports/unified/world-scene.json` reports `status=pass`,
+  `hello_3d_orbit_status=camera-orbit-delta-pass`,
+  `hello_3d_orbit_input_mode=operator-host-pointer-drag`,
+  `hello_3d_orbit_host_event_count=3`,
+  `hello_3d_orbit_controller_active_after_release=false`,
+  `hello_3d_orbit_patch_operation_count=1`,
+  `hello_3d_orbit_diff_operation_count=1`,
+  `hello_3d_orbit_camera_transform_update_count=1`,
+  `hello_3d_orbit_instance_transform_update_count=0`,
+  `hello_3d_orbit_selection_update_count=0`,
+  `hello_3d_orbit_geometry_rebuild_count=0`, and
+  `u7_status=hello-3d-runtime-world-output-interaction-and-operator-host-pointer-camera-orbit-deltas-no-renderer`.
+- Remaining limits:
+  this proves only the platform-neutral operator-host pointer to camera-orbit
+  consequence over the real Boon `hello_3d` runtime output. Visible native
+  preview pointer stream wiring and browser WebGPU parity remain open.
+
+### 2026-06-24 U7 App-Owned WGPU Depth Target Proof
+
+- Task:
+  prove that the native world-scene verifier owns and submits a WGPU depth
+  attachment without claiming mesh drawing, camera-matrix vertex transforms,
+  depth-tested picking, or browser parity.
+- Result:
+  `boon_native_gpu` now exposes `WorldSceneDepthTargetProof` and
+  `render_app_owned_world_scene_depth_target(...)`. The proof creates a
+  `Depth32Float` texture owned by Boon, attaches it to a render pass, clears it
+  to depth `1.0`, submits the pass, and reports dimensions, format, sample
+  count, clear value, submitted pass count, and the `WorldScene` identity hash.
+  `verify-native-gpu-world-scene` runs this beside the existing app-owned
+  color, selected-outline, pick-ID, and feature/depth metadata proofs.
+- Verification:
+  `cargo test -p boon_native_gpu --lib world_scene_depth_target_clear_pass_uses_app_owned_depth_texture -- --nocapture`;
+  `cargo test -p boon_native_gpu --lib world_scene_ -- --nocapture`;
+  `cargo run -p xtask -- verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_depth_target_status=app-owned-depth-target-clear-pass`,
+  `native_gpu_world_scene_depth_target_capture_method=app-owned-world-scene-depth-target-clear-pass`,
+  `native_gpu_world_scene_depth_target_format=Depth32Float`,
+  `native_gpu_world_scene_depth_target_width=320`,
+  `native_gpu_world_scene_depth_target_height=220`,
+  `native_gpu_world_scene_depth_target_sample_count=1`,
+  `native_gpu_world_scene_depth_target_clear_depth=1.0`,
+  `native_gpu_world_scene_depth_target_submitted_pass_count=1`, and
+  `world_3d_pipeline_status=app-owned-depth-target-pass-no-mesh-pipeline`.
+- Remaining limits:
+  this is a real app-owned WGPU depth attachment submission proof. It is not
+  yet a depth-tested mesh renderer, camera-matrix pipeline, shader-written
+  feature/normal target, renderer hit-test proof, live `hello_3d` orbit
+  scenario, browser WebGPU parity proof, or manufacturing proof.
+
+### 2026-06-24 U7 Basic Indexed Mesh/Depth/Normal/Feature Hit-Test Readback
+
+- Task:
+  prove that the native GPU verifier can draw supported `WorldScene` geometry
+  as indexed triangles into app-owned color, depth, shader-written normal
+  targets, and shader-written full-64-bit feature-ID targets, then resolve a
+  deterministic app-owned feature-target hit sample, without claiming a full
+  retained 3D renderer.
+- Result:
+  `boon_native_gpu` now exposes `WorldSceneMeshPipelineProof` and
+  `render_app_owned_world_scene_mesh_pipeline(...)` plus
+  `render_app_owned_solid_visual_scene_mesh_pipeline(...)`. The proof consumes
+  visible `WorldScene` instances, material base colors, camera projection, and
+  supported geometry kinds from the scene. The current supported `WorldScene`
+  geometry path renders `SharedPrimitive::Cube` and `IndexedMeshSummary` bounds
+  as indexed triangles; unsupported geometry is counted explicitly rather than
+  silently faked. The `SolidVisualScene` path consumes retained
+  `SurfaceChunk::IndexedMesh` payloads directly, including the parametric car's
+  exact shared wheel cylinder mesh. The WGPU path creates app-owned
+  `Rgba8UnormSrgb` color, `Depth32Float` depth, one `Rgba8Unorm` normal
+  texture, and two `Rgba8Unorm` feature-ID textures. The two feature textures
+  encode the full `u64` `FeatureId` as low/high RGBA byte halves, so large
+  runtime feature IDs are not truncated. The mesh shader writes visual color,
+  normal, and feature-ID targets in the same draw pass, reads back all
+  app-owned targets, writes PNG artifacts for color, normal, and feature
+  halves, and reports counts, decoded feature IDs, normal-target pixel
+  statistics, and artifact hashes. The mesh vertex buffer now carries
+  world-space positions, while a WGPU uniform buffer carries camera
+  world-to-clip rows and the vertex shader performs camera projection. The
+  proof decodes a deterministic renderer hit sample from the same app-owned
+  feature target, including hit x/y, decoded `FeatureId`, and sampled feature
+  pixel count. `verify-native-gpu-world-scene` now applies the
+  platform-neutral `hello_3d` operator-host pointer camera-orbit patch and
+  renders the orbit scene through the same app-owned mesh path, requiring a
+  changed mesh artifact/render identity while preserving the same decoded
+  feature IDs.
+  The verifier runs this beside the existing projection, selection-outline,
+  pick-ID, feature/depth metadata, and depth-target proofs. The same verifier
+  now runs the retained chunk mesh path on the parametric car visual proxy,
+  proving that a SolidGraph-derived scene with six visible instances renders
+  from retained `SurfaceChunk` payloads and resolves a feature-target hit
+  through the same app-owned indexed mesh/depth/normal/feature path.
+- Verification:
+  `cargo test -p boon_native_gpu --lib world_scene_mesh_pipeline_draws_indexed_triangles_with_depth -- --nocapture`;
+  `cargo test -p boon_native_gpu --lib solid_visual_scene_mesh_pipeline_draws_retained_chunk_payloads -- --nocapture`;
+  `cargo test -p boon_native_gpu --lib world_scene_ -- --nocapture`;
+  `cargo run -p xtask -- verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_mesh_pipeline_status=app-owned-indexed-mesh-depth-feature-readback-pass`,
+  `native_gpu_world_scene_mesh_pipeline_capture_method=app-owned-world-scene-indexed-mesh-depth-readback`,
+  `native_gpu_world_scene_mesh_pipeline_camera_projection_method=shader-camera-uniform-world-to-clip`,
+  `native_gpu_world_scene_mesh_pipeline_feature_capture_method=app-owned-world-scene-mesh-shader-feature-id64-readback`,
+  `native_gpu_world_scene_mesh_pipeline_normal_capture_method=app-owned-world-scene-mesh-shader-normal-readback`,
+  `native_gpu_world_scene_mesh_pipeline_color_format=Rgba8UnormSrgb`,
+  `native_gpu_world_scene_mesh_pipeline_feature_format=Rgba8Unorm`,
+  `native_gpu_world_scene_mesh_pipeline_normal_format=Rgba8Unorm`,
+  `native_gpu_world_scene_mesh_pipeline_depth_format=Depth32Float`,
+  `native_gpu_world_scene_mesh_pipeline_visible_instance_count=1`,
+  `native_gpu_world_scene_mesh_pipeline_rendered_instance_count=1`,
+  `native_gpu_world_scene_mesh_pipeline_unsupported_geometry_count=0`,
+  `native_gpu_world_scene_mesh_pipeline_vertex_count=8`,
+  `native_gpu_world_scene_mesh_pipeline_index_count=36`,
+  `native_gpu_world_scene_mesh_pipeline_triangle_count=12`,
+  `native_gpu_world_scene_mesh_pipeline_normal_status=app-owned-mesh-normal-readback-pass`,
+  `native_gpu_world_scene_mesh_pipeline_sampled_normal_pixel_count=5724`,
+  `native_gpu_world_scene_mesh_pipeline_unique_normal_rgba_values=5724`,
+  `native_gpu_world_scene_mesh_pipeline_sampled_feature_ids=[6296697283487069164]`,
+  `native_gpu_world_scene_mesh_hit_test_status=app-owned-mesh-feature-hit-test-pass`,
+  `native_gpu_world_scene_mesh_hit_test_capture_method=app-owned-world-scene-mesh-feature-target-hit-test`,
+  `native_gpu_world_scene_mesh_hit_test_feature_id=6296697283487069164`,
+  `native_gpu_world_scene_mesh_hit_test_sampled_pixel_count=5724`,
+  `native_gpu_world_scene_mesh_camera_orbit_status=app-owned-mesh-camera-orbit-readback-pass`,
+  `native_gpu_world_scene_mesh_camera_orbit_input_mode=operator-host-pointer-drag`,
+  `native_gpu_world_scene_mesh_camera_orbit_host_input_status=operator-host-pointer-orbit-pass`,
+  `native_gpu_world_scene_mesh_camera_orbit_host_event_count=3`,
+  `native_gpu_world_scene_mesh_camera_orbit_patch_operation_count=1`,
+  `native_gpu_world_scene_mesh_camera_orbit_camera_transform_update_count=1`,
+  `native_gpu_world_scene_mesh_camera_orbit_instance_transform_update_count=0`,
+  `native_gpu_world_scene_mesh_camera_orbit_geometry_rebuild_count=0`,
+  `native_gpu_world_scene_mesh_camera_orbit_controller_active_after_release=false`,
+  `native_gpu_world_scene_mesh_camera_orbit_projection_method=shader-camera-uniform-world-to-clip`,
+  `native_gpu_world_scene_mesh_camera_orbit_artifact_changed=true`,
+  `native_gpu_world_scene_mesh_camera_orbit_same_feature_ids=true`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_status=app-owned-retained-chunk-mesh-depth-feature-readback-pass`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_capture_method=app-owned-solid-visual-scene-retained-chunk-mesh-depth-readback`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_camera_projection_method=shader-camera-uniform-world-to-clip`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_feature_capture_method=app-owned-world-scene-mesh-shader-feature-id64-readback`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_normal_capture_method=app-owned-world-scene-mesh-shader-normal-readback`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_geometry_source=solid-visual-retained-surface-chunks`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_visible_instance_count=6`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_rendered_instance_count=6`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_unsupported_geometry_count=0`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_count=6`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_vertex_count=280`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_index_count=1608`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_vertex_count=280`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_index_count=1608`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_triangle_count=536`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_normal_status=app-owned-retained-mesh-normal-readback-pass`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_sampled_normal_pixel_count=9302`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_unique_normal_rgba_values=9273`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_sampled_feature_ids=[1]`,
+  `native_gpu_world_scene_parametric_car_mesh_hit_test_status=app-owned-retained-mesh-feature-hit-test-pass`,
+  `native_gpu_world_scene_parametric_car_mesh_hit_test_feature_id=1`,
+  `native_gpu_world_scene_parametric_car_mesh_hit_test_sampled_pixel_count=9302`,
+  `world_3d_pipeline_status=app-owned-indexed-mesh-depth-normal-feature-hit-test-camera-matrix-orbit-pass-basic-retained-chunks`,
+  `u7_status=native-gpu-worldscene-retained-chunk-mesh-depth-normal-feature-hit-test-camera-matrix-operator-host-pointer-orbit-basic`,
+  and thirteen tracked `artifact_sha256s` entries.
+- Remaining limits:
+  this is a basic app-owned indexed mesh/depth/normal/feature/hit-test readback
+  proof for supported `WorldScene` and retained `SolidVisualScene` geometry. It
+  proves shader-written normals, shader-written feature IDs, feature-target hit
+  sampling, and that the current native mesh path responds to camera orbit
+  derived from pointer deltas through a shader-side camera uniform. It is not
+  yet a full retained 3D
+  renderer, adaptive CSG mesh path, live host pointer/orbit `hello_3d`
+  scenario, browser WebGPU parity proof, or manufacturing proof.
+
+### 2026-06-24 U7 Native Preview WorldScene Visible Surface
+
+- Task:
+  connect generic runtime `world:` output to the native preview visible-surface
+  path without passing example names and without projecting the 3D scene through
+  document layout.
+- Result:
+  keep the slice. `boon_native_gpu` now exposes
+  `SurfaceWorldSceneRenderRequest` and
+  `encode_world_scene_mesh_pipeline_to_surface(...)`, which renders a
+  `WorldScene` directly into the native surface view with a depth attachment
+  and shader-side camera uniform. `boon_native_playground` now stores
+  `PreviewWorldSceneState` when `LiveRuntime::world_scene_output()` succeeds
+  and chooses the WorldScene render branch for top-level `world:` sources.
+  The preview runtime helper now uses the source-unit/project runtime path for
+  single-file sources too; this fixed a real mismatch where `hello_3d` could
+  pass verifier/runtime lowering but the preview role could miss the generic
+  `world:` output contract. Document scroll, viewport relayout, and focus
+  overlay materialization are skipped for world-scene previews because those
+  are document-only poll assumptions and were the cause of the
+  `layout proof missing artifact_path` failure.
+- Verification:
+  `cargo test -p boon_native_playground preview_world_scene_detects_hello_3d_source_output -- --nocapture`;
+  `target/debug/boon_native_playground --role preview --code-file examples/hello_3d/RUN.bn --probe --demand-driven-loop --hold-ms 1 --warmup-frame-count 0 --sample-frame-count 1 --title-token preview-hello-3d-world-scene --report target/reports/native-gpu/preview-hello-3d-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/preview-hello-3d-world-scene.json`;
+  `cargo fmt --check`.
+- Report:
+  `target/reports/native-gpu/preview-hello-3d-world-scene.json` reports
+  `status=pass`. The relevant proof path is
+  `details.app_window_surface_proof.external_render_proof`, with
+  `visible_style_mode=world_scene_3d`, `visible_surface_rendered=true`,
+  `visible_present_path=true`,
+  `render_backend_trait=boon_native_gpu::encode_world_scene_mesh_pipeline_to_surface`,
+  `world_scene_preview_output.status=pass`,
+  `world_scene_preview_output.output_root=world`,
+  `world_scene_preview_output.preview_receives_example_name=false`,
+  one camera/light/geometry/appearance/instance/pickable instance, and
+  `world_scene_surface_proof.capture_method=visible-surface-world-scene-indexed-mesh-depth-pass`,
+  `vertex_count=8`, `index_count=36`, `triangle_count=12`.
+- Remaining limits:
+  this is a static visible native preview render proof for generic `world:`
+  output. At this point it did not complete preview mouse-drag/orbit routing,
+  browser WebGPU parity, or a full retained 3D renderer. The one-frame proof
+  command now writes a pass report and exits cleanly with `--hold-ms 1`.
+
+### 2026-06-24 U7 Preview WorldScene Pointer-Orbit Routing
+
+- Task:
+  route native preview pointer input for generic `world:` output through the
+  platform-neutral `WorldHostPointerOrbitController` and mutate the current
+  preview `WorldScene` without example-name or source-text branches.
+- Result:
+  keep the slice. Preview `world:` state is now mutable behind
+  `PreviewWorldSceneStore = Arc<Mutex<PreviewWorldSceneState>>` and carries the
+  current `WorldScene`, `WorldHostPointerOrbitController`, and orbit counters.
+  `preview_apply_world_scene_input(...)` consumes `NativeInputAdapterProof`
+  mouse position, button events, button-down state, and motion counters, maps
+  left press/drag/release to `WorldHostPointerOrbitEvent`, applies resulting
+  `WorldPatch` values to the current preview scene, and increments the preview
+  content revision when the proof-visible orbit state changes. The
+  visible-surface proof now reports
+  `world_scene_preview_output.operator_host_pointer_orbit` with host event
+  count, patch operation count, camera transform updates, instance transform
+  updates, geometry rebuilds, controller-active state, and input method. A
+  follow-up correctness review also fixed legacy `ReplaceCode` so it refreshes
+  or clears preview `world:` state, made world-scene render proofs report
+  `pending`/`fail` when status overlays or input errors are present, and split
+  render-hook shared/input state snapshots to reduce lock-order risk. The Linux
+  `app_window` cursor worker now exits normally when its request channel is
+  dropped, removing the shutdown panic from the bounded preview proof command.
+- Verification:
+  `cargo check -p boon_native_playground`;
+  `cargo test -p boon_native_playground preview_world_scene_ -- --nocapture`;
+  `cargo build -p boon_native_playground`;
+  `target/debug/boon_native_playground --role preview --code-file examples/hello_3d/RUN.bn --probe --demand-driven-loop --hold-ms 1 --warmup-frame-count 0 --sample-frame-count 1 --title-token preview-hello-3d-world-scene --report target/reports/native-gpu/preview-hello-3d-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/preview-hello-3d-world-scene.json`;
+  `cargo fmt --check`;
+  `git diff --check -- crates/boon_native_playground/src/main.rs target/reports/native-gpu/preview-hello-3d-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/preview-hello-3d-world-scene.json` reports
+  `status=pass`, `visible_style_mode=world_scene_3d`,
+  `visible_surface_rendered=true`, `world_scene_surface_proof.triangle_count=12`,
+  and idle orbit telemetry because no OS pointer input was injected during the
+  one-frame report:
+  `operator_host_pointer_orbit.status=idle`, `host_event_count=0`,
+  `patch_operation_count=0`, `camera_transform_update_count=0`,
+  `instance_transform_update_count=0`, `geometry_rebuild_count=0`, and
+  `input_method=WorldHostPointerOrbitController`. The non-idle route is proven
+  by `preview_world_scene_pointer_drag_orbits_camera`, which applies an
+  app-owned native press/drag/release input sequence and checks
+  `orbit_host_event_count=3`, `orbit_patch_operation_count=1`,
+  `orbit_camera_transform_update_count=1`,
+  `orbit_instance_transform_update_count=0`, `orbit_geometry_rebuild_count=0`,
+  controller inactive after release, and preview `update_count=3`.
+- Remaining limits:
+  this is internal preview poll-path routing proven with app-owned native input
+  structures. It is not yet a headed visible OS-pointer scenario, not human
+  observation evidence, not browser WebGPU parity, and not a full retained 3D
+  renderer. The one-frame proof command now writes a pass report and exits
+  cleanly with `--hold-ms 1`.
+
+### 2026-06-24 U7 Preview WorldScene E2E Orbit Gate
+
+- Task:
+  make the native preview `hello_3d` world-scene orbit route report-gated under
+  `verify-native-gpu-preview-e2e` instead of relying only on a direct helper
+  unit test.
+- Result:
+  keep the slice. The preview role now accepts `--world-scene-orbit-probe`,
+  which injects an app-owned `NativeInputAdapterProof` press/drag/release
+  sequence into the same preview `world:` poll route before the first report
+  frame. `verify-native-gpu-preview-e2e --example hello_3d` builds the native
+  playground, runs `examples/hello_3d/RUN.bn` through the preview role without
+  passing an example name to the preview process, verifies the generated role
+  report, and writes a normal native gate report.
+- Verification:
+  `cargo check -p boon_native_playground -p xtask`;
+  `cargo xtask verify-native-gpu-preview-e2e --example hello_3d --report target/reports/native-gpu/preview-e2e-hello_3d.json`.
+- Report:
+  `target/reports/native-gpu/preview-e2e-hello_3d.json` reports
+  `status=pass`. The nested role report
+  `target/reports/native-gpu/preview-e2e-hello_3d-role.json` reports
+  `visible_style_mode=world_scene_3d`, `visible_surface_rendered=true`,
+  `world_scene_surface_proof.triangle_count=12`,
+  `world_scene_orbit_probe.status=pass`,
+  `operator_host_pointer_orbit.status=operator-host-pointer-orbit-pass`,
+  `host_event_count=3`, `patch_operation_count=1`,
+  `camera_transform_update_count=1`,
+  `instance_transform_update_count=0`, `geometry_rebuild_count=0`, and
+  `controller_active=false` after release.
+- Remaining limits:
+  this is app-owned host-event evidence through `NativeInputAdapterProof`, not
+  real OS pointer input and not human observation. U7 remains open for
+  headed/manual visible OS-pointer behavior, browser WebGPU parity, and a full
+  retained 3D renderer.
+
+### 2026-06-24 U7 Native/Web Render Contract Gate
+
+- Task:
+  add a small, honest native/web renderer compatibility gate before attempting
+  full browser WebGPU parity.
+- Result:
+  keep the slice. The native GPU crate now names the world-scene visible-surface
+  WGSL shader and app-owned mesh-proof WGSL shader as stable constants and
+  exports `world_scene_webgpu_render_contract()`. `xtask` now advertises and
+  implements `verify-native-web-render-contract`, which validates WGPU version,
+  shader hashes, vertex/uniform layout, formats, usages, and absence of
+  native-only features.
+- Verification:
+  `cargo fmt --check`;
+  `cargo check -p boon_native_gpu -p xtask`;
+  `CARGO_BUILD_JOBS=1 cargo build -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-contract.json` reports
+  `status=pass`,
+  `native_web_render_contract_status=webgpu-compatible-contract-pass`,
+  `browser_render_executed=false`,
+  `browser_webgpu_visual_parity_status=not-implemented-not-executed`, and
+  `native_web_render_contract.parity_status=contract-only-browser-webgpu-visual-parity-not-executed`.
+  It records stable shader hashes
+  `f72c3ecb9acdac4d6b2ed4b9f031652d01ec18eedfca3b687895c32097b49c62`
+  for the visible-surface shader and
+  `79f70b380f3c2e75924d5da05de20cb6b3f7027f417abf5ee41844151b072b60`
+  for the app-owned mesh-proof shader.
+- Remaining limits:
+  this is not `verify-native-web-render-parity`. It does not launch a browser,
+  execute browser WebGPU, compare captures, prove headed OS-pointer behavior, or
+  finish the full retained 3D renderer.
+- Tooling note:
+  one parallel `cargo xtask verify-native-web-render-contract ...` attempt
+  compiled the Rust code but crashed in `rust-lld` with a bus error during link.
+  A single-threaded `CARGO_BUILD_JOBS=1 cargo build -p xtask` succeeded, and the
+  built `target/debug/xtask` command then passed.
+
+### 2026-06-24 U6 Browser Artifact Budget Guardrail
+
+- Task:
+  add the planned browser artifact budget command as a guardrail for the current
+  no-browser-host state.
+- Superseded note:
+  this was the correct state before the browser host source artifact existed.
+  The later `2026-06-24 U6/U7 Browser WebGPU Host Source Artifact` slice
+  changes this gate into a measured source-artifact budget with
+  `browser_host_status=source-host-present`.
+- Result:
+  keep the slice. `xtask` now advertises and implements
+  `verify-browser-artifact-budget`. The gate verifies that no browser host crate,
+  no source-tree browser bundle directory, and no generated
+  `target/wasm32-unknown-unknown` artifacts exist in the current workspace. It
+  records zero browser artifact bytes and explicitly labels the browser host and
+  browser visual parity as not implemented.
+- Verification:
+  `cargo fmt --check`;
+  `cargo check -p xtask`;
+  `CARGO_BUILD_JOBS=1 cargo build -p xtask`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`,
+  `browser_artifact_budget_status=browser-host-not-implemented-no-artifact-to-budget`,
+  `browser_host_status=not-implemented`, `browser_artifact_bytes=0`,
+  `browser_source_artifact_paths=[]`, `generated_wasm_artifact_paths=[]`, and
+  `browser_visual_parity_status=not-implemented-not-executed`.
+- Tooling note:
+  the root filesystem was full (`0` available bytes), which caused repeated
+  `rust-lld` bus errors and one `mold` "failed to write to an output file"
+  error. `target/debug` was about `104G`,
+  `target/debug/incremental` about `59G`, and
+  `target/artifacts/native-gpu` about `114G`. A partial cleanup of generated
+  `target/artifacts/native-gpu` and `target/debug/incremental` freed about
+  `18G`; those generated folders still partly exist.
+- Remaining limits:
+  this is not a real browser artifact budget or startup report. When a browser
+  host/bundle appears, this gate must change from "no artifact exists" into a
+  measured wasm/js/css byte and startup-budget report with explicit approval for
+  material growth.
+
+### 2026-06-24 U9 3MF Importer-Smoke Package Validation
+
+- Task:
+  add an honest internal importer-smoke proof for generated 3MF package bytes
+  without claiming external 3MF conformance.
+- Result:
+  keep the slice. `boon_3mf` now exposes `ThreeMfImporterSmokeReport` and
+  `import_3mf_package_smoke()`. The smoke path reads the generated OPC/ZIP
+  bytes and reconstructs model object IDs, build item references, material
+  count, slice/region/polygon/hole counts, source hash, placeholder mesh count,
+  and optional preparation metadata from the actual package entries.
+  `verify-solid-graph` now records importer-smoke evidence for the bracket and
+  parametric car 3MF paths.
+- Verification:
+  `cargo fmt --check`;
+  `cargo test -p boon_3mf -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `three_mf_importer_smoke_status=Pass`,
+  `three_mf_importer_smoke_scope=deterministic-opc-zip-structure-import-smoke-not-external-conformance`,
+  `three_mf_importer_smoke_model_object_count=2`,
+  `three_mf_importer_smoke_build_item_count=2`,
+  `three_mf_importer_smoke_resolved_build_item_count=2`,
+  `three_mf_importer_smoke_source_hash_matches=true`,
+  `parametric_car_three_mf_importer_smoke_status=Pass`, and
+  `parametric_car_three_mf_importer_smoke_preparation_metadata_decoded=true`.
+  The per-step audit check
+  `3mf:bracket-importer-smoke-parses-opc-structure` also passes.
+- Remaining limits:
+  this is deterministic package-byte structural readback, not proof from an
+  external 3MF conformance checker, slicer, third-party importer, STL
+  compatibility export, full mesh payload compatibility, or
+  tolerance-controlled manufacturing correctness.
+
+### 2026-06-24 U8 Sphere/Cone/Torus Generic Solid Constructor Coverage
+
+- Task:
+  expand Boon-facing SolidGraph constructor coverage for curved primitives
+  without weakening manufacturing honesty gates.
+- Result:
+  keep the slice. The manufacturing root type contract now includes
+  `SolidSphere`, `SolidCone`, and `SolidTorus`; generic runtime constructor
+  handling accepts `Solid/sphere`, `Solid/cone`, and `Solid/torus`; runtime
+  lowering creates `SolidOp::Sphere`, `SolidOp::Cone`, and `SolidOp::Torus`
+  with conservative bounds. A later U9 slice now compiles them into analytic
+  manufacturing layers instead of unsupported-op diagnostics.
+- Verification:
+  `cargo fmt --check`;
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_cone_and_torus_constructors -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_generic_boon_value_to_solid_model -- --nocapture`;
+  `cargo test -p boon_manufacturing unsupported_solid_operation_fails_with_diagnostic -- --nocapture`;
+  `cargo check -p boon_typecheck -p boon_runtime -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `solid_runtime_curved_constructor_status=sphere-cone-torus-lowered-analytic-manufacturing-pass`,
+  `solid_runtime_curved_constructor_primitive_count=3`,
+  `solid_runtime_curved_constructor_part_count=3`,
+  `solid_runtime_curved_constructor_has_sphere=true`,
+  `solid_runtime_curved_constructor_has_cone=true`,
+  `solid_runtime_curved_constructor_has_torus=true`,
+  `solid_runtime_curved_constructor_manufacturing_status=Pass`,
+  `solid_runtime_curved_constructor_layer_count=50`,
+  `solid_runtime_curved_constructor_hole_count=10`, and
+  `solid_runtime_curved_constructor_unsupported_operation_count=0`. The
+  per-step audit check
+  `solid-graph:boon-sphere-cone-torus-constructors-lower-and-section-analytically`
+  passes.
+- Remaining limits:
+  this is typecheck/runtime/SolidGraph lowering plus analytic curved
+  manufacturing evidence. It is not CSG over those primitives, not
+  hole-preserving STL export, and not external importer/conformance evidence.
+
+### 2026-06-24 U8 Sphere/Cone/Torus Exact Retained Visual Meshes
+
+- Task:
+  replace the Sphere/Cone/Torus visual proxy bounds fallback with exact
+  retained indexed mesh chunks while preserving the manufacturing unsupported-op
+  gate.
+- Result:
+  keep the slice. `boon_scene_model` now emits exact retained
+  `SurfaceChunk::IndexedMesh` payloads for `SolidOp::Sphere`,
+  `SolidOp::Cone`, and `SolidOp::Torus`. `verify-solid-graph` proves those
+  exact chunks from the same generic Boon `manufacturing:` source fixture used
+  for constructor lowering, while separately proving manufacturing uses
+  analytic layer polygons instead of those visual chunks.
+- Verification:
+  `cargo fmt --check`;
+  `cargo test -p boon_scene_model curved_solid_visual_proxy_uses_exact_meshes_for_sphere_cone_and_torus -- --nocapture`;
+  `cargo test -p boon_scene_model parametric_car_visual_proxy_uses_exact_mesh_for_shared_wheel_cylinder -- --nocapture`;
+  `cargo check -p boon_scene_model -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `solid_runtime_curved_visual_status=exact-retained-indexed-meshes-no-manufacturing-claim`,
+  `solid_runtime_curved_visual_exact_mesh_count=3`,
+  `solid_runtime_curved_visual_generated_vertex_count=932`,
+  `solid_runtime_curved_visual_generated_index_count=5568`,
+  `solid_runtime_curved_visual_manufacturing_mesh_used=false`, and
+  `solid_runtime_curved_constructor_manufacturing_status=Pass`. The per-step
+  audit check
+  `solid-graph:sphere-cone-torus-visual-proxy-uses-exact-retained-indexed-meshes`
+  passes.
+- Remaining limits:
+  this is exact visual mesh support for simple primitive Sphere/Cone/Torus
+  roots only. It is not CSG over those primitives, not rounded/adaptive visual
+  chunking, not hole-preserving STL export, not browser WebGPU parity, and not
+  external importer/conformance evidence.
+
+### 2026-06-24 U9 Sphere/Cone/Torus Analytic Manufacturing and 3MF Export
+
+- Task:
+  move simple Sphere/Cone/Torus roots from honest unsupported diagnostics into
+  authoritative manufacturing layer sections and deterministic 3MF output.
+- Result:
+  keep the slice. `boon_manufacturing` now sections `SolidOp::Sphere`,
+  `SolidOp::Cone`, and `SolidOp::Torus` directly from `SolidGraph` into layer
+  polygons. Sphere sections are circles, Cone sections interpolate radius by Z,
+  and Torus sections are annular polygons with holes. The old unsupported
+  sphere negative fixture is replaced by `unsupported_loft_fixture()` so
+  unsupported-op diagnostics still cover an actually unsupported operation.
+  `boon_3mf` exports and importer-smoke validates the curved analytic layer
+  package without visual mesh use.
+- Verification:
+  `cargo fmt -p boon_solid_model -p boon_manufacturing -p boon_3mf -p xtask`;
+  `cargo test -p boon_solid_model fixture -- --nocapture`;
+  `cargo test -p boon_manufacturing curved_primitives_compile_to_analytic_layers_without_visual_meshes -- --nocapture`;
+  `cargo test -p boon_manufacturing unsupported_solid_operation_fails_with_diagnostic -- --nocapture`;
+  `cargo test -p boon_3mf curved_analytic_layer_package_exports_without_visual_meshes -- --nocapture`;
+  `cargo check -p boon_solid_model -p boon_manufacturing -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `solid_runtime_curved_constructor_status=sphere-cone-torus-lowered-analytic-manufacturing-pass`,
+  `solid_runtime_curved_constructor_manufacturing_status=Pass`,
+  `solid_runtime_curved_constructor_layer_count=50`,
+  `solid_runtime_curved_constructor_hole_count=10`,
+  `solid_runtime_curved_constructor_unsupported_operation_count=0`,
+  `solid_runtime_curved_three_mf_status=Pass`,
+  `solid_runtime_curved_three_mf_validation_status=Pass`,
+  `solid_runtime_curved_three_mf_importer_smoke_status=Pass`,
+  `solid_runtime_curved_three_mf_slice_count=50`, and
+  `solid_runtime_curved_three_mf_hole_count=10`. The unsupported-op negative
+  gate still reports `manufacturing_unsupported_operation_diagnostic_count=50`
+  from the loft fixture.
+- Remaining limits:
+  this is a bounded analytic layer subset, not full CSG/Boolean support over
+  curved primitives, not adaptive/tolerance-controlled curved manufacturing,
+  not hole-preserving STL export, not external 3MF conformance/importer proof,
+  not browser WebGPU parity, and not final car manufacturing.
+
+### 2026-06-24 U9 STL Compatibility Export Foundation
+
+- Task:
+  add STL compatibility export from authoritative manufacturing-layer output
+  without using visual meshes and without silently corrupting holes.
+- Result:
+  keep the slice as the original STL foundation. A new platform-neutral
+  `boon_mesh_export` crate exports deterministic ASCII STL from no-hole
+  `PrintCompileOutput` layers. It records source manufacturing artifact hash,
+  triangle count, byte count, rejected-hole count, and visual-mesh provenance.
+  A later U9 slice supersedes the original hole-bearing rejection limitation
+  with hole-preserving cap triangulation and hole-wall facets.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_stl_status=Pass`,
+  `parametric_car_stl_validation_status=Pass`,
+  `parametric_car_stl_layer_count=47`,
+  `parametric_car_stl_polygon_count=125`,
+  `parametric_car_stl_triangle_count=10460`,
+  `parametric_car_stl_byte_count=1645307`,
+  `parametric_car_stl_rejected_hole_count=0`. The original report also
+  recorded `mesh_export_hole_negative_status=Fail`,
+  `mesh_export_hole_negative_validation_status=Fail`, and
+  `mesh_export_hole_negative_rejected_hole_count=60`; those negative fields are
+  superseded by the later hole-preserving STL slice.
+- Remaining limits:
+  this original slice was ASCII STL compatibility for no-hole
+  manufacturing-layer outputs only. A later slice adds hole-preserving STL
+  topology, and another later slice adds binary STL. Remaining limits are
+  watertight mesh validation, external slicer/importer proof, full 3MF mesh
+  payload compatibility, adaptive/tolerance-controlled manufacturing, browser
+  WebGPU parity, and final car manufacturing.
+
+### 2026-06-24 U9 Manufacturing Tolerance Report Fields
+
+- Task:
+  make manufacturing tolerance requests and achieved tolerance evidence
+  explicit in output structs, artifact hashes, and `verify-solid-graph`
+  reports.
+- Result:
+  keep the slice. `boon_manufacturing` now records a
+  `ManufacturingToleranceReport` on print, connector-print, and split-segment
+  outputs. The report carries requested XY/Z error, requested minimum feature,
+  requested integer grid, achieved XY/Z error, max layer achieved error, and
+  within-requested flags. Manufacturing, connector, and split-segment artifact
+  hashes include this tolerance report, and `boon_3mf` wrapper outputs preserve
+  it for connector and split packages.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p boon_3mf -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo test -p boon_3mf -- --nocapture`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_manufacturing -p boon_3mf -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_requested_xy_error=0.05`,
+  `manufacturing_achieved_xy_error=0.0005`,
+  `manufacturing_requested_z_error=0.2`,
+  `manufacturing_achieved_z_error=0.2`,
+  `manufacturing_within_requested_xy_error=true`,
+  `manufacturing_within_requested_z_error=true`,
+  `solid_runtime_curved_constructor_achieved_xy_error=0.0005`,
+  `solid_runtime_curved_constructor_achieved_z_error=0.2`,
+  `parametric_car_manufacturing_achieved_xy_error=0.0005`,
+  `parametric_car_manufacturing_achieved_z_error=0.2`,
+  `parametric_car_manufacturing_within_requested_xy_error=true`, and
+  `parametric_car_manufacturing_within_requested_z_error=true`.
+- Remaining limits:
+  this is tolerance provenance and a current compiler summary, not a full
+  adaptive tolerance-controlled manufacturing compiler. It does not add
+  singular-feature diagnostics beyond existing negative fixtures,
+  hole-preserving STL topology, external slicer/importer proof, browser WebGPU
+  parity, or final car manufacturing.
+
+### 2026-06-24 U10 Conservative Wall-Thickness Preparation Diagnostics
+
+- Task:
+  add first-class wall-thickness preparation evidence for manufacturing/export
+  readiness and prove it through the solid-graph verifier.
+- Result:
+  keep the slice. `PrintPreparationPlan` and `PrintPreparationArtifact` now
+  carry `minimum_wall_thickness`, `minimum_wall_thickness_observed`, and
+  `wall_thickness_violation_count`. The preparation artifact hash includes
+  these fields. `prepare_print_job` estimates wall thickness from the
+  authoritative `SolidGraph`, uses explicit `Shell { thickness }` where
+  available, conservatively estimates primitive/composite roots, and blocks a
+  thin-shell negative fixture with a `wall-thickness-violation` diagnostic.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p xtask`;
+  `cargo test -p boon_manufacturing print_preparation -- --nocapture`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo check -p boon_manufacturing -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_default_minimum_wall_thickness=0.4`,
+  `parametric_car_default_minimum_wall_thickness_observed=8.0`,
+  `parametric_car_default_wall_thickness_violation_count=0`,
+  `parametric_car_split_minimum_wall_thickness_observed=8.0`, and
+  `parametric_car_split_wall_thickness_violation_count=0`.
+- Remaining limits:
+  this is conservative preparation validation, not full exact wall-thickness
+  analysis through Boolean/CSG/shell geometry. It is not final
+  loft/revolve/shell car geometry, exact cut/cutout/split repair, integrated
+  connector-fit geometry validation, browser editor integration, external 3MF
+  conformance/importer validation, or full native-web graphics parity.
+
+### 2026-06-24 U9 Hole-Preserving STL Export
+
+- Task:
+  remove the previous no-hole STL compatibility limitation for authoritative
+  manufacturing-layer output.
+- Result:
+  keep the slice. `boon_mesh_export` now depends on focused polygon
+  triangulation crate `earcutr` and exports ASCII STL from `PolygonWithHoles`
+  by triangulating top/bottom caps with hole rings and writing side-wall facets
+  for both outer rings and hole rings. `StlMetrics` now records
+  `preserved_hole_count` separately from `rejected_hole_count`. The printable
+  bracket hole-bearing STL path is now positive evidence instead of a
+  `holes-not-supported` failure.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_stl_scope=authoritative-manufacturing-layer-ascii-stl-hole-preserving`,
+  `parametric_car_stl_status=Pass`,
+  `parametric_car_stl_validation_status=Pass`,
+  `parametric_car_stl_preserved_hole_count=0`,
+  `parametric_car_stl_rejected_hole_count=0`,
+  `mesh_export_hole_preserving_status=Pass`,
+  `mesh_export_hole_preserving_validation_status=Pass`,
+  `mesh_export_hole_preserving_preserved_hole_count=60`,
+  `mesh_export_hole_preserving_rejected_hole_count=0`, and
+  `mesh_export_hole_preserving_triangle_count=10800`.
+- Remaining limits:
+  this is ASCII STL export from layer prisms with hole-preserving caps/walls.
+  A later slice adds binary STL from the same triangle stream. Remaining limits
+  are watertight manifold proof, external slicer/importer proof, full 3MF mesh
+  payload compatibility, adaptive/tolerance-controlled manufacturing, browser
+  WebGPU parity, and final car manufacturing.
+
+### 2026-06-24 U9 Binary STL Compatibility Export
+
+- Task:
+  add deterministic binary STL compatibility output from the same
+  authoritative, hole-preserving manufacturing-layer triangle stream as ASCII
+  STL.
+- Result:
+  keep the slice. `boon_mesh_export` now exposes `BinaryStlPackage`,
+  `export_binary_stl_from_layers`, and `validate_binary_stl_package`. ASCII
+  and binary STL export share one triangle builder, so both formats use the
+  same cap triangulation and outer/hole wall facets. Binary STL writes a
+  deterministic 80-byte header, little-endian triangle count, 50-byte triangle
+  records, and a SHA-256 artifact hash over the binary bytes.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_binary_stl_status=Pass`,
+  `parametric_car_binary_stl_scope=authoritative-manufacturing-layer-binary-stl-hole-preserving`,
+  `parametric_car_binary_stl_validation_status=Pass`,
+  `parametric_car_binary_stl_triangle_count=10460`,
+  `parametric_car_binary_stl_byte_count=523084`,
+  `mesh_export_binary_hole_preserving_status=Pass`,
+  `mesh_export_binary_hole_preserving_validation_status=Pass`,
+  `mesh_export_binary_hole_preserving_preserved_hole_count=60`,
+  `mesh_export_binary_hole_preserving_rejected_hole_count=0`,
+  `mesh_export_binary_hole_preserving_triangle_count=10800`, and
+  `mesh_export_binary_hole_preserving_byte_count=540084`.
+- Remaining limits:
+  this is deterministic binary STL compatibility output from layer-prism
+  triangles, not watertight manifold proof, external slicer/importer proof,
+  full 3MF mesh payload compatibility, adaptive/tolerance-controlled
+  manufacturing, browser WebGPU parity, or final car manufacturing.
+
+### 2026-06-24 U9 Per-Prism STL Topology Validation
+
+- Task:
+  add topology validation for generated manufacturing-layer STL prisms and
+  expose it through the solid-graph verifier.
+- Result:
+  keep the slice. `boon_mesh_export` now exposes `StlTopologyReport` and
+  `validate_layer_prism_topology`. The validator rebuilds each layer prism
+  independently from authoritative `PolygonWithHoles` data, checks that every
+  undirected edge is used exactly twice, and counts degenerate triangles.
+  `verify-solid-graph` now requires a topology pass for both the no-hole
+  parametric car path and the hole-bearing printable bracket path.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_stl_topology_status=Pass`,
+  `parametric_car_stl_topology_checked_prism_count=125`,
+  `parametric_car_stl_topology_triangle_count=10460`,
+  `parametric_car_stl_topology_boundary_edge_count=0`,
+  `parametric_car_stl_topology_non_manifold_edge_count=0`,
+  `parametric_car_stl_topology_degenerate_triangle_count=0`,
+  `mesh_export_hole_preserving_topology_status=Pass`,
+  `mesh_export_hole_preserving_topology_checked_prism_count=240`,
+  `mesh_export_hole_preserving_topology_triangle_count=10800`,
+  `mesh_export_hole_preserving_topology_boundary_edge_count=0`,
+  `mesh_export_hole_preserving_topology_non_manifold_edge_count=0`, and
+  `mesh_export_hole_preserving_topology_degenerate_triangle_count=0`.
+- Remaining limits:
+  this proves each generated layer prism is closed at edge-incidence level. It
+  is not proof that adjacent stacked prisms have been Boolean-unioned into one
+  watertight manifold, not exact CSG/shell topology proof, and not external
+  slicer/importer validation.
+
+### 2026-06-24 U9 3MF Layer-Derived Model Mesh Payload
+
+- Task:
+  replace placeholder 3MF model meshes with deterministic, layer-derived mesh
+  payloads while preserving the authoritative slice metadata and no-visual-mesh
+  evidence boundary.
+- Result:
+  keep the slice. `boon_3mf` now uses `earcutr` to triangulate
+  `PolygonWithHoles` caps and writes cap/wall prism triangles into the 3MF
+  model entry for each component object. `ThreeMfMetrics`,
+  `ThreeMfValidationMetrics`, and `ThreeMfImporterSmokeMetrics` expose model
+  mesh vertex/triangle counts, placeholder-mesh counts, and model mesh
+  validation status. `verify-solid-graph` rejects empty/placeholder model
+  meshes for whole bracket, parametric car, curved primitive, split segment,
+  and connector package paths.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf -- --nocapture`;
+  `cargo check -p boon_3mf -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `three_mf_mesh_vertex_count=2176`,
+  `three_mf_mesh_triangle_count=8280`,
+  `three_mf_placeholder_mesh_object_count=0`,
+  `three_mf_validation_model_mesh_status=true`,
+  `parametric_car_three_mf_mesh_vertex_count=2872`,
+  `parametric_car_three_mf_mesh_triangle_count=10460`,
+  `parametric_car_three_mf_placeholder_mesh_object_count=0`,
+  `parametric_car_three_mf_validation_model_mesh_status=true`,
+  `solid_runtime_curved_three_mf_mesh_vertex_count=6304`,
+  `solid_runtime_curved_three_mf_mesh_triangle_count=12480`, and
+  `solid_runtime_curved_three_mf_placeholder_mesh_object_count=0`.
+- Remaining limits:
+  this is a deterministic layer-prism mesh payload inside the 3MF model entry,
+  not exact CSG/shell mesh generation, not Boolean-unioned watertight manifold
+  proof, and not external 3MF conformance or third-party importer validation.
+
+### 2026-06-24 U9 3MF Model Mesh Reference Validation
+
+- Task:
+  strengthen internal 3MF importer-smoke validation so model mesh evidence is
+  parsed per object instead of accepted from global XML tag counts.
+- Result:
+  keep the slice. `boon_3mf::import_3mf_package_smoke` now parses generated
+  OPC/ZIP package bytes, walks each `<object>` model mesh body, and reports
+  object-local mesh coverage, invalid triangle reference count, and degenerate
+  triangle count. `validate_3mf_package` now exposes
+  `model_mesh_reference_status` and fails when per-object mesh references are
+  missing or invalid. A negative test corrupts one generated triangle reference
+  and proves importer smoke fails with `mesh-triangle-references`.
+  `verify-solid-graph` requires the parsed reference proof for bracket, car,
+  and curved primitive packages; split and connector packages inherit it from
+  `validate_3mf_package`.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf -- --nocapture`;
+  `cargo check -p boon_3mf -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `three_mf_validation_model_mesh_reference_status=true`,
+  `three_mf_importer_smoke_mesh_object_count=2`,
+  `three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  `three_mf_importer_smoke_mesh_degenerate_triangle_count=0`,
+  `parametric_car_three_mf_validation_model_mesh_reference_status=true`,
+  `parametric_car_three_mf_importer_smoke_mesh_object_count=5`,
+  `parametric_car_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  `parametric_car_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`,
+  `solid_runtime_curved_three_mf_validation_model_mesh_reference_status=true`,
+  `solid_runtime_curved_three_mf_importer_smoke_mesh_object_count=3`,
+  `solid_runtime_curved_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  and
+  `solid_runtime_curved_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`.
+- Remaining limits:
+  this is internal parsed package-byte validation of generated model mesh
+  references. It is not external 3MF conformance validation, not third-party
+  importer proof, not exact CSG/shell topology proof, and not a
+  Boolean-unioned watertight manifold proof.
+
+### 2026-06-24 U9 Box-Like Shell Manufacturing Sections
+
+- Task:
+  remove the blanket `SolidOp::Shell` manufacturing rejection for the first
+  honest subset and expose it through the existing Boon constructor-record
+  API, without adding new syntax or claiming general shell support.
+- Result:
+  keep the slice. `SolidModelBundle::shell_box_fixture()` now provides a small
+  authoritative `SolidGraph` fixture with a `Box` child wrapped by
+  `Shell { thickness: 2.0 }`. `Solid/shell(child: ..., thickness: ...)` is now
+  registered in the manufacturing type contract and runtime generic solid
+  constructor lowering path, so Boon source lowers to `SolidOp::Shell` without
+  new syntax. `boon_manufacturing` now sections `Shell(Box|RoundedBox)` into
+  layer polygons directly from the authoritative graph: middle layers preserve
+  the shell cavity as a rectangular hole and top or bottom cap layers remain
+  solid. Invalid thickness and unsupported shell children still produce
+  diagnostics. `verify-solid-graph` now includes the
+  `manufacturing:shell-box-layers-preserve-wall-hole` audit check plus Boon
+  constructor, manufacturing, and 3MF mesh-reference evidence for this shell
+  path.
+- Verification:
+  `cargo fmt -p boon_solid_model -p boon_manufacturing -p xtask`;
+  `cargo test -p boon_solid_model -- --nocapture`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_shell_constructor -- --nocapture`;
+  `cargo check -p boon_manufacturing -p xtask`;
+  `cargo check -p boon_runtime -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_shell_box_status=hollow-layer-shell-pass`,
+  `manufacturing_shell_box_boon_constructor_status=Solid/shell-lowered`,
+  `manufacturing_shell_box_output_root=manufacturing`,
+  `manufacturing_shell_box_layer_count=40`,
+  `manufacturing_shell_box_polygon_count=40`,
+  `manufacturing_shell_box_hole_count=30`,
+  `manufacturing_shell_box_unsupported_operation_count=0`,
+  `manufacturing_shell_box_visual_mesh_used=false`,
+  `manufacturing_shell_box_three_mf_status=Pass`,
+  `manufacturing_shell_box_three_mf_mesh_vertex_count=288`,
+  `manufacturing_shell_box_three_mf_mesh_triangle_count=1080`,
+  `manufacturing_shell_box_three_mf_validation_model_mesh_reference_status=true`,
+  `manufacturing_shell_box_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  and
+  `manufacturing_shell_box_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`.
+- Remaining limits:
+  this is narrow box/rounded-box shell sectioning only. It is not general shell
+  support, not offset-surface shelling, not loft/revolve/sweep shell
+  manufacturing, not final parametric-car shell geometry, not external 3MF
+  conformance validation, and not watertight Boolean-unioned topology proof.
+
+### 2026-06-24 U8/U9 Rectangular Extrude Constructor and Manufacturing Sections
+
+- Task:
+  add the first honest `Solid/extrude` path through Boon constructor lowering,
+  SolidGraph validation, manufacturing layers, and 3MF validation without
+  pretending arbitrary sketch/profile extrusion is implemented.
+- Result:
+  keep the slice. `SolidModelBundle::extruded_rectangle_fixture()` now provides
+  one `SolidOp::Extrude` node backed by a closed rectangular `ProfileSummary`.
+  SolidGraph validation now checks profile references for `Extrude`, `Revolve`,
+  `Sweep`, and `Loft`, plus curve references for `Sweep`. `Solid/extrude` is
+  registered in the manufacturing type contract and runtime generic solid
+  constructor path. Boon source
+  `Solid/extrude(size: [x: ..., y: ..., z: 0], height: ...)` lowers to
+  `SolidOp::Extrude` plus one rectangular profile summary. `boon_manufacturing`
+  sections closed four-segment rectangular profiles into deterministic layer
+  polygons and reports diagnostics for missing, invalid, or non-rectangular
+  profiles. A later U8 visual slice now compiles this same supported
+  rectangular-profile subset into exact retained visual prism meshes.
+  `verify-solid-graph` now includes
+  `manufacturing:extruded-rectangle-profile-layers` and
+  `visual:extruded-rectangle-exact-retained-prism`.
+- Verification:
+  `cargo fmt -p boon_solid_model -p boon_manufacturing -p boon_typecheck -p boon_runtime -p xtask`;
+  `cargo test -p boon_solid_model -- --nocapture`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_extrude_constructor -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_manufacturing -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_extruded_rectangle_status=rectangular-profile-extrude-pass`,
+  `manufacturing_extruded_rectangle_boon_constructor_status=Solid/extrude-lowered`,
+  `manufacturing_extruded_rectangle_output_root=manufacturing`,
+  `manufacturing_extruded_rectangle_profile_count=1`,
+  `manufacturing_extruded_rectangle_layer_count=30`,
+  `manufacturing_extruded_rectangle_polygon_count=30`,
+  `manufacturing_extruded_rectangle_hole_count=0`,
+  `manufacturing_extruded_rectangle_unsupported_operation_count=0`,
+  `manufacturing_extruded_rectangle_visual_mesh_used=false`,
+  `manufacturing_extruded_rectangle_three_mf_status=Pass`,
+  `manufacturing_extruded_rectangle_three_mf_mesh_vertex_count=124`,
+  `manufacturing_extruded_rectangle_three_mf_mesh_triangle_count=360`,
+  `manufacturing_extruded_rectangle_three_mf_validation_model_mesh_reference_status=true`,
+  `manufacturing_extruded_rectangle_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  and
+  `manufacturing_extruded_rectangle_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`.
+  A later report also records
+  `visual_extruded_rectangle_status=exact-retained-prism-pass`,
+  `visual_extruded_rectangle_exact_mesh_count=1`,
+  `visual_extruded_rectangle_generated_vertex_count=8`,
+  `visual_extruded_rectangle_generated_index_count=36`, and
+  `visual_extruded_rectangle_manufacturing_mesh_used=false`.
+- Remaining limits:
+  this is rectangular-profile extrude only. It is not arbitrary profile
+  sketching, not holes in extruded profiles, not revolve/sweep/loft, not
+  adaptive visual meshing for extrudes, not final parametric-car geometry, not
+  external 3MF conformance validation, and not watertight Boolean-unioned
+  topology proof.
+
+### 2026-06-24 U8/U9 Rectangular Radial Revolve Constructor and Manufacturing Sections
+
+- Task:
+  add the first honest `Solid/revolve` path through Boon constructor lowering,
+  SolidGraph validation, manufacturing annulus layers, and 3MF validation
+  without pretending arbitrary sketch/profile revolve is implemented.
+- Result:
+  keep the slice. `SolidModelBundle::revolved_ring_fixture()` now provides one
+  `SolidOp::Revolve` node backed by a closed rectangular radial
+  `ProfileSummary`. `Solid/revolve` is registered in the manufacturing type
+  contract and runtime generic solid constructor path. Boon source
+  `Solid/revolve(inner_radius: ..., outer_radius: ..., height: ...)` lowers to
+  `SolidOp::Revolve` plus one rectangular radial profile summary.
+  `boon_manufacturing` sections the default-Z-axis closed four-segment radial
+  rectangle into deterministic annulus layers and reports diagnostics for
+  missing profiles, non-Z axes, invalid radii, or arbitrary profiles.
+  `verify-solid-graph` now includes
+  `manufacturing:revolved-ring-profile-layers`. `xtask` also now uses
+  `#![recursion_limit = "4096"]` because the unified solid-graph report JSON
+  literal exceeded the old macro expansion limit; the report semantics are
+  unchanged, but a later cleanup should split that large report into smaller
+  helper maps.
+- Verification:
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract -- --nocapture`;
+  `cargo test -p boon_solid_model -- --nocapture`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_revolve_constructor -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_manufacturing -p xtask`;
+  `cargo fmt --check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_revolved_ring_status=rectangular-radial-profile-revolve-pass`,
+  `manufacturing_revolved_ring_boon_constructor_status=Solid/revolve-lowered`,
+  `manufacturing_revolved_ring_output_root=manufacturing`,
+  `manufacturing_revolved_ring_validation_status=Pass`,
+  `manufacturing_revolved_ring_profile_count=1`,
+  `manufacturing_revolved_ring_layer_count=30`,
+  `manufacturing_revolved_ring_polygon_count=30`,
+  `manufacturing_revolved_ring_hole_count=30`,
+  `manufacturing_revolved_ring_unsupported_operation_count=0`,
+  `manufacturing_revolved_ring_visual_mesh_used=false`,
+  `manufacturing_revolved_ring_three_mf_status=Pass`,
+  `manufacturing_revolved_ring_three_mf_mesh_vertex_count=1984`,
+  `manufacturing_revolved_ring_three_mf_mesh_triangle_count=7680`,
+  `manufacturing_revolved_ring_three_mf_validation_model_mesh_reference_status=true`,
+  `manufacturing_revolved_ring_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  and
+  `manufacturing_revolved_ring_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`.
+- Remaining limits:
+  this is rectangular radial revolve only. It is not arbitrary sketch/profile
+  revolve, not non-Z axis revolve, not sweep/loft, not exact CSG/adaptive visual
+  meshing for revolves, not final parametric-car tire/rim geometry, not
+  external 3MF conformance validation, and not watertight Boolean-unioned
+  topology proof.
+
+### 2026-06-24 U8/U9 Two-Rectangle Loft Constructor and Manufacturing Sections
+
+- Task:
+  add the first honest `Solid/loft` path through Boon constructor lowering,
+  SolidGraph validation, manufacturing interpolated profile layers, and 3MF
+  validation without pretending arbitrary sketch/profile lofting is implemented.
+- Result:
+  keep the slice. `SolidModelBundle::lofted_rectangle_fixture()` now provides
+  one `SolidOp::Loft` node backed by two closed rectangular `ProfileSummary`
+  values. `Solid/loft` is registered in the manufacturing type contract and
+  runtime generic solid constructor path. Boon source
+  `Solid/loft(bottom_size: ..., top_size: ..., height: ...)` lowers to
+  `SolidOp::Loft` plus two rectangular profile summaries. `boon_manufacturing`
+  sections exactly two closed four-segment rectangular profiles at increasing Z
+  positions by linearly interpolating profile bounds for each layer. Missing
+  profiles, invalid profile bounds, unsupported profile shapes, more/fewer than
+  two profiles, and non-increasing profile Z positions produce diagnostics.
+  A duplicate `Solid/revolve` profile-shape validation block was removed while
+  touching the same sectioning code. `verify-solid-graph` now includes
+  `manufacturing:lofted-rectangle-profile-layers`.
+- Verification:
+  `cargo test -p boon_solid_model lofted_rectangle_fixture_keeps_two_profile_references_printable -- --nocapture`;
+  `cargo test -p boon_manufacturing lofted_rectangle_compiles_to_interpolated_profile_layers_without_visual_meshes -- --nocapture`;
+  `cargo test -p boon_runtime manufacturing_output_lowers_loft_constructor -- --nocapture`;
+  `cargo test -p boon_typecheck manufacturing_root_uses_solid_contract -- --nocapture`;
+  `cargo fmt -p boon_solid_model -p boon_manufacturing -p boon_typecheck -p boon_runtime -p xtask`;
+  `cargo test -p boon_solid_model -- --nocapture`;
+  `cargo test -p boon_manufacturing -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_manufacturing -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `manufacturing_lofted_rectangle_status=two-rectangle-profile-loft-pass`,
+  `manufacturing_lofted_rectangle_boon_constructor_status=Solid/loft-lowered`,
+  `manufacturing_lofted_rectangle_output_root=manufacturing`,
+  `manufacturing_lofted_rectangle_validation_status=Pass`,
+  `manufacturing_lofted_rectangle_profile_count=2`,
+  `manufacturing_lofted_rectangle_layer_count=30`,
+  `manufacturing_lofted_rectangle_polygon_count=30`,
+  `manufacturing_lofted_rectangle_hole_count=0`,
+  `manufacturing_lofted_rectangle_unsupported_operation_count=0`,
+  `manufacturing_lofted_rectangle_visual_mesh_used=false`,
+  `manufacturing_lofted_rectangle_three_mf_status=Pass`,
+  `manufacturing_lofted_rectangle_three_mf_mesh_vertex_count=240`,
+  `manufacturing_lofted_rectangle_three_mf_mesh_triangle_count=360`,
+  `manufacturing_lofted_rectangle_three_mf_validation_model_mesh_reference_status=true`,
+  `manufacturing_lofted_rectangle_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  and
+  `manufacturing_lofted_rectangle_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`.
+- Remaining limits:
+  this is two-rectangle-profile loft only. It is not arbitrary sketch/profile
+  lofting, not multi-section lofting, not twist/guide-curve lofting, not sweep,
+  not exact CSG/adaptive visual meshing for lofts, not final parametric-car
+  body geometry, not external 3MF conformance validation, and not watertight
+  Boolean-unioned topology proof.
+
+### 2026-06-24 U10 Hidden Rich Parametric Car Example
+
+- Task:
+  connect the newly supported loft/revolve/shell constructors to an actual
+  Boon-facing 3D car example without destabilizing the older supported-subset
+  `parametric_car_3d` gates.
+- Result:
+  keep the slice. Added hidden manifest entry `parametric_car_rich_3d` plus
+  `examples/parametric_car_rich_3d/RUN.bn`,
+  `examples/parametric_car_rich_3d.scn`, and
+  `examples/parametric_car_rich_3d.budget.toml`. The rich example uses a
+  lofted printable body, one revolved printable wheel prototype reused by four
+  wheel instances, and shell-based visual-only windows/cabin. `verify-solid-graph`
+  now checks manifest registration, generic runtime lowering, loft/revolve/shell
+  constructor presence, profile count, manufacturing compile output, 3MF
+  export/validation/importer smoke, and visual proxy honesty. The visual proxy
+  now reports `retained-exact-primitive-mesh-no-csg` and
+  `exact_mesh_count=3` for this richer example after the later shell visual
+  mesh slice: the supported loft, revolve, and box-like shell roots use exact
+  retained meshes.
+- Verification:
+  `cargo fmt -p xtask -p boon_runtime`;
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model revolved_ring_visual_proxy_uses_exact_retained_annulus_mesh -- --nocapture`;
+  `cargo test -p boon_scene_model lofted_rectangle_visual_proxy_uses_exact_retained_tapered_mesh -- --nocapture`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo check -p boon_scene_model -p xtask`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_rich_status=loft-revolve-shell-generic-manufacturing-output-pass`,
+  `parametric_car_rich_shown_by_default=false`,
+  `parametric_car_rich_has_loft=true`,
+  `parametric_car_rich_has_revolve=true`,
+  `parametric_car_rich_has_shell=true`,
+  `parametric_car_rich_profile_count=3`,
+  `parametric_car_rich_part_count=3`,
+  `parametric_car_rich_instance_count=6`,
+  `parametric_car_rich_printable_part_count=2`,
+  `parametric_car_rich_visual_only_part_count=1`,
+  `parametric_car_rich_shared_wheel_instance_count=4`,
+  `parametric_car_rich_manufacturing_status=Pass`,
+  `parametric_car_rich_manufacturing_layer_count=47`,
+  `parametric_car_rich_manufacturing_polygon_count=125`,
+  `parametric_car_rich_manufacturing_hole_count=80`,
+  `parametric_car_rich_manufacturing_unsupported_operation_count=0`,
+  `parametric_car_rich_visual_mesh_used_for_manufacturing=false`,
+  `parametric_car_rich_three_mf_status=Pass`,
+  `parametric_car_rich_three_mf_validation_model_mesh_reference_status=true`,
+  `parametric_car_rich_three_mf_importer_smoke_mesh_invalid_triangle_reference_count=0`,
+  `parametric_car_rich_three_mf_importer_smoke_mesh_degenerate_triangle_count=0`,
+  `parametric_car_rich_visual_proxy_status=retained-exact-primitive-mesh-no-csg`,
+  and
+  `parametric_car_rich_visual_exact_mesh_count=3`.
+- Remaining limits:
+  this is a richer checked-in example and verifier target, not the final car.
+  It does not add rotations for physically oriented wheels, exact shell visual
+  meshing beyond box-like shell roots, adaptive/general loft or revolve visual
+  meshing, Boolean wheel wells/cutouts, integrated clearance/wall-thickness
+  over exact geometry, browser rendering parity, external 3MF conformance
+  validation, or Boolean-unioned watertight topology proof.
+
+### 2026-06-24 U8 Exact Retained Profile Meshes for Revolve and Loft
+
+- Task:
+  reduce visual fallback for the richer SolidGraph constructors without
+  changing manufacturing authority or adding a parallel renderer.
+- Result:
+  keep the slice. `WorldScene::visual_proxy_with_chunks_from_solid_model` now
+  passes the authoritative `SolidGraph` into the root mesh dispatcher so profile
+  summaries can drive retained visual meshes. Supported rectangular radial
+  `SolidOp::Revolve` roots now produce exact retained annulus meshes. Supported
+  two-rectangle `SolidOp::Loft` roots now produce exact retained tapered meshes.
+  Unsupported profile shapes still fall back to bounds meshes and are not
+  reported as exact. A later shell visual mesh slice supersedes the original
+  shell fallback for box-like shell roots. The hidden rich car now proves three
+  exact retained visual meshes after the shell slice while manufacturing still
+  reports `visual_mesh_used_for_manufacturing=false`.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model revolved_ring_visual_proxy_uses_exact_retained_annulus_mesh -- --nocapture`;
+  `cargo test -p boon_scene_model lofted_rectangle_visual_proxy_uses_exact_retained_tapered_mesh -- --nocapture`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo check -p boon_scene_model -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_rich_visual_proxy_status=retained-exact-primitive-mesh-no-csg`,
+  `parametric_car_rich_visual_exact_mesh_count=3`,
+  `parametric_car_rich_visual_generated_mesh_count=3`,
+  `parametric_car_rich_visual_proxy_geometry_count=3`,
+  `parametric_car_rich_visual_proxy_shared_geometry_instance_count=4`, and
+  `parametric_car_rich_visual_mesh_used_for_manufacturing=false`.
+- Remaining limits:
+  this is exact visual meshing for the same narrow supported rectangular
+  profile subsets used by the manufacturing slices. It is not arbitrary
+  profile/sketch visual meshing, not shell visual meshing beyond the later
+  box-like shell slice, not Boolean/CSG visual meshing, not adaptive surface
+  error control, not browser rendering parity, and not manufacturing authority.
+
+### 2026-06-24 U8 Exact Retained Box-Like Shell Visual Mesh
+
+- Task:
+  remove the rich car shell visual fallback for the supported box-like shell
+  subset without allowing visual meshes to become manufacturing authority.
+- Result:
+  keep the slice. `WorldScene::visual_proxy_with_chunks_from_solid_model` now
+  recognizes supported `SolidOp::Shell` roots whose child is `Box` or
+  `RoundedBox`. Those roots generate a retained hollow-box mesh with an outer
+  box surface and reversed-normal inner box surface. Invalid thickness or
+  unsupported shell children still fall back to bounds meshes and are not
+  reported as exact. `verify-solid-graph` now requires the hidden
+  `parametric_car_rich_3d` visual proxy to report exact meshes for supported
+  loft, revolve, and box-like shell roots.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model box_like_shell_visual_proxy_uses_exact_retained_hollow_mesh -- --nocapture`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `manufacturing_shell_box_status=hollow-layer-shell-pass`,
+  `manufacturing_shell_box_visual_mesh_used=false`,
+  `parametric_car_rich_visual_proxy_status=retained-exact-primitive-mesh-no-csg`,
+  `parametric_car_rich_visual_exact_mesh_count=3`,
+  `parametric_car_rich_visual_generated_mesh_count=3`, and
+  `parametric_car_rich_visual_mesh_used_for_manufacturing=false`.
+- Remaining limits:
+  this is exact retained visual meshing only for shell roots over box-like
+  children. It is not general shelling, not exact rounded-corner shell geometry,
+  not CSG/Boolean visual meshing, not adaptive surface error control, not
+  browser/native visual parity proof, and not manufacturing authority.
+
+### 2026-06-24 U8 Exact Retained Rectangular Extrude Visual Mesh
+
+- Task:
+  remove visual fallback for the same rectangular-profile `Solid/extrude`
+  subset already supported by generic Boon lowering and manufacturing.
+- Result:
+  keep the slice. `WorldScene::visual_proxy_with_chunks_from_solid_model` now
+  recognizes supported `SolidOp::Extrude` roots whose profile is one closed
+  four-segment rectangle and whose height/root Z bounds are finite. Those roots
+  generate retained prism meshes from profile X/Y bounds and authoritative root
+  Z bounds. Unsupported profiles or invalid height still fall back to bounds
+  meshes and are not reported as exact. `verify-solid-graph` now requires the
+  generic Boon `Solid/extrude` fixture to pass exact retained visual prism
+  checks in addition to manufacturing/3MF checks.
+- Verification:
+  `cargo fmt -p boon_scene_model`;
+  `cargo test -p boon_scene_model extruded_rectangle_visual_proxy_uses_exact_retained_prism_mesh -- --nocapture`;
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_extruded_rectangle_status=exact-retained-prism-pass`,
+  `visual_extruded_rectangle_exact_mesh_count=1`,
+  `visual_extruded_rectangle_generated_vertex_count=8`,
+  `visual_extruded_rectangle_generated_index_count=36`,
+  `visual_extruded_rectangle_manufacturing_mesh_used=false`, and
+  `manufacturing_extruded_rectangle_visual_mesh_used=false`.
+- Remaining limits:
+  this is exact retained visual meshing only for rectangular-profile extrudes.
+  It is not arbitrary profile/sketch visual meshing, not extruded holes, not
+  sweep, not CSG/Boolean visual meshing, not adaptive surface error control, not
+  browser/native visual parity proof, and not manufacturing authority.
+
+### 2026-06-24 U8 Adaptive Retained RoundedBox Visual Mesh
+
+- Task:
+  add an honest retained visual path for `Solid/rounded_box` without pretending
+  the approximation is exact or manufacturing-authoritative.
+- Result:
+  keep the slice. The visual compiler now has exact/adaptive/proxy mesh
+  classification instead of an exact/bounds boolean. `SolidOp::RoundedBox`
+  roots compile to retained rounded-box prism meshes with tolerance class
+  `adaptive-rounded-box` and a nonzero error bound derived from the corner
+  segment approximation. Unsupported rounded boxes still fall back to proxy
+  bounds. The supported-subset parametric car now reports one exact
+  wheel-cylinder mesh and two adaptive rounded-box chunks for body/windows.
+  `verify-solid-graph` now includes
+  `visual:rounded-box-adaptive-retained-mesh` through the generic Boon
+  `Solid/rounded_box` constructor path.
+- Verification:
+  `cargo fmt -p boon_scene_model`;
+  `cargo test -p boon_scene_model rounded_box_visual_proxy_uses_adaptive_retained_mesh_not_exact_claim -- --nocapture`;
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_rounded_box_status=adaptive-retained-rounded-box-pass`,
+  `visual_rounded_box_exact_mesh_count=0`,
+  `visual_rounded_box_adaptive_chunk_count=1`,
+  `visual_rounded_box_generated_vertex_count=52`,
+  `visual_rounded_box_generated_index_count=300`,
+  `visual_rounded_box_error_bound=0.025665415878568854`,
+  `visual_rounded_box_manufacturing_mesh_used=false`,
+  `parametric_car_visual_exact_mesh_count=1`, and
+  `parametric_car_visual_adaptive_chunk_count=2`.
+- Remaining limits:
+  this is a bounded vertical rounded-rectangle prism approximation. It is not a
+  full exact 3D rounded-box/signed-distance/B-rep evaluator, not adaptive LOD
+  splitting by projected screen error, not CSG/Boolean visual meshing, not
+  browser/native visual parity proof, and not manufacturing authority.
+
+### 2026-06-24 U8 Visual Proxy Bounds Fallback Accounting
+
+- Task:
+  tighten visual report honesty after exact and adaptive mesh coverage
+  increased.
+- Result:
+  keep the slice. Added `proxy_bounds_chunk_count` to
+  `SolidVisualCompileReport` while preserving `proxy_mesh_count` as the legacy
+  total visual proxy geometry count. Visual compiler status strings now
+  distinguish exact-only, adaptive-only, proxy-bounds-only, exact+adaptive,
+  exact+bounds, adaptive+bounds, and exact+adaptive+bounds outputs. Scene-model
+  tests and `verify-solid-graph` now fail if exact/adaptive fixtures silently
+  reintroduce bounds fallback.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_compiler_status=retained-generated-bounds-mesh-no-csg`,
+  `visual_proxy_bounds_chunk_count=1`,
+  `visual_exact_mesh_count=0`, `visual_adaptive_chunk_count=0`,
+  `visual_extruded_rectangle_status=exact-retained-prism-pass`,
+  `visual_extruded_rectangle_proxy_bounds_chunk_count=0`,
+  `visual_rounded_box_status=adaptive-retained-rounded-box-pass`,
+  `visual_rounded_box_proxy_bounds_chunk_count=0`,
+  `parametric_car_visual_proxy_bounds_chunk_count=0`,
+  `parametric_car_rich_visual_proxy_status=retained-exact-primitive-mesh-no-csg`,
+  and `parametric_car_rich_visual_proxy_bounds_chunk_count=0`.
+- Remaining limits:
+  this is report and gate honesty, not new geometry coverage. The original
+  printable-bracket CSG visual proxy still honestly reports one proxy-bounds
+  fallback chunk. CSG/Boolean visual meshing, adaptive LOD splitting, and
+  native/browser visual parity remain open.
+
+### 2026-06-24 U8 Translation-Only Transform Visual Mesh Reuse
+
+- Task:
+  remove the next visual fallback under supported transform nodes without
+  introducing Boon-level workarounds or claiming general CSG/transform support.
+- Result:
+  keep the slice. `SolidOp::Transform` now compiles translation-only transforms
+  by compiling the child visual mesh and translating retained vertex positions.
+  The child quality classification is preserved, so adaptive rounded-box
+  children remain `adaptive-rounded-box` instead of degrading to bounds
+  fallback. Unsupported transforms still use the honest proxy-bounds path.
+  `verify-solid-graph` now includes
+  `visual:translated-rounded-box-preserves-adaptive-mesh` through generic Boon
+  source using `Solid/translate(child: Solid/rounded_box(...), by: ...)`.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model translated_rounded_box_visual_proxy_preserves_adaptive_mesh_quality -- --nocapture`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `cargo check -p boon_scene_model -p xtask`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_translated_rounded_box_status=translated-adaptive-retained-rounded-box-pass`,
+  `visual_translated_rounded_box_adaptive_chunk_count=1`,
+  `visual_translated_rounded_box_proxy_bounds_chunk_count=0`,
+  `visual_translated_rounded_box_generated_vertex_count=52`,
+  `visual_translated_rounded_box_generated_index_count=300`,
+  `visual_translated_rounded_box_error_bound=0.025665415878568854`, and
+  `visual_translated_rounded_box_manufacturing_mesh_used=false`.
+- Remaining limits:
+  this is translation-only transform reuse. It does not handle rotation, scale,
+  skew, transform composition, Union/Difference/Intersection visual meshing,
+  exact CSG, adaptive projected-error LOD, native/web visual parity, or
+  manufacturing geometry. The original printable bracket still honestly reports
+  one proxy-bounds chunk because its root is CSG `Difference`.
+
+### 2026-06-24 U8 Printable Bracket CSG-Subset Visual Mesh
+
+- Task:
+  remove the original printable-bracket root bounds visual fallback while
+  keeping the report honest that this is not full arbitrary Boolean CSG.
+- Result:
+  keep the slice. `SolidVisualCompileReport` now includes
+  `csg_subset_chunk_count`, and the visual compiler has a
+  `csg-subset-composite` quality class with status
+  `retained-csg-subset-composite-mesh-no-full-csg`. The supported path handles
+  base prisms made from `Box`, `RoundedBox`, translation-only `Transform`, and
+  `Union`, then turns vertical cylinder tools into through-hole rings. Caps are
+  triangulated with `earcutr`, and outer/hole walls are emitted as retained
+  indexed mesh geometry. The printable bracket now renders as a composite mesh
+  instead of an 8-vertex bounds cube, while manufacturing still comes only from
+  the authoritative SolidGraph/manufacturing compiler path.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model solid_model_visual_proxy_preserves_shared_geometry_and_identity -- --nocapture`;
+  `cargo test -p boon_scene_model -- --nocapture`;
+  `cargo build -p xtask`;
+  `cargo fmt --check -p boon_scene_model -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `cargo check -p boon_scene_model -p xtask`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `visual_compiler_status=retained-csg-subset-composite-mesh-no-full-csg`,
+  `visual_generated_vertex_count=1080`,
+  `visual_generated_index_count=1080`,
+  `visual_exact_mesh_count=0`,
+  `visual_adaptive_chunk_count=0`,
+  `visual_csg_subset_chunk_count=1`,
+  `visual_proxy_bounds_chunk_count=0`, and
+  `visual_mesh_used_for_manufacturing=false`.
+- Remaining limits:
+  this is a supported CSG-subset composite visual mesh for extruded
+  box/rounded-box/union bases with vertical cylinder through-holes. It is not
+  arbitrary Union/Difference/Intersection/SmoothUnion CSG, not exact
+  overlapping-surface removal between base and upright, not adaptive
+  projected-error LOD, not native/web visual parity, and not manufacturing
+  authority.
+
+### 2026-06-24 U7 Native WGPU Retained Mesh Verifier Derives Counts
+
+- Task:
+  keep the native retained 3D verifier aligned with actual retained mesh
+  payloads after visual mesh quality changes upstream.
+- Result:
+  keep the slice. `verify-native-gpu-world-scene` no longer hardcodes the
+  parametric-car retained mesh vertex/index totals. It derives expected totals
+  from visible world instances and the retained `SurfaceChunk` payload for each
+  instance geometry, while keeping the app-owned WGPU indexed mesh, depth,
+  normal, feature readback, and hit-test checks strict.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_status=app-owned-retained-chunk-mesh-depth-feature-readback-pass`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_geometry_source=solid-visual-retained-surface-chunks`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_count=6`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_vertex_count=368`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_index_count=2136`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_vertex_count=368`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_index_count=2136`,
+  `native_gpu_world_scene_parametric_car_mesh_hit_test_status=app-owned-retained-mesh-feature-hit-test-pass`,
+  `native_gpu_world_scene_mesh_camera_orbit_status=app-owned-mesh-camera-orbit-readback-pass`,
+  and `native_web_3d_parity_status=not-covered-by-this-report`.
+- Remaining limits:
+  this is native verifier hardening only. It does not prove browser WebGPU
+  capture/parity, headed manual orbit behavior, full retained 3D renderer
+  completeness, or general CSG.
+
+### 2026-06-24 U6/U7 Native-Web Retained Mesh Contract
+
+- Task:
+  strengthen the shared native/browser renderer contract for retained 3D mesh
+  payloads without claiming browser WebGPU execution.
+- Result:
+  keep the slice. `WorldSceneWebGpuRenderContract` now records the retained
+  `SurfaceChunk` indexed-mesh payload shape: source, representation, identity
+  fields, vertex position format, normal format, split 64-bit feature-id
+  encoding, index type, and copy-dst upload path. The
+  `verify-native-web-render-contract` gate compiles the generic SolidGraph
+  parametric car visual scene and verifies its real retained chunk payloads
+  against that contract, while still reporting browser rendering and parity as
+  not implemented/not executed.
+- Verification:
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `cargo fmt --check -p boon_native_gpu -p xtask`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `cargo check -p boon_native_gpu -p xtask`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-contract.json` reports
+  `status=pass`,
+  `native_web_render_contract_status=webgpu-compatible-contract-pass`,
+  `browser_webgpu_visual_parity_status=not-implemented-not-executed`,
+  `browser_render_executed=false`,
+  `native_web_retained_surface_chunk_contract_status=retained-surface-chunk-indexed-mesh-contract-pass`,
+  `native_web_retained_surface_chunk_count=3`,
+  `native_web_retained_surface_chunk_identity_count=3`,
+  `native_web_retained_surface_chunk_vertex_count=170`,
+  `native_web_retained_surface_chunk_index_count=984`,
+  `native_web_retained_surface_chunk_index_multiple_of_three=true`,
+  `native_web_retained_surface_chunk_tolerance_classes=[adaptive-rounded-box, exact-primitive]`,
+  `native_web_retained_surface_chunk_manufacturing_mesh_used=false`,
+  `native_web_render_contract.retained_mesh_payload=SurfaceRepresentation::IndexedMesh`,
+  and
+  `native_web_render_contract.retained_mesh_feature_id_encoding=FeatureId-u64-split-low-high-Rgba8Unorm-targets`.
+  A later U6/U7 slice now adds the minimal `boon_web_host` source artifact and
+  changes `target/reports/native-gpu/browser-artifact-budget.json` from the
+  earlier no-host guardrail into a measured source-artifact budget gate.
+- Remaining limits:
+  this is a stronger static contract plus real retained payload compatibility
+  check. It is not browser WebGPU render, screenshot/readback parity, generated
+  WASM/startup measurement, or live browser IME/DOM integration.
+
+### 2026-06-24 U6/U7 Browser WebGPU Host Source Artifact
+
+- Task:
+  add the first browser WebGPU host source artifact and budget it without
+  claiming browser execution.
+- Result:
+  keep the slice. Added `boon_web_host` with a serializable
+  `WebHostArtifactManifest`, plus `static/index.html` and
+  `static/world_scene_host.js`. The browser visual surface is a single WebGPU
+  canvas; DOM is limited to a semantic bridge and does not mirror visual
+  primitives. Added `WebRetainedScenePacket` to wrap the shared `WorldScene`
+  and retained `SurfaceChunk` payloads for the browser host while recording
+  counts and `browser_render_executed=false`. The packet declares the serde
+  externally tagged `SurfaceRepresentation` encoding and supported
+  representation tags, and the browser host JS validates that encoded shape
+  instead of treating `representation` as a string.
+  Added a source-only browser `WORLD_SCENE_PIPELINE_CONTRACT` and
+  `WebWorldScenePipelineContract` for the shared WebGPU world-scene pipeline:
+  shader entry points, vertex stride/attributes, camera uniform size, topology,
+  index/depth/feature/normal formats, buffer/texture usages, and no native-only
+  feature use.
+  Added `WebRetainedSceneUploadPlan` and JS
+  `planRetainedSceneUpload(...)`, deriving exact vertex/index/uniform upload
+  byte counts and draw counts from the retained packet plus shared pipeline
+  contract while recording `browser_upload_executed=false`.
+  Added `WebBrowserRenderSourceContract` plus browser JS
+  `createRetainedWorldSceneRenderer(...)`, `renderRetainedWorldScene(...)`,
+  and `packRetainedWorldScene(...)`. The source path packs retained
+  `SurfaceChunk::IndexedMesh` payloads into the shared 80-byte vertex layout,
+  creates a WebGPU pipeline, uploads vertex/index/camera buffers with
+  `queue.writeBuffer`, draws with `drawIndexed`, and allocates app-owned
+  normal/feature/feature-high/depth targets. The verifier still records
+  `browser_render_executed=false` and `browser_capture_executed=false`.
+  `verify-native-web-render-contract` now verifies the source artifact,
+  retained scene packet serialization, and retained packet schema support in
+  the JS source, browser host pipeline contract parity with the authoritative
+  native contract, retained upload-plan support in the JS source, retained
+  renderer-source support in the JS source, and `verify-browser-artifact-budget`
+  now enforces a real source byte budget.
+  `verify-native-web-render-parity` now sees
+  `browser_host_status=present` but still fails honestly until browser
+  render/readback, browser capture, and native/browser comparison exist.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p boon_web_host -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`
+  returned expected blocker exit `1`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-contract.json` reports
+  `status=pass`,
+  `native_web_render_contract_status=webgpu-compatible-contract-pass`,
+  `browser_host_source_status=source-artifact-contract-pass`,
+  `browser_host_static_source_bytes=21758`,
+  `browser_host_retained_packet_schema_status=retained-packet-schema-pass`,
+  `browser_host_retained_packet_schema_encoding=serde-externally-tagged-SurfaceRepresentation`,
+  `browser_host_retained_packet_schema_supported_tags=[IndexedMesh, IndexedMeshSummary, DirectedDualGridSummary]`,
+  `browser_host_pipeline_contract_status=source-pipeline-contract-pass`,
+  `browser_host_pipeline_contract_vertex_stride_bytes=80`,
+  `browser_host_pipeline_contract_camera_uniform_size_bytes=64`,
+  `browser_host_pipeline_contract_index_format=Uint32`,
+  `browser_host_pipeline_contract_depth_format=Depth32Float`,
+  `browser_host_pipeline_contract_required_features=[]`,
+  `browser_host_pipeline_contract_uses_native_only_features=false`,
+  `browser_host_retained_upload_plan_status=retained-upload-plan-pass`,
+  `browser_host_retained_upload_plan_vertex_buffer_bytes=13600`,
+  `browser_host_retained_upload_plan_index_buffer_bytes=3936`,
+  `browser_host_retained_upload_plan_camera_uniform_bytes=64`,
+  `browser_host_retained_upload_plan_total_upload_bytes=17600`,
+  `browser_host_retained_upload_plan_draw_count=3`,
+  `browser_host_retained_upload_plan_uses_copy_dst_uploads=true`,
+  `browser_host_retained_upload_plan_browser_upload_executed=false`,
+  `browser_host_renderer_source_status=retained-webgpu-renderer-source-pass`,
+  `browser_host_renderer_source_color_target_count=4`,
+  `browser_host_renderer_source_depth_target_format=Depth32Float`,
+  `browser_host_renderer_source_normal_target_format=Rgba8Unorm`,
+  `browser_host_renderer_source_feature_target_format=Rgba8Unorm`,
+  `browser_host_renderer_source_feature_high_target_format=Rgba8Unorm`,
+  `browser_host_renderer_source_uses_queue_write_buffer=true`,
+  `browser_host_renderer_source_uses_draw_indexed=true`,
+  `browser_host_renderer_source_uses_app_owned_readback_targets=true`,
+  `browser_host_renderer_source_browser_upload_executed=false`,
+  `browser_host_renderer_source_browser_render_executed=false`,
+  `browser_host_renderer_source_browser_capture_executed=false`,
+  and
+  `native_web_retained_scene_packet_status=retained-scene-packet-serialization-pass`.
+  The same report records retained scene packet schema/count facts:
+  `native_web_retained_scene_packet_schema_version=1`,
+  `native_web_retained_scene_packet_surface_representation_encoding=serde-externally-tagged-SurfaceRepresentation`,
+  `native_web_retained_scene_packet_chunk_count=3`,
+  `native_web_retained_scene_packet_indexed_mesh_chunk_count=3`,
+  `native_web_retained_scene_packet_vertex_count=170`,
+  `native_web_retained_scene_packet_index_count=984`,
+  `native_web_retained_scene_packet_json_bytes=19788`, and
+  `native_web_retained_scene_packet_browser_render_executed=false`.
+  The contract report still records
+  `browser_webgpu_visual_parity_status=not-implemented-not-executed`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`,
+  `browser_artifact_budget_status=browser-host-source-budget-pass`,
+  `browser_host_status=source-host-present`,
+  `browser_artifact_bytes=21758`,
+  `browser_source_budget_bytes=32000`, and
+  `browser_visual_parity_status=not-implemented-not-executed`.
+  `target/reports/native-gpu/native-web-render-parity.json` remains the
+  expected blocker with `status=fail`,
+  `native_web_render_parity_status=browser-webgpu-parity-not-implemented`,
+  `browser_host_status=present`,
+  `browser_render_executed=false`,
+  `browser_capture_status=missing`, and
+  `native_browser_comparison_status=missing`.
+- Remaining limits:
+  this is browser host source scaffolding, retained-packet serialization,
+  source-side upload planning, renderer source implementation, and source-byte
+  budgeting only. It is
+  not a generated WASM/JS bundle budget, browser startup measurement, browser
+  WebGPU buffer upload/draw/readback, native-vs-browser image comparison, live
+  browser accessibility/IME integration, or native/browser visual parity.
+
+### 2026-06-24 U6/U7 Native-Web Render Parity Blocker Gate
+
+- Task:
+  add the missing named browser parity gate from the unified plan without
+  conflating static native-web contract checks with real browser WebGPU
+  evidence.
+- Result:
+  keep the slice. `verify-native-web-render-parity` is now a standalone
+  `xtask` command with report path
+  `target/reports/native-gpu/native-web-render-parity.json`. The gate is an
+  intentional blocker-audit report: it now finds the browser WebGPU host source
+  artifact, but still requires executed browser render/readback, browser
+  capture report, and native-vs-browser captured-frame comparison before parity
+  can pass. The command is included in
+  the report-schema failing-blocker allowlist, so `status=fail` is
+  schema-valid. It is not part of `verify-native-gpu-all`, which remains the
+  native-only handoff aggregate from `docs/architecture/NATIVE_GPU_PIPELINE.md`.
+- Verification:
+  `cargo fmt -p boon_report_schema -p xtask`;
+  `cargo build -p boon_report_schema -p xtask`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`
+  returned expected blocker exit `1`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=fail`,
+  `exit_status=1`,
+  `native_web_render_parity_status=browser-webgpu-parity-not-implemented`,
+  `browser_host_status=present`,
+  `browser_render_executed=false`,
+  `browser_capture_status=missing`,
+  `native_browser_comparison_status=missing`,
+  and
+  `native_capture_status=app-owned-retained-chunk-mesh-depth-feature-readback-pass`.
+- Remaining limits:
+  this is a guardrail and readiness blocker only. It does not implement the
+  browser host, browser artifact budget, browser capture/readback,
+  DOM/IME/accessibility bridge, or visual-diff comparison.
+
+### 2026-06-24 U9 Standalone Manufacturing Slices Gate
+
+- Task:
+  add the named `verify-manufacturing-slices` gate from the unified plan as a
+  focused authoritative layer-slice verifier, separate from the broader
+  `verify-solid-graph` gate.
+- Result:
+  keep the slice. `verify-manufacturing-slices` is now an advertised `xtask`
+  command with report path
+  `target/reports/unified/manufacturing-slices.json`. It compiles real
+  `boon_manufacturing` outputs from authoritative `SolidGraph`/`AssemblyGraph`
+  fixtures for bracket, curved primitives, shell box, extrude, revolve, loft,
+  and parametric car cases. It verifies deterministic artifact hashes,
+  tolerance flags, layer/polygon/hole metrics, selected printable-instance
+  scope, visual-only selected-instance rejection, negative diagnostics, and
+  split/connector layer outputs.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-manufacturing-slices --report target/reports/unified/manufacturing-slices.json`;
+  `cargo fmt --check -p xtask`;
+  `target/debug/xtask verify-report-schema target/reports/unified/manufacturing-slices.json`.
+- Report:
+  `target/reports/unified/manufacturing-slices.json` reports
+  `status=pass`,
+  `manufacturing_slices_status=authoritative-layer-slices-pass`,
+  `manufacturing_positive_case_count=7`,
+  `manufacturing_negative_case_count=4`,
+  `manufacturing_total_layer_count=332`,
+  `manufacturing_total_polygon_count=585`,
+  `manufacturing_total_hole_count=130`,
+  `manufacturing_selected_instance_scope_status=selected-printable-only-pass`,
+  `manufacturing_split_connector_status=split-and-connector-layer-output-pass`,
+  `manufacturing_split_segment_count=2`,
+  `manufacturing_connector_count=2`,
+  `manufacturing_connector_layer_count=10`, and
+  `manufacturing_visual_mesh_used=false`.
+- Remaining limits:
+  this proves the current authoritative layer-slice compiler cases and
+  guardrails. It is not external slicer validation, external 3MF conformance,
+  exact arbitrary CSG/Boolean proof, final car manufacturing certification, or
+  visual mesh authority.
+
+### 2026-06-24 U9 Standalone 3MF Export Gate
+
+- Task:
+  add the named `verify-3mf-export` gate from the unified plan as a focused
+  deterministic package/readback verifier, separate from SolidGraph and
+  manufacturing slice compilation.
+- Result:
+  keep the slice. `verify-3mf-export` is now an advertised `xtask` command with
+  report path `target/reports/unified/3mf-export.json`. It exports deterministic
+  OPC/ZIP 3MF packages from bracket, parametric car, curved primitive, shell,
+  extrude, revolve, and loft manufacturing outputs. It validates package
+  readback, required entries, CRC coverage, model units, material metadata,
+  concrete mesh payloads, triangle references, slice metadata, source hashes,
+  importer-smoke metrics, preparation metadata packages, split car package
+  sets, connector packages, split bracket hole preservation, and failing-output
+  rejection.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `cargo fmt --check -p xtask`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports
+  `status=pass`,
+  `three_mf_export_status=deterministic-3mf-export-pass`,
+  `three_mf_package_case_count=7`,
+  `three_mf_total_opc_zip_bytes=3130826`,
+  `three_mf_total_slice_count=332`,
+  `three_mf_total_mesh_vertex_count=14772`,
+  `three_mf_total_mesh_triangle_count=43220`,
+  `three_mf_preparation_metadata_status=preparation-metadata-pass`,
+  `three_mf_split_car_segment_package_status=split-car-segment-packages-pass`,
+  `three_mf_split_car_segment_package_count=2`,
+  `three_mf_connector_package_status=connector-package-pass`,
+  `three_mf_connector_package_component_count=2`,
+  `three_mf_split_bracket_hole_status=split-bracket-hole-preservation-pass`,
+  `three_mf_negative_rejection_status=failing-manufacturing-output-rejected`,
+  and `three_mf_visual_mesh_used=false`.
+- Remaining limits:
+  this is internal deterministic 3MF package/readback/importer-smoke evidence.
+  It is not external slicer certification, external 3MF conformance-suite
+  certification, full arbitrary Boolean manufacturing, or final printable car
+  certification.
+
+### 2026-06-24 U7 Standalone Hello 3D Gate
+
+- Task:
+  add the named `verify-3d-hello-cube` gate from the unified plan as a focused
+  generic world-output verifier for the checked-in `hello_3d` example.
+- Result:
+  keep the slice. `verify-3d-hello-cube` is now an advertised `xtask` command
+  with report path `target/reports/unified/3d-hello-cube.json`. It verifies the
+  manifest/source/scenario contract, parser/typechecker/IR generic `world`
+  output root, runtime `WorldScene`, pick identity, and incremental
+  selection/transform/material/orbit patches. Runtime world lowering now
+  preserves source-level Boon instance identity in `WorldSemanticBinding`, so
+  the hello cube pick target reports
+  `semantic_id=world:instance:cube_instance` and `label=cube_instance` instead
+  of only a numeric runtime ID.
+- Verification:
+  `cargo fmt -p boon_runtime -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3d-hello-cube --report target/reports/unified/3d-hello-cube.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-hello-cube.json`;
+  `cargo fmt --check -p boon_runtime -p xtask`;
+  `cargo check -p xtask`;
+  `cargo test -p boon_runtime world_output_lowers_generic_boon_value_to_world_scene`.
+- Report:
+  `target/reports/unified/3d-hello-cube.json` reports `status=pass`,
+  `three_d_hello_cube_status=generic-world-output-hello-cube-pass`,
+  `source_path=examples/hello_3d/RUN.bn`,
+  `scenario_path=examples/hello_3d.scn`,
+  `world_output_root=world`,
+  `world_runtime_read_count=0`,
+  one camera, one light, one geometry, one instance, one semantic binding, one
+  pickable instance, `world_selected_instance_count_after_selection=1`, one
+  selection patch, one transform patch, one material patch, one orbit patch,
+  and `world_geometry_rebuild_count=0`.
+- Remaining limits:
+  this is a standalone runtime/model/patch verifier. It is not native WGPU
+  frame readback, browser WebGPU parity, headed human observation, full 3D
+  renderer completion, or manufacturing/export evidence.
+
+### 2026-06-24 U8/U9 Standalone Printable Bracket Gate
+
+- Task:
+  add the named `verify-3d-printable-bracket` gate from the unified plan as a
+  focused verifier for the checked-in `printable_bracket_3d` generic
+  manufacturing-output example.
+- Result:
+  keep the slice. `verify-3d-printable-bracket` is now an advertised `xtask`
+  command with report path
+  `target/reports/unified/3d-printable-bracket.json`. It verifies the manifest,
+  source, scenario, parser/typechecker/IR generic `manufacturing` output root,
+  runtime `SolidModelBundle`, authoritative manufacturing layers, deterministic
+  3MF package validation, and importer-smoke readback. The gate starts from
+  checked-in Boon source and scenario files, and keeps the visual-mesh authority
+  boundary explicit.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3d-printable-bracket --report target/reports/unified/3d-printable-bracket.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-printable-bracket.json`;
+  `cargo fmt --check -p xtask`;
+  `cargo check -p xtask`.
+- Report:
+  `target/reports/unified/3d-printable-bracket.json` reports `status=pass`,
+  `three_d_printable_bracket_status=generic-manufacturing-output-printable-bracket-pass`,
+  `manufacturing_output_root=manufacturing`,
+  `solid_subtractive_cylinder_count=2`,
+  `assembly_part_count=1`,
+  `assembly_instance_count=2`,
+  `assembly_shared_geometry_instance_count=2`,
+  `solid_validation_status=Pass`,
+  `solid_validation_visual_mesh_used_for_manufacturing=false`,
+  `manufacturing_status=Pass`,
+  `manufacturing_layer_count=15`,
+  `manufacturing_polygon_count=30`,
+  `manufacturing_hole_count=60`,
+  `manufacturing_visual_mesh_used=false`,
+  `three_mf_status=Pass`,
+  `three_mf_opc_zip_byte_count=547921`,
+  `three_mf_slice_count=15`,
+  `three_mf_hole_count=60`,
+  `three_mf_mesh_vertex_count=2176`,
+  `three_mf_mesh_triangle_count=8280`,
+  `three_mf_placeholder_mesh_object_count=0`,
+  `three_mf_validation_status=Pass`,
+  `three_mf_importer_smoke_status=Pass`, and
+  `three_mf_visual_mesh_used=false`.
+- Remaining limits:
+  this is internal checked-in-example evidence. It is not external slicer
+  certification, external 3MF conformance-suite certification, browser/native
+  visual parity, headed human observation, or full arbitrary CSG/Boolean proof.
+
+### 2026-06-24 U10 Standalone Parametric Car Gate
+
+- Task:
+  add the named `verify-3d-parametric-car` gate from the unified plan as a
+  focused verifier for the checked-in `parametric_car_3d` generic
+  manufacturing-output example.
+- Result:
+  keep the slice. `verify-3d-parametric-car` is now an advertised `xtask`
+  command with report path `target/reports/unified/3d-parametric-car.json`. It
+  verifies the manifest, source, scenario, parser/typechecker/IR generic
+  `manufacturing` output root, runtime `SolidModelBundle`, visual proxy
+  identity/shared-wheel evidence, printable-vs-visual-only export routing,
+  authoritative manufacturing output, deterministic 3MF validation,
+  importer-smoke readback, split preparation, per-segment 3MF packages, and
+  connector package validation. The gate starts from checked-in Boon source and
+  scenario files and does not assume fixture numeric IDs for text IDs lowered
+  from Boon source.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  `cargo fmt --check -p xtask`;
+  `cargo check -p xtask`.
+- Report:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `three_d_parametric_car_status=generic-manufacturing-output-parametric-car-pass`,
+  `manufacturing_output_root=manufacturing`,
+  `assembly_part_count=3`,
+  `assembly_instance_count=6`,
+  `assembly_printable_part_count=2`,
+  `assembly_visual_only_part_count=1`,
+  `assembly_shared_geometry_instance_count=4`,
+  `visual_proxy_geometry_count=3`,
+  `visual_proxy_instance_count=6`,
+  `visual_proxy_shared_geometry_instance_count=4`,
+  `export_selected_wheel_status=ReadySelectedPrintable`,
+  `export_selected_windows_status=SelectionNotPrintable`,
+  `manufacturing_status=Pass`,
+  `manufacturing_layer_count=47`,
+  `manufacturing_material_region_count=125`,
+  `three_mf_status=Pass`,
+  `three_mf_material_count=2`,
+  `three_mf_component_count=5`,
+  `three_mf_slice_count=47`,
+  `three_mf_mesh_vertex_count=2872`,
+  `three_mf_mesh_triangle_count=10460`,
+  `split_preparation_status=SplitRequired`,
+  `split_output_status=Pass`,
+  `split_output_segment_count=2`,
+  `split_three_mf_status=Pass`,
+  `split_three_mf_segment_package_count=2`,
+  `connector_output_status=Pass`,
+  `connector_count=2`,
+  `connector_three_mf_status=Pass`,
+  `connector_three_mf_validation_status=Pass`,
+  and all manufacturing/base-3MF/split-3MF/connector visual-mesh authority
+  flags are false.
+- Remaining limits:
+  this is internal checked-in-example evidence. It is not external slicer
+  certification, external 3MF conformance-suite certification, actual
+  browser/editor integration, browser/native visual parity, headed human
+  observation, or exact arbitrary CSG/Boolean proof.
+
+### 2026-06-24 U10 Split-Boundary Hole Repair
+
+- Task:
+  replace the old `split-layer-hole-boundary-unsupported` behavior with a real
+  split-output path that preserves bracket holes intersecting a split segment
+  boundary, then verify the repaired output through internal 3MF segment
+  package validation.
+- Result:
+  keep the slice. `compile_split_print_output` no longer rejects
+  boundary-crossing holes before segment output is generated.
+  `clip_hole_to_grid_bounds` clips boundary-intersecting holes into
+  segment-local topology, the manufacturing unit test now expects split output
+  to pass for boundary-crossing holes, and `verify-solid-graph` now checks
+  `manufacturing:split-print-output-preserves-boundary-crossing-holes` with
+  split 3MF export/validation evidence.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p xtask`;
+  `cargo test -p boon_manufacturing split_print_output`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `cargo check -p boon_manufacturing -p xtask`;
+  `cargo test -p boon_3mf split_bracket_exports_hole_preserving_segment_packages`;
+  `target/debug/xtask verify-manufacturing-slices --report target/reports/unified/manufacturing-slices.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/manufacturing-slices.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `manufacturing_split_boundary_hole_status=Pass`,
+  `manufacturing_split_boundary_hole_diagnostic_status=preserved-boundary-crossing-holes`,
+  `manufacturing_split_boundary_hole_segment_count=2`,
+  `manufacturing_split_boundary_hole_count=75`,
+  `manufacturing_split_boundary_hole_three_mf_status=Pass`,
+  `manufacturing_split_boundary_hole_three_mf_validation_pass_count=2`,
+  and `manufacturing_split_boundary_hole_three_mf_hole_count=75`. The same
+  report keeps contained-hole split evidence passing with
+  `manufacturing_split_hole_status=Pass`, `manufacturing_split_hole_count=60`,
+  and `manufacturing_split_hole_three_mf_status=Pass`.
+- Remaining limits:
+  this is internal split-output and internal 3MF package validation evidence.
+  It is not external slicer certification, external 3MF conformance-suite
+  certification, full arbitrary Boolean split/cut geometry, or complete
+  native/browser 3D graphics parity.
+
+### 2026-06-24 U9/U10 Preparation-Aware Split 3MF Packages
+
+- Task:
+  carry print-preparation metadata into car split segment packages so each
+  segment artifact records the split segment plan, connector plan,
+  connector-fit status, and visual-mesh authority flag that produced it.
+- Result:
+  keep the slice. Added `export_split_3mf_entry_sets_with_preparation` while
+  preserving `export_split_3mf_entry_sets` as the plain/no-metadata wrapper.
+  Added a deterministic unit test for metadata-bearing split segment packages,
+  updated the stale failing split-package test, and tightened
+  `verify-3d-parametric-car`, `verify-solid-graph`, and `verify-3mf-export` to
+  require preparation metadata on car split segment packages.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf split`;
+  `cargo check -p boon_3mf`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_split_car_segment_package_status=split-car-segment-packages-pass`,
+  `three_mf_split_car_segment_package_count=2`,
+  `three_mf_split_car_preparation_metadata_count=2`,
+  `three_mf_split_car_preparation_validation_pass_count=2`,
+  `three_mf_connector_package_status=connector-package-pass`, and
+  `three_mf_visual_mesh_used=false`. `target/reports/unified/solid-graph.json`
+  reports `parametric_car_split_three_mf_preparation_metadata_count=2`,
+  `parametric_car_split_three_mf_preparation_validation_pass_count=2`, and
+  `parametric_car_split_three_mf_total_entry_count=10`.
+- Remaining limits:
+  this embeds and validates preparation metadata in the segment packages, but
+  it still does not put connector-pin mesh objects or mating cutout geometry
+  inside the segment model. Full Boolean split/cut geometry, external slicer or
+  3MF conformance-suite certification, and native/browser 3D graphics parity
+  remain open.
+
+### 2026-06-24 U9/U10 Preparation-Aware Connector 3MF Package
+
+- Task:
+  carry print-preparation metadata into the separate connector-pin 3MF package
+  so it records the split segment plan, connector plan, connector-fit status,
+  and visual-mesh authority flag that produced it.
+- Result:
+  keep the slice. Added `export_connector_3mf_entry_set_with_preparation`
+  while preserving `export_connector_3mf_entry_set` as the plain/no-metadata
+  wrapper. Added connector package metadata unit coverage and tightened
+  `verify-3d-parametric-car`, `verify-solid-graph`, and `verify-3mf-export` to
+  require preparation metadata on the car connector package.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf connector`;
+  `cargo test -p boon_3mf split`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json target/reports/unified/solid-graph.json target/reports/unified/3d-parametric-car.json`;
+  `cargo check -p boon_3mf -p xtask`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_connector_package_status=connector-package-pass`,
+  `three_mf_connector_package_component_count=2`,
+  `three_mf_connector_preparation_metadata_present=true`,
+  `three_mf_connector_preparation_validation_status=true`, and
+  `three_mf_visual_mesh_used=false`. `target/reports/unified/solid-graph.json`
+  reports `parametric_car_connector_three_mf_preparation_metadata_present=true`,
+  `parametric_car_connector_three_mf_preparation_metadata_hash_present=true`,
+  and `parametric_car_connector_three_mf_preparation_validation_status=true`.
+- Remaining limits:
+  connector pins are still exported as a separate supported-subset package.
+  This is provenance and package validation work, not integrated mating cutouts,
+  connector/cut objects inside segment packages, full Boolean split/cut
+  geometry, external slicer or 3MF conformance-suite certification, or
+  native/browser 3D graphics parity.
+
+### 2026-06-24 U9/U10 Prepared Split+Connector Package Set
+
+- Task:
+  create one deterministic prepared package-set artifact that links prepared
+  split segment packages with the prepared connector-pin package.
+- Result:
+  keep the slice. Added `PreparedSplitConnectorThreeMfPackageSet` and
+  `export_prepared_split_connector_3mf_package_set`. The new artifact carries
+  split and connector source hashes, all child packages, combined diagnostics,
+  a deterministic package-set hash, and visual-mesh authority status. Tightened
+  `verify-3d-parametric-car`, `verify-3mf-export`, and `verify-solid-graph` to
+  require it.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf prepared_split_connector_package_set`;
+  `cargo test -p boon_3mf connector`;
+  `cargo test -p boon_3mf split`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json target/reports/unified/solid-graph.json target/reports/unified/3d-parametric-car.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_prepared_split_connector_package_status=prepared-split-connector-package-set-pass`,
+  `three_mf_prepared_split_connector_segment_package_count=2`,
+  `three_mf_prepared_split_connector_connector_package_present=true`,
+  `three_mf_prepared_split_connector_connector_component_count=2`,
+  `three_mf_prepared_split_connector_preparation_metadata_count=3`, and
+  `three_mf_prepared_split_connector_visual_mesh_used=false`.
+  `target/reports/unified/solid-graph.json` reports
+  `parametric_car_prepared_split_connector_package_status=prepared-split-connector-package-set-pass`,
+  `parametric_car_prepared_split_connector_segment_package_count=2`,
+  `parametric_car_prepared_split_connector_connector_package_present=true`,
+  `parametric_car_prepared_split_connector_connector_component_count=2`,
+  `parametric_car_prepared_split_connector_preparation_metadata_count=3`, and
+  `parametric_car_prepared_split_connector_visual_mesh_used=false`.
+  `target/reports/unified/3d-parametric-car.json` reports
+  `prepared_split_connector_package_status=deterministic-prepared-split-connector-package-set`,
+  `prepared_split_connector_package_export_status=Pass`,
+  `prepared_split_connector_segment_package_count=2`,
+  `prepared_split_connector_connector_package_present=true`,
+  `prepared_split_connector_connector_component_count=2`,
+  `prepared_split_connector_preparation_metadata_count=3`, and
+  `prepared_split_connector_visual_mesh_used=false`.
+- Remaining limits:
+  the package set links and validates prepared child packages. It still does
+  not embed connector mesh into every split segment package, does not add
+  mating cutout geometry to the segment models, and does not provide full
+  Boolean split/cut geometry, external slicer or 3MF conformance-suite
+  certification, or native/browser 3D graphics parity.
+
+### 2026-06-24 U10 Layer-Level Connector Cutouts In Split Segments
+
+- Task:
+  add real supported-subset mating geometry to split segments by inserting
+  planned dowel connector cutout holes into the segment layer output.
+- Result:
+  keep the slice. `compile_split_print_output` now routes connector plans into
+  split segment generation. Each segment layer computes supported dowel
+  connector slice polygons, clips them to segment bounds, and inserts them as
+  holes into printable polygons containing the cutout centroid.
+  `SplitPrintSegmentOutput` records `connector_cutout_hole_count`, and the
+  count participates in the segment artifact hash. 3MF split-package tests and
+  unified verifiers now require the segment packages to preserve those holes.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p boon_3mf -p xtask`;
+  `cargo test -p boon_manufacturing parametric_car_print_preparation_detects_split_and_connector_plan -- --nocapture`;
+  `cargo test -p boon_manufacturing split_print_output -- --nocapture`;
+  `cargo test -p boon_3mf split -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-manufacturing-slices --report target/reports/unified/manufacturing-slices.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json target/reports/unified/3d-parametric-car.json target/reports/unified/solid-graph.json target/reports/unified/manufacturing-slices.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_split_car_connector_cutout_hole_count=40`,
+  `three_mf_split_car_segment_package_hole_count=40`, and
+  `three_mf_prepared_split_connector_package_status=prepared-split-connector-package-set-pass`.
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `split_output_connector_cutout_hole_count=40`,
+  `split_three_mf_hole_count=40`, and
+  `prepared_split_connector_package_export_status=Pass`.
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `parametric_car_split_connector_cutout_hole_count=40`,
+  `parametric_car_split_three_mf_hole_count=40`, and
+  `parametric_car_prepared_split_connector_package_status=prepared-split-connector-package-set-pass`.
+  `target/reports/unified/manufacturing-slices.json` reports `status=pass`.
+- Remaining limits:
+  this is a supported-subset layer-level dowel cutout implementation for the
+  current split connector plan. It is not a full arbitrary Boolean CSG engine,
+  not exact volumetric connector/cut composition for every solid operation, not
+  external slicer or 3MF conformance-suite certification, and not native/browser
+  3D graphics parity.
+
+### 2026-06-24 U10 Connector Cutout Validation Report
+
+- Task:
+  add a manufacturing-level validation report that recomputes planned connector
+  cutout geometry and proves the split output still contains matching holes.
+- Result:
+  keep the slice. Added `ConnectorCutoutValidationReport` and
+  `validate_split_connector_cutouts`. The validator checks preparation/split/
+  connector status, preparation hash links, connector counts, recomputed
+  expected layer-level cutout holes, observed holes in segment layers, and
+  declared split output cutout counts. The manufacturing test now also proves a
+  tampered split output fails when a cutout hole is removed.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p xtask`;
+  `cargo test -p boon_manufacturing parametric_car_print_preparation_detects_split_and_connector_plan -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json target/reports/unified/3d-parametric-car.json target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_connector_cutout_validation_status=Pass`,
+  `three_mf_connector_cutout_validation_expected_count=40`,
+  `three_mf_connector_cutout_validation_observed_count=40`, and
+  `three_mf_connector_cutout_validation_declared_count=40`.
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `split_connector_cutout_validation_status=Pass`,
+  `split_connector_cutout_validation_expected_count=40`,
+  `split_connector_cutout_validation_observed_count=40`, and
+  `split_connector_cutout_validation_declared_count=40`.
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `parametric_car_split_connector_cutout_validation_status=Pass`,
+  `parametric_car_split_connector_cutout_validation_expected_count=40`,
+  `parametric_car_split_connector_cutout_validation_observed_count=40`, and
+  `parametric_car_split_connector_cutout_validation_declared_count=40`.
+- Remaining limits:
+  this validates the current supported-subset dowel cutout geometry against
+  split and connector artifacts. It is not a full arbitrary Boolean CSG engine,
+  not exact volumetric connector/cut composition for every solid operation, not
+  external slicer or 3MF conformance-suite certification, and not native/browser
+  3D graphics parity.
+
+### 2026-06-24 U9 Aggregate STL Topology Evidence
+
+- Task:
+  strengthen STL export evidence from per-prism topology to final aggregate
+  exported-triangle-stream topology.
+- Result:
+  keep the slice. `boon_mesh_export` now removes exact duplicate
+  opposite-facing internal triangles before emitting ASCII/binary STL, and
+  exposes `validate_export_triangle_stream_topology`. The SolidGraph verifier
+  requires the parametric car aggregate STL topology to pass and records the
+  printable bracket aggregate topology as a known non-manifold blocker instead
+  of claiming it is watertight.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo check -p boon_mesh_export -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-manufacturing-slices --report target/reports/unified/manufacturing-slices.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json target/reports/unified/manufacturing-slices.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `parametric_car_stl_export_topology_status=Pass`, raw/exported triangle
+  counts `10460 -> 5724`, `2368` culled internal triangle pairs, and `0`
+  boundary/non-manifold aggregate edges for the parametric car. It also reports
+  `mesh_export_hole_preserving_export_topology_status=Fail`, raw/exported
+  triangle counts `10800 -> 6048`, `2376` culled internal triangle pairs, `0`
+  boundary edges, and `122` non-manifold aggregate edges for the printable
+  bracket.
+- Remaining limits:
+  this is exact-grid duplicate-face culling plus aggregate edge-count evidence,
+  not robust Boolean-unioned watertight topology. The printable bracket remains
+  an explicit topology blocker for full hole-bearing CSG-like manifold proof,
+  and this is not external slicer/importer or 3MF conformance certification.
+
+### 2026-06-24 U9/U10 Per-Segment 3MF Connector Cutout Evidence
+
+- Task:
+  make each split 3MF segment package explicitly declare how many connector
+  cutout holes it is responsible for preserving.
+- Result:
+  keep the slice. `SplitThreeMfSegmentPackage` now carries
+  `connector_cutout_hole_count` and `segment_hole_count`. Split 3MF package
+  export fails with `split-segment-cutout-holes-not-preserved` if a package
+  carries fewer holes than the declared connector cutout holes. The unified
+  3MF, parametric-car, and SolidGraph gates now compare the split output
+  cutout count against the declared per-segment 3MF cutout count and the actual
+  package hole counts.
+- Verification:
+  `cargo fmt -p boon_3mf -p xtask`;
+  `cargo test -p boon_3mf split -- --nocapture`;
+  `cargo test -p boon_3mf prepared_split_connector_package_set -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json target/reports/unified/3d-parametric-car.json target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_split_car_connector_cutout_hole_count=40`,
+  `three_mf_split_car_segment_package_declared_cutout_hole_count=40`, and
+  `three_mf_split_car_segment_package_hole_count=40`.
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `split_output_connector_cutout_hole_count=40`,
+  `split_three_mf_declared_cutout_hole_count=40`, and
+  `split_three_mf_hole_count=40`.
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `parametric_car_split_connector_cutout_hole_count=40`,
+  `parametric_car_split_three_mf_declared_cutout_hole_count=40`, and
+  `parametric_car_split_three_mf_hole_count=40`.
+- Remaining limits:
+  this is internal package evidence for the current supported-subset dowel
+  connector path. It is not full arbitrary Boolean CSG, not external slicer or
+  3MF conformance-suite certification, and not native/browser 3D graphics
+  parity.
+
+### 2026-06-24 U6/U7 Browser WebGPU Execution And Capture Proof
+
+- Task:
+  move the browser WorldScene renderer beyond source-only evidence by proving a
+  real browser WebGPU upload, indexed draw submission, and app-owned target
+  readback, while keeping native/browser visual parity as a separate required
+  comparison.
+- Result:
+  keep the slice. Added `verify-browser-webgpu-world-scene`. The verifier
+  writes a retained parametric-car packet and passive harness, launches
+  headless Chromium with WebGPU enabled, drives the page through CDP via
+  `websocat`, imports the checked-in `world_scene_host.js` source as a Blob
+  module, and captures app-owned color/normal/feature/feature-high targets with
+  `copyTextureToBuffer`. `verify-native-web-render-parity` now recognizes the
+  browser capture report, but still fails until a native/browser captured-frame
+  comparison report exists.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask -- --check`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`
+  (expected fail: native/browser captured-frame comparison is missing);
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_world_scene_status=browser-webgpu-retained-scene-capture-pass`,
+  `browser_capture_status=browser-webgpu-capture-pass`,
+  `browser_upload_executed=true`, `browser_render_executed=true`,
+  `browser_capture_executed=true`, `browser_color_non_clear_pixel_count=4372`,
+  and `browser_feature_non_zero_pixel_count=4372`.
+  `target/reports/native-gpu/native-web-render-contract.json` reports
+  `status=pass`, `browser_host_static_source_bytes=25654`,
+  `browser_host_renderer_source_status=retained-webgpu-renderer-source-pass`,
+  and `browser_host_renderer_source_color_target_count=4`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=25654`, and
+  `browser_source_budget_bytes=32000`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=fail`,
+  `browser_webgpu_visual_parity_status=browser-capture-present-comparison-missing`,
+  and `native_browser_comparison_status=missing`.
+- Remaining limits:
+  this proves browser-side retained-scene WebGPU execution and app-owned
+  readback, not full native/browser visual parity. The next U7 step is a native
+  capture for the same retained packet plus a comparison report. Depth is
+  allocated and used but not yet read back by the browser proof.
+
+### 2026-06-24 U6/U7 Native-Web Feature Mask Comparison
+
+- Task:
+  replace the "comparison missing" browser/native parity blocker with a real
+  app-owned retained-scene comparison that can be followed by later full
+  color-pixel parity work.
+- Result:
+  keep the slice. Added `verify-native-web-render-comparison` and made
+  `verify-native-web-render-parity` require that schema-valid comparison report
+  instead of accepting mere file presence. The browser renderer now aligns with
+  the native retained mesh pipeline on culling, clear values, and row-based
+  camera uniforms including inverse quaternion camera rotation. Browser readback
+  can emit compact nonzero feature-mask row runs for selected targets, and the
+  comparison gate computes a measured native/browser feature-mask mismatch
+  count against the native feature PNG.
+- Verification:
+  `cargo fmt -p xtask -p boon_web_host -p boon_report_schema`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p boon_web_host -p xtask -p boon_report_schema`;
+  `git diff --check -- crates/boon_web_host crates/xtask/src/main.rs crates/boon_report_schema/src/lib.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-mask-raster-tolerance-pass`,
+  retained geometry counts `368` vertices, `2136` indices, and `6`
+  browser draws/native retained chunks on both paths,
+  `browser_feature_non_zero_pixel_count=4959`,
+  `native_feature_non_zero_pixel_count=4960`,
+  `comparison_mismatch_pixel_count=3`,
+  `comparison_feature_mask_tolerance_pixels=5`, and
+  `comparison_feature_mask_within_tolerance=true`. It also records
+  `comparison_checksum_match=false` and
+  `native_browser_visual_color_status=color-pixel-parity-not-yet-measured`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass`,
+  `browser_webgpu_visual_parity_status=feature-frame-measured-pass-color-parity-open`,
+  and
+  `native_browser_comparison_status=native-browser-feature-mask-raster-tolerance-pass`.
+- Remaining limits:
+  this is retained feature-mask comparison with a strict 0.01% capped raster
+  tolerance, not exact checksum parity and not color-pixel parity. Browser depth
+  readback, headed/manual 3D interaction evidence, browser IME integration, and
+  broader native/web product integration remain open.
+
+### 2026-06-24 U6/U7 Browser Depth Readback Proof
+
+- Task:
+  prove the browser retained WebGPU path can read back Boon-owned depth, not
+  only color/normal/feature RGBA targets.
+- Result:
+  keep the slice. `world_scene_host.js` now copies the app-owned
+  `Depth32Float` texture with `aspect: "depth-only"` and reports finite depth
+  pixels, visible-depth pixels, checksum, minimum depth, and maximum depth.
+  `verify-browser-webgpu-world-scene` now requires
+  `browser-webgpu-depth-capture-pass`, a complete finite-depth frame, and
+  nonzero visible-depth pixels before the browser execution proof can pass.
+- Verification:
+  `cargo fmt -p xtask -p boon_web_host -p boon_report_schema`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p boon_web_host -p xtask -p boon_report_schema`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_depth_capture_status=browser-webgpu-depth-capture-pass`,
+  `browser_depth_visible_pixel_count=4959`,
+  `browser_depth_finite_pixel_count=49152`,
+  `browser_depth_checksum=698861969`,
+  `browser_depth_min=0.9999441504478456`, and `browser_depth_max=1`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=30447`, and
+  `browser_source_budget_bytes=32000`. `target/reports/native-gpu/native-web-render-parity.json`
+  remains `status=pass` with
+  `browser_webgpu_visual_parity_status=feature-frame-measured-pass-color-parity-open`.
+- Remaining limits:
+  this proves browser depth readback, not full native/browser color-pixel
+  parity. The browser source artifact is close to the current 32 KB budget, so
+  future browser-host work should be factored or paired with an explicit budget
+  decision. Headed/manual 3D interaction evidence, browser IME integration, and
+  broader native/web product integration remain open.
+
+### 2026-06-24 U7 Native Retained Mesh Depth Readback Proof
+
+- Task:
+  prove the native retained mesh renderer reads back real Boon-owned
+  `Depth32Float` samples for both the basic world-scene mesh path and the
+  retained parametric-car `SurfaceChunk` mesh path.
+- Result:
+  keep the slice. `WorldSceneMeshPipelineProof` now records native mesh depth
+  capture method, sampled depth pixels, visible-depth pixels, minimum depth, and
+  maximum depth. The retained mesh depth target is now copyable, copied with
+  `TextureAspect::DepthOnly`, mapped, and summarized by the verifier. The
+  retained parametric-car unit test derives expected retained chunk
+  vertex/index counts from `visual.chunks` and visible instances instead of
+  hard-coding stale fixture counts.
+- Verification:
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo test -p boon_native_gpu --lib mesh_pipeline -- --nocapture`;
+  `cargo check -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_mesh_pipeline_depth_capture_method=app-owned-world-scene-mesh-depth32float-readback`,
+  `native_gpu_world_scene_mesh_pipeline_sampled_depth_pixel_count=70400`,
+  `native_gpu_world_scene_mesh_pipeline_visible_depth_pixel_count=5724`,
+  `native_gpu_world_scene_mesh_pipeline_min_depth=0.8008009195327759`,
+  and `native_gpu_world_scene_mesh_pipeline_max_depth=1.0`. The same report
+  records the retained parametric-car mesh path with
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_depth_capture_method=app-owned-world-scene-mesh-depth32float-readback`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_sampled_depth_pixel_count=104000`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_visible_depth_pixel_count=9121`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_min_depth=0.9999440312385559`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_max_depth=1.0`,
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_vertex_count=368`,
+  and
+  `native_gpu_world_scene_parametric_car_mesh_pipeline_retained_chunk_index_count=2136`.
+  `target/reports/native-gpu/native-web-render-comparison.json` remains
+  `status=pass` with
+  `native_browser_comparison_status=native-browser-feature-mask-raster-tolerance-pass`,
+  `comparison_mismatch_pixel_count=3`, and
+  `comparison_feature_mask_tolerance_pixels=5`.
+  `target/reports/native-gpu/native-web-render-parity.json` remains
+  `status=pass` with
+  `native_web_render_parity_status=browser-webgpu-parity-pass`.
+- Remaining limits:
+  this proves native retained mesh depth readback, not exact native/browser
+  checksum parity, not color-pixel parity, and not headed/manual visible 3D
+  interaction behavior. U7 still remains open for broader 3D viewport/product
+  integration, and U6 still remains open for browser IME/action integration.
+
+### 2026-06-24 U6/U7 Native-Web Color Mask Comparison
+
+- Task:
+  upgrade native/browser retained 3D comparison beyond feature masks by adding
+  measured color target evidence without claiming exact color parity.
+- Result:
+  keep the slice. The native app-owned retained mesh color target now uses
+  `Rgba8Unorm`, matching the browser app-owned `rgba8unorm` target. Browser
+  color readback now reports compact non-clear row runs plus bounded RGBA
+  sample counts, and
+  `verify-native-web-render-comparison` records native/browser color checksums,
+  color non-clear counts, color mask mismatch, and exact-color checksum status.
+  `verify-native-web-render-parity` now reports whether exact color parity
+  passed or whether feature/color masks passed while exact color still
+  mismatches. A raw `pixelData` transfer experiment was rejected because it
+  broke the current simple CDP/websocket response reader with a large payload.
+  The browser retained color target now uses the same alpha blend factors as
+  the native WGPU color target, removing the earlier direct translucent-alpha
+  browser output while still leaving exact checksum parity open.
+- Verification:
+  `cargo fmt -p boon_native_gpu -p xtask -p boon_web_host`;
+  `cargo test -p boon_native_gpu --lib mesh_pipeline -- --nocapture`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_visual_color_status=color-non-clear-mask-raster-tolerance-pass-exact-mismatch`,
+  `comparison_color_mask_mismatch_pixel_count=3`,
+  `comparison_color_mask_tolerance_pixels=5`,
+  `comparison_color_mask_within_tolerance=true`,
+  `comparison_color_checksum_match=false`,
+  `browser_color_non_clear_pixel_count=4959`, and
+  `native_color_non_clear_pixel_count=4960`. Exact checksum parity remains
+  false with `browser_color_checksum=575348705` and
+  `native_color_checksum=2675012351`. Feature-mask comparison remains passing
+  with `comparison_mismatch_pixel_count=3`,
+  `comparison_feature_mask_tolerance_pixels=5`, and
+  `comparison_feature_mask_within_tolerance=true`.
+  Browser and native both report `*_color_non_clear_unique_rgba_count=12`
+  after browser alpha-blend alignment, but sample counts and some blended color
+  channels still differ by backend raster/blend rounding.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `browser_webgpu_visual_parity_status=feature-and-color-mask-measured-pass-color-exact-mismatch`,
+  `native_browser_color_exact_match=false`, and
+  `native_browser_color_mask_within_tolerance=true`.
+  `target/reports/native-gpu/world-scene.json` reports
+  `native_gpu_world_scene_mesh_pipeline_color_format=Rgba8Unorm`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=31843`, and
+  `browser_source_budget_bytes=32000`.
+- Remaining limits:
+  this proves native/browser retained color coverage parity within the bounded
+  raster tolerance, not exact color-pixel checksum parity. The browser source
+  artifact is now very close to the current 32 KB budget (`31843 / 32000`
+  bytes), so further browser-host work should be factored before adding inline
+  JS. Headed/manual visible 3D interaction evidence, browser IME/action
+  integration, and broader 3D viewport/product integration remain open.
+- 2026-06-24 browser-host source budget headroom slice: kept the retained
+  browser WebGPU proof semantics unchanged while factoring repeated format
+  literals and target construction in `world_scene_host.js`. Browser-owned
+  `rgba8unorm` target creation/capture metadata now shares one constant, depth
+  pipeline/capture metadata shares `DEPTH_FORMAT`, and the four app-owned RGBA
+  target labels are built through one helper. This is source-size cleanup only;
+  it does not change verifier status strings, report fields, target formats, or
+  the exact-color parity claim.
+- Verification:
+  `cargo fmt -p xtask -p boon_web_host`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=31686`, and
+  `browser_source_budget_bytes=32000`.
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_visual_color_status=color-non-clear-mask-raster-tolerance-pass-exact-mismatch`,
+  `comparison_color_mask_mismatch_pixel_count=3`,
+  `comparison_color_mask_tolerance_pixels=5`,
+  `comparison_color_mask_within_tolerance=true`, and
+  `comparison_color_checksum_match=false`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass`,
+  `browser_webgpu_visual_parity_status=feature-and-color-mask-measured-pass-color-exact-mismatch`,
+  `native_browser_color_exact_match=false`, and
+  `native_browser_color_mask_within_tolerance=true`.
+- Remaining limits:
+  exact native/browser color checksum parity remains open. The browser source
+  budget is healthier than the prior `31843 / 32000` state, but future
+  browser-host additions should still be factored before adding inline JS.
+- 2026-06-24 U6 browser semantic IME/action bridge contract slice: closed a
+  browser semantic bridge gap without adding a visual DOM renderer.
+  `SemanticWebInputEvent` now carries increment/decrement events, semantic DOM
+  nodes expose `data-boon-action-increment` and
+  `data-boon-action-decrement` route markers, and `boon_web_host` now owns a
+  typed `WebSemanticBridgeContract` plus `WebSemanticBridgeProof` over
+  `boon_document::SemanticWebBridgeSnapshot`.
+- Verification:
+  `cargo fmt -p boon_document -p boon_web_host -p xtask`;
+  `cargo test -p boon_document semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom -- --nocapture`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json`.
+- Report:
+  `target/reports/unified/semantic-scene.json` reports `status=pass`,
+  `web_host_semantic_bridge_status=semantic-ime-action-bridge-pass`,
+  `web_host_semantic_bridge_source_dispatch_count=4`,
+  `web_host_semantic_bridge_source_routed_action_count=4`,
+  `web_host_semantic_bridge_supports_increment_dispatch=true`,
+  `web_host_semantic_bridge_supports_decrement_dispatch=true`, and
+  `web_host_semantic_bridge_visual_dom_node_count=0`.
+  `target/reports/unified/accessibility-adapters.json` reports `status=pass`,
+  `web_semantic_ime_bridge_status=static-dom-ime-action-route-contract-implemented`,
+  supported browser semantic input events
+  `[focus, press, set_text, replace_selected_text, increment, decrement]`,
+  `web_host_semantic_bridge_source_dispatch_count=4`, and
+  `web_host_semantic_bridge_source_routed_action_count=4`.
+- Remaining limits:
+  this proves the browser-host semantic/IME/action route contract and source
+  dispatch surface, not a live browser DOM overlay or real-browser IME session.
+  The browser visual path remains canvas/WebGPU-only.
+- 2026-06-24 U6 browser startup budget report slice: added retained browser
+  WebGPU startup timing fields to `verify-browser-webgpu-world-scene` and a
+  new `verify-browser-startup-budget` gate. The gate consumes the fresh
+  `browser-world-scene.json`, rejects stale git/worktree/binary provenance,
+  requires the retained browser WebGPU proof to pass, keeps the source artifact
+  under the 32 KB budget, and applies a loose `20000 ms` headless proof runaway
+  cap. It explicitly does not claim human-visible presentation latency or
+  generated WASM bundle size.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `status=pass`,
+  `browser_startup_budget_status=browser-startup-budget-pass`,
+  exact current startup timing fields, and
+  `browser_first_useful_frame_runaway_budget_ms=20000.0`. It also records
+  `browser_startup_source_artifact_bytes` against
+  `browser_source_budget_bytes=32000`.
+- Remaining limits:
+  this is a headless Chromium/CDP retained-render startup measurement, not
+  human-visible presentation latency, not a generated WASM/JS bundle budget,
+  and not live browser IME evidence. Generated WASM/startup budgets remain
+  future work if/when a generated WASM bundle exists.
+- 2026-06-24 U9 contained-union manufacturing slice: diagnosed the printable
+  bracket STL aggregate topology failure as two separate issues. The large
+  part was overlapping same-slice `Union` sections: the upright plate was
+  emitted as a separate contained polygon inside the base for the shared lower
+  layers, creating 122 over-shared export edges after duplicate-face culling.
+  `boon_manufacturing` now collapses supported contained, hole-free union
+  polygons while preserving their source feature IDs on the surviving polygon.
+  This reduces the bracket aggregate STL failure to the real remaining seam:
+  two non-manifold edges at the base/upright transition where adjacent-layer
+  cap clipping is still needed.
+- Killed experiment:
+  a local cap-only clipping attempt removed the two over-shared seam edges but
+  introduced 12 boundary edges because the side-wall contours also need to be
+  split/stapled at the new cap boundary. Do not repeat cap-only clipping; the
+  next attempt should build a contour-stitching/layer-transition surface
+  exporter or move the Boolean union to a real 2D polygon operation before STL
+  surface generation.
+- Killed experiment:
+  a follow-up layer-transition exporter split the side-wall ring and reused
+  the split ring for adjacent caps. It first reproduced the 12 boundary-edge
+  failure at the transition slab bottom, then after split-cap reuse removed
+  boundary edges but regressed to 50 non-manifold edges. The experiment was
+  reverted. The next watertight-bracket attempt should not be a local
+  cap/ring heuristic; it needs real contour stitching across layer
+  transitions or a proper same-slice Boolean union before STL surface
+  generation.
+- Verification:
+  `cargo fmt -p boon_manufacturing -p boon_mesh_export`;
+  `cargo test -p boon_manufacturing printable_bracket_compiles_to_deterministic_layers_with_holes -- --nocapture`;
+  `cargo test -p boon_mesh_export hole_bearing_layers_export_with_preserved_hole_walls -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `mesh_export_hole_preserving_export_topology_status=Fail`,
+  `mesh_export_hole_preserving_export_topology_non_manifold_edge_count=2`,
+  `mesh_export_hole_preserving_export_topology_boundary_edge_count=0`,
+  `mesh_export_hole_preserving_export_topology_degenerate_triangle_count=0`,
+  `mesh_export_hole_preserving_export_topology_triangle_count=5808`,
+  `mesh_export_hole_preserving_export_topology_raw_triangle_count=10440`,
+  and
+  `mesh_export_hole_preserving_export_topology_culled_internal_triangle_pair_count=2316`.
+- Remaining limits:
+  this is a real improvement but not U9 watertight completion. The bracket STL
+  aggregate remains non-manifold until the exporter or manufacturing compiler
+  clips top/bottom caps against adjacent-layer overlap at union transitions
+  instead of treating every layer as an independent full prism.
+- 2026-06-24 U9 external 3MF tool-availability report slice: extended
+  `verify-3mf-export` with machine-readable external-tool discovery fields.
+  The gate still proves deterministic internal 3MF package export/import-smoke
+  evidence only; it now explicitly records whether candidate external 3MF,
+  slicer, or importer tools are available on `PATH` so future conformance work
+  has an honest prerequisite signal.
+- Verification:
+  `cargo fmt -p xtask -p boon_mesh_export`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_export_status=deterministic-3mf-export-pass`,
+  `three_mf_external_conformance_status=external-tool-unavailable`,
+  `three_mf_external_conformance_tool_available_count=0`, and candidate tools
+  `3mf`, `lib3mf`, `prusa-slicer`, `PrusaSlicer`, `cura`, `openscad`, and
+  `assimp` all unavailable on `PATH`.
+- Remaining limits:
+  this is environment discovery, not external 3MF conformance, slicer
+  acceptance, or third-party importer validation. The external validation task
+  remains open until an actual external tool or conformance suite is installed
+  and run against generated packages.
+- 2026-06-24 U9 deterministic 3MF external-candidate artifact slice:
+  extended `verify-3mf-export` so the gate writes deterministic generated
+  `.3mf` files to `target/artifacts/unified/3mf-export` and records their
+  paths, byte counts, OPC ZIP hashes, package artifact hashes, source
+  manufacturing artifact hashes, and `visual_mesh_used_for_manufacturing`
+  flags in the report. This gives future external slicer/importer/conformance
+  work real files to consume instead of only in-memory package bytes.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json`;
+  `find target/artifacts/unified/3mf-export -maxdepth 1 -type f -name '*.3mf' | sort | wc -l`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_export_status=deterministic-3mf-export-pass`,
+  `three_mf_external_candidate_artifact_dir=target/artifacts/unified/3mf-export`,
+  `three_mf_external_candidate_artifact_count=16`, first artifact
+  `target/artifacts/unified/3mf-export/printable-bracket.3mf`,
+  first artifact `byte_count=733652`, first artifact
+  `opc_zip_hash=sha256:e58da30ce47aba8b11a7cbc98b28d5f5816f7e7539ccda96e86828764ba0f417`,
+  and
+  `three_mf_external_conformance_status=external-tool-unavailable`.
+- Remaining limits:
+  this is deterministic artifact emission and internal report/readback
+  evidence, not external 3MF conformance, slicer acceptance, or third-party
+  importer validation. The generated artifacts live under ignored `target/`
+  output and must be regenerated by the verifier when needed.
+- 2026-06-24 U6 browser semantic live bridge helper slice: extended the
+  canvas/WebGPU browser host with `createSemanticWebBridge(...)`, a small live
+  semantic DOM mount/source-dispatch helper for `SemanticWebBridgeSnapshot`
+  data. The visual renderer remains the single WebGPU canvas path; the DOM
+  helper is restricted to accessibility/IME/action routing and is not a visual
+  DOM fallback.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/unified/accessibility-adapters.json` reports `status=pass`,
+  `web_live_dom_ime_status=browser-host-semantic-live-dom-mount-helper-implemented-not-headed-ime-proof`,
+  `web_host_semantic_bridge_live_function_present=true`,
+  `web_host_semantic_bridge_live_mount_present=true`, and
+  `web_host_semantic_bridge_live_dispatch_present=true`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=29882`, and
+  `browser_source_budget_bytes=32000`.
+- Remaining limits:
+  this is not headed browser IME proof, not human-visible browser input proof,
+  and not native/web visual parity. The semantic DOM must remain a bridge for
+  accessibility/IME/action routing only.
+- 2026-06-24 U6 headless browser semantic bridge execution slice: extended the
+  existing `verify-browser-webgpu-world-scene` CDP harness so headless Chromium
+  imports the browser host module, mounts a serialized
+  `SemanticWebBridgeSnapshot`, dispatches semantic `press` and `set_text`
+  actions, and reports the resulting source routes. This upgrades the previous
+  helper/static proof into executed browser evidence while keeping the visual
+  renderer on the WebGPU canvas.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_world_scene_status=browser-webgpu-retained-scene-capture-pass`,
+  `browser_semantic_bridge_status=browser-semantic-live-bridge-executed`,
+  `browser_semantic_bridge_mounted_node_count=6`,
+  `browser_semantic_bridge_dispatch_count=2`,
+  `browser_semantic_bridge_visual_dom_node_count=0`,
+  `browser_semantic_bridge_press_source_path=toolbar.save`,
+  `browser_semantic_bridge_text_source_path=toolbar.filter`, and
+  `browser_semantic_bridge_text_payload=typed`.
+- Remaining limits:
+  this is headless Chromium execution through the browser host module, not
+  headed/manual browser IME observation, OS text-input integration proof, or
+  visual DOM parity evidence.
+- 2026-06-24 U6 route-aware browser semantic DOM event slice: updated
+  `createSemanticWebBridge(...)` so mounted DOM events route by semantic action
+  attributes. Clicks now dispatch `press`, `increment`, or `decrement`
+  depending on the node; text endpoints dispatch `set_text` on `input`. The
+  browser-world-scene CDP proof now triggers mounted DOM events for Save,
+  Filter input, Zoom in, and Zoom out instead of only calling the helper
+  directly.
+- Verification:
+  `cargo fmt -p xtask -p boon_web_host`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_semantic_bridge_status=browser-semantic-live-bridge-executed`,
+  `browser_semantic_bridge_mounted_node_count=6`,
+  `browser_semantic_bridge_dispatch_count=4`,
+  `browser_semantic_bridge_visual_dom_node_count=0`,
+  `browser_semantic_bridge_press_source_path=toolbar.save`,
+  `browser_semantic_bridge_text_source_path=toolbar.filter`,
+  `browser_semantic_bridge_text_payload=typed`,
+  `browser_semantic_bridge_increment_source_path=viewport.zoom`, and
+  `browser_semantic_bridge_decrement_source_path=viewport.zoom`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass` and `browser_artifact_bytes=30134`.
+- Remaining limits:
+  this is still headless Chromium execution, not headed/manual browser IME
+  observation, OS text-input integration proof, or visual DOM parity evidence.
+- 2026-06-24 U6 browser semantic focus synchronization slice: added minimal
+  focus state synchronization to `createSemanticWebBridge(...)`. The bridge now
+  exposes `focusedSemanticId()` and `setFocus(...)`, updates
+  `data-boon-focused` on mounted nodes, moves DOM focus for semantic-to-DOM
+  focus changes, and updates semantic focus from mounted DOM `focus` events.
+- Verification:
+  `cargo fmt -p xtask -p boon_web_host`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_semantic_bridge_status=browser-semantic-live-bridge-executed`,
+  `browser_semantic_bridge_dispatch_count=4`,
+  `browser_semantic_bridge_initial_focused_id=semantic:filter`,
+  `browser_semantic_bridge_programmatic_focused_id=semantic:save`,
+  `browser_semantic_bridge_programmatic_focus_dom_ok=true`,
+  `browser_semantic_bridge_dom_focused_id=semantic:zoom-in`, and
+  `browser_semantic_bridge_dom_focus_attr_ok=true`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass` and `browser_artifact_bytes=30854`.
+- Remaining limits:
+  this is not headed/manual browser focus observation, real OS IME proof, or
+  GPU-pick to semantic focus integration. The DOM remains semantic-only.
+- 2026-06-24 U6/U7 native pick-to-semantic editor route slice: added
+  `WorldScene::semantic_editor_route_for_pick(...)` and a native GPU verifier
+  gate that proves app-owned parametric-car pick-ID readback routes into the
+  SolidGraph semantic editor tree. The route applies the pick-derived
+  `WorldSelection`, rebuilds the semantic tree, and accepts the route only when
+  the focused node is selected, focusable, selectable, and tied to the picked
+  instance.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask`;
+  `cargo test -p boon_scene_model --lib`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`. Its
+  nested `native_gpu_world_scene_render` proof reports
+  `native_gpu_world_scene_parametric_car_pick_semantic_route_status=app-owned-pick-id-to-semantic-editor-focus-pass`,
+  `native_gpu_world_scene_parametric_car_sampled_pick_ids=[1,2,3,4,5,6]`,
+  `native_gpu_world_scene_parametric_car_pick_semantic_route_count=6`, focused
+  editor nodes `world-editor:assembly:instance:1` through
+  `world-editor:assembly:instance:6`, and semantic IDs
+  `solid:part:1:instance:1`, `solid:part:3:instance:2`, and
+  `solid:part:2:instance:3` through `solid:part:2:instance:6`.
+- Remaining limits:
+  this is native/app-owned WGPU pick-ID to SolidGraph semantic editor routing.
+  It is not headed/manual pointer observation, browser GPU-pick to semantic
+  focus, or real OS accessibility focus handoff.
+- 2026-06-24 U6/U7 browser feature-target semantic route slice: extended the
+  headless browser WebGPU capture report with `firstNonZeroRgba`, added
+  `WorldScene::semantic_editor_routes_for_feature(...)`, and taught
+  `verify-browser-webgpu-world-scene` to decode the browser feature target
+  sample into a `FeatureId` and route matching visible instances through the
+  SolidGraph semantic editor model.
+- Verification:
+  `cargo fmt -p boon_scene_model -p xtask -p boon_web_host`;
+  `cargo test -p boon_scene_model --lib semantic_editor -- --nocapture`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_feature_first_nonzero_rgba=[1,0,0,0]`,
+  `browser_feature_high_first_nonzero_rgba=null`,
+  `browser_sampled_feature_id=1`,
+  `browser_feature_semantic_route_status=browser-feature-target-to-semantic-editor-route-pass`,
+  `browser_feature_semantic_route_count=6`, and
+  `browser_feature_semantic_expected_route_count=6`. It records focused editor
+  nodes `world-editor:assembly:instance:1` through
+  `world-editor:assembly:instance:6` and the corresponding six SolidGraph
+  semantic IDs. `target/reports/native-gpu/browser-artifact-budget.json`
+  reports `status=pass`, `browser_artifact_bytes=30957`, and
+  `browser_source_budget_bytes=32000`.
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `status=pass` and
+  `browser_startup_budget_status=browser-startup-budget-pass`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass` and
+  `native_web_render_parity_status=browser-webgpu-parity-pass`.
+- Remaining limits:
+  this is browser WebGPU feature-target to retained WorldScene/SolidGraph
+  semantic route proof. It is not a browser pick-ID target, headed/manual
+  pointer observation, or OS accessibility focus handoff.
+- 2026-06-24 U6/U7 browser pick-target semantic route slice: converted the
+  browser host's fourth app-owned RGBA target from `featureHigh` to `pick`
+  while keeping vertex stride at 80 bytes and the four-color-target browser
+  profile. `verify-browser-webgpu-world-scene` now decodes the browser pick
+  target's first nonzero RGBA sample into a `PickId`, routes it through
+  `WorldScene::semantic_editor_route_for_pick(...)`, and requires a selected
+  focused SolidGraph semantic editor node.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-contract.json` reports
+  `status=pass`,
+  `browser_host_pipeline_contract_status=source-pipeline-contract-pass`,
+  `browser_host_renderer_source_status=retained-webgpu-renderer-source-pass`,
+  `location4:Float32x4@64:pick_color`, and
+  `browser_host_renderer_source_pick_target_format=Rgba8Unorm`.
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_pick_first_nonzero_rgba=[4,0,0,0]`,
+  `browser_sampled_pick_id=4`,
+  `browser_pick_semantic_route_status=browser-pick-target-to-semantic-editor-route-pass`,
+  `browser_pick_semantic_focused_node=world-editor:assembly:instance:4`, and
+  `browser_pick_semantic_id=solid:part:2:instance:4`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`, `browser_artifact_bytes=30924`, and
+  `browser_source_budget_bytes=32000`.
+- Remaining limits:
+  this is headless Chromium/WebGPU pick target readback, not headed/manual
+  pointer observation or OS accessibility focus handoff. Browser feature target
+  currently records the low 32 bits of `FeatureId`; native retained mesh
+  feature-high proof remains separate until a future browser profile can carry
+  both feature-high and pick targets without weakening the four-target browser
+  gate.
+- 2026-06-24 U6/U7 browser pick-target semantic focus bridge slice: connected
+  the browser WebGPU pick-target readback to a mounted non-visual parametric car
+  editor semantic bridge. `verify-browser-webgpu-world-scene` now passes a
+  Rust-generated pick-ID to `semantic:world-editor:assembly:instance:*` focus
+  map into the headless browser harness, decodes the actual pick target's first
+  nonzero RGBA sample, calls `createSemanticWebBridge(...).setFocus(...)`, and
+  requires DOM focus plus `data-boon-focused` on the matching car editor node.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_world_scene_status=browser-webgpu-retained-scene-capture-pass`,
+  `browser_sampled_pick_id=4`,
+  `browser_pick_semantic_route_status=browser-pick-target-to-semantic-editor-route-pass`,
+  `browser_pick_semantic_focus_bridge_status=browser-pick-target-to-semantic-focus-bridge-pass`,
+  `browser_pick_semantic_focus_id=semantic:world-editor:assembly:instance:4`,
+  `browser_pick_semantic_focus_bridge_mounted_node_count=16`,
+  `browser_pick_semantic_focus_bridge_visual_dom_node_count=0`,
+  `browser_pick_semantic_focus_bridge_sampled_pick_id=4`,
+  `browser_pick_semantic_focus_bridge_focus_id=semantic:world-editor:assembly:instance:4`,
+  `browser_pick_semantic_focus_bridge_focused_id=semantic:world-editor:assembly:instance:4`,
+  and `browser_pick_semantic_focus_bridge_dom_ok=true`.
+- Remaining limits:
+  this is still headless Chromium/WebGPU readback plus semantic DOM focus proof,
+  not headed/manual pointer observation, live pointer-event hit testing, or real
+  OS accessibility focus handoff. The car semantic DOM remains a non-visual
+  accessibility/action bridge only.
+- 2026-06-24 U6/U7 browser canvas pointer pick readback slice: extended the
+  browser retained renderer host with
+  `pickRetainedWorldSceneAtCanvasPoint(...)`, which converts a browser canvas
+  client coordinate through the canvas CSS box into an app-owned pick texture
+  pixel and reads one pixel with WebGPU `copyTextureToBuffer`. The headless
+  verifier now dispatches a synthetic Chromium pointer event at the CSS-space
+  center of the retained pick sample, verifies event pixel, readback pixel,
+  RGBA, and pick ID all match the retained capture, and requires that proof
+  before the semantic focus bridge can pass. The static HTML shell was compacted
+  to keep the existing web source budget instead of raising it.
+- Verification:
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_world_scene_status=browser-webgpu-retained-scene-capture-pass`,
+  `browser_pick_first_nonzero_pixel=[90,48]`,
+  `browser_pick_first_nonzero_rgba=[4,0,0,0]`,
+  `browser_sampled_pick_id=4`,
+  `browser_canvas_pointer_pick_status=browser-webgpu-canvas-pointer-pick-readback-pass`,
+  `browser_canvas_pointer_pick_readback_status=browser-webgpu-canvas-pointer-pick-pass`,
+  `browser_canvas_pointer_pick_id=4`,
+  `browser_canvas_pointer_pick_rgba=[4,0,0,0]`,
+  `browser_canvas_pointer_pick_pixel=[90,48]`,
+  `browser_canvas_pointer_pick_event_pixel=[90,48]`,
+  `browser_pick_semantic_focus_bridge_status=browser-pick-target-to-semantic-focus-bridge-pass`,
+  and `browser_pick_semantic_focus_bridge_dom_ok=true`.
+  `crates/boon_web_host/static/index.html` plus
+  `crates/boon_web_host/static/world_scene_host.js` total `31932` bytes, below
+  the existing `32000` byte source budget.
+- Remaining limits:
+  this is a headless Chromium synthetic pointer-coordinate proof plus app-owned
+  one-pixel WebGPU readback, not headed/manual pointer observation, real browser
+  user input, or OS accessibility focus handoff. The semantic DOM remains a
+  non-visual accessibility/action bridge only.
+- 2026-06-24 U6/U7 browser pick-to-semantic-select-action slice: extended the
+  headless browser proof from pick/focus to a real source action dispatch. The
+  browser harness now records dispatches from the mounted parametric car
+  semantic bridge, clicks the semantic DOM node focused from the WebGPU pick
+  readback, and `verify-browser-webgpu-world-scene` feeds the resulting
+  `world.instance.*.select` action into
+  `WorldScene::editor_source_action_outcome(...)`. The verifier requires the
+  resulting `WorldPatch` to apply as a selection-only update with no geometry
+  rebuild.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_pick_semantic_select_action_status=browser-pick-target-to-semantic-select-action-pass`,
+  `browser_pick_semantic_select_dispatch_count=1`,
+  `browser_pick_semantic_select_dispatch_semantic_id=semantic:world-editor:assembly:instance:4`,
+  `browser_pick_semantic_select_dispatch_source_path=world.instance.4.select`,
+  `browser_pick_semantic_select_dispatch_source_intent=select`,
+  `browser_pick_semantic_select_action_model_status=browser-pick-select-source-action-applied`,
+  `browser_pick_semantic_select_action_kind=SelectInstance(4)`,
+  `browser_pick_semantic_select_patch_operation_count=1`,
+  `browser_pick_semantic_select_patch_selection_update_count=1`,
+  `browser_pick_semantic_select_patch_geometry_rebuild_count=0`, and
+  `browser_pick_semantic_select_selected_pick_id=4`.
+- Remaining limits:
+  this is still a headless Chromium synthetic pointer/semantic-click proof, not
+  headed/manual browser input, real OS accessibility activation, or visual
+  re-render evidence after applying the selection patch. The semantic DOM
+  remains a non-visual accessibility/action bridge only.
+- 2026-06-24 U6/U7 browser selected-scene visual re-render slice: closed the
+  browser-side selected visual evidence gap without adding a visual DOM renderer
+  or weakening the source budget. The retained browser renderer now consumes
+  `scene.selection` from the serialized packet and colors the selected instance
+  distinctly. `verify-browser-webgpu-world-scene` serializes selected packets by
+  pick ID, lets headless Chromium select the packet matching the actual WebGPU
+  pick readback, re-renders it, and requires the selected color checksum to
+  change while feature and pick checksums remain stable.
+- Verification:
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo run -p xtask -- verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_selected_scene_visible_rerender_status=browser-selected-scene-visible-rerender-pass`,
+  `browser_selected_scene_pick_id=4`, `browser_sampled_pick_id=4`,
+  `browser_selected_scene_instance=4`, and
+  `browser_pick_semantic_select_selected_instance=4`. It also reports the
+  selected color checksum changed from `575348705` to `3987917235`, while the
+  feature checksum stayed `667896564` and the pick checksum stayed
+  `3908218647`. `target/reports/native-gpu/browser-artifact-budget.json`
+  reports `status=pass`, `browser_artifact_bytes=31828`, and
+  `browser_source_budget_bytes=32000`.
+- Remaining limits:
+  this is still headless Chromium synthetic pointer/semantic-click evidence,
+  not headed/manual browser input or real OS accessibility activation. The
+  browser selected visual is selected-color feedback, not parity with the
+  native retained 2D selection outline primitive. The semantic DOM remains a
+  non-visual accessibility/action bridge only.
+- 2026-06-24 U6/U7 browser selected-halo same-pass experiment killed:
+  attempted to promote selected-color feedback toward a browser-side retained
+  selection halo by adding an expanded selected mesh draw inside the existing
+  four-target WebGPU pass. The experiment was rejected and removed because it
+  polluted identity targets: the failed report changed color checksum from
+  `575348705` to `3025417865`, but also changed feature checksum from
+  `667896564` to `3535707844` and pick checksum from `3908218647` to
+  `2494561879`. This would weaken the app-owned pick/feature proof, so the
+  selected-color path remains the kept implementation.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `jq` inspection of `target/reports/native-gpu/browser-world-scene.json`.
+- Result:
+  killed. The source artifact remains under budget after compacting the static
+  HTML shell, and the fresh browser report again passes
+  `browser_selected_scene_visible_rerender_status=browser-selected-scene-visible-rerender-pass`
+  with selected color checksum `3987917235`, feature checksum `667896564`, and
+  pick checksum `3908218647`.
+- Follow-up:
+  native/browser selected-outline parity needs a real color-only overlay path or
+  separate selected-outline pass that does not write depth, feature, or pick
+  targets. Do not retry same-pass expanded selected geometry unless identity
+  targets are preserved by construction.
+- 2026-06-24 U6/U7 browser color-only selection overlay pass: implemented the
+  safe successor to the killed same-pass selected-halo experiment. The browser
+  retained WebGPU renderer now creates a second selection overlay pipeline,
+  runs it after the main scene pass, reuses the selected mesh draw, and attaches
+  normal/feature/pick targets with `writeMask:0`. The packed scene separates
+  `overlayDraws` from main draws, and the verifier requires
+  `selectionOverlayDrawCount > 0`, unchanged main draw count, changed color
+  checksum, and unchanged feature/pick checksums.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `jq` inspection of `target/reports/native-gpu/browser-world-scene.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_selected_scene_visible_rerender_status=browser-selected-scene-color-overlay-rerender-pass`,
+  `browser_selected_scene_base_draw_count=6`,
+  `browser_selected_scene_draw_count=6`,
+  `browser_selected_scene_overlay_draw_count=1`,
+  `browser_selected_scene_pick_id=4`, and `browser_sampled_pick_id=4`. The
+  color checksum changed from `575348705` to `3987917235`, while feature stayed
+  `667896564` and pick stayed `3908218647`. The refreshed artifact report
+  records `browser_artifact_bytes=31828` against the `32000` byte budget.
+- Remaining limits:
+  this is a color-only selected mesh overlay path, not yet native retained 2D
+  outline geometry/parity. It is still headless Chromium synthetic
+  pointer/semantic-click evidence, not headed/manual browser input or real OS
+  accessibility activation.
+- 2026-06-24 U6/U7 browser outline overlay and restore pass: superseded the
+  selected-mesh overlay with a stronger color-only outline overlay. The browser
+  packer now keeps the main retained draw count unchanged, draws an expanded
+  selected mesh in gold in a separate color-only overlay pass, then draws the
+  original selected mesh over it to restore the interior. Normal, feature, and
+  pick targets are still attached with `writeMask:0`; the verifier now requires
+  `selectionOutlineDrawCount > 0`, `selectionRestoreDrawCount > 0`,
+  `selectionOverlayDrawCount == outline + restore`, unchanged main draw count,
+  changed color checksum, and unchanged feature/pick checksums.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/native-gpu/native-web-render-contract.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-contract.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_selected_scene_visible_rerender_status=browser-selected-scene-outline-overlay-rerender-pass`,
+  `browser_selected_scene_base_draw_count=6`,
+  `browser_selected_scene_draw_count=6`,
+  `browser_selected_scene_overlay_draw_count=2`,
+  `browser_selected_scene_outline_draw_count=1`, and
+  `browser_selected_scene_restore_draw_count=1`. The color checksum changed
+  from `575348705` to `3764660407`, while feature stayed `667896564` and pick
+  stayed `3908218647`. The refreshed artifact report records
+  `browser_artifact_bytes=31998` against the unchanged `32000` byte budget.
+- Remaining limits:
+  this is still headless Chromium synthetic evidence. The outline is an
+  expanded retained mesh overlay with an interior restore draw, not exact
+  native/browser color-pixel parity and not yet a shared native/browser outline
+  geometry compiler.
+- 2026-06-24 U6 browser generated artifact inventory budget: upgraded
+  `verify-browser-artifact-budget` from a source-only budget plus
+  target-directory existence probe to a measured generated-artifact inventory.
+  The gate now scans explicit browser output roots (`pkg`, `dist`, `web/pkg`,
+  `www/pkg`, `examples/web/pkg`, `examples/browser/pkg`, `target/browser`,
+  `target/web`, and top-level `target/wasm32-unknown-unknown/{debug,release}`)
+  for actual `.wasm`, `.js`, `.mjs`, and `.css` files, while skipping Rust
+  build-internal `build`, `deps`, `incremental`, and `.fingerprint`
+  directories. Each generated artifact records path, kind, raw bytes, optional
+  `.gz` sidecar bytes/path, and SHA-256. Source-host bytes remain a separate
+  strict budget.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`,
+  `browser_artifact_budget_status=browser-host-source-and-generated-inventory-budget-pass`,
+  `browser_artifact_bytes=31998`,
+  `browser_source_budget_bytes=32000`,
+  `generated_browser_artifact_count=0`,
+  `generated_browser_artifact_raw_bytes=0`,
+  `generated_browser_artifact_gzip_sidecar_bytes=0`, and an empty
+  generated-artifact inventory.
+- Remaining limits:
+  this is inventory and budget plumbing, not a generated WASM build. Actual
+  generated browser bundle size/startup proof remains open until a generated
+  bundle exists, and compressed-size evidence currently depends on future `.gz`
+  sidecars rather than an internal compression benchmark.
+- 2026-06-24 U6 browser source and generated artifact gzip budget: made
+  compressed browser artifact budgeting deterministic inside
+  `verify-browser-artifact-budget`. `xtask` now uses `flate2` with deterministic
+  gzip headers (`mtime=0`) to measure the browser host static source manifest
+  in manifest order and to record `gzip_bytes` for any discovered generated
+  `.wasm`, `.js`, `.mjs`, or `.css` browser artifacts. Optional `.gz` sidecars
+  remain reported as metadata, but generated artifact budget enforcement now
+  uses measured raw bytes plus measured gzip bytes.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`,
+  `browser_artifact_budget_status=browser-host-source-and-generated-inventory-budget-pass`,
+  `browser_artifact_bytes=31998`,
+  `browser_source_budget_bytes=32000`,
+  `browser_source_gzip_bytes=9009`,
+  `browser_source_gzip_budget_bytes=16384`,
+  `generated_browser_artifact_status=not-present`,
+  `generated_browser_artifact_budget_includes_generated_outputs=false`,
+  `generated_browser_artifact_count=0`,
+  `generated_browser_artifact_raw_bytes=0`, and
+  `generated_browser_artifact_gzip_bytes=0`.
+- Remaining limits:
+  this is still inventory and budget plumbing, not a generated WASM build or
+  browser startup proof. The current generated-artifact scan found no generated
+  browser artifacts, so the only non-zero compressed measurement today is the
+  source-host bundle.
+- 2026-06-24 U6 browser startup source gzip budget: carried the deterministic
+  source gzip budget into `verify-browser-startup-budget`. The startup verifier
+  now measures the `boon_web_host` static source manifest with the same
+  deterministic gzip helper used by `verify-browser-artifact-budget`, records
+  `browser_startup_source_gzip_bytes` and
+  `browser_source_gzip_budget_bytes`, and fails if startup proof would hide a
+  raw or compressed source-host artifact regression. The startup evidence
+  classification remains unchanged: headless Chromium/CDP proof only, not
+  human-visible latency and not generated WASM bundle proof.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `status=pass`,
+  `browser_startup_budget_status=browser-startup-budget-pass`,
+  a finite positive `browser_first_useful_frame_ms` under the `20000` ms
+  runaway budget,
+  `browser_startup_source_artifact_bytes=31998`,
+  `browser_source_budget_bytes=32000`,
+  `browser_startup_source_gzip_bytes=9009`,
+  `browser_source_gzip_budget_bytes=16384`,
+  `browser_startup_generated_artifact_status=not-present`,
+  `browser_startup_generated_artifact_count=0`,
+  `browser_startup_is_human_visible_latency=false`, and
+  `browser_startup_is_generated_wasm_bundle_budget=false`.
+- Remaining limits:
+  this is still a headless Chromium/CDP startup verifier. It does not prove
+  headed/manual presentation latency, live browser IME behavior, or generated
+  WASM/JS bundle startup.
+- 2026-06-24 U6 generated browser artifact evidence classification: made the
+  browser artifact/startup reports explicit about generated browser outputs
+  being absent. `verify-browser-artifact-budget` now reports
+  `generated_browser_artifact_status` and
+  `generated_browser_artifact_budget_includes_generated_outputs`.
+  `verify-browser-startup-budget` now reports
+  `browser_startup_generated_artifact_status` and
+  `browser_startup_generated_artifact_count`. Startup keeps
+  `browser_startup_is_generated_wasm_bundle_budget=false` because the current
+  headless startup proof loads the static source host, not a generated WASM/JS
+  bundle.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `generated_browser_artifact_status=not-present`,
+  `generated_browser_artifact_budget_includes_generated_outputs=false`,
+  `generated_browser_artifact_count=0`, and
+  `generated_browser_artifact_gzip_bytes=0`.
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `browser_startup_generated_artifact_status=not-present`,
+  `browser_startup_generated_artifact_count=0`, and
+  `browser_startup_is_generated_wasm_bundle_budget=false`.
+- Remaining limits:
+  this still does not create a generated browser/WASM bundle. It only prevents
+  the existing source-host and headless startup gates from overclaiming what
+  they prove.
+- 2026-06-24 U6/U7 native-web exact-parity diagnostics: improved the
+  captured-frame comparison/parity evidence without changing acceptance
+  semantics. `verify-native-web-render-comparison` now reports
+  `comparison_exact_parity_status`,
+  `comparison_feature_mask_mismatch_ratio_ppm`, and
+  `comparison_color_mask_mismatch_ratio_ppm`. `verify-native-web-render-parity`
+  mirrors mismatch counts, mismatch ratios, mismatch pixel samples, and
+  tolerance pixels from the comparison report. The gate still passes only as a
+  raster-tolerance check; exact checksum parity remains an explicit mismatch.
+  Mismatch samples now include bounded 3x3 ownership neighborhoods, so the
+  report shows the local edge around each differing pixel rather than only the
+  coordinate.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-mask-raster-tolerance-pass`,
+  `comparison_exact_parity_status=feature-and-color-exact-mismatch`,
+  `comparison_mismatch_pixel_count=3`,
+  `comparison_feature_mask_mismatch_pixel_samples=[(187,70,native-only),(187,75,native-only),(91,106,browser-only)]`,
+  `comparison_feature_mask_mismatch_ratio_ppm=61.0`,
+  `comparison_feature_mask_tolerance_pixels=5`,
+  `comparison_color_mask_mismatch_pixel_count=3`,
+  `comparison_color_mask_mismatch_pixel_samples=[(187,70,native-only),(187,75,native-only),(91,106,browser-only)]`,
+  `comparison_color_mask_mismatch_ratio_ppm=61.0`, and
+  `comparison_color_mask_tolerance_pixels=5`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `browser_webgpu_visual_parity_status=feature-and-color-mask-measured-pass-color-exact-mismatch`,
+  `native_browser_exact_parity_status=feature-and-color-exact-mismatch`,
+  `native_browser_color_exact_match=false`, and
+  `native_browser_color_mask_within_tolerance=true`.
+- Remaining limits:
+  this is diagnostic evidence only. It does not fix the 3-pixel native/browser
+  mask difference and does not make exact color or feature checksum parity
+  pass.
+  The identical feature/color mismatch coordinates and identical mask-run counts
+  point to a tiny shared-edge rasterization/backend difference rather than
+  missing geometry. Exact parity should stay open until the renderer has a
+  shared edge/raster policy or another stricter shared path.
+  The 3x3 neighborhoods show each mismatch is a one-pixel boundary decision:
+  the two native-only pixels are adjacent to `both` on the left and `none` on
+  the right, while the browser-only pixel is adjacent to `none` on the left and
+  `both` on the right.
+- 2026-06-24 U9 fresh 3MF candidate artifact manifest: tightened the
+  `verify-3mf-export` external-candidate handoff so stale ignored artifacts
+  cannot be mistaken for current evidence. The verifier now removes prior
+  `.3mf` candidates and the prior manifest from
+  `target/artifacts/unified/3mf-export`, writes the current deterministic 3MF
+  package set, writes `candidate-manifest.json`, records the manifest path/hash
+  in the report, and adds the audit check
+  `3mf-export:external-candidate-artifact-handoff`. It also fills the standard
+  `artifact_sha256s` array with the manifest plus the generated packages, so
+  generic report-freshness checks can validate those handoff files.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3mf-export.json`;
+  `find target/artifacts/unified/3mf-export -maxdepth 1 -type f -name '*.3mf' | sort | wc -l`.
+- Report:
+  `target/reports/unified/3mf-export.json` reports `status=pass`,
+  `three_mf_export_status=deterministic-3mf-export-pass`,
+  `three_mf_external_candidate_artifact_handoff_status=fresh-manifested-candidate-artifacts-pass`,
+  `three_mf_external_candidate_artifact_count=16`,
+  `three_mf_external_candidate_artifact_on_disk_count=16`,
+  `three_mf_external_candidate_artifact_removed_stale_count=17`,
+  `three_mf_external_candidate_artifact_files_match_report=true`,
+  `three_mf_external_candidate_manifest_path=target/artifacts/unified/3mf-export/candidate-manifest.json`,
+  `artifact_sha256s` length `17`,
+  and
+  `three_mf_external_candidate_manifest_sha256=sha256:dc45ac5e07452f804a021d70d8061f914fbe321d9ed77021f0e39b2d1afa9b70`.
+- Remaining limits:
+  this is still an internal deterministic candidate-file handoff for future
+  external tools, not external 3MF conformance, slicer acceptance, or
+  third-party importer validation.
+- 2026-06-24 U6 headless browser semantic composition text proof: strengthened
+  the browser semantic/IME bridge without creating a visual DOM renderer.
+  `createSemanticWebBridge(...)` now tracks `compositionstart`,
+  `compositionupdate`, and `compositionend` on semantic text inputs, commits
+  one final `set_text` source dispatch at composition end, and suppresses the
+  immediately following duplicate `input` dispatch for the same committed text.
+  The static contract/proof now exposes `supports_composition_events` and
+  `live_bridge_composition_present`.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-semantic-scene --report target/reports/unified/semantic-scene.json`;
+  `target/debug/xtask verify-accessibility-adapters --report target/reports/unified/accessibility-adapters.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/semantic-scene.json target/reports/unified/accessibility-adapters.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_semantic_bridge_status=browser-semantic-live-bridge-executed`,
+  `browser_semantic_bridge_dispatch_count=4`,
+  `browser_semantic_bridge_text_payload=ime-final`,
+  `browser_semantic_bridge_text_dispatch_count=1`,
+  `browser_semantic_bridge_composition_event_count=3`,
+  `browser_semantic_bridge_composition_event_types=[compositionstart,compositionupdate,compositionend]`,
+  `browser_semantic_bridge_composition_final_text=ime-final`,
+  `browser_semantic_bridge_composition_input_duplicate_suppressed=true`, and
+  `browser_semantic_bridge_composition_scope=headless-synthetic-dom-composition-events-not-os-ime`.
+  `target/reports/unified/semantic-scene.json` and
+  `target/reports/unified/accessibility-adapters.json` both report
+  `web_host_semantic_bridge_live_composition_present=true`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `browser_artifact_bytes=31942` against `browser_source_budget_bytes=32000`
+  and `browser_source_gzip_bytes=9003`.
+- Remaining limits:
+  this is headless synthetic DOM composition-event proof, not headed browser
+  IME observation, not OS text-input integration proof, and not human testing.
+  The semantic DOM remains accessibility/IME/action-only and still is not
+  visual renderer parity.
+- 2026-06-24 U10 browser semantic Export 3MF action proof: extended
+  `verify-browser-webgpu-world-scene` so the mounted car editor semantic DOM
+  clicks `Export 3MF` after the WGPU pick target is semantically selected. The
+  verifier now records select/export dispatches separately, replays select then
+  export through `WorldEditorSession`, compiles the selected printable through
+  `boon_manufacturing`, exports/validates 3MF through `boon_3mf`, and fails if
+  manufacturing evidence uses visual meshes.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_pick_semantic_export_action_status=browser-pick-target-to-semantic-export-action-pass`,
+  `browser_pick_semantic_export_scope=headless-browser-semantic-dispatch-host-authoritative-3mf-not-browser-download`,
+  `browser_pick_semantic_total_dispatch_count=2`,
+  `browser_pick_semantic_export_dispatch_count=1`,
+  `browser_pick_semantic_export_dispatch_source_path=world.manufacturing.export_3mf`,
+  `browser_pick_semantic_export_dispatch_source_intent=press`,
+  `browser_pick_semantic_export_action_model_status=browser-pick-export-source-action-exported-3mf`,
+  `browser_pick_semantic_export_preparation_status=ReadySelectedPrintable`,
+  `browser_pick_semantic_export_selected_printable=true`,
+  `browser_pick_semantic_export_print_status=Pass`,
+  `browser_pick_semantic_export_three_mf_status=Pass`,
+  `browser_pick_semantic_export_three_mf_validation_status=Pass`,
+  `browser_pick_semantic_export_three_mf_opc_zip_byte_count=169752`, and
+  `browser_pick_semantic_export_visual_mesh_used=false`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass` and
+  `native_web_render_parity_status=browser-webgpu-parity-pass`.
+- Remaining limits:
+  this is headless browser semantic dispatch plus host-authoritative selected
+  printable 3MF generation. It is not browser file download/export UX, not
+  headed/manual browser testing, and not external 3MF conformance, slicer
+  acceptance, or third-party importer validation.
+- 2026-06-25 U6/U7 native-browser retained pick target parity: aligned native
+  retained mesh target 4 with the browser retained mesh contract by making it a
+  pick-ID target instead of the old high-feature target. Target 3 is now checked
+  honestly as a low-32 feature-ID mask, while full feature IDs remain in
+  scene/runtime data. `WorldSceneMeshPipelineProof` records pick target
+  artifacts and sampled pick IDs. `verify-browser-webgpu-world-scene` now asks
+  the browser capture harness for pick mask runs, and the native/web comparison
+  gates require feature, pick, and color masks to be within tolerance.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`;
+  `git diff --check -- crates/boon_native_gpu/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Report:
+  `target/reports/native-gpu/world-scene.json` reports `status=pass`,
+  `native_gpu_world_scene_render.native_gpu_world_scene_mesh_pipeline_status=app-owned-indexed-mesh-depth-feature-pick-readback-pass`,
+  base mesh sampled feature IDs `[1751774188]`, base mesh sampled pick IDs
+  `[1]`,
+  `native_gpu_world_scene_render.native_gpu_world_scene_parametric_car_mesh_pipeline_status=app-owned-retained-chunk-mesh-depth-feature-pick-readback-pass`,
+  and retained car mesh sampled pick IDs `[1, 2, 3, 4, 5, 6]`.
+  `target/reports/native-gpu/browser-world-scene.json` reports browser pick
+  `nonZeroPixelCount=4959` and `maskRuns=82`.
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-pick-color-mask-raster-tolerance-pass`,
+  `comparison_pick_mask_within_tolerance=true`,
+  `comparison_pick_mask_mismatch_pixel_count=3`,
+  `comparison_pick_mask_mismatch_ratio_ppm=61.0`, and
+  `native_browser_visual_exact_parity_status=feature-pick-and-color-exact-mismatch`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass`,
+  `native_web_render_parity_status=browser-webgpu-parity-pass`,
+  `native_browser_pick_mask_within_tolerance=true`, and
+  `native_browser_pick_mask_mismatch_pixel_count=3`.
+- Remaining limits:
+  this is mask-level native/browser retained parity within strict raster
+  tolerance, not exact feature/pick/color checksum parity. It is headless
+  browser plus app-owned WGPU proof, not headed/manual UX testing.
+- 2026-06-25 U6 generated browser host artifact inventory and module API: added
+  `cargo xtask build-browser-host-artifact`, which materializes the current
+  single-canvas WebGPU host source as `target/web/boon_web_host.mjs`, writes
+  `target/web/index.html`, writes deterministic
+  `target/web/boon_web_host.mjs.gz`, builds
+  `target/wasm32-unknown-unknown/release/boon_web_host.wasm`, writes
+  deterministic `target/wasm32-unknown-unknown/release/boon_web_host.wasm.gz`,
+  and records `target/web/boon_web_host_artifact.json`. The generated module
+  and retained-upload-plan and draw-plan validation wasm artifact are measured by the existing
+  `verify-browser-artifact-budget` inventory paths under `target/web` and
+  `target/wasm32-unknown-unknown/release`.
+- The wasm artifact is intentionally narrow: `boon_web_host` now emits an
+  `rlib` plus `cdylib`, and the wasm cdylib exports retained scene packet
+  schema version, vertex/index/camera byte sizes, static source budget bytes,
+  and retained upload byte totals. It does not run the browser renderer.
+- The browser host module now exports `loadBoonWebHostWasmContract(...)`, so the
+  browser world-scene proof imports the generated browser host module in
+  Chromium, passes the generated wasm bytes and actual retained scene packet
+  into that API, executes the retained upload-plan and draw-plan validation/fingerprint exports, and
+  records that browser startup loads generated wasm while the renderer still
+  runs through the JavaScript WebGPU host.
+- The checked-in static browser host source is minified with Bun and remains
+  below the 32 KiB source budget at `22512` bytes.
+- Verification:
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`;
+  `git diff --check -- crates/boon_web_host/Cargo.toml crates/boon_web_host/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Report:
+  `target/reports/native-gpu/browser-host-artifact.json` reports `status=pass`,
+  `browser_host_artifact_status=generated-browser-host-artifact-pass`,
+  `generated_browser_artifact_status=present-built-under-target-web`,
+  `generated_browser_artifact_path=target/web/boon_web_host.mjs`,
+  `generated_browser_artifact_raw_bytes=24080`,
+  `generated_browser_artifact_gzip_bytes=8301`,
+  `generated_browser_wasm_artifact_status=present-built-under-wasm32-release`,
+  `generated_browser_wasm_artifact_path=target/wasm32-unknown-unknown/release/boon_web_host.wasm`,
+  `generated_browser_wasm_artifact_raw_bytes=2926`,
+  `generated_browser_wasm_artifact_gzip_bytes=999`, and
+  `generated_browser_wasm_artifact_export_scope=retained upload-plan and draw-plan validation cdylib exports`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `status=pass`,
+  `browser_artifact_budget_status=browser-host-source-and-generated-inventory-budget-pass`,
+  `generated_browser_artifact_status=present-inventoried-under-budget`,
+  `generated_browser_artifact_budget_includes_generated_outputs=true`,
+  `generated_browser_artifact_count=2`,
+  `generated_browser_wasm_artifact_count=1`,
+  `generated_browser_artifact_raw_bytes=27006`,
+  `generated_browser_artifact_gzip_bytes=9300`,
+  `generated_browser_artifact_gzip_sidecar_bytes=9300`, and
+  `generated_browser_artifact_missing_gzip_sidecar_count=0`.
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `status=pass`,
+  `browser_startup_budget_status=browser-startup-budget-pass`,
+  `browser_startup_generated_artifact_status=present-inventoried-by-artifact-budget`,
+  `browser_startup_generated_artifact_count=2`,
+  `browser_startup_generated_wasm_artifact_count=1`,
+  `browser_startup_generated_artifact_raw_bytes=27006`,
+  `browser_startup_generated_artifact_gzip_bytes=9300`,
+  `browser_startup_generated_artifact_gzip_sidecar_bytes=9300`,
+  `browser_startup_generated_artifact_missing_gzip_sidecar_count=0`,
+  `browser_startup_is_generated_wasm_artifact_budget=true`,
+  `browser_startup_loads_generated_wasm_artifact=true`,
+  `browser_startup_runs_wasm_renderer=false`,
+  `browser_startup_retained_upload_plan_valid=1`,
+  `browser_startup_retained_upload_plan_validated_by_wasm=true`,
+  `browser_startup_retained_upload_plan_fingerprint=983041066`,
+  `browser_startup_expected_retained_upload_plan_fingerprint=983041066`,
+  `browser_startup_wasm_export_scope=retained-upload-and-draw-plan-validation-cdylib-not-browser-webgpu-command-encoder`,
+  `browser_startup_is_generated_wasm_bundle_budget=true`,
+  `browser_startup_source_artifact_bytes=24242`,
+  `browser_startup_source_gzip_bytes=8230`,
+  finite `browser_wasm_instantiate_ms`, and
+  finite positive `browser_first_useful_frame_ms` under the startup runaway budget.
+  `target/reports/native-gpu/browser-world-scene.json` reports
+  `status=pass`,
+  `browser_world_scene_status=browser-webgpu-retained-scene-capture-pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-upload-and-draw-plan-execution-pass`,
+  `browser_wasm_metadata_report.status=browser-wasm-retained-upload-and-draw-plan-executed`,
+  `browser_loads_generated_wasm_artifact=true`,
+  `browser_runs_wasm_renderer=false`,
+  `browser_wasm_retained_upload_plan_valid=1`,
+  `browser_wasm_retained_upload_plan_validated=true`,
+  `browser_wasm_retained_upload_plan_fingerprint=983041066`,
+  `browser_wasm_expected_retained_upload_plan_fingerprint=983041066`,
+  `browser_wasm_export_scope=retained-upload-and-draw-plan-validation-cdylib-not-browser-webgpu-command-encoder`,
+  `browser_wasm_artifact_byte_count=2926`,
+  `browser_wasm_loaded_byte_count=2926`,
+  `browser_wasm_module_source_bytes=24080`,
+  `browser_wasm_schema_version=1`,
+  `browser_wasm_vertex_stride_bytes=80`,
+  `browser_wasm_index_stride_bytes=4`,
+  `browser_wasm_camera_uniform_bytes=64`,
+  `browser_wasm_vertex_buffer_bytes=13600`,
+  `browser_wasm_index_buffer_bytes=3936`, and
+  `browser_wasm_total_upload_bytes=17600`.
+- Remaining limits:
+  this is generated JavaScript-module evidence for the existing browser host
+  source plus browser-executed generated Rust/WASM retained upload-plan
+  validation/fingerprint evidence through the browser host module API, not proof
+  that the browser renderer itself runs from wasm. It does not add visual
+  DOM mirroring and does not replace the separate browser render/startup proofs.
+- 2026-06-25 U6 browser beforeinput replacement text and keyboard bridge:
+  extended the live browser semantic bridge from composition-only text dispatch
+  to `beforeinput` replacement text dispatch. `world_scene_host.js` now handles
+  `inputType="insertReplacementText"`, dispatches
+  `input_kind="replace_selected_text"`, suppresses the following duplicate
+  `input`, and exposes `inputEvents()` for verifier evidence while keeping
+  composition tracking separate.
+- Static proof:
+  `crates/boon_web_host/src/lib.rs` now exercises the existing typed
+  `SemanticWebInputEvent::ReplaceSelectedText` route and requires the browser
+  host source to contain `beforeinput`, `insertReplacementText`, and
+  `inputEvents:`.
+- Dynamic proof:
+  `verify-browser-webgpu-world-scene` drives a real headless Chromium
+  `InputEvent("beforeinput", { inputType: "insertReplacementText" })`, follows
+  it with an `input` event, and requires exactly one replacement text source
+  dispatch. It also activates the semantic Save control by
+  `KeyboardEvent("keydown", { key: "Enter" })` and requires one
+  keyboard-originated press dispatch in addition to the click press dispatch.
+- Verification:
+  `bun build crates/boon_web_host/static/world_scene_host.js --format=esm --minify --outfile=/tmp/world_scene_host.min.js`;
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_semantic_bridge_status=browser-semantic-live-bridge-executed`,
+  `browser_semantic_bridge_dispatch_count=6`,
+  `browser_semantic_bridge_press_dispatch_count=2`,
+  `browser_semantic_bridge_keyboard_press_dispatch_count=1`,
+  `browser_semantic_bridge_keyboard_press_input_kind=keyboard`,
+  `browser_semantic_bridge_text_dispatch_count=2`,
+  `browser_semantic_bridge_text_payload=ime-final`,
+  `browser_semantic_bridge_replacement_text_payload=replacement-final`,
+  `browser_semantic_bridge_replacement_text_dispatch_count=1`,
+  `browser_semantic_bridge_replacement_input_kind=replace_selected_text`,
+  `browser_semantic_bridge_beforeinput_event_count=1`,
+  `browser_semantic_bridge_beforeinput_event_types=["beforeinput:insertReplacementText"]`,
+  `browser_semantic_bridge_beforeinput_duplicate_suppressed=true`, and
+  `browser_semantic_bridge_composition_input_duplicate_suppressed=true`.
+  `target/reports/native-gpu/browser-host-artifact.json` reports
+  `generated_browser_artifact_raw_bytes=22996`,
+  `generated_browser_artifact_gzip_bytes=8055`,
+  `generated_browser_wasm_artifact_raw_bytes=1250`, and
+  `generated_browser_wasm_artifact_gzip_bytes=618`.
+  `target/reports/native-gpu/browser-artifact-budget.json` reports
+  `browser_artifact_budget_status=browser-host-source-and-generated-inventory-budget-pass`,
+  `generated_browser_artifact_raw_bytes=24246`, and
+  `generated_browser_artifact_gzip_bytes=8673`.
+  `target/reports/native-gpu/browser-startup-budget.json` reports
+  `browser_startup_budget_status=browser-startup-budget-pass`,
+  `browser_startup_source_artifact_bytes=23158`,
+  `browser_startup_source_gzip_bytes=8146`,
+  `browser_first_useful_frame_ms=5351.5`,
+  `browser_startup_loads_generated_wasm_artifact=true`, and
+  `browser_startup_runs_wasm_renderer=false`.
+- Remaining limits:
+  this is still headless synthetic DOM event proof, not OS/browser human IME
+  observation. It does not add visual DOM mirroring, does not run the visual
+  renderer from WASM, and does not close full native/browser color-pixel parity
+  or headed/manual `hello_3d` pointer/orbit proof.
+- 2026-06-25 U6/U7 native-browser exact-parity edge diagnostics: added
+  structured mask mismatch diagnostics to `verify-native-web-render-comparison`
+  so the exact-parity gap is now classified instead of just tolerated. Feature,
+  pick, and color reports now each include
+  `comparison_*_mask_mismatch_diagnostics` with browser-only/native-only pixel
+  counts, component count, max component size, isolated mismatch count,
+  adjacency to shared pixels, run-count deltas, and
+  `all_mismatches_are_single_pixel_edge_islands`.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-pick-color-mask-raster-tolerance-pass`,
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  and feature/pick/color mismatch counts all equal `3`. Feature, pick, and
+  color diagnostics all report
+  `all_mismatches_are_single_pixel_edge_islands=true`,
+  `component_count=3`, `max_component_pixel_count=1`,
+  `isolated_mismatch_pixel_count=3`,
+  `adjacent_to_shared_pixel_count=3`, `browser_only_pixel_count=1`,
+  `native_only_pixel_count=2`, `same_run_count=true`, and
+  `run_count_delta=0`.
+  `target/reports/native-gpu/native-web-render-parity.json` reports
+  `status=pass`,
+  `native_web_render_parity_status=browser-webgpu-parity-pass`,
+  `native_browser_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  `native_browser_color_exact_match=false`, and feature/pick/color mismatch
+  counts all equal `3`.
+- Remaining limits:
+  this diagnoses the exact parity gap; it does not close it. The current cause
+  is a three-pixel native WGPU vs browser WebGPU edge-ownership/rasterization
+  convention difference on identical retained geometry and identical run counts.
+  Exact checksum parity should stay open until a shared deterministic edge/raster
+  policy or stricter shared render path removes those edge islands.
+- 2026-06-25 U6 browser WASM retained upload-and-draw-plan execution: moved
+  the generated browser WASM proof from metadata/upload arithmetic to retained
+  draw-plan validation over the browser-packed geometry that the JavaScript
+  WebGPU host is about to render. `boon_web_host` now exports
+  `boon_web_host_retained_upload_plan_valid(...)` and
+  `boon_web_host_retained_upload_plan_fingerprint(...)` plus
+  `boon_web_host_retained_draw_plan_valid(...)` and
+  `boon_web_host_retained_draw_plan_fingerprint(...)`.
+  `loadBoonWebHostWasmContract(...)` instantiates the generated WASM in
+  Chromium, calls those exports with the actual retained scene packet and
+  browser-packed draw-plan counts, and records validity plus deterministic
+  fingerprint evidence.
+- Verifier contract:
+  `verify-browser-webgpu-world-scene` now requires
+  `browser-wasm-retained-upload-and-draw-plan-executed`,
+  `browser_wasm_retained_upload_plan_valid=1`,
+  `browser_wasm_retained_upload_plan_validated=true`, matching
+  `browser_wasm_retained_upload_plan_fingerprint`,
+  `browser_wasm_retained_draw_plan_fingerprint`, and their expected
+  fingerprints, packed draw-plan counts matching the render report, the explicit
+  export scope
+  `retained-upload-and-draw-plan-validation-cdylib-not-browser-webgpu-command-encoder`,
+  and `browser_runs_wasm_renderer=false`. `verify-browser-startup-budget`
+  consumes the same retained upload-plan and draw-plan validation/fingerprint
+  evidence.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-upload-and-draw-plan-execution-pass`,
+  `browser_wasm_metadata_report.status=browser-wasm-retained-upload-and-draw-plan-executed`,
+  `browser_wasm_retained_upload_plan_valid=1`,
+  `browser_wasm_retained_upload_plan_validated=true`,
+  `browser_wasm_retained_upload_plan_fingerprint=983041066`,
+  `browser_wasm_expected_retained_upload_plan_fingerprint=983041066`,
+  `browser_wasm_retained_draw_plan_valid=1`,
+  `browser_wasm_retained_draw_plan_validated=true`,
+  `browser_wasm_retained_draw_plan_fingerprint=2457400091`,
+  `browser_wasm_expected_retained_draw_plan_fingerprint=2457400091`,
+  `browser_wasm_retained_draw_plan_packed_vertex_count=368`,
+  `browser_wasm_retained_draw_plan_packed_index_count=2136`,
+  `browser_wasm_retained_draw_plan_packed_draw_count=6`,
+  `browser_wasm_retained_draw_plan_selection_overlay_draw_count=0`,
+  `browser_wasm_retained_draw_plan_selection_outline_draw_count=0`,
+  `browser_wasm_retained_draw_plan_selection_restore_draw_count=0`,
+  `browser_wasm_export_scope=retained-upload-and-draw-plan-validation-cdylib-not-browser-webgpu-command-encoder`,
+  `browser_loads_generated_wasm_artifact=true`, and
+  `browser_runs_wasm_renderer=false`.
+- Remaining limits:
+  this executes generated WASM retained upload-plan and draw-plan validation/fingerprint
+  exports; it still does not run the browser renderer from WASM and does not
+  encode WebGPU commands from WASM.
+
+- 2026-06-25 U9 STL aggregate seam diagnostics: added bounded topology edge
+  samples to `StlTopologyReport` and exposed them through `verify-solid-graph`
+  for the parametric-car and printable-bracket STL aggregate paths. Also tested
+  exact same-oriented duplicate triangle culling as a repair hypothesis and
+  added `culled_duplicate_triangle_count` to the topology report.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `parametric_car_stl_export_topology_status=Pass`,
+  `parametric_car_stl_export_topology_non_manifold_edge_count=0`,
+  `parametric_car_stl_export_topology_culled_duplicate_triangle_count=0`,
+  `mesh_export_hole_preserving_export_topology_status=Fail`,
+  `mesh_export_hole_preserving_export_topology_non_manifold_edge_count=2`,
+  `mesh_export_hole_preserving_export_topology_boundary_edge_count=0`,
+  `mesh_export_hole_preserving_export_topology_culled_internal_triangle_pair_count=2316`,
+  and `mesh_export_hole_preserving_export_topology_culled_duplicate_triangle_count=0`.
+- The remaining printable-bracket seam samples are
+  `[-35, -17, 3] -> [35, -17, 3]` and
+  `[125, -17, 3] -> [55, -17, 3]`, each with
+  `incident_triangle_count=4`. This disproves exact duplicate identical faces as
+  the cause; the next U9 fix should target slice/region stitching or aggregate
+  triangulation at adjacent material/region joins.
+
+### 2026-06-25 U9 STL aggregate seam fix
+
+- Goal:
+  fix the printable-bracket hole-preserving STL aggregate topology seam without
+  weakening topology validation or hiding the engine/exporter problem.
+- Cause found:
+  the previous two non-manifold seam edges were produced by blind layer-prism
+  caps at a union transition. The base top cap and upright bottom cap overlapped
+  only partially, so exact opposite-triangle culling could not remove the hidden
+  interface. After clipping that cap overlap, unsplit side-wall rings produced
+  T-junction boundary edges because the cap had new footprint vertices that the
+  walls did not share. The layer-surface adjacency check was also too strict:
+  normal floating-point accumulation around `z=3` exceeded raw `f64::EPSILON`.
+- Implementation:
+  `boon_mesh_export` now uses a scale-aware adjacent-layer tolerance, clips
+  visible caps against adjacent same-part/same-instance/same-material rectangular
+  footprints, propagates same-region wall boundary breakpoints through the print,
+  and triangulates caps with matching wall boundary points.
+- Gate tightening:
+  `verify-solid-graph` now requires the printable-bracket exported aggregate STL
+  topology to pass with zero boundary edges, zero non-manifold edges, and zero
+  degenerate triangles. The old expected-failure condition was removed.
+- Verification:
+  `cargo fmt -p boon_mesh_export -p xtask`;
+  `cargo test -p boon_mesh_export -- --nocapture`;
+  `cargo test -p boon_manufacturing printable_bracket_compiles_to_deterministic_layers_with_holes -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Report:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `mesh_export_hole_preserving_export_topology_status=Pass`,
+  `mesh_export_hole_preserving_export_topology_boundary_edge_count=0`,
+  `mesh_export_hole_preserving_export_topology_non_manifold_edge_count=0`,
+  `mesh_export_hole_preserving_export_topology_raw_triangle_count=5928`,
+  `mesh_export_hole_preserving_export_topology_triangle_count=5928`,
+  `parametric_car_stl_export_topology_status=Pass`,
+  `parametric_car_stl_export_topology_boundary_edge_count=0`, and
+  `parametric_car_stl_export_topology_non_manifold_edge_count=0`.
+- Remaining limits:
+  this is bounded STL aggregate stitching for the current rectangle-footprint
+  manufacturing transitions. General polygon-boolean slicer stitching,
+  arbitrary CSG watertightness, and external 3MF/slicer/importer conformance
+  remain separate work.
+
+### 2026-06-25 U6 browser WASM renderer-dispatch contract
+
+- Goal:
+  move one more retained-renderer contract into the generated browser WASM
+  artifact while keeping the report honest that actual WebGPU command encoding
+  remains JavaScript-hosted.
+- Implementation:
+  `boon_web_host` now exports
+  `boon_web_host_retained_renderer_dispatch_valid` and
+  `boon_web_host_retained_renderer_dispatch_fingerprint`. The static browser
+  host calls those exports from `loadBoonWebHostWasmContract` after packing the
+  retained scene and reports `retainedRendererDispatchValid`,
+  `retainedRendererDispatchFingerprint`, and
+  `retainedRendererDispatchValidatedByWasm`.
+- Gate tightening:
+  `verify-browser-webgpu-world-scene`, `build-browser-host-artifact`, and
+  `verify-browser-startup-budget` now require the
+  `retained-upload-draw-and-render-dispatch-validation-cdylib-not-browser-webgpu-command-encoder`
+  scope and matching Rust-side renderer-dispatch fingerprint.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo check -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-upload-draw-and-render-dispatch-execution-pass`,
+  `browser_wasm_metadata_report.status=browser-wasm-retained-upload-draw-and-render-dispatch-executed`,
+  `browser_wasm_retained_renderer_dispatch_valid=1`,
+  `browser_wasm_retained_renderer_dispatch_validated=true`, and
+  `browser_wasm_retained_renderer_dispatch_fingerprint=492193420`, matching
+  `browser_wasm_expected_retained_renderer_dispatch_fingerprint=492193420`.
+  `target/reports/native-gpu/browser-startup-budget.json` repeats the same
+  dispatch proof under `browser_startup_*` fields. The generated WASM artifact
+  remains small in `target/reports/native-gpu/browser-host-artifact.json`:
+  `generated_browser_wasm_artifact_raw_bytes=3609` and
+  `generated_browser_wasm_artifact_gzip_bytes=1082`.
+- Remaining limits:
+  `browser_runs_wasm_renderer=false` remains intentional. This validates
+  upload-plan, draw-plan, and renderer-dispatch contracts from generated WASM,
+  but browser WebGPU command encoding/submission still runs through the
+  generated JavaScript host. Full native/browser color-pixel parity and
+  headed/live browser IME proof remain open.
+
+### 2026-06-25 U6 browser WASM command-stream contract
+
+- Goal:
+  move one more browser renderer contract into generated WASM by validating the
+  retained WebGPU command-stream shape, while staying honest that JavaScript
+  still owns direct browser WebGPU API calls.
+- Implementation:
+  `boon_web_host` now exports
+  `boon_web_host_retained_command_stream_valid` and
+  `boon_web_host_retained_command_stream_fingerprint`. The static browser host
+  calls those exports from `loadBoonWebHostWasmContract` and reports retained
+  render pass count, color attachment count, depth attachment count, draw
+  count, copyTextureToBuffer target count, queue submit count, validation, and
+  fingerprint.
+- Gate tightening:
+  `verify-browser-webgpu-world-scene` and `verify-browser-startup-budget` now
+  require the command-stream validation/fingerprint evidence and the generated
+  artifact scope
+  `retained-upload-draw-render-dispatch-and-command-stream-validation-cdylib-not-browser-webgpu-command-encoder`.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/browser-world-scene.json` reports `status=pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-upload-draw-render-dispatch-and-command-stream-execution-pass`,
+  nested
+  `browser_wasm_metadata_report.status=browser-wasm-retained-upload-draw-render-dispatch-and-command-stream-executed`,
+  `browser_wasm_retained_command_stream_valid=1`,
+  `browser_wasm_retained_command_stream_validated=true`,
+  `browser_wasm_retained_command_stream_fingerprint=2011113264`,
+  matching
+  `browser_wasm_expected_retained_command_stream_fingerprint=2011113264`,
+  one render pass, four color attachments, one depth attachment, six draws,
+  five copyTextureToBuffer targets, and six queue submits. Startup budget
+  consumes the same proof under `browser_startup_retained_command_stream_*`.
+- Remaining limits:
+  `browser_runs_wasm_renderer=false` remains intentional. This is generated
+  WASM validation of a compact command-stream contract, not direct browser
+  WebGPU API ownership by WASM. Full native/browser exact color-pixel parity
+  and headed/live browser IME proof remain open.
+
+### 2026-06-25 U6/U7 native-browser input parity diagnostics
+
+- Goal:
+  determine whether the native/browser three-pixel exact-parity gap is caused
+  by different packed inputs or by backend rasterization after equivalent
+  inputs.
+- Implementation:
+  `WorldSceneMeshPipelineProof` now records checksums for native vertex, index,
+  and camera-uniform upload bytes, plus per-component vertex checksums for
+  position, color, normal, feature, and pick data. The browser WebGPU host now
+  reports matching packed-buffer checksums from `renderRetainedWorldScene`.
+- Gate tightening:
+  `verify-native-web-render-comparison` now requires byte-identical
+  raster-critical inputs before claiming native/browser raster-tolerance pass:
+  position, feature, pick, index, and camera buffers. Full interleaved vertex
+  checksum mismatch remains diagnostic because normal bytes do not affect
+  feature/pick coverage.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_input_buffer_parity_status=byte-identical-raster-input-buffers-pass`,
+  `native_browser_raster_input_buffer_checksums_match=true`, and
+  `native_browser_full_vertex_buffer_checksums_match=false`. Position, material
+  color, feature, pick, index, and camera checksums match exactly. Only normal
+  checksums differ:
+  `browser_vertex_normal_buffer_checksum=3350269297` versus
+  `native_vertex_normal_buffer_checksum=4276200353`.
+- Remaining limits:
+  exact color/frame parity remains open:
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch` with
+  three single-pixel edge islands. The current evidence rules out different
+  geometry positions, feature IDs, pick IDs, index data, and camera uniforms;
+  it does not yet eliminate backend rasterization differences or normal-byte
+  packing differences.
+
+### 2026-06-25 U6/U7 native-browser normal byte diagnostics
+
+- Goal:
+  turn the remaining normal-byte checksum mismatch into inspectable evidence
+  instead of a single opaque checksum.
+- Implementation:
+  `WorldSceneMeshPipelineProof` now records the first retained normal-color
+  vertex components as raw IEEE-754 bit samples. The browser WebGPU host reports
+  matching `packedVertexNormalBitSamples`, and
+  `verify-native-web-render-comparison` carries both sample sets into the report.
+  A short browser-side f32-rounding experiment was killed because it changed the
+  browser normal checksum without matching native; the browser normal math was
+  restored to the previous semantics while keeping the less-brittle
+  `normalize3` helper name.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`;
+  `git diff --check -- crates/boon_native_gpu/src/lib.rs crates/boon_web_host/static/world_scene_host.js crates/xtask/src/main.rs`.
+- Report:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_input_buffer_parity_status=byte-identical-raster-input-buffers-pass`,
+  `native_browser_raster_input_buffer_checksums_match=true`, and
+  `native_browser_full_vertex_buffer_checksums_match=false`.
+  Normal checksums remain different:
+  `browser_vertex_normal_buffer_checksum=3350269297` versus
+  `native_vertex_normal_buffer_checksum=4276200353`. The first sample shows a
+  one-ULP difference in the first normal component: browser
+  `[1064908441, 1051574150, 1056964608, 1065353216]` versus native
+  `[1064908442, 1051574150, 1056964608, 1065353216]`.
+- Remaining limits:
+  full interleaved vertex byte parity remains open. The exact
+  feature/pick/color edge-island mismatch remains separate from normal packing
+  because the raster-critical position, feature, pick, index, and camera inputs
+  already match byte-for-byte.
+
+### 2026-06-25 U5/U6 WGPU small-region readback gate
+
+- Goal:
+  turn the Phase 5 `verify-wgpu-readback` placeholder into an advertised,
+  schema-validated gate that proves app-owned browser/native WGPU readback
+  behavior without claiming exact full-frame visual parity.
+- Implementation:
+  `WorldSceneMeshPipelineProof` now records a bounded native 1x1 pick-target
+  readback. The native proof uses the feature-target hit-test pixel, copies a
+  1x1 region from the pick target, maps the padded 256-byte transfer buffer,
+  and verifies the four logical pick bytes against the same pixel in the full
+  pick artifact. `verify-native-gpu-world-scene` enforces that proof for both
+  the basic `hello_3d` mesh and the retained parametric car mesh.
+  `verify-wgpu-readback` is now advertised, dispatched, has a native default
+  report path, and consumes fresh browser, native world-scene, and
+  native/browser comparison reports.
+- Verification:
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-wgpu-readback --report target/reports/native-gpu/wgpu-readback.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/wgpu-readback.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Report:
+  `target/reports/native-gpu/wgpu-readback.json` reports `status=pass`,
+  `wgpu_readback_status=app-owned-browser-and-native-small-pick-readback-pass`,
+  browser pick id `4`, native basic mesh pick id `1`, native retained car mesh
+  pick id `2`, and
+  `native_browser_input_buffer_parity_status=byte-identical-raster-input-buffers-pass`.
+  `target/reports/native-gpu/native-web-render-parity.json` remains pass with
+  `browser_webgpu_visual_parity_status=feature-and-color-mask-measured-pass-color-exact-mismatch`.
+- Remaining limits:
+  this proves small-region/pixel pick readback for current browser and native
+  retained world-scene fixtures, while preserving full-target diagnostic
+  readbacks. It does not yet replace every diagnostic full-target readback with
+  small regions. Exact full-frame feature/pick/color parity remains open with
+  three single-pixel edge islands. Retained WGPU arenas, coalesced dirty writes,
+  demand-driven scheduling, and device-loss replay remain separate U5 work.
+
+### 2026-06-25 U5 demand-driven render-loop aggregate gate
+
+- Goal:
+  turn the Phase 5 `verify-demand-driven-render-loop` placeholder into a real
+  advertised gate without weakening the existing live idle/wake proof.
+- Implementation:
+  added `verify-demand-driven-render-loop` to `xtask` command advertising,
+  dispatch, default native report path, and blocker-audit classification. The
+  command is a `--check-existing` aggregate over fresh native-contract
+  `verify-native-gpu-idle-wake` reports for Counter, TodoMVC, Cells, and the
+  custom-project fixture. The required report list is shared with
+  `native_gpu_regression_required_reports()` so the standalone demand-driven
+  gate and broader native regression gate require the same idle/wake evidence.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `cargo build -p xtask`;
+  `cargo test -p boon_native_app_window demand_driven -- --nocapture`;
+  `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`.
+- Report:
+  `target/reports/native-gpu/demand-driven-render-loop.json` is written as a
+  native gate report and currently reports `status=fail`, because the four
+  required live idle/wake reports are not present in the current workspace:
+  `target/reports/native-gpu/idle-wake-counter.json`,
+  `target/reports/native-gpu/idle-wake-todomvc.json`,
+  `target/reports/native-gpu/idle-wake-cells.json`, and
+  `target/reports/native-gpu/idle-wake-custom-projects.json`.
+- Remaining limits:
+  demand-driven rendering is not accepted yet. The next slice must generate
+  those four `verify-native-gpu-idle-wake` reports fresh, or document the exact
+  local Weston/test-helper blocker if the isolated live native window
+  environment is unavailable.
+
+### 2026-06-25 U5 WGPU retained arena gate
+
+- Goal:
+  turn the Phase 5 `verify-wgpu-retained-arenas` placeholder into a real gate
+  that proves native retained WGPU upload/cache behavior and links it to fresh
+  native/browser retained scene evidence.
+- Implementation:
+  added `verify-wgpu-retained-arenas` to `xtask` command advertising,
+  dispatch, default native report path, and blocker-audit classification. The
+  gate checks source evidence for `QuadUploadRing`, `CachedGpuQuadBatch`, dirty
+  retained upload chunk IDs, and buffer reuse counters; runs focused native
+  WGPU tests for upload-ring growth/wrap/invalidation and one-changed-retained
+  chunk reuse; and consumes fresh `verify-native-gpu-world-scene` plus
+  `verify-browser-webgpu-world-scene` reports.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-wgpu-retained-arenas --report target/reports/native-gpu/wgpu-retained-arenas.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/world-scene.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/wgpu-retained-arenas.json`.
+- Report:
+  `target/reports/native-gpu/wgpu-retained-arenas.json` reports
+  `status=pass` and
+  `wgpu_retained_arenas_status=native-wgpu-retained-arena-and-browser-retained-plan-pass`.
+  Current evidence includes `native_retained_surface_chunk_count=6`,
+  `native_dirty_upload_chunk_count=1`, `native_queue_write_count=1`,
+  `browser_packet_chunk_count=3`, and true browser retained upload-plan,
+  draw-plan, and renderer-dispatch validation.
+- Remaining limits:
+  this is not final coalesced dirty-write proof, device-loss replay, or live
+  idle/wake acceptance. Those remain separate U5 work.
+
+### 2026-06-25 U2-U4 lower-layer contract gates
+
+- Goal:
+  add the missing advertised verifier names for the current runtime/document,
+  retained-layout/text-cache, and render-patch contracts.
+- Implementation:
+  added `verify-runtime-change-sets`, `verify-document-batch-patches`,
+  `verify-retained-layout-deltas`, `verify-text-cache-layers`, and
+  `verify-render-patch-contract` to `xtask` command advertising, dispatch, and
+  blocker-audit classification. Each gate writes a report under
+  `target/reports/unified` and runs focused existing tests plus source-evidence
+  checks for the relevant contract.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `target/debug/xtask verify-runtime-change-sets --report target/reports/unified/runtime-change-sets.json`;
+  `target/debug/xtask verify-document-batch-patches --report target/reports/unified/document-batch-patches.json`;
+  `target/debug/xtask verify-retained-layout-deltas --report target/reports/unified/retained-layout-deltas.json`;
+  `target/debug/xtask verify-text-cache-layers --report target/reports/unified/text-cache-layers.json`;
+  `target/debug/xtask verify-render-patch-contract --report target/reports/unified/render-patch-contract.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/runtime-change-sets.json target/reports/unified/document-batch-patches.json target/reports/unified/retained-layout-deltas.json target/reports/unified/text-cache-layers.json target/reports/unified/render-patch-contract.json`.
+- Report:
+  all five reports pass. Status fields are
+  `runtime-semantic-render-change-sets-pass`, `document-batch-patches-pass`,
+  `retained-layout-deltas-pass`, `text-cache-layers-pass`, and
+  `render-patch-contract-pass`.
+- Remaining limits:
+  these gates verify the current lower-layer contracts. They do not complete
+  true incremental layout, fix the NovyWave interaction latency budgets, or
+  finish protocol cleanup.
+
+### 2026-06-25 unified architecture aggregate gate
+
+- Goal:
+  add the missing `verify-unified-architecture-all` command as a final
+  check-existing aggregate over the unified roadmap report set.
+- Implementation:
+  added `verify-unified-architecture-all` to `xtask` command advertising,
+  dispatch, and blocker-audit classification. The aggregate requires 18 child
+  reports covering runtime/document/layout/text/render contracts, WGPU retained
+  arenas/readback/demand scheduling, native-web parity, semantics/accessibility,
+  browser artifact budget, 3D examples, SolidGraph, manufacturing slices, 3MF,
+  and the parametric car.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Report:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status=fail`,
+  `unified_architecture_all_status=unified-architecture-all-incomplete`,
+  `required_report_count=18`, and `passed_report_count=17`. The current blocker
+  set includes stale child report-schema failures after the latest `xtask`
+  rebuild plus the real unfinished demand-driven child report.
+- Remaining limits:
+  this is not a final acceptance pass. Before using the aggregate as the final
+  handoff command, refresh every child report after the final source/docs state
+  and resolve the missing live idle/wake reports required by
+  `verify-demand-driven-render-loop`.
+
+### 2026-06-25 U5 Counter idle/wake debug loop
+
+- Task:
+  continue `verify-demand-driven-render-loop` by trying to generate the first
+  required child report,
+  `target/reports/native-gpu/idle-wake-counter.json`.
+- Result:
+  keep the verifier fixes and diagnostics, but do not mark the demand-driven
+  task complete.
+- Implementation kept:
+  the post-idle source-replacement payload now uses canonical source-project
+  unit roles/hash construction instead of raw text SHA-256 with an implicit
+  `source` role. The target helper now recognizes `press` as an action intent,
+  and native layout-probe targeting helpers accept either a raw layout proof or
+  a wrapped `layout_proof` report. The failure path now records a targeting
+  summary for the layout payload it saw.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo test -p xtask native_idle_wake_target_helpers_accept_wrapped_press_intents -- --nocapture`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`.
+- Evidence:
+  the focused helper unit test passes. The live Counter idle/wake report still
+  fails, but it now proves the idle part is quiet:
+  `preview_idle_rendered_frame_delta=0`, `dev_idle_rendered_frame_delta=0`,
+  `skipped_idle_poll_count≈493`, `input_poll_count≈500`,
+  `forced_frame_count=0`, `scheduled_wake_count=0`, and all idle CPU p95 fields
+  are `0.0`.
+- Evidence:
+  the source-replacement wake path now passes in the live report. The ack is
+  queued with a valid canonical project hash, ready status passes, present probe
+  passes, readback probe passes, and elapsed time is about `244ms`.
+- Remaining blocker:
+  `post_idle_input_probe` still fails with
+  `no generic source-bound hit target was available for post-idle input`.
+  The associated layout-proof artifact contains Counter hit/source evidence
+  (`hit_target_count=3`, `source_intent_count=9`, with `press` intents), and the
+  new unit test says that wrapped shape should resolve. The next live pass
+  should inspect the newly added `layout_probe_summary` rather than continuing
+  blind reruns.
+- Stop condition:
+  do not run more long live idle/wake loops until the next pass can use the new
+  targeting diagnostics. Do not treat this as an idle-loop performance failure;
+  the remaining failure is verifier input-target selection/diagnostics.
+
+### 2026-06-25 U5 Counter idle/wake visual-staleness addendum
+
+- Task:
+  continue the same Counter child report, but correct the earlier evidence
+  interpretation.
+- Status:
+  incomplete. Do not mark `verify-demand-driven-render-loop` done from the
+  current Counter evidence.
+- Changes kept:
+  native role reports now use a real binary hash instead of `running:/path`;
+  xtask passes `BOON_NATIVE_PLAYGROUND_BINARY_HASH` into layout-proof and
+  isolated idle/wake child processes; the desktop supervisor accepts the
+  skip-shutdown hold-window mode when the preview completes its hold cleanly;
+  embedded layout frames derive a renderer cache key from the in-memory layout
+  frame hash.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo build -p xtask -p boon_native_playground`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`.
+- Evidence:
+  the fresh Counter idle/wake report still fails, now only on
+  `post-idle source replacement-to-present readback evidence failed`.
+  Idle-loop CPU/render evidence is good
+  (`preview_idle_rendered_frame_delta=0`,
+  `dev_idle_rendered_frame_delta=0`, combined idle CPU p95 about `0.66%`) and
+  `desktop_pass=true` / `supervisor_pass=true`.
+- Corrected diagnosis:
+  the previous "input/source replacement is visually good" conclusion was too
+  weak. App-owned frame inspection shows both
+  `target/artifacts/native-gpu/frames/2772101-preview-748e6f7e0b4138d3-3.png`
+  and
+  `target/artifacts/native-gpu/frames/2772101-preview-748e6f7e0b4138d3-4.png`
+  still render `Counter` with value `0`. The runtime ack reports accepted
+  semantic state changes, and standalone layout proof of the replacement source
+  lowers `Counter updated` with layout hash
+  `5ff1f351e324acdec660c2d7787cc2056a83384150ef07a5d2b52f8a0d2edcfd`, so the
+  remaining blocker is the live preview commit/rebuild path from changed
+  runtime/source state into the visible document frame.
+- Next action:
+  fix the generic live preview layout commit path so source events and source
+  replacement rebuild or patch the shared `PreviewSharedRenderState` from the
+  updated runtime/source. Then strengthen the Counter idle/wake child
+  acceptance to assert semantic pixels (`-1` after decrement and a
+  deterministic replacement marker such as `Counter updated`) instead of only
+  frame hash/content revision movement.
+
+### 2026-06-25 U5 Counter idle/wake semantic-evidence addendum
+
+- Task:
+  close the false-green visual evidence gap found in the previous addendum
+  without weakening the native GPU idle/wake budgets.
+- Status:
+  incomplete. Keep the code and verifier hardening, but do not mark
+  `verify-demand-driven-render-loop` or the Counter child complete.
+- Changes kept:
+  the live post-idle `press` path no longer treats a source event with an
+  address as focus-only unless the source intent is actually `focus`; runtime
+  `document_initial_locals` now merges alias fields into existing object locals
+  so `store.count` cannot hide a newer top-level `count`; successful
+  replace-source status now includes compact `visible_layout_frame_hash` and
+  `visible_layout_text_evidence`; and `verify-native-gpu-idle-wake` requires
+  the expected mutated replacement label when one is known.
+- Verification:
+  `cargo fmt -p xtask -p boon_native_playground`;
+  `cargo test -p boon_native_playground counter_operator_host_press_rebuilds_visible_count_layout -- --nocapture`;
+  `cargo test -p boon_native_playground replace_source_ack_is_small_and_worker_commits_latest_revision -- --nocapture`;
+  `cargo test -p xtask native_idle_wake_target_helpers_accept_wrapped_press_intents -- --nocapture`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique -- --nocapture`;
+  `cargo build -p xtask -p boon_native_playground`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`.
+- Current report facts:
+  the fresh Counter report still fails with
+  `post-idle native input-to-present readback evidence failed`, but the failure
+  is now a real debug budget miss instead of stale pixels or supervisor timeout.
+  `live_observation.status=pass`, `desktop_exit_status="exit status: 0"`,
+  `desktop_exit_timeout_ms=150000`, `effective_preview_hold_ms=105000`,
+  `post_idle_input_probe.status=pass`, and
+  `post_idle_source_replace_probe.status=pass`.
+- Semantic evidence:
+  post-idle input rebuilds the runtime-backed layout with
+  `post_input_frame_method=render-patch-state-delta-and-full-runtime-backed-layout-recompute`,
+  writes
+  `target/artifacts/native-gpu/document-layout/counter-807fd3fd4786-state-81ea3f811a57.json`,
+  and that layout contains `-1`. Source replacement reports
+  `expected_visible_text="Counter updated"`,
+  `expected_visible_text_found=true`, and visible layout texts
+  `["Counter updated", "0", "-", "Reset", "+"]`.
+- Remaining blocker:
+  `post_idle_input_to_present_ms=224.818565` exceeds the debug budget
+  `post_idle_input_to_present_ms_p95=120.0`. The same run shows
+  `post_idle_source_replace_to_present_ms=148.339764`, which is under the debug
+  source-replacement budget `250.0`. The input layout work itself is small
+  (`document_eval_lower_ms=0.991838`, `text_measure_and_layout_ms=1.815237`,
+  `typecheck_ms=0.954935`) and app-owned readback after input is about
+  `6.6935ms`, so the current evidence points at external wake/present latency
+  rather than parser/runtime/layout work for this Counter path.
+- Killed experiment:
+  a same-iteration external-wake render attempt in
+  `boon_native_app_window` was tested and reverted. It did not improve the
+  focused child report: the trial still failed with
+  `post_idle_input_to_present_ms=229.432415` and the same semantic pass shape.
+  Do not reapply that exact loop tweak without adding finer wake/present
+  timestamp evidence first.
+- Next action:
+  do not return to stale-pixel or parser micro-optimization debugging for this
+  child. Continue from the preview demand-loop wake/present path, scheduler
+  wake delivery, or broader unified retained-WGPU work that can reduce
+  post-idle input present latency below the debug `120ms` budget.
+
+## 2026-06-25 U5 Demand-Driven Aggregate Child Evidence
+
+- Goal:
+  make the demand-driven aggregate itself useful for future debugging and
+  handoff, without weakening any native GPU gate.
+- Status:
+  report-observability slice implemented; `verify-demand-driven-render-loop`
+  still fails honestly.
+- Changes kept:
+  native GPU report bundles now write `required_report_count`,
+  `checked_report_count`, `missing_report_count`, `passed_report_count`,
+  `failed_report_count`, schema/contract/all-step/git/worktree freshness
+  counts, `aggregate_checks_pass`, and explicit `child_reports`. Missing
+  children are child entries, not only prose blockers.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique -- --nocapture`;
+  `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`;
+  `git diff --check`;
+  process hygiene check for native playground, Weston, the Weston test driver,
+  and idle/wake verifier processes.
+- Current report facts:
+  `target/reports/native-gpu/demand-driven-render-loop.json` reports
+  `status=fail`, `aggregate_checks_pass=false`, `required_report_count=4`,
+  `checked_report_count=1`, `missing_report_count=3`,
+  `passed_report_count=0`, `failed_report_count=1`,
+  `schema_file_valid_report_count=1`, `schema_valid_report_count=0`,
+  `native_contract_valid_report_count=0`,
+  `all_steps_pass_report_count=0`, `git_fresh_report_count=1`, and
+  `worktree_fresh_report_count=0`.
+- Child summary:
+  `idle-wake-counter` exists but has `observed_status=fail`,
+  `schema_valid=false`, `native_contract_valid=false`,
+  `all_steps_pass=false`, `git_fresh=true`, and `worktree_fresh=false`.
+  `idle-wake-todomvc`, `idle-wake-cells`, and
+  `idle-wake-custom-projects` are missing.
+- Next action:
+  continue implementation from a non-0804A slice or from the broader retained
+  WGPU/demand-loop wake path. Do not rerun all live children expecting a pass
+  until Counter's input present latency or its replacement architecture is
+  actually addressed.
+
+## 2026-06-25 U5 Counter idle/wake render-hook timing attribution
+
+- Goal:
+  stop guessing at the Counter child failure and attribute the remaining
+  post-idle input latency to the concrete render-loop stage that consumes the
+  time.
+- Status:
+  measurement and report hardening kept; Counter child remains failing;
+  `verify-demand-driven-render-loop` remains unfinished.
+- Changes kept:
+  `NativeRenderLoopState` and render-loop reports now include focused timing
+  markers for poll start, dirty poll, external wake observation, render start,
+  surface acquire, render-hook completion, queue submit, and present
+  completion. `verify-native-gpu-idle-wake` copies those markers into the
+  `present_probe`/`readback_probe` objects.
+- Verification:
+  `cargo fmt -p boon_native_app_window -p xtask`;
+  `cargo test -p boon_native_app_window wake_handle_interrupts_idle_wait`;
+  `cargo test -p boon_native_app_window demand_driven_idle_wait_reports_timeout_and_wake_reason`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`.
+- Current report facts:
+  fresh `target/reports/native-gpu/idle-wake-counter.json` still reports
+  `status=fail` and blocker
+  `post-idle native input-to-present readback evidence failed`.
+  The operator-host input path passes semantically with `ack_round_trip_ms=18`
+  and stage total about `17.0ms`.
+- Timing attribution:
+  wake observation to dirty poll/render start is sub-millisecond:
+  wake observed at `4852.419073ms`, poll start `4852.459363ms`, dirty poll
+  `4852.885191ms`, render start `4852.889945ms`. Surface acquire takes about
+  `0.222ms`; queue submit to present completion is about `3.5ms`; readback is
+  about `6.9ms`.
+- Current culprit:
+  the preview render hook takes about `203.7ms` for the post-idle input frame
+  (`4852.889945ms` -> `5056.573689ms`) and about `198.2ms` for the source
+  replacement frame (`5073.24239ms` -> `5271.444423ms`). That is the remaining
+  U5 Counter child slow path.
+- Next action:
+  do not resume blind wake/runtime/parser/layout microchanges for this child.
+  Inspect the preview render hook and retained renderer path for per-frame
+  reconstruction, text shaping, scene lowering, cache misses, synchronous
+  reporting, or other expensive work hidden inside the hook. A real fix should
+  make the preview frame use retained render-scene/resources instead of
+  rebuilding expensive render-hook state each post-idle frame.
+- Stop condition:
+  do not mark the Counter child or `verify-demand-driven-render-loop` done
+  until the strict `120ms` post-idle input-to-present budget passes with fresh
+  app-owned native GPU evidence, or a new explicit architecture task supersedes
+  this child with equal or stronger evidence.
+
+## 2026-06-25 U11 Unified Aggregate Child Evidence
+
+- Goal:
+  make the top-level unified architecture aggregate explain its current
+  incompleteness with structured child evidence, not only blocker strings.
+- Status:
+  report-observability slice implemented; `verify-unified-architecture-all`
+  still fails honestly.
+- Changes kept:
+  `verify-unified-architecture-all` now writes `checked_report_count`,
+  `missing_report_count`, `failed_report_count`,
+  `schema_valid_report_count`, `command_match_report_count`,
+  `aggregate_checks_pass`, and `child_reports`. Child entries include
+  existence, observed status/command, command match, status pass, schema
+  validity, artifact hash, and schema error text when validation fails.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo test -p xtask advertised_xtask_commands_are_unique -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`;
+  `git diff --check -- crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`;
+  process hygiene check for native playground, Weston, the Weston test driver,
+  and idle/wake verifier processes.
+- Current report facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status=fail`, `aggregate_checks_pass=false`,
+  `required_report_count=18`, `checked_report_count=18`,
+  `missing_report_count=0`, `passed_report_count=17`,
+  `failed_report_count=1`, `schema_valid_report_count=0`, and
+  `command_match_report_count=18`.
+- Interpretation:
+  all child reports are currently schema-stale after the latest `xtask`
+  rebuild; the first recorded schema error is a stale `binary_hash` on
+  `target/reports/unified/runtime-change-sets.json`. Separately,
+  `demand-driven-render-loop` is the only child with non-passing observed
+  status.
+- Next action:
+  do not claim unified completion from `17/18` pass status. The final aggregate
+  requires regenerating child reports after the final binary, and the
+  demand-driven child still requires real idle/wake evidence or an architectural
+  fix.
+
+### 2026-06-25 U6 browser WASM command-word contract
+
+- Goal:
+  move one more retained browser command contract into generated WASM without
+  claiming that WASM owns browser WebGPU API calls.
+- Status:
+  implemented and verified for the current browser-world-scene/startup budget
+  gates.
+- Changes kept:
+  `boon_web_host` now exports
+  `boon_web_host_retained_command_stream_word_count`,
+  `boon_web_host_retained_command_stream_word_at`, and
+  `boon_web_host_retained_command_stream_words_fingerprint`. The browser host
+  loads those exports and reports the command words returned by WASM, expected
+  command words derived from the observed browser command stream, word-list
+  match status, and word-list fingerprint.
+- Gate tightening:
+  `verify-browser-webgpu-world-scene` and `verify-browser-startup-budget` now
+  require the WASM command-word evidence in addition to the earlier scalar
+  command-stream validation/fingerprint. The generated artifact scope is now
+  `retained-upload-draw-render-dispatch-command-stream-and-words-validation-cdylib-not-browser-webgpu-command-encoder`.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/browser-world-scene.json` reports
+  `status=pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-upload-draw-render-dispatch-command-stream-and-words-execution-pass`,
+  `browser_wasm_retained_command_stream_word_count=8`,
+  command words `[2953576449, 1, 4, 1, 6, 0, 5, 6]`,
+  `browser_wasm_retained_command_stream_words_match_expected=true`,
+  `browser_wasm_retained_command_stream_words_fingerprint=1506068472`, and
+  `browser_runs_wasm_renderer=false`. Startup budget consumes the same proof
+  and also keeps `browser_startup_runs_wasm_renderer=false`.
+- Remaining limits:
+  this still is not a WASM renderer or direct WebGPU command encoder. JavaScript
+  owns `GPUDevice`, `GPUQueue`, command encoding, render passes, draw calls,
+  readbacks, and queue submission.
+- Next action:
+  the next browser-WASM architecture slice should make WASM own
+  `packet -> packed buffers + draw descriptors` and require those packed
+  buffer checksums to match the JS-submitted render report exactly. The next
+  native/browser parity slice should add adapter/backend provenance and a
+  browser-aligned native capture for the remaining three single-pixel edge
+  islands without weakening the current tolerance gate.
+
+### 2026-06-25 U6/U7 native-browser adapter provenance
+
+- Goal:
+  strengthen the native/browser exact-parity diagnosis without weakening the
+  current raster-tolerance gate.
+- Status:
+  implemented and verified for the current native-web comparison/parity path.
+- Changes kept:
+  `verify-native-web-render-comparison` now records native WGPU adapter request
+  policy and resolved adapter/backend/vendor/device/driver information. It also
+  records the browser request policy and emits
+  `native_browser_exact_mismatch_is_adapter_edge_policy_candidate` when the
+  exact mismatch fits byte-identical inputs plus fallback-vs-browser
+  single-pixel edge ownership.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_adapter_provenance_status=byte-identical-raster-inputs-with-fallback-vs-browser-edge-islands`,
+  `native_browser_exact_mismatch_is_adapter_edge_policy_candidate=true`,
+  native request `LowPower` with `force_fallback_adapter=true`, native adapter
+  `llvmpipe (LLVM 20.1.2, 256 bits)` on Vulkan with driver
+  `Mesa 25.2.8-0ubuntu0.24.04.1 (LLVM 20.1.2)`, browser request
+  `high-performance` with no fallback adapter request, byte-identical raster
+  inputs, and exactly three feature/pick/color edge-island mismatch pixels.
+- Remaining limits:
+  exact parity remains open. This is diagnosis/provenance only, not an exact
+  parity fix.
+- Next action:
+  add a separate browser-aligned native capture using
+  `PowerPreference::HighPerformance` and `force_fallback_adapter=false` where
+  available, while preserving the current fallback tolerance path and its
+  reports.
+
+### 2026-06-25 U6/U7 browser-aligned native capture
+
+- Goal:
+  test whether the exact native/browser mismatch disappears when native WGPU
+  uses a high-performance non-fallback adapter instead of the fallback adapter.
+- Status:
+  implemented and verified as a diagnostic comparison slice.
+- Changes kept:
+  `verify-native-web-render-comparison` now performs the existing fallback
+  native capture and a second browser-aligned native capture with
+  `PowerPreference::HighPerformance` and `force_fallback_adapter=false`. The
+  second capture records adapter details, exact feature/pick/color match flags,
+  and feature/pick/color mismatch counts. The existing fallback
+  raster-tolerance gate is unchanged.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `browser_aligned_native_capture_status=available`. The aligned capture uses
+  Vulkan on `NVIDIA GeForce RTX 2070`, driver `NVIDIA 580.126.09`, device type
+  `DiscreteGpu`, with request `HighPerformance` and no fallback adapter. Exact
+  parity still does not pass:
+  `browser_aligned_native_exact_parity_status=feature-pick-or-color-exact-mismatch`,
+  all feature/pick/color exact match flags are false, and feature/pick/color
+  mismatch counts remain `3`.
+- Updated diagnosis:
+  the earlier fallback-vs-browser explanation is not enough. The exact mismatch
+  also appears on the high-performance NVIDIA native path, so the remaining
+  problem is likely cross-backend/browser edge ownership or an unproven
+  native/browser command-path detail.
+- Next action:
+  add per-mismatch provenance for the three pixels: triangle/chunk/feature/pick
+  and depth samples around the mismatch coordinates for browser, fallback
+  native, and browser-aligned native.
+
+### 2026-06-25 U6/U7 per-mismatch pixel provenance
+
+- Goal:
+  make the remaining three native/browser exact-parity mismatch pixels
+  inspectable without weakening the current raster-tolerance pass gate.
+- Status:
+  implemented and verified as a diagnostic evidence slice.
+- Changes kept:
+  `verify-native-web-render-comparison` now records
+  `comparison_mismatch_pixel_provenance_samples`. The samples are the union of
+  existing feature, pick, and color mismatch coordinates. For each coordinate,
+  the report records browser mask-run ownership, fallback-native ownership,
+  browser-aligned-native ownership, fallback-native PNG RGBA samples, and
+  browser-aligned-native PNG RGBA samples. The browser capture also accepts
+  bounded explicit probe pixels from the previous comparison report, so the
+  three current mismatch coordinates now have browser-side RGBA samples without
+  hardcoding those coordinates in the verifier.
+- Evidence limits kept explicit:
+  this slice initially left per-pixel depth unavailable; the later
+  "per-mismatch depth provenance" slice below resolves that limitation with
+  bounded explicit browser/native depth probes.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  `comparison_mismatch_pixel_provenance_browser_rgba_available=true`, and
+  three provenance samples: `(187,70)`, `(187,75)`, and `(91,106)`.
+- Diagnosis:
+  `(187,70)` and `(187,75)` are native-only edge pixels. Browser masks report
+  no feature, no pick, and clear color there, with explicit browser probe RGBA
+  `[0,0,0,0]` for feature/pick and `[5,6,8,255]` for color, while both
+  fallback native and browser-aligned native report feature/pick id `1` and
+  non-clear color.
+  `(91,106)` is the inverse browser-only edge pixel: browser masks report
+  feature, pick, and non-clear color, with explicit browser probe RGBA
+  `[1,0,0,0]` for feature, `[3,0,0,0]` for pick, and `[76,158,230,255]` for
+  color, while both native captures report zero feature/pick and clear color.
+  Fallback native and high-performance browser-aligned native agree at all
+  three sampled pixels.
+- Updated next action:
+  the remaining exact-parity investigation should focus on browser/native
+  triangle edge inclusion or command-state differences. A useful next evidence
+  step is a command-state/depth-state comparison or bounded depth-image sample
+  artifact that can explain edge ownership.
+
+### 2026-06-25 U6/U7 per-mismatch depth provenance
+
+- Goal:
+  add bounded browser/native depth samples to the existing three-pixel
+  native/browser exact-parity diagnostic without weakening the raster-tolerance
+  pass gate.
+- Status:
+  implemented and verified as a diagnostic evidence slice.
+- Changes kept:
+  the browser WebGPU depth capture accepts the same explicit probe pixels as
+  feature/pick/color provenance and reports `depthPixelSamples`. Native retained
+  world-scene mesh proofs carry bounded `depth_pixel_samples` when the
+  comparison verifier supplies probe coordinates. `verify-native-web-render-comparison`
+  records browser, fallback-native, and browser-aligned-native depth samples in
+  each `comparison_mismatch_pixel_provenance_samples` entry.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p boon_web_host -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p boon_web_host browser_renderer_source_contract_is_present_but_not_executed`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/browser-world-scene.json` reports
+  `browser_native_web_comparison_probe_pixel_count=3` and
+  `browser_depth_pixel_sample_count=3`. `target/reports/native-gpu/native-web-render-comparison.json`
+  reports `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  `comparison_mismatch_pixel_provenance_browser_rgba_available=true`, and
+  `comparison_mismatch_pixel_provenance_depth_available=true`.
+- Diagnosis:
+  `(187,70)` and `(187,75)` are native-only edge pixels with browser clear
+  depth `1` and native visible depths around `0.999945`. `(91,106)` is the
+  inverse browser-only edge pixel with browser visible depth
+  `0.9999538064002992` and native clear depth `1`. Fallback native and
+  browser-aligned native agree at all three depth samples.
+- Updated next action:
+  compare browser/native raster command state that affects triangle edge
+  inclusion: viewport, scissor, primitive state, depth state, draw order, index
+  order, and clip-space positions around the edge pixels.
+
+### 2026-06-25 U6/U7 native-browser raster command-state provenance
+
+- Goal:
+  record browser/native raster command state for the retained parametric-car
+  comparison so the remaining exact-parity gap is not diagnosed only by code
+  inspection.
+- Status:
+  implemented and verified as a diagnostic evidence slice.
+- Changes kept:
+  browser retained WebGPU render reports and native retained mesh proofs now
+  include primitive/depth/index state, attachment counts, default
+  viewport/scissor encoding, draw command encoding, and draw-call count.
+  `verify-native-web-render-comparison` records
+  `native_browser_command_state_status`,
+  `native_browser_raster_pipeline_state_match`,
+  `native_browser_draw_command_encoding_match`,
+  `browser_raster_command_state`, `native_raster_command_state`, and
+  `browser_aligned_native_raster_command_state`.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p boon_web_host -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p boon_web_host browser_renderer_source_contract_is_present_but_not_executed`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `native_browser_command_state_status=pipeline-state-match-draw-command-encoding-diff`,
+  `native_browser_raster_pipeline_state_match=true`, and
+  `native_browser_draw_command_encoding_match=false`. Browser reports
+  `draw_command_encoding=retained-chunk-index-ranges` with `draw_call_count=6`;
+  both native captures report `draw_command_encoding=single-draw-all-indices`
+  with `draw_call_count=1`.
+- Diagnosis:
+  pipeline state is now proven equivalent at the report level; the remaining
+  proven command-state difference is draw segmentation. The next exact-parity
+  experiment should make the native comparison capture optionally issue
+  retained-chunk draw calls matching the browser draw ranges and measure
+  whether the three edge/depth ownership mismatches disappear.
+
+### 2026-06-25 U6/U7 chunked native draw diagnostic
+
+- Goal:
+  test whether matching the browser retained chunk draw segmentation fixes the
+  remaining native/browser exact-parity edge mismatch.
+- Status:
+  implemented and verified as a killed diagnostic hypothesis.
+- Changes kept:
+  native retained mesh proofs now record explicit draw ranges. The native
+  comparison renderer has a diagnostic-only chunked-draw mode that emits one
+  `drawIndexed` per retained chunk range. `verify-native-web-render-comparison`
+  runs a third native diagnostic capture using high-performance non-fallback
+  native WGPU and browser-like retained chunk draw ranges.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p boon_web_host browser_renderer_source_contract_is_present_but_not_executed`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `chunked_native_capture_status=available`,
+  `chunked_native_browser_draw_command_encoding_match=true`,
+  `chunked_native_exact_parity_status=feature-pick-or-color-exact-mismatch`,
+  and chunked feature/pick/color mismatch counts `3`, `3`, and `3`.
+- Diagnosis:
+  draw segmentation is now a killed explanation. Matching the browser's six
+  retained chunk draw calls does not change the edge/depth ownership
+  disagreement. The next useful exact-parity slice should add per-mismatch
+  triangle/clip-space provenance: identify adjacent triangles and compare
+  projected vertex positions or edge-function inputs for the three mismatch
+  pixels.
+
+### 2026-06-25 U6/U7 per-mismatch triangle probe
+
+- Goal:
+  add geometric context to the three native/browser exact-parity edge pixels so
+  future work can distinguish bad inputs from sub-pixel raster edge policy.
+- Status:
+  implemented and verified as a diagnostic evidence slice.
+- Changes kept:
+  native retained mesh proofs now carry bounded `triangle_probe_samples` for
+  explicit probe pixels. Each sample records nearest candidate triangles,
+  clip/NDC/screen positions, signed edge values, edge distances, barycentric
+  values, inside/outside status, and encoded feature/pick RGBA. The comparison
+  report embeds those probes for fallback native, browser-aligned native, and
+  chunked native captures.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_native_gpu -p xtask`;
+  `cargo build -p xtask`;
+  `cargo test -p boon_web_host browser_renderer_source_contract_is_present_but_not_executed`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`;
+  `git diff --check -- crates/boon_native_gpu/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-pick-color-mask-raster-tolerance-pass`,
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  `comparison_mismatch_pixel_provenance_depth_available=true`, and
+  `comparison_mismatch_pixel_provenance_triangle_probe_available=true`.
+- Diagnosis:
+  the remaining three exact-mismatch pixels are sub-pixel edge coverage cases.
+  `(187,70)` and `(187,75)` are native-only pixels inside nearest native
+  triangles but only `0.014428062` px and `0.003182119` px from an edge.
+  `(91,106)` is browser-only and sits `0.013378497` px from the nearest native
+  triangle edge while native classifies it outside. Fallback native,
+  browser-aligned native, and chunked native agree on the triangle probes.
+- Updated next action:
+  add browser-side projected-triangle/edge-function provenance for the same
+  pixels, or explicitly decide that retained browser/native parity should stay
+  tolerance-based because different WebGPU implementations may make different
+  sub-pixel edge inclusion decisions at this precision.
+
+### 2026-06-25 U6/U7 browser-side triangle probe
+
+- Goal:
+  add browser-side geometric provenance for the same three native/browser
+  exact-parity edge pixels, so the remaining decision is not based only on
+  native CPU projection.
+- Status:
+  implemented and verified as a diagnostic evidence slice.
+- Changes kept:
+  browser retained WebGPU render reports now include bounded
+  `browserTriangleProbeSamples` computed from the packed browser vertex/index
+  buffers and JS `Math.fround` projection math for explicit probe pixels.
+  `verify-native-web-render-comparison` embeds the browser probe in each
+  `comparison_mismatch_pixel_provenance_samples` entry and requires it for
+  `comparison_mismatch_pixel_provenance_triangle_probe_available=true`.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host browser_renderer_source_contract_is_present_but_not_executed`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`;
+  `git diff --check -- crates/boon_web_host/static/world_scene_host.js crates/boon_web_host/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `status=pass`,
+  `native_browser_comparison_status=native-browser-feature-pick-color-mask-raster-tolerance-pass`,
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`, and
+  `comparison_mismatch_pixel_provenance_triangle_probe_available=true`.
+- Diagnosis:
+  the remaining mismatch has moved from suspected input/projection mismatch to
+  actual WebGPU raster edge inclusion/precision. `(187,70)` and `(187,75)` are
+  native-only in captured targets, yet browser JS and native CPU probes both
+  classify the same nearest triangles (`33` and `25`) as inside. `(91,106)` is
+  browser-only and both probes classify adjacent nearest triangles as outside,
+  with matching feature/pick IDs.
+- Updated next action:
+  either keep retained native/browser parity tolerance-based with explicit
+  exact-parity kill criteria, or add a heavier shader-side/debug-render
+  edge-function target if exact parity remains worth pursuing.
+
+### 2026-06-25 U6/U7 exact-parity disposition gate
+
+- Goal:
+  stop reopening the same three-pixel native/browser exact-parity edge loop
+  without new evidence by making the tolerance-based disposition explicit in
+  reports.
+- Status:
+  implemented and verified.
+- Changes kept:
+  `verify-native-web-render-comparison` now emits
+  `native_browser_exact_parity_disposition_status`,
+  `native_browser_exact_parity_required_gate=false`, and structured
+  `native_browser_exact_parity_kill_criteria`. `verify-native-web-render-parity`
+  propagates those fields into the aggregate parity report.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json target/reports/native-gpu/browser-artifact-budget.json target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`;
+  `git diff --check -- crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Current report facts:
+  `target/reports/native-gpu/native-web-render-comparison.json` reports
+  `native_browser_comparison_status=native-browser-feature-pick-color-mask-raster-tolerance-pass`,
+  `comparison_exact_parity_status=feature-pick-and-color-exact-mismatch`,
+  `native_browser_exact_parity_disposition_status=exact-parity-killed-retain-raster-tolerance-subpixel-edge-policy`,
+  and `native_browser_exact_parity_required_gate=false`. The parity aggregate
+  propagates the same disposition while reporting
+  `native_web_render_parity_status=browser-webgpu-parity-pass`.
+- Kill criteria:
+  exact parity is killed as a required readiness gate only while raster
+  tolerance passes, packed input checksums match, pipeline state matches,
+  chunked draw diagnostics are available and browser-aligned, browser RGBA
+  provenance is available, depth provenance is available, and browser/native
+  triangle probes are available.
+- Reopen conditions:
+  mismatch count exceeds tolerance, mismatch class stops being isolated edge
+  islands, packed vertex/index/camera inputs diverge, pipeline state diverges,
+  depth or triangle provenance is missing, or a deliberate shader-side
+  edge-function target is added.
+- Updated next action:
+  move U6/U7 forward into broader browser/native graphics, IME/action, or 3D
+  viewport/product integration work instead of continuing exact-pixel parity
+  micro-debugging for this retained parametric-car report.
+
+### 2026-06-25 U5 Counter idle/wake offscreen-proof hot-path fix
+
+- Task:
+  U5 demand-driven render-loop child evidence after the render-hook timing
+  attribution showed a `~200ms` preview render-hook slice.
+- Status:
+  implemented and verified for the Counter child only. U5 remains
+  `in-progress`.
+- Root cause:
+  the idle/wake interaction measurement was still running an extra offscreen
+  app-owned scene render/readback inside the preview render hook, even though
+  the render loop already had visible-surface WGPU readback evidence for the
+  same hot frame.
+- Change kept:
+  `verify-native-gpu-idle-wake` now launches the desktop/preview path with
+  `--skip-render-hook-app-owned-proof`. In that mode the preview render hook
+  reports a visible-surface replacement proof and does not run
+  `render_app_owned_scene_pixels` in the interaction hot path. Normal verifier
+  modes that require the app-owned offscreen proof artifact are left intact.
+- Verification:
+  `cargo fmt -p boon_native_playground -p xtask`;
+  `cargo build -p xtask -p boon_native_playground`;
+  `cargo test -p boon_native_playground app_owned_readback_reuse_requires_matching_render_frame_hash`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-counter.json`.
+- Report result:
+  `target/reports/native-gpu/idle-wake-counter.json` now reports
+  `status=pass` with no blockers. Post-idle total is `84.471239ms`, present
+  probe is `77.365992ms`, readback is `6.99971ms`, and operator-host input ack
+  is `6ms`.
+- Remaining cost:
+  post-idle render-hook work is still about `64.2ms`
+  (`4745.964212ms` -> `4810.170371ms`). Source replacement still spends about
+  `77.3ms` in the render hook (`4828.287217ms` -> `4905.573774ms`) and has
+  `169.228961ms` total latency.
+- Follow-up:
+  do not treat this as full renderer success or U5 completion. The next U5
+  work should refresh/run the demand-driven aggregate and remaining children,
+  then reduce the real retained render-hook work rather than putting diagnostic
+  proof/readback back into the interaction path.
+
+### 2026-06-25 U5 TodoMVC idle/wake render-scene lowering attribution
+
+- Task:
+  U5 demand-driven render-loop TodoMVC child evidence after the Counter
+  measurement-path fix.
+- Status:
+  instrumented and diagnosed, but not complete. The TodoMVC child still fails
+  the strict post-idle input-to-present budget.
+- Change kept:
+  native render-loop reports now preserve the latest external render proof, and
+  xtask present/readback probes copy that proof into child reports. The
+  visible-surface idle/wake measurement path also skips full `RenderScene`
+  hashing while the offscreen app-owned proof path keeps the real hash.
+- Verification:
+  `cargo fmt -p boon_native_app_window -p boon_native_playground -p xtask`;
+  `cargo build -p boon_native_app_window -p boon_native_playground -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example todomvc --idle-ms 1500 --report target/reports/native-gpu/idle-wake-todomvc.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-todomvc.json`.
+- Report result:
+  `target/reports/native-gpu/idle-wake-todomvc.json` reports `status=fail`
+  with blocker `post-idle native input-to-present readback evidence failed`.
+  Post-idle total is `167.272476ms`; present probe is `151.670483ms`;
+  readback is `9.574626ms`.
+- Measured culprit:
+  `render_scene_hash_ms` dropped to `0.0068ms` on the visible-surface
+  measurement path, so the previous hash overhead is no longer the blocker.
+  The dominant remaining phase is `render_scene_cache_ms=67.087969` with
+  `render_scene_cache_hit=false` and `render_scene_patch_applied=false`.
+- Follow-up:
+  do not continue blind micro-optimization on this child. The next real fix is
+  retained `RenderScene` patch/reuse for TodoMVC-style non-text changes
+  (row/checkbox/style state), or a broader renderer architecture change that
+  avoids full scene lowering for small interactions. U5 still needs the
+  TodoMVC child to pass or a documented kill/postpone decision, fresh
+  Cells/custom child evidence, and
+  `verify-demand-driven-render-loop --check-existing`.
+
+### 2026-06-25 U5 TodoMVC idle/wake checkbox/operator-path fix
+
+- Task:
+  continue U5 demand-driven render-loop TodoMVC child evidence and identify
+  the real slow path instead of blindly tuning verifier waits.
+- Status:
+  TodoMVC idle/wake child now passes. `verify-demand-driven-render-loop`
+  remains unfinished until the remaining child reports and aggregate are
+  refreshed.
+- Changes kept before the fix:
+  `verify-native-gpu-idle-wake` now writes
+  `target/artifacts/native-gpu/idle-wake-*/parent-progress.json` with parent
+  stages for layout probe, Weston readiness, desktop spawn, live-state read,
+  procfs sample, post-idle input/source probes, desktop exit wait, Weston
+  teardown, and final observation assembly. Idle/wake desktop probe hold
+  padding is configurable through
+  `--probe-min-dev-hold-ms`/`--probe-preview-hold-tail-ms`; the idle/wake
+  verifier uses a bounded `30s` preview tail instead of the old generic
+  `60s` probe tail. Loop-report polling sleeps were widened from `2ms` to
+  `10ms` to reduce verifier CPU while waiting for JSON report changes.
+- Renderer fix:
+  checkbox primitives in `boon_native_gpu` now use bounded vector triangles
+  instead of per-pixel 1px raster quads. The focused checkbox test now asserts
+  bounded geometry while preserving expected colors. This reduced the
+  TodoMVC checkbox dirty upload from hundreds of KB to `14400` bytes across
+  the three dirty checkbox chunks, with `0` staging wraps.
+- Operator-path fix:
+  preview `operator-host-input` no longer jumps straight from source-event
+  deltas to full runtime-backed layout recompute. It first tries the existing
+  paint-space patch path, updates shared render state from the patched layout,
+  and falls back to full recompute only when patching is not proven. The
+  passing TodoMVC report used
+  `post_input_frame_method=render-patch-state-delta-and-paint-space-patch`.
+- Refined diagnosis:
+  the earlier layout-proof observation was a useful preflight-cost smell, but
+  it was not the final TodoMVC gate failure. The completed failing runs showed
+  `post_idle_input_to_present_ms` over budget, first dominated by checkbox
+  upload volume and then by the operator-host-input path forcing full layout /
+  RenderScene lowering. After the operator path patch, the render hook still
+  reports `render_scene_cache_ms=68.442932` and
+  `render_scene_patch_applied=false`, but the overall child is now under the
+  strict debug budget because the source-event update and dirty set are
+  bounded.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example counter --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-counter.json`;
+  `cargo fmt -p boon_native_gpu -p boon_native_playground`;
+  `cargo test -p boon_native_gpu --lib checkbox -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground paint_space_mixed_text_and_width_patch_keeps_text_as_render_scene_sidecar -- --nocapture`;
+  `cargo build -p boon_native_playground -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example todomvc --idle-ms 1500 --report target/reports/native-gpu/idle-wake-todomvc.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-todomvc.json`.
+- Passing report:
+  `target/reports/native-gpu/idle-wake-todomvc.json` reports `status=pass`,
+  `post_idle_input_to_present_ms=97.354603`,
+  `post_idle_source_replace_to_present_ms=11.271195`,
+  `idle_cpu_percent_preview_p95=1.987953`,
+  `preview_idle_rendered_frame_delta=0`, `dev_idle_rendered_frame_delta=0`,
+  `forced_frame_count=0`, and `scheduled_wake_count=0`. The post-idle input
+  probe stage timings report `runtime_ms=2.139935`, `layout_ms=3.648154`,
+  and `total_ms=7.98358`.
+- Follow-up:
+  do not mark U5 complete from TodoMVC alone. Refresh the remaining Cells and
+  custom-project idle/wake children, then run
+  `verify-demand-driven-render-loop --check-existing`. Separately keep the
+  TodoMVC layout-proof preflight cost and remaining
+  `render_scene_cache_ms`/`render_scene_patch_applied=false` evidence on the
+  optimization backlog.
+
+### 2026-06-25 U5 Cells idle/wake live-state and source-project fixture check
+
+- Task:
+  refresh the remaining Cells idle/wake child without hiding verifier or engine
+  limitations behind timeouts.
+- Status:
+  Cells still fails, but the failure is now specific. Live child PID/procfs
+  evidence, idle render suppression, skipped idle polls, and CPU budget pass.
+  The remaining blockers are post-idle interaction latency and source-replace
+  readiness/readback proof. U5 remains in-progress; do not run the aggregate as
+  proof until Cells and the custom-project child are passing.
+- xtask fixes kept:
+  the idle/wake verifier now waits for a complete live-state contract
+  (`preview_child_pid`, `dev_child_pid`, loop report paths, and child cmdlines)
+  instead of accepting the first parseable JSON file. For Cells, the earlier
+  first-read race embedded `status: missing` while
+  `desktop-live-state.json` arrived moments later with valid PIDs. The
+  role-report timeout now budgets for the measured duplicated Cells startup
+  cost by using `2 * layout_runtime_state_ms + 30s`, because the verifier pays
+  the expensive runtime-state path once in layout-proof and again during live
+  preview/dev startup.
+- Source-project fixture fix kept:
+  post-idle replace-source now preserves the manifest source-unit set for normal
+  examples and mutates the first visible text literal across any runtime unit.
+  This prevents the previous invalid single-unit Cells replacement that dropped
+  `examples/cells/cell.bn` and failed with
+  `memory://idle-wake-replacement.bn: required construct SOURCE is missing`.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  three focused Cells reruns of
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current Cells report:
+  `target/reports/native-gpu/idle-wake-cells.json` is schema-valid but reports
+  `status=fail`. Passing evidence:
+  `preview_child_pid=3461525`, `dev_child_pid=3468199`,
+  `live_observation.status=pass`, `preview_idle_rendered_frame_delta=0`,
+  `dev_idle_rendered_frame_delta=0`, `scheduled_wake_count=0`,
+  `skipped_idle_poll_count=1497`, `input_poll_count=1502`,
+  `idle_cpu_percent_preview_p95=0.665852`, `idle_cpu_percent_dev_p95=0.0`,
+  and `combined_idle_cpu_percent_p95=0.665852`.
+- Remaining blockers:
+  `post_idle_input_to_present_ms=214.569574` is over the `120ms` debug budget
+  even though `post_idle_frame_hash_changed=true`. Source replace presents a
+  pending/error overlay quickly
+  (`post_idle_source_replace_to_present_ms=9.914889`) but
+  `post_idle_source_replace_hash_changed=false`; the ready probe times out with
+  `ready.status=timeout`, `ready.response.status=pending`, and the expected
+  mutated text `A0 updated` is not observed. This means the remaining Cells
+  source-project work is not a visual-present timeout problem; it is the slow
+  full Cells replacement/build path not becoming ready within the current
+  verifier wait.
+- Next action:
+  either optimize/prewarm the full Cells source-project replacement path or
+  split the idle/wake source-replace proof so it measures the intended pending
+  visual feedback separately from full commit readiness. Do not weaken the
+  readback/change requirement, and do not mark U5 complete until the custom
+  child and aggregate have fresh evidence.
+
+### 2026-06-25 U5 Cells idle/wake prewarmed source-project evidence
+
+- Task:
+  finish the bounded Cells source-replace debugging loop by proving whether the
+  timeout was IPC/render/present latency or slow full Cells runtime
+  initialization.
+- Status:
+  Cells still fails, but the source-replace half is now proven and no longer a
+  current blocker. U5 remains in-progress because post-idle input-to-present is
+  still over the strict debug budget, and the custom-project child plus
+  aggregate are not complete.
+- Runtime/source-replace fix kept:
+  `boon_native_playground` caches successful prewarm build results by project
+  hash/runtime hash. A later identical source-project replacement consumes the
+  prewarmed build result, commits it synchronously to preview state, reports
+  `source_project_committed_from_prewarm=true`, keeps latest-wins counters
+  coherent, and avoids enqueueing a duplicate worker job. The idle/wake verifier
+  now prewarms the replacement source project before post-idle interaction
+  probes.
+- Verifier fixture fix kept:
+  multi-unit visible mutation now prefers explicit `label: TEXT { ... }`
+  literals before falling back to arbitrary `TEXT` literals. This avoids the
+  previous Cells false check that mutated `store.selected_address` to
+  `A0 updated`, even though the sampled visible evidence contained headers and
+  formula-bar labels rather than the selected address value.
+- Verification:
+  `cargo fmt -p boon_native_playground -p xtask`;
+  `cargo build -p boon_native_playground -p xtask`;
+  `cargo test -p boon_native_playground --bin boon_native_playground prewarm_source_project_ack_is_deferred_and_background_marks_hash -- --nocapture`;
+  `cargo fmt -p xtask`;
+  `cargo build -p xtask`;
+  two focused reruns of
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current Cells report:
+  `target/reports/native-gpu/idle-wake-cells.json` is schema-valid and reports
+  `status=fail` with only
+  `post-idle native input-to-present readback evidence failed`.
+  Source replace now passes: `post_idle_source_replace_hash_changed=true`,
+  `post_idle_source_replace_to_present_ms=74.001046`,
+  expected text `A updated` is found, prewarm reports `status=pass`,
+  replacement ack reports `source_project_prewarmed=true`,
+  `source_project_committed_from_prewarm=true`, `replace_job_queue_depth=0`,
+  and ready returns in `0.394213ms`.
+- Actual slowness cause documented:
+  the slow source-project path is full Cells live runtime initialization, not
+  readback/present. The latest report records `live_runtime_ms=37815.698649`
+  during the prewarmed replacement build. Inside that,
+  `initialize_generic_derived` dominates, and `cells.value` recomputation alone
+  costs `28485.455958999977ms` across `2600` cells. That is the concrete
+  runtime-layer culprit to address with indexed dependency narrowing,
+  formula/value memoization, virtualized visible rows, or compile-time constant
+  and LIST/storage specialization; do not spend more blind time on IPC or WGPU
+  source-replace mechanics for this symptom.
+- Remaining blocker:
+  post-idle input still changes the frame but takes `215.866488ms` against the
+  `120ms` budget. This should be debugged from the post-idle input wake/present
+  path and any Cells-specific recompute/layout work still happening after input,
+  not from the already-proven source-project prewarm path.
+- Next action:
+  either reduce the Cells post-idle input path below `120ms`, or explicitly
+  carry the Cells child as unfinished while continuing with the custom-project
+  child and aggregate. Do not mark `verify-demand-driven-render-loop` complete
+  until the remaining children have fresh passing evidence or an explicit
+  postponed disposition.
+
+### 2026-06-25 TASK-0804C currentness-gate diagnostic
+
+- Task:
+  TASK-0804C root-list currentness/materialization follow-up after subagent
+  review identified `try_materialize_root_list_view_field_only` as a possible
+  next branch to verify.
+- Status:
+  diagnostic counters kept; performance task remains unfinished.
+- Change kept:
+  root-list profile/report counters now expose when targeted clean-row/field
+  skipping is disabled by the `previous_root_reads_are_current` branch:
+  `targeted_skip_disabled_by_currentness_refresh_count`,
+  `targeted_skip_disabled_dirty_row_count`, and
+  `targeted_skip_disabled_dirty_field_count`. The counters flow through runtime
+  aggregates and the native `runtime_root_list_cause_summary`.
+- Killed experiment:
+  a generic field-cache clone cleanup was tried and reverted. It only moved
+  click/input p95 from `21.515ms` to `21.252ms`, did not reduce root-list
+  buckets by the required `10%` and `1ms`, and regressed hover over budget to
+  `17.202ms`.
+- Verification:
+  `cargo fmt -p boon_runtime -p boon_native_playground`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_prevalidated_clean_hit_still_refreshes_deferred_dirty_root -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_currentness_barrier_ -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_ -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Report result:
+  the official NovyWave speed gate still fails strict budgets:
+  `click_to_cursor_p95=30.43634ms`, `input_to_visible_p95=30.43634ms`,
+  `hover_p95=16.820361ms`, `divider_drag_p95=16.425585ms`,
+  `runtime_apply_p95=12.80899ms`, and `layout_rebuild_p95=5.275276ms`.
+  Renderer upload remains retained and small: `3600` post-interaction bytes,
+  `4` dirty ranges, `4` queue writes, `0` staging wraps, and `0` quad-cache
+  evictions.
+- Diagnostic result:
+  the new targeted-skip-disabled counters are all zero in the current canonical
+  report, so the tempting currentness-refresh branch is not the active
+  bottleneck for this run.
+- Follow-up:
+  do not implement "allow targeted skipping after currentness refresh" unless a
+  future report shows these counters nonzero. Next TASK-0804C work should
+  target the real remaining root-list work: `selected_cursor_pair_rows` has
+  zero skipped fields and about `21.5ms` elapsed work; `selected_signal_lane_rows`
+  still spends about `44.6ms` across field-only eval/diff despite `4768`
+  skipped fields. Candidate directions are reducing the dirty frontier that
+  makes fields actually dirty, improving cursor-pair projected field cost, or
+  moving retained layout/shared-update cost, not renderer upload or report
+  serialization.
+- Follow-up diagnostic:
+  `cargo xtask verify-native-gpu-novywave-interaction-speed --event-count 8 --record-hot-path-profiles --report target/diagnostics/native-gpu/novywave-interaction-speed-hotprofiles.json`
+  wrote a schema-valid diagnostic-only report. Non-warmup click samples mostly
+  sit around `9.7ms` to `17.2ms`; click root flush is roughly
+  `1.836076ms` to `3.941967ms`, root materialization is roughly
+  `1.055316ms` to `2.261291ms`, and dirty scheduler is roughly
+  `0.605244ms` to `1.498605ms`. The targeted-skip-disabled counters are still
+  zero. Every sampled click uses direct layout-frame patching but still reports
+  `render_scene_patch_rejection=non_text_like_item` while also reporting
+  `render_scene_patch_applied=true`, so retained render/layout patch handling
+  is another concrete next suspect alongside runtime fanout.
+
+### 2026-06-25 TASK-0804C geometry render-scene patch experiment
+
+- Task:
+  investigate the active `render_scene_patch_rejection=non_text_like_item`
+  smell from NovyWave click/hover reports.
+- Status:
+  core primitive implemented as an opt-in experiment; not promoted for
+  NovyWave. TASK-0804C remains unfinished.
+- Change kept:
+  `boon_document::RenderScenePatchOperation::ReplaceNodeEntries` can replace
+  retained render-scene entries for touched nodes. The playground render-scene
+  patch cache now records the base layout hash so the visible renderer can
+  apply a sidecar only to the previous cached scene it was generated from.
+  Geometry patch generation is disabled by default and requires
+  `BOON_EXPERIMENT_GEOMETRY_RENDER_SCENE_PATCH`.
+- Killed production experiment:
+  enabling geometry patches for NovyWave width/cursor interactions was slower,
+  not faster. The unbounded run regressed to
+  `click_to_cursor_p95=38.536136ms`, `hover_p95=30.371396ms`,
+  `divider_drag_p95=33.335553ms`, and `layout_rebuild_p95=21.43544ms`. A
+  guarded run with a `12` touched-node cap still regressed to
+  `click_to_cursor_p95=41.099976ms`, `hover_p95=35.969741ms`, and
+  `layout_rebuild_p95=19.121431ms`.
+- Final report after disabling geometry generation by default:
+  the canonical speed gate still fails, but the layout class is restored:
+  `click_to_cursor_p95=22.728178ms`, `input_to_visible_p95=22.728178ms`,
+  `hover_p95=15.606097ms`, `divider_drag_p95=13.554882ms`,
+  `runtime_apply_p95=11.293395ms`, `runtime_step_apply_p95=9.512444ms`,
+  and `layout_rebuild_p95=4.432323ms`. The final
+  `render_scene_patch_counts` include `geometry_rejected:disabled=97`.
+- Verification:
+  `cargo fmt -p boon_document -p boon_native_playground`;
+  `cargo test -p boon_native_playground paint_space_ -- --nocapture`;
+  `cargo test -p boon_document render_scene_patch -- --nocapture`;
+  `cargo check -p boon_document -p boon_native_playground`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Follow-up:
+  do not retry per-interaction geometry fragment generation as a NovyWave
+  speed fix unless the fragment compiler becomes precomputed/incremental.
+  The current report points back to runtime/apply and dirty frontier shape:
+  hover/divider are under budget, layout p95 is about `4.4ms`, but click/input
+  still fail at about `22.7ms`.
+
+### 2026-06-25 TASK-0804C root-list field hotspot diagnostic
+
+- Task:
+  narrow the remaining NovyWave click/input slow path from list-level
+  aggregates to concrete projected fields before changing runtime semantics.
+- Status:
+  diagnostic implemented and verified. TASK-0804C remains unfinished.
+- Change kept:
+  `LiveRuntimeRootListViewAggregate` now keeps bounded
+  `(record_scope, field)` hotspots, and the native NovyWave speed report now
+  exposes them under `runtime_root_list_cause_summary.*.root_list_counters`
+  and per-list `by_list.*.field_hotspots`.
+- Report result:
+  the canonical speed gate still fails:
+  `click_to_cursor_p95=24.500189ms`,
+  `input_to_visible_p95=24.500189ms`, `hover_p95=16.004472ms`,
+  `divider_drag_p95=12.701746ms`, `runtime_apply_p95=12.016792ms`,
+  `runtime_step_apply_p95=10.042701ms`, and
+  `layout_rebuild_p95=4.583756ms`.
+- Measured culprit:
+  click root-list/root-flush remains dominant:
+  `source_action_root_flush_ms=109.383842`,
+  `source_action_root_dirty_scheduler_ms=37.805163`,
+  `source_action_root_materialization_ms=64.302832`, and
+  `root_materialization_total_ms=105.61666`.
+  The top field hotspots are
+  `RUN/selected_cursor_pair_row.label` at `8.593043ms` over `96` misses,
+  `RUN/new_signal_lane_variable_row.current_value` at `3.763739ms` over `96`
+  misses, `RUN/new_signal_lane_variable_row.page_refs` at `2.435062ms`, and
+  `RUN/new_signal_lane_group_row.page_refs` at `1.730189ms`.
+- Verification:
+  `cargo fmt -p boon_runtime -p boon_native_playground`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_field_cache_reuses_stable_fields_across_cursor_change -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_compiled_frontier_profiles_direct_projector_dependencies -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib root_list_view_compiled_frontier_profiles_branch_projector_dependencies -- --nocapture`;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave -- --nocapture`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Follow-up:
+  do not retry geometry patching or currentness-refresh targeted skipping for
+  this evidence. The next TASK-0804C implementation should make the compiled
+  root-list field frontier executable or add a generic shared projection/cache
+  for row-scoped cursor-value list pipelines, especially
+  `selected_cursor_value_for_signal(...)`, while keeping the existing indexed
+  `List/filter_field_equal` and numeric-retain pipeline routes.
+
+### 2026-06-25 TASK-0804C killed narrow runtime experiment
+
+- Task:
+  after the field hotspot report, try a narrow runtime optimization but kill it
+  unless the native speed report proves an improvement.
+- Status:
+  experiment killed and reverted. TASK-0804C remains unfinished.
+- Experiment attempted:
+  fused `map |> join_field` zero-or-one-part allocation reduction, plus a
+  narrowed same-flush currentness-refresh rule for targeted root-list dirty
+  fields when invalidated field-cache keys were non-empty, non-ambiguous, and
+  fully source-identity mapped.
+- Kill evidence:
+  the experiment did not address the active NovyWave expression shape
+  (`NovyModel/format_signal_value(value: segment.label, ...)`) and the
+  experimental canonical report still failed/regressed:
+  `click_to_cursor_p95=28.152407ms`, `hover_p95=24.308268ms`,
+  `runtime_apply_p95=13.302463ms`, `runtime_step_apply_p95=11.139968ms`,
+  and `layout_rebuild_p95=5.072317ms`.
+- Restored current-code report:
+  after reverting the experiment, the canonical speed gate still fails but the
+  report again reflects current code:
+  `click_to_cursor_p95=24.439652ms`,
+  `input_to_visible_p95=24.439652ms`, `hover_p95=13.847906ms`,
+  `divider_drag_p95=13.580042ms`, `runtime_apply_p95=11.985034ms`,
+  `runtime_step_apply_p95=9.909573ms`, and `layout_rebuild_p95=4.871721ms`.
+- Current measured culprit:
+  `selected_cursor_pair_rows` evaluates `100` label fields, skips `0`, and
+  reports `RUN/selected_cursor_pair_row.label` at `8.860557ms` over `100`
+  misses. `selected_signal_lane_rows` skips `4930` fields and evaluates `174`,
+  but still spends `4.040382ms` in variable-row `current_value`,
+  `2.564902ms` in variable-row `page_refs`, `1.762698ms` in group-row
+  `page_refs`, and `1.062655ms` in variable-row `segments`.
+- Measurement caveat:
+  `--record-hot-path-profiles` still produced empty function-level
+  `by_function` maps (`25` samples, `0` non-empty maps), so current evidence is
+  field/list-level, not per-function flame data.
+- Verification:
+  `cargo fmt -p boon_runtime`;
+  focused cache tests during the experiment;
+  `RUST_MIN_STACK=33554432 cargo test -p boon_runtime --lib novywave -- --nocapture`;
+  `cargo check -p boon_runtime -p boon_native_playground -p xtask`;
+  `env -u BOON_PROFILE_ROOT_DEMAND -u BOON_PROFILE_DIRTY_FRONTIER -u BOON_PROFILE_ROOT_MATERIALIZATION_SAMPLES -u BOON_PROFILE_ROOT_MATERIALIZATION_DETAILS cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/novywave-interaction-speed.json`.
+- Follow-up:
+  do not keep or retry these two narrow edits as the main fix. Implement an
+  executable compiled row/field frontier for `selected_cursor_pair_rows` or a
+  generic shared projection/cache for pure row-scoped cursor-value pipelines
+  that can cache formatted segment/current values without hardcoding NovyWave.
+
+### 2026-06-25 U6 browser WASM packed-buffer checksum contract
+
+- Task:
+  move the retained browser packet-to-packed-buffer handoff one step closer to
+  WASM ownership by making the generated WASM artifact validate the exact
+  packed-buffer checksums reported by the real browser WebGPU upload/render
+  path.
+- Status:
+  implemented and verified for the current browser-world-scene, startup-budget,
+  artifact-budget, and native-web parity reports.
+- Changes kept:
+  `boon_web_host` exports
+  `boon_web_host_retained_packed_buffer_checksums_valid` and
+  `boon_web_host_retained_packed_buffer_checksums_fingerprint`; the browser
+  host reports `packedDrawDescriptorChecksum`; and
+  `loadBoonWebHostWasmContract(...)` validates packed vertex, index, camera
+  uniform, and draw descriptor checksums from the actual browser
+  `renderReport`.
+- Gate tightening:
+  `verify-browser-webgpu-world-scene` now fails unless the generated WASM
+  metadata report validates the packed-buffer checksum contract and the
+  checksums match the browser render report exactly. `verify-browser-startup-budget`
+  now consumes the same stronger proof and recomputes the expected checksum
+  fingerprint through Rust.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask`;
+  `cargo test -p boon_web_host -- --nocapture`;
+  `cargo build -p xtask`;
+  `target/debug/xtask build-browser-host-artifact --report target/reports/native-gpu/browser-host-artifact.json`;
+  `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`;
+  `target/debug/xtask verify-browser-startup-budget --browser-report target/reports/native-gpu/browser-world-scene.json --report target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-browser-artifact-budget --report target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-native-web-render-comparison --report target/reports/native-gpu/native-web-render-comparison.json`;
+  `target/debug/xtask verify-native-web-render-parity --report target/reports/native-gpu/native-web-render-parity.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-host-artifact.json target/reports/native-gpu/browser-world-scene.json target/reports/native-gpu/browser-startup-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/browser-artifact-budget.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/native-web-render-comparison.json target/reports/native-gpu/native-web-render-parity.json`.
+- Current report facts:
+  `target/reports/native-gpu/browser-world-scene.json` reports
+  `status=pass`,
+  `browser_wasm_metadata_status=browser-generated-wasm-retained-packed-buffer-checksums-execution-pass`,
+  `browser_wasm_export_scope=retained-packed-buffer-checksums-validation-cdylib-not-browser-webgpu-command-encoder`,
+  `browser_wasm_retained_packed_buffer_checksums_valid=1`,
+  `browser_wasm_retained_packed_buffer_checksums_validated=true`,
+  and matching WASM/browser checksums for vertex `4000065801`, index
+  `792248305`, camera uniform `85886642`, and draw descriptor `3290511696`.
+  `browser_runs_wasm_renderer=false` remains explicit.
+- Remaining limit:
+  this still is not direct WASM ownership of browser WebGPU API calls.
+  JavaScript still owns `GPUDevice`, `GPUQueue`, command encoding, render
+  passes, draw calls, readbacks, and queue submission.
+- Follow-up:
+  continue U6/U7 by moving packed-buffer production into WASM memory or by
+  introducing a validated browser command-encoder boundary, without weakening
+  the current honesty caveat.
+
+### 2026-06-25 U5 Cells document-state alias and grid-target correction
+
+- Task:
+  continue the Cells idle/wake child after discovering that the previous
+  measurement targeted the formula bar because document lowering rendered raw
+  runtime paths and omitted grid cell hit targets.
+- Status:
+  engine/layout correctness fixed and verified with a focused test; Cells
+  idle/wake remains failing on real performance budgets.
+- Root cause fixed:
+  `document_initial_locals` merged top-level alias fields into an existing
+  nested runtime object by overwriting existing keys. For Cells, that could
+  replace real `store.selected_input` data with the top-level summary
+  `selected_input`, so `store.selected_input.address` rendered as raw text and
+  `store.sheet_rows` did not materialize the grid. The merge now fills missing
+  alias fields only.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -p boon_native_playground --bin boon_native_playground cells_document_layout_materializes_runtime_backed_grid_targets -- --nocapture`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the focused layout test passes. Fresh
+  `target/artifacts/native-gpu/idle-wake-cells-95052-1782394711/post-idle-layout-proof.json`
+  reports `display_item_count=347`, `hit_target_count=241`, and
+  `source_intent_count=2408`. The idle/wake input now targets real grid cell
+  `A3` at `hit:doc-node-372-sheet_row-3-cell-0`, with
+  `source_path=cell.sources.editor.select`, `target_key=79`,
+  `bind_epoch=391`, and cell bounds `x=49,y=157,width=80,height=24`.
+- Remaining blocker:
+  `target/reports/native-gpu/idle-wake-cells.json` schema-validates but reports
+  `status=fail`. `post_idle_input_to_present_ms=959.196572` exceeds the
+  `120ms` budget, and idle CPU also fails with preview CPU about `11.264%`.
+  The operator-host ack stage timings show the real hot stage:
+  `layout_ms=667.005312`, `total_ms=736.874921`; runtime itself is
+  `11.634521ms`, route is `19.077434ms`, and before-summary is `10.872884ms`.
+  The frame method is still
+  `render-patch-state-delta-and-full-runtime-backed-layout-recompute`, with
+  post-input `document_eval_lower_ms=321.441103` for `347` retained entries.
+- Important correction:
+  do not use older Cells reports that show only one hit target or
+  `target_text=store.selected_input.address` as speed evidence. Those were
+  measuring a broken formula-bar fallback, not a real grid-cell interaction.
+- Next action:
+  implement retained document/layout patching for Cells focus/selection changes
+  or otherwise eliminate the full runtime-backed document relower from the
+  post-idle grid-cell input path. Keep Cells and the demand-driven aggregate
+  unfinished until the child report passes or receives an explicit reviewed
+  unfinished disposition.
+
+### 2026-06-25 TASK-0804A Cells retained equality-style patch
+
+- Task:
+  continue TASK-0804A after proving the real Cells grid-cell click was slow
+  because it used
+  `render-patch-state-delta-and-full-runtime-backed-layout-recompute`.
+- Status:
+  partial improvement kept. TASK-0804A remains unfinished because the Cells
+  idle/wake report still fails the `120ms` post-idle input budget and idle CPU
+  budget.
+- Root cause fixed:
+  retained document bindings did not patch the Cells selection style. Root
+  locals such as `store` did not carry canonical read origins, and the renderer
+  had no derived equality binding for style expressions such as
+  `cell.address == store.selected_address`.
+- Implementation:
+  `document_initial_local_origins` gives initial root locals canonical origins;
+  style lowering records simple equality expressions as derived boolean patch
+  targets; patch lowering transforms a changed root value into the correct
+  boolean style value before applying document/layout patches; the raw duplicate
+  target for equality expressions is suppressed.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -p boon_native_playground equality_data_binding_target_transforms_root_patch_to_boolean_style -- --nocapture`;
+  `cargo test -p boon_native_playground cells_document_layout_materializes_runtime_backed_grid_targets -- --nocapture`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates but
+  reports `status=fail`. The grid-cell click now uses
+  `post_input_frame_method=render-patch-state-delta-and-paint-space-patch`,
+  not full document relower. The post-input layout profile reports
+  `document_eval_lower_ms=0.0`, `artifact_serialize_ms=0.0`,
+  `artifact_write_ms=0.0`, `patched_target_count=240`,
+  `direct_target_count=240`, `direct_target_patch_ms=0.38365`, and
+  `patch_function_total_ms=21.466989`.
+- Speed result:
+  the end-to-end post-idle grid-cell input latency improved from the earlier
+  `959.196572ms` report to `331.197328ms`, but still exceeds the `120ms`
+  budget. Source replacement passes at `207.262547ms` against `250ms`. Preview
+  idle CPU still fails at about `11.317%`.
+- Remaining culprit:
+  full document relower is no longer the current Cells click bottleneck. The
+  remaining evidence points after the retained patch: present/readback latency,
+  layout-frame clone/patch/proof/cache overhead, and idle CPU. The render-scene
+  sidecar rejects the style patch with
+  `render_scene_patch_rejection=unsupported_text_patch_attr`, so the next
+  TASK-0804A work should support non-layout style attrs such as `selected` in
+  render-scene patching, reduce post-patch present/readback overhead, or fix the
+  idle CPU loop.
+- Stop condition:
+  do not continue optimizing the old full document relower path for this Cells
+  click unless a fresh report regresses to `document_eval_lower_ms > 0`.
+
+### 2026-06-25 TASK-0804A Cells render-scene retag sidecar
+
+- Task:
+  continue TASK-0804A after the retained equality-style patch removed full
+  document relower but still cloned/patched the layout frame for 240 `selected`
+  style targets.
+- Status:
+  partial improvement kept. TASK-0804A remains unfinished because Cells
+  idle/wake still fails post-idle input and idle CPU budgets.
+- Implementation:
+  added `RenderScenePatchOperation::RetagNodeEntries` for identity-only style
+  state, taught `ReplaceNodeEntries` to tolerate primitive/text-run count
+  changes for future node-entry style patches, and grouped non-layout style
+  sidecar patches in the playground. The `selected` Cells path now retags scene
+  entries instead of rebuilding all node text/visual entries or cloning the
+  layout frame.
+- Verification:
+  `cargo fmt -p boon_document -p boon_native_playground`;
+  `cargo test -p boon_document render_scene -- --nocapture`;
+  `cargo test -p boon_native_playground selected_style_render_scene_patch_replaces_only_target_node_entries -- --nocapture`;
+  `cargo test -p boon_native_playground text_color_render_scene_patch_reports_rejection_reason -- --nocapture`;
+  `cargo test -p boon_native_playground cells_document_layout_materializes_runtime_backed_grid_targets -- --nocapture`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates but
+  reports `status=fail`. The grid-cell click still uses
+  `post_input_frame_method=render-patch-state-delta-and-paint-space-patch`.
+  The post-input layout profile reports `document_eval_lower_ms=0.0`,
+  `direct_layout_frame_patch=false`, `layout_frame_clone_ms=0.0`,
+  `retained_layout_frame_reuse_without_clone=true`,
+  `render_scene_patch_applied=true`, `render_scene_patch_operation_count=1`,
+  `render_scene_patch_rejection=null`, `patched_target_count=240`, and
+  `patch_function_total_ms=14.094198`.
+- Speed result:
+  this is faster than the prior retained layout-frame patch
+  (`patch_function_total_ms=21.466989`, `post_idle_input_to_present_ms=331.197328`)
+  and faster than the killed full node-entry sidecar experiment
+  (`patch_function_total_ms=90.248443`, `post_idle_input_to_present_ms=401.756657`).
+  The latest end-to-end input latency is `254.468377ms`, still above the
+  `120ms` budget. Source replacement measured `251.860011ms`, barely above the
+  `250ms` budget. Preview idle CPU still fails at about `9.986%`.
+- Remaining culprit:
+  the current blocker is no longer full document relower, layout-frame cloning,
+  or unsupported selected-style sidecar patching. Continue TASK-0804A by
+  profiling/optimizing post-patch present/readback and the idle CPU loop.
+- Stop condition:
+  keep the retag sidecar unless future evidence shows a correctness regression
+  or consistently worse end-to-end timing; do not spend more time on the killed
+  full node-entry sidecar relower route for Cells selected-style clicks.
+
+### 2026-06-25 U5 Cells compact operator-ack measurement attempt
+
+- Task:
+  reduce measurement harness overhead in TASK-0804A/U5 by making the idle/wake
+  verifier request compact operator-host input acks instead of returning large
+  bounded state-summary samples on the synchronous hot path.
+- Status:
+  kept as measurement hygiene. Do not mark TASK-0804A complete and do not treat
+  this as a full speedup; it reduces synchronous response bloat but the Cells
+  idle/wake gate still fails.
+- Implementation:
+  `preview_operator_host_input_response` now supports opt-in
+  `compact_response: true`; compact acks keep route assertions, state hashes,
+  stage timings, framebuffer delta evidence, patch/layout profile evidence, and
+  an explicit omitted-samples marker. `verify-native-gpu-idle-wake` requests
+  compact responses for post-idle operator probes. Default operator-host
+  responses still include full bounded samples.
+- Verification:
+  `cargo fmt -p boon_native_playground -p xtask`;
+  `cargo test -p boon_native_playground operator_host_input -- --nocapture`;
+  `cargo test -p boon_native_playground novywave_operator_host_input_batches_execute_in_preview_runtime -- --nocapture`;
+  `cargo check -p boon_native_playground -p xtask`;
+  `cargo build -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`.
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Results:
+  `cargo check -p boon_native_playground -p xtask` passes. The broad
+  operator-host run passed 7 tests and failed
+  `novywave_operator_host_input_batches_execute_in_preview_runtime`; the
+  focused failure was still on the default full-evidence path
+  (`state_summary_samples_omitted=false`), so it is a NovyWave host-route
+  contract failure for `Clear All`, not a compact-ack regression.
+- Verifier blocker:
+  the Cells idle/wake run created
+  `target/artifacts/native-gpu/idle-wake-cells-906825-1782399856/post-idle-layout-proof.json`
+  with `status=pass`, but did not rewrite
+  `target/reports/native-gpu/idle-wake-cells.json`. Progress markers stopped at
+  `parent-progress.json` stage `role-pid-scan-finished` and
+  `desktop-supervisor.progress.json` stage `preview-spawned`; at that time the
+  verifier had not yet recorded whether it was waiting for the preview IPC
+  socket or for the parent live-state report. The layout proof reported about
+  `36651ms` of runtime-state work, which expands the live-state timeout, so the
+  stopped run is inconclusive rather than proof of an infinite loop. A follow-up
+  `pgrep` showed no lingering playground process.
+- Instrumentation follow-up:
+  added progress markers for `preview-ipc-wait-started`, `preview-ipc-ready`,
+  `preview-ipc-wait-failed`, and `live-state-wait-started` so the next run can
+  distinguish slow preview startup from a real verifier hang.
+- Current report facts:
+  the first rerun after adding markers used a stale `target/debug/xtask`
+  executable because `cargo check` does not rebuild the binary, so it did not
+  request compact acks. After `cargo build -p xtask`, the fresh
+  `target/reports/native-gpu/idle-wake-cells.json` schema-validates and reports
+  `status=fail` with `post_idle_input_to_present_ms=237.58679899999998`,
+  `post_idle_source_replace_to_present_ms=200.31849`, preview idle CPU about
+  `9.9755%`, and combined idle CPU about `9.9755%`.
+- Compact ack evidence:
+  the fresh report has `compact_response=true`,
+  `state_summary_samples_omitted=true`, and the first output sample marked
+  `status=omitted`. The previous non-compact fresh run measured
+  `post_idle_input_to_present_ms=271.24237899999997`,
+  `post_idle_source_replace_to_present_ms=201.83342000000002`, and
+  `round_trip_ms=159`; the compact run measured `round_trip_ms=147`.
+- Remaining culprit:
+  compact ack helps measurement overhead but does not solve the gate. The
+  remaining failures are post-idle input-to-present latency above the `120ms`
+  budget and idle CPU. The preview loop reports no idle rendering and about
+  `1222` idle waits over `132941ms`, but a preview thread named
+  `boon-native-pre` still accounts for about `10.633%` CPU in the sampled
+  thread delta.
+- Follow-up:
+  keep the compact response. Next TASK-0804A work should target the actual
+  remaining failures: the preview thread burning CPU while the demand loop is
+  otherwise idle, and the post-idle input-to-present path still taking about
+  `238ms`. Only classify the verifier as hung if it exceeds the recorded
+  timeout stage.
+
+### 2026-06-25 U5 Cells idle CPU thread attribution
+
+- Task:
+  identify which preview thread consumes CPU while the demand-driven loop
+  reports idle waits.
+- Status:
+  diagnostic kept. TASK-0804A remains unfinished.
+- Implementation:
+  renamed preview helper threads so Linux procfs `comm` can distinguish them
+  within the 15-byte thread-name limit: `bn-prev-ipc`, `bn-prev-prewarm`, and
+  `bn-prev-replace`.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo check -p boon_native_playground`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh report schema-validates and still reports `status=fail`.
+  Compact ack remains active with `compact_response=true`,
+  `state_summary_samples_omitted=true`, and `round_trip_ms=148`.
+  `post_idle_input_to_present_ms=259.934665`,
+  `post_idle_source_replace_to_present_ms=199.094154`, preview idle CPU is
+  about `6.6398%`, and combined idle CPU is about `7.3038%`.
+- CPU attribution:
+  live sampling during the later prewarm stage showed `bn-prev-prewarm` burning
+  CPU while it built the replacement source project; that is outside the idle
+  sample window. In the report's idle sample, `bn-prev-ipc` is at `0.0%`, and
+  the hot `boon-native-pre` thread is now attributable to the
+  `boon-native-preview-render` render/event thread. The preview loop reports
+  about `1272` idle waits over `138373ms`, zero forced frames, and six total
+  rendered frames, so this is passive polling CPU rather than idle rendering or
+  helper-worker CPU.
+- Stop condition:
+  do not blindly increase `PASSIVE_INPUT_POLL_INTERVAL` as a shortcut; it would
+  likely reduce CPU but risks making real mouse/keyboard input laggier. Next
+  work should measure render-thread idle poll substeps (`size_scale`, input
+  sampling, accessibility drain, hook poll) or implement real app-window input
+  wake so passive polling can be safely relaxed.
+
+### 2026-06-25 U5 Cells render-thread idle poll substep attribution
+
+- Task:
+  identify which operation inside the render/event thread passive idle poll is
+  consuming CPU.
+- Status:
+  diagnostic kept. TASK-0804A remains unfinished.
+- Implementation:
+  `boon_native_app_window` now records idle poll substep totals, averages, and
+  last-sample timings for `size_scale`, input sampling, accessibility action
+  drain, native hook polling, and bookkeeping. The native render-loop report and
+  `verify-native-gpu-idle-wake` expose those fields.
+- Verification:
+  `cargo fmt -p boon_native_app_window`;
+  `cargo test -p boon_native_app_window --lib demand_driven_idle -- --nocapture`;
+  `cargo check -p boon_native_app_window -p boon_native_playground -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh report schema-validates and still reports `status=fail` with
+  blockers `post-idle native input-to-present readback evidence failed` and
+  `idle CPU budget exceeded`. It measured
+  `post_idle_input_to_present_ms=265.718277`,
+  `post_idle_source_replace_to_present_ms=197.375708`, preview idle CPU about
+  `8.6114%`, and combined idle CPU about `8.6114%`. Compact acks remain active
+  with `compact_response=true`, `state_summary_samples_omitted=true`, and
+  `round_trip_ms=154`.
+- Root cause for the current slow idle path:
+  the render loop reported `1225` skipped idle polls and `1225` idle waits over
+  `132408.767599ms`, with only six rendered frames. The new substep timings
+  show `hook_poll` dominates passive idle polling:
+  average `hook_poll=7130.394us`, `bookkeeping=560.370us`,
+  `size_scale=25.238us`, `input_sample=17.321us`, and
+  `accessibility=1.279us`. The last idle poll sample was also dominated by
+  `hook_poll=15897us`.
+- Next direction:
+  target `poll_native_window_hooks` / app-window native hook polling, or replace
+  the passive polling contract with real native input/event wake. Do not spend
+  the next TASK-0804A slice on JSON encoding, root list materialization, helper
+  IPC, or `PASSIVE_INPUT_POLL_INTERVAL` unless fresh evidence shows those have
+  become dominant again.
+
+### 2026-06-25 U5 Cells retained accessibility publish cache
+
+- Task:
+  reduce the measured `hook_poll` idle CPU cost without weakening the
+  demand-driven render-loop gate.
+- Status:
+  partial fix kept. TASK-0804A remains unfinished because post-idle
+  input-to-present latency still fails.
+- Implementation:
+  the preview native poll hook now retains an accessibility host cache and
+  publishes an AccessKit tree update only when the preview content revision
+  changes. Repeated passive idle polls no longer rebuild and resend the same
+  semantic accessibility tree.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -p boon_native_playground --bin boon_native_playground preview_accessibility_host_cache_publishes_only_changed_revisions -- --nocapture`;
+  `cargo check -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh report schema-validates and still reports `status=fail`, but the
+  idle CPU blocker is gone. The only remaining blocker is
+  `post-idle native input-to-present readback evidence failed`.
+  `post_idle_input_to_present_ms=261.002163`,
+  `post_idle_source_replace_to_present_ms=197.41065799999998`, preview idle CPU
+  about `0.6624%`, combined idle CPU about `0.6624%`, and compact ack
+  `round_trip_ms=183`.
+- Measured improvement:
+  idle `hook_poll` average improved from `7130.394us` to `284.457us`, and the
+  last idle `hook_poll` sample improved from `15897us` to `489us`.
+- Next direction:
+  stop treating idle CPU as the active TASK-0804A problem. The next slice should
+  inspect the post-idle operator-host input-to-present path: runtime event
+  application, layout/render patch preparation, readback proof, and synchronous
+  IPC/report assembly.
+
+### 2026-06-25 U5 Cells operator-host snapshot narrowing and verifier hold check
+
+- Task:
+  continue U5/TASK-0804A after the retained accessibility cache removed the
+  idle CPU blocker, and verify whether the preview IPC hot-path clone was still
+  a measurable part of the post-idle input-to-present cost.
+- Status:
+  partial fix kept. TASK-0804A remains unfinished because post-idle
+  input-to-present latency still fails.
+- Implementation:
+  the preview IPC `operator-host-input` path now snapshots a narrow
+  `PreviewOperatorHostInputState` instead of cloning the full `PreviewIpcState`.
+  The narrow state carries the live runtime, shared render state, source path,
+  source hash, and runtime-units fallback while avoiding unrelated source text,
+  runtime summaries, prewarmed project maps, counters, and worker handles.
+  `verify-native-gpu-idle-wake` also records whether the supervisor report was
+  ready before shutdown and can intentionally terminate the verifier-owned
+  desktop process after evidence collection when that report is already
+  available.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo fmt -p xtask`;
+  `cargo test -p boon_native_playground --bin boon_native_playground preview_accessibility_host_cache_publishes_only_changed_revisions -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground preview_operator_host_input_rejects_forbidden_scenario_keys -- --nocapture`;
+  `cargo check -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `cargo build -p xtask`;
+  `./target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `./target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates
+  and reports `status=fail`. The only blocker is
+  `post-idle native input-to-present readback evidence failed`.
+  `post_idle_input_to_present_ms=249.56482499999998`,
+  `post_idle_source_replace_to_present_ms=198.54085899999998`, preview idle CPU
+  `0.0%`, and combined idle CPU about `0.6627%`.
+- Measured improvement:
+  compact operator-host ack remains active with `compact_response=true` and
+  `state_summary_samples_omitted=true`. The narrow IPC snapshot improved
+  compact ack `round_trip_ms` from the previous `183` to `139`, but total
+  input-to-present is still about `250ms`. Latest ack stage timings were
+  approximately `window_ms=16.176`, `before_summary_ms=10.507`,
+  `route_ms=18.169`, `runtime_ms=11.212`, `layout_ms=34.854`, and
+  `total_ms=102.533`.
+- Verifier reliability note:
+  one run used a stale `target/debug/xtask` binary after `cargo check`; that
+  showed why `cargo build -p xtask` is required before measuring xtask edits.
+  The fresh rebuilt verifier still needed the natural Cells hold because
+  `supervisor_report_ready_before_shutdown=false`; the early termination path
+  did not trigger on this run. Future verifier work should make the supervisor
+  report available earlier or add a dedicated post-idle report-finalization
+  command.
+- Broad-test note:
+  a broad `cargo test ... preview_` sweep failed in existing
+  NovyWave/physical scenario tests and was not used as the acceptance gate for
+  this narrow snapshot slice. Focused tests passed.
+- Next direction:
+  continue TASK-0804A on the approximately `100ms` preview-side
+  operator-host-input work and the render/present/readback tail. Do not re-chase
+  idle CPU unless a fresh report shows it regressed.
+
+### 2026-06-25 U5 Cells compact pre-summary skip and borrowed route proof
+
+- Task:
+  continue reducing the measured compact operator-host-input ack path after the
+  narrow IPC snapshot reduced but did not solve post-idle input-to-present
+  latency.
+- Status:
+  partial fix kept. TASK-0804A remains unfinished because post-idle
+  input-to-present remains above budget.
+- Implementation:
+  compact `operator-host-input` now skips the pre-event windowed runtime state
+  summary when the layout/source-intent route already supplies `target_key` and
+  `target_generation`. The report marks this explicitly with
+  `before_state_summary_omitted=true` and
+  `before_state_hash="omitted-for-compact-response"`. Full/non-compact
+  responses still build the old state sample. The host-route proof also borrows
+  `source_intent_assertions` and `hit_target_assertions` from the layout proof
+  instead of cloning both arrays.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -p boon_native_playground --bin boon_native_playground compact_operator_host_input_skips_pre_event_summary_when_layout_identity_exists -- --nocapture`;
+  `cargo test -p boon_native_playground --bin boon_native_playground preview_operator_host_input_rejects_forbidden_scenario_keys -- --nocapture`;
+  `cargo check -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `./target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `./target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates
+  and reports `status=fail`. The only blocker remains
+  `post-idle native input-to-present readback evidence failed`.
+  `post_idle_input_to_present_ms=193.20808`,
+  `post_idle_source_replace_to_present_ms=200.243968`, preview idle CPU about
+  `0.6658%`, and combined idle CPU about `0.6658%`.
+- Measured improvement:
+  the first compact pre-summary-skip run measured compact ack `round_trip_ms=121`
+  with `before_summary_ms=0.001617`. After borrowing route arrays, the fresh
+  run measured compact ack `round_trip_ms=113` and stage timings
+  `window_ms=15.795434`, `before_summary_ms=0.001995`,
+  `route_ms=15.263028`, `runtime_ms=11.2741`, `layout_ms=34.67836`, and
+  `total_ms=77.050899`.
+- Next direction:
+  do not re-chase the pre-summary path or route-array clone; they are no longer
+  the dominant measured costs. Continue TASK-0804A on retained layout/patch
+  proof cost (`layout_ms` about `35ms`) and the native render/present/readback
+  tail outside the ack. The gate is still not solved.
+
+### 2026-06-25 U5 Cells source-event node hint fast path
+
+- Task:
+  continue reducing the compact operator-host-input ack path after the borrowed
+  route-proof slice left a measured `window_ms` scan cost in the Cells click
+  report.
+- Status:
+  partial fix kept. TASK-0804A remains unfinished because post-idle
+  input-to-present remains above budget.
+- Implementation:
+  `preview_event_json_with_layout_row_identity` now uses a source-event `node`
+  hint when the current layout proof has a matching `source_intent_assertion`
+  for that node/source pair. Missing or stale hints still fall back to the old
+  proof scan, so this is a generic verified shortcut, not a Cells branch.
+- Verification:
+  `cargo test -q -p boon_native_playground --bin boon_native_playground compact_operator_host_input_skips_pre_event_summary_when_layout_identity_exists`;
+  `cargo test -q -p boon_native_playground --bin boon_native_playground layout_node_hint_enriches_row_identity_from_source_intent`;
+  `cargo check -q -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `cargo build -q -p xtask`;
+  `./target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `./target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Current report facts:
+  the fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates
+  and reports `status=fail`. The only blocker remains
+  `post-idle native input-to-present readback evidence failed`.
+  `post_idle_input_to_present_ms=192.582655`,
+  `post_idle_source_replace_to_present_ms=200.874235`, preview idle CPU about
+  `0.6624%`, and combined idle CPU about `0.6624%`.
+- Measured improvement:
+  the source event carried
+  `node="doc-node-372-sheet_row-3-cell-0"` and
+  `source="cell.sources.editor.select"`, so the run exercised the node-hint
+  path. Compact ack improved to `round_trip_ms=108`. Stage timings were
+  `window_ms=0.144294`, `before_summary_ms=0.002012`,
+  `route_ms=19.498162`, `runtime_ms=11.846749`, `layout_ms=39.975667`, and
+  `total_ms=71.525051`. The previous borrowed-route run measured
+  `window_ms=15.795434`, so this removes that scan cost but does not solve the
+  full input-to-present budget.
+- Caveat:
+  during the long verifier tail, a live `ps` sample saw the preview process at
+  about `50-88%` CPU while report collection/hold was still active. The report's
+  idle CPU window stayed low, so this should be investigated as verifier-tail
+  behavior rather than treated as steady-idle regression proof.
+- Next direction:
+  do not keep optimizing source-event node lookup. Continue TASK-0804A on
+  retained layout/patch proof cost, route-table/indexing cost (`route_ms` about
+  `19.5ms` in this run), and the native render/present/readback tail outside the
+  ack.
+
+### 2026-06-25 U5 Cells direct node/source route proof and verifier wait hardening
+
+- Task:
+  continue reducing the measured compact operator-host-input ack path after the
+  node-hint slice left `route_ms` around `19.5ms`.
+- Status:
+  partial fix kept. TASK-0804A remains unfinished because post-idle
+  input-to-present remains above budget.
+- Implementation:
+  `preview_host_input_route_proof` now uses a direct route only when the event
+  carries a node and the current layout proof has an exact node/source assertion
+  whose `target_key` and `target_generation` match the event. Requested nodes
+  alone and stale row identities still fall back to the older proof scan.
+  `verify-native-gpu-idle-wake` also watches the desktop child while waiting
+  for complete live-state, so an early desktop exit becomes bounded failure
+  evidence instead of a hot live-state wait.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -q -p boon_native_playground --bin boon_native_playground layout_node_hint_enriches_row_identity_from_source_intent`;
+  `cargo test -q -p boon_native_playground --bin boon_native_playground host_route_uses_direct_node_source_when_row_identity_matches`;
+  `cargo test -q -p boon_native_playground --bin boon_native_playground host_route_does_not_use_direct_node_source_for_stale_row_identity`;
+  `cargo check -q -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `cargo fmt -p xtask`;
+  `cargo build -q -p xtask`;
+  `./target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`;
+  `./target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-cells.json`.
+- Measurement hygiene:
+  the first post-change live verifier attempt was manually terminated because
+  its final report remained stale and progress stayed at
+  `live-state-wait-started` / `preview-ipc-wait-started` while no playground
+  child remained. That killed run is not used as speed evidence. The verifier
+  hardening was added before the accepted measurement.
+- Current report facts:
+  the fresh `target/reports/native-gpu/idle-wake-cells.json` schema-validates
+  and reports `status=fail`. The only blocker remains
+  `post-idle native input-to-present readback evidence failed`.
+  `post_idle_input_to_present_ms=156.066706`,
+  `post_idle_source_replace_to_present_ms=198.703886`, preview idle CPU about
+  `0.6654%`, and combined idle CPU about `1.3307%`.
+- Measured improvement:
+  compact ack improved to `round_trip_ms=82`. Stage timings were
+  `window_ms=0.139593`, `before_summary_ms=0.001849`,
+  `route_ms=0.059589`, `runtime_ms=11.441561`, `layout_ms=36.011677`, and
+  `total_ms=47.6962`. The host route assertion reports
+  `direct_node_source_route_used=true` for
+  `doc-node-372-sheet_row-3-cell-0`. Compared with the previous node-hint run,
+  route proof cost dropped from about `19.5ms` to about `0.06ms`, compact ack
+  improved from `108ms` to `82ms`, and input-to-present improved from about
+  `193ms` to about `156ms`.
+- Next direction:
+  route proof is no longer the active Cells click bottleneck. Continue U5 on
+  retained layout/patch proof cost (`layout_ms` about `36ms`) and the native
+  render/present/readback tail outside the ack. The source-replace path remains
+  around `199ms` and is not fixed by this slice.
+
+### 2026-06-25 U5 Cells static equality patch pruning and layout-proof timeout
+
+- Task:
+  continue TASK-0804A after the direct node/source route proof moved the active
+  compact ack cost to retained layout/patch work.
+- Status:
+  code slice kept, but TASK-0804A remains unfinished and no fresh speed win is
+  accepted yet.
+- Implementation:
+  data-binding patch targets for static equality attributes now compare the
+  previous runtime state against the new value before patching. For selection
+  changes, unchanged equality targets are skipped while the old selected and new
+  selected rows still patch. `DocumentPatchLayoutProfile` now exposes
+  `equality_static_unchanged_target_skip_count` and
+  `equality_static_changed_target_count`. `run_native_layout_probe` is now
+  report-driven and bounded: it consumes a valid layout-proof JSON report as
+  soon as it appears, stops a still-running child, and returns a clear timeout
+  failure if no report appears. The timeout defaults to `90000ms` and can be
+  overridden with `BOON_NATIVE_LAYOUT_PROBE_TIMEOUT_MS`.
+- Verification:
+  `cargo fmt -p boon_native_playground`;
+  `cargo test -q -p boon_native_playground --bin boon_native_playground static_equality_binding_prunes_unchanged_targets`;
+  `cargo check -q -p boon_native_playground -p boon_native_app_window -p xtask`;
+  `cargo fmt -p xtask`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `/usr/bin/time -f 'elapsed=%E cpu=%P maxrss_kb=%M exit=%x' timeout 45s target/debug/boon_native_playground --role layout-proof --code-file examples/cells.bn --report target/artifacts/native-gpu/layout-proof-cells-timeout-check.json`;
+  `BOON_NATIVE_LAYOUT_PROBE_TIMEOUT_MS=60000 ./target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`.
+- Measurement hygiene:
+  the full verifier attempt was stopped manually and is not accepted as a fresh
+  speed report. The current `target/reports/native-gpu/idle-wake-cells.json`
+  must not be treated as evidence for this slice unless a later run refreshes
+  it and shows the new equality-pruning counters.
+- Current facts:
+  the focused unit test passed. The standalone Cells layout-proof probe timed
+  out after `45.04s` at `99%` CPU and about `640460 KB` RSS without writing a
+  usable report. The following bounded full idle-wake attempt did produce a
+  valid `post-idle-layout-proof.json` with `status=pass`, but its profile
+  showed `runtime_state_ms=41511.072917` for `examples/cells.bn`, while
+  parse/typecheck/lower/layout costs were much smaller:
+  `parse_cache_ms=87.976729`, `typecheck_ms=236.397607`,
+  `document_eval_lower_ms=353.144575`, and
+  `text_measure_and_layout_ms=73.823433`.
+- Next direction:
+  before interpreting another Cells click-latency report, fix or bypass the
+  slow Cells setup/runtime-state path. The next accepted report must prove
+  whether `equality_static_unchanged_target_skip_count` is high and whether
+  `patched_target_count`/`layout_ms` actually drop. Do not spend more TASK-0804A
+  time on blind click-path microchanges while `runtime_state_ms` around `41.5s`
+  and slow desktop live-state startup can distort or block the measurement.
+
+### 2026-06-25 U5 Cells layout-proof root cause measurement
+
+- Task:
+  finish one deep measurement loop for TASK-0804A/U5 and document what is
+  actually slow before moving to other unfinished work.
+- Status:
+  measurement blocker fixed; real runtime blocker identified. TASK-0804A
+  remains unfinished.
+- Implementation:
+  layout-proof now writes a sidecar progress file at `<report>.progress.json`
+  and records stages through runtime-state setup, proof JSON construction,
+  cache updates, final report writing, and schema validation. Layout profiles
+  now include `runtime_init_ms`, `runtime_document_summary_ms`, and nested
+  `runtime_state_profile` from `LiveRuntime::from_project_profiled`.
+  `boon_report_schema::sha256_file` now streams file hashing and, for files
+  over 8 MiB, uses only absolute `/usr/bin/sha256sum` or `/bin/sha256sum`
+  with `--` and lowercase normalization when available, falling back to the
+  Rust streaming hasher. The hash value remains the real file-byte SHA-256.
+- Verification:
+  `cargo fmt -p boon_report_schema -p boon_native_playground`;
+  `cargo check -q -p boon_report_schema`;
+  `cargo check -q -p boon_native_playground`;
+  `cargo build -q -p boon_native_playground`;
+  `/usr/bin/time -f 'elapsed=%E cpu=%P maxrss_kb=%M exit=%x' timeout 60s target/debug/boon_native_playground --role layout-proof --code-file examples/cells.bn --report target/artifacts/native-gpu/layout-proof-cells-root-cause.json`.
+- Measurement hygiene:
+  the earlier 45s layout-proof timeout was a report-generation artifact:
+  progress stopped at `base-report-binary-hash-started` while hashing the
+  527 MiB debug executable. This hid the real Cells runtime profile. The
+  verifier contract was not weakened: `binary_hash` and artifact hashes remain
+  exact SHA-256 values and schema validation still recomputes them.
+- Current facts:
+  after the hash-path fix, Cells layout proof completes with `elapsed=0:40.78`,
+  `cpu=99%`, `maxrss_kb=118612`, and `status=pass`. The report shows
+  `runtime_init_ms=37309.590100999994`,
+  `runtime_document_summary_ms=24.035957`,
+  `generic_total_ms=37189.763702000004`,
+  `initialize_generic_derived_ms=32192.184642999997`, and
+  `initialize_indexed_reset_sources_ms=4924.46496`.
+  The dominant field is `cells.value`: `count=2600`,
+  `total_ms=28408.06217599999`, `avg_ms=10.926177759999996`,
+  `changed_read_count=5196`. Reset-source initialization separately recomputes
+  `cells.address` for 2600 rows (`4694.196477ms`) and
+  `cells.default_formula` for 2600 rows (`230.192856ms`).
+- Root cause:
+  the active setup slowness is engine/runtime work, not WGPU, parsing, layout,
+  or JSON report writing. Cells creates 2600 rows and each row has derived
+  `address`, `default_formula`, `value`, and `error`; runtime startup eagerly
+  enumerates all startup recompute keys (`2600 * 4 = 10400`) and evaluates them.
+  Formula values call `cell_value()`, which uses `List/find(cells, field:
+  address, value: target_address)`, so startup behaves like a full spreadsheet
+  interpreter pass with list lookup/dependency bookkeeping.
+- Next direction:
+  stop spending TASK-0804A time on click-route/report/layout microchanges until
+  this setup path is addressed or explicitly bypassed. The next architectural
+  fix should be an engine-level per-list indexed dependency scheduler over
+  dense row slots: initialize only fields directly required by indexed hold
+  resets, replace the reset-source ordered-prefix scan, lazily or
+  dependency-drive `cells.value`, register formula address/range dependencies
+  so changing `A0` wakes only dependent formula rows, and avoid clearing global
+  lookup caches per row mutation during batch startup.
+
+### 2026-06-25 U5 Cells lazy-startup experiment killed
+
+- Task:
+  test one bounded TASK-0804A follow-up idea after the root-cause measurement:
+  skip eager startup recompute for pure indexed row fields and materialize
+  bounded document-summary rows on demand.
+- Status:
+  killed and postponed. TASK-0804A remains unfinished and should be returned to
+  only after other dependency-ready unified tasks, unless a later task builds a
+  real compiled dependency scheduler that directly supersedes this route.
+- Result:
+  do not keep the lazy-summary/startup behavior. The experiment confirmed that
+  normal row-field reads already recompute generic derived indexed fields on
+  demand, but document summaries currently serialize stored row fields. A naive
+  bridge from summary serialization back into recomputation is not safe enough:
+  the Cells cycle scenario still stack-overflows on the default test stack,
+  while the arithmetic formula helper test passes.
+- Commands:
+  - `cargo fmt -p boon_runtime && cargo check -q -p boon_runtime`
+  - `cargo test -q -p boon_runtime --lib pure_boon_cells_helpers_support_documented_arithmetic_ops -- --nocapture`
+  - `cargo test -q -p boon_runtime --lib cells_scenario_runs_and_detects_cycle -- --nocapture`
+- Evidence:
+  `cargo check -q -p boon_runtime` passed. The arithmetic helper test passed.
+  `cells_scenario_runs_and_detects_cycle` failed with stack overflow on the
+  current worktree/default test stack. A temporary high-stack run passed during
+  debugging, which means the path is bounded by stack size in one configuration
+  but still unacceptable for the normal test/runtime contract.
+- Kill reason:
+  the simple lazy summary approach couples reporting/summary serialization to
+  formula recomputation and cycle handling in a way that is too fragile. The
+  correct future fix is not a summary-time workaround; it needs an engine-level
+  dependency scheduler with explicit formula/range dependency registration,
+  bounded materialization windows, batch startup cache invalidation, and cycle
+  safety proven by the default-stack Cells scenario.
+- Next direction:
+  stop TASK-0804A work now. Continue with a different unfinished unified task.
+  When 0804A is resumed as a last piece, start from the measured root cause and
+  design the scheduler first; do not retry ad hoc lazy summary materialization.
+
+### 2026-06-25 TASK-0804A user-directed postponement
+
+- Task:
+  stop the current Cells/TASK-0804A loop because it has consumed too much time
+  without reaching the strict speed gate.
+- Status:
+  explicitly unfinished and postponed again. This is not a pass, not a default
+  switch unblocker, and not a claim that Cells is fast enough.
+- Reason:
+  the current evidence already points at the real engine problem: full Cells
+  startup and interaction paths still eagerly materialize/recompute too much
+  row-field and formula/value state. More local click-route, verifier wait,
+  report, JSON, or WGPU microchanges are unlikely to solve that root cause.
+- Resume condition:
+  return to TASK-0804A only after other dependency-ready unified tasks are done,
+  or after a real compiled/indexed dependency scheduler, formula dependency
+  model, virtualized row materialization path, or equivalent runtime
+  architecture exists to test against.
+- Next direction:
+  continue with non-0804 unified work. The demand-driven aggregate may keep the
+  Cells child failing/postponed honestly while other child reports and
+  independent U6-U10 work progress. The standalone handoff for a future
+  TASK-0804A attempt is `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
+
+### 2026-06-25 U11 unified aggregate freshness refresh
+
+- Task:
+  continue with non-0804 unified-goal work after killing the Cells lazy-startup
+  experiment.
+- Status:
+  U11 aggregate hygiene in-progress; stale child-report noise removed.
+- Result:
+  refreshed all stale passing unified aggregate children for the current
+  `target/debug/xtask` binary. The final aggregate remains a correct expected
+  failure: 18 child reports exist, 17 pass and schema-validate, no child reports
+  are stale, and the only failing child is `demand-driven-render-loop`.
+- Verification:
+  `cargo build -q -p xtask`; refreshed the unified runtime/document/layout,
+  semantic/accessibility, 3D/manufacturing, browser artifact, native/browser
+  comparison, WGPU retained arena/readback, and native-web parity reports; then
+  reran
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current aggregate facts:
+  `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, `command_match_report_count=18`, stale child
+  count `0`. The remaining failing child is `demand-driven-render-loop`.
+- Next direction:
+  do not claim the unified goal complete. Continue from a non-blind
+  demand-driven/retained-runtime task, or leave the Cells-containing child open
+  until the scheduler architecture is resumed as a later/last piece.
+
+### 2026-06-25 U5 custom-project demand-driven child postponed
+
+- Task:
+  continue non-0804 U5 demand-driven evidence by refreshing the custom-project
+  idle/wake child and aggregate.
+- Status:
+  custom-project child still unfinished; aggregate still fails honestly.
+- Verification:
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --idle-ms 1500 --report target/reports/native-gpu/idle-wake-custom-projects.json`
+  twice;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/idle-wake-custom-projects.json`;
+  `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`;
+  `target/debug/xtask verify-report-schema target/reports/native-gpu/demand-driven-render-loop.json`.
+- Current facts:
+  the custom-project report is live and changes pixels, but it fails the strict
+  debug post-idle input-to-present budget. The two fresh attempts measured
+  about `131.776ms` and `134.775ms` against the `120ms` budget. Source
+  replacement stays under budget at about `67.3ms`; preview/dev idle CPU and
+  idle render suppression pass.
+- Measured split:
+  the repeat run spent about `61.076ms` in the operator-host event path
+  (`route_ms=0.014610`, `runtime_ms=0.385032`, `layout_ms=60.553926`) and about
+  `59.769ms` in the preview render hook before queue submission/present. This
+  is a retained layout/render-hook problem, not a Cells formula scheduler
+  problem.
+- Aggregate:
+  `target/reports/native-gpu/demand-driven-render-loop.json` now records all
+  four children present, `passed_report_count=2`, `failed_report_count=2`,
+  and `missing_report_count=0`. The failing children are Cells and
+  custom-projects.
+- Next direction:
+  do not spend another loop on verifier waits. Resume U5 only with a retained
+  layout/render-hook change that can remove the roughly `60ms + 60ms` custom
+  path, or continue independent U6-U10 work while both U5 children remain
+  explicitly unfinished.
+
+### 2026-06-25 U8/U9 rectangular slot Difference slice
+
+- Task:
+  continue with an independent non-0804 geometry/manufacturing task after
+  postponing the Cells and custom-project U5 children.
+- Status:
+  implemented and verified as a bounded CSG subset. U8/U9 remain in-progress;
+  this is not general CSG completion.
+- Changes kept:
+  `SolidModelBundle::box_slot_difference_fixture()` now models a reusable
+  `Box - Box` through-slot. Retained visual CSG Difference supports bounded
+  through-hole rings for cylinders and rectangular box slots. Manufacturing
+  already emits authoritative rectangular holes for this shape, and the
+  fixture is now part of the solid-graph, manufacturing-slices, and 3MF export
+  report matrices.
+- Verification:
+  `cargo test -q -p boon_solid_model -- --nocapture`;
+  `cargo test -q -p boon_manufacturing -- --nocapture`;
+  `cargo test -q -p boon_scene_model -- --nocapture`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-manufacturing-slices --report target/reports/unified/manufacturing-slices.json`;
+  `target/debug/xtask verify-3mf-export --report target/reports/unified/3mf-export.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json target/reports/unified/manufacturing-slices.json target/reports/unified/3mf-export.json`.
+- Current facts:
+  `solid-graph:box-slot-difference-visual-proxy-uses-rectangular-hole-csg-subset-mesh`
+  passes. `box-slot-difference` manufacturing reports `20` layers, `20`
+  polygons, `20` holes, and visual mesh false. The 3MF package reports `20`
+  slices, `168` mesh vertices, `640` mesh triangles, and visual mesh false.
+- Limits:
+  only full-depth supported through holes are intended. Partial-depth holes,
+  arbitrary polygon booleans, exact/general CSG, curved/hollow intersections,
+  native/browser 3D visual parity, TASK-0804A, Cells release benchmark
+  evidence, and the default executor switch remain open.
+- Next direction:
+  continue with another independent U6-U10 slice or refresh aggregate evidence
+  with the known U5 demand-loop failure still visible.
+
+### 2026-06-25 U9 rectangular slot STL propagation
+
+- Task:
+  propagate the bounded rectangular-slot Difference fixture through STL export
+  evidence so 3MF is not the only export path covering it.
+- Status:
+  implemented and verified. U9 remains in-progress; this is a bounded
+  rectangle-supported STL slice, not general Boolean mesh export.
+- Changes kept:
+  `boon_mesh_export` now has a focused
+  `box_slot_difference_layers_export_to_hole_preserving_stl_without_visual_meshes`
+  test. `verify-solid-graph` now includes
+  `mesh-export:box-slot-difference-stl-preserves-rectangular-hole-layers` and
+  reports slot STL preserved/rejected hole counts, triangle counts, binary STL
+  counts, and topology status.
+- Verification:
+  `cargo test -q -p boon_mesh_export box_slot -- --nocapture`;
+  `cargo test -q -p boon_mesh_export -- --nocapture`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `cargo fmt -p boon_mesh_export -p xtask -- --check`;
+  `git diff --check -- crates/boon_mesh_export/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Current facts:
+  the solid-graph report is `pass`; the slot STL check is `pass`; ASCII STL
+  preserves `20` holes, rejects `0` holes, and emits `336` triangles; binary
+  STL also emits `336` triangles; topology status is `Pass`.
+- Limits:
+  this does not implement general polygon Boolean contour stitching, partial
+  depth slots, curved/hollow CSG, external conformance/importer validation,
+  final car manufacturing, TASK-0804A, Cells release benchmark evidence, or
+  the default executor switch.
+- Next direction:
+  continue independent U6-U10 work or refresh aggregate evidence with the
+  known U5 demand-loop failure still visible.
+
+### 2026-06-25 U8/U9 top-open pocket slice postponed
+
+- Task:
+  start extending the bounded `Box - Box` Difference support from full-depth
+  through-slots to a top-open rectangular pocket.
+- Status:
+  unfinished and postponed by user direction. This is not accepted U8/U9
+  evidence.
+- Partial groundwork kept:
+  `SolidModelBundle::box_pocket_difference_fixture()` now exists, and the
+  retained visual Difference helper has a compile-safe sketch for splitting a
+  base prism into a bottom slab plus holed top slab for one top-open rectangular
+  cutter shape.
+- Verification:
+  `cargo check -q -p boon_solid_model -p boon_scene_model` passed after
+  removing an unused-mut warning.
+- Missing acceptance evidence:
+  no focused pocket scene-model test, no manufacturing-slices case, no STL
+  proof, no 3MF proof, no `verify-solid-graph` report row, and no schema
+  evidence exist for this pocket fixture yet.
+- Postponement reason:
+  the slice is starting to consume too much time and should not distract from
+  other unfinished unified tasks. Do not claim partial-depth pocket support from
+  this groundwork.
+- Resume condition:
+  return only when Boolean/export work is again the active focus, then add
+  report-gated tests for retained visual CSG, authoritative layer generation,
+  STL/3MF export, and schema validation.
+- Next direction:
+  continue with a different unfinished unified task that is not blocked by
+  U5/TASK-0804A or this partial-depth CSG slice.
+
+### 2026-06-25 U9 Shell/Extrude/Revolve STL propagation
+
+- Task:
+  continue independent U9 export work by propagating already-supported
+  authoritative hollow/profile manufacturing fixtures through deterministic
+  STL export evidence.
+- Status:
+  implemented and verified for Shell, Extrude, and Revolve. U9 remains
+  in-progress; Loft STL topology remains unfinished/postponed.
+- Changes kept:
+  `boon_mesh_export` now has focused tests for
+  `shell_box_layers_export_to_stl_without_visual_meshes`,
+  `extruded_rectangle_layers_export_to_stl_without_visual_meshes` and
+  `revolved_ring_layers_export_to_stl_without_visual_meshes`. `verify-solid-graph`
+  now has a reusable STL fixture evidence helper and three report checks:
+  `mesh-export:shell-box-stl-preserves-authoritative-hollow-layers`,
+  `mesh-export:extruded-rectangle-stl-preserves-authoritative-profile-layers`
+  and
+  `mesh-export:revolved-ring-stl-preserves-authoritative-annulus-layers`.
+- Verification:
+  `cargo test -q -p boon_mesh_export extruded_rectangle_layers_export_to_stl_without_visual_meshes -- --nocapture`;
+  `cargo test -q -p boon_mesh_export revolved_ring_layers_export_to_stl_without_visual_meshes -- --nocapture`;
+  `cargo test -q -p boon_mesh_export shell_box_layers_export_to_stl_without_visual_meshes -- --nocapture`;
+  `cargo test -q -p boon_mesh_export -- --nocapture`;
+  `cargo fmt -p boon_mesh_export -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`.
+- Current facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass` and
+  `mesh_export_profile_stl_status="shell-extrude-and-revolve-authoritative-layer-stl-pass"`.
+  Shell reports `40` layers, `40` polygons, `30` holes, `30` preserved holes,
+  `568` ASCII/binary triangles, topology `Pass`, rejected holes `0`, and
+  visual mesh used `false`.
+  Extrude reports `30` layers, `30` polygons, `0` holes, `244` triangles,
+  topology `Pass`, rejected holes `0`, and visual mesh used `false`. Revolve
+  reports `30` layers, `30` polygons, `30` holes, `30` preserved holes,
+  `3968` triangles, topology `Pass`, rejected holes `0`, and visual mesh used
+  `false`.
+- Explicit non-claims:
+  Shell initially exported with `8` boundary edges because adjacent-layer cap
+  clipping treated blocker polygons with holes as fully solid. That is fixed
+  for the current rectangular hollow Shell fixture. Loft still exported with
+  `464` boundary edges in exploratory checks, remains open U9
+  topology/stitching work, and is not hidden by this slice.
+- Limits:
+  this does not implement general polygon Boolean contour stitching,
+  partial-depth pockets, exact/general CSG, external conformance/importer
+  validation, final car manufacturing, TASK-0804A, Cells release benchmark
+  evidence, or the default executor switch.
+- Next direction:
+  continue another independent U6-U10 slice. Return to Loft STL only when
+  changing-profile topology stitching is the active focus or it is the final
+  remaining goal piece.
+
+### 2026-06-25 U11 aggregate freshness after U9 STL slice
+
+- Task:
+  refresh aggregate evidence after rebuilding `xtask` for the U9 STL report
+  changes.
+- Status:
+  aggregate hygiene refreshed; unified goal still incomplete.
+- Result:
+  regenerated stale passing child reports against the current
+  `target/debug/xtask` binary and reran the aggregate in check-existing mode.
+  The aggregate remains an expected failure only because
+  `demand-driven-render-loop` fails.
+- Verification:
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  refreshed stale passing children for runtime/document/layout/render,
+  retained WGPU/readback/native-web, semantic/accessibility/browser artifact,
+  3D, manufacturing, 3MF, and parametric car reports;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current aggregate facts:
+  `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, `command_match_report_count=18`, and no
+  stale/schema-invalid passing children remain. The only failing child is
+  `demand-driven-render-loop`.
+- Limits:
+  this is freshness hygiene, not completion. U5/TASK-0804A/custom-project
+  demand-driven evidence is still open and must remain visible.
+- Next direction:
+  continue another independent U6-U10 implementation slice; return to U5 only
+  when the retained scheduler/layout/runtime architecture is ready or it is the
+  final remaining goal piece.
+
+### 2026-06-25 U6 WASM packed-buffer layout contract
+
+- Task:
+  continue independent U6 browser/WASM work after postponing Loft/top-open
+  pocket and the U5/TASK-0804A speed loop.
+- Status:
+  implemented and verified as a source/report contract. U6 remains
+  in-progress; this is not direct WASM ownership of browser WebGPU calls.
+- Changes kept:
+  `boon_web_host` now exports WASM-callable retained packed-buffer layout
+  helpers for word count, word lookup, validation, total bytes, draw-descriptor
+  bytes, and fingerprinting. `WebRetainedPackedBufferLayout` records exact
+  vertex/index/camera/draw-descriptor byte offsets and lengths with
+  `browser_upload_executed=false` and `browser_render_executed=false`.
+  `verify-native-web-render-contract` now report-gates the layout under
+  `native-web-render-contract:browser-host-packed-buffer-layout`.
+- Verification:
+  `node --check crates/boon_web_host/static/world_scene_host.js`;
+  `cargo fmt -p boon_web_host -p xtask -- --check`;
+  `cargo test -q -p boon_web_host exported_wasm_metadata_matches_host_contract -- --nocapture`;
+  `cargo test -q -p boon_web_host packed_buffer_layout_contract_derives_non_overlapping_offsets -- --nocapture`;
+  `cargo check -q -p boon_web_host -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-native-web-render-contract --report target/reports/unified/native-web-render-contract.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/native-web-render-contract.json`.
+- Current facts:
+  `target/reports/unified/native-web-render-contract.json` reports
+  `status=pass`,
+  `native_web_render_contract_status=webgpu-compatible-contract-pass`,
+  `browser_host_packed_buffer_layout_status=retained-packed-buffer-layout-contract-pass`,
+  `browser_host_packed_buffer_layout_word_count=12`,
+  `browser_host_packed_buffer_layout_total_bytes=17636`,
+  `browser_host_packed_buffer_layout_wasm_fingerprint=1941043131`, and
+  `browser_host_static_source_bytes=31998`.
+- Limits:
+  this does not make WASM own `GPUDevice`, WebGPU command encoding, queue
+  submission, browser readback, or actual browser packed-buffer memory writes.
+  The browser JS source remains just under the existing `32000` byte static
+  source budget, so future U6 JS growth should either generate/minify more
+  aggressively or move logic into WASM instead of raising the budget casually.
+  The unified aggregate was not refreshed after this focused U6 edit.
+- Next direction:
+  continue another independent U6-U10 task, but do not keep looping on the
+  next WASM-memory step right now.
+
+### 2026-06-25 U6 WASM packed-buffer memory proof postponed
+
+- Task:
+  attempt the next U6 browser/WASM slice after the packed-buffer layout
+  contract by making generated WASM own/write a small retained packed buffer in
+  memory and validating it against existing native-web/browser-render evidence.
+- Status:
+  explicitly unfinished and postponed by user direction. This is not a pass and
+  not evidence that WASM owns browser packed-buffer memory or WebGPU calls.
+- Current facts:
+  the prior layout-only contract is implemented and verified, but the
+  follow-up memory ownership proof was starting to turn into another long loop.
+  The checked-in browser host source is already close to its static source
+  budget (`31998` bytes against `32000`), so this step should not be forced by
+  piling more JavaScript into the checked-in host.
+- Postponement reason:
+  the goal has multiple independent unfinished U6-U10 tasks, and this subtask
+  is not required before those can move. Return to it after lower-risk
+  independent tasks are done, or as one of the final remaining U6 pieces.
+- Resume condition:
+  resume only with a bounded plan that either moves actual packing logic into
+  generated WASM without increasing the browser-host source budget casually, or
+  first creates a smaller generated-host surface that makes browser-executed
+  WASM memory validation cheap to prove.
+- Next direction:
+  continue a different independent U6-U10 implementation slice that is not
+  blocked by U5/TASK-0804A, the custom-project demand child, top-open pocket,
+  Loft STL topology, or this U6 WASM-memory proof.
+
+### 2026-06-25 U9 thin-shell wall-thickness report gate
+
+- Task:
+  continue with a bounded independent U9 manufacturing reliability slice after
+  postponing the U6 WASM-memory proof.
+- Status:
+  implemented and verified. U9 remains in-progress; this is preparation-level
+  diagnostic evidence, not general wall-analysis completion.
+- Changes kept:
+  `boon_solid_model` now exposes
+  `SolidModelBundle::thin_shell_wall_thickness_negative_fixture()`.
+  The manufacturing wall-thickness unit test reuses that fixture.
+  `verify-solid-graph` now has the audit check
+  `manufacturing:thin-shell-wall-thickness-preparation-blocker` and emits
+  thin-shell preparation/artifact report fields.
+- Verification:
+  `cargo fmt -p boon_solid_model -p boon_manufacturing -p xtask -- --check`;
+  `cargo test -q -p boon_manufacturing print_preparation_reports_wall_thickness_violation -- --nocapture`;
+  `cargo check -q -p boon_solid_model -p boon_manufacturing -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json`;
+  `git diff --check -- crates/boon_solid_model/src/lib.rs crates/boon_manufacturing/src/lib.rs crates/xtask/src/main.rs docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md docs/plans/speedup/12-speedup-goal-execution-checklist.md`.
+- Current facts:
+  `target/reports/unified/solid-graph.json` reports `status=pass`,
+  `thin_shell_wall_thickness_preparation_status="Blocked"`,
+  `thin_shell_wall_thickness_minimum=0.4`,
+  `thin_shell_wall_thickness_observed=0.2`,
+  `thin_shell_wall_thickness_violation_count=1`,
+  `thin_shell_wall_thickness_diagnostic_status="wall-thickness-violation"`,
+  `thin_shell_wall_thickness_artifact_status="Fail"`, and
+  `thin_shell_wall_thickness_artifact_visual_mesh_used=false`.
+- Limits:
+  this does not implement general wall analysis, arbitrary shell validation,
+  external slicer validation, Loft STL topology, top-open pockets, U5 speed
+  closure, or direct browser WASM memory ownership.
+- Next direction:
+  continue another independent U6-U10 slice. Keep U5/TASK-0804A,
+  custom-project demand evidence, top-open pocket, Loft STL topology, and U6
+  WASM-memory proof postponed until they are active/final goal pieces.
+
+### 2026-06-25 U11 aggregate freshness check after thin-shell gate
+
+- Task:
+  run a bounded aggregate check after the U9 thin-shell verifier/report change.
+- Status:
+  unfinished aggregate hygiene. This check did not regenerate all stale child
+  reports.
+- Verification:
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`
+  returned the expected aggregate failure.
+- Current facts:
+  the aggregate reports `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `command_match_report_count=18`, and `schema_valid_report_count=1`.
+  The known failing child remains
+  `target/reports/native-gpu/demand-driven-render-loop.json`. Older passing
+  child reports now need regeneration/schema refresh before U11 aggregate
+  freshness can be claimed.
+- Limits:
+  this is report hygiene, not a new feature regression claim and not completion
+  of U11. Do not claim the unified aggregate is fresh from this result.
+- Next direction:
+  either refresh child reports as a bounded U11 hygiene task, or continue
+  another independent U6-U10 implementation slice. Keep U5/TASK-0804A,
+  top-open pocket, Loft STL topology, and U6 WASM-memory proof postponed until
+  they are active/final goal pieces.
+
+### 2026-06-25 U11 aggregate child schema freshness restored
+
+- Task:
+  finish the bounded U11 aggregate hygiene follow-up after the thin-shell report
+  gate made older passing child reports schema-stale.
+- Status:
+  aggregate child freshness restored for all passing children. Unified goal
+  remains incomplete because the demand-driven render-loop child still fails.
+- Commands run:
+  regenerated the schema-stale passing children with the current
+  `target/debug/xtask`: runtime-change-sets, document-batch-patches,
+  retained-layout-deltas, text-cache-layers, render-patch-contract,
+  native-gpu-world-scene, browser WebGPU world-scene at the consumed
+  `browser-world-scene.json` path, wgpu-retained-arenas,
+  native-web-render-comparison, wgpu-readback, native-web-render-parity,
+  semantic-scene, accessibility-adapters, browser-artifact-budget,
+  3d-hello-cube, 3d-printable-bracket, manufacturing-slices, 3mf-export, and
+  3d-parametric-car.
+- Verification:
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`
+  still returns expected failure, but now only because
+  `target/reports/native-gpu/demand-driven-render-loop.json` fails.
+- Current facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+- Limits:
+  this does not complete U11, does not solve U5/TASK-0804A, and does not solve
+  the custom-project demand-driven child. It restores freshness for evidence
+  that already passed.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  default/cleanup U11 task. Return to demand-driven render-loop only when U5 is
+  active/final focus.
+
+### 2026-06-25 U1/U11 current readiness audit after aggregate refresh
+
+- Task:
+  run a current readiness audit after restoring unified aggregate child schema
+  freshness, without reopening postponed Cells/default-switch work.
+- Status:
+  expected failure documented. Overall readiness remains incomplete.
+- Verification:
+  `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`
+  wrote the report and failed honestly.
+- Current facts:
+  `target/reports/bytes-plan/goal-readiness.json` reports `status="fail"`.
+  Blockers are: `8` phases still partial, BYTES/MachinePlan aggregate not
+  passing, BYTES/MachinePlan aggregate stale for the current worktree
+  fingerprint, missing Cells release benchmark wrapper because `TASK-0804A`
+  remains blocked by speed budgets, and Phase 10 default switch not done
+  because `boon_cli run` still defaults to legacy. `not_started_phases=[]`.
+- Limits:
+  this is audit evidence only. It does not solve TASK-0804A, refresh the
+  BYTES/MachinePlan aggregate, or switch default execution.
+- Next direction:
+  continue an independent U6-U10 implementation slice, or choose a bounded U11
+  cleanup task that does not depend on the default switch. Return to BYTES
+  aggregate freshness/default-switch/TASK-0804A only when those are active/final
+  focus.
+
+### 2026-06-25 U10 selected-wheel STL export evidence
+
+- Task:
+  continue with an independent U10 manufacturing/export slice after postponing
+  the U5/TASK-0804A speed loop and U6 WASM-memory proof.
+- Status:
+  implemented and verified as focused U10 evidence. U10 remains in-progress;
+  aggregate freshness is again unfinished after the report-schema/report-field
+  change.
+- Changes kept:
+  `verify-3d-parametric-car` now includes the
+  `3d-parametric-car:selected-wheel-stl-export` audit check. It compiles the
+  selected wheel with `PrintCompileRequest::for_selected_instances`, exports
+  ASCII and binary STL from authoritative manufacturing layers, validates STL
+  package shape, validates layer-prism topology, validates exported triangle
+  stream topology, and reports explicit
+  `selected_wheel_stl_visual_mesh_used=false` evidence.
+- Verification:
+  `cargo fmt -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `selected_wheel_stl_status="Pass"`,
+  `selected_wheel_stl_validation_status="Pass"`,
+  `selected_wheel_stl_layer_count=20`,
+  `selected_wheel_stl_polygon_count=20`,
+  `selected_wheel_stl_triangle_count=1340`,
+  `selected_wheel_stl_topology_status="Pass"`,
+  `selected_wheel_stl_topology_boundary_edge_count=0`,
+  `selected_wheel_stl_export_topology_status="Pass"`,
+  `selected_wheel_stl_export_topology_triangle_count=1340`,
+  `selected_wheel_binary_stl_status="Pass"`,
+  `selected_wheel_binary_stl_validation_status="Pass"`,
+  `selected_wheel_binary_stl_triangle_count=1340`, and
+  `selected_wheel_stl_visual_mesh_used=false`.
+- Aggregate facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=1`, and `command_match_report_count=18`.
+  The known failing child is still
+  `target/reports/native-gpu/demand-driven-render-loop.json`, but older passing
+  children also need schema regeneration before aggregate freshness can be
+  claimed again.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, aggregate freshness, default
+  execution, or U5/TASK-0804A speed closure.
+- Next direction:
+  continue another independent U6-U10 task, or refresh aggregate child-report
+  schemas as a bounded U11 hygiene task. Keep U5/TASK-0804A, custom-project
+  demand evidence, top-open pocket, Loft STL topology, and U6 WASM-memory proof
+  postponed until they are active/final goal pieces.
+
+### 2026-06-25 U11 aggregate freshness restored after selected-wheel STL
+
+- Task:
+  refresh aggregate child-report schemas after the U10 selected-wheel report
+  fields made older passing child reports stale.
+- Status:
+  aggregate child freshness restored for all passing children. Unified goal
+  remains incomplete because the demand-driven render-loop child still fails.
+- Commands run:
+  regenerated the required passing children with the current
+  `target/debug/xtask`: runtime-change-sets, document-batch-patches,
+  retained-layout-deltas, text-cache-layers, render-patch-contract,
+  wgpu-retained-arenas, wgpu-readback, native-web-render-parity,
+  semantic-scene, accessibility-adapters, browser-artifact-budget,
+  3d-hello-cube, solid-graph, 3d-printable-bracket, manufacturing-slices,
+  3mf-export, and 3d-parametric-car. Also refreshed prerequisite native
+  world-scene, browser world-scene, native-web render comparison, and browser
+  host artifact reports used by those children.
+- Verification:
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`
+  still returns expected failure, but now only because
+  `target/reports/native-gpu/demand-driven-render-loop.json` fails.
+- Current facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+  The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+- Limits:
+  this does not complete U11, does not solve U5/TASK-0804A, does not solve the
+  custom-project demand-driven child, and does not switch default execution.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  U11 cleanup/default task that does not depend on demand-driven render-loop
+  passing. Return to demand-driven render-loop/TASK-0804A only when U5 is
+  active/final focus.
+
+### 2026-06-25 U10 visual-only manufacturing negative gate
+
+- Task:
+  strengthen U10 by proving selected visual-only parametric-car windows cannot
+  be compiled into manufacturing output, without reopening the postponed
+  U5/TASK-0804A speed loop.
+- Status:
+  implemented and verified as focused U10 negative evidence. U10 remains
+  in-progress.
+- Changes kept:
+  `verify-3d-parametric-car` now includes
+  `3d-parametric-car:selected-visual-only-manufacturing-negative`. It compiles a
+  selected-instance print request for the visual-only window instance and
+  requires `ManufacturingCompileStatus::Fail`, zero layers, zero polygons, zero
+  printable parts/instances, a `selected-instance-not-printable` diagnostic, and
+  `visual_mesh_used_for_manufacturing=false`.
+- Verification:
+  `cargo fmt -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  refreshed the unified aggregate's passing child reports;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `selected_visual_only_manufacturing_status="Fail"`,
+  `selected_visual_only_manufacturing_layer_count=0`,
+  `selected_visual_only_manufacturing_polygon_count=0`,
+  `selected_visual_only_manufacturing_printable_part_count=0`,
+  `selected_visual_only_manufacturing_printable_instance_count=0`,
+  `selected_visual_only_manufacturing_diagnostic_codes=["selected-instance-not-printable"]`,
+  and `selected_visual_only_manufacturing_visual_mesh_used=false`.
+- Aggregate facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+  The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, default execution, or U5/TASK-0804A
+  speed closure.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  U11 cleanup/default task. Keep U5/TASK-0804A, custom-project demand evidence,
+  top-open pocket, Loft STL topology, and U6 WASM-memory proof postponed until
+  they are active/final goal pieces.
+
+### 2026-06-25 U10 selected-body 3MF export evidence
+
+- Task:
+  strengthen U10 selected printable export evidence by proving the `Car body`
+  selection produces a deterministic validating 3MF package from authoritative
+  manufacturing layers.
+- Status:
+  implemented and verified as focused U10 selected printable evidence. U10
+  remains in-progress.
+- Changes kept:
+  `verify-3d-parametric-car` now includes
+  `3d-parametric-car:selected-body-3mf-export`. It routes selection of the
+  `Car body` instance through `WorldScene::manufacturing_export_preparation`,
+  compiles only that selected instance with
+  `PrintCompileRequest::for_selected_instances`, exports deterministic 3MF
+  package bytes, validates the package, and runs importer smoke without using
+  visual mesh authority.
+- Verification:
+  `cargo fmt -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  refreshed the unified aggregate's passing child reports;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `export_selected_body_status="ReadySelectedPrintable"`,
+  `export_selected_body_exportable=true`,
+  `selected_body_three_mf_status="Pass"`,
+  `selected_body_three_mf_validation_status="Pass"`,
+  `selected_body_three_mf_importer_smoke_status="Pass"`,
+  `selected_body_three_mf_layer_count=45`,
+  `selected_body_three_mf_polygon_count=45`,
+  `selected_body_three_mf_component_count=1`,
+  `selected_body_three_mf_material_count=1`,
+  `selected_body_three_mf_mesh_triangle_count=540`, and
+  `selected_body_three_mf_visual_mesh_used=false`.
+- Aggregate facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+  The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, default execution, or U5/TASK-0804A
+  speed closure.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  U11 cleanup/default task. Keep U5/TASK-0804A, custom-project demand evidence,
+  top-open pocket, Loft STL topology, and U6 WASM-memory proof postponed until
+  they are active/final goal pieces.
+
+### 2026-06-25 U10 selected-wheel 3MF export evidence
+
+- Task:
+  strengthen U10 selected printable export evidence by proving the selected
+  shared wheel instance produces a deterministic validating 3MF package from
+  authoritative manufacturing layers.
+- Status:
+  implemented and verified as focused U10 selected printable evidence. U10
+  remains in-progress.
+- Changes kept:
+  `verify-3d-parametric-car` now includes
+  `3d-parametric-car:selected-wheel-3mf-export`. It reuses the selected wheel
+  manufacturing output produced by `PrintCompileRequest::for_selected_instances`,
+  exports deterministic 3MF package bytes, validates the package, and runs
+  importer smoke without using visual mesh authority.
+- Verification:
+  `cargo fmt -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  refreshed the unified aggregate's passing child reports;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `export_selected_wheel_status="ReadySelectedPrintable"`,
+  `export_selected_wheel_exportable=true`,
+  `selected_wheel_three_mf_status="Pass"`,
+  `selected_wheel_three_mf_validation_status="Pass"`,
+  `selected_wheel_three_mf_importer_smoke_status="Pass"`,
+  `selected_wheel_three_mf_layer_count=20`,
+  `selected_wheel_three_mf_polygon_count=20`,
+  `selected_wheel_three_mf_component_count=1`,
+  `selected_wheel_three_mf_material_count=1`,
+  `selected_wheel_three_mf_mesh_triangle_count=2480`, and
+  `selected_wheel_three_mf_visual_mesh_used=false`.
+- Aggregate facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+  The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, default execution, or U5/TASK-0804A
+  speed closure.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  U11 cleanup/default task. Keep U5/TASK-0804A, custom-project demand evidence,
+  top-open pocket, Loft STL topology, and U6 WASM-memory proof postponed until
+  they are active/final goal pieces.
+
+### 2026-06-25 U10 selected-body STL export evidence
+
+- Task:
+  strengthen U10 selected printable export evidence by proving the selected
+  `Car body` instance also produces deterministic ASCII/binary STL from
+  authoritative manufacturing layers.
+- Status:
+  implemented and verified as focused U10 selected printable evidence. U10
+  remains in-progress.
+- Changes kept:
+  `verify-3d-parametric-car` now includes
+  `3d-parametric-car:selected-body-stl-export`. It reuses the selected body
+  manufacturing output produced by `PrintCompileRequest::for_selected_instances`,
+  exports deterministic ASCII and binary STL, validates the packages, validates
+  layer-prism topology, validates exported triangle-stream topology, and keeps
+  visual mesh authority out of the manufacturing path.
+- Verification:
+  `cargo fmt -p xtask -- --check`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  refreshed the unified aggregate's passing child reports;
+  `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `selected_body_stl_status="Pass"`,
+  `selected_body_stl_validation_status="Pass"`,
+  `selected_body_stl_triangle_count=364`,
+  `selected_body_stl_topology_status="Pass"`,
+  `selected_body_stl_export_topology_status="Pass"`,
+  `selected_body_stl_export_topology_boundary_edge_count=0`,
+  `selected_body_binary_stl_status="Pass"`,
+  `selected_body_binary_stl_validation_status="Pass"`,
+  `selected_body_binary_stl_triangle_count=364`, and
+  `selected_body_stl_visual_mesh_used=false`.
+- Aggregate facts:
+  `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`, `checked_report_count=18`, `missing_report_count=0`,
+  `passed_report_count=17`, `failed_report_count=1`,
+  `schema_valid_report_count=17`, and `command_match_report_count=18`.
+  The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, default execution, or U5/TASK-0804A
+  speed closure.
+- Next direction:
+  continue another independent U6-U10 implementation slice or start a bounded
+  U11 cleanup/default task. Keep U5/TASK-0804A, custom-project demand evidence,
+  top-open pocket, Loft STL topology, and U6 WASM-memory proof postponed until
+  they are active/final goal pieces.
+
+### 2026-06-25 U10 visual-only export negative gate
+
+- Task:
+  prove selected visual-only parametric-car windows fail export as well as
+  manufacturing, so visual geometry cannot leak into 3MF/STL artifacts.
+- Status:
+  implemented and verified as focused U10 negative evidence. U10 remains
+  in-progress.
+- Changes kept:
+  `verify-3d-parametric-car` now includes
+  `3d-parametric-car:selected-visual-only-export-negative`. It reuses the
+  selected visual-only window manufacturing output, requires that output to
+  fail, and then requires 3MF, ASCII STL, and binary STL export/validation to
+  fail with no package entries, no OPC bytes, no STL triangles, and no
+  visual-mesh fallback.
+- Verification:
+  `cargo fmt -p xtask`;
+  `cargo check -q -p xtask`;
+  `cargo build -q -p xtask`;
+  `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json`;
+  `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json`;
+  refreshed the unified aggregate's passing child reports.
+- Current facts:
+  `target/reports/unified/3d-parametric-car.json` reports `status=pass`,
+  `selected_visual_only_manufacturing_status="Fail"`,
+  `selected_visual_only_manufacturing_layer_count=0`,
+  `selected_visual_only_manufacturing_polygon_count=0`,
+  `selected_visual_only_manufacturing_diagnostic_codes=["selected-instance-not-printable"]`,
+  `selected_visual_only_three_mf_status="Fail"`,
+  `selected_visual_only_three_mf_validation_status="Fail"`,
+  `selected_visual_only_three_mf_entry_count=0`,
+  `selected_visual_only_three_mf_opc_zip_byte_count=0`,
+  `selected_visual_only_three_mf_diagnostic_codes=["manufacturing-output-not-pass", "missing-slices"]`,
+  `selected_visual_only_stl_status="Fail"`,
+  `selected_visual_only_stl_validation_status="Fail"`,
+  `selected_visual_only_stl_triangle_count=0`,
+  `selected_visual_only_stl_byte_count=0`,
+  `selected_visual_only_stl_diagnostic_codes=["manufacturing-output-not-pass", "missing-layers"]`,
+  `selected_visual_only_binary_stl_status="Fail"`,
+  `selected_visual_only_binary_stl_validation_status="Fail"`,
+  `selected_visual_only_binary_stl_triangle_count=0`,
+  `selected_visual_only_binary_stl_byte_count=0`,
+  `selected_visual_only_binary_stl_diagnostic_codes=["manufacturing-output-not-pass", "missing-layers"]`,
+  and `selected_visual_only_stl_visual_mesh_used=false`.
+- TASK-0804A handoff:
+  `docs/plans/speedup/TASK-0804A_HANDOFF.md` now records the standalone
+  unfinished Cells speed handoff, including accepted measurements, killed
+  attempts, kept improvements, commands, acceptance criteria, and the required
+  future scheduler/indexing direction.
+- Limits:
+  this does not complete final car manufacturing, general CSG, external slicer
+  validation, full native/browser 3D parity, default execution, or U5/TASK-0804A
+  speed closure.
+- Next direction:
+  refresh the unified aggregate after this doc-only update if fresh aggregate
+  evidence is needed, then continue another independent U6-U10 implementation
+  slice or start a bounded U11 cleanup/default task. Keep U5/TASK-0804A,
+  custom-project demand evidence, top-open pocket, Loft STL topology, and U6
+  WASM-memory proof postponed until they are active/final goal pieces.
 
 ## File Maintenance Checklist
 

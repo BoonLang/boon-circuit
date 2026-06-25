@@ -1,0 +1,18 @@
+[package]
+name = "boon_web_host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+boon_document.workspace = true
+boon_scene_model.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+boon_solid_model.workspace = true
+serde_json.workspace = true

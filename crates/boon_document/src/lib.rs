@@ -7,9 +7,10 @@ pub mod render_scene;
 use boon_host::Viewport;
 pub use render_scene::{
     RenderFontStyle, RenderFontWeight, RenderQuadBatch, RenderRichTextSpan, RenderScene,
-    RenderSceneItem, RenderSceneMetrics, RenderTextAlign, RenderTextPlacementKey, RenderTextRun,
-    RenderTextShapeKey, RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
-    RenderVisualPrimitiveKind, RetainedRenderChunkDescriptor,
+    RenderSceneItem, RenderSceneMetrics, RenderScenePaintPatch, RenderScenePatch,
+    RenderScenePatchOperation, RenderScenePatchReport, RenderTextAlign, RenderTextPlacementKey,
+    RenderTextRun, RenderTextShapeKey, RenderTextVerticalAlign, RenderTextureRef,
+    RenderVisualPrimitive, RenderVisualPrimitiveKind, RetainedRenderChunkDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -402,6 +403,433 @@ fn style_u64(style: &StyleMap, key: &str) -> Option<u64> {
     }
 }
 
+fn semantic_node_from_document_node(
+    document: &DocumentFrame,
+    node: &DocumentNode,
+    item: Option<&DisplayItem>,
+) -> SemanticNode {
+    let id = SemanticId::from_document_node_id(&node.id);
+    let checked = semantic_style_bool(&node.style, "checked");
+    let focused = document.focus.as_ref() == Some(&node.id)
+        || item.is_some_and(|item| item.focused)
+        || semantic_style_bool(&node.style, "__focused") == Some(true)
+        || semantic_style_bool(&node.style, "focus") == Some(true);
+    let source_binding = node.source_binding.as_ref();
+    let source_intent = source_binding.map(|binding| binding.intent.clone());
+    let role = semantic_role_for_document_kind(&node.kind);
+    let actions = semantic_actions_for_node(&node.kind, source_intent.as_deref());
+    let value = semantic_value_for_node(node, item);
+    SemanticNode {
+        id,
+        node: node.id.clone(),
+        role,
+        name: semantic_name_for_node(node, item),
+        description: semantic_style_text_any(
+            &node.style,
+            &[
+                "accessibility_description",
+                "aria_description",
+                "description",
+            ],
+        ),
+        value,
+        state: SemanticState {
+            focused,
+            checked,
+            disabled: semantic_style_bool(&node.style, "disabled").unwrap_or(false),
+            selected: semantic_style_bool(&node.style, "selected").unwrap_or(false),
+        },
+        actions,
+        relations: SemanticRelations {
+            parent: node.parent.as_ref().map(SemanticId::from_document_node_id),
+            children: node
+                .children
+                .iter()
+                .map(SemanticId::from_document_node_id)
+                .collect(),
+            controls: Vec::new(),
+            labelled_by: Vec::new(),
+            described_by: Vec::new(),
+        },
+        bounds: item.map(|item| item.bounds),
+        language: semantic_style_text_any(&node.style, &["language", "lang"]),
+        heading_level: style_u64(&node.style, "heading_level").and_then(|value| {
+            u8::try_from(value)
+                .ok()
+                .filter(|value| (1..=6).contains(value))
+        }),
+        href: semantic_style_text_any(&node.style, &["href", "url"]),
+        source_binding_id: source_binding.map(|binding| binding.id.clone()),
+        source_path: source_binding.map(|binding| binding.source_path.clone()),
+        source_intent,
+    }
+}
+
+fn semantic_role_for_document_kind(kind: &DocumentNodeKind) -> SemanticRole {
+    match kind {
+        DocumentNodeKind::Root => SemanticRole::Application,
+        DocumentNodeKind::Stack => SemanticRole::Group,
+        DocumentNodeKind::Row => SemanticRole::Row,
+        DocumentNodeKind::Text => SemanticRole::Text,
+        DocumentNodeKind::Button => SemanticRole::Button,
+        DocumentNodeKind::Checkbox => SemanticRole::Checkbox,
+        DocumentNodeKind::TextInput => SemanticRole::TextInput,
+        DocumentNodeKind::Table => SemanticRole::Table,
+        DocumentNodeKind::TableCell => SemanticRole::Cell,
+        DocumentNodeKind::ScrollRoot => SemanticRole::ScrollRegion,
+    }
+}
+
+fn semantic_actions_for_node(
+    kind: &DocumentNodeKind,
+    source_intent: Option<&str>,
+) -> SemanticActions {
+    let press_intent = source_intent.is_some_and(|intent| {
+        matches!(
+            intent,
+            "press" | "activate" | "toggle" | "submit" | "open" | "select"
+        )
+    });
+    SemanticActions {
+        focus: matches!(
+            kind,
+            DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::TextInput
+        ) || press_intent,
+        press: matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox)
+            || press_intent,
+        set_text: matches!(kind, DocumentNodeKind::TextInput),
+        increment: false,
+        decrement: false,
+    }
+}
+
+fn semantic_name_for_node(node: &DocumentNode, item: Option<&DisplayItem>) -> Option<String> {
+    semantic_style_text_any(
+        &node.style,
+        &[
+            "accessibility_label",
+            "aria_label",
+            "label",
+            "title",
+            "placeholder",
+        ],
+    )
+    .or_else(|| node.text.as_ref().map(|text| text.text.clone()))
+    .or_else(|| item.and_then(|item| item.text.clone()))
+}
+
+fn semantic_value_for_node(
+    node: &DocumentNode,
+    item: Option<&DisplayItem>,
+) -> Option<SemanticValue> {
+    match node.kind {
+        DocumentNodeKind::Checkbox => {
+            semantic_style_bool(&node.style, "checked").map(|value| SemanticValue::Bool { value })
+        }
+        DocumentNodeKind::TextInput => node
+            .text
+            .as_ref()
+            .map(|text| text.text.clone())
+            .or_else(|| item.and_then(|item| item.text.clone()))
+            .or_else(|| semantic_style_text_any(&node.style, &["value"]))
+            .map(|text| SemanticValue::Text { text }),
+        DocumentNodeKind::Text => node.text.as_ref().map(|text| SemanticValue::Text {
+            text: text.text.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn semantic_node_from_world_editor_node(
+    node: &boon_scene_model::WorldSemanticEditorNode,
+    tree: &boon_scene_model::WorldSemanticEditorTree,
+) -> SemanticNode {
+    let id = SemanticId::from_world_editor_node_id(&node.id);
+    let source_intent = world_editor_source_intent(node);
+    let source_path = source_intent
+        .as_ref()
+        .map(|intent| world_editor_source_path(node, intent));
+    SemanticNode {
+        id,
+        node: DocumentNodeId(format!("world:{}", node.id.0)),
+        role: semantic_role_for_world_editor_role(&node.role, &node.actions),
+        name: Some(node.label.clone()),
+        description: world_editor_description(node),
+        value: world_editor_value(node),
+        state: SemanticState {
+            focused: tree.focused.as_ref() == Some(&node.id),
+            checked: None,
+            disabled: !world_editor_node_enabled(node),
+            selected: node.selected,
+        },
+        actions: SemanticActions {
+            focus: node.actions.focus || node.actions.select || node.actions.export_3mf,
+            press: node.actions.select || node.actions.toggle_visibility || node.actions.export_3mf,
+            set_text: false,
+            increment: false,
+            decrement: false,
+        },
+        relations: SemanticRelations {
+            parent: world_editor_parent_id(&node.id, tree)
+                .map(SemanticId::from_world_editor_node_id),
+            children: node
+                .children
+                .iter()
+                .map(SemanticId::from_world_editor_node_id)
+                .collect(),
+            controls: Vec::new(),
+            labelled_by: Vec::new(),
+            described_by: Vec::new(),
+        },
+        bounds: None,
+        language: None,
+        heading_level: None,
+        href: None,
+        source_binding_id: source_path
+            .as_ref()
+            .map(|path| SourceBindingId(format!("source:{path}"))),
+        source_path,
+        source_intent,
+    }
+}
+
+pub fn document_frame_from_world_editor_tree(
+    tree: &boon_scene_model::WorldSemanticEditorTree,
+) -> DocumentFrame {
+    let root_id = document_node_id_from_world_editor_node_id(&tree.root);
+    let mut frame = DocumentFrame::empty(root_id.0.clone());
+    frame.focus = tree
+        .focused
+        .as_ref()
+        .map(document_node_id_from_world_editor_node_id);
+
+    if let Some(root) = tree.nodes.get(&tree.root) {
+        if let Some(root_node) = frame.nodes.get_mut(&root_id) {
+            root_node.style.insert(
+                "accessibility_label".to_owned(),
+                StyleValue::Text(root.label.clone()),
+            );
+            root_node.style.insert(
+                "semantic_source".to_owned(),
+                StyleValue::Text(root.id.0.clone()),
+            );
+            root_node.children = root
+                .children
+                .iter()
+                .map(document_node_id_from_world_editor_node_id)
+                .collect();
+        }
+    }
+
+    for node in tree.nodes.values() {
+        if node.id == tree.root {
+            continue;
+        }
+        let id = document_node_id_from_world_editor_node_id(&node.id);
+        let mut document_node =
+            DocumentNode::new(id.0.clone(), document_kind_for_world_editor_node(node));
+        document_node.parent =
+            world_editor_parent_id(&node.id, tree).map(document_node_id_from_world_editor_node_id);
+        document_node.children = node
+            .children
+            .iter()
+            .map(document_node_id_from_world_editor_node_id)
+            .collect();
+        document_node.text = Some(TextValue {
+            text: node.label.clone(),
+        });
+        document_node.style.insert(
+            "accessibility_label".to_owned(),
+            StyleValue::Text(node.label.clone()),
+        );
+        document_node.style.insert(
+            "semantic_source".to_owned(),
+            StyleValue::Text(node.id.0.clone()),
+        );
+        if node.selected {
+            document_node
+                .style
+                .insert("selected".to_owned(), StyleValue::Bool(true));
+        }
+        if !node.visible {
+            document_node
+                .style
+                .insert("visible".to_owned(), StyleValue::Bool(false));
+        }
+        if let Some(intent) = world_editor_source_intent(node) {
+            let source_path = world_editor_source_path(node, &intent);
+            document_node.source_binding = Some(boon_document_model::SourceBinding {
+                id: SourceBindingId(format!("source:{source_path}:{intent}")),
+                source_path,
+                intent,
+            });
+        }
+        frame.nodes.insert(id, document_node);
+    }
+    frame
+}
+
+fn document_kind_for_world_editor_node(
+    node: &boon_scene_model::WorldSemanticEditorNode,
+) -> DocumentNodeKind {
+    match node.role {
+        boon_scene_model::WorldSemanticEditorRole::Editor => DocumentNodeKind::Root,
+        boon_scene_model::WorldSemanticEditorRole::Viewport
+        | boon_scene_model::WorldSemanticEditorRole::Assembly
+        | boon_scene_model::WorldSemanticEditorRole::Parameters
+        | boon_scene_model::WorldSemanticEditorRole::Manufacturing => DocumentNodeKind::Stack,
+        boon_scene_model::WorldSemanticEditorRole::PartInstance
+        | boon_scene_model::WorldSemanticEditorRole::Parameter
+        | boon_scene_model::WorldSemanticEditorRole::Action
+            if node.actions.select || node.actions.edit_parameter || node.actions.export_3mf =>
+        {
+            DocumentNodeKind::Button
+        }
+        boon_scene_model::WorldSemanticEditorRole::PartInstance => DocumentNodeKind::Row,
+        boon_scene_model::WorldSemanticEditorRole::Parameter
+        | boon_scene_model::WorldSemanticEditorRole::Status => DocumentNodeKind::Text,
+        boon_scene_model::WorldSemanticEditorRole::Action => DocumentNodeKind::Button,
+    }
+}
+
+fn document_node_id_from_world_editor_node_id(
+    node: &boon_scene_model::WorldSemanticEditorNodeId,
+) -> DocumentNodeId {
+    DocumentNodeId(format!("world-doc:{}", node.0))
+}
+
+fn semantic_role_for_world_editor_role(
+    role: &boon_scene_model::WorldSemanticEditorRole,
+    actions: &boon_scene_model::WorldSemanticEditorActions,
+) -> SemanticRole {
+    match role {
+        boon_scene_model::WorldSemanticEditorRole::Editor => SemanticRole::Application,
+        boon_scene_model::WorldSemanticEditorRole::Viewport
+        | boon_scene_model::WorldSemanticEditorRole::Assembly
+        | boon_scene_model::WorldSemanticEditorRole::Parameters
+        | boon_scene_model::WorldSemanticEditorRole::Manufacturing => SemanticRole::Group,
+        boon_scene_model::WorldSemanticEditorRole::PartInstance
+        | boon_scene_model::WorldSemanticEditorRole::Parameter
+        | boon_scene_model::WorldSemanticEditorRole::Action
+            if actions.select || actions.edit_parameter || actions.export_3mf =>
+        {
+            SemanticRole::Button
+        }
+        boon_scene_model::WorldSemanticEditorRole::PartInstance => SemanticRole::Row,
+        boon_scene_model::WorldSemanticEditorRole::Parameter
+        | boon_scene_model::WorldSemanticEditorRole::Status => SemanticRole::Text,
+        boon_scene_model::WorldSemanticEditorRole::Action => SemanticRole::Button,
+    }
+}
+
+fn world_editor_description(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<String> {
+    match node.role {
+        boon_scene_model::WorldSemanticEditorRole::PartInstance => Some(format!(
+            "part {:?}, feature {:?}, {:?}",
+            node.part_id, node.feature_id, node.manufacturing_role
+        )),
+        boon_scene_model::WorldSemanticEditorRole::Action if node.actions.export_3mf => {
+            Some("Export the prepared printable assembly as 3MF".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn world_editor_value(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<SemanticValue> {
+    if node.role == boon_scene_model::WorldSemanticEditorRole::Status {
+        Some(SemanticValue::Text {
+            text: node.label.clone(),
+        })
+    } else if node.role == boon_scene_model::WorldSemanticEditorRole::PartInstance {
+        Some(SemanticValue::Text {
+            text: if node.visible { "visible" } else { "hidden" }.to_owned(),
+        })
+    } else {
+        None
+    }
+}
+
+fn world_editor_node_enabled(node: &boon_scene_model::WorldSemanticEditorNode) -> bool {
+    node.actions.focus
+        || node.actions.select
+        || node.actions.toggle_visibility
+        || node.actions.edit_parameter
+        || node.actions.export_3mf
+        || !node.children.is_empty()
+}
+
+fn world_editor_source_intent(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<String> {
+    if node.actions.export_3mf {
+        Some("press".to_owned())
+    } else if node.actions.select || node.actions.toggle_visibility {
+        Some("select".to_owned())
+    } else if node.actions.focus {
+        Some("focus".to_owned())
+    } else if node.actions.edit_parameter {
+        Some("press".to_owned())
+    } else {
+        None
+    }
+}
+
+fn world_editor_source_path(
+    node: &boon_scene_model::WorldSemanticEditorNode,
+    intent: &str,
+) -> String {
+    if node.actions.export_3mf {
+        "world.manufacturing.export_3mf".to_owned()
+    } else if let Some(instance) = node.instance {
+        format!("world.instance.{}.{}", instance.0, intent)
+    } else {
+        format!(
+            "world.editor.{}.{}",
+            semantic_path_token(&node.id.0),
+            intent
+        )
+    }
+}
+
+fn semantic_path_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn world_editor_parent_id<'a>(
+    child: &boon_scene_model::WorldSemanticEditorNodeId,
+    tree: &'a boon_scene_model::WorldSemanticEditorTree,
+) -> Option<&'a boon_scene_model::WorldSemanticEditorNodeId> {
+    tree.nodes
+        .values()
+        .find(|node| node.children.iter().any(|candidate| candidate == child))
+        .map(|node| &node.id)
+}
+
+fn semantic_style_text_any(style: &StyleMap, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| match style.get(*key)? {
+        StyleValue::Text(value) if !value.is_empty() => Some(value.clone()),
+        StyleValue::Number(value) => Some(value.to_string()),
+        StyleValue::Bool(value) => Some(value.to_string()),
+        StyleValue::Text(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
+    })
+}
+
+fn semantic_style_bool(style: &StyleMap, key: &str) -> Option<bool> {
+    match style.get(key)? {
+        StyleValue::Bool(value) => Some(*value),
+        StyleValue::Text(value) => value.parse::<bool>().ok(),
+        StyleValue::Number(value) => Some(*value != 0.0),
+        StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrollRegion {
     pub id: String,
@@ -413,6 +841,746 @@ pub struct ScrollRegion {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccessibilityTree {
     pub node_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SemanticId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRole {
+    Application,
+    Group,
+    Row,
+    Text,
+    Button,
+    Checkbox,
+    TextInput,
+    Table,
+    Cell,
+    ScrollRegion,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticValue {
+    Text { text: String },
+    Bool { value: bool },
+    Number { value: f64 },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticState {
+    pub focused: bool,
+    pub checked: Option<bool>,
+    pub disabled: bool,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticActions {
+    pub focus: bool,
+    pub press: bool,
+    pub set_text: bool,
+    pub increment: bool,
+    pub decrement: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticRelations {
+    pub parent: Option<SemanticId>,
+    pub children: Vec<SemanticId>,
+    pub controls: Vec<SemanticId>,
+    pub labelled_by: Vec<SemanticId>,
+    pub described_by: Vec<SemanticId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SemanticNode {
+    pub id: SemanticId,
+    pub node: DocumentNodeId,
+    pub role: SemanticRole,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub value: Option<SemanticValue>,
+    pub state: SemanticState,
+    pub actions: SemanticActions,
+    pub relations: SemanticRelations,
+    pub bounds: Option<Rect>,
+    pub language: Option<String>,
+    pub heading_level: Option<u8>,
+    pub href: Option<String>,
+    pub source_binding_id: Option<SourceBindingId>,
+    pub source_path: Option<String>,
+    pub source_intent: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticScene {
+    pub root: Option<SemanticId>,
+    pub nodes: BTreeMap<SemanticId, SemanticNode>,
+    pub focused: Option<SemanticId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticPatch {
+    pub operations: Vec<SemanticPatchOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticPatchOperation {
+    UpsertNode { node: SemanticNode },
+    RemoveNode { id: SemanticId },
+    SetFocus { focused: Option<SemanticId> },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticDomSnapshot {
+    pub root: Option<SemanticId>,
+    pub nodes: Vec<SemanticDomNode>,
+    pub metrics: SemanticDomMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SemanticDomNode {
+    pub semantic_id: SemanticId,
+    pub tag: String,
+    pub role: Option<String>,
+    pub attributes: BTreeMap<String, String>,
+    pub text: Option<String>,
+    pub focus_proxy: bool,
+    pub source_binding_id: Option<SourceBindingId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticDomMetrics {
+    pub semantic_node_count: usize,
+    pub dom_node_count: usize,
+    pub interactive_node_count: usize,
+    pub text_input_endpoint_count: usize,
+    pub visual_dom_node_count: usize,
+    pub data_boon_id_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticWebBridgeSnapshot {
+    pub dom: SemanticDomSnapshot,
+    pub ime_endpoints: Vec<SemanticWebImeEndpoint>,
+    pub action_routes: Vec<SemanticWebActionRoute>,
+    pub metrics: SemanticWebBridgeMetrics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticWebImeEndpoint {
+    pub semantic_id: SemanticId,
+    pub node: DocumentNodeId,
+    pub dom_id: String,
+    pub value: String,
+    pub source_binding_id: Option<SourceBindingId>,
+    pub source_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticWebActionRoute {
+    pub semantic_id: SemanticId,
+    pub node: DocumentNodeId,
+    pub action: SemanticWebAction,
+    pub dom_event: String,
+    pub source_binding_id: Option<SourceBindingId>,
+    pub source_path: Option<String>,
+    pub source_intent: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticWebAction {
+    Focus,
+    Press,
+    SetText,
+    Increment,
+    Decrement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticAction {
+    Focus,
+    Press,
+    SetText,
+    Increment,
+    Decrement,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticWebBridgeMetrics {
+    pub semantic_node_count: usize,
+    pub dom_node_count: usize,
+    pub visual_dom_node_count: usize,
+    pub ime_endpoint_count: usize,
+    pub action_route_count: usize,
+    pub source_routed_action_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticWebInputEvent {
+    Focus {
+        semantic_id: SemanticId,
+    },
+    Press {
+        semantic_id: SemanticId,
+    },
+    SetText {
+        semantic_id: SemanticId,
+        text: String,
+    },
+    ReplaceSelectedText {
+        semantic_id: SemanticId,
+        text: String,
+    },
+    Increment {
+        semantic_id: SemanticId,
+    },
+    Decrement {
+        semantic_id: SemanticId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticInputEvent {
+    Focus {
+        semantic_id: SemanticId,
+    },
+    Press {
+        semantic_id: SemanticId,
+    },
+    SetText {
+        semantic_id: SemanticId,
+        text: String,
+    },
+    ReplaceSelectedText {
+        semantic_id: SemanticId,
+        text: String,
+    },
+    Increment {
+        semantic_id: SemanticId,
+    },
+    Decrement {
+        semantic_id: SemanticId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticWebSourceDispatch {
+    pub semantic_id: SemanticId,
+    pub node: DocumentNodeId,
+    pub source_path: String,
+    pub source_intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+pub type SemanticSourceDispatch = SemanticWebSourceDispatch;
+
+impl SemanticScene {
+    pub fn from_document_layout(document: &DocumentFrame, layout: &LayoutFrame) -> Self {
+        let mut display_by_node = BTreeMap::new();
+        for item in &layout.display_list {
+            display_by_node
+                .entry(item.node.clone())
+                .or_insert_with(|| item.clone());
+        }
+
+        let mut scene = Self {
+            root: document
+                .nodes
+                .contains_key(&document.root)
+                .then(|| SemanticId::from_document_node_id(&document.root)),
+            nodes: BTreeMap::new(),
+            focused: None,
+        };
+        for node in document.nodes.values() {
+            let item = display_by_node.get(&node.id);
+            let semantic = semantic_node_from_document_node(document, node, item);
+            if semantic.state.focused {
+                scene.focused = Some(semantic.id.clone());
+            }
+            scene.nodes.insert(semantic.id.clone(), semantic);
+        }
+        scene
+    }
+
+    pub fn from_world_editor_tree(tree: &boon_scene_model::WorldSemanticEditorTree) -> Self {
+        let mut scene = Self {
+            root: Some(SemanticId::from_world_editor_node_id(&tree.root)),
+            nodes: BTreeMap::new(),
+            focused: tree
+                .focused
+                .as_ref()
+                .map(SemanticId::from_world_editor_node_id),
+        };
+        for node in tree.nodes.values() {
+            let semantic = semantic_node_from_world_editor_node(node, tree);
+            scene.nodes.insert(semantic.id.clone(), semantic);
+        }
+        scene
+    }
+
+    pub fn diff(&self, next: &SemanticScene) -> SemanticPatch {
+        let mut operations = Vec::new();
+        for id in self.nodes.keys() {
+            if !next.nodes.contains_key(id) {
+                operations.push(SemanticPatchOperation::RemoveNode { id: id.clone() });
+            }
+        }
+        for (id, node) in &next.nodes {
+            if self.nodes.get(id) != Some(node) {
+                operations.push(SemanticPatchOperation::UpsertNode { node: node.clone() });
+            }
+        }
+        if self.focused != next.focused {
+            operations.push(SemanticPatchOperation::SetFocus {
+                focused: next.focused.clone(),
+            });
+        }
+        SemanticPatch { operations }
+    }
+
+    pub fn source_dispatch_for_event(
+        &self,
+        event: SemanticInputEvent,
+    ) -> Option<SemanticSourceDispatch> {
+        let (semantic_id, action, text) = match event {
+            SemanticInputEvent::Focus { semantic_id } => (semantic_id, SemanticAction::Focus, None),
+            SemanticInputEvent::Press { semantic_id } => (semantic_id, SemanticAction::Press, None),
+            SemanticInputEvent::SetText { semantic_id, text }
+            | SemanticInputEvent::ReplaceSelectedText { semantic_id, text } => {
+                (semantic_id, SemanticAction::SetText, Some(text))
+            }
+            SemanticInputEvent::Increment { semantic_id } => {
+                (semantic_id, SemanticAction::Increment, None)
+            }
+            SemanticInputEvent::Decrement { semantic_id } => {
+                (semantic_id, SemanticAction::Decrement, None)
+            }
+        };
+        let node = self.nodes.get(&semantic_id)?;
+        Some(SemanticSourceDispatch {
+            semantic_id,
+            node: node.node.clone(),
+            source_path: semantic_source_for_action(node, &action)?,
+            source_intent: node.source_intent.clone(),
+            text,
+        })
+    }
+}
+
+impl SemanticWebBridgeSnapshot {
+    pub fn from_scene(scene: &SemanticScene) -> Self {
+        let dom = SemanticDomSnapshot::from_scene(scene);
+        let mut ime_endpoints = Vec::new();
+        let mut action_routes = Vec::new();
+        for node in scene.nodes.values() {
+            let dom_id = semantic_web_dom_id(&node.id);
+            if node.actions.focus || node.state.focused {
+                action_routes.push(semantic_web_action_route(
+                    node,
+                    SemanticWebAction::Focus,
+                    "focus",
+                ));
+            }
+            if node.actions.press {
+                action_routes.push(semantic_web_action_route(
+                    node,
+                    SemanticWebAction::Press,
+                    "click",
+                ));
+            }
+            if node.actions.set_text {
+                ime_endpoints.push(SemanticWebImeEndpoint {
+                    semantic_id: node.id.clone(),
+                    node: node.node.clone(),
+                    dom_id,
+                    value: semantic_text_value(node).unwrap_or_default(),
+                    source_binding_id: node.source_binding_id.clone(),
+                    source_path: node.source_path.clone(),
+                });
+                action_routes.push(semantic_web_action_route(
+                    node,
+                    SemanticWebAction::SetText,
+                    "input",
+                ));
+            }
+            if node.actions.increment {
+                action_routes.push(semantic_web_action_route(
+                    node,
+                    SemanticWebAction::Increment,
+                    "input",
+                ));
+            }
+            if node.actions.decrement {
+                action_routes.push(semantic_web_action_route(
+                    node,
+                    SemanticWebAction::Decrement,
+                    "input",
+                ));
+            }
+        }
+        let metrics = SemanticWebBridgeMetrics {
+            semantic_node_count: scene.nodes.len(),
+            dom_node_count: dom.metrics.dom_node_count,
+            visual_dom_node_count: dom.metrics.visual_dom_node_count,
+            ime_endpoint_count: ime_endpoints.len(),
+            action_route_count: action_routes.len(),
+            source_routed_action_count: action_routes
+                .iter()
+                .filter(|route| route.source_path.is_some())
+                .count(),
+        };
+        Self {
+            dom,
+            ime_endpoints,
+            action_routes,
+            metrics,
+        }
+    }
+
+    pub fn to_html_fragment(&self) -> String {
+        self.dom.to_html_fragment()
+    }
+
+    pub fn source_dispatch_for_event(
+        &self,
+        event: SemanticWebInputEvent,
+    ) -> Option<SemanticWebSourceDispatch> {
+        let (semantic_id, action, text) = match event {
+            SemanticWebInputEvent::Focus { semantic_id } => {
+                (semantic_id, SemanticWebAction::Focus, None)
+            }
+            SemanticWebInputEvent::Press { semantic_id } => {
+                (semantic_id, SemanticWebAction::Press, None)
+            }
+            SemanticWebInputEvent::SetText { semantic_id, text }
+            | SemanticWebInputEvent::ReplaceSelectedText { semantic_id, text } => {
+                (semantic_id, SemanticWebAction::SetText, Some(text))
+            }
+            SemanticWebInputEvent::Increment { semantic_id } => {
+                (semantic_id, SemanticWebAction::Increment, None)
+            }
+            SemanticWebInputEvent::Decrement { semantic_id } => {
+                (semantic_id, SemanticWebAction::Decrement, None)
+            }
+        };
+        let route = self
+            .action_routes
+            .iter()
+            .find(|route| route.semantic_id == semantic_id && route.action == action)?;
+        Some(SemanticWebSourceDispatch {
+            semantic_id: route.semantic_id.clone(),
+            node: route.node.clone(),
+            source_path: route.source_path.clone()?,
+            source_intent: route.source_intent.clone(),
+            text,
+        })
+    }
+}
+
+fn semantic_source_for_action(node: &SemanticNode, action: &SemanticAction) -> Option<String> {
+    let intent = node.source_intent.as_deref()?;
+    let matches_action = match action {
+        SemanticAction::Focus => intent == "focus",
+        SemanticAction::Press => matches!(
+            intent,
+            "press" | "click" | "source" | "activate" | "toggle" | "submit" | "open" | "select"
+        ),
+        SemanticAction::SetText => matches!(intent, "change" | "text" | "input"),
+        SemanticAction::Increment => intent == "increment",
+        SemanticAction::Decrement => intent == "decrement",
+    };
+    matches_action.then(|| node.source_path.clone()).flatten()
+}
+
+fn semantic_web_action_route(
+    node: &SemanticNode,
+    action: SemanticWebAction,
+    dom_event: &str,
+) -> SemanticWebActionRoute {
+    let source_path = semantic_web_source_for_action(node, &action);
+    let source_intent = source_path
+        .as_ref()
+        .and_then(|_| node.source_intent.clone());
+    SemanticWebActionRoute {
+        semantic_id: node.id.clone(),
+        node: node.node.clone(),
+        action,
+        dom_event: dom_event.to_owned(),
+        source_binding_id: source_path
+            .as_ref()
+            .and_then(|_| node.source_binding_id.clone()),
+        source_path,
+        source_intent,
+    }
+}
+
+fn semantic_web_source_for_action(
+    node: &SemanticNode,
+    action: &SemanticWebAction,
+) -> Option<String> {
+    semantic_source_for_action(node, &semantic_action_from_web_action(action))
+}
+
+fn semantic_action_from_web_action(action: &SemanticWebAction) -> SemanticAction {
+    match action {
+        SemanticWebAction::Focus => SemanticAction::Focus,
+        SemanticWebAction::Press => SemanticAction::Press,
+        SemanticWebAction::SetText => SemanticAction::SetText,
+        SemanticWebAction::Increment => SemanticAction::Increment,
+        SemanticWebAction::Decrement => SemanticAction::Decrement,
+    }
+}
+
+fn semantic_web_dom_id(id: &SemanticId) -> String {
+    let mut dom_id = String::from("boon-");
+    for character in id.0.chars() {
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            dom_id.push(character);
+        } else {
+            dom_id.push('-');
+        }
+    }
+    dom_id
+}
+
+impl SemanticId {
+    pub fn from_document_node_id(node: &DocumentNodeId) -> Self {
+        Self(format!("semantic:{}", node.0))
+    }
+
+    pub fn from_world_editor_node_id(node: &boon_scene_model::WorldSemanticEditorNodeId) -> Self {
+        Self(format!("semantic:{}", node.0))
+    }
+}
+
+impl SemanticDomSnapshot {
+    pub fn from_scene(scene: &SemanticScene) -> Self {
+        let mut nodes = Vec::with_capacity(scene.nodes.len());
+        for node in scene.nodes.values() {
+            nodes.push(SemanticDomNode::from_semantic_node(
+                node,
+                scene.focused.as_ref() == Some(&node.id),
+            ));
+        }
+        let metrics = SemanticDomMetrics {
+            semantic_node_count: scene.nodes.len(),
+            dom_node_count: nodes.len(),
+            interactive_node_count: nodes
+                .iter()
+                .filter(|node| {
+                    node.attributes.contains_key("data-boon-action-press")
+                        || node.attributes.contains_key("data-boon-action-set-text")
+                        || node.attributes.contains_key("data-boon-action-increment")
+                        || node.attributes.contains_key("data-boon-action-decrement")
+                        || node.attributes.contains_key("tabindex")
+                })
+                .count(),
+            text_input_endpoint_count: nodes
+                .iter()
+                .filter(|node| {
+                    node.attributes.get("data-boon-ime-endpoint") == Some(&"true".to_owned())
+                })
+                .count(),
+            visual_dom_node_count: 0,
+            data_boon_id_count: nodes
+                .iter()
+                .filter(|node| node.attributes.contains_key("data-boon-id"))
+                .count(),
+        };
+        Self {
+            root: scene.root.clone(),
+            nodes,
+            metrics,
+        }
+    }
+
+    pub fn to_html_fragment(&self) -> String {
+        let mut html = String::new();
+        for node in &self.nodes {
+            node.push_html(&mut html);
+        }
+        html
+    }
+}
+
+impl SemanticDomNode {
+    fn from_semantic_node(node: &SemanticNode, focused: bool) -> Self {
+        let mut attributes = BTreeMap::new();
+        attributes.insert("data-boon-id".to_owned(), node.id.0.clone());
+        attributes.insert("data-boon-node".to_owned(), node.node.0.clone());
+        attributes.insert("id".to_owned(), semantic_web_dom_id(&node.id));
+        if let Some(name) = &node.name {
+            attributes.insert("aria-label".to_owned(), name.clone());
+        }
+        if let Some(description) = &node.description {
+            attributes.insert("aria-description".to_owned(), description.clone());
+        }
+        if node.state.disabled {
+            attributes.insert("aria-disabled".to_owned(), "true".to_owned());
+        }
+        if node.state.selected {
+            attributes.insert("aria-selected".to_owned(), "true".to_owned());
+        }
+        if focused || node.state.focused {
+            attributes.insert("data-boon-focused".to_owned(), "true".to_owned());
+            attributes.insert("tabindex".to_owned(), "0".to_owned());
+        }
+        if node.actions.press {
+            attributes.insert("data-boon-action-press".to_owned(), "true".to_owned());
+        }
+        if node.actions.set_text {
+            attributes.insert("data-boon-action-set-text".to_owned(), "true".to_owned());
+            attributes.insert("data-boon-ime-endpoint".to_owned(), "true".to_owned());
+        }
+        if node.actions.increment {
+            attributes.insert("data-boon-action-increment".to_owned(), "true".to_owned());
+        }
+        if node.actions.decrement {
+            attributes.insert("data-boon-action-decrement".to_owned(), "true".to_owned());
+        }
+        if let Some(binding) = &node.source_binding_id {
+            attributes.insert("data-boon-source-binding-id".to_owned(), binding.0.clone());
+        }
+        if let Some(path) = &node.source_path {
+            attributes.insert("data-boon-source-path".to_owned(), path.clone());
+        }
+        if let Some(intent) = &node.source_intent {
+            attributes.insert("data-boon-source-intent".to_owned(), intent.clone());
+        }
+        if let Some(language) = &node.language {
+            attributes.insert("lang".to_owned(), language.clone());
+        }
+        if let Some(level) = node.heading_level {
+            attributes.insert("aria-level".to_owned(), level.to_string());
+        }
+
+        let (tag, role, text) = semantic_dom_shape(node, &mut attributes);
+        Self {
+            semantic_id: node.id.clone(),
+            tag,
+            role,
+            attributes,
+            text,
+            focus_proxy: focused || node.state.focused || node.actions.set_text,
+            source_binding_id: node.source_binding_id.clone(),
+        }
+    }
+
+    fn push_html(&self, html: &mut String) {
+        html.push('<');
+        html.push_str(&self.tag);
+        if let Some(role) = &self.role {
+            push_html_attr(html, "role", role);
+        }
+        for (name, value) in &self.attributes {
+            push_html_attr(html, name, value);
+        }
+        if self.tag == "input" {
+            html.push_str(">");
+            return;
+        }
+        html.push('>');
+        if let Some(text) = &self.text {
+            push_html_text(html, text);
+        }
+        html.push_str("</");
+        html.push_str(&self.tag);
+        html.push('>');
+    }
+}
+
+fn semantic_dom_shape(
+    node: &SemanticNode,
+    attributes: &mut BTreeMap<String, String>,
+) -> (String, Option<String>, Option<String>) {
+    match node.role {
+        SemanticRole::Application => (
+            "main".to_owned(),
+            Some("application".to_owned()),
+            node.name.clone(),
+        ),
+        SemanticRole::Group => (
+            "section".to_owned(),
+            Some("group".to_owned()),
+            node.name.clone(),
+        ),
+        SemanticRole::Row => ("div".to_owned(), Some("row".to_owned()), node.name.clone()),
+        SemanticRole::Text => ("span".to_owned(), None, semantic_text_value(node)),
+        SemanticRole::Button => ("button".to_owned(), None, node.name.clone()),
+        SemanticRole::Checkbox => {
+            attributes.insert("type".to_owned(), "checkbox".to_owned());
+            let checked = node.state.checked.unwrap_or(false);
+            attributes.insert("aria-checked".to_owned(), checked.to_string());
+            if checked {
+                attributes.insert("checked".to_owned(), "checked".to_owned());
+            }
+            ("input".to_owned(), None, None)
+        }
+        SemanticRole::TextInput => {
+            attributes.insert("type".to_owned(), "text".to_owned());
+            if let Some(text) = semantic_text_value(node) {
+                attributes.insert("value".to_owned(), text);
+            }
+            ("input".to_owned(), None, None)
+        }
+        SemanticRole::Table => ("table".to_owned(), None, node.name.clone()),
+        SemanticRole::Cell => ("div".to_owned(), Some("cell".to_owned()), node.name.clone()),
+        SemanticRole::ScrollRegion => (
+            "section".to_owned(),
+            Some("region".to_owned()),
+            node.name.clone(),
+        ),
+    }
+}
+
+fn semantic_text_value(node: &SemanticNode) -> Option<String> {
+    match &node.value {
+        Some(SemanticValue::Text { text }) => Some(text.clone()),
+        Some(SemanticValue::Bool { value }) => Some(value.to_string()),
+        Some(SemanticValue::Number { value }) => Some(value.to_string()),
+        None => node.name.clone(),
+    }
+}
+
+fn push_html_attr(html: &mut String, name: &str, value: &str) {
+    html.push(' ');
+    html.push_str(name);
+    html.push_str("=\"");
+    push_html_attr_value(html, value);
+    html.push('"');
+}
+
+fn push_html_attr_value(html: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => html.push_str("&amp;"),
+            '"' => html.push_str("&quot;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            _ => html.push(ch),
+        }
+    }
+}
+
+fn push_html_text(html: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            _ => html.push(ch),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -547,6 +1715,7 @@ pub struct DocumentRetainedLayoutKeyTable {
 pub enum DocumentRetainedLayoutDirtyReason {
     Added,
     Removed,
+    Geometry,
     Kind,
     LayoutStyle,
     TextStyle,
@@ -748,6 +1917,15 @@ pub struct DocumentTypedBindingIndex {
     pub by_route: BTreeMap<DocumentTypedBindingRoute, Vec<DocumentTypedBindingRef>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentDerivedIndexBundle {
+    pub hot_ids: DocumentHotIdTable,
+    pub intern_index: DocumentInternIndex,
+    pub retained_layout_keys: DocumentRetainedLayoutKeyTable,
+    pub typed_styles: DocumentTypedStyleIndex,
+    pub typed_bindings: DocumentTypedBindingIndex,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DocumentChangeBatch {
     pub patches: Vec<DocumentPatch>,
@@ -839,6 +2017,9 @@ pub enum PatchApplyError {
         reference_kind: &'static str,
         id: DocumentNodeId,
     },
+    UnsupportedTrustedNonstructuralPatch {
+        patch_kind: &'static str,
+    },
 }
 
 impl fmt::Display for PatchApplyError {
@@ -893,6 +2074,10 @@ impl fmt::Display for PatchApplyError {
             Self::StaleReference { reference_kind, id } => {
                 write!(f, "{reference_kind} references stale node `{}`", id.0)
             }
+            Self::UnsupportedTrustedNonstructuralPatch { patch_kind } => write!(
+                f,
+                "{patch_kind} cannot be applied through trusted nonstructural document patching"
+            ),
         }
     }
 }
@@ -1078,52 +2263,56 @@ impl DocumentInternIndex {
                         reference_kind: "hot_id_table",
                         id: node_id.clone(),
                     })?;
-            let text = node
-                .text
-                .as_ref()
-                .map(|text| index.texts.intern(text.text.clone()));
-            let layout_style = index.layout_styles.intern(stable_style_intern_key(
-                &node.style,
-                StyleHashCategory::Layout,
-            ));
-            let paint_style = index.paint_styles.intern(stable_style_intern_key(
-                &node.style,
-                StyleHashCategory::Paint,
-            ));
-            let text_style = index.text_styles.intern(stable_style_intern_key(
-                &node.style,
-                StyleHashCategory::Font,
-            ));
-            let material = index.materials.intern(stable_style_intern_key(
-                &node.style,
-                StyleHashCategory::Material,
-            ));
-            let clip = index.clips.intern(stable_style_intern_key(
-                &node.style,
-                StyleHashCategory::Clip,
-            ));
-            let source_binding = node.source_binding.as_ref().map(|binding| {
-                index.source_bindings.intern(stable_source_binding_key(
-                    &binding.id.0,
-                    &binding.source_path,
-                    &binding.intent,
-                ))
-            });
-            index.nodes.insert(
-                hot_ref.id,
-                DocumentInternedNode {
-                    node: hot_ref,
-                    text,
-                    layout_style,
-                    paint_style,
-                    text_style,
-                    material,
-                    clip,
-                    source_binding,
-                },
-            );
+            index.update_node(node, hot_ref);
         }
         Ok(index)
+    }
+
+    fn update_node(&mut self, node: &DocumentNode, hot_ref: DocumentHotNodeRef) {
+        let text = node
+            .text
+            .as_ref()
+            .map(|text| self.texts.intern(text.text.clone()));
+        let layout_style = self.layout_styles.intern(stable_style_intern_key(
+            &node.style,
+            StyleHashCategory::Layout,
+        ));
+        let paint_style = self.paint_styles.intern(stable_style_intern_key(
+            &node.style,
+            StyleHashCategory::Paint,
+        ));
+        let text_style = self.text_styles.intern(stable_style_intern_key(
+            &node.style,
+            StyleHashCategory::Font,
+        ));
+        let material = self.materials.intern(stable_style_intern_key(
+            &node.style,
+            StyleHashCategory::Material,
+        ));
+        let clip = self.clips.intern(stable_style_intern_key(
+            &node.style,
+            StyleHashCategory::Clip,
+        ));
+        let source_binding = node.source_binding.as_ref().map(|binding| {
+            self.source_bindings.intern(stable_source_binding_key(
+                &binding.id.0,
+                &binding.source_path,
+                &binding.intent,
+            ))
+        });
+        self.nodes.insert(
+            hot_ref.id,
+            DocumentInternedNode {
+                node: hot_ref,
+                text,
+                layout_style,
+                paint_style,
+                text_style,
+                material,
+                clip,
+                source_binding,
+            },
+        );
     }
 }
 
@@ -1183,6 +2372,67 @@ impl DocumentRetainedLayoutKeyTable {
             );
         }
         Ok(table)
+    }
+
+    fn update_node(
+        &mut self,
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        intern_index: &DocumentInternIndex,
+        node_id: &DocumentNodeId,
+    ) -> Result<(), PatchApplyError> {
+        let node = frame
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "document_frame",
+                id: node_id.clone(),
+            })?;
+        let node_ref = hot_ids
+            .hot_ref(node_id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "hot_id_table",
+                id: node_id.clone(),
+            })?;
+        let interned = intern_index.nodes.get(&node_ref.id).ok_or_else(|| {
+            PatchApplyError::StaleReference {
+                reference_kind: "document_intern_index",
+                id: node_id.clone(),
+            }
+        })?;
+        let mut children = Vec::with_capacity(node.children.len());
+        for child in &node.children {
+            children.push(hot_ids.hot_id(child).ok_or_else(|| {
+                PatchApplyError::StaleReference {
+                    reference_kind: "hot_id_table_child",
+                    id: child.clone(),
+                }
+            })?);
+        }
+        let materialized = node
+            .materialized
+            .iter()
+            .map(|range| DocumentMaterializationWindowKey {
+                axis: range.axis,
+                visible: range.visible.clone(),
+                overscan: range.overscan.clone(),
+            })
+            .collect();
+        self.entries.insert(
+            node_ref.id,
+            DocumentRetainedLayoutEntry {
+                node: node_ref,
+                key: DocumentRetainedLayoutKey {
+                    kind: node.kind.clone(),
+                    layout_style: interned.layout_style,
+                    text_style: interned.text_style,
+                    text: interned.text,
+                    children,
+                    materialized,
+                },
+            },
+        );
+        Ok(())
     }
 
     pub fn entry(&self, id: DocumentHotNodeId) -> Option<&DocumentRetainedLayoutEntry> {
@@ -1383,6 +2633,89 @@ impl DocumentRetainedLayoutCache {
         })
     }
 
+    pub fn update_nodes_from_layout_frame(
+        &self,
+        frame: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        key_table: &DocumentRetainedLayoutKeyTable,
+        layout: &LayoutFrame,
+        changed_nodes: &BTreeSet<DocumentNodeId>,
+    ) -> Result<Option<DocumentRetainedLayoutCacheUpdate>, PatchApplyError> {
+        if changed_nodes.is_empty() {
+            let mut delta = DocumentRetainedLayoutDelta::default();
+            delta
+                .reused
+                .extend(self.entries.values().map(|entry| entry.node));
+            return Ok(Some(DocumentRetainedLayoutCacheUpdate {
+                cache: self.clone(),
+                delta,
+                refreshed: Vec::new(),
+                patch: DocumentRetainedLayoutPatch::default(),
+            }));
+        }
+
+        let mut cache = self.clone();
+        let mut delta = DocumentRetainedLayoutDelta {
+            reused: self.entries.values().map(|entry| entry.node).collect(),
+            dirty: Vec::new(),
+            removed: Vec::new(),
+        };
+        let mut refreshed = Vec::new();
+        let mut patch = DocumentRetainedLayoutPatch::default();
+
+        for node_id in changed_nodes {
+            let hot_ref =
+                hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            let Some(measured_entry) =
+                retained_layout_cache_entry_for_node(frame, hot_ids, key_table, layout, node_id)?
+            else {
+                return Ok(None);
+            };
+            let previous_entry = self.entries.get(&hot_ref.id);
+            let mut reasons = previous_entry
+                .map(|previous| retained_layout_dirty_reasons(&previous.key, &measured_entry.key))
+                .unwrap_or_else(|| vec![DocumentRetainedLayoutDirtyReason::Added]);
+            if previous_entry.is_some_and(|previous| previous.geometry != measured_entry.geometry)
+                && !reasons.contains(&DocumentRetainedLayoutDirtyReason::Geometry)
+            {
+                reasons.push(DocumentRetainedLayoutDirtyReason::Geometry);
+            }
+            if reasons.is_empty() {
+                continue;
+            }
+
+            delta.reused.retain(|entry| entry.id != hot_ref.id);
+            delta.dirty.push(DocumentRetainedLayoutDirtyEntry {
+                node: hot_ref.id,
+                previous: previous_entry.map(|entry| entry.node),
+                current: Some(measured_entry.node),
+                reasons: reasons.clone(),
+            });
+            refreshed.push(measured_entry.node);
+            patch
+                .operations
+                .push(DocumentRetainedLayoutPatchOperation::UpsertGeometry {
+                    node: measured_entry.node,
+                    key: measured_entry.key.clone(),
+                    geometry: measured_entry.geometry.clone(),
+                    reasons,
+                });
+            cache.entries.insert(hot_ref.id, measured_entry);
+        }
+
+        Ok(Some(DocumentRetainedLayoutCacheUpdate {
+            cache,
+            delta,
+            refreshed,
+            patch,
+        }))
+    }
+
     pub fn key_table(&self) -> DocumentRetainedLayoutKeyTable {
         DocumentRetainedLayoutKeyTable {
             entries: self
@@ -1400,6 +2733,66 @@ impl DocumentRetainedLayoutCache {
                 .collect(),
         }
     }
+}
+
+fn retained_layout_cache_entry_for_node(
+    frame: &DocumentFrame,
+    hot_ids: &DocumentHotIdTable,
+    key_table: &DocumentRetainedLayoutKeyTable,
+    layout: &LayoutFrame,
+    node_id: &DocumentNodeId,
+) -> Result<Option<DocumentRetainedLayoutCacheEntry>, PatchApplyError> {
+    let Some((display_index, item)) = layout
+        .display_list
+        .iter()
+        .enumerate()
+        .find(|(_, item)| item.node == *node_id)
+    else {
+        return Ok(None);
+    };
+    let node = frame
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| PatchApplyError::StaleReference {
+            reference_kind: "layout_frame_display_item",
+            id: node_id.clone(),
+        })?;
+    let node_ref = hot_ids
+        .hot_ref(node_id)
+        .ok_or_else(|| PatchApplyError::StaleReference {
+            reference_kind: "hot_id_table",
+            id: node_id.clone(),
+        })?;
+    let key_entry =
+        key_table
+            .entry(node_ref.id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "retained_layout_key_table",
+                id: node_id.clone(),
+            })?;
+    Ok(Some(DocumentRetainedLayoutCacheEntry {
+        node: node_ref,
+        key: key_entry.key.clone(),
+        geometry: DocumentRetainedLayoutGeometry {
+            bounds: item.bounds,
+            display_index,
+            hit_region_count: layout
+                .hit_regions
+                .iter()
+                .filter(|hit| hit.node == node.id)
+                .count(),
+            scroll_region_count: layout
+                .scroll_regions
+                .iter()
+                .filter(|scroll| scroll.node == node.id)
+                .count(),
+            materialization_count: layout
+                .materialization
+                .iter()
+                .filter(|report| report.node == node.id)
+                .count(),
+        },
+    }))
 }
 
 impl DocumentTypedStyleIndex {
@@ -1431,6 +2824,27 @@ impl DocumentTypedStyleIndex {
             );
         }
         Ok(index)
+    }
+
+    fn update_node(
+        &mut self,
+        node_id: &DocumentNodeId,
+        node: &DocumentNode,
+        hot_ref: DocumentHotNodeRef,
+    ) {
+        let _ = node_id;
+        self.records.insert(
+            hot_ref.id,
+            DocumentTypedStyleRecord {
+                node: hot_ref,
+                identity: computed_style_identity(&node.style),
+                layout: typed_layout_style(&node.style),
+                paint: typed_paint_style(&node.style),
+                text: typed_text_style(&node.style),
+                material: typed_material_style(&node.style),
+                pseudo: typed_pseudo_style(&node.style),
+            },
+        );
     }
 
     pub fn record(&self, id: DocumentHotNodeId) -> Option<&DocumentTypedStyleRecord> {
@@ -1502,6 +2916,77 @@ impl DocumentTypedBindingIndex {
         Ok(index)
     }
 
+    fn update_node(
+        &mut self,
+        node_id: &DocumentNodeId,
+        node: &DocumentNode,
+        hot_ref: DocumentHotNodeRef,
+        intern_index: &DocumentInternIndex,
+    ) -> Result<(), PatchApplyError> {
+        if let Some(previous_node) = self.nodes.remove(&hot_ref.id) {
+            for binding in previous_node.bindings {
+                if let Some(refs) = self.by_binding_id.get_mut(&binding.binding_id) {
+                    refs.retain(|reference| *reference != binding.reference);
+                    if refs.is_empty() {
+                        self.by_binding_id.remove(&binding.binding_id);
+                    }
+                }
+                if let Some(refs) = self.by_route.get_mut(&binding.route) {
+                    refs.retain(|reference| *reference != binding.reference);
+                    if refs.is_empty() {
+                        self.by_route.remove(&binding.route);
+                    }
+                }
+            }
+        }
+
+        let Some(binding) = &node.source_binding else {
+            return Ok(());
+        };
+        let interned =
+            intern_index
+                .nodes
+                .get(&hot_ref.id)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "document_intern_index",
+                    id: node_id.clone(),
+                })?;
+        let intern_id = interned
+            .source_binding
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "document_intern_index_source_binding",
+                id: node_id.clone(),
+            })?;
+        let reference = DocumentTypedBindingRef {
+            node: hot_ref.id,
+            ordinal: 0,
+        };
+        let route = DocumentTypedBindingRoute {
+            source_path: binding.source_path.clone(),
+            intent: binding.intent.clone(),
+        };
+        let typed = DocumentTypedBinding {
+            node: hot_ref,
+            reference,
+            binding_id: binding.id.clone(),
+            route: route.clone(),
+            intern_id,
+        };
+        self.nodes.insert(
+            hot_ref.id,
+            DocumentTypedBindingNode {
+                node: hot_ref,
+                bindings: vec![typed],
+            },
+        );
+        self.by_binding_id
+            .entry(binding.id.clone())
+            .or_default()
+            .push(reference);
+        self.by_route.entry(route).or_default().push(reference);
+        Ok(())
+    }
+
     pub fn bindings_for_node(&self, node: DocumentHotNodeId) -> &[DocumentTypedBinding] {
         self.nodes
             .get(&node)
@@ -1515,6 +3000,169 @@ impl DocumentTypedBindingIndex {
 
     pub fn refs_for_route(&self, route: &DocumentTypedBindingRoute) -> &[DocumentTypedBindingRef] {
         self.by_route.get(route).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+impl DocumentDerivedIndexBundle {
+    pub fn from_frame(frame: &DocumentFrame) -> Result<Self, PatchApplyError> {
+        let hot_ids = DocumentHotIdTable::from_frame(frame)?;
+        let intern_index = DocumentInternIndex::from_frame(frame, &hot_ids)?;
+        let retained_layout_keys =
+            DocumentRetainedLayoutKeyTable::from_frame(frame, &hot_ids, &intern_index)?;
+        let typed_styles = DocumentTypedStyleIndex::from_frame(frame, &hot_ids)?;
+        let typed_bindings = DocumentTypedBindingIndex::from_frame(frame, &hot_ids, &intern_index)?;
+        Ok(Self {
+            hot_ids,
+            intern_index,
+            retained_layout_keys,
+            typed_styles,
+            typed_bindings,
+        })
+    }
+
+    pub fn from_previous_nonstructural_patch(
+        previous: &Self,
+        frame: &DocumentFrame,
+        changed_nodes: &BTreeSet<DocumentNodeId>,
+    ) -> Result<Self, PatchApplyError> {
+        validate_frame_integrity(frame)?;
+        if previous.hot_ids.ids_by_node.len() != frame.nodes.len() {
+            return Err(PatchApplyError::StaleReference {
+                reference_kind: "hot_id_table_node_count",
+                id: frame.root.clone(),
+            });
+        }
+        for node_id in frame.nodes.keys() {
+            if !previous.hot_ids.ids_by_node.contains_key(node_id) {
+                return Err(PatchApplyError::StaleReference {
+                    reference_kind: "hot_id_table",
+                    id: node_id.clone(),
+                });
+            }
+        }
+
+        let mut next = previous.clone();
+        for node_id in changed_nodes {
+            let node = frame
+                .nodes
+                .get(node_id)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "document_frame",
+                    id: node_id.clone(),
+                })?;
+            let hot_ref =
+                next.hot_ids
+                    .hot_ref(node_id)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: node_id.clone(),
+                    })?;
+            next.intern_index.update_node(node, hot_ref);
+            next.retained_layout_keys.update_node(
+                frame,
+                &next.hot_ids,
+                &next.intern_index,
+                node_id,
+            )?;
+            next.typed_styles.update_node(node_id, node, hot_ref);
+            next.typed_bindings
+                .update_node(node_id, node, hot_ref, &next.intern_index)?;
+        }
+        Ok(next)
+    }
+
+    pub fn try_layout<'a>(
+        &'a self,
+        input: LayoutInput<'a>,
+    ) -> Result<LayoutFrame, PatchApplyError> {
+        try_layout_with_typed_styles(input, &self.hot_ids, &self.typed_styles)
+    }
+
+    pub fn try_hit_side_table(
+        &self,
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+    ) -> Result<HitSideTable, PatchApplyError> {
+        self.try_hit_side_table_with_bucket_size(
+            document,
+            layout,
+            HitSideTable::DEFAULT_BUCKET_SIZE,
+        )
+    }
+
+    pub fn try_hit_side_table_with_bucket_size(
+        &self,
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+        bucket_size: f32,
+    ) -> Result<HitSideTable, PatchApplyError> {
+        HitSideTable::try_from_document_layout_with_typed_bindings(
+            document,
+            &self.hot_ids,
+            &self.typed_bindings,
+            layout,
+            bucket_size,
+        )
+    }
+
+    pub fn try_render_scene(
+        &self,
+        layout: &LayoutFrame,
+        width: u32,
+        height: u32,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<RenderScene, PatchApplyError> {
+        render_scene::lower_layout_frame_to_render_scene_with_retained_keys(
+            layout,
+            &self.hot_ids,
+            &self.retained_layout_keys,
+            width,
+            height,
+            columns,
+        )
+    }
+
+    pub fn try_retained_layout_cache(
+        &self,
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+    ) -> Result<DocumentRetainedLayoutCache, PatchApplyError> {
+        DocumentRetainedLayoutCache::from_layout_frame(
+            document,
+            &self.hot_ids,
+            &self.retained_layout_keys,
+            layout,
+        )
+    }
+
+    pub fn try_retained_layout_cache_update(
+        &self,
+        previous: &DocumentRetainedLayoutCache,
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+    ) -> Result<DocumentRetainedLayoutCacheUpdate, PatchApplyError> {
+        previous.update_from_layout_frame(
+            document,
+            &self.hot_ids,
+            &self.retained_layout_keys,
+            layout,
+        )
+    }
+
+    pub fn try_retained_layout_cache_update_for_nodes(
+        &self,
+        previous: &DocumentRetainedLayoutCache,
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+        changed_nodes: &BTreeSet<DocumentNodeId>,
+    ) -> Result<Option<DocumentRetainedLayoutCacheUpdate>, PatchApplyError> {
+        previous.update_nodes_from_layout_frame(
+            document,
+            &self.hot_ids,
+            &self.retained_layout_keys,
+            layout,
+            changed_nodes,
+        )
     }
 }
 
@@ -1568,6 +3216,56 @@ impl DocumentState {
             document_change_set_from_reports(reports, node_count_before, next_frame.nodes.len());
         self.frame = next_frame;
         Ok(change_set)
+    }
+
+    pub fn apply_batch_to_owned_frame(
+        mut frame: DocumentFrame,
+        batch: DocumentChangeBatch,
+    ) -> Result<(DocumentFrame, DocumentChangeSet), PatchApplyError> {
+        validate_frame_integrity(&frame)?;
+        let node_count_before = frame.nodes.len();
+        let mut reports = Vec::with_capacity(batch.patches.len());
+        for patch in batch.patches {
+            reports.push(apply_document_patch_unchecked(&mut frame, patch)?);
+        }
+        validate_frame_integrity(&frame)?;
+        let change_set =
+            document_change_set_from_reports(reports, node_count_before, frame.nodes.len());
+        Ok((frame, change_set))
+    }
+
+    pub fn apply_nonstructural_batch_to_valid_owned_frame(
+        mut frame: DocumentFrame,
+        batch: DocumentChangeBatch,
+    ) -> Result<(DocumentFrame, DocumentChangeSet), PatchApplyError> {
+        for patch in &batch.patches {
+            if let Some(patch_kind) = document_patch_structural_kind(patch) {
+                return Err(PatchApplyError::UnsupportedTrustedNonstructuralPatch { patch_kind });
+            }
+        }
+        let node_count_before = frame.nodes.len();
+        let mut reports = Vec::with_capacity(batch.patches.len());
+        for patch in batch.patches {
+            reports.push(apply_document_patch_unchecked(&mut frame, patch)?);
+        }
+        let change_set =
+            document_change_set_from_reports(reports, node_count_before, frame.nodes.len());
+        Ok((frame, change_set))
+    }
+}
+
+fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str> {
+    match patch {
+        DocumentPatch::UpsertNode(_) => Some("upsert_node"),
+        DocumentPatch::RemoveNode { .. } => Some("remove_node"),
+        DocumentPatch::InsertChild { .. } => Some("insert_child"),
+        DocumentPatch::RemoveChild { .. } => Some("remove_child"),
+        DocumentPatch::MoveChild { .. } => Some("move_child"),
+        DocumentPatch::SetText { .. }
+        | DocumentPatch::SetStyle { .. }
+        | DocumentPatch::SetBinding { .. }
+        | DocumentPatch::SetScroll { .. }
+        | DocumentPatch::SetListMaterialization { .. } => None,
     }
 }
 
@@ -2162,6 +3860,31 @@ pub fn layout(input: LayoutInput<'_>) -> LayoutFrame {
     try_layout(input).expect("document layout frame failed integrity validation")
 }
 
+pub fn try_layout_with_typed_styles<'a>(
+    input: LayoutInput<'a>,
+    hot_ids: &'a DocumentHotIdTable,
+    typed_styles: &'a DocumentTypedStyleIndex,
+) -> Result<LayoutFrame, PatchApplyError> {
+    validate_frame_integrity(input.document)?;
+    validate_typed_style_context(input.document, hot_ids, typed_styles)?;
+    Ok(layout_unchecked_with_typed_styles(
+        input,
+        Some(TypedLayoutStyleContext {
+            hot_ids,
+            typed_styles,
+        }),
+    ))
+}
+
+pub fn layout_with_typed_styles<'a>(
+    input: LayoutInput<'a>,
+    hot_ids: &'a DocumentHotIdTable,
+    typed_styles: &'a DocumentTypedStyleIndex,
+) -> LayoutFrame {
+    try_layout_with_typed_styles(input, hot_ids, typed_styles)
+        .expect("typed document layout frame failed integrity validation")
+}
+
 pub fn try_layout_subtree(input: LayoutSubtreeInput<'_>) -> Result<LayoutFrame, PatchApplyError> {
     validate_frame_integrity(input.document)?;
     Ok(layout_subtree_unchecked(input))
@@ -2172,9 +3895,17 @@ pub fn layout_subtree(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
 }
 
 fn layout_unchecked(input: LayoutInput<'_>) -> LayoutFrame {
+    layout_unchecked_with_typed_styles(input, None)
+}
+
+fn layout_unchecked_with_typed_styles<'a>(
+    input: LayoutInput<'a>,
+    typed_styles: Option<TypedLayoutStyleContext<'a>>,
+) -> LayoutFrame {
     let mut builder = LayoutBuilder {
         document: input.document,
         text: input.text,
+        typed_styles,
         display_list: Vec::new(),
         hit_regions: Vec::new(),
         scroll_regions: Vec::new(),
@@ -2218,6 +3949,7 @@ fn layout_subtree_unchecked(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
     let mut builder = LayoutBuilder {
         document: input.document,
         text: input.text,
+        typed_styles: None,
         display_list: Vec::new(),
         hit_regions: Vec::new(),
         scroll_regions: Vec::new(),
@@ -2252,6 +3984,35 @@ fn layout_subtree_unchecked(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
     }
 }
 
+fn validate_typed_style_context(
+    document: &DocumentFrame,
+    hot_ids: &DocumentHotIdTable,
+    typed_styles: &DocumentTypedStyleIndex,
+) -> Result<(), PatchApplyError> {
+    for node_id in document.nodes.keys() {
+        let hot_ref = hot_ids
+            .hot_ref(node_id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "typed_style_hot_id_table",
+                id: node_id.clone(),
+            })?;
+        let record =
+            typed_styles
+                .record(hot_ref.id)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "typed_style_index",
+                    id: node_id.clone(),
+                })?;
+        if record.node != hot_ref {
+            return Err(PatchApplyError::StaleReference {
+                reference_kind: "typed_style_generation",
+                id: node_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn document_subtree_node_count(document: &DocumentFrame, root: &DocumentNodeId) -> usize {
     let mut count = 0usize;
     let mut stack = vec![root.clone()];
@@ -2265,9 +4026,16 @@ fn document_subtree_node_count(document: &DocumentFrame, root: &DocumentNodeId) 
     count
 }
 
+#[derive(Clone, Copy)]
+struct TypedLayoutStyleContext<'a> {
+    hot_ids: &'a DocumentHotIdTable,
+    typed_styles: &'a DocumentTypedStyleIndex,
+}
+
 struct LayoutBuilder<'a, 'b> {
     document: &'a DocumentFrame,
     text: &'b mut dyn TextMeasurer,
+    typed_styles: Option<TypedLayoutStyleContext<'a>>,
     display_list: Vec<DisplayItem>,
     hit_regions: Vec<HitRegion>,
     scroll_regions: Vec<ScrollRegion>,
@@ -2277,6 +4045,26 @@ struct LayoutBuilder<'a, 'b> {
 }
 
 impl LayoutBuilder<'_, '_> {
+    fn typed_style_record(&self, node: &DocumentNode) -> Option<DocumentTypedStyleRecord> {
+        let typed_styles = self.typed_styles?;
+        let hot_id = typed_styles.hot_ids.hot_id(&node.id)?;
+        typed_styles.typed_styles.record(hot_id).cloned()
+    }
+
+    fn typed_layout_style(&self, node: &DocumentNode) -> Option<DocumentTypedLayoutStyle> {
+        self.typed_style_record(node).map(|record| record.layout)
+    }
+
+    fn node_layout_dimension_is_fill(&self, node: &DocumentNode, key: &str) -> bool {
+        let typed_layout = self.typed_layout_style(node);
+        layout_dimension_is_fill(&node.style, typed_layout.as_ref(), key)
+    }
+
+    fn preferred_row_child_width(&mut self, node: &DocumentNode) -> Option<f32> {
+        let typed_layout = self.typed_layout_style(node);
+        preferred_row_child_width_with_typed(node, typed_layout.as_ref(), self.text)
+    }
+
     fn layout_node(
         &mut self,
         id: &DocumentNodeId,
@@ -2293,40 +4081,38 @@ impl LayoutBuilder<'_, '_> {
                 height: 0.0,
             };
         };
-        let padding = style_edges(&node.style, "padding");
-        let gap = style_spacing(&node.style, "gap").unwrap_or(0.0);
+        let typed_record = self.typed_style_record(&node);
+        let typed_layout = typed_record.as_ref().map(|record| &record.layout);
+        let padding = layout_edges(&node.style, typed_layout, "padding");
+        let gap = layout_spacing(&node.style, typed_layout, "gap").unwrap_or(0.0);
         let box_size = match node.kind {
-            DocumentNodeKind::Checkbox => style_spacing(&node.style, "box_size")
-                .or_else(|| style_spacing(&node.style, "size")),
+            DocumentNodeKind::Checkbox => layout_spacing(&node.style, typed_layout, "box_size")
+                .or_else(|| layout_spacing(&node.style, typed_layout, "size")),
             DocumentNodeKind::Button | DocumentNodeKind::Stack | DocumentNodeKind::TableCell
                 if node.text.is_none() =>
             {
-                style_spacing(&node.style, "box_size")
+                layout_spacing(&node.style, typed_layout, "box_size")
             }
             _ => None,
         };
-        let auto_width = style_text(&node.style, "width")
-            .is_some_and(|value| value.eq_ignore_ascii_case("auto"));
-        let explicit_width = style_dimension(&node.style, "width", available_width).or(box_size);
-        let explicit_height = style_dimension(&node.style, "height", available_height).or(box_size);
+        let auto_width = layout_dimension_is_auto(&node.style, typed_layout, "width");
+        let explicit_width =
+            layout_dimension(&node.style, typed_layout, "width", available_width).or(box_size);
+        let explicit_height =
+            layout_dimension(&node.style, typed_layout, "height", available_height).or(box_size);
         let text = node.text.as_ref().map(|value| value.text.clone());
         let measurement_text = text
             .as_deref()
             .filter(|value| !value.is_empty())
             .or_else(|| {
                 matches!(node.kind, DocumentNodeKind::TextInput)
-                    .then(|| style_text(&node.style, "placeholder"))
+                    .then(|| layout_text(&node.style, typed_layout, "placeholder"))
                     .flatten()
             });
+        let font_size = layout_spacing(&node.style, typed_layout, "size").unwrap_or(14.0);
         let mut measured = measurement_text
             .filter(|value| !value.is_empty())
-            .map(|value| {
-                self.text.measure_styled(
-                    value,
-                    style_spacing(&node.style, "size").unwrap_or(14.0),
-                    &node.style,
-                )
-            })
+            .map(|value| self.text.measure_styled(value, font_size, &node.style))
             .unwrap_or(TextMetrics {
                 width: 0.0,
                 height: 0.0,
@@ -2345,8 +4131,8 @@ impl LayoutBuilder<'_, '_> {
                 DocumentNodeKind::Button | DocumentNodeKind::Checkbox
             );
         let mut width = if auto_width {
-            let auto_padding = style_spacing(&node.style, "auto_padding")
-                .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
+            let auto_padding = layout_spacing(&node.style, typed_layout, "auto_padding")
+                .unwrap_or_else(|| font_size * 0.9);
             (measured.width + auto_padding + padding.horizontal()).max(1.0)
         } else if shrink_to_child_width {
             padding.horizontal().max(1.0)
@@ -2355,13 +4141,23 @@ impl LayoutBuilder<'_, '_> {
                 .unwrap_or_else(|| measured.width.max(available_width))
                 .max(1.0)
         };
-        width = constrain_dimension(width, &node.style, "width", available_width);
+        width =
+            constrain_layout_dimension(width, &node.style, typed_layout, "width", available_width);
         let mut height =
             explicit_height.unwrap_or_else(|| measured.height.max(24.0) + padding.vertical());
-        height = constrain_dimension(height, &node.style, "height", available_height);
-        let style_identity = computed_style_identity(&node.style);
-        let centered = style_bool(&node.style, "center").unwrap_or(false);
-        let align_x = style_text(&node.style, "align_x").unwrap_or_default();
+        height = constrain_layout_dimension(
+            height,
+            &node.style,
+            typed_layout,
+            "height",
+            available_height,
+        );
+        let style_identity = typed_record
+            .as_ref()
+            .map(|record| record.identity)
+            .unwrap_or_else(|| computed_style_identity(&node.style));
+        let centered = layout_bool(&node.style, typed_layout, "center").unwrap_or(false);
+        let align_x = layout_text(&node.style, typed_layout, "align_x").unwrap_or_default();
         let mut node_x = if centered && width < available_width {
             x + (available_width - width) / 2.0
         } else if align_x.eq_ignore_ascii_case("right") && width < available_width {
@@ -2398,27 +4194,33 @@ impl LayoutBuilder<'_, '_> {
                     let hit_start = self.hit_regions.len();
                     let scroll_start = self.scroll_regions.len();
                     let child_count = node.children.len();
-                    let fill_child_count =
-                        node.children
-                            .iter()
-                            .filter(|child| {
-                                self.document.nodes.get(child).is_some_and(|child| {
-                                    style_dimension_is_fill(&child.style, "width")
-                                })
+                    let fill_child_count = node
+                        .children
+                        .iter()
+                        .filter(|child| {
+                            self.document.nodes.get(child).is_some_and(|child| {
+                                self.node_layout_dimension_is_fill(child, "width")
                             })
-                            .count();
+                        })
+                        .count();
                     let row_gap_total = if child_count > 0 {
                         gap * child_count.saturating_sub(1) as f32
                     } else {
                         0.0
                     };
                     let fixed_child_width: f32 = if fill_child_count > 0 {
-                        node.children
-                            .iter()
-                            .filter_map(|child| self.document.nodes.get(child))
-                            .filter(|child| !style_dimension_is_fill(&child.style, "width"))
-                            .filter_map(|child| preferred_row_child_width(child, self.text))
-                            .sum()
+                        let mut fixed_child_width = 0.0;
+                        for child in &node.children {
+                            let Some(child_node) = self.document.nodes.get(child).cloned() else {
+                                continue;
+                            };
+                            if self.node_layout_dimension_is_fill(&child_node, "width") {
+                                continue;
+                            }
+                            fixed_child_width +=
+                                self.preferred_row_child_width(&child_node).unwrap_or(0.0);
+                        }
+                        fixed_child_width
                     } else {
                         0.0
                     };
@@ -2436,14 +4238,13 @@ impl LayoutBuilder<'_, '_> {
                             .document
                             .nodes
                             .get(child)
+                            .cloned()
                             .and_then(|child_node| {
-                                style_dimension_is_fill(&child_node.style, "width")
+                                self.node_layout_dimension_is_fill(&child_node, "width")
                                     .then_some(fill_child_width)
                                     .or_else(|| {
                                         (fill_child_count > 0)
-                                            .then(|| {
-                                                preferred_row_child_width(child_node, self.text)
-                                            })
+                                            .then(|| self.preferred_row_child_width(&child_node))
                                             .flatten()
                                     })
                             })
@@ -2459,7 +4260,7 @@ impl LayoutBuilder<'_, '_> {
                         cursor_x += child_rect.width + gap;
                         max_child_height = max_child_height.max(child_rect.height);
                     }
-                    if style_bool(&node.style, "center").unwrap_or(false) {
+                    if layout_bool(&node.style, typed_layout, "center").unwrap_or(false) {
                         let total_child_width = (cursor_x - content_x - gap).max(0.0);
                         let offset_x = ((content_width - total_child_width) / 2.0).max(0.0);
                         if offset_x > f32::EPSILON {
@@ -2478,7 +4279,9 @@ impl LayoutBuilder<'_, '_> {
                         height = (max_child_height + padding.vertical()).max(24.0);
                     }
                 }
-                _ if style_bool(&node.style, "overlay_children").unwrap_or(false) => {
+                _ if layout_bool(&node.style, typed_layout, "overlay_children")
+                    .unwrap_or(false) =>
+                {
                     let mut max_child_width: f32 = 0.0;
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
@@ -2493,17 +4296,19 @@ impl LayoutBuilder<'_, '_> {
                         max_child_height = max_child_height.max(child_rect.height);
                     }
                     if explicit_width.is_none() {
-                        width = constrain_dimension(
+                        width = constrain_layout_dimension(
                             max_child_width.max(width).max(1.0) + padding.horizontal(),
                             &node.style,
+                            typed_layout,
                             "width",
                             available_width,
                         );
                     }
                     if explicit_height.is_none() {
-                        height = constrain_dimension(
+                        height = constrain_layout_dimension(
                             (max_child_height + padding.vertical()).max(24.0),
                             &node.style,
+                            typed_layout,
                             "height",
                             available_height,
                         );
@@ -2535,18 +4340,20 @@ impl LayoutBuilder<'_, '_> {
                                 };
                             (max_child_width + padding.horizontal() + padded_button_safety).max(1.0)
                         } else {
-                            constrain_dimension(
+                            constrain_layout_dimension(
                                 max_child_width.max(width).max(1.0) + padding.horizontal(),
                                 &node.style,
+                                typed_layout,
                                 "width",
                                 available_width,
                             )
                         };
                     }
                     if explicit_height.is_none() {
-                        height = constrain_dimension(
+                        height = constrain_layout_dimension(
                             (cursor_y - y - gap).max(24.0) + padding.bottom,
                             &node.style,
+                            typed_layout,
                             "height",
                             available_height,
                         );
@@ -2586,7 +4393,11 @@ impl LayoutBuilder<'_, '_> {
         if !node.materialized.is_empty() {
             apply_clip_to_display_items(&mut self.display_list[subtree_display_start..], rect);
         }
-        if node.source_binding.is_some() || style_bool(&node.style, "__hover_scope") == Some(true) {
+        let hover_scope = typed_record
+            .as_ref()
+            .map(|record| record.pseudo.hover_scope)
+            .unwrap_or_else(|| style_bool(&node.style, "__hover_scope") == Some(true));
+        if node.source_binding.is_some() || hover_scope {
             self.hit_regions.push(HitRegion {
                 id: format!("hit:{}", node.id.0),
                 node: node.id.clone(),
@@ -2731,6 +4542,129 @@ fn style_dimension_is_fill(style: &BTreeMap<String, StyleValue>, key: &str) -> b
     )
 }
 
+fn layout_edges(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    prefix: &str,
+) -> EdgeSpacing {
+    if prefix == "padding" {
+        if let Some(typed_layout) = typed_layout {
+            return typed_edge_spacing_to_layout(typed_layout.padding);
+        }
+    }
+    style_edges(style, prefix)
+}
+
+fn layout_spacing(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    key: &str,
+) -> Option<f32> {
+    typed_layout
+        .and_then(|typed_layout| match key {
+            "gap" => typed_layout.gap,
+            "size" => typed_layout.size,
+            "box_size" => typed_layout.box_size,
+            "auto_padding" => typed_layout.auto_padding,
+            _ => None,
+        })
+        .or_else(|| style_spacing(style, key))
+}
+
+fn layout_bool(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    key: &str,
+) -> Option<bool> {
+    typed_layout
+        .and_then(|typed_layout| match key {
+            "center" => Some(typed_layout.center),
+            "overlay_children" => Some(typed_layout.overlay_children),
+            _ => None,
+        })
+        .or_else(|| style_bool(style, key))
+}
+
+fn layout_text<'a>(
+    style: &'a BTreeMap<String, StyleValue>,
+    typed_layout: Option<&'a DocumentTypedLayoutStyle>,
+    key: &str,
+) -> Option<&'a str> {
+    typed_layout
+        .and_then(|typed_layout| match key {
+            "align_x" => typed_layout.align_x.as_deref(),
+            "placeholder" => typed_layout.placeholder.as_deref(),
+            _ => None,
+        })
+        .or_else(|| style_text(style, key))
+}
+
+fn layout_dimension(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    key: &str,
+    fill_extent: f32,
+) -> Option<f32> {
+    typed_layout
+        .and_then(|typed_layout| typed_layout_dimension(typed_layout, key))
+        .and_then(|dimension| layout_dimension_value(dimension, fill_extent))
+        .or_else(|| style_dimension(style, key, fill_extent))
+}
+
+fn layout_dimension_is_auto(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    key: &str,
+) -> bool {
+    typed_layout
+        .and_then(|typed_layout| typed_layout_dimension(typed_layout, key))
+        .is_some_and(|dimension| matches!(dimension, DocumentStyleDimension::Auto))
+        || style_text(style, key).is_some_and(|value| value.eq_ignore_ascii_case("auto"))
+}
+
+fn layout_dimension_is_fill(
+    style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    key: &str,
+) -> bool {
+    typed_layout
+        .and_then(|typed_layout| typed_layout_dimension(typed_layout, key))
+        .is_some_and(|dimension| matches!(dimension, DocumentStyleDimension::Fill))
+        || style_dimension_is_fill(style, key)
+}
+
+fn typed_layout_dimension(
+    typed_layout: &DocumentTypedLayoutStyle,
+    key: &str,
+) -> Option<DocumentStyleDimension> {
+    match key {
+        "width" => typed_layout.width,
+        "height" => typed_layout.height,
+        "min_width" => typed_layout.min_width,
+        "max_width" => typed_layout.max_width,
+        "min_height" => typed_layout.min_height,
+        "max_height" => typed_layout.max_height,
+        _ => None,
+    }
+}
+
+fn layout_dimension_value(dimension: DocumentStyleDimension, fill_extent: f32) -> Option<f32> {
+    match dimension {
+        DocumentStyleDimension::Px { value } => Some(value),
+        DocumentStyleDimension::Fill => Some(fill_extent),
+        DocumentStyleDimension::Auto => None,
+    }
+}
+
+fn typed_edge_spacing_to_layout(spacing: DocumentTypedEdgeSpacing) -> EdgeSpacing {
+    EdgeSpacing {
+        top: spacing.top,
+        right: spacing.right,
+        bottom: spacing.bottom,
+        left: spacing.left,
+    }
+}
+
 fn typed_layout_style(style: &BTreeMap<String, StyleValue>) -> DocumentTypedLayoutStyle {
     DocumentTypedLayoutStyle {
         width: typed_style_dimension(style, "width"),
@@ -2840,45 +4774,36 @@ fn typed_clip_rect(style: &BTreeMap<String, StyleValue>) -> Option<Rect> {
     })
 }
 
-fn preferred_row_child_width(node: &DocumentNode, text: &mut dyn TextMeasurer) -> Option<f32> {
-    let padding = style_edges(&node.style, "padding");
+fn preferred_row_child_width_with_typed(
+    node: &DocumentNode,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
+    text: &mut dyn TextMeasurer,
+) -> Option<f32> {
+    let padding = layout_edges(&node.style, typed_layout, "padding");
     let box_size = match node.kind {
-        DocumentNodeKind::Checkbox => {
-            style_spacing(&node.style, "box_size").or_else(|| style_spacing(&node.style, "size"))
-        }
+        DocumentNodeKind::Checkbox => layout_spacing(&node.style, typed_layout, "box_size")
+            .or_else(|| layout_spacing(&node.style, typed_layout, "size")),
         DocumentNodeKind::Button | DocumentNodeKind::Stack | DocumentNodeKind::TableCell
             if node.text.is_none() =>
         {
-            style_spacing(&node.style, "box_size")
+            layout_spacing(&node.style, typed_layout, "box_size")
         }
         _ => None,
     };
-    if style_text(&node.style, "width").is_some_and(|value| value.eq_ignore_ascii_case("auto")) {
-        let auto_padding = style_spacing(&node.style, "auto_padding")
-            .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
-        let measured_width = row_child_measurement_text(node)
-            .map(|value| {
-                text.measure_styled(
-                    value,
-                    style_spacing(&node.style, "size").unwrap_or(14.0),
-                    &node.style,
-                )
-                .width
-            })
+    let font_size = layout_spacing(&node.style, typed_layout, "size").unwrap_or(14.0);
+    if layout_dimension_is_auto(&node.style, typed_layout, "width") {
+        let auto_padding = layout_spacing(&node.style, typed_layout, "auto_padding")
+            .unwrap_or_else(|| font_size * 0.9);
+        let measured_width = row_child_measurement_text(node, typed_layout)
+            .map(|value| text.measure_styled(value, font_size, &node.style).width)
             .unwrap_or(0.0);
         return Some((measured_width + auto_padding + padding.horizontal()).max(1.0));
     }
-    style_dimension(&node.style, "width", 0.0)
+    layout_dimension(&node.style, typed_layout, "width", 0.0)
         .or(box_size)
         .or_else(|| {
-            row_child_measurement_text(node).map(|value| {
-                let mut measured_width = text
-                    .measure_styled(
-                        value,
-                        style_spacing(&node.style, "size").unwrap_or(14.0),
-                        &node.style,
-                    )
-                    .width;
+            row_child_measurement_text(node, typed_layout).map(|value| {
+                let mut measured_width = text.measure_styled(value, font_size, &node.style).width;
                 if matches!(node.kind, DocumentNodeKind::Text)
                     && (node.style.contains_key("relief") || node.style.contains_key("depth"))
                     && measured_width > 0.0
@@ -2890,27 +4815,31 @@ fn preferred_row_child_width(node: &DocumentNode, text: &mut dyn TextMeasurer) -
         })
 }
 
-fn row_child_measurement_text(node: &DocumentNode) -> Option<&str> {
+fn row_child_measurement_text<'a>(
+    node: &'a DocumentNode,
+    typed_layout: Option<&'a DocumentTypedLayoutStyle>,
+) -> Option<&'a str> {
     node.text
         .as_ref()
         .map(|value| value.text.as_str())
         .filter(|value| !value.is_empty())
         .or_else(|| {
             matches!(node.kind, DocumentNodeKind::TextInput)
-                .then(|| style_text(&node.style, "placeholder"))
+                .then(|| layout_text(&node.style, typed_layout, "placeholder"))
                 .flatten()
                 .filter(|value| !value.is_empty())
         })
 }
 
-fn constrain_dimension(
+fn constrain_layout_dimension(
     value: f32,
     style: &BTreeMap<String, StyleValue>,
+    typed_layout: Option<&DocumentTypedLayoutStyle>,
     key: &str,
     fill_extent: f32,
 ) -> f32 {
-    let min = style_dimension(style, &format!("min_{key}"), fill_extent);
-    let max = style_dimension(style, &format!("max_{key}"), fill_extent);
+    let min = layout_dimension(style, typed_layout, &format!("min_{key}"), fill_extent);
+    let max = layout_dimension(style, typed_layout, &format!("max_{key}"), fill_extent);
     let mut constrained = value;
     if let Some(min) = min {
         constrained = constrained.max(min);
@@ -3405,6 +5334,829 @@ mod tests {
     }
 
     #[test]
+    fn semantic_scene_derives_stable_roles_bounds_actions_and_patch() {
+        let mut frame = DocumentFrame::empty("root");
+        let mut title = node("title", DocumentNodeKind::Text, Some("root"));
+        title.text = Some(TextValue {
+            text: "Inbox".to_owned(),
+        });
+        title
+            .style
+            .insert("heading_level".to_owned(), StyleValue::Number(2.0));
+
+        let mut button = node("save", DocumentNodeKind::Button, Some("root"));
+        button.text = Some(TextValue {
+            text: "Save".to_owned(),
+        });
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("source:save:press".to_owned()),
+            source_path: "toolbar.save".to_owned(),
+            intent: "press".to_owned(),
+        });
+
+        let mut checkbox = node("done", DocumentNodeKind::Checkbox, Some("root"));
+        checkbox
+            .style
+            .insert("checked".to_owned(), StyleValue::Bool(true));
+        checkbox.style.insert(
+            "accessibility_label".to_owned(),
+            StyleValue::Text("Done".to_owned()),
+        );
+
+        let mut input = node("filter", DocumentNodeKind::TextInput, Some("root"));
+        input.text = Some(TextValue {
+            text: "abc".to_owned(),
+        });
+        input.style.insert(
+            "placeholder".to_owned(),
+            StyleValue::Text("Filter".to_owned()),
+        );
+        frame.focus = Some(input.id.clone());
+
+        frame.nodes.get_mut(&frame.root).unwrap().children.extend([
+            title.id.clone(),
+            button.id.clone(),
+            checkbox.id.clone(),
+            input.id.clone(),
+        ]);
+        frame.nodes.insert(title.id.clone(), title);
+        frame.nodes.insert(button.id.clone(), button);
+        frame.nodes.insert(checkbox.id.clone(), checkbox);
+        frame.nodes.insert(input.id.clone(), input);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 320.0,
+                height: 180.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let scene = SemanticScene::from_document_layout(&frame, &layout);
+        assert_eq!(
+            scene.root,
+            Some(SemanticId("semantic:root".to_owned())),
+            "root semantic id must be stable and document-derived"
+        );
+        assert_eq!(
+            scene.focused,
+            Some(SemanticId("semantic:filter".to_owned())),
+            "document focus must project into the SemanticScene"
+        );
+
+        let button_semantic = scene
+            .nodes
+            .get(&SemanticId("semantic:save".to_owned()))
+            .expect("button semantic node should exist");
+        assert_eq!(button_semantic.role, SemanticRole::Button);
+        assert_eq!(button_semantic.name.as_deref(), Some("Save"));
+        assert!(button_semantic.actions.press);
+        assert!(button_semantic.actions.focus);
+        assert!(button_semantic.bounds.is_some());
+        assert_eq!(
+            button_semantic.source_binding_id,
+            Some(SourceBindingId("source:save:press".to_owned()))
+        );
+        assert_eq!(button_semantic.source_path.as_deref(), Some("toolbar.save"));
+
+        let checkbox_semantic = scene
+            .nodes
+            .get(&SemanticId("semantic:done".to_owned()))
+            .expect("checkbox semantic node should exist");
+        assert_eq!(checkbox_semantic.role, SemanticRole::Checkbox);
+        assert_eq!(checkbox_semantic.name.as_deref(), Some("Done"));
+        assert_eq!(checkbox_semantic.state.checked, Some(true));
+        assert_eq!(
+            checkbox_semantic.value,
+            Some(SemanticValue::Bool { value: true })
+        );
+
+        let title_semantic = scene
+            .nodes
+            .get(&SemanticId("semantic:title".to_owned()))
+            .expect("text semantic node should exist");
+        assert_eq!(title_semantic.role, SemanticRole::Text);
+        assert_eq!(title_semantic.heading_level, Some(2));
+
+        let mut next = scene.clone();
+        next.nodes.remove(&SemanticId("semantic:done".to_owned()));
+        let mut changed_button = next
+            .nodes
+            .remove(&SemanticId("semantic:save".to_owned()))
+            .unwrap();
+        changed_button.name = Some("Save now".to_owned());
+        next.nodes.insert(changed_button.id.clone(), changed_button);
+        next.focused = Some(SemanticId("semantic:save".to_owned()));
+
+        let patch = scene.diff(&next);
+        assert!(patch.operations.iter().any(|operation| matches!(
+            operation,
+            SemanticPatchOperation::RemoveNode { id } if id.0 == "semantic:done"
+        )));
+        assert!(patch.operations.iter().any(|operation| matches!(
+            operation,
+            SemanticPatchOperation::UpsertNode { node } if node.id.0 == "semantic:save"
+                && node.name.as_deref() == Some("Save now")
+        )));
+        assert!(patch.operations.iter().any(|operation| matches!(
+            operation,
+            SemanticPatchOperation::SetFocus { focused: Some(id) } if id.0 == "semantic:save"
+        )));
+    }
+
+    #[test]
+    fn semantic_scene_lowers_world_editor_tree_actions_for_accessibility() {
+        let root = boon_scene_model::WorldSemanticEditorNodeId("world-editor:root".to_owned());
+        let assembly =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:assembly".to_owned());
+        let wheel =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:part:front-left".to_owned());
+        let manufacturing =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:manufacturing".to_owned());
+        let export = boon_scene_model::WorldSemanticEditorNodeId(
+            "world-editor:manufacturing:export-3mf".to_owned(),
+        );
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(
+            root.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: root.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Editor,
+                label: "Car editor".to_owned(),
+                children: vec![assembly.clone(), manufacturing.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: false,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            assembly.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: assembly.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Assembly,
+                label: "Car assembly".to_owned(),
+                children: vec![wheel.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: false,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            wheel.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: wheel.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::PartInstance,
+                label: "Front-left wheel".to_owned(),
+                children: Vec::new(),
+                instance: Some(boon_scene_model::InstanceId(7)),
+                part_id: Some(boon_scene_model::PartId(2)),
+                feature_id: Some(boon_scene_model::FeatureId(22)),
+                pick_id: Some(boon_scene_model::PickId(4)),
+                manufacturing_role: None,
+                physical_material: Some(boon_scene_model::PhysicalMaterialId(2)),
+                selected: true,
+                visible: true,
+                exportable: true,
+                actions: boon_scene_model::WorldSemanticEditorActions {
+                    focus: true,
+                    select: true,
+                    ..boon_scene_model::WorldSemanticEditorActions::default()
+                },
+            },
+        );
+        nodes.insert(
+            manufacturing.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: manufacturing.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Manufacturing,
+                label: "Manufacturing".to_owned(),
+                children: vec![export.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: true,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            export.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: export.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Action,
+                label: "Export 3MF".to_owned(),
+                children: Vec::new(),
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: true,
+                actions: boon_scene_model::WorldSemanticEditorActions {
+                    focus: true,
+                    export_3mf: true,
+                    ..boon_scene_model::WorldSemanticEditorActions::default()
+                },
+            },
+        );
+        let mut tree = boon_scene_model::WorldSemanticEditorTree {
+            root: root.clone(),
+            focused: Some(wheel.clone()),
+            nodes,
+            metrics: boon_scene_model::WorldSemanticEditorTreeMetrics::default(),
+        };
+        tree.metrics = tree.compute_metrics();
+
+        let scene = SemanticScene::from_world_editor_tree(&tree);
+        let bridge = SemanticWebBridgeSnapshot::from_scene(&scene);
+        let export_id = SemanticId::from_world_editor_node_id(&export);
+        let wheel_id = SemanticId::from_world_editor_node_id(&wheel);
+        let export_node = scene.nodes.get(&export_id).expect("export semantic node");
+        let wheel_node = scene.nodes.get(&wheel_id).expect("wheel semantic node");
+
+        assert_eq!(
+            scene.root,
+            Some(SemanticId::from_world_editor_node_id(&root))
+        );
+        assert_eq!(scene.focused, Some(wheel_id.clone()));
+        assert_eq!(scene.nodes.len(), tree.nodes.len());
+        assert_eq!(export_node.role, SemanticRole::Button);
+        assert_eq!(export_node.name.as_deref(), Some("Export 3MF"));
+        assert!(export_node.actions.press);
+        assert_eq!(
+            export_node.source_path.as_deref(),
+            Some("world.manufacturing.export_3mf")
+        );
+        assert_eq!(export_node.source_intent.as_deref(), Some("press"));
+        assert_eq!(wheel_node.role, SemanticRole::Button);
+        assert!(wheel_node.state.selected);
+        assert_eq!(
+            wheel_node.source_path.as_deref(),
+            Some("world.instance.7.select")
+        );
+        assert!(bridge.action_routes.iter().any(|route| {
+            route.semantic_id == export_id
+                && route.action == SemanticWebAction::Press
+                && route.source_path.as_deref() == Some("world.manufacturing.export_3mf")
+        }));
+    }
+
+    #[test]
+    fn world_editor_tree_projects_to_source_bound_document_controls() {
+        let root = boon_scene_model::WorldSemanticEditorNodeId("world-editor:root".to_owned());
+        let assembly =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:assembly".to_owned());
+        let wheel =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:part:front-left".to_owned());
+        let manufacturing =
+            boon_scene_model::WorldSemanticEditorNodeId("world-editor:manufacturing".to_owned());
+        let export = boon_scene_model::WorldSemanticEditorNodeId(
+            "world-editor:manufacturing:export-3mf".to_owned(),
+        );
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            root.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: root.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Editor,
+                label: "Car editor".to_owned(),
+                children: vec![assembly.clone(), manufacturing.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: false,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            assembly.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: assembly.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Assembly,
+                label: "Car assembly".to_owned(),
+                children: vec![wheel.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: false,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            wheel.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: wheel.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::PartInstance,
+                label: "Front-left wheel".to_owned(),
+                children: Vec::new(),
+                instance: Some(boon_scene_model::InstanceId(7)),
+                part_id: Some(boon_scene_model::PartId(3)),
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: Some(boon_scene_model::PhysicalMaterialId(4)),
+                selected: true,
+                visible: true,
+                exportable: true,
+                actions: boon_scene_model::WorldSemanticEditorActions {
+                    focus: true,
+                    select: true,
+                    ..boon_scene_model::WorldSemanticEditorActions::default()
+                },
+            },
+        );
+        nodes.insert(
+            manufacturing.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: manufacturing.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Manufacturing,
+                label: "Manufacturing".to_owned(),
+                children: vec![export.clone()],
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: false,
+                actions: boon_scene_model::WorldSemanticEditorActions::default(),
+            },
+        );
+        nodes.insert(
+            export.clone(),
+            boon_scene_model::WorldSemanticEditorNode {
+                id: export.clone(),
+                role: boon_scene_model::WorldSemanticEditorRole::Action,
+                label: "Export 3MF".to_owned(),
+                children: Vec::new(),
+                instance: None,
+                part_id: None,
+                feature_id: None,
+                pick_id: None,
+                manufacturing_role: None,
+                physical_material: None,
+                selected: false,
+                visible: true,
+                exportable: true,
+                actions: boon_scene_model::WorldSemanticEditorActions {
+                    focus: true,
+                    export_3mf: true,
+                    ..boon_scene_model::WorldSemanticEditorActions::default()
+                },
+            },
+        );
+        let mut tree = boon_scene_model::WorldSemanticEditorTree {
+            root: root.clone(),
+            focused: Some(wheel.clone()),
+            nodes,
+            metrics: boon_scene_model::WorldSemanticEditorTreeMetrics::default(),
+        };
+        tree.metrics = tree.compute_metrics();
+
+        let frame = document_frame_from_world_editor_tree(&tree);
+        DocumentState::from_frame(frame.clone()).expect("document frame should validate");
+        let derived =
+            DocumentDerivedIndexBundle::from_frame(&frame).expect("derived indexes should build");
+        let mut text = SimpleTextMeasurer;
+        let layout = derived
+            .try_layout(LayoutInput {
+                document: &frame,
+                viewport: Viewport {
+                    surface: 1,
+                    width: 640.0,
+                    height: 360.0,
+                    scale: 1.0,
+                },
+                text: &mut text,
+                capabilities: RenderCapabilities::fake_portable(),
+            })
+            .expect("world editor document should layout");
+        let hit_table = derived
+            .try_hit_side_table(&frame, &layout)
+            .expect("world editor document should produce typed hit table");
+        let scene = SemanticScene::from_document_layout(&frame, &layout);
+        let export_doc_id = document_node_id_from_world_editor_node_id(&export);
+        let wheel_doc_id = document_node_id_from_world_editor_node_id(&wheel);
+        let export_semantic_id = SemanticId::from_document_node_id(&export_doc_id);
+        let wheel_semantic_id = SemanticId::from_document_node_id(&wheel_doc_id);
+
+        assert_eq!(
+            frame.root,
+            document_node_id_from_world_editor_node_id(&root)
+        );
+        assert_eq!(frame.focus, Some(wheel_doc_id.clone()));
+        assert_eq!(
+            frame
+                .nodes
+                .get(&export_doc_id)
+                .and_then(|node| node.source_binding.as_ref())
+                .map(|binding| binding.source_path.as_str()),
+            Some("world.manufacturing.export_3mf")
+        );
+        assert_eq!(
+            frame
+                .nodes
+                .get(&wheel_doc_id)
+                .and_then(|node| node.source_binding.as_ref())
+                .map(|binding| binding.source_path.as_str()),
+            Some("world.instance.7.select")
+        );
+        assert!(
+            layout
+                .hit_regions
+                .iter()
+                .any(|hit| hit.node == export_doc_id)
+        );
+        assert!(hit_table.entries.iter().any(|entry| {
+            entry.node == export_doc_id
+                && entry.source_path.as_deref() == Some("world.manufacturing.export_3mf")
+                && !entry.source_binding_refs.is_empty()
+        }));
+        assert!(hit_table.entries.iter().any(|entry| {
+            entry.node == wheel_doc_id
+                && entry.source_path.as_deref() == Some("world.instance.7.select")
+                && !entry.source_binding_refs.is_empty()
+        }));
+        assert_eq!(
+            scene
+                .source_dispatch_for_event(SemanticInputEvent::Press {
+                    semantic_id: export_semantic_id,
+                })
+                .map(|dispatch| dispatch.source_path),
+            Some("world.manufacturing.export_3mf".to_owned())
+        );
+        assert_eq!(
+            scene
+                .source_dispatch_for_event(SemanticInputEvent::Press {
+                    semantic_id: wheel_semantic_id,
+                })
+                .map(|dispatch| dispatch.source_path),
+            Some("world.instance.7.select".to_owned())
+        );
+    }
+
+    #[test]
+    fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
+        let mut scene = SemanticScene::default();
+        scene.root = Some(SemanticId("semantic:root".to_owned()));
+        scene.focused = Some(SemanticId("semantic:filter".to_owned()));
+        scene.nodes.insert(
+            SemanticId("semantic:root".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:root".to_owned()),
+                node: DocumentNodeId("root".to_owned()),
+                role: SemanticRole::Application,
+                name: Some("Boon app".to_owned()),
+                description: None,
+                value: None,
+                state: SemanticState::default(),
+                actions: SemanticActions::default(),
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: Some("en".to_owned()),
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:save".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:save".to_owned()),
+                node: DocumentNodeId("save".to_owned()),
+                role: SemanticRole::Button,
+                name: Some("Save & <Close>".to_owned()),
+                description: None,
+                value: None,
+                state: SemanticState::default(),
+                actions: SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:save".to_owned())),
+                source_path: Some("toolbar.save".to_owned()),
+                source_intent: Some("press".to_owned()),
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:done".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:done".to_owned()),
+                node: DocumentNodeId("done".to_owned()),
+                role: SemanticRole::Checkbox,
+                name: Some("Done".to_owned()),
+                description: None,
+                value: Some(SemanticValue::Bool { value: true }),
+                state: SemanticState {
+                    checked: Some(true),
+                    ..SemanticState::default()
+                },
+                actions: SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: None,
+                source_path: None,
+                source_intent: None,
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:filter".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:filter".to_owned()),
+                node: DocumentNodeId("filter".to_owned()),
+                role: SemanticRole::TextInput,
+                name: Some("Filter".to_owned()),
+                description: None,
+                value: Some(SemanticValue::Text {
+                    text: "a\"b".to_owned(),
+                }),
+                state: SemanticState {
+                    focused: true,
+                    ..SemanticState::default()
+                },
+                actions: SemanticActions {
+                    focus: true,
+                    press: false,
+                    set_text: true,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:filter:change".to_owned())),
+                source_path: Some("toolbar.filter".to_owned()),
+                source_intent: Some("change".to_owned()),
+            },
+        );
+
+        let snapshot = SemanticDomSnapshot::from_scene(&scene);
+        let html = snapshot.to_html_fragment();
+
+        assert_eq!(snapshot.metrics.semantic_node_count, 4);
+        assert_eq!(snapshot.metrics.dom_node_count, 4);
+        assert_eq!(snapshot.metrics.data_boon_id_count, 4);
+        assert_eq!(snapshot.metrics.text_input_endpoint_count, 1);
+        assert_eq!(snapshot.metrics.visual_dom_node_count, 0);
+        assert!(html.contains("id=\"boon-semantic-save\""));
+        assert!(html.contains("data-boon-id=\"semantic:save\""));
+        assert!(html.contains("data-boon-source-binding-id=\"source:save\""));
+        assert!(html.contains("data-boon-source-path=\"toolbar.save\""));
+        assert!(html.contains("data-boon-action-press=\"true\""));
+        assert!(html.contains("Save &amp; &lt;Close&gt;"));
+        assert!(html.contains("type=\"checkbox\""));
+        assert!(html.contains("aria-checked=\"true\""));
+        assert!(html.contains("data-boon-ime-endpoint=\"true\""));
+        assert!(html.contains("value=\"a&quot;b\""));
+        assert!(html.contains("data-boon-focused=\"true\""));
+        assert!(!html.contains("<canvas"));
+        assert!(!html.contains("<style"));
+        assert!(!html.contains("<svg"));
+    }
+
+    #[test]
+    fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
+        let mut scene = SemanticScene::default();
+        scene.root = Some(SemanticId("semantic:root".to_owned()));
+        scene.focused = Some(SemanticId("semantic:filter".to_owned()));
+        scene.nodes.insert(
+            SemanticId("semantic:filter".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:filter".to_owned()),
+                node: DocumentNodeId("filter".to_owned()),
+                role: SemanticRole::TextInput,
+                name: Some("Filter".to_owned()),
+                description: None,
+                value: Some(SemanticValue::Text {
+                    text: "abc".to_owned(),
+                }),
+                state: SemanticState {
+                    focused: true,
+                    ..SemanticState::default()
+                },
+                actions: SemanticActions {
+                    focus: true,
+                    press: false,
+                    set_text: true,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:filter:change".to_owned())),
+                source_path: Some("toolbar.filter".to_owned()),
+                source_intent: Some("change".to_owned()),
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:save".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:save".to_owned()),
+                node: DocumentNodeId("save".to_owned()),
+                role: SemanticRole::Button,
+                name: Some("Save".to_owned()),
+                description: None,
+                value: None,
+                state: SemanticState::default(),
+                actions: SemanticActions {
+                    focus: true,
+                    press: true,
+                    set_text: false,
+                    increment: false,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:save:press".to_owned())),
+                source_path: Some("toolbar.save".to_owned()),
+                source_intent: Some("press".to_owned()),
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:zoom-in".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:zoom-in".to_owned()),
+                node: DocumentNodeId("zoom-in".to_owned()),
+                role: SemanticRole::Button,
+                name: Some("Zoom in".to_owned()),
+                description: None,
+                value: Some(SemanticValue::Number { value: 1.0 }),
+                state: SemanticState::default(),
+                actions: SemanticActions {
+                    focus: true,
+                    press: false,
+                    set_text: false,
+                    increment: true,
+                    decrement: false,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:zoom:increment".to_owned())),
+                source_path: Some("viewport.zoom".to_owned()),
+                source_intent: Some("increment".to_owned()),
+            },
+        );
+        scene.nodes.insert(
+            SemanticId("semantic:zoom-out".to_owned()),
+            SemanticNode {
+                id: SemanticId("semantic:zoom-out".to_owned()),
+                node: DocumentNodeId("zoom-out".to_owned()),
+                role: SemanticRole::Button,
+                name: Some("Zoom out".to_owned()),
+                description: None,
+                value: Some(SemanticValue::Number { value: -1.0 }),
+                state: SemanticState::default(),
+                actions: SemanticActions {
+                    focus: true,
+                    press: false,
+                    set_text: false,
+                    increment: false,
+                    decrement: true,
+                },
+                relations: SemanticRelations::default(),
+                bounds: None,
+                language: None,
+                heading_level: None,
+                href: None,
+                source_binding_id: Some(SourceBindingId("source:zoom:decrement".to_owned())),
+                source_path: Some("viewport.zoom".to_owned()),
+                source_intent: Some("decrement".to_owned()),
+            },
+        );
+
+        let bridge = SemanticWebBridgeSnapshot::from_scene(&scene);
+        let html = bridge.to_html_fragment();
+
+        assert_eq!(bridge.metrics.semantic_node_count, 4);
+        assert_eq!(bridge.metrics.dom_node_count, 4);
+        assert_eq!(bridge.metrics.visual_dom_node_count, 0);
+        assert_eq!(bridge.metrics.ime_endpoint_count, 1);
+        assert_eq!(bridge.metrics.source_routed_action_count, 4);
+        assert_eq!(bridge.ime_endpoints[0].dom_id, "boon-semantic-filter");
+        assert_eq!(
+            bridge.ime_endpoints[0].source_path.as_deref(),
+            Some("toolbar.filter")
+        );
+        assert!(html.contains("data-boon-ime-endpoint=\"true\""));
+        assert!(html.contains("data-boon-action-increment=\"true\""));
+        assert!(html.contains("data-boon-action-decrement=\"true\""));
+        assert!(!html.contains("<canvas"));
+        assert!(!html.contains("<style"));
+        assert!(!html.contains("<svg"));
+
+        let text_dispatch = bridge
+            .source_dispatch_for_event(SemanticWebInputEvent::SetText {
+                semantic_id: SemanticId("semantic:filter".to_owned()),
+                text: "next".to_owned(),
+            })
+            .expect("text input route should dispatch to a Boon source");
+        assert_eq!(text_dispatch.source_path, "toolbar.filter");
+        assert_eq!(text_dispatch.source_intent.as_deref(), Some("change"));
+        assert_eq!(text_dispatch.text.as_deref(), Some("next"));
+
+        let press_dispatch = bridge
+            .source_dispatch_for_event(SemanticWebInputEvent::Press {
+                semantic_id: SemanticId("semantic:save".to_owned()),
+            })
+            .expect("button route should dispatch to a Boon source");
+        assert_eq!(press_dispatch.source_path, "toolbar.save");
+        assert_eq!(press_dispatch.source_intent.as_deref(), Some("press"));
+        assert_eq!(press_dispatch.text, None);
+
+        let increment_dispatch = bridge
+            .source_dispatch_for_event(SemanticWebInputEvent::Increment {
+                semantic_id: SemanticId("semantic:zoom-in".to_owned()),
+            })
+            .expect("increment route should dispatch to a Boon source");
+        assert_eq!(increment_dispatch.source_path, "viewport.zoom");
+        assert_eq!(
+            increment_dispatch.source_intent.as_deref(),
+            Some("increment")
+        );
+        assert_eq!(increment_dispatch.text, None);
+
+        let decrement_dispatch = bridge
+            .source_dispatch_for_event(SemanticWebInputEvent::Decrement {
+                semantic_id: SemanticId("semantic:zoom-out".to_owned()),
+            })
+            .expect("decrement route should dispatch to a Boon source");
+        assert_eq!(decrement_dispatch.source_path, "viewport.zoom");
+        assert_eq!(
+            decrement_dispatch.source_intent.as_deref(),
+            Some("decrement")
+        );
+        assert_eq!(decrement_dispatch.text, None);
+    }
+
+    #[test]
     fn document_patch_reports_text_and_layout_invalidation() {
         let mut state = DocumentState::new("root");
         state
@@ -3712,6 +6464,123 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn derived_index_bundle_incrementally_updates_nonstructural_nodes() {
+        let mut alpha = node("alpha", DocumentNodeKind::Text, Some("root"));
+        alpha.text = Some(TextValue {
+            text: "before".to_owned(),
+        });
+        alpha
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        alpha.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("alpha-binding".to_owned()),
+            source_path: "store.before".to_owned(),
+            intent: "edit".to_owned(),
+        });
+
+        let mut state = DocumentState::new("root");
+        state.apply_patch(DocumentPatch::UpsertNode(alpha)).unwrap();
+        let previous_bundle = DocumentDerivedIndexBundle::from_frame(state.frame()).unwrap();
+        let alpha_node = DocumentNodeId("alpha".to_owned());
+        let alpha_hot = previous_bundle.hot_ids.hot_id(&alpha_node).unwrap();
+
+        state
+            .apply_batch(DocumentChangeBatch {
+                patches: vec![
+                    DocumentPatch::SetText {
+                        id: alpha_node.clone(),
+                        text: TextValue {
+                            text: "after".to_owned(),
+                        },
+                    },
+                    DocumentPatch::SetStyle {
+                        id: alpha_node.clone(),
+                        patch: BTreeMap::from([(
+                            "width".to_owned(),
+                            Some(StyleValue::Number(180.0)),
+                        )]),
+                    },
+                    DocumentPatch::SetBinding {
+                        id: alpha_node.clone(),
+                        binding: boon_document_model::SourceBinding {
+                            id: SourceBindingId("alpha-binding".to_owned()),
+                            source_path: "store.after".to_owned(),
+                            intent: "edit".to_owned(),
+                        },
+                    },
+                ],
+            })
+            .unwrap();
+
+        let changed_nodes = BTreeSet::from([alpha_node]);
+        let incremental = DocumentDerivedIndexBundle::from_previous_nonstructural_patch(
+            &previous_bundle,
+            state.frame(),
+            &changed_nodes,
+        )
+        .unwrap();
+        let full = DocumentDerivedIndexBundle::from_frame(state.frame()).unwrap();
+        let after_route = DocumentTypedBindingRoute {
+            source_path: "store.after".to_owned(),
+            intent: "edit".to_owned(),
+        };
+        let before_route = DocumentTypedBindingRoute {
+            source_path: "store.before".to_owned(),
+            intent: "edit".to_owned(),
+        };
+
+        assert_eq!(
+            incremental
+                .hot_ids
+                .hot_id(&DocumentNodeId("alpha".to_owned())),
+            Some(alpha_hot)
+        );
+        let incremental_key = &incremental
+            .retained_layout_keys
+            .entry(alpha_hot)
+            .unwrap()
+            .key;
+        let full_key = &full.retained_layout_keys.entry(alpha_hot).unwrap().key;
+        assert_eq!(incremental_key.kind, full_key.kind);
+        assert_eq!(incremental_key.children, full_key.children);
+        assert_eq!(incremental_key.materialized, full_key.materialized);
+        assert_eq!(
+            incremental
+                .intern_index
+                .layout_styles
+                .key(incremental_key.layout_style),
+            full.intern_index.layout_styles.key(full_key.layout_style)
+        );
+        assert_eq!(
+            incremental
+                .intern_index
+                .text_styles
+                .key(incremental_key.text_style),
+            full.intern_index.text_styles.key(full_key.text_style)
+        );
+        assert_eq!(
+            incremental_key
+                .text
+                .and_then(|id| incremental.intern_index.texts.key(id)),
+            full_key.text.and_then(|id| full.intern_index.texts.key(id))
+        );
+        assert_eq!(
+            incremental.typed_styles.record(alpha_hot),
+            full.typed_styles.record(alpha_hot)
+        );
+        assert_eq!(
+            incremental.typed_bindings.refs_for_route(&after_route),
+            full.typed_bindings.refs_for_route(&after_route)
+        );
+        assert!(
+            incremental
+                .typed_bindings
+                .refs_for_route(&before_route)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4198,6 +7067,263 @@ mod tests {
     }
 
     #[test]
+    fn typed_style_layout_path_matches_legacy_layout_for_covered_properties() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut row = node("row", DocumentNodeKind::Row, Some("root"));
+        row.style
+            .insert("width".to_owned(), StyleValue::Number(360.0));
+        row.style
+            .insert("height".to_owned(), StyleValue::Number(84.0));
+        row.style.insert("gap".to_owned(), StyleValue::Number(8.0));
+        row.style
+            .insert("padding".to_owned(), StyleValue::Number(6.0));
+        row.style
+            .insert("padding_left".to_owned(), StyleValue::Number(10.0));
+        row.style
+            .insert("center".to_owned(), StyleValue::Bool(true));
+        row.children.push(DocumentNodeId("auto-button".to_owned()));
+        row.children.push(DocumentNodeId("fill-panel".to_owned()));
+        row.children.push(DocumentNodeId("field".to_owned()));
+
+        let mut auto_button = node("auto-button", DocumentNodeKind::Button, Some("row"));
+        auto_button.text = Some(TextValue {
+            text: "Open".to_owned(),
+        });
+        auto_button
+            .style
+            .insert("width".to_owned(), StyleValue::Text("auto".to_owned()));
+        auto_button
+            .style
+            .insert("height".to_owned(), StyleValue::Number(26.0));
+        auto_button
+            .style
+            .insert("padding".to_owned(), StyleValue::Number(3.0));
+        auto_button
+            .style
+            .insert("auto_padding".to_owned(), StyleValue::Number(12.0));
+        auto_button
+            .style
+            .insert("size".to_owned(), StyleValue::Number(10.0));
+
+        let mut fill_panel = node("fill-panel", DocumentNodeKind::Stack, Some("row"));
+        fill_panel
+            .style
+            .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+        fill_panel
+            .style
+            .insert("height".to_owned(), StyleValue::Number(30.0));
+        fill_panel
+            .style
+            .insert("__hover_scope".to_owned(), StyleValue::Bool(true));
+
+        let mut field = node("field", DocumentNodeKind::TextInput, Some("row"));
+        field
+            .style
+            .insert("width".to_owned(), StyleValue::Number(80.0));
+        field
+            .style
+            .insert("height".to_owned(), StyleValue::Number(24.0));
+        field.style.insert(
+            "placeholder".to_owned(),
+            StyleValue::Text("Find".to_owned()),
+        );
+        field
+            .style
+            .insert("size".to_owned(), StyleValue::Number(11.0));
+
+        let mut overlay = node("overlay", DocumentNodeKind::Stack, Some("root"));
+        overlay
+            .style
+            .insert("overlay_children".to_owned(), StyleValue::Bool(true));
+        overlay
+            .style
+            .insert("padding".to_owned(), StyleValue::Number(5.0));
+        overlay
+            .style
+            .insert("min_width".to_owned(), StyleValue::Number(100.0));
+        overlay
+            .style
+            .insert("max_width".to_owned(), StyleValue::Number(140.0));
+        overlay
+            .children
+            .push(DocumentNodeId("overlay-text".to_owned()));
+
+        let mut overlay_text = node("overlay-text", DocumentNodeKind::Text, Some("overlay"));
+        overlay_text.text = Some(TextValue {
+            text: "Overlay".to_owned(),
+        });
+        overlay_text
+            .style
+            .insert("size".to_owned(), StyleValue::Number(9.0));
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .extend([row.id.clone(), overlay.id.clone()]);
+        frame.nodes.insert(row.id.clone(), row);
+        frame.nodes.insert(auto_button.id.clone(), auto_button);
+        frame.nodes.insert(fill_panel.id.clone(), fill_panel);
+        frame.nodes.insert(field.id.clone(), field);
+        frame.nodes.insert(overlay.id.clone(), overlay);
+        frame.nodes.insert(overlay_text.id.clone(), overlay_text);
+
+        let hot_ids = DocumentHotIdTable::from_frame(&frame).unwrap();
+        let typed_styles = DocumentTypedStyleIndex::from_frame(&frame, &hot_ids).unwrap();
+        let viewport = Viewport {
+            surface: 1,
+            width: 500.0,
+            height: 240.0,
+            scale: 1.0,
+        };
+
+        let mut legacy_text = SimpleTextMeasurer;
+        let legacy = layout(LayoutInput {
+            document: &frame,
+            viewport,
+            text: &mut legacy_text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let mut typed_text = SimpleTextMeasurer;
+        let typed = layout_with_typed_styles(
+            LayoutInput {
+                document: &frame,
+                viewport,
+                text: &mut typed_text,
+                capabilities: RenderCapabilities::fake_portable(),
+            },
+            &hot_ids,
+            &typed_styles,
+        );
+
+        assert_eq!(typed, legacy);
+        assert!(
+            typed
+                .hit_regions
+                .iter()
+                .any(|hit| hit.node.0 == "fill-panel"),
+            "typed pseudo styles should preserve hover hit-region emission"
+        );
+
+        let mut stale_styles = typed_styles.clone();
+        let row_hot = hot_ids
+            .hot_id(&DocumentNodeId("row".to_owned()))
+            .expect("row should have a hot id");
+        stale_styles.records.remove(&row_hot);
+        let mut stale_text = SimpleTextMeasurer;
+        let err = try_layout_with_typed_styles(
+            LayoutInput {
+                document: &frame,
+                viewport,
+                text: &mut stale_text,
+                capabilities: RenderCapabilities::fake_portable(),
+            },
+            &hot_ids,
+            &stale_styles,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PatchApplyError::StaleReference {
+                reference_kind: "typed_style_index",
+                id
+            } if id.0 == "row"
+        ));
+    }
+
+    #[test]
+    fn derived_index_bundle_builds_typed_layout_and_hit_indexes_together() {
+        let mut frame = DocumentFrame::empty("root");
+        let mut button = node("button", DocumentNodeKind::Button, Some("root"));
+        button.text = Some(TextValue {
+            text: "Press".to_owned(),
+        });
+        button
+            .style
+            .insert("width".to_owned(), StyleValue::Text("auto".to_owned()));
+        button
+            .style
+            .insert("padding".to_owned(), StyleValue::Number(4.0));
+        button
+            .style
+            .insert("size".to_owned(), StyleValue::Number(12.0));
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("source:button:press".to_owned()),
+            source_path: "controls.primary.press".to_owned(),
+            intent: "press".to_owned(),
+        });
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(button.id.clone());
+        frame.nodes.insert(button.id.clone(), button);
+
+        let bundle = DocumentDerivedIndexBundle::from_frame(&frame).unwrap();
+        let standalone_hot_ids = DocumentHotIdTable::from_frame(&frame).unwrap();
+        let standalone_intern =
+            DocumentInternIndex::from_frame(&frame, &standalone_hot_ids).unwrap();
+        let standalone_styles =
+            DocumentTypedStyleIndex::from_frame(&frame, &standalone_hot_ids).unwrap();
+        let standalone_bindings =
+            DocumentTypedBindingIndex::from_frame(&frame, &standalone_hot_ids, &standalone_intern)
+                .unwrap();
+
+        assert_eq!(bundle.hot_ids, standalone_hot_ids);
+        assert_eq!(bundle.intern_index, standalone_intern);
+        assert_eq!(bundle.typed_styles, standalone_styles);
+        assert_eq!(bundle.typed_bindings, standalone_bindings);
+
+        let viewport = Viewport {
+            surface: 1,
+            width: 240.0,
+            height: 80.0,
+            scale: 1.0,
+        };
+        let mut legacy_text = SimpleTextMeasurer;
+        let legacy = layout(LayoutInput {
+            document: &frame,
+            viewport,
+            text: &mut legacy_text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let mut typed_text = SimpleTextMeasurer;
+        let typed = bundle
+            .try_layout(LayoutInput {
+                document: &frame,
+                viewport,
+                text: &mut typed_text,
+                capabilities: RenderCapabilities::fake_portable(),
+            })
+            .unwrap();
+        assert_eq!(typed, legacy);
+
+        let hit_table = bundle.try_hit_side_table(&frame, &typed).unwrap();
+        let hit = hit_table
+            .entry_for_source_path("controls.primary.press")
+            .expect("typed bundle hit table should preserve source path lookup");
+        let button_hot = bundle
+            .hot_ids
+            .hot_id(&DocumentNodeId("button".to_owned()))
+            .unwrap();
+        let retained_layout_cache = bundle.try_retained_layout_cache(&frame, &typed).unwrap();
+        assert!(
+            retained_layout_cache.entries.contains_key(&button_hot),
+            "derived bundle should build retained layout geometry for hot document nodes"
+        );
+        assert_eq!(
+            hit.source_binding_refs,
+            vec![DocumentTypedBindingRef {
+                node: button_hot,
+                ordinal: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn typed_binding_index_exposes_current_single_binding_as_multi_binding_shape() {
         let mut button = node("button", DocumentNodeKind::Button, Some("root"));
         button.source_binding = Some(boon_document_model::SourceBinding {
@@ -4546,6 +7672,107 @@ mod tests {
                 patch_kind: "set_list_materialization",
                 id
             } if id.0 == "missing"
+        ));
+    }
+
+    #[test]
+    fn owned_frame_batch_matches_stateful_batch_patch_result() {
+        let mut initial = DocumentState::new("root");
+        initial
+            .apply_patch(DocumentPatch::UpsertNode(node(
+                "title",
+                DocumentNodeKind::Text,
+                Some("root"),
+            )))
+            .unwrap();
+        let batch = DocumentChangeBatch {
+            patches: vec![
+                DocumentPatch::SetText {
+                    id: DocumentNodeId("title".to_owned()),
+                    text: TextValue {
+                        text: "Ready".to_owned(),
+                    },
+                },
+                DocumentPatch::SetStyle {
+                    id: DocumentNodeId("title".to_owned()),
+                    patch: BTreeMap::from([(
+                        "color".to_owned(),
+                        Some(StyleValue::Text("green".to_owned())),
+                    )]),
+                },
+            ],
+        };
+
+        let mut stateful = DocumentState::from_frame(initial.frame().clone()).unwrap();
+        let stateful_change_set = stateful.apply_batch(batch.clone()).unwrap();
+        let (owned_frame, owned_change_set) =
+            DocumentState::apply_batch_to_owned_frame(initial.into_frame(), batch).unwrap();
+
+        assert_eq!(owned_frame, stateful.into_frame());
+        assert_eq!(owned_change_set, stateful_change_set);
+    }
+
+    #[test]
+    fn trusted_nonstructural_owned_frame_batch_matches_stateful_batch_patch_result() {
+        let mut initial = DocumentState::new("root");
+        initial
+            .apply_patch(DocumentPatch::UpsertNode(node(
+                "title",
+                DocumentNodeKind::Text,
+                Some("root"),
+            )))
+            .unwrap();
+        let batch = DocumentChangeBatch {
+            patches: vec![
+                DocumentPatch::SetText {
+                    id: DocumentNodeId("title".to_owned()),
+                    text: TextValue {
+                        text: "Ready".to_owned(),
+                    },
+                },
+                DocumentPatch::SetStyle {
+                    id: DocumentNodeId("title".to_owned()),
+                    patch: BTreeMap::from([(
+                        "color".to_owned(),
+                        Some(StyleValue::Text("green".to_owned())),
+                    )]),
+                },
+            ],
+        };
+
+        let mut stateful = DocumentState::from_frame(initial.frame().clone()).unwrap();
+        let stateful_change_set = stateful.apply_batch(batch.clone()).unwrap();
+        let (owned_frame, owned_change_set) =
+            DocumentState::apply_nonstructural_batch_to_valid_owned_frame(
+                initial.into_frame(),
+                batch,
+            )
+            .unwrap();
+
+        assert_eq!(owned_frame, stateful.into_frame());
+        assert_eq!(owned_change_set, stateful_change_set);
+    }
+
+    #[test]
+    fn trusted_nonstructural_owned_frame_batch_rejects_structural_patch() {
+        let initial = DocumentState::new("root");
+        let error = DocumentState::apply_nonstructural_batch_to_valid_owned_frame(
+            initial.into_frame(),
+            DocumentChangeBatch {
+                patches: vec![DocumentPatch::UpsertNode(node(
+                    "title",
+                    DocumentNodeKind::Text,
+                    Some("root"),
+                ))],
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchApplyError::UnsupportedTrustedNonstructuralPatch {
+                patch_kind: "upsert_node"
+            }
         ));
     }
 

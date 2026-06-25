@@ -20,6 +20,7 @@ pub struct TypedProgram {
     pub sources: Vec<SourcePort>,
     pub state_cells: Vec<StateCell>,
     pub lists: Vec<ListMemory>,
+    pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
     pub possible_causes: Vec<PossibleCause>,
@@ -231,6 +232,7 @@ pub struct SemanticIndex {
     pub computed_from: String,
     pub parser_policy_phase: String,
     pub reuse_key: String,
+    pub output_roots: Vec<SemanticOutputRootEntry>,
     pub source_units: Vec<SemanticSourceUnit>,
     pub sources: Vec<SemanticSourceEntry>,
     pub lists: Vec<SemanticListEntry>,
@@ -242,6 +244,16 @@ pub struct SemanticIndex {
     pub symbols: Vec<SemanticSymbolEntry>,
     pub readiness: SemanticIndexReadiness,
     pub reuse: SemanticIndexReuse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticOutputRootEntry {
+    pub root: String,
+    pub output_kind: String,
+    pub statement_id: usize,
+    pub line: usize,
+    pub typed_contract_known: bool,
+    pub generic_output_port: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -635,6 +647,17 @@ pub struct DerivedValue {
     pub indexed: bool,
     pub scope_id: Option<ScopeId>,
     pub startup_recompute: bool,
+    pub statement: AstStatement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputRootValue {
+    pub root: String,
+    pub output_kind: String,
+    pub statement_id: usize,
+    pub line: usize,
+    pub typed_contract_known: bool,
+    pub generic_output_port: bool,
     pub statement: AstStatement,
 }
 
@@ -1117,6 +1140,9 @@ fn lower_profiled_with_typecheck(
     let functions_started = Instant::now();
     let functions = function_definitions(program);
     let functions_ms = lower_elapsed_ms(functions_started);
+    let output_values_started = Instant::now();
+    let output_values = output_root_values(program, &typecheck_report);
+    let output_values_ms = lower_elapsed_ms(output_values_started);
     let derived_values_started = Instant::now();
     let derived_values =
         derived_values(program, &row_scopes, &fields, &state_cells, &direct_sources);
@@ -1158,6 +1184,7 @@ fn lower_profiled_with_typecheck(
         nodes,
         row_scopes,
         sources,
+        output_values,
         dependencies,
         possible_causes,
         update_branches,
@@ -1198,6 +1225,7 @@ fn lower_profiled_with_typecheck(
         "list_operations_ms": list_operations_ms,
         "list_projections_ms": list_projections_ms,
         "function_definitions_ms": functions_ms,
+        "output_values_ms": output_values_ms,
         "derived_values_ms": derived_values_ms,
         "view_bindings_ms": view_bindings_ms,
         "expression_coverage_ms": expression_coverage_ms,
@@ -1893,6 +1921,7 @@ fn semantic_index(
             line_count: file.source.lines().count().max(1),
         })
         .collect::<Vec<_>>();
+    let output_roots = semantic_output_roots(program, typecheck_report);
     let sources = sources
         .iter()
         .map(|source| {
@@ -1990,6 +2019,7 @@ fn semantic_index(
         .collect::<Vec<_>>();
     let symbols = semantic_symbols(
         program,
+        &output_roots,
         &sources,
         &lists,
         &row_scopes,
@@ -2009,6 +2039,7 @@ fn semantic_index(
         computed_from: "parser_ast_ir_typecheck_tables".to_owned(),
         parser_policy_phase: "syntax_parse_then_semantic_index_policy_checks".to_owned(),
         reuse_key: semantic_index_reuse_key(program, &readiness),
+        output_roots,
         source_units,
         sources,
         lists,
@@ -2029,14 +2060,138 @@ fn semantic_index(
                 "ParsedProgram.row_scope_functions".to_owned(),
                 "TypeCheckReport.source_payload_shape_table".to_owned(),
                 "TypeCheckReport.render_slot_table".to_owned(),
+                "TypedProgram.semantic_index.output_roots".to_owned(),
                 "TypedProgram.view_bindings".to_owned(),
             ],
         },
     }
 }
 
+fn semantic_output_roots(
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<SemanticOutputRootEntry> {
+    program
+        .ast
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let AstStatementKind::Field { name } = &statement.kind else {
+                return None;
+            };
+            let output_kind = match name.as_str() {
+                "document" => "document",
+                "scene" => "legacy_scene",
+                "world" => "world",
+                "manufacturing" => "manufacturing",
+                _ => return None,
+            };
+            Some(SemanticOutputRootEntry {
+                root: name.clone(),
+                output_kind: output_kind.to_owned(),
+                statement_id: statement.id,
+                line: statement.line,
+                typed_contract_known: output_root_typed_contract_known(
+                    name,
+                    statement,
+                    program,
+                    typecheck_report,
+                ),
+                generic_output_port: matches!(
+                    name.as_str(),
+                    "document" | "world" | "manufacturing"
+                ),
+            })
+        })
+        .collect()
+}
+
+fn output_root_values(
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<OutputRootValue> {
+    program
+        .ast
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let AstStatementKind::Field { name } = &statement.kind else {
+                return None;
+            };
+            let output_kind = match name.as_str() {
+                "document" => "document",
+                "scene" => "legacy_scene",
+                "world" => "world",
+                "manufacturing" => "manufacturing",
+                _ => return None,
+            };
+            Some(OutputRootValue {
+                root: name.clone(),
+                output_kind: output_kind.to_owned(),
+                statement_id: statement.id,
+                line: statement.line,
+                typed_contract_known: output_root_typed_contract_known(
+                    name,
+                    statement,
+                    program,
+                    typecheck_report,
+                ),
+                generic_output_port: matches!(
+                    name.as_str(),
+                    "document" | "world" | "manufacturing"
+                ),
+                statement: statement.clone(),
+            })
+        })
+        .collect()
+}
+
+fn output_root_typed_contract_known(
+    root: &str,
+    statement: &AstStatement,
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> bool {
+    if typecheck_report.has_errors() {
+        return false;
+    }
+    match root {
+        "document" => {
+            statement_contains_constructor(statement, program, "Document/")
+                || statement_contains_constructor(statement, program, "Element/")
+        }
+        "scene" => statement_contains_constructor(statement, program, "Scene/"),
+        "world" => statement_contains_constructor(statement, program, "World/"),
+        "manufacturing" => {
+            statement_contains_constructor(statement, program, "Assembly/")
+                || statement_contains_constructor(statement, program, "Part/")
+                || statement_contains_constructor(statement, program, "Solid/")
+        }
+        _ => false,
+    }
+}
+
+fn statement_contains_constructor(
+    statement: &AstStatement,
+    program: &ParsedProgram,
+    prefix: &str,
+) -> bool {
+    collect_statement_ast_exprs(statement, program)
+        .iter()
+        .any(|expr| match &expr.kind {
+            AstExprKind::Call { function, .. } => function.starts_with(prefix),
+            AstExprKind::Pipe { op, .. } => op.starts_with(prefix),
+            _ => false,
+        })
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_contains_constructor(child, program, prefix))
+}
+
 fn semantic_symbols(
     program: &ParsedProgram,
+    output_roots: &[SemanticOutputRootEntry],
     sources: &[SemanticSourceEntry],
     lists: &[SemanticListEntry],
     row_scopes: &[SemanticRowScopeEntry],
@@ -2050,6 +2205,10 @@ fn semantic_symbols(
         if let Some(module) = &file.module {
             table.intern("module_path", module);
         }
+    }
+    for root in output_roots {
+        table.intern("output_root", &root.root);
+        table.intern("output_kind", &root.output_kind);
     }
     for source in sources {
         table.intern("source_label", &source.path);
@@ -6941,6 +7100,12 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
         } else {
             DerivedValueKind::Pure
         }
+    } else if field_terminal_pipeline_operator(field).is_some_and(list_scalar_reducer_operator) {
+        if !sources.is_empty() || field.has_then_expr() {
+            DerivedValueKind::SourceEventTransform
+        } else {
+            DerivedValueKind::Pure
+        }
     } else if field.has_any_operator(&[
         "List/retain",
         "List/map",
@@ -6960,6 +7125,48 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
     } else {
         DerivedValueKind::Pure
     }
+}
+
+fn field_terminal_pipeline_operator(field: &FieldDef) -> Option<&str> {
+    let expr_id = field
+        .statement
+        .children
+        .iter()
+        .rev()
+        .find_map(top_level_pipeline_statement_expr_id)
+        .or(field.statement.expr)?;
+    field
+        .ast_exprs
+        .iter()
+        .find(|expr| expr.id == expr_id)
+        .and_then(expr_operator)
+}
+
+fn top_level_pipeline_statement_expr_id(statement: &AstStatement) -> Option<usize> {
+    match statement.kind {
+        AstStatementKind::Expression
+        | AstStatementKind::Hold { .. }
+        | AstStatementKind::List { field: None, .. } => statement.expr.or_else(|| {
+            statement
+                .children
+                .iter()
+                .rev()
+                .find_map(top_level_pipeline_statement_expr_id)
+        }),
+        _ => None,
+    }
+}
+
+fn expr_operator(expr: &AstExpr) -> Option<&str> {
+    match &expr.kind {
+        AstExprKind::Pipe { op, .. } => Some(op.as_str()),
+        AstExprKind::Call { function, .. } => Some(function.as_str()),
+        _ => None,
+    }
+}
+
+fn list_scalar_reducer_operator(operator: &str) -> bool {
+    matches!(operator, "List/join_field" | "List/count" | "List/sum")
 }
 
 fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValue {
@@ -13323,7 +13530,7 @@ fn should_record_field_statement(
     };
     let top_level_data_scope = scope
         .first()
-        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene"));
+        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene" | "world"));
     local_name != "sources"
         && !scope.iter().any(|name| name == "sources")
         && (program
@@ -13767,6 +13974,109 @@ FUNCTION left_panel_base(panel_width, panel_height) {
                     && binding.path == "store.panel_width"
             }),
             "forwarded style width should make the root data path render-observed: {:?}",
+            ir.view_bindings
+        );
+    }
+
+    #[test]
+    fn world_root_records_generic_output_port_without_document_view_bindings() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+world: World/new(
+    camera: World/perspective_camera(
+        transform: World/transform(translation: [x: 0, y: 0, z: 6])
+    )
+    lights: LIST {
+        World/light(transform: World/transform(translation: [x: 2, y: 4, z: 3]))
+    }
+    materials: LIST {
+        World/material(base_color: [r: 0.2, g: 0.55, b: 0.95, a: 1])
+    }
+    geometries: LIST {
+        World/primitive(kind: Cube, size: [x: 1, y: 1, z: 1])
+    }
+    instances: LIST {
+        World/model(
+            geometry: TEXT { cube }
+            transform: World/transform(rotation_z_degrees: 45)
+            material: TEXT { blue }
+            part_id: TEXT { body }
+            feature_id: TEXT { cube_feature }
+            pick_id: 1
+        )
+    }
+)
+"#;
+        let parsed = boon_parser::parse_source("world-output-root.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        let world_root = ir
+            .semantic_index
+            .output_roots
+            .iter()
+            .find(|root| root.root == "world")
+            .expect("world root should be recorded as an output root");
+        assert_eq!(world_root.output_kind, "world");
+        assert!(world_root.typed_contract_known);
+        assert!(world_root.generic_output_port);
+        assert!(
+            ir.view_bindings.is_empty(),
+            "world output roots must not be lowered through document view bindings: {:?}",
+            ir.view_bindings
+        );
+        assert!(
+            ir.semantic_index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.category == "operator_name" && symbol.text == "World/new")
+        );
+        assert!(
+            ir.semantic_index
+                .symbols
+                .iter()
+                .any(|symbol| symbol.category == "output_root" && symbol.text == "world")
+        );
+    }
+
+    #[test]
+    fn manufacturing_root_records_generic_output_port() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+manufacturing: Assembly/new(
+    parts: LIST {
+        Part/new(
+            id: TEXT { bracket }
+            geometry: Solid/box(size: [x: 10, y: 10, z: 2])
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+    instances: LIST {
+        Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket })
+    }
+)
+"#;
+        let parsed = boon_parser::parse_source("manufacturing-output-root.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        let manufacturing_root = ir
+            .semantic_index
+            .output_roots
+            .iter()
+            .find(|root| root.root == "manufacturing")
+            .expect("manufacturing root should be recorded as an output root");
+        assert_eq!(manufacturing_root.output_kind, "manufacturing");
+        assert!(manufacturing_root.typed_contract_known);
+        assert!(manufacturing_root.generic_output_port);
+        assert!(
+            ir.view_bindings.is_empty(),
+            "manufacturing output roots must not be lowered through document view bindings: {:?}",
             ir.view_bindings
         );
     }
@@ -15731,6 +16041,66 @@ FUNCTION new_todo(todo) {
             ir.derived_values.iter().any(|value| {
                 value.path == "store.note" && value.kind == DerivedValueKind::Pure
             })
+        );
+    }
+
+    #[test]
+    fn terminal_list_join_field_pipeline_is_scalar_not_list_view() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+store: [
+    cursor: 75
+    source_signals:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }, current: TEXT { fallback }]
+        }
+    segments:
+        LIST {
+            [signal_id: TEXT { a }, start: 0, end: 50, label: TEXT { old }]
+            [signal_id: TEXT { a }, start: 50, end: 150, label: TEXT { middle }]
+        }
+    active_label:
+        segments
+        |> List/retain(segment, if: segment.start <= cursor)
+        |> List/retain(segment, if: segment.end > cursor)
+        |> List/join_field(field: "label", separator: "", empty: TEXT { missing })
+    signal_rows:
+        source_signals |> List/map(signal, new: signal_row(signal: signal))
+]
+
+FUNCTION signal_row(signal) {
+    [
+        id: signal.id
+        label:
+            store.segments
+            |> List/filter_field_equal(field: "signal_id", value: signal.id)
+            |> List/join_field(field: "label", separator: "", empty: signal.current)
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("terminal-join-field-scalar.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let active_label = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.active_label")
+            .expect("active_label should lower as a derived value");
+        assert_eq!(
+            active_label.kind,
+            DerivedValueKind::Pure,
+            "a top-level List/join_field terminal reducer is scalar, not a list view"
+        );
+        let signal_rows = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.signal_rows")
+            .expect("signal_rows should lower as a derived value");
+        assert_eq!(
+            signal_rows.kind,
+            DerivedValueKind::ListView,
+            "nested scalar reducers inside mapped rows must not hide the outer list view"
         );
     }
 

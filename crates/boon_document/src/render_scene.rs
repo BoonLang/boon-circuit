@@ -1,9 +1,11 @@
 use crate::{
-    ComputedStyleIdentity, DisplayItem, DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect,
-    StyleEditorTypeHint, StyleMap, StyleRichTextSpan, StyleValue,
+    ComputedStyleIdentity, DisplayItem, DocumentHotIdTable, DocumentNodeId, DocumentNodeKind,
+    DocumentRetainedLayoutKeyTable, LayoutFrame, PatchApplyError, Rect, StyleEditorTypeHint,
+    StyleMap, StyleRichTextSpan, StyleValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 pub const DEFAULT_DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
@@ -35,6 +37,376 @@ pub struct RenderScene {
     pub quad_batches: Vec<RenderQuadBatch>,
     pub text_runs: Vec<RenderTextRun>,
     pub metrics: RenderSceneMetrics,
+}
+
+impl RenderScene {
+    pub fn apply_patch(
+        &mut self,
+        patch: &RenderScenePatch,
+    ) -> Result<RenderScenePatchReport, PatchApplyError> {
+        apply_render_scene_patch(self, patch)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RenderScenePatchReport {
+    pub patched_items: usize,
+    pub patched_primitives: usize,
+    pub patched_text_runs: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderScenePatch {
+    pub operations: Vec<RenderScenePatchOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderScenePatchOperation {
+    Paint {
+        node: DocumentNodeId,
+        paint: RenderScenePaintPatch,
+        style_identity: ComputedStyleIdentity,
+        retained_chunk_id: String,
+    },
+    TextContent {
+        node: DocumentNodeId,
+        text: String,
+        retained_chunk_id: String,
+    },
+    ReplaceNodeEntries {
+        nodes: Vec<DocumentNodeId>,
+        items: Vec<RenderSceneItem>,
+        visual_primitives: Vec<RenderVisualPrimitive>,
+        text_runs: Vec<RenderTextRun>,
+    },
+    RetagNodeEntries {
+        items: Vec<RenderSceneItem>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderScenePaintPatch {
+    FillColor { color: [u8; 4] },
+    TextColor { color: [u8; 4] },
+}
+
+pub fn apply_render_scene_patch(
+    scene: &mut RenderScene,
+    patch: &RenderScenePatch,
+) -> Result<RenderScenePatchReport, PatchApplyError> {
+    let mut report = RenderScenePatchReport::default();
+    for operation in &patch.operations {
+        match operation {
+            RenderScenePatchOperation::Paint {
+                node,
+                paint,
+                style_identity,
+                retained_chunk_id,
+            } => {
+                let op_report = apply_render_scene_paint_patch(
+                    scene,
+                    node,
+                    paint,
+                    *style_identity,
+                    retained_chunk_id,
+                )?;
+                report.patched_items = report.patched_items.saturating_add(op_report.patched_items);
+                report.patched_primitives = report
+                    .patched_primitives
+                    .saturating_add(op_report.patched_primitives);
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(op_report.patched_text_runs);
+            }
+            RenderScenePatchOperation::TextContent {
+                node,
+                text,
+                retained_chunk_id,
+            } => {
+                let op_report =
+                    apply_render_scene_text_content_patch(scene, node, text, retained_chunk_id)?;
+                report.patched_items = report.patched_items.saturating_add(op_report.patched_items);
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(op_report.patched_text_runs);
+            }
+            RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes,
+                items,
+                visual_primitives,
+                text_runs,
+            } => {
+                let op_report = apply_render_scene_replace_node_entries_patch(
+                    scene,
+                    nodes,
+                    items,
+                    visual_primitives,
+                    text_runs,
+                )?;
+                report.patched_items = report.patched_items.saturating_add(op_report.patched_items);
+                report.patched_primitives = report
+                    .patched_primitives
+                    .saturating_add(op_report.patched_primitives);
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(op_report.patched_text_runs);
+            }
+            RenderScenePatchOperation::RetagNodeEntries { items } => {
+                let op_report = apply_render_scene_retag_node_entries_patch(scene, items)?;
+                report.patched_items = report.patched_items.saturating_add(op_report.patched_items);
+                report.patched_primitives = report
+                    .patched_primitives
+                    .saturating_add(op_report.patched_primitives);
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(op_report.patched_text_runs);
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn apply_render_scene_paint_patch(
+    scene: &mut RenderScene,
+    node: &DocumentNodeId,
+    paint: &RenderScenePaintPatch,
+    style_identity: ComputedStyleIdentity,
+    retained_chunk_id: &str,
+) -> Result<RenderScenePatchReport, PatchApplyError> {
+    let mut report = RenderScenePatchReport::default();
+    let mut saw_item = false;
+    for item in &mut scene.items {
+        if item.node == *node {
+            item.style_identity = style_identity;
+            item.retained_chunk_id = retained_chunk_id.to_owned();
+            report.patched_items = report.patched_items.saturating_add(1);
+            saw_item = true;
+        }
+    }
+    if !saw_item {
+        return Err(PatchApplyError::StaleReference {
+            reference_kind: "render_scene_item",
+            id: node.clone(),
+        });
+    }
+    match paint {
+        RenderScenePaintPatch::FillColor { color } => {
+            for primitive in &mut scene.visual_primitives {
+                if primitive.node == *node && primitive.primitive == RenderVisualPrimitiveKind::Fill
+                {
+                    primitive.color = *color;
+                    primitive.style_identity = style_identity;
+                    primitive.retained_chunk_id = retained_chunk_id.to_owned();
+                    report.patched_primitives = report.patched_primitives.saturating_add(1);
+                }
+            }
+            if report.patched_primitives == 0 {
+                return Err(PatchApplyError::StaleReference {
+                    reference_kind: "render_scene_fill_primitive",
+                    id: node.clone(),
+                });
+            }
+        }
+        RenderScenePaintPatch::TextColor { color } => {
+            for text_run in &mut scene.text_runs {
+                if text_run.node == *node {
+                    text_run.color = *color;
+                    text_run.paint_id = style_identity.paint_id;
+                    report.patched_text_runs = report.patched_text_runs.saturating_add(1);
+                }
+            }
+            if report.patched_text_runs == 0 {
+                return Err(PatchApplyError::StaleReference {
+                    reference_kind: "render_scene_text_run",
+                    id: node.clone(),
+                });
+            }
+        }
+    }
+    scene.quad_batches.clear();
+    Ok(report)
+}
+
+fn apply_render_scene_retag_node_entries_patch(
+    scene: &mut RenderScene,
+    items: &[RenderSceneItem],
+) -> Result<RenderScenePatchReport, PatchApplyError> {
+    let mut report = RenderScenePatchReport::default();
+    let mut updates = BTreeMap::<DocumentNodeId, (String, ComputedStyleIdentity)>::new();
+    for replacement in items {
+        let Some(item) = scene
+            .items
+            .iter_mut()
+            .find(|item| item.node == replacement.node)
+        else {
+            return Err(PatchApplyError::StaleReference {
+                reference_kind: "render_scene_retag_item",
+                id: replacement.node.clone(),
+            });
+        };
+        *item = replacement.clone();
+        updates.insert(
+            replacement.node.clone(),
+            (
+                replacement.retained_chunk_id.clone(),
+                replacement.style_identity,
+            ),
+        );
+        report.patched_items = report.patched_items.saturating_add(1);
+    }
+    for primitive in &mut scene.visual_primitives {
+        let Some((retained_chunk_id, style_identity)) = updates.get(&primitive.node) else {
+            continue;
+        };
+        primitive.retained_chunk_id = retained_chunk_id.clone();
+        primitive.style_identity = *style_identity;
+        report.patched_primitives = report.patched_primitives.saturating_add(1);
+    }
+    for text_run in &mut scene.text_runs {
+        let Some((_, style_identity)) = updates.iter().find_map(|(node, update)| {
+            render_text_run_belongs_to_node(&text_run.node, node).then_some(update)
+        }) else {
+            continue;
+        };
+        text_run.paint_id = style_identity.paint_id;
+        report.patched_text_runs = report.patched_text_runs.saturating_add(1);
+    }
+    scene.quad_batches.clear();
+    Ok(report)
+}
+
+fn apply_render_scene_replace_node_entries_patch(
+    scene: &mut RenderScene,
+    nodes: &[DocumentNodeId],
+    items: &[RenderSceneItem],
+    visual_primitives: &[RenderVisualPrimitive],
+    text_runs: &[RenderTextRun],
+) -> Result<RenderScenePatchReport, PatchApplyError> {
+    let node_set = nodes.iter().cloned().collect::<BTreeSet<_>>();
+    let mut report = RenderScenePatchReport::default();
+    if !replace_render_scene_entries_for_nodes(
+        &mut scene.items,
+        &node_set,
+        items,
+        |item| &item.node,
+        |node, nodes| nodes.contains(node),
+        true,
+    )? {
+        return Err(PatchApplyError::StaleReference {
+            reference_kind: "render_scene_replace_item",
+            id: nodes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| DocumentNodeId(String::new())),
+        });
+    }
+    report.patched_items = report.patched_items.saturating_add(items.len());
+
+    replace_render_scene_entries_for_nodes(
+        &mut scene.visual_primitives,
+        &node_set,
+        visual_primitives,
+        |primitive| &primitive.node,
+        |node, nodes| nodes.contains(node),
+        false,
+    )?;
+    report.patched_primitives = report
+        .patched_primitives
+        .saturating_add(visual_primitives.len());
+
+    replace_render_scene_entries_for_nodes(
+        &mut scene.text_runs,
+        &node_set,
+        text_runs,
+        |text_run| &text_run.node,
+        render_text_run_belongs_to_any_node,
+        false,
+    )?;
+    report.patched_text_runs = report.patched_text_runs.saturating_add(text_runs.len());
+
+    scene.quad_batches.clear();
+    Ok(report)
+}
+
+fn replace_render_scene_entries_for_nodes<T: Clone>(
+    entries: &mut Vec<T>,
+    node_set: &BTreeSet<DocumentNodeId>,
+    replacements: &[T],
+    node_for_entry: impl Fn(&T) -> &DocumentNodeId,
+    entry_belongs_to_nodes: impl Fn(&DocumentNodeId, &BTreeSet<DocumentNodeId>) -> bool,
+    require_existing: bool,
+) -> Result<bool, PatchApplyError> {
+    let first = entries
+        .iter()
+        .position(|entry| entry_belongs_to_nodes(node_for_entry(entry), node_set));
+    let mut saw_existing = first.is_some();
+    if first.is_none() && require_existing && !replacements.is_empty() {
+        return Ok(false);
+    }
+    let insert_at = first.unwrap_or(entries.len());
+    entries.retain(|entry| {
+        let remove = entry_belongs_to_nodes(node_for_entry(entry), node_set);
+        saw_existing |= remove;
+        !remove
+    });
+    entries.splice(insert_at..insert_at, replacements.iter().cloned());
+    Ok(saw_existing || replacements.is_empty())
+}
+
+fn render_text_run_belongs_to_any_node(
+    text_run_node: &DocumentNodeId,
+    nodes: &BTreeSet<DocumentNodeId>,
+) -> bool {
+    nodes
+        .iter()
+        .any(|node| render_text_run_belongs_to_node(text_run_node, node))
+}
+
+fn render_text_run_belongs_to_node(text_run_node: &DocumentNodeId, node: &DocumentNodeId) -> bool {
+    text_run_node == node
+        || text_run_node
+            .0
+            .strip_prefix(node.0.as_str())
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn apply_render_scene_text_content_patch(
+    scene: &mut RenderScene,
+    node: &DocumentNodeId,
+    text: &str,
+    retained_chunk_id: &str,
+) -> Result<RenderScenePatchReport, PatchApplyError> {
+    let mut report = RenderScenePatchReport::default();
+    let mut saw_item = false;
+    for item in &mut scene.items {
+        if item.node == *node {
+            item.retained_chunk_id = retained_chunk_id.to_owned();
+            report.patched_items = report.patched_items.saturating_add(1);
+            saw_item = true;
+        }
+    }
+    if !saw_item {
+        return Err(PatchApplyError::StaleReference {
+            reference_kind: "render_scene_item",
+            id: node.clone(),
+        });
+    }
+    for text_run in &mut scene.text_runs {
+        if text_run.node == *node {
+            text_run.text = text.to_owned();
+            report.patched_text_runs = report.patched_text_runs.saturating_add(1);
+        }
+    }
+    if report.patched_text_runs == 0 {
+        return Err(PatchApplyError::StaleReference {
+            reference_kind: "render_scene_text_run",
+            id: node.clone(),
+        });
+    }
+    scene.quad_batches.clear();
+    Ok(report)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -364,7 +736,57 @@ pub fn lower_layout_frame_to_render_scene(
     }
 }
 
+pub fn lower_layout_frame_to_render_scene_with_retained_keys(
+    frame: &LayoutFrame,
+    hot_ids: &DocumentHotIdTable,
+    retained_layout_keys: &DocumentRetainedLayoutKeyTable,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+) -> Result<RenderScene, PatchApplyError> {
+    let mut scene = lower_layout_frame_to_render_scene(frame, width, height, columns);
+    let mut retained_chunk_ids_by_node = BTreeMap::new();
+    for item in &mut scene.items {
+        let retained_chunk_id =
+            checked_retained_chunk_id_for_item(item, hot_ids, retained_layout_keys)?;
+        item.retained_chunk_id = retained_chunk_id.clone();
+        retained_chunk_ids_by_node.insert(item.node.clone(), retained_chunk_id);
+    }
+    for primitive in &mut scene.visual_primitives {
+        if primitive.node.0 == "__viewport__" || render_scene_synthetic_node(&primitive.node) {
+            continue;
+        }
+        let retained_chunk_id =
+            retained_chunk_ids_by_node
+                .get(&primitive.node)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "render_scene_primitive_retained_chunk",
+                    id: primitive.node.clone(),
+                })?;
+        primitive.retained_chunk_id = retained_chunk_id.clone();
+    }
+    Ok(scene)
+}
+
 pub fn render_scene_items(frame: &LayoutFrame, width: u32, height: u32) -> Vec<RenderSceneItem> {
+    render_scene_items_for_nodes(frame, width, height, None)
+}
+
+pub fn render_scene_items_for_touched_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    nodes: &BTreeSet<DocumentNodeId>,
+) -> Vec<RenderSceneItem> {
+    render_scene_items_for_nodes(frame, width, height, Some(nodes))
+}
+
+fn render_scene_items_for_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    nodes: Option<&BTreeSet<DocumentNodeId>>,
+) -> Vec<RenderSceneItem> {
     let viewport = Rect {
         x: 0.0,
         y: 0.0,
@@ -375,6 +797,7 @@ pub fn render_scene_items(frame: &LayoutFrame, width: u32, height: u32) -> Vec<R
         .display_list
         .iter()
         .filter(|item| rect_intersects(item.bounds, viewport))
+        .filter(|item| nodes.is_none_or(|nodes| nodes.contains(&item.node)))
         .map(render_scene_item)
         .collect()
 }
@@ -418,11 +841,78 @@ fn retained_chunk_id_for_item(item: &DisplayItem) -> String {
     )
 }
 
+fn checked_retained_chunk_id_for_item(
+    item: &RenderSceneItem,
+    hot_ids: &DocumentHotIdTable,
+    retained_layout_keys: &DocumentRetainedLayoutKeyTable,
+) -> Result<String, PatchApplyError> {
+    if render_scene_synthetic_node(&item.node) {
+        return Ok(item.retained_chunk_id.clone());
+    }
+    let hot_ref = hot_ids
+        .hot_ref(&item.node)
+        .ok_or_else(|| PatchApplyError::StaleReference {
+            reference_kind: "render_scene_hot_id_table",
+            id: item.node.clone(),
+        })?;
+    let retained_entry =
+        retained_layout_keys
+            .entry(hot_ref.id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "render_scene_retained_layout_key_table",
+                id: item.node.clone(),
+            })?;
+    Ok(format!(
+        "chunk:hot:{}:gen:{}:kind:{:?}:layout:{}:text_style:{}:text:{}:bounds:{:08x}:{:08x}:{:08x}:{:08x}:style:{:x}:paint:{:x}:material:{:x}:font:{:x}:pseudo:{:x}",
+        hot_ref.id.0,
+        retained_entry.node.generation.0,
+        retained_entry.key.kind,
+        retained_entry.key.layout_style.0,
+        retained_entry.key.text_style.0,
+        retained_entry.key.text.map(|id| id.0).unwrap_or(u32::MAX),
+        item.bounds.x.to_bits(),
+        item.bounds.y.to_bits(),
+        item.bounds.width.to_bits(),
+        item.bounds.height.to_bits(),
+        item.style_identity.style_id,
+        item.style_identity.paint_id,
+        item.style_identity.material_id,
+        item.style_identity.font_id,
+        item.style_identity.pseudo_state_id
+    ))
+}
+
+fn render_scene_synthetic_node(node: &DocumentNodeId) -> bool {
+    node.0.starts_with("__")
+        || node.0.starts_with("preview-")
+        || node.0.starts_with("headed-scenario-")
+}
+
 pub fn render_visual_primitives(
     frame: &LayoutFrame,
     width: u32,
     height: u32,
     columns: &mut impl RenderTextColumnMeasurer,
+) -> Vec<RenderVisualPrimitive> {
+    render_visual_primitives_for_nodes(frame, width, height, columns, None)
+}
+
+pub fn render_visual_primitives_for_touched_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+    nodes: &BTreeSet<DocumentNodeId>,
+) -> Vec<RenderVisualPrimitive> {
+    render_visual_primitives_for_nodes(frame, width, height, columns, Some(nodes))
+}
+
+fn render_visual_primitives_for_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+    nodes: Option<&BTreeSet<DocumentNodeId>>,
 ) -> Vec<RenderVisualPrimitive> {
     let viewport = Rect {
         x: 0.0,
@@ -430,23 +920,26 @@ pub fn render_visual_primitives(
         width: width as f32,
         height: height as f32,
     };
-    let mut primitives = vec![RenderVisualPrimitive {
-        node: DocumentNodeId("__viewport__".to_owned()),
-        retained_chunk_id: "chunk:__viewport__:Root:viewport".to_owned(),
-        source_kind: DocumentNodeKind::Root,
-        primitive: RenderVisualPrimitiveKind::ViewportBackground,
-        bounds: viewport,
-        clip: None,
-        radius: 0.0,
-        stroke_width: 0.0,
-        color: [246, 248, 251, 255],
-        secondary_color: [0, 0, 0, 0],
-        antialias: 0.0,
-        control_points: Vec::new(),
-        texture: RenderTextureRef::Solid,
-        style_identity: ComputedStyleIdentity::from_style(&StyleMap::new()),
-        dependency_set: vec!["viewport-background".to_owned()],
-    }];
+    let mut primitives = Vec::new();
+    if nodes.is_none() {
+        primitives.push(RenderVisualPrimitive {
+            node: DocumentNodeId("__viewport__".to_owned()),
+            retained_chunk_id: "chunk:__viewport__:Root:viewport".to_owned(),
+            source_kind: DocumentNodeKind::Root,
+            primitive: RenderVisualPrimitiveKind::ViewportBackground,
+            bounds: viewport,
+            clip: None,
+            radius: 0.0,
+            stroke_width: 0.0,
+            color: [246, 248, 251, 255],
+            secondary_color: [0, 0, 0, 0],
+            antialias: 0.0,
+            control_points: Vec::new(),
+            texture: RenderTextureRef::Solid,
+            style_identity: ComputedStyleIdentity::from_style(&StyleMap::new()),
+            dependency_set: vec!["viewport-background".to_owned()],
+        });
+    }
     let mut border_primitives = Vec::new();
     for (index, item) in frame
         .display_list
@@ -454,6 +947,9 @@ pub fn render_visual_primitives(
         .filter(|item| rect_intersects(item.bounds, viewport))
         .enumerate()
     {
+        if nodes.is_some_and(|nodes| !nodes.contains(&item.node)) {
+            continue;
+        }
         let Some(item_bounds) = clipped_item_bounds(item) else {
             continue;
         };
@@ -1438,6 +1934,26 @@ pub fn render_text_runs(
     height: u32,
     columns: &mut impl RenderTextColumnMeasurer,
 ) -> Vec<RenderTextRun> {
+    render_text_runs_for_nodes(frame, width, height, columns, None)
+}
+
+pub fn render_text_runs_for_touched_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+    nodes: &BTreeSet<DocumentNodeId>,
+) -> Vec<RenderTextRun> {
+    render_text_runs_for_nodes(frame, width, height, columns, Some(nodes))
+}
+
+fn render_text_runs_for_nodes(
+    frame: &LayoutFrame,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+    nodes: Option<&BTreeSet<DocumentNodeId>>,
+) -> Vec<RenderTextRun> {
     let viewport = Rect {
         x: 0.0,
         y: 0.0,
@@ -1450,6 +1966,9 @@ pub fn render_text_runs(
         .iter()
         .filter(|item| rect_intersects(item.bounds, viewport))
     {
+        if nodes.is_some_and(|nodes| !nodes.contains(&item.node)) {
+            continue;
+        }
         let Some(_) = clipped_item_bounds(item) else {
             continue;
         };
@@ -2146,7 +2665,11 @@ fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
 }
 
 fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {
-    match state_style_value(style, key)? {
+    style_value_color_u8(state_style_value(style, key)?)
+}
+
+pub fn style_value_color_u8(value: &StyleValue) -> Option<[u8; 4]> {
+    match value {
         StyleValue::Text(value) => parse_oklch_color(value).or_else(|| parse_hex_color(value)),
         StyleValue::Number(_)
         | StyleValue::Bool(_)
@@ -2236,7 +2759,10 @@ fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccessibilityTree, LayoutMetrics};
+    use crate::{
+        AccessibilityTree, DocumentDerivedIndexBundle, DocumentFrame, DocumentNode, LayoutMetrics,
+        TextValue,
+    };
 
     fn identity() -> ComputedStyleIdentity {
         ComputedStyleIdentity {
@@ -3022,6 +3548,292 @@ mod tests {
             scene.metrics.visual_primitive_count as usize,
             scene.visual_primitives.len()
         );
+    }
+
+    #[test]
+    fn render_scene_patch_updates_fill_and_invalidates_quad_batches() {
+        let mut style = StyleMap::new();
+        style.insert("bg".to_owned(), StyleValue::Text("#101820".to_owned()));
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style,
+            text: Some("Ready".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let mut columns = ApproximateTextColumnMeasurer;
+        let mut scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+        scene.quad_batches.push(RenderQuadBatch {
+            retained_chunk_id: Some("old-chunk".to_owned()),
+            texture: RenderTextureRef::Solid,
+            positions: vec![0.0, 0.0, 1.0, 1.0],
+            colors: vec![0],
+            uvs: Vec::new(),
+        });
+        let mut next_identity = identity();
+        next_identity.paint_id = 44;
+        let report = scene
+            .apply_patch(&RenderScenePatch {
+                operations: vec![RenderScenePatchOperation::Paint {
+                    node: DocumentNodeId("label".to_owned()),
+                    paint: RenderScenePaintPatch::FillColor {
+                        color: [222, 111, 0, 255],
+                    },
+                    style_identity: next_identity,
+                    retained_chunk_id: "chunk:label:paint:next".to_owned(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(report.patched_items, 1);
+        assert_eq!(report.patched_primitives, 1);
+        assert_eq!(report.patched_text_runs, 0);
+        assert!(scene.quad_batches.is_empty());
+        assert_eq!(scene.items[0].style_identity.paint_id, 44);
+        assert_eq!(scene.items[0].retained_chunk_id, "chunk:label:paint:next");
+        let fill = scene
+            .visual_primitives
+            .iter()
+            .find(|primitive| {
+                primitive.node.0 == "label"
+                    && primitive.primitive == RenderVisualPrimitiveKind::Fill
+            })
+            .expect("fill primitive");
+        assert_eq!(fill.color, [222, 111, 0, 255]);
+        assert_eq!(fill.style_identity.paint_id, 44);
+        assert_eq!(fill.retained_chunk_id, "chunk:label:paint:next");
+        assert_eq!(scene.text_runs[0].color, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn render_scene_patch_updates_text_color_without_changing_text_shape() {
+        let mut style = StyleMap::new();
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style,
+            text: Some("Ready".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let mut columns = ApproximateTextColumnMeasurer;
+        let mut scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+        let original_font_id = scene.text_runs[0].font_id;
+        let original_text = scene.text_runs[0].text.clone();
+        let mut next_identity = identity();
+        next_identity.paint_id = 77;
+        let report = scene
+            .apply_patch(&RenderScenePatch {
+                operations: vec![RenderScenePatchOperation::Paint {
+                    node: DocumentNodeId("label".to_owned()),
+                    paint: RenderScenePaintPatch::TextColor {
+                        color: [1, 2, 3, 255],
+                    },
+                    style_identity: next_identity,
+                    retained_chunk_id: "chunk:label:text-paint:next".to_owned(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(report.patched_items, 1);
+        assert_eq!(report.patched_primitives, 0);
+        assert_eq!(report.patched_text_runs, 1);
+        assert_eq!(scene.text_runs[0].color, [1, 2, 3, 255]);
+        assert_eq!(scene.text_runs[0].paint_id, 77);
+        assert_eq!(scene.text_runs[0].font_id, original_font_id);
+        assert_eq!(scene.text_runs[0].text, original_text);
+    }
+
+    #[test]
+    fn render_scene_patch_updates_text_content_and_invalidates_quad_batches() {
+        let mut style = StyleMap::new();
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style,
+            text: Some("Ready".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let mut columns = ApproximateTextColumnMeasurer;
+        let mut scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+        scene.quad_batches.push(RenderQuadBatch {
+            retained_chunk_id: Some("old-chunk".to_owned()),
+            texture: RenderTextureRef::Solid,
+            positions: vec![0.0, 0.0, 1.0, 1.0],
+            colors: vec![0],
+            uvs: Vec::new(),
+        });
+        let original_font_id = scene.text_runs[0].font_id;
+        let original_paint_id = scene.text_runs[0].paint_id;
+        let report = scene
+            .apply_patch(&RenderScenePatch {
+                operations: vec![RenderScenePatchOperation::TextContent {
+                    node: DocumentNodeId("label".to_owned()),
+                    text: "Done".to_owned(),
+                    retained_chunk_id: "chunk:label:text:done".to_owned(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(report.patched_items, 1);
+        assert_eq!(report.patched_primitives, 0);
+        assert_eq!(report.patched_text_runs, 1);
+        assert!(scene.quad_batches.is_empty());
+        assert_eq!(scene.items[0].retained_chunk_id, "chunk:label:text:done");
+        assert_eq!(scene.text_runs[0].text, "Done");
+        assert_eq!(scene.text_runs[0].font_id, original_font_id);
+        assert_eq!(scene.text_runs[0].paint_id, original_paint_id);
+    }
+
+    #[test]
+    fn render_scene_patch_rejects_stale_scene_references() {
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Stack,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style: StyleMap::new(),
+            text: None,
+            focused: false,
+            style_identity: identity(),
+        });
+        let mut columns = ApproximateTextColumnMeasurer;
+        let mut scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+        let error = scene
+            .apply_patch(&RenderScenePatch {
+                operations: vec![RenderScenePatchOperation::Paint {
+                    node: DocumentNodeId("missing".to_owned()),
+                    paint: RenderScenePaintPatch::FillColor {
+                        color: [222, 111, 0, 255],
+                    },
+                    style_identity: identity(),
+                    retained_chunk_id: "chunk:missing".to_owned(),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchApplyError::StaleReference {
+                reference_kind: "render_scene_item",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn checked_render_scene_uses_retained_layout_keys_for_chunk_identity() {
+        let mut style = StyleMap::new();
+        style.insert("bg".to_owned(), StyleValue::Text("#101820".to_owned()));
+        style.insert("color".to_owned(), StyleValue::Text("#ffffff".to_owned()));
+        let mut document = DocumentFrame::empty("root");
+        let mut label = DocumentNode::new("label", DocumentNodeKind::Text);
+        label.parent = Some(DocumentNodeId("root".to_owned()));
+        label.text = Some(TextValue {
+            text: "Ready".to_owned(),
+        });
+        label.style = style.clone();
+        document
+            .nodes
+            .get_mut(&DocumentNodeId("root".to_owned()))
+            .unwrap()
+            .children
+            .push(DocumentNodeId("label".to_owned()));
+        document
+            .nodes
+            .insert(DocumentNodeId("label".to_owned()), label);
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style,
+            text: Some("Ready".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let bundle = DocumentDerivedIndexBundle::from_frame(&document).unwrap();
+        let mut columns = ApproximateTextColumnMeasurer;
+        let scene = bundle
+            .try_render_scene(&frame, 320, 200, &mut columns)
+            .unwrap();
+
+        assert_eq!(scene.items.len(), 1);
+        let item_chunk_id = &scene.items[0].retained_chunk_id;
+        assert!(
+            item_chunk_id.starts_with("chunk:hot:"),
+            "checked render scene should use hot retained node identity, got {item_chunk_id}"
+        );
+        assert!(item_chunk_id.contains("bounds:41000000:41400000:42f00000:41c00000"));
+        assert!(scene.visual_primitives.iter().any(|primitive| {
+            primitive.node.0 == "label"
+                && primitive.primitive == RenderVisualPrimitiveKind::Fill
+                && primitive.retained_chunk_id == *item_chunk_id
+        }));
+    }
+
+    #[test]
+    fn checked_render_scene_rejects_real_nodes_missing_retained_keys() {
+        let mut style = StyleMap::new();
+        style.insert("bg".to_owned(), StyleValue::Text("#101820".to_owned()));
+        let frame = frame_with_item(DisplayItem {
+            node: DocumentNodeId("label".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 8.0,
+                y: 12.0,
+                width: 120.0,
+                height: 24.0,
+            },
+            style,
+            text: Some("Ready".to_owned()),
+            focused: false,
+            style_identity: identity(),
+        });
+        let bundle = DocumentDerivedIndexBundle::from_frame(&DocumentFrame::empty("root")).unwrap();
+        let mut columns = ApproximateTextColumnMeasurer;
+        let error = bundle
+            .try_render_scene(&frame, 320, 200, &mut columns)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PatchApplyError::StaleReference {
+                reference_kind: "render_scene_hot_id_table",
+                ..
+            }
+        ));
     }
 
     #[test]

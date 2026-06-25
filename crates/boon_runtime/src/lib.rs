@@ -24,6 +24,13 @@ use boon_plan::{
     PlanRowSelectPattern, PlanSourceGuard, PlanValueType, RegionKind, TargetProfile, ValueRef,
     compile_typed_program, plan_sha256, verify_plan,
 };
+use boon_scene_model::{
+    AppearanceMaterial, AppearanceMaterialId, Bounds3D, Camera, CameraId, CameraProjection,
+    FeatureId, GeometryKind, GeometryLogicalId, GeometryResource, GeometryRevision, Light, LightId,
+    LightKind, ModelInstance, PartId, PickId, PrimitiveGeometry, Transform3D, Visibility,
+    WorldScene, WorldSemanticBinding,
+};
+use boon_solid_model as solid_model;
 use bytes::Bytes;
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
@@ -1531,6 +1538,17 @@ pub struct LiveRuntimeRootListViewAggregate {
     pub field_only_skipped_field_count: usize,
     pub field_only_evaluated_field_count: usize,
     pub field_only_changed_field_count: usize,
+    pub targeted_skip_disabled_by_currentness_refresh_count: usize,
+    pub targeted_skip_disabled_dirty_row_count: usize,
+    pub targeted_skip_disabled_dirty_field_count: usize,
+    pub compiled_frontier_field_count: usize,
+    pub compiled_frontier_classifiable_field_count: usize,
+    pub compiled_frontier_unclassified_field_count: usize,
+    pub compiled_frontier_row_dependent_field_count: usize,
+    pub compiled_frontier_whole_row_dependent_field_count: usize,
+    pub compiled_frontier_row_field_dependency_count: usize,
+    pub compiled_frontier_predicted_dirty_field_count: usize,
+    pub compiled_frontier_predicted_clean_field_count: usize,
     pub field_only_fallback_reasons: BTreeMap<String, usize>,
     pub field_cache_hits: usize,
     pub field_cache_misses: usize,
@@ -1576,6 +1594,8 @@ pub struct LiveRuntimeRootListViewAggregate {
     pub field_cache_field_value_hit_count: usize,
     pub value_columns_insert_count: usize,
     pub record_map_insert_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_hotspots: Vec<LiveRuntimeRootListViewFieldProfile>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1667,6 +1687,28 @@ pub struct LiveRuntimeRootListViewProfile {
     pub field_only_evaluated_field_count: usize,
     #[serde(default)]
     pub field_only_changed_field_count: usize,
+    #[serde(default)]
+    pub targeted_skip_disabled_by_currentness_refresh_count: usize,
+    #[serde(default)]
+    pub targeted_skip_disabled_dirty_row_count: usize,
+    #[serde(default)]
+    pub targeted_skip_disabled_dirty_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_classifiable_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_unclassified_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_row_dependent_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_whole_row_dependent_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_row_field_dependency_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_predicted_dirty_field_count: usize,
+    #[serde(default)]
+    pub compiled_frontier_predicted_clean_field_count: usize,
     pub field_profile_total_ms: f64,
     pub eval_minus_field_profiles_ms: f64,
     pub eval_unattributed_ms: f64,
@@ -1932,6 +1974,30 @@ impl LiveRuntimeRootListViewAggregate {
         self.changed_field_count = self
             .changed_field_count
             .saturating_add(profile.changed_field_count);
+        self.current_dirty_read_count = self
+            .current_dirty_read_count
+            .saturating_add(profile.current_dirty_read_count);
+        self.current_dirty_root_read_count = self
+            .current_dirty_root_read_count
+            .saturating_add(profile.current_dirty_root_read_count);
+        self.current_dirty_list_read_count = self
+            .current_dirty_list_read_count
+            .saturating_add(profile.current_dirty_list_read_count);
+        self.current_dirty_list_column_read_count = self
+            .current_dirty_list_column_read_count
+            .saturating_add(profile.current_dirty_list_column_read_count);
+        self.current_dirty_list_field_read_count = self
+            .current_dirty_list_field_read_count
+            .saturating_add(profile.current_dirty_list_field_read_count);
+        self.full_eval_row_count = self
+            .full_eval_row_count
+            .saturating_add(profile.full_eval_row_count);
+        self.full_eval_unchanged_row_count = self
+            .full_eval_unchanged_row_count
+            .saturating_add(profile.full_eval_unchanged_row_count);
+        self.source_identity_count = self
+            .source_identity_count
+            .saturating_add(profile.source_identity_count);
         if profile.broad_fallback {
             self.broad_fallback_count = self.broad_fallback_count.saturating_add(1);
         }
@@ -1966,6 +2032,39 @@ impl LiveRuntimeRootListViewAggregate {
         self.field_only_changed_field_count = self
             .field_only_changed_field_count
             .saturating_add(profile.field_only_changed_field_count);
+        self.targeted_skip_disabled_by_currentness_refresh_count = self
+            .targeted_skip_disabled_by_currentness_refresh_count
+            .saturating_add(profile.targeted_skip_disabled_by_currentness_refresh_count);
+        self.targeted_skip_disabled_dirty_row_count = self
+            .targeted_skip_disabled_dirty_row_count
+            .saturating_add(profile.targeted_skip_disabled_dirty_row_count);
+        self.targeted_skip_disabled_dirty_field_count = self
+            .targeted_skip_disabled_dirty_field_count
+            .saturating_add(profile.targeted_skip_disabled_dirty_field_count);
+        self.compiled_frontier_field_count = self
+            .compiled_frontier_field_count
+            .saturating_add(profile.compiled_frontier_field_count);
+        self.compiled_frontier_classifiable_field_count = self
+            .compiled_frontier_classifiable_field_count
+            .saturating_add(profile.compiled_frontier_classifiable_field_count);
+        self.compiled_frontier_unclassified_field_count = self
+            .compiled_frontier_unclassified_field_count
+            .saturating_add(profile.compiled_frontier_unclassified_field_count);
+        self.compiled_frontier_row_dependent_field_count = self
+            .compiled_frontier_row_dependent_field_count
+            .saturating_add(profile.compiled_frontier_row_dependent_field_count);
+        self.compiled_frontier_whole_row_dependent_field_count = self
+            .compiled_frontier_whole_row_dependent_field_count
+            .saturating_add(profile.compiled_frontier_whole_row_dependent_field_count);
+        self.compiled_frontier_row_field_dependency_count = self
+            .compiled_frontier_row_field_dependency_count
+            .saturating_add(profile.compiled_frontier_row_field_dependency_count);
+        self.compiled_frontier_predicted_dirty_field_count = self
+            .compiled_frontier_predicted_dirty_field_count
+            .saturating_add(profile.compiled_frontier_predicted_dirty_field_count);
+        self.compiled_frontier_predicted_clean_field_count = self
+            .compiled_frontier_predicted_clean_field_count
+            .saturating_add(profile.compiled_frontier_predicted_clean_field_count);
         self.field_cache_hits = self
             .field_cache_hits
             .saturating_add(profile.field_cache_hits);
@@ -2061,6 +2160,7 @@ impl LiveRuntimeRootListViewAggregate {
         self.record_map_insert_count = self
             .record_map_insert_count
             .saturating_add(profile.record_map_insert_count);
+        root_list_view_merge_field_hotspots(&mut self.field_hotspots, &profile.field_profiles);
     }
 
     fn saturating_add_assign(&mut self, other: Self) {
@@ -2108,6 +2208,39 @@ impl LiveRuntimeRootListViewAggregate {
         self.field_only_changed_field_count = self
             .field_only_changed_field_count
             .saturating_add(other.field_only_changed_field_count);
+        self.targeted_skip_disabled_by_currentness_refresh_count = self
+            .targeted_skip_disabled_by_currentness_refresh_count
+            .saturating_add(other.targeted_skip_disabled_by_currentness_refresh_count);
+        self.targeted_skip_disabled_dirty_row_count = self
+            .targeted_skip_disabled_dirty_row_count
+            .saturating_add(other.targeted_skip_disabled_dirty_row_count);
+        self.targeted_skip_disabled_dirty_field_count = self
+            .targeted_skip_disabled_dirty_field_count
+            .saturating_add(other.targeted_skip_disabled_dirty_field_count);
+        self.compiled_frontier_field_count = self
+            .compiled_frontier_field_count
+            .saturating_add(other.compiled_frontier_field_count);
+        self.compiled_frontier_classifiable_field_count = self
+            .compiled_frontier_classifiable_field_count
+            .saturating_add(other.compiled_frontier_classifiable_field_count);
+        self.compiled_frontier_unclassified_field_count = self
+            .compiled_frontier_unclassified_field_count
+            .saturating_add(other.compiled_frontier_unclassified_field_count);
+        self.compiled_frontier_row_dependent_field_count = self
+            .compiled_frontier_row_dependent_field_count
+            .saturating_add(other.compiled_frontier_row_dependent_field_count);
+        self.compiled_frontier_whole_row_dependent_field_count = self
+            .compiled_frontier_whole_row_dependent_field_count
+            .saturating_add(other.compiled_frontier_whole_row_dependent_field_count);
+        self.compiled_frontier_row_field_dependency_count = self
+            .compiled_frontier_row_field_dependency_count
+            .saturating_add(other.compiled_frontier_row_field_dependency_count);
+        self.compiled_frontier_predicted_dirty_field_count = self
+            .compiled_frontier_predicted_dirty_field_count
+            .saturating_add(other.compiled_frontier_predicted_dirty_field_count);
+        self.compiled_frontier_predicted_clean_field_count = self
+            .compiled_frontier_predicted_clean_field_count
+            .saturating_add(other.compiled_frontier_predicted_clean_field_count);
         for (reason, count) in other.field_only_fallback_reasons {
             *self.field_only_fallback_reasons.entry(reason).or_default() += count;
         }
@@ -2204,6 +2337,7 @@ impl LiveRuntimeRootListViewAggregate {
         self.record_map_insert_count = self
             .record_map_insert_count
             .saturating_add(other.record_map_insert_count);
+        root_list_view_merge_field_hotspots(&mut self.field_hotspots, &other.field_hotspots);
     }
 
     fn saturating_delta_since(&self, before: Option<&Self>) -> Self {
@@ -2277,6 +2411,39 @@ impl LiveRuntimeRootListViewAggregate {
             field_only_changed_field_count: self
                 .field_only_changed_field_count
                 .saturating_sub(before.field_only_changed_field_count),
+            targeted_skip_disabled_by_currentness_refresh_count: self
+                .targeted_skip_disabled_by_currentness_refresh_count
+                .saturating_sub(before.targeted_skip_disabled_by_currentness_refresh_count),
+            targeted_skip_disabled_dirty_row_count: self
+                .targeted_skip_disabled_dirty_row_count
+                .saturating_sub(before.targeted_skip_disabled_dirty_row_count),
+            targeted_skip_disabled_dirty_field_count: self
+                .targeted_skip_disabled_dirty_field_count
+                .saturating_sub(before.targeted_skip_disabled_dirty_field_count),
+            compiled_frontier_field_count: self
+                .compiled_frontier_field_count
+                .saturating_sub(before.compiled_frontier_field_count),
+            compiled_frontier_classifiable_field_count: self
+                .compiled_frontier_classifiable_field_count
+                .saturating_sub(before.compiled_frontier_classifiable_field_count),
+            compiled_frontier_unclassified_field_count: self
+                .compiled_frontier_unclassified_field_count
+                .saturating_sub(before.compiled_frontier_unclassified_field_count),
+            compiled_frontier_row_dependent_field_count: self
+                .compiled_frontier_row_dependent_field_count
+                .saturating_sub(before.compiled_frontier_row_dependent_field_count),
+            compiled_frontier_whole_row_dependent_field_count: self
+                .compiled_frontier_whole_row_dependent_field_count
+                .saturating_sub(before.compiled_frontier_whole_row_dependent_field_count),
+            compiled_frontier_row_field_dependency_count: self
+                .compiled_frontier_row_field_dependency_count
+                .saturating_sub(before.compiled_frontier_row_field_dependency_count),
+            compiled_frontier_predicted_dirty_field_count: self
+                .compiled_frontier_predicted_dirty_field_count
+                .saturating_sub(before.compiled_frontier_predicted_dirty_field_count),
+            compiled_frontier_predicted_clean_field_count: self
+                .compiled_frontier_predicted_clean_field_count
+                .saturating_sub(before.compiled_frontier_predicted_clean_field_count),
             field_only_fallback_reasons: self
                 .field_only_fallback_reasons
                 .iter()
@@ -2424,8 +2591,128 @@ impl LiveRuntimeRootListViewAggregate {
             record_map_insert_count: self
                 .record_map_insert_count
                 .saturating_sub(before.record_map_insert_count),
+            field_hotspots: root_list_view_field_hotspot_delta(
+                &self.field_hotspots,
+                &before.field_hotspots,
+            ),
         }
     }
+}
+
+const ROOT_LIST_VIEW_FIELD_HOTSPOT_LIMIT: usize = 32;
+
+fn root_list_view_merge_field_hotspots(
+    target: &mut Vec<LiveRuntimeRootListViewFieldProfile>,
+    incoming: &[LiveRuntimeRootListViewFieldProfile],
+) {
+    if incoming.is_empty() {
+        return;
+    }
+    for profile in incoming {
+        if let Some(entry) = target.iter_mut().find(|entry| {
+            entry.record_scope == profile.record_scope && entry.field == profile.field
+        }) {
+            root_list_view_add_field_hotspot(entry, profile);
+            continue;
+        }
+        if target.len() < ROOT_LIST_VIEW_FIELD_HOTSPOT_LIMIT {
+            target.push(profile.clone());
+            continue;
+        }
+        if let Some((index, coldest)) = target.iter().enumerate().min_by(|(_, left), (_, right)| {
+            left.total_ms
+                .partial_cmp(&right.total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) && profile.total_ms > coldest.total_ms
+        {
+            target[index] = profile.clone();
+        }
+    }
+    root_list_view_sort_field_hotspots(target);
+}
+
+fn root_list_view_add_field_hotspot(
+    target: &mut LiveRuntimeRootListViewFieldProfile,
+    incoming: &LiveRuntimeRootListViewFieldProfile,
+) {
+    target.sample_count = target.sample_count.saturating_add(incoming.sample_count);
+    target.cache_hit_count = target
+        .cache_hit_count
+        .saturating_add(incoming.cache_hit_count);
+    target.cache_miss_count = target
+        .cache_miss_count
+        .saturating_add(incoming.cache_miss_count);
+    target.cache_store_count = target
+        .cache_store_count
+        .saturating_add(incoming.cache_store_count);
+    target.total_ms += incoming.total_ms;
+    target.max_ms = target.max_ms.max(incoming.max_ms);
+}
+
+fn root_list_view_field_hotspot_delta(
+    current: &[LiveRuntimeRootListViewFieldProfile],
+    before: &[LiveRuntimeRootListViewFieldProfile],
+) -> Vec<LiveRuntimeRootListViewFieldProfile> {
+    let before = before
+        .iter()
+        .map(|profile| {
+            (
+                (profile.record_scope.clone(), profile.field.clone()),
+                profile.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut delta = current
+        .iter()
+        .filter_map(|profile| {
+            let previous = before.get(&(profile.record_scope.clone(), profile.field.clone()));
+            let total_ms =
+                saturating_f64_sub(profile.total_ms, previous.map_or(0.0, |item| item.total_ms));
+            let sample_count = profile
+                .sample_count
+                .saturating_sub(previous.map_or(0, |item| item.sample_count));
+            let cache_hit_count = profile
+                .cache_hit_count
+                .saturating_sub(previous.map_or(0, |item| item.cache_hit_count));
+            let cache_miss_count = profile
+                .cache_miss_count
+                .saturating_sub(previous.map_or(0, |item| item.cache_miss_count));
+            let cache_store_count = profile
+                .cache_store_count
+                .saturating_sub(previous.map_or(0, |item| item.cache_store_count));
+            (total_ms > 0.0 || sample_count > 0).then(|| LiveRuntimeRootListViewFieldProfile {
+                record_scope: profile.record_scope.clone(),
+                field: profile.field.clone(),
+                sample_count,
+                cache_hit_count,
+                cache_miss_count,
+                cache_store_count,
+                total_ms,
+                max_ms: profile.max_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    delta = root_list_view_sorted_field_hotspots(delta);
+    delta
+}
+
+fn root_list_view_sorted_field_hotspots(
+    mut profiles: Vec<LiveRuntimeRootListViewFieldProfile>,
+) -> Vec<LiveRuntimeRootListViewFieldProfile> {
+    root_list_view_sort_field_hotspots(&mut profiles);
+    profiles
+}
+
+fn root_list_view_sort_field_hotspots(profiles: &mut Vec<LiveRuntimeRootListViewFieldProfile>) {
+    profiles.sort_by(|left, right| {
+        right
+            .total_ms
+            .partial_cmp(&left.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.record_scope.cmp(&right.record_scope))
+            .then_with(|| left.field.cmp(&right.field))
+    });
+    profiles.truncate(ROOT_LIST_VIEW_FIELD_HOTSPOT_LIMIT);
 }
 
 fn root_materialization_aggregate_delta_by_path(
@@ -9612,6 +9899,18 @@ fn plan_row_expression_contains_state(expression: &PlanRowExpression, state_id: 
                     .as_deref()
                     .is_some_and(|encoding| plan_row_expression_contains_state(encoding, state_id))
         }
+        PlanRowExpression::BytesToText { input, encoding } => {
+            plan_row_expression_contains_state(input, state_id)
+                || encoding
+                    .as_deref()
+                    .is_some_and(|encoding| plan_row_expression_contains_state(encoding, state_id))
+        }
+        PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input } => {
+            plan_row_expression_contains_state(input, state_id)
+        }
         PlanRowExpression::BytesIsEmpty { input } => {
             plan_row_expression_contains_state(input, state_id)
         }
@@ -9631,6 +9930,60 @@ fn plan_row_expression_contains_state(expression: &PlanRowExpression, state_id: 
                 || plan_row_expression_contains_state(offset, state_id)
                 || plan_row_expression_contains_state(byte_count, state_id)
         }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(byte_count, state_id)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => {
+            plan_row_expression_contains_state(byte_count, state_id)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(offset, state_id)
+                || plan_row_expression_contains_state(byte_count, state_id)
+                || plan_row_expression_contains_state(endian, state_id)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(index, state_id)
+                || plan_row_expression_contains_state(value, state_id)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            plan_row_expression_contains_state(input, state_id)
+                || plan_row_expression_contains_state(offset, state_id)
+                || plan_row_expression_contains_state(byte_count, state_id)
+                || plan_row_expression_contains_state(endian, state_id)
+                || plan_row_expression_contains_state(value, state_id)
+        }
         PlanRowExpression::BytesFind { input, needle } => {
             plan_row_expression_contains_state(input, state_id)
                 || plan_row_expression_contains_state(needle, state_id)
@@ -9642,6 +9995,10 @@ fn plan_row_expression_contains_state(expression: &PlanRowExpression, state_id: 
         PlanRowExpression::BytesEndsWith { input, suffix } => {
             plan_row_expression_contains_state(input, state_id)
                 || plan_row_expression_contains_state(suffix, state_id)
+        }
+        PlanRowExpression::BytesConcat { left, right } => {
+            plan_row_expression_contains_state(left, state_id)
+                || plan_row_expression_contains_state(right, state_id)
         }
         PlanRowExpression::BytesEqual { left, right } => {
             plan_row_expression_contains_state(left, state_id)
@@ -12018,6 +12375,42 @@ fn eval_plan_row_expression_with_stack(
             let bytes = row_text_to_bytes(&text, &encoding)?;
             Ok(row_private_bytes_json(&bytes))
         }
+        PlanRowExpression::BytesToText { input, encoding } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let encoding = match encoding.as_deref() {
+                Some(encoding) => {
+                    eval_plan_row_text_with_stack(plan, list_state, row, encoding, stack)?
+                }
+                None => return Err("row Bytes/to_text requires explicit encoding".into()),
+            };
+            runtime_bytes_to_text(&bytes, &encoding)
+                .map(JsonValue::String)
+                .map_err(|error| format!("row Bytes/to_text {error}").into())
+        }
+        PlanRowExpression::BytesToHex { input } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            Ok(JsonValue::String(bytes_encode_hex(&bytes)))
+        }
+        PlanRowExpression::BytesToBase64 { input } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            Ok(JsonValue::String(bytes_encode_base64(&bytes)))
+        }
+        PlanRowExpression::BytesFromHex { input } => {
+            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
+            let bytes = bytes_decode_hex(&text).map_err(|error| match error {
+                BoonValue::Error(code) => format!("row Bytes/from_hex failed: {code}"),
+                _ => "row Bytes/from_hex failed".to_owned(),
+            })?;
+            Ok(row_private_bytes_json(&bytes))
+        }
+        PlanRowExpression::BytesFromBase64 { input } => {
+            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
+            let bytes = bytes_decode_base64(&text).map_err(|error| match error {
+                BoonValue::Error(code) => format!("row Bytes/from_base64 failed: {code}"),
+                _ => "row Bytes/from_base64 failed".to_owned(),
+            })?;
+            Ok(row_private_bytes_json(&bytes))
+        }
         PlanRowExpression::BytesIsEmpty { input } => {
             let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
             Ok(JsonValue::Bool(bytes.is_empty()))
@@ -12055,6 +12448,152 @@ fn eval_plan_row_expression_with_stack(
                 .to_vec();
             Ok(row_private_bytes_json(&slice))
         }
+        PlanRowExpression::BytesTake { input, byte_count } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let slice = bytes
+                .get(0..byte_count)
+                .ok_or_else(|| "row Bytes/take out of bounds".to_owned())?
+                .to_vec();
+            Ok(row_private_bytes_json(&slice))
+        }
+        PlanRowExpression::BytesDrop { input, byte_count } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            if byte_count > bytes.len() {
+                return Err("row Bytes/drop out of bounds".into());
+            }
+            Ok(row_private_bytes_json(&bytes[byte_count..]))
+        }
+        PlanRowExpression::BytesZeros { byte_count } => {
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(byte_count)
+                .map_err(|_| format!("row Bytes/zeros could not allocate {byte_count} bytes"))?;
+            output.resize(byte_count, 0);
+            Ok(row_private_bytes_json(&output))
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
+                .max(0) as usize;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
+            let endian = row_bytes_endian(&endian_text)?;
+            match bytes_read_unsigned(&bytes, offset, byte_count, endian) {
+                Ok(value) if value <= i64::MAX as u64 => Ok(json!(value as i64)),
+                Ok(_) => Err("row Bytes/read_unsigned overflows Boon NUMBER".into()),
+                Err(BoonValue::Error(code)) => {
+                    Err(format!("row Bytes/read_unsigned failed: {code}").into())
+                }
+                Err(error) => Err(format!("row Bytes/read_unsigned failed: {error:?}").into()),
+            }
+        }
+        PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
+                .max(0) as usize;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
+            let endian = row_bytes_endian(&endian_text)?;
+            match bytes_read_signed(&bytes, offset, byte_count, endian) {
+                Ok(value) => Ok(json!(value)),
+                Err(BoonValue::Error(code)) => {
+                    Err(format!("row Bytes/read_signed failed: {code}").into())
+                }
+                Err(error) => Err(format!("row Bytes/read_signed failed: {error:?}").into()),
+            }
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let index = eval_plan_row_number_with_stack(plan, list_state, row, index, stack)?.max(0)
+                as usize;
+            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
+            let value = u8::try_from(value)
+                .map_err(|_| format!("row Bytes/set value {value} is outside BYTE range"))?;
+            let slot = bytes
+                .get_mut(index)
+                .ok_or_else(|| format!("row Bytes/set index {index} is out of bounds"))?;
+            *slot = value;
+            Ok(row_private_bytes_json(&bytes))
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
+                .max(0) as usize;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
+            let endian = row_bytes_endian(&endian_text)?;
+            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
+            bytes_write_unsigned(&mut bytes, offset, byte_count, endian, value).map_err(
+                |error| match error {
+                    BoonValue::Error(code) => {
+                        format!("row Bytes/write_unsigned failed: {code}")
+                    }
+                    error => format!("row Bytes/write_unsigned failed: {error:?}"),
+                },
+            )?;
+            Ok(row_private_bytes_json(&bytes))
+        }
+        PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
+            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
+                .max(0) as usize;
+            let byte_count =
+                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
+                    as usize;
+            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
+            let endian = row_bytes_endian(&endian_text)?;
+            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
+            bytes_write_signed(&mut bytes, offset, byte_count, endian, value).map_err(|error| {
+                match error {
+                    BoonValue::Error(code) => {
+                        format!("row Bytes/write_signed failed: {code}")
+                    }
+                    error => format!("row Bytes/write_signed failed: {error:?}"),
+                }
+            })?;
+            Ok(row_private_bytes_json(&bytes))
+        }
         PlanRowExpression::BytesFind { input, needle } => {
             let haystack = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
             let needle = eval_plan_row_bytes_with_stack(plan, list_state, row, needle, stack)?;
@@ -12071,6 +12610,12 @@ fn eval_plan_row_expression_with_stack(
             let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
             let suffix = eval_plan_row_bytes_with_stack(plan, list_state, row, suffix, stack)?;
             Ok(JsonValue::Bool(bytes.ends_with(&suffix)))
+        }
+        PlanRowExpression::BytesConcat { left, right } => {
+            let mut left = eval_plan_row_bytes_with_stack(plan, list_state, row, left, stack)?;
+            let right = eval_plan_row_bytes_with_stack(plan, list_state, row, right, stack)?;
+            left.extend_from_slice(&right);
+            Ok(row_private_bytes_json(&left))
         }
         PlanRowExpression::BytesEqual { left, right } => {
             let left = eval_plan_row_bytes_with_stack(plan, list_state, row, left, stack)?;
@@ -12498,6 +13043,14 @@ fn row_text_to_bytes(text: &str, encoding: &str) -> RuntimeResult<Vec<u8>> {
         "ascii" if text.is_ascii() => Ok(text.as_bytes().to_vec()),
         "ascii" => Err("row Text/to_bytes input is not ASCII for Ascii encoding".into()),
         _ => Err(format!("row Text/to_bytes unsupported encoding `{encoding}`").into()),
+    }
+}
+
+fn row_bytes_endian(text: &str) -> RuntimeResult<BytesEndian> {
+    match text {
+        "Little" => Ok(BytesEndian::Little),
+        "Big" => Ok(BytesEndian::Big),
+        _ => Err(format!("row BYTES endian `{text}` is unsupported").into()),
     }
 }
 
@@ -13978,6 +14531,20 @@ pub struct LiveRuntime {
     last_source_batch_sequence: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeWorldSceneOutput {
+    pub output_root: String,
+    pub scene: boon_scene_model::WorldScene,
+    pub read_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeSolidModelOutput {
+    pub output_root: String,
+    pub bundle: solid_model::SolidModelBundle,
+    pub read_count: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeSourceUnit {
     pub path: String,
@@ -14425,6 +14992,14 @@ impl LiveRuntime {
                 "total_ms": runtime_elapsed_ms(total_started)
             }),
         ))
+    }
+
+    pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        self.runtime.world_scene_output()
+    }
+
+    pub fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        self.runtime.solid_model_output()
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
@@ -16071,6 +16646,22 @@ impl LoadedRuntime {
         summary
     }
 
+    fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("loaded runtime has no generic schedule for world output")?;
+        generic.world_scene_output()
+    }
+
+    fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("loaded runtime has no generic schedule for manufacturing output")?;
+        generic.solid_model_output()
+    }
+
     fn copy_candidate_defer_probe_to_profile(&self, profile: &mut LiveRuntimeStepProfile) {
         let Some(generic) = self.generic.as_ref() else {
             return;
@@ -16775,6 +17366,7 @@ enum RuntimeInitialValue {
 #[derive(Clone, Debug, Default)]
 struct RuntimeGenericDerivedPlan {
     functions: BTreeMap<String, RuntimeGenericFunction>,
+    output_roots: Vec<RuntimeGenericOutputRoot>,
     root_fields: Vec<RuntimeGenericDerivedRootField>,
     indexed_fields: Vec<RuntimeGenericDerivedIndexedField>,
     unsupported_reasons: BTreeMap<String, usize>,
@@ -16785,6 +17377,16 @@ struct RuntimeGenericFunction {
     name: String,
     args: Vec<String>,
     statement: RuntimeGenericStatement,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeGenericOutputRoot {
+    root: String,
+    output_kind: String,
+    typed_contract_known: bool,
+    generic_output_port: bool,
+    statement: Option<RuntimeGenericStatement>,
+    unsupported_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -17600,6 +18202,28 @@ impl RuntimeGenericDerivedPlan {
                 }
             }
         }
+        for output in &ir.output_values {
+            let compiled = RuntimeGenericStatement::from_ast(
+                &output.statement,
+                &ir.expressions,
+                &function_names,
+            );
+            let (statement, unsupported_reason) = match compiled {
+                Ok(statement) => (Some(statement), None),
+                Err(reason) => {
+                    *plan.unsupported_reasons.entry(reason.clone()).or_default() += 1;
+                    (None, Some(reason))
+                }
+            };
+            plan.output_roots.push(RuntimeGenericOutputRoot {
+                root: output.root.clone(),
+                output_kind: output.output_kind.clone(),
+                typed_contract_known: output.typed_contract_known,
+                generic_output_port: output.generic_output_port,
+                statement,
+                unsupported_reason,
+            });
+        }
         for value in ir.derived_values.iter().filter(|value| {
             !value.indexed
                 && value.scope_id.is_none()
@@ -17695,6 +18319,23 @@ impl RuntimeGenericDerivedPlan {
                 *plan.unsupported_reasons.entry(reason).or_default() += 1;
             }
         }
+        for output in &mut plan.output_roots {
+            if let Some(statement) = output.statement.as_ref()
+                && let Some(function) = runtime_statement_missing_function(
+                    statement,
+                    &compiled_functions,
+                    &unsupported_functions,
+                )
+            {
+                let reason = unsupported_functions
+                    .get(&function)
+                    .map(|reason| format!("function:{function}:{reason}"))
+                    .unwrap_or_else(|| format!("function:{function}:missing"));
+                output.statement = None;
+                output.unsupported_reason = Some(reason.clone());
+                *plan.unsupported_reasons.entry(reason).or_default() += 1;
+            }
+        }
         for field in &mut plan.indexed_fields {
             if let Some(statement) = field.statement.as_ref()
                 && let Some(function) = runtime_statement_missing_function(
@@ -17723,6 +18364,10 @@ impl RuntimeGenericDerivedPlan {
         self.root_fields
             .iter()
             .find(|field| root_state_path_matches_runtime_path(&field.path, path))
+    }
+
+    fn output_root_plan(&self, root: &str) -> Option<&RuntimeGenericOutputRoot> {
+        self.output_roots.iter().find(|output| output.root == root)
     }
 
     fn indexed_field_plan(
@@ -17763,9 +18408,14 @@ impl RuntimeGenericDerivedPlan {
     ) -> ReachableRuntimeFunctions {
         let mut pending = Vec::new();
         for statement in self
-            .root_fields
+            .output_roots
             .iter()
-            .filter_map(|field| field.statement.as_ref())
+            .filter_map(|output| output.statement.as_ref())
+            .chain(
+                self.root_fields
+                    .iter()
+                    .filter_map(|field| field.statement.as_ref()),
+            )
             .chain(
                 self.indexed_fields
                     .iter()
@@ -17870,13 +18520,20 @@ impl RuntimeGenericStatement {
             )
             .map(Self::Record);
         }
-        if matches!(statement.kind, AstStatementKind::List { .. }) {
-            return statement
+        if let AstStatementKind::List { field, .. } = &statement.kind {
+            let value = statement
                 .children
                 .iter()
                 .map(|child| Self::from_ast(child, expressions, functions))
                 .collect::<Result<Vec<_>, _>>()
-                .map(Self::List);
+                .map(Self::List)?;
+            if let Some(name) = field {
+                return Ok(Self::Binding {
+                    name: name.clone(),
+                    value: Box::new(value),
+                });
+            }
+            return Ok(value);
         }
         if statement.expr.is_none() && record_statement_children(&statement.children) {
             return RuntimeGenericRecordField::from_ast_children(
@@ -18207,6 +18864,8 @@ fn runtime_generic_call_supported(
 ) -> Result<(), String> {
     if function.strip_prefix("Field/").is_some()
         || is_generic_render_constructor(function)
+        || is_generic_world_constructor(function)
+        || is_generic_solid_constructor(function)
         || is_light_constructor(function)
         || functions.contains(function)
         || function
@@ -19511,12 +20170,14 @@ fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> Js
         "generic_derived_runtime_ast_free": true,
         "partial_coverage": true,
         "function_count": plan.functions.len(),
+        "output_root_count": plan.output_roots.len(),
         "root_field_count": plan.root_fields.len(),
         "indexed_field_count": plan.indexed_fields.len(),
         "root_supported_count": plan.supported_root_count(),
         "indexed_supported_count": plan.supported_indexed_count(),
         "unsupported_reasons": usize_map_artifact(&plan.unsupported_reasons),
         "functions": plan.functions.values().map(runtime_generic_function_artifact).collect::<Vec<_>>(),
+        "output_roots": plan.output_roots.iter().map(runtime_generic_output_root_artifact).collect::<Vec<_>>(),
         "root_fields": plan.root_fields.iter().map(runtime_generic_derived_root_field_artifact).collect::<Vec<_>>(),
         "indexed_fields": plan.indexed_fields.iter().map(runtime_generic_derived_indexed_field_artifact).collect::<Vec<_>>(),
         "excluded_parser_ast_sections": [
@@ -19524,6 +20185,18 @@ fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> Js
             "AstExpr",
             "FunctionDefinition"
         ]
+    })
+}
+
+fn runtime_generic_output_root_artifact(output: &RuntimeGenericOutputRoot) -> JsonValue {
+    json!({
+        "root": output.root,
+        "output_kind": output.output_kind,
+        "typed_contract_known": output.typed_contract_known,
+        "generic_output_port": output.generic_output_port,
+        "supported": output.statement.is_some(),
+        "unsupported_reason": output.unsupported_reason,
+        "statement": output.statement.as_ref().map(runtime_generic_statement_artifact)
     })
 }
 
@@ -19740,6 +20413,18 @@ impl RuntimeGenericDerivedPlan {
             }
         }
 
+        let output_roots =
+            artifact_array_field(object, "output_roots", "runtime_plan.generic_derived")?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    RuntimeGenericOutputRoot::from_artifact(
+                        value,
+                        &format!("runtime_plan.generic_derived.output_roots[{index}]"),
+                    )
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+
         let root_fields =
             artifact_array_field(object, "root_fields", "runtime_plan.generic_derived")?
                 .iter()
@@ -19772,6 +20457,7 @@ impl RuntimeGenericDerivedPlan {
 
         let plan = Self {
             functions,
+            output_roots,
             root_fields,
             indexed_fields,
             unsupported_reasons,
@@ -19780,6 +20466,12 @@ impl RuntimeGenericDerivedPlan {
             object,
             "function_count",
             plan.functions.len(),
+            "runtime_plan.generic_derived",
+        )?;
+        artifact_count_matches(
+            object,
+            "output_root_count",
+            plan.output_roots.len(),
             "runtime_plan.generic_derived",
         )?;
         artifact_count_matches(
@@ -19820,6 +20512,27 @@ impl RuntimeGenericFunction {
                 artifact_field(object, "statement", context)?,
                 &format!("{context}.statement"),
             )?,
+        })
+    }
+}
+
+impl RuntimeGenericOutputRoot {
+    fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
+        let object = artifact_object(value, context)?;
+        let statement = optional_runtime_generic_statement(object, "statement", context)?;
+        let supported = artifact_bool_field(object, "supported", context)?;
+        if supported != statement.is_some() {
+            return Err(
+                format!("{context} supported flag does not match statement presence").into(),
+            );
+        }
+        Ok(Self {
+            root: artifact_string_field(object, "root", context)?,
+            output_kind: artifact_string_field(object, "output_kind", context)?,
+            typed_contract_known: artifact_bool_field(object, "typed_contract_known", context)?,
+            generic_output_port: artifact_bool_field(object, "generic_output_port", context)?,
+            statement,
+            unsupported_reason: optional_string_field(object, "unsupported_reason", context)?,
         })
     }
 }
@@ -29812,15 +30525,13 @@ impl GenericScheduledRuntime {
         if emitted_mutation {
             stats.emitted_mutation_count = stats.emitted_mutation_count.saturating_add(1);
         }
-        if runtime_profile_root_materialization_details_enabled() {
-            stats.by_path.entry(path.clone()).or_default().record(
-                elapsed_ms,
-                changed,
-                emitted_mutation,
-                changed_read_count,
-                list_view_profile.as_ref(),
-            );
-        }
+        stats.by_path.entry(path.clone()).or_default().record(
+            elapsed_ms,
+            changed,
+            emitted_mutation,
+            changed_read_count,
+            list_view_profile.as_ref(),
+        );
         if !runtime_profile_root_materialization_samples_enabled() {
             return;
         }
@@ -32975,6 +33686,7 @@ impl GenericScheduledRuntime {
             .map(runtime_elapsed_ms)
             .unwrap_or_default();
         let mut materializations = Vec::new();
+        let mut cardinality_stable_root_lists: BTreeSet<String> = BTreeSet::new();
         let mut guard = 0usize;
         loop {
             let ready_refresh_started = source_action_profile.as_ref().map(|_| Instant::now());
@@ -33027,8 +33739,13 @@ impl GenericScheduledRuntime {
                 entry.pop_count = entry.pop_count.saturating_add(1);
             }
             let skip_started = source_action_profile.as_ref().map(|_| Instant::now());
-            let can_skip = self
+            let can_skip = (self
                 .can_skip_root_derived_field_for_changed_reads(&path, &current_dirty_reads)
+                || self.can_skip_root_list_length_for_changed_reads(
+                    &field,
+                    &current_dirty_reads,
+                    &cardinality_stable_root_lists,
+                ))
                 && self.has_cached_or_stored_root_value_for_skip(&path);
             if let Some(profile) = source_action_profile.as_deref_mut()
                 && let Some(started) = skip_started
@@ -33080,6 +33797,11 @@ impl GenericScheduledRuntime {
                 let changed_reads = result.changed_reads;
                 let changed = !changed_reads.is_empty();
                 let changed_read_count = changed_reads.len();
+                if result.profile.as_ref().is_some_and(|profile| {
+                    profile.row_count == profile.previous_row_count && !profile.broad_fallback
+                }) {
+                    cardinality_stable_root_lists.insert(path.clone());
+                }
                 if let Some(work) = dirty_root_work.as_mut()
                     && let Some(entry) = work.get_mut(&path)
                 {
@@ -34273,10 +34995,22 @@ impl GenericScheduledRuntime {
             .map(|statement| {
                 let name = record_statement_child_name(&statement)?.to_owned();
                 let free_env_names = self.statement_free_env_names(&statement);
+                let row_arg_set = BTreeSet::from([row_arg.clone()]);
+                let mut shadowed = BTreeSet::new();
+                let mut arg_accesses =
+                    BTreeMap::from([(row_arg.clone(), FunctionArgAccess::default())]);
+                self.collect_statement_arg_accesses(
+                    &statement,
+                    &row_arg_set,
+                    &mut shadowed,
+                    &mut arg_accesses,
+                );
+                let row_arg_access = arg_accesses.remove(&row_arg).unwrap_or_default();
                 Some(RootListViewFieldOnlyRecordField {
                     name,
                     statement,
                     free_env_names,
+                    row_arg_access,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -34323,6 +35057,26 @@ impl GenericScheduledRuntime {
             AstExprKind::Pipe { input, op, .. } if op == "WHEN" => *input,
             _ => return None,
         };
+        let row_arg_set = BTreeSet::from([row_arg.clone()]);
+        let mut selector_shadowed = BTreeSet::new();
+        let mut selector_arg_accesses =
+            BTreeMap::from([(row_arg.clone(), FunctionArgAccess::default())]);
+        self.collect_expr_arg_accesses(
+            selector_expr,
+            &row_arg_set,
+            &mut selector_shadowed,
+            &mut selector_arg_accesses,
+        );
+        let selector_row_arg_access = selector_arg_accesses.remove(&row_arg).unwrap_or_default();
+        let selector_bound = BTreeSet::from([row_arg.clone()]);
+        let mut selector_free_env_names = BTreeSet::new();
+        let mut selector_visiting = BTreeSet::new();
+        self.collect_expr_free_names(
+            selector_expr,
+            &selector_bound,
+            &mut selector_free_env_names,
+            &mut selector_visiting,
+        );
         let mut arms = Vec::new();
         for arm in &body[0].children {
             if !arm.children.is_empty() {
@@ -34357,6 +35111,8 @@ impl GenericScheduledRuntime {
             function,
             row_arg,
             selector_expr,
+            selector_row_arg_access,
+            selector_free_env_names,
             arms,
         })
     }
@@ -34478,6 +35234,201 @@ impl GenericScheduledRuntime {
             map_binding,
             projector,
         })
+    }
+
+    fn root_list_view_compiled_frontier_stats(
+        &self,
+        plan: &RootListViewFieldOnlyPlan,
+        row_index_source: Option<&RootListViewRowIndexSource>,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+    ) -> RootListViewCompiledFrontierStats {
+        match &plan.projector {
+            RootListViewFieldOnlyProjector::Direct(projector) => self
+                .root_list_view_compiled_frontier_record_projector_stats(
+                    projector,
+                    row_index_source,
+                    source_identities,
+                    current_dirty_reads,
+                    &BTreeSet::new(),
+                ),
+            RootListViewFieldOnlyProjector::Branch {
+                row_arg,
+                selector_row_arg_access,
+                selector_free_env_names,
+                arms,
+                ..
+            } => {
+                let selector_dirty_rows = self.root_list_view_compiled_frontier_dirty_rows(
+                    selector_row_arg_access,
+                    selector_free_env_names,
+                    row_arg,
+                    row_index_source,
+                    source_identities.len(),
+                    current_dirty_reads,
+                );
+                let mut stats = RootListViewCompiledFrontierStats::default();
+                for arm in arms {
+                    stats.saturating_add_assign(
+                        self.root_list_view_compiled_frontier_record_projector_stats(
+                            &arm.projector,
+                            row_index_source,
+                            source_identities,
+                            current_dirty_reads,
+                            &selector_dirty_rows,
+                        ),
+                    );
+                }
+                stats
+            }
+        }
+    }
+
+    fn root_list_view_compiled_frontier_record_projector_stats(
+        &self,
+        projector: &RootListViewFieldOnlyRecordProjector,
+        row_index_source: Option<&RootListViewRowIndexSource>,
+        source_identities: &[Option<RootListViewFieldSourceIdentity>],
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+        extra_dirty_rows: &BTreeSet<usize>,
+    ) -> RootListViewCompiledFrontierStats {
+        let mut stats = RootListViewCompiledFrontierStats::default();
+        stats.field_count = projector.fields.len();
+        for field in &projector.fields {
+            if !root_list_view_record_field_is_cacheable(&field.statement) {
+                stats.unclassified_field_count = stats.unclassified_field_count.saturating_add(1);
+                stats.predicted_dirty_field_count = stats
+                    .predicted_dirty_field_count
+                    .saturating_add(source_identities.len());
+                continue;
+            }
+            stats.classifiable_field_count = stats.classifiable_field_count.saturating_add(1);
+            let row_dependent =
+                field.row_arg_access.whole_value || !field.row_arg_access.fields.is_empty();
+            if row_dependent {
+                stats.row_dependent_field_count = stats.row_dependent_field_count.saturating_add(1);
+            }
+            if field.row_arg_access.whole_value {
+                stats.whole_row_dependent_field_count =
+                    stats.whole_row_dependent_field_count.saturating_add(1);
+            }
+            stats.row_field_dependency_count = stats
+                .row_field_dependency_count
+                .saturating_add(field.row_arg_access.fields.len());
+            let root_dirty = field
+                .free_env_names
+                .iter()
+                .any(|name| name != &projector.row_arg)
+                && current_dirty_reads.iter().any(|read| {
+                    matches!(
+                        read,
+                        GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. }
+                    )
+                });
+            if field.row_arg_access.whole_value {
+                let source_list_dirty = row_index_source.is_some_and(|source| {
+                    current_dirty_reads
+                        .iter()
+                        .any(|read| generic_read_key_affects_list(read, source.list()))
+                });
+                if root_dirty || source_list_dirty {
+                    stats.predicted_dirty_field_count = stats
+                        .predicted_dirty_field_count
+                        .saturating_add(source_identities.len());
+                } else {
+                    stats.predicted_clean_field_count = stats
+                        .predicted_clean_field_count
+                        .saturating_add(source_identities.len());
+                }
+                continue;
+            }
+            for row in 0..source_identities.len() {
+                let source_dirty = if field.row_arg_access.fields.is_empty() {
+                    false
+                } else {
+                    row_index_source
+                        .and_then(|source| {
+                            Some((
+                                source.list(),
+                                source.index_at(row)?,
+                                &field.row_arg_access.fields,
+                            ))
+                        })
+                        .is_none_or(|(list, index, fields)| {
+                            fields.iter().any(|field| {
+                                current_dirty_reads.iter().any(|read| {
+                                    generic_read_key_affects_list_field(read, list, index, field)
+                                })
+                            })
+                        })
+                };
+                if root_dirty || source_dirty || extra_dirty_rows.contains(&row) {
+                    stats.predicted_dirty_field_count =
+                        stats.predicted_dirty_field_count.saturating_add(1);
+                } else {
+                    stats.predicted_clean_field_count =
+                        stats.predicted_clean_field_count.saturating_add(1);
+                }
+            }
+        }
+        stats
+    }
+
+    fn root_list_view_compiled_frontier_dirty_rows(
+        &self,
+        access: &FunctionArgAccess,
+        free_env_names: &BTreeSet<String>,
+        row_arg: &str,
+        row_index_source: Option<&RootListViewRowIndexSource>,
+        row_count: usize,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+    ) -> BTreeSet<usize> {
+        let root_dirty = free_env_names.iter().any(|name| name != row_arg)
+            && current_dirty_reads.iter().any(|read| {
+                matches!(
+                    read,
+                    GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. }
+                )
+            });
+        (0..row_count)
+            .filter(|row| {
+                root_dirty
+                    || self.root_list_view_compiled_frontier_row_access_dirty(
+                        access,
+                        row_index_source,
+                        *row,
+                        current_dirty_reads,
+                    )
+            })
+            .collect()
+    }
+
+    fn root_list_view_compiled_frontier_row_access_dirty(
+        &self,
+        access: &FunctionArgAccess,
+        row_index_source: Option<&RootListViewRowIndexSource>,
+        row: usize,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+    ) -> bool {
+        if access.whole_value {
+            return row_index_source.is_none_or(|source| {
+                current_dirty_reads
+                    .iter()
+                    .any(|read| generic_read_key_affects_list(read, source.list()))
+            });
+        }
+        if access.fields.is_empty() {
+            return false;
+        }
+        row_index_source
+            .and_then(|source| Some((source.list(), source.index_at(row)?)))
+            .is_none_or(|(list, index)| {
+                access.fields.iter().any(|field| {
+                    current_dirty_reads
+                        .iter()
+                        .any(|read| generic_read_key_affects_list_field(read, list, index, field))
+                })
+            })
     }
 
     fn insert_root_list_view_existing_source_column_reads(
@@ -34630,6 +35581,7 @@ impl GenericScheduledRuntime {
                 row_arg,
                 selector_expr,
                 arms,
+                ..
             } => {
                 child.env.insert(row_arg.clone(), row_value.clone());
                 let mut selector_child = child.child();
@@ -34789,8 +35741,151 @@ impl GenericScheduledRuntime {
             .root_numeric_stability_guards_by_field
             .get(&field.path)
             .cloned();
+        let previous_root_reads_are_current = previous_root_reads_for_reused_fields
+            .as_ref()
+            .is_some_and(|reads| {
+                self.ensure_root_reads_current(
+                    reads,
+                    RuntimeRootCurrentnessReason::RootListViewFieldCacheHit,
+                )
+                .unwrap_or(true)
+            });
+        let mut targeted_skip_disabled_by_currentness_refresh_count = 0usize;
+        let mut targeted_skip_disabled_dirty_row_count = 0usize;
+        let mut targeted_skip_disabled_dirty_field_count = 0usize;
+        let targeted_dirty_fields = if ancestor_root_stack.is_empty()
+            && field_cache_entries_prevalidated
+            && !current_dirty_reads.is_empty()
+        {
+            let mut cacheable_fields_by_scope = BTreeMap::<String, BTreeSet<String>>::new();
+            let mut direct_clean_row_skip_field_count = None;
+            let mut all_fields_cacheable = true;
+            match &plan.projector {
+                RootListViewFieldOnlyProjector::Direct(projector) => {
+                    let fields = projector
+                        .fields
+                        .iter()
+                        .filter_map(|record_field| {
+                            if root_list_view_record_field_is_cacheable(&record_field.statement) {
+                                Some(record_field.name.clone())
+                            } else {
+                                all_fields_cacheable = false;
+                                None
+                            }
+                        })
+                        .collect::<BTreeSet<_>>();
+                    if !fields.is_empty() {
+                        direct_clean_row_skip_field_count = Some(fields.len());
+                        cacheable_fields_by_scope.insert(projector.function.name.clone(), fields);
+                    }
+                }
+                RootListViewFieldOnlyProjector::Branch { arms, .. } => {
+                    for arm in arms {
+                        let fields = arm
+                            .projector
+                            .fields
+                            .iter()
+                            .filter_map(|record_field| {
+                                if root_list_view_record_field_is_cacheable(&record_field.statement)
+                                {
+                                    Some(record_field.name.clone())
+                                } else {
+                                    all_fields_cacheable = false;
+                                    None
+                                }
+                            })
+                            .collect::<BTreeSet<_>>();
+                        if !fields.is_empty() {
+                            cacheable_fields_by_scope
+                                .entry(arm.projector.function.name.clone())
+                                .or_default()
+                                .extend(fields);
+                        }
+                    }
+                }
+            }
+            if !all_fields_cacheable || cacheable_fields_by_scope.is_empty() {
+                None
+            } else {
+                let invalidated_keys = self
+                    .generic_derived_state
+                    .recent_invalidated_root_list_view_field_cache_keys(&field.path);
+                let mut rows_by_identity = BTreeMap::<(String, u64, u64), Vec<usize>>::new();
+                for (index, identity) in source_identities.iter().enumerate() {
+                    let Some(identity) = identity else {
+                        continue;
+                    };
+                    rows_by_identity
+                        .entry((identity.list.clone(), identity.key, identity.generation))
+                        .or_default()
+                        .push(index);
+                }
+                let mut targeted = RootListViewTargetedDirtyFields {
+                    direct_clean_row_skip_field_count,
+                    ..Default::default()
+                };
+                let mut ambiguous = false;
+                for key in invalidated_keys.into_iter().filter(|key| {
+                    key.root_path == field.path
+                        && cacheable_fields_by_scope
+                            .get(&key.record_scope)
+                            .is_some_and(|fields| fields.contains(&key.field))
+                }) {
+                    if key.source_key == 0 && key.source_generation == 0 {
+                        for index in 0..row_count {
+                            targeted.mark_dirty(index, &key.record_scope, &key.field);
+                        }
+                        continue;
+                    }
+                    let Some(rows) = rows_by_identity.get(&(
+                        key.source_list.clone(),
+                        key.source_key,
+                        key.source_generation,
+                    )) else {
+                        ambiguous = true;
+                        break;
+                    };
+                    for index in rows {
+                        targeted.mark_dirty(*index, &key.record_scope, &key.field);
+                    }
+                }
+                if ambiguous || targeted.is_empty() {
+                    None
+                } else if previous_root_reads_are_current {
+                    targeted_skip_disabled_by_currentness_refresh_count = 1;
+                    targeted_skip_disabled_dirty_row_count = targeted.dirty_row_count();
+                    targeted_skip_disabled_dirty_field_count = targeted.dirty_field_count();
+                    None
+                } else {
+                    Some(targeted)
+                }
+            }
+        } else {
+            None
+        };
         let field_eval_started = Instant::now();
         for index in 0..row_count {
+            if let Some(targeted_dirty_fields) = targeted_dirty_fields.as_ref()
+                && let Some(targeted_clean_row_skip_field_count) =
+                    targeted_dirty_fields.direct_clean_row_skip_field_count
+                && !targeted_dirty_fields.row_has_any_dirty_field(index)
+            {
+                skipped_field_count =
+                    skipped_field_count.saturating_add(targeted_clean_row_skip_field_count);
+                reused_previous_pass_fields = true;
+                self.root_list_view_field_cache_hits = self
+                    .root_list_view_field_cache_hits
+                    .saturating_add(targeted_clean_row_skip_field_count);
+                with_root_list_view_attribution(&frame, |profile| {
+                    profile.field_cache_field_value_hit_count = profile
+                        .field_cache_field_value_hit_count
+                        .saturating_add(targeted_clean_row_skip_field_count);
+                    profile.field_cache_hit_read_key_count = profile
+                        .field_cache_hit_read_key_count
+                        .saturating_add(targeted_clean_row_skip_field_count);
+                });
+                continue;
+            }
             let value = if let Some(source) = row_index_source.as_ref() {
                 source.row_ref_at(index).ok_or_else(|| {
                     format!("root list-view row-index source is missing target row {index}")
@@ -34836,11 +35931,48 @@ impl GenericScheduledRuntime {
                     .user_function_call_count
                     .saturating_add(active.function_call_count);
             });
+            if let Some(targeted_dirty_fields) = targeted_dirty_fields.as_ref()
+                && !targeted_dirty_fields.scope_has_dirty_field(index, active.function_name)
+            {
+                let skipped_count = active.record_fields.len();
+                skipped_field_count = skipped_field_count.saturating_add(skipped_count);
+                reused_previous_pass_fields = true;
+                self.root_list_view_field_cache_hits = self
+                    .root_list_view_field_cache_hits
+                    .saturating_add(skipped_count);
+                with_root_list_view_attribution(&child, |profile| {
+                    profile.field_cache_field_value_hit_count = profile
+                        .field_cache_field_value_hit_count
+                        .saturating_add(skipped_count);
+                    profile.field_cache_hit_read_key_count = profile
+                        .field_cache_hit_read_key_count
+                        .saturating_add(skipped_count);
+                });
+                frame.eval_budget = child.eval_budget;
+                frame.reads.extend(child.reads);
+                frame.merge_numeric_stability_guards(child.numeric_stability_guards);
+                continue;
+            }
             let body_started = Instant::now();
             let field_loop_started = Instant::now();
             let mut env_fingerprint_cache = BTreeMap::new();
             for record_field in active.record_fields {
                 let name = record_field.name.as_str();
+                if let Some(targeted_dirty_fields) = targeted_dirty_fields.as_ref()
+                    && !targeted_dirty_fields.field_is_dirty(index, active.function_name, name)
+                {
+                    skipped_field_count = skipped_field_count.saturating_add(1);
+                    reused_previous_pass_fields = true;
+                    self.root_list_view_field_cache_hits =
+                        self.root_list_view_field_cache_hits.saturating_add(1);
+                    with_root_list_view_attribution(&child, |profile| {
+                        profile.field_cache_field_value_hit_count =
+                            profile.field_cache_field_value_hit_count.saturating_add(1);
+                        profile.field_cache_hit_read_key_count =
+                            profile.field_cache_hit_read_key_count.saturating_add(1);
+                    });
+                    continue;
+                }
                 let record_child = &record_field.statement;
                 let field_free_names = &record_field.free_env_names;
                 let env_fingerprint_started = Instant::now();
@@ -34980,6 +36112,8 @@ impl GenericScheduledRuntime {
                 )?;
             }
         }
+        self.generic_derived_state
+            .clear_recent_invalidated_root_list_view_field_cache_keys(&field.path);
         let replace_ms = runtime_elapsed_ms(replace_started);
 
         let (field_profiles, attribution) = frame
@@ -34998,6 +36132,12 @@ impl GenericScheduledRuntime {
             current_dirty_list_column_read_count,
             current_dirty_list_field_read_count,
         ) = generic_read_key_kind_counts(current_dirty_reads);
+        let compiled_frontier_stats = self.root_list_view_compiled_frontier_stats(
+            &plan,
+            row_index_source.as_ref(),
+            &source_identities,
+            current_dirty_reads,
+        );
         let field_profile_total_ms = field_profiles
             .iter()
             .map(|profile| profile.total_ms)
@@ -35052,6 +36192,24 @@ impl GenericScheduledRuntime {
             field_only_skipped_field_count: skipped_field_count,
             field_only_evaluated_field_count: evaluated_field_count,
             field_only_changed_field_count: changed_field_count,
+            targeted_skip_disabled_by_currentness_refresh_count,
+            targeted_skip_disabled_dirty_row_count,
+            targeted_skip_disabled_dirty_field_count,
+            compiled_frontier_field_count: compiled_frontier_stats.field_count,
+            compiled_frontier_classifiable_field_count: compiled_frontier_stats
+                .classifiable_field_count,
+            compiled_frontier_unclassified_field_count: compiled_frontier_stats
+                .unclassified_field_count,
+            compiled_frontier_row_dependent_field_count: compiled_frontier_stats
+                .row_dependent_field_count,
+            compiled_frontier_whole_row_dependent_field_count: compiled_frontier_stats
+                .whole_row_dependent_field_count,
+            compiled_frontier_row_field_dependency_count: compiled_frontier_stats
+                .row_field_dependency_count,
+            compiled_frontier_predicted_dirty_field_count: compiled_frontier_stats
+                .predicted_dirty_field_count,
+            compiled_frontier_predicted_clean_field_count: compiled_frontier_stats
+                .predicted_clean_field_count,
             field_profile_total_ms,
             eval_minus_field_profiles_ms: saturating_f64_sub(eval_ms, field_profile_total_ms),
             eval_unattributed_ms: saturating_f64_sub(eval_ms, attribution.list_map_total_ms),
@@ -35319,6 +36477,17 @@ impl GenericScheduledRuntime {
             field_only_skipped_field_count: 0,
             field_only_evaluated_field_count: evaluated_field_count,
             field_only_changed_field_count: changed_field_count,
+            targeted_skip_disabled_by_currentness_refresh_count: 0,
+            targeted_skip_disabled_dirty_row_count: 0,
+            targeted_skip_disabled_dirty_field_count: 0,
+            compiled_frontier_field_count: 0,
+            compiled_frontier_classifiable_field_count: 0,
+            compiled_frontier_unclassified_field_count: 0,
+            compiled_frontier_row_dependent_field_count: 0,
+            compiled_frontier_whole_row_dependent_field_count: 0,
+            compiled_frontier_row_field_dependency_count: 0,
+            compiled_frontier_predicted_dirty_field_count: 0,
+            compiled_frontier_predicted_clean_field_count: 0,
             field_profile_total_ms,
             eval_minus_field_profiles_ms: saturating_f64_sub(eval_ms, field_profile_total_ms),
             eval_unattributed_ms: saturating_f64_sub(eval_ms, attribution.list_map_total_ms),
@@ -35633,6 +36802,17 @@ impl GenericScheduledRuntime {
             field_only_skipped_field_count: 0,
             field_only_evaluated_field_count: 0,
             field_only_changed_field_count: 0,
+            targeted_skip_disabled_by_currentness_refresh_count: 0,
+            targeted_skip_disabled_dirty_row_count: 0,
+            targeted_skip_disabled_dirty_field_count: 0,
+            compiled_frontier_field_count: 0,
+            compiled_frontier_classifiable_field_count: 0,
+            compiled_frontier_unclassified_field_count: 0,
+            compiled_frontier_row_dependent_field_count: 0,
+            compiled_frontier_whole_row_dependent_field_count: 0,
+            compiled_frontier_row_field_dependency_count: 0,
+            compiled_frontier_predicted_dirty_field_count: 0,
+            compiled_frontier_predicted_clean_field_count: 0,
             field_profile_total_ms: 0.0,
             eval_minus_field_profiles_ms: eval_ms,
             eval_unattributed_ms: eval_ms,
@@ -36014,6 +37194,17 @@ impl GenericScheduledRuntime {
             field_only_skipped_field_count: 0,
             field_only_evaluated_field_count: 0,
             field_only_changed_field_count: 0,
+            targeted_skip_disabled_by_currentness_refresh_count: 0,
+            targeted_skip_disabled_dirty_row_count: 0,
+            targeted_skip_disabled_dirty_field_count: 0,
+            compiled_frontier_field_count: 0,
+            compiled_frontier_classifiable_field_count: 0,
+            compiled_frontier_unclassified_field_count: 0,
+            compiled_frontier_row_dependent_field_count: 0,
+            compiled_frontier_whole_row_dependent_field_count: 0,
+            compiled_frontier_row_field_dependency_count: 0,
+            compiled_frontier_predicted_dirty_field_count: 0,
+            compiled_frontier_predicted_clean_field_count: 0,
             field_profile_total_ms,
             eval_minus_field_profiles_ms: saturating_f64_sub(eval_ms, field_profile_total_ms),
             eval_unattributed_ms: saturating_f64_sub(eval_ms, attribution.list_map_total_ms),
@@ -36608,6 +37799,52 @@ impl GenericScheduledRuntime {
         })
     }
 
+    fn can_skip_root_list_length_for_changed_reads(
+        &self,
+        field: &GenericDerivedRootField,
+        changed_reads: &BTreeSet<GenericReadKey>,
+        cardinality_stable_root_lists: &BTreeSet<String>,
+    ) -> bool {
+        let Some((referenced_path, list)) =
+            self.root_list_length_ref_for_statement(&field.statement)
+        else {
+            return false;
+        };
+        if cardinality_stable_root_lists.contains(&referenced_path) {
+            return true;
+        }
+        if changed_reads.contains(&list_read_key(&list)) {
+            return false;
+        }
+        let Some(previous_reads) = self
+            .generic_derived_state
+            .root_reads_by_field
+            .get(&field.path)
+        else {
+            return false;
+        };
+        let relevant_reads = previous_reads
+            .iter()
+            .filter(|read| changed_reads.contains(*read))
+            .collect::<Vec<_>>();
+        if relevant_reads.is_empty() {
+            return false;
+        }
+        relevant_reads.into_iter().all(|read| {
+            root_read_key_matches_path(read, &referenced_path)
+                || matches!(
+                    read,
+                    GenericReadKey::ListColumn {
+                        list: dirty_list,
+                        ..
+                    } | GenericReadKey::ListField {
+                        list: dirty_list,
+                        ..
+                    } if dirty_list == &list
+                )
+        })
+    }
+
     fn has_cached_or_stored_root_value_for_skip(&mut self, path: &str) -> bool {
         self.generic_derived_state
             .root_value_cache
@@ -36883,6 +38120,12 @@ impl GenericScheduledRuntime {
                 let input = self.runtime_named_or_positional_arg_value(args, "input", 0, frame)?;
                 self.eval_runtime_generic_while(input, children, frame)
             }
+            RuntimeGenericExpr::Call { function, args }
+                if runtime_generic_constructor_accepts_children(function) =>
+            {
+                let value = self.eval_runtime_generic_call(function, args, None, frame)?;
+                self.eval_runtime_generic_constructor_children(value, children, frame)
+            }
             RuntimeGenericExpr::Pipe { input, op, args }
                 if list_predicate_operator(op)
                     && !args.iter().any(|arg| arg.name.as_deref() == Some("if"))
@@ -36903,6 +38146,42 @@ impl GenericScheduledRuntime {
                 self.eval_runtime_generic_pipe_continuation_siblings(children, value, frame)
             }
         }
+    }
+
+    fn eval_runtime_generic_constructor_children(
+        &mut self,
+        value: BoonValue,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let BoonValue::Record(mut record) = value else {
+            return Ok(value);
+        };
+        for child in children {
+            if self.runtime_generic_statement_is_pipe_continuation(child) {
+                continue;
+            }
+            match child {
+                RuntimeGenericStatement::Binding { name, value } => {
+                    record.insert(
+                        name.clone(),
+                        self.eval_runtime_generic_statement(value, frame)?,
+                    );
+                }
+                _ => {
+                    let value = self.eval_runtime_generic_statement(child, frame)?;
+                    if !matches!(value, BoonValue::Empty) {
+                        let index = record.len();
+                        record.insert(format!("child_{index}"), value);
+                    }
+                }
+            }
+        }
+        self.eval_runtime_generic_pipe_continuation_siblings(
+            children,
+            BoonValue::Record(record),
+            frame,
+        )
     }
 
     fn eval_runtime_generic_pipe_continuation_chain(
@@ -37170,7 +38449,11 @@ impl GenericScheduledRuntime {
         input: Option<BoonValue>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        if is_generic_render_constructor(function) || is_light_constructor(function) {
+        if is_generic_render_constructor(function)
+            || is_generic_world_constructor(function)
+            || is_generic_solid_constructor(function)
+            || is_light_constructor(function)
+        {
             return self.eval_runtime_generic_constructor(function, args, input, frame);
         }
         if bytes_runtime_builtin(function) {
@@ -38858,7 +40141,10 @@ impl GenericScheduledRuntime {
         input: Option<BoonValue>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
-        if is_generic_render_constructor(function) {
+        if is_generic_render_constructor(function)
+            || is_generic_world_constructor(function)
+            || is_generic_solid_constructor(function)
+        {
             return self.eval_generic_constructor(function, args, input, frame);
         }
         if is_light_constructor(function) {
@@ -40070,22 +41356,20 @@ impl GenericScheduledRuntime {
         if cache_store {
             self.root_list_view_field_cache_stores =
                 self.root_list_view_field_cache_stores.saturating_add(1);
+            let cache_entry = RootListViewFieldCacheEntry {
+                value: value.clone(),
+                field_value: boon_value_field_value(&value),
+                reads,
+                numeric_stability_guards,
+                materialization_pass: frame
+                    .root_list_view_field_cache_context
+                    .as_ref()
+                    .map(|context| context.materialization_pass)
+                    .unwrap_or_default(),
+            };
             self.generic_derived_state
                 .root_list_view_field_cache
-                .insert(
-                    cache_key,
-                    RootListViewFieldCacheEntry {
-                        value: value.clone(),
-                        field_value: boon_value_field_value(&value),
-                        reads,
-                        numeric_stability_guards,
-                        materialization_pass: frame
-                            .root_list_view_field_cache_context
-                            .as_ref()
-                            .map(|context| context.materialization_pass)
-                            .unwrap_or_default(),
-                    },
-                );
+                .insert(cache_key, cache_entry);
         }
         Ok(value)
     }
@@ -40191,8 +41475,11 @@ impl GenericScheduledRuntime {
                     .is_some_and(|context| {
                         entry.materialization_pass != context.materialization_pass
                     });
-                let value = (!previous_pass_cache_hit || value_for_previous_pass_hit)
-                    .then(|| entry.field_value.clone());
+                let value = if !previous_pass_cache_hit || value_for_previous_pass_hit {
+                    Some(entry.field_value.clone())
+                } else {
+                    None
+                };
                 let numeric_stability_guards = entry.numeric_stability_guards.clone();
                 self.root_list_view_field_cache_hits =
                     self.root_list_view_field_cache_hits.saturating_add(1);
@@ -40260,22 +41547,20 @@ impl GenericScheduledRuntime {
         if cache_store {
             self.root_list_view_field_cache_stores =
                 self.root_list_view_field_cache_stores.saturating_add(1);
+            let cache_entry = RootListViewFieldCacheEntry {
+                value: value.clone(),
+                field_value: field_value.clone(),
+                reads,
+                numeric_stability_guards,
+                materialization_pass: frame
+                    .root_list_view_field_cache_context
+                    .as_ref()
+                    .map(|context| context.materialization_pass)
+                    .unwrap_or_default(),
+            };
             self.generic_derived_state
                 .root_list_view_field_cache
-                .insert(
-                    cache_key,
-                    RootListViewFieldCacheEntry {
-                        value: value.clone(),
-                        field_value: field_value.clone(),
-                        reads,
-                        numeric_stability_guards,
-                        materialization_pass: frame
-                            .root_list_view_field_cache_context
-                            .as_ref()
-                            .map(|context| context.materialization_pass)
-                            .unwrap_or_default(),
-                    },
-                );
+                .insert(cache_key, cache_entry);
         }
         Ok(RootListViewEvaluatedFieldValue {
             value: Some(field_value),
@@ -43305,8 +44590,26 @@ impl GenericScheduledRuntime {
         shadowed: &mut BTreeSet<String>,
         accesses: &mut BTreeMap<String, FunctionArgAccess>,
     ) {
+        let mut visiting = BTreeSet::new();
+        self.collect_statement_arg_accesses_inner(
+            statement,
+            args,
+            shadowed,
+            accesses,
+            &mut visiting,
+        );
+    }
+
+    fn collect_statement_arg_accesses_inner(
+        &self,
+        statement: &AstStatement,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+        visiting: &mut BTreeSet<String>,
+    ) {
         if let Some(expr_id) = statement.expr {
-            self.collect_expr_arg_accesses(expr_id, args, shadowed, accesses);
+            self.collect_expr_arg_accesses_inner(expr_id, args, shadowed, accesses, visiting);
         }
         if statement.children.is_empty() {
             return;
@@ -43314,16 +44617,20 @@ impl GenericScheduledRuntime {
         if record_statement_children(&statement.children) {
             for child in &statement.children {
                 if let Some(expr_id) = child.expr {
-                    self.collect_expr_arg_accesses(expr_id, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(
+                        expr_id, args, shadowed, accesses, visiting,
+                    );
                 }
                 if !child.children.is_empty() {
-                    self.collect_statement_arg_accesses(child, args, shadowed, accesses);
+                    self.collect_statement_arg_accesses_inner(
+                        child, args, shadowed, accesses, visiting,
+                    );
                 }
             }
             return;
         }
         for child in &statement.children {
-            self.collect_statement_arg_accesses(child, args, shadowed, accesses);
+            self.collect_statement_arg_accesses_inner(child, args, shadowed, accesses, visiting);
             if let AstStatementKind::Field { name } = &child.kind
                 && args.contains(name)
             {
@@ -43338,6 +44645,18 @@ impl GenericScheduledRuntime {
         args: &BTreeSet<String>,
         shadowed: &mut BTreeSet<String>,
         accesses: &mut BTreeMap<String, FunctionArgAccess>,
+    ) {
+        let mut visiting = BTreeSet::new();
+        self.collect_expr_arg_accesses_inner(expr_id, args, shadowed, accesses, &mut visiting);
+    }
+
+    fn collect_expr_arg_accesses_inner(
+        &self,
+        expr_id: usize,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+        visiting: &mut BTreeSet<String>,
     ) {
         let Some(expr) = self.generic_derived.expressions.get(expr_id) else {
             return;
@@ -43367,14 +44686,22 @@ impl GenericScheduledRuntime {
             | AstExprKind::Record(fields)
             | AstExprKind::Object(fields) => {
                 for field in fields {
-                    self.collect_expr_arg_accesses(field.value, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(
+                        field.value,
+                        args,
+                        shadowed,
+                        accesses,
+                        visiting,
+                    );
                 }
             }
             AstExprKind::Call {
                 function,
                 args: call_args,
             } => {
-                self.collect_call_arg_accesses(function, None, call_args, args, shadowed, accesses);
+                self.collect_call_arg_accesses(
+                    function, None, call_args, args, shadowed, accesses, visiting,
+                );
             }
             AstExprKind::Pipe {
                 input,
@@ -43388,37 +44715,42 @@ impl GenericScheduledRuntime {
                     args,
                     shadowed,
                     accesses,
+                    visiting,
                 );
             }
             AstExprKind::Hold { initial, .. } => {
-                self.collect_expr_arg_accesses(*initial, args, shadowed, accesses);
+                self.collect_expr_arg_accesses_inner(*initial, args, shadowed, accesses, visiting);
             }
             AstExprKind::Then { input, output } => {
-                self.collect_expr_arg_accesses(*input, args, shadowed, accesses);
+                self.collect_expr_arg_accesses_inner(*input, args, shadowed, accesses, visiting);
                 if let Some(output) = output {
-                    self.collect_expr_arg_accesses(*output, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(
+                        *output, args, shadowed, accesses, visiting,
+                    );
                 }
             }
             AstExprKind::When { input } => {
-                self.collect_expr_arg_accesses(*input, args, shadowed, accesses);
+                self.collect_expr_arg_accesses_inner(*input, args, shadowed, accesses, visiting);
             }
             AstExprKind::Infix { left, right, .. } => {
-                self.collect_expr_arg_accesses(*left, args, shadowed, accesses);
-                self.collect_expr_arg_accesses(*right, args, shadowed, accesses);
+                self.collect_expr_arg_accesses_inner(*left, args, shadowed, accesses, visiting);
+                self.collect_expr_arg_accesses_inner(*right, args, shadowed, accesses, visiting);
             }
             AstExprKind::ListLiteral { items, .. } => {
                 for item in items {
-                    self.collect_expr_arg_accesses(*item, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(*item, args, shadowed, accesses, visiting);
                 }
             }
             AstExprKind::BytesLiteral { items, .. } => {
                 for item in items {
-                    self.collect_expr_arg_accesses(*item, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(*item, args, shadowed, accesses, visiting);
                 }
             }
             AstExprKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
-                    self.collect_expr_arg_accesses(*output, args, shadowed, accesses);
+                    self.collect_expr_arg_accesses_inner(
+                        *output, args, shadowed, accesses, visiting,
+                    );
                 }
             }
             AstExprKind::StringLiteral(_)
@@ -43443,9 +44775,41 @@ impl GenericScheduledRuntime {
         args: &BTreeSet<String>,
         shadowed: &mut BTreeSet<String>,
         accesses: &mut BTreeMap<String, FunctionArgAccess>,
+        visiting: &mut BTreeSet<String>,
     ) {
+        if let Some(callee) = self.user_function_definition(function)
+            && !visiting.contains(&callee.name)
+        {
+            visiting.insert(callee.name.clone());
+            let callee_args = callee.args.iter().cloned().collect::<BTreeSet<_>>();
+            let mut callee_shadowed = BTreeSet::new();
+            let mut callee_accesses = callee_args
+                .iter()
+                .map(|arg| (arg.clone(), FunctionArgAccess::default()))
+                .collect::<BTreeMap<_, _>>();
+            self.collect_statement_arg_accesses_inner(
+                &callee.statement,
+                &callee_args,
+                &mut callee_shadowed,
+                &mut callee_accesses,
+                visiting,
+            );
+            visiting.remove(&callee.name);
+            self.collect_projected_user_call_arg_accesses(
+                input,
+                call_args,
+                &callee,
+                &callee_accesses,
+                args,
+                shadowed,
+                accesses,
+                visiting,
+            );
+            return;
+        }
+
         if let Some(input) = input {
-            self.collect_expr_arg_accesses(input, args, shadowed, accesses);
+            self.collect_expr_arg_accesses_inner(input, args, shadowed, accesses, visiting);
         }
         let binding = self.list_call_binding(function, call_args);
         let inserted_shadow = binding
@@ -43461,10 +44825,107 @@ impl GenericScheduledRuntime {
             }) {
                 continue;
             }
-            self.collect_expr_arg_accesses(arg.value, args, shadowed, accesses);
+            self.collect_expr_arg_accesses_inner(arg.value, args, shadowed, accesses, visiting);
         }
         if let Some(binding) = inserted_shadow {
             shadowed.remove(&binding);
+        }
+    }
+
+    fn collect_projected_user_call_arg_accesses(
+        &self,
+        input: Option<usize>,
+        call_args: &[AstCallArg],
+        callee: &FunctionDefinition,
+        callee_accesses: &BTreeMap<String, FunctionArgAccess>,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+        visiting: &mut BTreeSet<String>,
+    ) {
+        if let Some(input) = input
+            && let Some(first) = callee.args.first()
+        {
+            self.collect_projected_call_arg_access(
+                input,
+                callee_accesses.get(first),
+                args,
+                shadowed,
+                accesses,
+                visiting,
+            );
+        }
+        for (position, arg) in call_args.iter().enumerate() {
+            let formal = arg.name.as_ref().or_else(|| callee.args.get(position));
+            self.collect_projected_call_arg_access(
+                arg.value,
+                formal.and_then(|formal| callee_accesses.get(formal)),
+                args,
+                shadowed,
+                accesses,
+                visiting,
+            );
+        }
+    }
+
+    fn collect_projected_call_arg_access(
+        &self,
+        expr_id: usize,
+        callee_access: Option<&FunctionArgAccess>,
+        args: &BTreeSet<String>,
+        shadowed: &mut BTreeSet<String>,
+        accesses: &mut BTreeMap<String, FunctionArgAccess>,
+        visiting: &mut BTreeSet<String>,
+    ) {
+        let Some((arg, prefix)) = self.arg_path_access_base(expr_id, args, shadowed) else {
+            self.collect_expr_arg_accesses_inner(expr_id, args, shadowed, accesses, visiting);
+            return;
+        };
+        let Some(access) = accesses.get_mut(&arg) else {
+            return;
+        };
+        if let Some(prefix) = prefix.as_ref() {
+            access.fields.insert(prefix.clone());
+        }
+        let Some(callee_access) = callee_access else {
+            return;
+        };
+        if callee_access.whole_value {
+            if let Some(prefix) = &prefix {
+                access.fields.insert(prefix.clone());
+            } else {
+                access.whole_value = true;
+            }
+        }
+        for field in &callee_access.fields {
+            access.fields.insert(match &prefix {
+                Some(prefix) => format!("{prefix}.{field}"),
+                None => field.clone(),
+            });
+        }
+    }
+
+    fn arg_path_access_base(
+        &self,
+        expr_id: usize,
+        args: &BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<(String, Option<String>)> {
+        let expr = self.generic_derived.expressions.get(expr_id)?;
+        match &expr.kind {
+            AstExprKind::Identifier(value) if args.contains(value) && !shadowed.contains(value) => {
+                Some((value.clone(), None))
+            }
+            AstExprKind::Path(parts)
+                if parts
+                    .first()
+                    .is_some_and(|first| args.contains(first) && !shadowed.contains(first)) =>
+            {
+                let first = parts.first()?.clone();
+                let prefix = (parts.len() > 1).then(|| parts[1..].join("."));
+                Some((first, prefix))
+            }
+            _ => None,
         }
     }
 
@@ -44639,7 +46100,9 @@ impl GenericScheduledRuntime {
                 max_list_items,
             ));
         }
-        if let Some((list, tail)) = self.runtime_path_list_head(path)
+        if let Some((list, tail)) = self
+            .runtime_path_list_head(path)
+            .map(|(list, tail)| (list.to_owned(), tail))
             && let Some(summary) = self.runtime_list_path_summary(
                 &list,
                 &tail,
@@ -44651,10 +46114,12 @@ impl GenericScheduledRuntime {
         {
             return Some(summary);
         }
-        if let Some((target, list, tail)) = self.runtime_retain_path_head(path)
+        if let Some((target, list, tail)) = self
+            .runtime_retain_path_head(path)
+            .map(|(target, list, tail)| (target.to_owned(), list.to_owned(), tail))
             && let Some(summary) = self.runtime_retain_path_summary(
-                target,
-                list,
+                &target,
+                &list,
                 &tail,
                 depth,
                 max_depth,
@@ -45108,6 +46573,109 @@ impl GenericScheduledRuntime {
         self.root_derived_boon_value(path, frame)
     }
 
+    fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        let mut frame = GenericEvalFrame::root();
+        let output = self
+            .generic_derived_runtime
+            .output_root_plan("world")
+            .ok_or("runtime world output requires a top-level `world:` value")?
+            .clone();
+        if output.output_kind != "world"
+            || !output.generic_output_port
+            || !output.typed_contract_known
+        {
+            return Err(format!(
+                "runtime world output root has unsupported contract kind={} generic={} typed={}",
+                output.output_kind, output.generic_output_port, output.typed_contract_known
+            )
+            .into());
+        }
+        let statement = output.statement.as_ref().ok_or_else(|| {
+            output
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "runtime world output root is not executable".to_owned())
+        })?;
+        let value = self.eval_runtime_generic_statement(statement, &mut frame)?;
+        let scene = lower_world_scene_from_boon_value(&value)?;
+        Ok(RuntimeWorldSceneOutput {
+            output_root: "world".to_owned(),
+            scene,
+            read_count: frame.reads.len(),
+        })
+    }
+
+    fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        let mut frame = GenericEvalFrame::root();
+        let output = self
+            .generic_derived_runtime
+            .output_root_plan("manufacturing")
+            .ok_or("runtime solid model output requires a top-level `manufacturing:` value")?
+            .clone();
+        if output.output_kind != "manufacturing"
+            || !output.generic_output_port
+            || !output.typed_contract_known
+        {
+            return Err(format!(
+                "runtime manufacturing output root has unsupported contract kind={} generic={} typed={}",
+                output.output_kind, output.generic_output_port, output.typed_contract_known
+            )
+            .into());
+        }
+        let statement = output.statement.as_ref().ok_or_else(|| {
+            output
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "runtime manufacturing output root is not executable".to_owned())
+        })?;
+        let value = self.eval_runtime_generic_statement(statement, &mut frame)?;
+        let value = self.resolve_solid_model_root_refs(value, &mut frame)?;
+        let bundle = lower_solid_model_from_boon_value(&value)?;
+        Ok(RuntimeSolidModelOutput {
+            output_root: "manufacturing".to_owned(),
+            bundle,
+            read_count: frame.reads.len(),
+        })
+    }
+
+    fn resolve_solid_model_root_refs(
+        &mut self,
+        value: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match value {
+            BoonValue::Record(mut fields) => {
+                for key in ["geometry", "base", "child"] {
+                    if let Some(referenced) =
+                        fields.get(key).and_then(solid_model_structural_ref_name)
+                        && let Some(resolved) = self.root_derived_boon_value(&referenced, frame)?
+                    {
+                        fields.insert(
+                            key.to_owned(),
+                            self.resolve_solid_model_root_refs(resolved, frame)?,
+                        );
+                    }
+                }
+                let keys = fields.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    if matches!(key.as_str(), "geometry" | "base" | "child") {
+                        continue;
+                    }
+                    if let Some(value) = fields.remove(&key) {
+                        fields.insert(key, self.resolve_solid_model_root_refs(value, frame)?);
+                    }
+                }
+                Ok(BoonValue::Record(fields))
+            }
+            BoonValue::List(items) => items
+                .into_iter()
+                .map(|item| self.resolve_solid_model_root_refs(item, frame))
+                .collect::<RuntimeResult<Vec<_>>>()
+                .map(BoonValue::List),
+            other => Ok(other),
+        }
+    }
+
     fn root_list_derived_boon_value(
         &mut self,
         path: &str,
@@ -45192,20 +46760,74 @@ impl GenericScheduledRuntime {
         Ok(())
     }
 
+    fn root_statement_single_expr_id(statement: &AstStatement) -> Option<usize> {
+        if let Some(expr) = statement.expr {
+            return Some(expr);
+        }
+        if statement.children.len() == 1 && statement.children[0].children.is_empty() {
+            return statement.children[0].expr;
+        }
+        None
+    }
+
     fn direct_root_list_ref_for_statement(
         &self,
         statement: &AstStatement,
     ) -> Option<(String, String)> {
-        if !statement.children.is_empty() {
-            return None;
-        }
-        let expr = self.generic_derived.expressions.get(statement.expr?)?;
+        let expr_id = Self::root_statement_single_expr_id(statement)?;
+        let expr = self.generic_derived.expressions.get(expr_id)?;
         let referenced = match &expr.kind {
             AstExprKind::Identifier(name) => name.clone(),
             AstExprKind::Path(parts) if !parts.is_empty() => parts.join("."),
             _ => return None,
         };
-        let plan = self.generic_derived.root_field_plan(&referenced)?;
+        let plan = self
+            .generic_derived
+            .root_field_plan(&referenced)
+            .or_else(|| {
+                (!referenced.starts_with("store."))
+                    .then(|| {
+                        self.generic_derived
+                            .root_field_plan(&format!("store.{referenced}"))
+                    })
+                    .flatten()
+            })?;
+        if !matches!(plan.kind, DerivedValueKind::ListView) {
+            return None;
+        }
+        let list = self.storage.list_name_for_path(&plan.path)?;
+        Some((plan.path.clone(), list.to_owned()))
+    }
+
+    fn root_list_length_ref_for_statement(
+        &self,
+        statement: &AstStatement,
+    ) -> Option<(String, String)> {
+        let expr_id = Self::root_statement_single_expr_id(statement)?;
+        let expr = self.generic_derived.expressions.get(expr_id)?;
+        let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
+            return None;
+        };
+        if !matches!(op.as_str(), "List/length" | "List/count") {
+            return None;
+        }
+        let input = self.generic_derived.expressions.get(*input)?;
+        let referenced = match &input.kind {
+            AstExprKind::Identifier(name) => name.clone(),
+            AstExprKind::Path(parts) if !parts.is_empty() => parts.join("."),
+            _ => return None,
+        };
+        let plan = self
+            .generic_derived
+            .root_field_plan(&referenced)
+            .or_else(|| {
+                (!referenced.starts_with("store."))
+                    .then(|| {
+                        self.generic_derived
+                            .root_field_plan(&format!("store.{referenced}"))
+                    })
+                    .flatten()
+            })?;
         if !matches!(plan.kind, DerivedValueKind::ListView) {
             return None;
         }
@@ -45263,10 +46885,11 @@ impl GenericScheduledRuntime {
         let summary = self
             .list_summary_fields
             .iter()
-            .find(|summary| summary.list == list)?;
+            .find(|summary| summary.list == list)?
+            .clone();
         if tail.indexes.is_empty() {
             return Some(self.runtime_list_summary(
-                summary,
+                &summary,
                 None,
                 depth,
                 max_depth,
@@ -45275,7 +46898,7 @@ impl GenericScheduledRuntime {
             ));
         }
         let index = *tail.indexes.first()?;
-        let row = self.value_summary_row_json(summary, index).ok()?;
+        let row = self.value_summary_row_json(&summary, index).ok()?;
         runtime_row_tail_summary(
             row,
             &tail.rest,
@@ -45311,14 +46934,15 @@ impl GenericScheduledRuntime {
         let summary = self
             .list_summary_fields
             .iter()
-            .find(|summary| summary.list == list)?;
+            .find(|summary| summary.list == list)?
+            .clone();
         let predicate = self.list_equations.retain_predicate(list, target).ok()?;
         if predicate == RuntimeListPredicate::Unsupported {
             return None;
         }
         if tail.indexes.is_empty() {
             return Some(self.runtime_list_summary(
-                summary,
+                &summary,
                 Some(&predicate),
                 depth,
                 max_depth,
@@ -45328,7 +46952,7 @@ impl GenericScheduledRuntime {
         }
         let retained_index = *tail.indexes.first()?;
         let row_index = self.retained_row_index(list, &predicate, retained_index)?;
-        let row = self.value_summary_row_json(summary, row_index).ok()?;
+        let row = self.value_summary_row_json(&summary, row_index).ok()?;
         runtime_row_tail_summary(
             row,
             &tail.rest,
@@ -45743,24 +47367,30 @@ impl GenericScheduledRuntime {
             insert_nested_json(&mut root, &path, value.clone());
             root.insert(row_field_name(&path).to_owned(), value);
         }
-        for (list, target) in self.list_equations.retain_targets() {
-            if contains_nested_json(&root, target) {
+        let retain_targets = self
+            .list_equations
+            .retain_targets()
+            .map(|(list, target)| (list.to_owned(), target.to_owned()))
+            .collect::<Vec<_>>();
+        for (list, target) in retain_targets {
+            if contains_nested_json(&root, &target) {
                 continue;
             }
             let Some(summary) = self
                 .list_summary_fields
                 .iter()
                 .find(|summary| summary.list == list)
+                .cloned()
             else {
                 continue;
             };
-            let Ok(predicate) = self.list_equations.retain_predicate(list, target) else {
+            let Ok(predicate) = self.list_equations.retain_predicate(&list, &target) else {
                 continue;
             };
             if predicate == RuntimeListPredicate::Unsupported {
                 continue;
             }
-            let len = self.storage.list_len(list).unwrap_or_default();
+            let len = self.storage.list_len(&list).unwrap_or_default();
             let row_start = limits.list_row_start.min(len);
             let row_end = limits
                 .list_rows
@@ -45770,30 +47400,30 @@ impl GenericScheduledRuntime {
             for index in 0..len {
                 let visible = self
                     .storage
-                    .list_row_matches_predicate(list, index, &predicate)
+                    .list_row_matches_predicate(&list, index, &predicate)
                     .unwrap_or(false);
                 if visible {
                     logical_item_count = logical_item_count.saturating_add(1);
                 }
                 if visible && index >= row_start && index < row_end {
                     rows.push(JsonValue::Object(
-                        self.summary_row_json(summary, index)
+                        self.summary_row_json(&summary, index)
                             .unwrap_or_else(|_| serde_json::Map::new()),
                     ));
                 }
             }
             materialization.push(materialization_report_for_rows(
-                target,
+                &target,
                 logical_item_count,
                 row_start,
                 rows.as_slice(),
             ));
             let value = JsonValue::Array(rows);
-            insert_nested_json(&mut root, target, value.clone());
-            root.entry(row_field_name(target).to_owned())
+            insert_nested_json(&mut root, &target, value.clone());
+            root.entry(row_field_name(&target).to_owned())
                 .or_insert(value);
         }
-        for summary in &self.list_summary_fields {
+        for summary in self.list_summary_fields.clone() {
             let len = self.storage.list_len(&summary.list).unwrap_or_default();
             let row_start = limits.list_row_start.min(len);
             let row_end = limits
@@ -45802,7 +47432,7 @@ impl GenericScheduledRuntime {
             let mut rows = Vec::with_capacity(row_end.saturating_sub(row_start));
             for index in row_start..row_end {
                 rows.push(JsonValue::Object(
-                    self.summary_row_json(summary, index)
+                    self.summary_row_json(&summary, index)
                         .unwrap_or_else(|_| serde_json::Map::new()),
                 ));
             }
@@ -45980,7 +47610,8 @@ impl GenericScheduledRuntime {
         let list_summary = self
             .list_summary_fields
             .iter()
-            .find(|summary| summary.list == list);
+            .find(|summary| summary.list == list)
+            .cloned();
         let len = self.storage.list_len(list).unwrap_or_default();
         let row_count = if rows > 0 {
             rows
@@ -46010,6 +47641,7 @@ impl GenericScheduledRuntime {
                     break;
                 }
                 let cell = list_summary
+                    .as_ref()
                     .and_then(|summary| self.summary_row_json(summary, index).ok())
                     .unwrap_or_default();
                 cells.push(JsonValue::Object(cell));
@@ -46128,7 +47760,8 @@ impl GenericScheduledRuntime {
         self.list_summary_fields
             .iter()
             .find(|summary| summary.list == list)
-            .and_then(|summary| self.summary_row_json(summary, index).ok())
+            .cloned()
+            .and_then(|summary| self.summary_row_json(&summary, index).ok())
     }
 
     fn summary_row_json(
@@ -46140,11 +47773,11 @@ impl GenericScheduledRuntime {
         let identity = self.storage.row_identity(&summary.list, index);
         let source_identity = self.storage.root_source_identity(&summary.list, index)?;
         let public_identity = source_identity
-            .map(|identity| (identity.list.as_str(), identity.key, identity.generation))
+            .map(|identity| (identity.list.to_owned(), identity.key, identity.generation))
             .or_else(|| {
                 identity
                     .ok()
-                    .map(|(key, generation)| (summary.list.as_str(), key, generation))
+                    .map(|(key, generation)| (summary.list.clone(), key, generation))
             });
         if let Some((_, key, generation)) = public_identity {
             row.insert(
@@ -46208,7 +47841,7 @@ impl GenericScheduledRuntime {
             let prefix = format!("{}.", summary.row_scope);
             for binding in self
                 .storage
-                .row_source_bindings(binding_list, key, generation)
+                .row_source_bindings(&binding_list, key, generation)
             {
                 let Some(path) = binding.source_path.strip_prefix(&prefix) else {
                     continue;
@@ -53193,6 +54826,7 @@ struct RootListViewFieldOnlyRecordField {
     name: String,
     statement: AstStatement,
     free_env_names: BTreeSet<String>,
+    row_arg_access: FunctionArgAccess,
 }
 
 #[derive(Clone, Debug)]
@@ -53202,6 +54836,8 @@ enum RootListViewFieldOnlyProjector {
         function: FunctionDefinition,
         row_arg: String,
         selector_expr: usize,
+        selector_row_arg_access: FunctionArgAccess,
+        selector_free_env_names: BTreeSet<String>,
         arms: Vec<RootListViewFieldOnlyBranchArm>,
     },
 }
@@ -53231,6 +54867,95 @@ struct RootListViewFieldOnlyPatch {
     row: usize,
     field: String,
     value: FieldValue,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RootListViewTargetedDirtyFields {
+    by_row_scope: BTreeMap<usize, BTreeMap<String, BTreeSet<String>>>,
+    direct_clean_row_skip_field_count: Option<usize>,
+}
+
+impl RootListViewTargetedDirtyFields {
+    fn is_empty(&self) -> bool {
+        self.by_row_scope.is_empty()
+    }
+
+    fn dirty_row_count(&self) -> usize {
+        self.by_row_scope.len()
+    }
+
+    fn dirty_field_count(&self) -> usize {
+        self.by_row_scope
+            .values()
+            .map(|by_scope| by_scope.values().map(BTreeSet::len).sum::<usize>())
+            .sum()
+    }
+
+    fn row_has_any_dirty_field(&self, row: usize) -> bool {
+        self.by_row_scope.contains_key(&row)
+    }
+
+    fn scope_has_dirty_field(&self, row: usize, scope: &str) -> bool {
+        self.by_row_scope
+            .get(&row)
+            .and_then(|by_scope| by_scope.get(scope))
+            .is_some_and(|fields| !fields.is_empty())
+    }
+
+    fn field_is_dirty(&self, row: usize, scope: &str, field: &str) -> bool {
+        self.by_row_scope
+            .get(&row)
+            .and_then(|by_scope| by_scope.get(scope))
+            .is_some_and(|fields| fields.contains(field))
+    }
+
+    fn mark_dirty(&mut self, row: usize, scope: &str, field: &str) {
+        self.by_row_scope
+            .entry(row)
+            .or_default()
+            .entry(scope.to_owned())
+            .or_default()
+            .insert(field.to_owned());
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RootListViewCompiledFrontierStats {
+    field_count: usize,
+    classifiable_field_count: usize,
+    unclassified_field_count: usize,
+    row_dependent_field_count: usize,
+    whole_row_dependent_field_count: usize,
+    row_field_dependency_count: usize,
+    predicted_dirty_field_count: usize,
+    predicted_clean_field_count: usize,
+}
+
+impl RootListViewCompiledFrontierStats {
+    fn saturating_add_assign(&mut self, other: Self) {
+        self.field_count = self.field_count.saturating_add(other.field_count);
+        self.classifiable_field_count = self
+            .classifiable_field_count
+            .saturating_add(other.classifiable_field_count);
+        self.unclassified_field_count = self
+            .unclassified_field_count
+            .saturating_add(other.unclassified_field_count);
+        self.row_dependent_field_count = self
+            .row_dependent_field_count
+            .saturating_add(other.row_dependent_field_count);
+        self.whole_row_dependent_field_count = self
+            .whole_row_dependent_field_count
+            .saturating_add(other.whole_row_dependent_field_count);
+        self.row_field_dependency_count = self
+            .row_field_dependency_count
+            .saturating_add(other.row_field_dependency_count);
+        self.predicted_dirty_field_count = self
+            .predicted_dirty_field_count
+            .saturating_add(other.predicted_dirty_field_count);
+        self.predicted_clean_field_count = self
+            .predicted_clean_field_count
+            .saturating_add(other.predicted_clean_field_count);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53971,6 +55696,8 @@ struct GenericDerivedState {
     runtime_function_arg_accesses_cache: BTreeMap<String, BTreeMap<String, FunctionArgAccess>>,
     statement_free_names_cache: BTreeMap<(usize, usize, usize), BTreeSet<String>>,
     root_list_view_field_cache: BTreeMap<RootListViewFieldCacheKey, RootListViewFieldCacheEntry>,
+    root_list_view_recent_invalidated_field_cache_keys:
+        BTreeMap<String, BTreeSet<RootListViewFieldCacheKey>>,
     root_list_map_output_cache: BTreeMap<RootListMapOutputCacheKey, RootListMapOutputCacheEntry>,
     root_numeric_stability_guards_by_field:
         BTreeMap<String, BTreeMap<GenericReadKey, NumericStabilityInterval>>,
@@ -54393,6 +56120,31 @@ fn generic_read_key_list(read: &GenericReadKey) -> Option<&str> {
         | GenericReadKey::ListColumn { list, .. }
         | GenericReadKey::ListField { list, .. } => Some(list),
         GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => None,
+    }
+}
+
+fn generic_read_key_affects_list(read: &GenericReadKey, list: &str) -> bool {
+    generic_read_key_list(read) == Some(list)
+}
+
+fn generic_read_key_affects_list_field(
+    read: &GenericReadKey,
+    list: &str,
+    index: usize,
+    field: &str,
+) -> bool {
+    match read {
+        GenericReadKey::List { list: dirty_list } => dirty_list == list,
+        GenericReadKey::ListColumn {
+            list: dirty_list,
+            field: dirty_field,
+        } => dirty_list == list && dirty_field == field,
+        GenericReadKey::ListField {
+            list: dirty_list,
+            index: dirty_index,
+            field: dirty_field,
+        } => dirty_list == list && *dirty_index == index && dirty_field == field,
+        GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => false,
     }
 }
 
@@ -55276,6 +57028,55 @@ fn is_generic_render_constructor(function: &str) -> bool {
     )
 }
 
+fn is_generic_world_constructor(function: &str) -> bool {
+    matches!(
+        function,
+        "World/new"
+            | "World/camera"
+            | "World/perspective_camera"
+            | "World/light"
+            | "World/point_light"
+            | "World/material"
+            | "World/transform"
+            | "World/primitive"
+            | "World/indexed_mesh"
+            | "World/model"
+            | "World/group"
+            | "Camera/perspective"
+            | "Light/directional"
+            | "World/instance"
+    )
+}
+
+fn is_generic_solid_constructor(function: &str) -> bool {
+    matches!(
+        function,
+        "Assembly/new"
+            | "Part/new"
+            | "Part/instance"
+            | "Solid/box"
+            | "Solid/rounded_box"
+            | "Solid/sphere"
+            | "Solid/cylinder"
+            | "Solid/cone"
+            | "Solid/torus"
+            | "Solid/extrude"
+            | "Solid/revolve"
+            | "Solid/loft"
+            | "Solid/shell"
+            | "Solid/union"
+            | "Solid/difference"
+            | "Solid/translate"
+    )
+}
+
+fn runtime_generic_constructor_accepts_children(function: &str) -> bool {
+    is_generic_render_constructor(function)
+        || is_generic_world_constructor(function)
+        || is_generic_solid_constructor(function)
+        || is_light_constructor(function)
+}
+
 fn boon_value_is_generic_render_constructor(value: &BoonValue) -> bool {
     let BoonValue::Record(fields) = value else {
         return false;
@@ -55310,7 +57111,1165 @@ fn generic_constructor_kind(function: &str) -> &'static str {
         "Light/directional" => "DirectionalLight",
         "Light/ambient" => "AmbientLight",
         "Light/spot" => "SpotLight",
+        "World/new" => "World",
+        "World/camera" => "Camera",
+        "World/perspective_camera" | "Camera/perspective" => "PerspectiveCamera",
+        "World/light" => "DirectionalLight",
+        "World/point_light" => "PointLight",
+        "World/material" => "AppearanceMaterial",
+        "World/transform" => "Transform3D",
+        "World/primitive" => "PrimitiveGeometry",
+        "World/indexed_mesh" => "IndexedMesh",
+        "World/model" | "World/instance" => "ModelInstance",
+        "World/group" => "Group",
+        "Assembly/new" => "Assembly",
+        "Part/new" => "Part",
+        "Part/instance" => "PartInstance",
+        "Solid/box" => "SolidBox",
+        "Solid/rounded_box" => "SolidRoundedBox",
+        "Solid/sphere" => "SolidSphere",
+        "Solid/cylinder" => "SolidCylinder",
+        "Solid/cone" => "SolidCone",
+        "Solid/torus" => "SolidTorus",
+        "Solid/extrude" => "SolidExtrude",
+        "Solid/revolve" => "SolidRevolve",
+        "Solid/loft" => "SolidLoft",
+        "Solid/shell" => "SolidShell",
+        "Solid/union" => "SolidUnion",
+        "Solid/difference" => "SolidDifference",
+        "Solid/translate" => "SolidTransform",
         _ => "Record",
+    }
+}
+
+struct SolidLoweringContext {
+    geometry: solid_model::GeometryLogicalId,
+    nodes: BTreeMap<solid_model::SolidNodeId, solid_model::SolidNode>,
+    profiles: BTreeMap<solid_model::ProfileId, solid_model::ProfileSummary>,
+    next_node: u64,
+    next_profile: u64,
+}
+
+impl SolidLoweringContext {
+    fn new(geometry: solid_model::GeometryLogicalId) -> Self {
+        Self {
+            geometry,
+            nodes: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            next_node: 1,
+            next_profile: 1,
+        }
+    }
+
+    fn push_node(
+        &mut self,
+        op: solid_model::SolidOp,
+        bounds: solid_model::Aabb64,
+    ) -> solid_model::SolidNodeId {
+        let id = solid_model::SolidNodeId(self.next_node);
+        self.next_node = self.next_node.saturating_add(1);
+        self.nodes.insert(
+            id,
+            solid_model::SolidNode {
+                id,
+                logical_id: self.geometry,
+                op,
+                bounds,
+                feature_id: solid_model::FeatureId(id.0),
+                physical_region: solid_model::RegionId(id.0),
+            },
+        );
+        id
+    }
+
+    fn push_rect_profile(&mut self, size: solid_model::Vec3d) -> solid_model::ProfileId {
+        let id = solid_model::ProfileId(self.next_profile);
+        self.next_profile = self.next_profile.saturating_add(1);
+        self.profiles.insert(
+            id,
+            solid_model::ProfileSummary {
+                bounds: solid_model::Aabb64::from_center_size(
+                    solid_model::Vec3d::ZERO,
+                    solid_model::Vec3d::new(size.x.abs(), size.y.abs(), 0.0),
+                ),
+                segment_count: 4,
+                closed: true,
+            },
+        );
+        id
+    }
+
+    fn push_radial_rect_profile(
+        &mut self,
+        inner_radius: f64,
+        outer_radius: f64,
+        height: f64,
+    ) -> solid_model::ProfileId {
+        let id = solid_model::ProfileId(self.next_profile);
+        self.next_profile = self.next_profile.saturating_add(1);
+        let min_radius = inner_radius.abs().min(outer_radius.abs());
+        let max_radius = inner_radius.abs().max(outer_radius.abs());
+        self.profiles.insert(
+            id,
+            solid_model::ProfileSummary {
+                bounds: solid_model::Aabb64 {
+                    min: solid_model::Vec3d::new(min_radius, 0.0, -height.abs() * 0.5),
+                    max: solid_model::Vec3d::new(max_radius, 0.0, height.abs() * 0.5),
+                },
+                segment_count: 4,
+                closed: true,
+            },
+        );
+        id
+    }
+
+    fn push_rect_profile_at_z(
+        &mut self,
+        size: solid_model::Vec3d,
+        z: f64,
+    ) -> solid_model::ProfileId {
+        let id = solid_model::ProfileId(self.next_profile);
+        self.next_profile = self.next_profile.saturating_add(1);
+        self.profiles.insert(
+            id,
+            solid_model::ProfileSummary {
+                bounds: solid_model::Aabb64::from_center_size(
+                    solid_model::Vec3d::new(0.0, 0.0, z),
+                    solid_model::Vec3d::new(size.x.abs(), size.y.abs(), 0.0),
+                ),
+                segment_count: 4,
+                closed: true,
+            },
+        );
+        id
+    }
+
+    fn node_bounds(&self, id: solid_model::SolidNodeId) -> RuntimeResult<solid_model::Aabb64> {
+        self.nodes
+            .get(&id)
+            .map(|node| node.bounds)
+            .ok_or_else(|| format!("solid node {:?} missing during lowering", id).into())
+    }
+}
+
+fn lower_solid_model_from_boon_value(
+    value: &BoonValue,
+) -> RuntimeResult<solid_model::SolidModelBundle> {
+    let assembly_record =
+        world_record_with_constructor(value, "Assembly/new", "manufacturing assembly output")?;
+    let assembly_id =
+        solid_model::AssemblyId(solid_id_from_record(assembly_record, "id", "assembly", 1)?);
+    let mut solids = BTreeMap::new();
+    let mut parts = BTreeMap::new();
+    let part_values = assembly_record
+        .get("parts")
+        .ok_or("manufacturing assembly requires `parts`")?;
+    for (index, part_value) in world_list_items(part_values, "manufacturing assembly parts")?
+        .iter()
+        .enumerate()
+    {
+        let part_record = world_record_with_constructor(part_value, "Part/new", "assembly part")?;
+        let part_id = solid_model::PartId(solid_id_from_record(
+            part_record,
+            "id",
+            "part",
+            (index + 1) as u64,
+        )?);
+        let geometry_value = part_record
+            .get("geometry")
+            .or_else(|| part_record.get("solid"))
+            .ok_or("assembly part requires `geometry`")?;
+        let geometry_id = solid_model::GeometryLogicalId(
+            world_text_field(part_record, &["geometry_id", "geometry_name", "id"])
+                .map(|name| solid_stable_id("geometry", &name))
+                .unwrap_or(part_id.0),
+        );
+        let graph = lower_solid_graph_from_boon_value(geometry_value, geometry_id)?;
+        let root = graph.root;
+        solids.insert(geometry_id, graph);
+        parts.insert(
+            part_id,
+            solid_model::PartDefinition {
+                id: part_id,
+                geometry: geometry_id,
+                root,
+                appearance: world_text_field(part_record, &["appearance", "material"]).map(
+                    |name| solid_model::AppearanceMaterialId(solid_stable_id("appearance", &name)),
+                ),
+                physical_material: world_text_field(part_record, &["physical_material"]).map(
+                    |name| {
+                        solid_model::PhysicalMaterialId(solid_stable_id("physical_material", &name))
+                    },
+                ),
+                manufacturing_role: solid_manufacturing_role(
+                    world_text_field(part_record, &["manufacturing_role", "role"]).as_deref(),
+                ),
+            },
+        );
+    }
+
+    let mut instances = Vec::new();
+    if let Some(instance_values) = assembly_record.get("instances") {
+        for (index, instance_value) in
+            world_list_items(instance_values, "manufacturing assembly instances")?
+                .iter()
+                .enumerate()
+        {
+            let instance_record = world_record_with_constructor(
+                instance_value,
+                "Part/instance",
+                "assembly part instance",
+            )?;
+            let part = solid_model::PartId(solid_id_from_record(
+                instance_record,
+                "part",
+                "part",
+                (index + 1) as u64,
+            )?);
+            instances.push(solid_model::PartInstance {
+                id: solid_model::PartInstanceId(solid_id_from_record(
+                    instance_record,
+                    "id",
+                    "part_instance",
+                    (index + 1) as u64,
+                )?),
+                part,
+                transform: instance_record
+                    .get("transform")
+                    .map(solid_transform_from_value)
+                    .transpose()?
+                    .unwrap_or(solid_model::Mat4d::IDENTITY),
+                label: world_text_field(instance_record, &["label"])
+                    .unwrap_or_else(|| format!("Part instance {}", index.saturating_add(1))),
+            });
+        }
+    }
+    if instances.is_empty() {
+        instances.extend(
+            parts
+                .keys()
+                .enumerate()
+                .map(|(index, part)| solid_model::PartInstance {
+                    id: solid_model::PartInstanceId((index + 1) as u64),
+                    part: *part,
+                    transform: solid_model::Mat4d::IDENTITY,
+                    label: format!("Part {}", index.saturating_add(1)),
+                }),
+        );
+    }
+
+    Ok(solid_model::SolidModelBundle {
+        solids,
+        assembly: solid_model::AssemblyGraph {
+            id: assembly_id,
+            parts,
+            instances,
+            constraints: Vec::new(),
+        },
+    })
+}
+
+fn solid_model_structural_ref_name(value: &BoonValue) -> Option<String> {
+    match value {
+        BoonValue::Text(value) | BoonValue::Enum(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn lower_solid_graph_from_boon_value(
+    value: &BoonValue,
+    geometry: solid_model::GeometryLogicalId,
+) -> RuntimeResult<solid_model::SolidGraph> {
+    let mut context = SolidLoweringContext::new(geometry);
+    let root = lower_solid_node_from_boon_value(value, &mut context)?;
+    Ok(solid_model::SolidGraph {
+        nodes: context.nodes,
+        root,
+        units: solid_model::Units::Millimeter,
+        tolerance: solid_model::ManufacturingTolerance::default(),
+        profiles: context.profiles,
+        curves: BTreeMap::new(),
+    })
+}
+
+fn lower_solid_node_from_boon_value(
+    value: &BoonValue,
+    context: &mut SolidLoweringContext,
+) -> RuntimeResult<solid_model::SolidNodeId> {
+    if !matches!(value, BoonValue::Record(_)) {
+        let detail = match value {
+            BoonValue::List(items) => format!(
+                "LIST len={} first={} first_keys={}",
+                items.len(),
+                items.first().map(boon_value_kind_label).unwrap_or("EMPTY"),
+                items
+                    .first()
+                    .and_then(|value| match value {
+                        BoonValue::Record(fields) =>
+                            Some(fields.keys().cloned().collect::<Vec<_>>().join(",")),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            ),
+            _ => boon_value_kind_label(value).to_owned(),
+        };
+        return Err(format!("solid geometry must be a constructor record, got {detail}",).into());
+    }
+    let record = world_record_with_any_constructor(
+        value,
+        &[
+            "Solid/box",
+            "Solid/rounded_box",
+            "Solid/sphere",
+            "Solid/cylinder",
+            "Solid/cone",
+            "Solid/torus",
+            "Solid/extrude",
+            "Solid/revolve",
+            "Solid/loft",
+            "Solid/shell",
+            "Solid/union",
+            "Solid/difference",
+            "Solid/translate",
+        ],
+        "solid geometry",
+    )?;
+    match world_constructor(record).unwrap_or_default() {
+        "Solid/box" => {
+            let size =
+                solid_vec3_field(record, "size")?.unwrap_or(solid_model::Vec3d::new(1.0, 1.0, 1.0));
+            Ok(context.push_node(
+                solid_model::SolidOp::Box { size },
+                solid_model::Aabb64::from_center_size(solid_model::Vec3d::ZERO, size),
+            ))
+        }
+        "Solid/rounded_box" => {
+            let size =
+                solid_vec3_field(record, "size")?.unwrap_or(solid_model::Vec3d::new(1.0, 1.0, 1.0));
+            Ok(context.push_node(
+                solid_model::SolidOp::RoundedBox {
+                    size,
+                    radius: world_f32_field(record, &["radius"]).unwrap_or(0.0) as f64,
+                },
+                solid_model::Aabb64::from_center_size(solid_model::Vec3d::ZERO, size),
+            ))
+        }
+        "Solid/sphere" => {
+            let radius = world_f32_field(record, &["radius"]).unwrap_or(0.5) as f64;
+            let size = solid_model::Vec3d::new(radius * 2.0, radius * 2.0, radius * 2.0);
+            Ok(context.push_node(
+                solid_model::SolidOp::Sphere { radius },
+                solid_model::Aabb64::from_center_size(solid_model::Vec3d::ZERO, size),
+            ))
+        }
+        "Solid/cylinder" => {
+            let radius = world_f32_field(record, &["radius"]).unwrap_or(0.5) as f64;
+            let height = world_f32_field(record, &["height"]).unwrap_or(1.0) as f64;
+            Ok(context.push_node(
+                solid_model::SolidOp::Cylinder { radius, height },
+                solid_model::Aabb64::from_cylinder_z(solid_model::Vec3d::ZERO, radius, height),
+            ))
+        }
+        "Solid/cone" => {
+            let radius0 = world_f32_field(record, &["radius0", "bottom_radius", "radius"])
+                .unwrap_or(0.5) as f64;
+            let radius1 = world_f32_field(record, &["radius1", "top_radius"]).unwrap_or(0.0) as f64;
+            let height = world_f32_field(record, &["height"]).unwrap_or(1.0) as f64;
+            Ok(context.push_node(
+                solid_model::SolidOp::Cone {
+                    radius0,
+                    radius1,
+                    height,
+                },
+                solid_model::Aabb64::from_cylinder_z(
+                    solid_model::Vec3d::ZERO,
+                    radius0.abs().max(radius1.abs()),
+                    height,
+                ),
+            ))
+        }
+        "Solid/torus" => {
+            let major_radius =
+                world_f32_field(record, &["major_radius", "radius"]).unwrap_or(1.0) as f64;
+            let minor_radius =
+                world_f32_field(record, &["minor_radius", "tube_radius"]).unwrap_or(0.25) as f64;
+            let outer_radius = major_radius.abs() + minor_radius.abs();
+            Ok(context.push_node(
+                solid_model::SolidOp::Torus {
+                    major_radius,
+                    minor_radius,
+                },
+                solid_model::Aabb64::from_center_size(
+                    solid_model::Vec3d::ZERO,
+                    solid_model::Vec3d::new(
+                        outer_radius * 2.0,
+                        outer_radius * 2.0,
+                        minor_radius.abs() * 2.0,
+                    ),
+                ),
+            ))
+        }
+        "Solid/extrude" => {
+            let profile_size = solid_vec3_field(record, "size")?
+                .or(solid_vec3_field(record, "profile_size")?)
+                .unwrap_or(solid_model::Vec3d::new(1.0, 1.0, 0.0));
+            let height = world_f32_field(record, &["height", "z"]).unwrap_or(1.0) as f64;
+            let profile = context.push_rect_profile(profile_size);
+            let bounds = solid_model::Aabb64::from_center_size(
+                solid_model::Vec3d::ZERO,
+                solid_model::Vec3d::new(profile_size.x.abs(), profile_size.y.abs(), height.abs()),
+            );
+            Ok(context.push_node(solid_model::SolidOp::Extrude { profile, height }, bounds))
+        }
+        "Solid/revolve" => {
+            let inner_radius = world_f32_field(record, &["inner_radius"]).unwrap_or(0.0) as f64;
+            let outer_radius =
+                world_f32_field(record, &["outer_radius", "radius"]).unwrap_or(1.0) as f64;
+            let height = world_f32_field(record, &["height"]).unwrap_or(1.0) as f64;
+            let profile = context.push_radial_rect_profile(inner_radius, outer_radius, height);
+            let radius = outer_radius.abs().max(inner_radius.abs());
+            let bounds = solid_model::Aabb64::from_center_size(
+                solid_model::Vec3d::ZERO,
+                solid_model::Vec3d::new(radius * 2.0, radius * 2.0, height.abs()),
+            );
+            Ok(context.push_node(
+                solid_model::SolidOp::Revolve {
+                    profile,
+                    axis: solid_model::Axis3d {
+                        origin: solid_model::Vec3d::ZERO,
+                        direction: solid_model::Vec3d::new(0.0, 0.0, 1.0),
+                    },
+                },
+                bounds,
+            ))
+        }
+        "Solid/loft" => {
+            let bottom_size = solid_vec3_field(record, "bottom_size")?
+                .or(solid_vec3_field(record, "base_size")?)
+                .unwrap_or(solid_model::Vec3d::new(1.0, 1.0, 0.0));
+            let top_size = solid_vec3_field(record, "top_size")?
+                .or(solid_vec3_field(record, "cap_size")?)
+                .unwrap_or(solid_model::Vec3d::new(
+                    bottom_size.x * 0.5,
+                    bottom_size.y * 0.5,
+                    0.0,
+                ));
+            let height = world_f32_field(record, &["height", "z"]).unwrap_or(1.0) as f64;
+            let half_height = height.abs() * 0.5;
+            let bottom_profile = context.push_rect_profile_at_z(bottom_size, -half_height);
+            let top_profile = context.push_rect_profile_at_z(top_size, half_height);
+            let bounds = solid_model::Aabb64::from_center_size(
+                solid_model::Vec3d::ZERO,
+                solid_model::Vec3d::new(
+                    bottom_size.x.abs().max(top_size.x.abs()),
+                    bottom_size.y.abs().max(top_size.y.abs()),
+                    height.abs(),
+                ),
+            );
+            Ok(context.push_node(
+                solid_model::SolidOp::Loft {
+                    profiles: vec![bottom_profile, top_profile],
+                },
+                bounds,
+            ))
+        }
+        "Solid/shell" => {
+            let child_value = record
+                .get("child")
+                .or_else(|| record.get("input"))
+                .ok_or("Solid/shell requires `child`")?;
+            let thickness = world_f32_field(record, &["thickness"]).unwrap_or(0.4) as f64;
+            let child = lower_solid_node_from_boon_value(child_value, context)?;
+            Ok(context.push_node(
+                solid_model::SolidOp::Shell { child, thickness },
+                context.node_bounds(child)?,
+            ))
+        }
+        "Solid/union" => {
+            let child_values = record
+                .get("items")
+                .or_else(|| record.get("children"))
+                .ok_or("Solid/union requires `items`")?;
+            let mut children = Vec::new();
+            let mut bounds = solid_model::Aabb64::EMPTY;
+            for child_value in world_list_items(child_values, "Solid/union items")? {
+                let child = lower_solid_node_from_boon_value(child_value, context)?;
+                children.push(child);
+                bounds = bounds.union(context.node_bounds(child)?);
+            }
+            if children.is_empty() {
+                return Err("Solid/union requires at least one child".into());
+            }
+            Ok(context.push_node(solid_model::SolidOp::Union { children }, bounds))
+        }
+        "Solid/difference" => {
+            let base_value = record
+                .get("base")
+                .ok_or("Solid/difference requires `base`")?;
+            let base = lower_solid_node_from_boon_value(base_value, context)?;
+            let mut tools = Vec::new();
+            if let Some(tool_values) = record.get("tools") {
+                for tool_value in world_list_items(tool_values, "Solid/difference tools")? {
+                    tools.push(lower_solid_node_from_boon_value(tool_value, context)?);
+                }
+            }
+            Ok(context.push_node(
+                solid_model::SolidOp::Difference { base, tools },
+                context.node_bounds(base)?,
+            ))
+        }
+        "Solid/translate" => {
+            let child_value = record
+                .get("child")
+                .or_else(|| record.get("input"))
+                .ok_or("Solid/translate requires `child`")?;
+            let by = solid_vec3_field(record, "by")?.unwrap_or(solid_model::Vec3d::ZERO);
+            let child = lower_solid_node_from_boon_value(child_value, context)?;
+            Ok(context.push_node(
+                solid_model::SolidOp::Transform {
+                    child,
+                    transform: solid_model::Mat4d::translation(by),
+                },
+                context.node_bounds(child)?.translate(by),
+            ))
+        }
+        other => Err(format!("unsupported solid constructor `{other}`").into()),
+    }
+}
+
+fn solid_manufacturing_role(value: Option<&str>) -> solid_model::ManufacturingRole {
+    match value.unwrap_or("PrintableSolid") {
+        "VisualOnly" | "visual_only" => solid_model::ManufacturingRole::VisualOnly,
+        "VoidModifier" | "void_modifier" => solid_model::ManufacturingRole::VoidModifier,
+        "SupportModifier" | "support_modifier" => solid_model::ManufacturingRole::SupportModifier,
+        "InfillModifier" | "infill_modifier" => solid_model::ManufacturingRole::InfillModifier,
+        "Reference" | "reference" => solid_model::ManufacturingRole::Reference,
+        _ => solid_model::ManufacturingRole::PrintableSolid,
+    }
+}
+
+fn solid_transform_from_value(value: &BoonValue) -> RuntimeResult<solid_model::Mat4d> {
+    let record =
+        world_record_with_constructor(value, "Solid/translate", "solid instance transform")?;
+    Ok(solid_model::Mat4d::translation(
+        solid_vec3_field(record, "by")?.unwrap_or(solid_model::Vec3d::ZERO),
+    ))
+}
+
+fn solid_vec3_field(
+    record: &BTreeMap<String, BoonValue>,
+    name: &str,
+) -> RuntimeResult<Option<solid_model::Vec3d>> {
+    let Some(value) = record.get(name) else {
+        return Ok(None);
+    };
+    Ok(Some(solid_vec3_value(value)?))
+}
+
+fn solid_vec3_value(value: &BoonValue) -> RuntimeResult<solid_model::Vec3d> {
+    match value {
+        BoonValue::Record(fields) => Ok(solid_model::Vec3d::new(
+            world_f32_field(fields, &["x"]).unwrap_or(0.0) as f64,
+            world_f32_field(fields, &["y"]).unwrap_or(0.0) as f64,
+            world_f32_field(fields, &["z"]).unwrap_or(0.0) as f64,
+        )),
+        _ => Err("solid vec3 value must be a record with x/y/z fields".into()),
+    }
+}
+
+fn solid_id_from_record(
+    record: &BTreeMap<String, BoonValue>,
+    field: &str,
+    namespace: &str,
+    fallback: u64,
+) -> RuntimeResult<u64> {
+    world_id_from_record(record, field, namespace, fallback)
+}
+
+fn solid_stable_id(namespace: &str, value: &str) -> u64 {
+    world_stable_id(namespace, value)
+}
+
+fn lower_world_scene_from_boon_value(value: &BoonValue) -> RuntimeResult<WorldScene> {
+    let world = world_record_with_constructor(value, "World/new", "world output")?;
+    let camera = world
+        .get("camera")
+        .map(|value| lower_world_camera(value, 1))
+        .transpose()?
+        .unwrap_or_else(default_world_camera);
+    let mut cameras = BTreeMap::new();
+    cameras.insert(camera.id, camera);
+
+    let lights = world
+        .get("lights")
+        .map(|value| lower_world_lights(value))
+        .transpose()?
+        .unwrap_or_default();
+    let geometries = world
+        .get("geometries")
+        .or_else(|| world.get("geometry"))
+        .map(|value| lower_world_geometries(value))
+        .transpose()?
+        .unwrap_or_default();
+    let appearances = world
+        .get("materials")
+        .or_else(|| world.get("appearances"))
+        .map(|value| lower_world_appearances(value))
+        .transpose()?
+        .unwrap_or_default();
+    let instances_value = world.get("instances").or_else(|| world.get("objects"));
+    let instances = instances_value
+        .map(|value| lower_world_instances(value, &geometries, &appearances))
+        .transpose()?
+        .unwrap_or_default();
+    let semantics = instances_value
+        .map(|value| lower_world_instance_semantics(value, &instances))
+        .transpose()?
+        .unwrap_or_else(|| default_world_instance_semantics(&instances));
+
+    Ok(WorldScene {
+        cameras,
+        lights,
+        geometries,
+        appearances,
+        instances,
+        semantics,
+        selection: None,
+    })
+}
+
+fn lower_world_camera(value: &BoonValue, fallback_index: u64) -> RuntimeResult<Camera> {
+    let record = world_record_with_any_constructor(
+        value,
+        &[
+            "World/camera",
+            "World/perspective_camera",
+            "Camera/perspective",
+        ],
+        "world camera",
+    )?;
+    let id = CameraId(world_id_from_record(
+        record,
+        "id",
+        "camera",
+        fallback_index,
+    )?);
+    let transform = record
+        .get("transform")
+        .map(lower_world_transform)
+        .transpose()?
+        .unwrap_or(Transform3D::IDENTITY);
+    let vertical_fov_degrees =
+        world_f32_field(record, &["vertical_fov_degrees", "vertical_fov"]).unwrap_or(55.0);
+    let near = world_f32_field(record, &["near"]).unwrap_or(0.01);
+    let far = world_f32_field(record, &["far"]).unwrap_or(1_000.0);
+    Ok(Camera {
+        id,
+        projection: CameraProjection::Perspective {
+            vertical_fov_degrees,
+            near,
+            far,
+        },
+        transform,
+    })
+}
+
+fn default_world_camera() -> Camera {
+    Camera {
+        id: CameraId(1),
+        projection: CameraProjection::Perspective {
+            vertical_fov_degrees: 55.0,
+            near: 0.01,
+            far: 1_000.0,
+        },
+        transform: Transform3D {
+            translation: [0.0, 1.5, 6.0],
+            ..Transform3D::IDENTITY
+        },
+    }
+}
+
+fn lower_world_lights(value: &BoonValue) -> RuntimeResult<BTreeMap<LightId, Light>> {
+    let mut lights = BTreeMap::new();
+    for (index, value) in world_list_items(value, "world lights")?.iter().enumerate() {
+        let record = world_record_with_any_constructor(
+            value,
+            &["World/light", "World/point_light", "Light/directional"],
+            "world light",
+        )?;
+        let id = LightId(world_id_from_record(
+            record,
+            "id",
+            "light",
+            (index + 1) as u64,
+        )?);
+        let kind = match world_constructor(record).unwrap_or_default() {
+            "World/point_light" => LightKind::Point {
+                radius: world_f32_field(record, &["radius"]).unwrap_or(1.0),
+            },
+            _ => LightKind::Directional,
+        };
+        let light = Light {
+            id,
+            kind,
+            color: world_vec3_field(record, "color")?.unwrap_or([1.0, 1.0, 1.0]),
+            intensity: world_f32_field(record, &["intensity", "illuminance"]).unwrap_or(3.0),
+            transform: record
+                .get("transform")
+                .map(lower_world_transform)
+                .transpose()?
+                .unwrap_or(Transform3D::IDENTITY),
+        };
+        lights.insert(id, light);
+    }
+    Ok(lights)
+}
+
+fn lower_world_geometries(
+    value: &BoonValue,
+) -> RuntimeResult<BTreeMap<GeometryLogicalId, GeometryResource>> {
+    let mut geometries = BTreeMap::new();
+    for (index, value) in world_list_items(value, "world geometries")?
+        .iter()
+        .enumerate()
+    {
+        let record = world_record_with_any_constructor(
+            value,
+            &["World/primitive", "World/indexed_mesh"],
+            "world geometry",
+        )?;
+        let id = GeometryLogicalId(world_id_from_record(
+            record,
+            "id",
+            "geometry",
+            (index + 1) as u64,
+        )?);
+        let revision = GeometryRevision(
+            world_i64_field(record, &["revision"])
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(1),
+        );
+        let kind = match world_constructor(record).unwrap_or_default() {
+            "World/indexed_mesh" => GeometryKind::IndexedMeshSummary {
+                vertex_count: world_i64_field(record, &["vertex_count"])
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0),
+                index_count: world_i64_field(record, &["index_count"])
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0),
+                bounds: Bounds3D {
+                    min: [-0.5, -0.5, -0.5],
+                    max: [0.5, 0.5, 0.5],
+                },
+            },
+            _ => GeometryKind::SharedPrimitive(lower_world_primitive(record)?),
+        };
+        geometries.insert(id, GeometryResource { id, revision, kind });
+    }
+    Ok(geometries)
+}
+
+fn lower_world_primitive(record: &BTreeMap<String, BoonValue>) -> RuntimeResult<PrimitiveGeometry> {
+    let kind = world_text_field(record, &["primitive", "shape", "kind"])
+        .unwrap_or_else(|| "Cube".to_owned());
+    match kind.as_str() {
+        "Cube" | "cube" => Ok(PrimitiveGeometry::Cube {
+            size: world_vec3_field(record, "size")?.unwrap_or([1.0, 1.0, 1.0]),
+        }),
+        "Sphere" | "sphere" => Ok(PrimitiveGeometry::Sphere {
+            radius: world_f32_field(record, &["radius"]).unwrap_or(0.5),
+            sectors: world_i64_field(record, &["sectors"])
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(32),
+            stacks: world_i64_field(record, &["stacks"])
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(16),
+        }),
+        "Cylinder" | "cylinder" => Ok(PrimitiveGeometry::Cylinder {
+            radius: world_f32_field(record, &["radius"]).unwrap_or(0.5),
+            height: world_f32_field(record, &["height"]).unwrap_or(1.0),
+            segments: world_i64_field(record, &["segments"])
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(32),
+        }),
+        other => Err(format!("world primitive kind `{other}` is not supported yet").into()),
+    }
+}
+
+fn lower_world_appearances(
+    value: &BoonValue,
+) -> RuntimeResult<BTreeMap<AppearanceMaterialId, AppearanceMaterial>> {
+    let mut appearances = BTreeMap::new();
+    for (index, value) in world_list_items(value, "world materials")?
+        .iter()
+        .enumerate()
+    {
+        let record = world_record_with_constructor(value, "World/material", "world material")?;
+        let id = AppearanceMaterialId(world_id_from_record(
+            record,
+            "id",
+            "appearance",
+            (index + 1) as u64,
+        )?);
+        appearances.insert(
+            id,
+            AppearanceMaterial {
+                id,
+                base_color: world_color_field(record, "base_color")?
+                    .unwrap_or([0.2, 0.55, 0.95, 1.0]),
+                roughness: world_f32_field(record, &["roughness"]).unwrap_or(0.62),
+                metallic: world_f32_field(record, &["metallic"]).unwrap_or(0.0),
+                emissive: world_vec3_field(record, "emissive")?.unwrap_or([0.0, 0.0, 0.0]),
+            },
+        );
+    }
+    Ok(appearances)
+}
+
+fn lower_world_instances(
+    value: &BoonValue,
+    geometries: &BTreeMap<GeometryLogicalId, GeometryResource>,
+    appearances: &BTreeMap<AppearanceMaterialId, AppearanceMaterial>,
+) -> RuntimeResult<BTreeMap<boon_scene_model::InstanceId, ModelInstance>> {
+    let default_geometry = geometries
+        .keys()
+        .next()
+        .copied()
+        .unwrap_or(GeometryLogicalId(1));
+    let default_geometry_revision = geometries
+        .get(&default_geometry)
+        .map(|geometry| geometry.revision)
+        .unwrap_or(GeometryRevision(1));
+    let default_appearance = appearances
+        .keys()
+        .next()
+        .copied()
+        .unwrap_or(AppearanceMaterialId(1));
+    let mut instances = BTreeMap::new();
+    for (index, value) in world_list_items(value, "world instances")?
+        .iter()
+        .enumerate()
+    {
+        let record = world_record_with_any_constructor(
+            value,
+            &["World/model", "World/instance"],
+            "world model instance",
+        )?;
+        let id = boon_scene_model::InstanceId(world_id_from_record(
+            record,
+            "id",
+            "instance",
+            (index + 1) as u64,
+        )?);
+        let geometry = world_text_field(record, &["geometry"])
+            .map(|name| world_stable_id("geometry", &name))
+            .map(GeometryLogicalId)
+            .unwrap_or(default_geometry);
+        let appearance = world_text_field(record, &["material", "appearance"])
+            .map(|name| world_stable_id("appearance", &name))
+            .map(AppearanceMaterialId)
+            .unwrap_or(default_appearance);
+        let part_id = world_text_field(record, &["part_id", "part"])
+            .map(|name| world_stable_id("part", &name))
+            .map(PartId)
+            .unwrap_or(PartId((index + 1) as u64));
+        let feature_id = world_text_field(record, &["feature_id", "feature"])
+            .map(|name| world_stable_id("feature", &name))
+            .map(FeatureId)
+            .unwrap_or(FeatureId((index + 1) as u64));
+        let pick_id = world_i64_field(record, &["pick_id", "pick"])
+            .and_then(|value| u32::try_from(value).ok())
+            .map(PickId)
+            .unwrap_or(PickId((index + 1) as u32));
+        instances.insert(
+            id,
+            ModelInstance {
+                id,
+                geometry,
+                geometry_revision: geometries
+                    .get(&geometry)
+                    .map(|geometry| geometry.revision)
+                    .unwrap_or(default_geometry_revision),
+                transform: record
+                    .get("transform")
+                    .map(lower_world_transform)
+                    .transpose()?
+                    .unwrap_or(Transform3D::IDENTITY),
+                appearance,
+                part_id,
+                feature_id,
+                pick_id,
+                visibility: world_bool_field(record, &["visible"])
+                    .map(|visible| {
+                        if visible {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Hidden
+                        }
+                    })
+                    .unwrap_or(Visibility::Visible),
+            },
+        );
+    }
+    Ok(instances)
+}
+
+fn default_world_instance_semantics(
+    instances: &BTreeMap<boon_scene_model::InstanceId, ModelInstance>,
+) -> BTreeMap<boon_scene_model::InstanceId, WorldSemanticBinding> {
+    instances
+        .values()
+        .map(|instance| {
+            (
+                instance.id,
+                WorldSemanticBinding {
+                    instance: instance.id,
+                    semantic_id: format!("world:instance:{}", instance.id.0),
+                    label: format!("Instance {}", instance.id.0),
+                    part_id: instance.part_id,
+                    feature_id: instance.feature_id,
+                },
+            )
+        })
+        .collect()
+}
+
+fn lower_world_instance_semantics(
+    value: &BoonValue,
+    instances: &BTreeMap<boon_scene_model::InstanceId, ModelInstance>,
+) -> RuntimeResult<BTreeMap<boon_scene_model::InstanceId, WorldSemanticBinding>> {
+    let mut semantics = BTreeMap::new();
+    for (index, value) in world_list_items(value, "world instance semantics")?
+        .iter()
+        .enumerate()
+    {
+        let record = world_record_with_any_constructor(
+            value,
+            &["World/model", "World/instance"],
+            "world model semantic identity",
+        )?;
+        let instance_id = boon_scene_model::InstanceId(world_id_from_record(
+            record,
+            "id",
+            "instance",
+            (index + 1) as u64,
+        )?);
+        let Some(instance) = instances.get(&instance_id) else {
+            continue;
+        };
+        let source_id = world_text_field(record, &["semantic_id", "semantic", "id"])
+            .unwrap_or_else(|| instance.id.0.to_string());
+        let semantic_id = if source_id.contains(':') {
+            source_id.clone()
+        } else {
+            format!("world:instance:{source_id}")
+        };
+        let label = world_text_field(record, &["label", "name", "id"]).unwrap_or(source_id);
+        semantics.insert(
+            instance.id,
+            WorldSemanticBinding {
+                instance: instance.id,
+                semantic_id,
+                label,
+                part_id: instance.part_id,
+                feature_id: instance.feature_id,
+            },
+        );
+    }
+    if semantics.len() == instances.len() {
+        Ok(semantics)
+    } else {
+        let mut merged = default_world_instance_semantics(instances);
+        merged.extend(semantics);
+        Ok(merged)
+    }
+}
+
+fn lower_world_transform(value: &BoonValue) -> RuntimeResult<Transform3D> {
+    let record = world_record_with_constructor(value, "World/transform", "world transform")?;
+    let mut transform = Transform3D::IDENTITY;
+    if let Some(translation) = world_vec3_field(record, "translation")? {
+        transform.translation = translation;
+    }
+    if let Some(scale) = world_vec3_field(record, "scale")? {
+        transform.scale = scale;
+    }
+    if let Some(degrees) = world_f32_field(record, &["rotation_z_degrees"]) {
+        transform = transform.with_rotation_z_degrees(degrees);
+    }
+    Ok(transform)
+}
+
+fn world_record_with_constructor<'a>(
+    value: &'a BoonValue,
+    expected: &str,
+    context: &str,
+) -> RuntimeResult<&'a BTreeMap<String, BoonValue>> {
+    world_record_with_any_constructor(value, &[expected], context)
+}
+
+fn world_record_with_any_constructor<'a>(
+    value: &'a BoonValue,
+    expected: &[&str],
+    context: &str,
+) -> RuntimeResult<&'a BTreeMap<String, BoonValue>> {
+    let BoonValue::Record(record) = value else {
+        return Err(format!("{context} must be a constructor record").into());
+    };
+    let constructor = world_constructor(record).ok_or_else(|| {
+        format!("{context} must carry a `constructor` field for one of {expected:?}")
+    })?;
+    if !expected.contains(&constructor) {
+        return Err(
+            format!("{context} constructor `{constructor}` is not one of {expected:?}").into(),
+        );
+    }
+    Ok(record)
+}
+
+fn world_constructor(record: &BTreeMap<String, BoonValue>) -> Option<&str> {
+    match record.get("constructor") {
+        Some(BoonValue::Text(value) | BoonValue::Enum(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn world_list_items<'a>(value: &'a BoonValue, context: &str) -> RuntimeResult<&'a [BoonValue]> {
+    match value {
+        BoonValue::List(values) => Ok(values),
+        _ => Err(format!("{context} must be a LIST value").into()),
+    }
+}
+
+fn world_id_from_record(
+    record: &BTreeMap<String, BoonValue>,
+    field: &str,
+    namespace: &str,
+    fallback: u64,
+) -> RuntimeResult<u64> {
+    match record.get(field) {
+        Some(BoonValue::Number(value)) => u64::try_from(*value)
+            .map_err(|_| format!("world `{field}` must be non-negative").into()),
+        Some(value) => Ok(world_stable_id(namespace, &world_scalar_text(value))),
+        None => Ok(fallback),
+    }
+}
+
+fn world_stable_id(namespace: &str, value: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes).max(1)
+}
+
+fn world_text_field(record: &BTreeMap<String, BoonValue>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| record.get(*name).map(world_scalar_text))
+}
+
+fn world_i64_field(record: &BTreeMap<String, BoonValue>, names: &[&str]) -> Option<i64> {
+    names.iter().find_map(|name| match record.get(*name) {
+        Some(BoonValue::Number(value)) => Some(*value),
+        Some(value) => world_scalar_text(value).parse::<i64>().ok(),
+        None => None,
+    })
+}
+
+fn world_f32_field(record: &BTreeMap<String, BoonValue>, names: &[&str]) -> Option<f32> {
+    names.iter().find_map(|name| match record.get(*name) {
+        Some(BoonValue::Number(value)) => Some(*value as f32),
+        Some(value) => world_scalar_text(value).parse::<f32>().ok(),
+        None => None,
+    })
+}
+
+fn world_bool_field(record: &BTreeMap<String, BoonValue>, names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| match record.get(*name) {
+        Some(BoonValue::Bool(value)) => Some(*value),
+        Some(value) => match world_scalar_text(value).as_str() {
+            "True" | "true" => Some(true),
+            "False" | "false" => Some(false),
+            _ => None,
+        },
+        None => None,
+    })
+}
+
+fn world_vec3_field(
+    record: &BTreeMap<String, BoonValue>,
+    name: &str,
+) -> RuntimeResult<Option<[f32; 3]>> {
+    let Some(value) = record.get(name) else {
+        return Ok(None);
+    };
+    world_vec3_value(value).map(Some)
+}
+
+fn world_vec3_value(value: &BoonValue) -> RuntimeResult<[f32; 3]> {
+    match value {
+        BoonValue::Record(fields) => Ok([
+            world_f32_field(fields, &["x", "r"]).unwrap_or(0.0),
+            world_f32_field(fields, &["y", "g"]).unwrap_or(0.0),
+            world_f32_field(fields, &["z", "b"]).unwrap_or(0.0),
+        ]),
+        BoonValue::List(values) if values.len() >= 3 => Ok([
+            world_number_value(&values[0])?,
+            world_number_value(&values[1])?,
+            world_number_value(&values[2])?,
+        ]),
+        _ => Err("world Vec3 must be a record with x/y/z or a 3-item list".into()),
+    }
+}
+
+fn world_color_field(
+    record: &BTreeMap<String, BoonValue>,
+    name: &str,
+) -> RuntimeResult<Option<[f32; 4]>> {
+    let Some(value) = record.get(name) else {
+        return Ok(None);
+    };
+    match value {
+        BoonValue::Record(fields) => Ok(Some([
+            world_f32_field(fields, &["r", "x"]).unwrap_or(0.0),
+            world_f32_field(fields, &["g", "y"]).unwrap_or(0.0),
+            world_f32_field(fields, &["b", "z"]).unwrap_or(0.0),
+            world_f32_field(fields, &["a", "alpha"]).unwrap_or(1.0),
+        ])),
+        BoonValue::List(values) if values.len() >= 3 => Ok(Some([
+            world_number_value(&values[0])?,
+            world_number_value(&values[1])?,
+            world_number_value(&values[2])?,
+            values
+                .get(3)
+                .map(world_number_value)
+                .transpose()?
+                .unwrap_or(1.0),
+        ])),
+        _ => Err("world color must be a record with r/g/b/a or a 3-4 item list".into()),
+    }
+}
+
+fn world_number_value(value: &BoonValue) -> RuntimeResult<f32> {
+    match value {
+        BoonValue::Number(value) => Ok(*value as f32),
+        _ => world_scalar_text(value)
+            .parse::<f32>()
+            .map_err(|_| "world numeric value must be NUMBER-like".into()),
+    }
+}
+
+fn world_scalar_text(value: &BoonValue) -> String {
+    match value {
+        BoonValue::Text(value) | BoonValue::Enum(value) => value.clone(),
+        BoonValue::Number(value) => value.to_string(),
+        BoonValue::Bool(true) => "True".to_owned(),
+        BoonValue::Bool(false) => "False".to_owned(),
+        _ => String::new(),
     }
 }
 
@@ -58603,7 +61562,8 @@ impl GenericDerivedPlan {
             if self.list_has_root_list_view(&field.list) {
                 continue;
             }
-            for index in 0..runtime.list_len(&field.list)? {
+            let row_count = runtime.list_len(&field.list)?;
+            for index in 0..row_count {
                 keys.push(GenericDerivedKey {
                     list: field.list.clone(),
                     index,
@@ -59227,17 +62187,46 @@ impl GenericDerivedState {
         reads: &BTreeSet<GenericReadKey>,
         root_numbers: &BTreeMap<String, i64>,
     ) {
-        if reads.is_empty() || self.root_list_view_field_cache.is_empty() {
+        if reads.is_empty() {
             return;
         }
-        self.root_list_view_field_cache.retain(|_, entry| {
-            !cache_entry_invalidated_by_reads(
-                &entry.reads,
-                &entry.numeric_stability_guards,
-                reads,
-                root_numbers,
-            )
-        });
+        if !self.root_list_view_field_cache.is_empty() {
+            let invalidated = self
+                .root_list_view_field_cache
+                .iter()
+                .filter_map(|(key, entry)| {
+                    cache_entry_invalidated_by_reads(
+                        &entry.reads,
+                        &entry.numeric_stability_guards,
+                        reads,
+                        root_numbers,
+                    )
+                    .then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in invalidated {
+                self.root_list_view_field_cache.remove(&key);
+                self.root_list_view_recent_invalidated_field_cache_keys
+                    .entry(key.root_path.clone())
+                    .or_default()
+                    .insert(key);
+            }
+        }
+    }
+
+    fn recent_invalidated_root_list_view_field_cache_keys(
+        &self,
+        root_path: &str,
+    ) -> BTreeSet<RootListViewFieldCacheKey> {
+        self.root_list_view_recent_invalidated_field_cache_keys
+            .get(root_path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn clear_recent_invalidated_root_list_view_field_cache_keys(&mut self, root_path: &str) {
+        self.root_list_view_recent_invalidated_field_cache_keys
+            .remove(root_path);
     }
 
     fn invalidate_root_list_map_output_cache_for_reads(
@@ -73719,6 +76708,109 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn root_list_view_branch_field_skip_keeps_arm_scopes_separate() {
+        let source = r#"
+store: [
+    elements: [
+        variable_click: SOURCE
+        group_click: SOURCE
+    ]
+    variable_cursor:
+        TEXT { 1 } |> HOLD variable_cursor {
+            LATEST {
+                elements.variable_click.event.press |> THEN { TEXT { 2 } }
+            }
+        }
+    group_cursor:
+        TEXT { 1 } |> HOLD group_cursor {
+            LATEST {
+                elements.group_click.event.press |> THEN { TEXT { 2 } }
+            }
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, kind: VariableRow, name: TEXT { A }]
+            [id: TEXT { b }, kind: GroupRow, name: TEXT { B }]
+        }
+    projected:
+        rows |> List/map(row, new: dispatch_row(row: row))
+]
+
+FUNCTION dispatch_row(row) {
+    row.kind |> WHEN {
+        VariableRow => variable_row(row: row)
+        __ => group_row(row: row)
+    }
+}
+
+FUNCTION variable_row(row) {
+    [
+        id: row.id
+        label: row.name |> Text/concat(with: store.variable_cursor, separator: "/")
+        stable: row.name
+    ]
+}
+
+FUNCTION group_row(row) {
+    [
+        id: row.id
+        label: row.name |> Text/concat(with: store.group_cursor, separator: "/")
+        stable: row.name
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-branch-field-scope-skip", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][0]["label"],
+            "A/1"
+        );
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][1]["label"],
+            "B/1"
+        );
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.variable_click".to_owned(),
+                ..LiveSourceEvent::default()
+            })
+            .expect("variable click should only update the variable arm row");
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["projected"][0]["label"], "A/2");
+        assert_eq!(
+            summary["store"]["projected"][1]["label"], "B/1",
+            "group arm field with the same name must not be treated dirty by variable arm scope"
+        );
+
+        let profile = output
+            .root_materialization_stats
+            .samples
+            .iter()
+            .find(|sample| sample.path == "store.projected")
+            .and_then(|sample| sample.list_view_profile.as_ref())
+            .expect("projected root list-view sample should be profiled");
+        assert!(
+            profile.field_only_patch,
+            "branch rows should stay on the field-only patch path: {profile:?}"
+        );
+        assert_eq!(
+            profile.field_only_changed_field_count, 1,
+            "only the variable arm label should patch: {profile:?}"
+        );
+        assert_eq!(
+            profile.field_only_evaluated_field_count, 1,
+            "only the dirty variable arm field should be evaluated: {profile:?}"
+        );
+        assert!(
+            profile.field_only_skipped_field_count >= 5,
+            "clean active-arm fields and the clean group row should be skipped: {profile:?}"
+        );
+    }
+
+    #[test]
     fn root_list_view_branch_selector_dirty_falls_back_before_field_patch() {
         let source = r#"
 store: [
@@ -74042,6 +77134,200 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 .all(|(key, _)| key.env_fingerprint.is_empty()),
             "row-dependent projected fields should not duplicate the source row in the env fingerprint when source key/generation already identify it: {row_entries:?}"
         );
+    }
+
+    #[test]
+    fn root_list_view_compiled_frontier_profiles_direct_projector_dependencies() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { noop } |> HOLD noop { LATEST {} }
+    source_signals:
+        LIST {
+            [name: TEXT { A }, current: TEXT { old }]
+            [name: TEXT { B }, current: TEXT { new }]
+        }
+    projected:
+        source_signals |> List/map(signal, new: projected_row(signal: signal))
+]
+
+FUNCTION projected_row(signal) {
+    [
+        label: signal.name |> Text/concat(with: signal.current, separator: "=")
+        static_label: TEXT { static }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-compiled-frontier", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][0]["label"],
+            "A=old"
+        );
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.projected")
+            .expect("projected list view root should have a plan")
+            .clone();
+        let plan = generic
+            .root_list_view_field_only_plan(&field.statement)
+            .expect("projected list view should compile to a field-only plan");
+        let source_list = generic
+            .storage
+            .list_name_for_path("store.source_signals")
+            .expect("source signals should have a storage list")
+            .to_owned();
+        let row_index_source = RootListViewRowIndexSource::ListRef {
+            list: source_list.clone(),
+            len: 2,
+        };
+        let source_identities = (0..2)
+            .map(|index| {
+                generic.root_list_view_field_source_identity(&BoonValue::RowRef {
+                    list: source_list.clone(),
+                    index,
+                })
+            })
+            .collect::<RuntimeResult<Vec<_>>>()
+            .expect("source rows should expose reusable identities");
+        let mut dirty_reads = BTreeSet::new();
+        dirty_reads.insert(GenericReadKey::ListField {
+            list: source_list,
+            index: 0,
+            field: "name".to_owned(),
+        });
+
+        let stats = generic.root_list_view_compiled_frontier_stats(
+            &plan,
+            Some(&row_index_source),
+            &source_identities,
+            &dirty_reads,
+        );
+
+        assert_eq!(stats.field_count, 2, "{stats:?}");
+        assert_eq!(stats.classifiable_field_count, 2, "{stats:?}");
+        assert_eq!(stats.unclassified_field_count, 0, "{stats:?}");
+        assert_eq!(stats.row_dependent_field_count, 1, "{stats:?}");
+        assert_eq!(stats.whole_row_dependent_field_count, 0, "{stats:?}");
+        assert_eq!(stats.row_field_dependency_count, 2, "{stats:?}");
+        assert_eq!(stats.predicted_dirty_field_count, 1, "{stats:?}");
+        assert_eq!(stats.predicted_clean_field_count, 3, "{stats:?}");
+    }
+
+    #[test]
+    fn root_list_view_compiled_frontier_profiles_branch_projector_dependencies() {
+        let source = r#"
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { noop } |> HOLD noop { LATEST {} }
+    rows:
+        LIST {
+            [kind: VariableRow, name: TEXT { A }, current: TEXT { old }]
+            [kind: GroupRow, name: TEXT { B }, current: TEXT { new }]
+        }
+    projected:
+        rows |> List/map(row, new: dispatch_row(row: row))
+]
+
+FUNCTION dispatch_row(row) {
+    row.kind |> WHEN {
+        VariableRow => variable_row(row: row)
+        __ => group_row(row: row)
+    }
+}
+
+FUNCTION format_label(row) {
+    row.name |> Text/concat(with: row.current, separator: "=")
+}
+
+FUNCTION variable_row(row) {
+    [
+        label: format_label(row: row)
+        static_label: TEXT { variable }
+    ]
+}
+
+FUNCTION group_row(row) {
+    [
+        label: format_label(row: row)
+        static_label: TEXT { group }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-view-compiled-branch-frontier", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["projected"][0]["label"],
+            "A=old"
+        );
+        let generic = runtime
+            .runtime
+            .generic
+            .as_mut()
+            .expect("generic runtime should be available");
+        let field = generic
+            .generic_derived
+            .root_field_plan("store.projected")
+            .expect("projected list view root should have a plan")
+            .clone();
+        let plan = generic
+            .root_list_view_field_only_plan(&field.statement)
+            .expect("projected list view should compile to a field-only plan");
+        let source_list = generic
+            .storage
+            .list_name_for_path("store.rows")
+            .expect("rows should have a storage list")
+            .to_owned();
+        let row_index_source = RootListViewRowIndexSource::ListRef {
+            list: source_list.clone(),
+            len: 2,
+        };
+        let source_identities = (0..2)
+            .map(|index| {
+                generic.root_list_view_field_source_identity(&BoonValue::RowRef {
+                    list: source_list.clone(),
+                    index,
+                })
+            })
+            .collect::<RuntimeResult<Vec<_>>>()
+            .expect("source rows should expose reusable identities");
+        let mut dirty_reads = BTreeSet::new();
+        dirty_reads.insert(GenericReadKey::ListField {
+            list: source_list,
+            index: 0,
+            field: "name".to_owned(),
+        });
+
+        let stats = generic.root_list_view_compiled_frontier_stats(
+            &plan,
+            Some(&row_index_source),
+            &source_identities,
+            &dirty_reads,
+        );
+
+        assert_eq!(stats.field_count, 4, "{stats:?}");
+        assert_eq!(stats.classifiable_field_count, 4, "{stats:?}");
+        assert_eq!(stats.unclassified_field_count, 0, "{stats:?}");
+        assert_eq!(stats.row_dependent_field_count, 2, "{stats:?}");
+        assert_eq!(stats.whole_row_dependent_field_count, 0, "{stats:?}");
+        assert_eq!(stats.row_field_dependency_count, 4, "{stats:?}");
+        assert_eq!(stats.predicted_dirty_field_count, 2, "{stats:?}");
+        assert_eq!(stats.predicted_clean_field_count, 6, "{stats:?}");
     }
 
     #[test]
@@ -74829,6 +78115,91 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             deduped.len(),
             root_read_keys_for_path("store.value").len(),
             "store-local and leaf aliases that are equal must not be emitted twice"
+        );
+    }
+
+    #[test]
+    fn root_list_length_skips_row_field_only_dirty_changes() {
+        let source = r#"
+store: [
+    elements: [
+        cursor: SOURCE
+    ]
+    cursor:
+        TEXT { old } |> HOLD cursor {
+            LATEST {
+                elements.cursor.text
+            }
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }]
+            [id: TEXT { b }, name: TEXT { B }]
+        }
+    projected:
+        rows |> List/map(row, new: projected_row(row: row))
+    projected_count:
+        projected |> List/length()
+]
+
+FUNCTION projected_row(row) {
+    [
+        id: row.id
+        label: row.name |> Text/concat(with: store.cursor, separator: "/")
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: store.projected_count))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("root-list-length-row-field-skip", source).unwrap();
+        assert_eq!(runtime.state_summary()["store"]["projected_count"], 2);
+        {
+            let generic = runtime
+                .runtime
+                .generic
+                .as_ref()
+                .expect("generic runtime should be available");
+            let count_field = generic
+                .generic_derived
+                .root_field_plan("store.projected_count")
+                .expect("projected_count should have a root field plan");
+            let count_expr = count_field
+                .statement
+                .expr
+                .and_then(|expr| generic.generic_derived.expressions.get(expr));
+            assert_eq!(
+                generic.root_list_length_ref_for_statement(&count_field.statement),
+                Some(("store.projected".to_owned(), "projected".to_owned())),
+                "count statement: {:?}; count expr: {:?}",
+                count_field.statement,
+                count_expr
+            );
+        }
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.cursor".to_owned(),
+                text: Some("new".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("cursor source should update projected row labels");
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["projected"][0]["label"], "A/new");
+        assert_eq!(summary["store"]["projected_count"], 2);
+        assert!(
+            output
+                .root_materialization_stats
+                .samples
+                .iter()
+                .all(|sample| sample.path != "store.projected_count"),
+            "row-field-only changes should not rematerialize a List/length root: {:#?}",
+            output.root_materialization_stats.samples
+        );
+        assert!(
+            output.runtime_step_profile.source_action_root_skip_count >= 1,
+            "List/length scalar root should be skipped once row-field dirtiness proves list cardinality unchanged: {:?}",
+            output.runtime_step_profile
         );
     }
 
@@ -82142,6 +85513,460 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn typed_row_bytes_concat_evaluates_private_bytes_and_feeds_length() {
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants: vec![boon_plan::PlanConstant {
+                id: boon_plan::PlanConstantId(0),
+                value: boon_plan::PlanConstantValue::Bytes {
+                    byte_len: 2,
+                    sha256: sha256_bytes(&[4, 5]),
+                    inline_bytes: Some(vec![4, 5]),
+                },
+            }],
+            source_routes: Vec::new(),
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: Vec::new(),
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: Vec::new(),
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 0,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 1,
+                source_route_count: 0,
+                scalar_storage_count: 0,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 0,
+                typed_value_ref_count: 0,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: Vec::new(),
+                state_slots: Vec::new(),
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: vec![boon_plan::DebugEntry {
+                    id: "field:0".to_owned(),
+                    label: "row.payload".to_owned(),
+                }],
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+        let payload = RuntimeBytes::inline(Bytes::from_static(&[1, 2, 3]));
+        let row = PlanListRowState {
+            key: 7,
+            generation: 1,
+            fields: BTreeMap::from([("payload".to_owned(), payload.report_json())]),
+            private_bytes: BTreeMap::from([("payload".to_owned(), payload)]),
+            fixed_bytes_banks: BTreeMap::new(),
+        };
+        let concat = PlanRowExpression::BytesConcat {
+            left: Box::new(PlanRowExpression::Field {
+                input: ValueRef::Field(FieldId(0)),
+            }),
+            right: Box::new(PlanRowExpression::Constant {
+                constant_id: boon_plan::PlanConstantId(0),
+            }),
+        };
+
+        let concat_value = eval_plan_row_expression(&plan, &BTreeMap::new(), &row, &concat)
+            .expect("typed row Bytes/concat should evaluate");
+        assert_eq!(concat_value["$boon_type"], "BYTES");
+        assert_eq!(concat_value["storage"], "row_inline");
+        assert_eq!(concat_value["byte_len"], 5);
+        assert_eq!(concat_value["inline_bytes"], json!([1, 2, 3, 4, 5]));
+
+        let length = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesLength {
+                input: Box::new(concat),
+            },
+        )
+        .expect("typed row Bytes/length should consume Bytes/concat output");
+        assert_eq!(length, json!(5));
+    }
+
+    #[test]
+    fn typed_row_bytes_to_text_evaluates_private_bytes() {
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants: vec![
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(0),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "Utf8".to_owned(),
+                    },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(1),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "414243".to_owned(),
+                    },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(2),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "QUJD".to_owned(),
+                    },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(3),
+                    value: boon_plan::PlanConstantValue::Number { value: 2 },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(4),
+                    value: boon_plan::PlanConstantValue::Number { value: 1 },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(5),
+                    value: boon_plan::PlanConstantValue::Number { value: 0 },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(6),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "Big".to_owned(),
+                    },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(7),
+                    value: boon_plan::PlanConstantValue::Text {
+                        value: "Little".to_owned(),
+                    },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(8),
+                    value: boon_plan::PlanConstantValue::Number { value: 255 },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(9),
+                    value: boon_plan::PlanConstantValue::Number { value: 258 },
+                },
+                boon_plan::PlanConstant {
+                    id: boon_plan::PlanConstantId(10),
+                    value: boon_plan::PlanConstantValue::Number { value: -1 },
+                },
+            ],
+            source_routes: Vec::new(),
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: Vec::new(),
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: Vec::new(),
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 0,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 11,
+                source_route_count: 0,
+                scalar_storage_count: 0,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 0,
+                typed_value_ref_count: 0,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: Vec::new(),
+                state_slots: Vec::new(),
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: vec![boon_plan::DebugEntry {
+                    id: "field:0".to_owned(),
+                    label: "row.payload".to_owned(),
+                }],
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+        let payload = RuntimeBytes::inline(Bytes::from_static(b"ABC"));
+        let row = PlanListRowState {
+            key: 7,
+            generation: 1,
+            fields: BTreeMap::from([("payload".to_owned(), payload.report_json())]),
+            private_bytes: BTreeMap::from([("payload".to_owned(), payload)]),
+            fixed_bytes_banks: BTreeMap::new(),
+        };
+        let decode = PlanRowExpression::BytesToText {
+            input: Box::new(PlanRowExpression::Field {
+                input: ValueRef::Field(FieldId(0)),
+            }),
+            encoding: Some(Box::new(PlanRowExpression::Constant {
+                constant_id: boon_plan::PlanConstantId(0),
+            })),
+        };
+
+        let text = eval_plan_row_expression(&plan, &BTreeMap::new(), &row, &decode)
+            .expect("typed row Bytes/to_text should evaluate private bytes");
+        assert_eq!(text, json!("ABC"));
+
+        let hex = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesToHex {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+            },
+        )
+        .expect("typed row Bytes/to_hex should evaluate private bytes");
+        assert_eq!(hex, json!("414243"));
+
+        let base64 = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesToBase64 {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+            },
+        )
+        .expect("typed row Bytes/to_base64 should evaluate private bytes");
+        assert_eq!(base64, json!("QUJD"));
+
+        let decoded_hex = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesFromHex {
+                input: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(1),
+                }),
+            },
+        )
+        .expect("typed row Bytes/from_hex should evaluate text input");
+        assert_eq!(decoded_hex["$boon_type"], "BYTES");
+        assert_eq!(decoded_hex["storage"], "row_inline");
+        assert_eq!(decoded_hex["inline_bytes"], json!([65, 66, 67]));
+
+        let decoded_base64 = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesFromBase64 {
+                input: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(2),
+                }),
+            },
+        )
+        .expect("typed row Bytes/from_base64 should evaluate text input");
+        assert_eq!(decoded_base64["$boon_type"], "BYTES");
+        assert_eq!(decoded_base64["storage"], "row_inline");
+        assert_eq!(decoded_base64["inline_bytes"], json!([65, 66, 67]));
+
+        let taken = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesTake {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(3),
+                }),
+            },
+        )
+        .expect("typed row Bytes/take should evaluate private bytes");
+        assert_eq!(taken["$boon_type"], "BYTES");
+        assert_eq!(taken["storage"], "row_inline");
+        assert_eq!(taken["inline_bytes"], json!([65, 66]));
+
+        let dropped = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesDrop {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(4),
+                }),
+            },
+        )
+        .expect("typed row Bytes/drop should evaluate private bytes");
+        assert_eq!(dropped["$boon_type"], "BYTES");
+        assert_eq!(dropped["storage"], "row_inline");
+        assert_eq!(dropped["inline_bytes"], json!([66, 67]));
+
+        let zeroed = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesZeros {
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(3),
+                }),
+            },
+        )
+        .expect("typed row Bytes/zeros should evaluate private bytes");
+        assert_eq!(zeroed["$boon_type"], "BYTES");
+        assert_eq!(zeroed["storage"], "row_inline");
+        assert_eq!(zeroed["inline_bytes"], json!([0, 0]));
+
+        let read_unsigned = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesReadUnsigned {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                offset: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(5),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(3),
+                }),
+                endian: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(6),
+                }),
+            },
+        )
+        .expect("typed row Bytes/read_unsigned should evaluate private bytes");
+        assert_eq!(read_unsigned, json!(16_706));
+
+        let read_signed = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesReadSigned {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                offset: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(5),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(4),
+                }),
+                endian: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(7),
+                }),
+            },
+        )
+        .expect("typed row Bytes/read_signed should evaluate private bytes");
+        assert_eq!(read_signed, json!(65));
+
+        let set = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesSet {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                index: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(4),
+                }),
+                value: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(8),
+                }),
+            },
+        )
+        .expect("typed row Bytes/set should evaluate private bytes");
+        assert_eq!(set["$boon_type"], "BYTES");
+        assert_eq!(set["storage"], "row_inline");
+        assert_eq!(set["inline_bytes"], json!([65, 255, 67]));
+
+        let write_unsigned = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesWriteUnsigned {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                offset: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(5),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(3),
+                }),
+                endian: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(6),
+                }),
+                value: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(9),
+                }),
+            },
+        )
+        .expect("typed row Bytes/write_unsigned should evaluate private bytes");
+        assert_eq!(write_unsigned["$boon_type"], "BYTES");
+        assert_eq!(write_unsigned["storage"], "row_inline");
+        assert_eq!(write_unsigned["inline_bytes"], json!([1, 2, 67]));
+
+        let write_signed = eval_plan_row_expression(
+            &plan,
+            &BTreeMap::new(),
+            &row,
+            &PlanRowExpression::BytesWriteSigned {
+                input: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::Field(FieldId(0)),
+                }),
+                offset: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(5),
+                }),
+                byte_count: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(4),
+                }),
+                endian: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(7),
+                }),
+                value: Box::new(PlanRowExpression::Constant {
+                    constant_id: boon_plan::PlanConstantId(10),
+                }),
+            },
+        )
+        .expect("typed row Bytes/write_signed should evaluate private bytes");
+        assert_eq!(write_signed["$boon_type"], "BYTES");
+        assert_eq!(write_signed["storage"], "row_inline");
+        assert_eq!(write_signed["inline_bytes"], json!([255, 66, 67]));
+    }
+
+    #[test]
     fn fixed_source_bytes_constructor_zero_fills_empty_body() {
         let BoonValue::Bytes(bytes) =
             finish_bytes_constructor(&BytesSizeSyntax::Fixed(4), 0, Vec::new())
@@ -86097,6 +89922,454 @@ expected_source_event = {{ source = "store.decode" }}
         assert!(
             error.contains("cannot evaluate update value numeric infix `store.zoom_step * 2`"),
             "unexpected runtime error: {error}"
+        );
+    }
+
+    #[test]
+    fn world_output_lowers_generic_boon_value_to_world_scene() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+world: World/new(
+    camera: World/perspective_camera(
+        transform: World/transform(translation: [x: 0, y: 1, z: 6])
+        vertical_fov_degrees: 60
+    )
+    lights: LIST {
+        World/light(
+            id: TEXT { key }
+            transform: World/transform(translation: [x: 2, y: 4, z: 3])
+            intensity: 4
+        )
+    }
+    materials: LIST {
+        World/material(
+            id: TEXT { blue }
+            base_color: [r: 0, g: 1, b: 1, a: 1]
+            roughness: 1
+            metallic: 0
+        )
+    }
+    geometries: LIST {
+        World/primitive(
+            id: TEXT { cube }
+            kind: Cube
+            size: [x: 2, y: 2, z: 2]
+        )
+    }
+    instances: LIST {
+        World/model(
+            id: TEXT { cube_instance }
+            geometry: TEXT { cube }
+            material: TEXT { blue }
+            transform: World/transform(rotation_z_degrees: 45)
+            part_id: TEXT { body }
+            feature_id: TEXT { cube_feature }
+            pick_id: 7
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("world-output-runtime-lowering", source)
+            .expect("world output source should compile");
+        let output = runtime
+            .world_scene_output()
+            .expect("world output should lower into a WorldScene");
+        let metrics = output.scene.metrics();
+        assert_eq!(output.output_root, "world");
+        assert_eq!(metrics.camera_count, 1);
+        assert_eq!(metrics.light_count, 1);
+        assert_eq!(metrics.geometry_count, 1);
+        assert_eq!(metrics.appearance_count, 1);
+        assert_eq!(metrics.instance_count, 1);
+        assert_eq!(metrics.pickable_instance_count, 1);
+        let target = output
+            .scene
+            .pick_target(PickId(7))
+            .expect("pick id should map to the lowered instance");
+        assert_eq!(
+            target.semantic_id.as_deref(),
+            Some("world:instance:cube_instance")
+        );
+        assert_eq!(target.label.as_deref(), Some("cube_instance"));
+
+        let mut rotated = output.scene.clone();
+        let instance_id = *rotated.instances.keys().next().unwrap();
+        rotated.instances.get_mut(&instance_id).unwrap().transform =
+            Transform3D::IDENTITY.with_rotation_z_degrees(90.0);
+        let patch = WorldScene::diff(&output.scene, &rotated);
+        let report = rotated
+            .apply_patch(&patch)
+            .expect("world transform patch should apply");
+        assert_eq!(report.transform_update_count, 1);
+        assert_eq!(report.geometry_rebuild_count, 0);
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_generic_boon_value_to_solid_model() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { bracket_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { bracket }
+            geometry: Solid/difference(
+                base: Solid/rounded_box(size: [x: 70, y: 34, z: 6], radius: 2)
+                tools: LIST {
+                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: -23, y: 0, z: 0])
+                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: 23, y: 0, z: 0])
+                }
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+    instances: LIST {
+        Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket }, label: TEXT { Bracket A })
+        Part/instance(id: TEXT { bracket_b }, part: TEXT { bracket }, label: TEXT { Bracket B })
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("manufacturing-output-runtime-lowering", source)
+            .expect("manufacturing output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("manufacturing output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.subtractive_cylinder_count, 2);
+        assert_eq!(assembly_metrics.part_count, 1);
+        assert_eq!(assembly_metrics.instance_count, 2);
+        assert_eq!(assembly_metrics.printable_part_count, 1);
+        assert_eq!(assembly_metrics.physical_material_part_count, 1);
+        assert_eq!(assembly_metrics.shared_geometry_instance_count, 2);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_cone_and_torus_constructors() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { curved_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { cone_part }
+            geometry: Solid/cone(radius0: 8, radius1: 3, height: 20)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { torus_part }
+            geometry: Solid/torus(major_radius: 12, minor_radius: 2)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("curved-solid-output-runtime-lowering", source)
+            .expect("curved solid output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("curved solid output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        let lowered_ops = output
+            .bundle
+            .solids
+            .values()
+            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.primitive_node_count, 2);
+        assert_eq!(assembly_metrics.part_count, 2);
+        assert_eq!(assembly_metrics.printable_part_count, 2);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+        assert!(
+            lowered_ops
+                .iter()
+                .any(|op| matches!(op, solid_model::SolidOp::Cone { .. })),
+            "{lowered_ops:?}"
+        );
+        assert!(
+            lowered_ops
+                .iter()
+                .any(|op| matches!(op, solid_model::SolidOp::Torus { .. })),
+            "{lowered_ops:?}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_shell_constructor() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { shell_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { shell_part }
+            geometry: Solid/shell(
+                child: Solid/box(size: [x: 40, y: 24, z: 16])
+                thickness: 2
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("shell-solid-output-runtime-lowering", source)
+            .expect("shell solid output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("shell solid output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        let lowered_ops = output
+            .bundle
+            .solids
+            .values()
+            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.primitive_node_count, 1);
+        assert_eq!(solid_metrics.transform_node_count, 1);
+        assert_eq!(assembly_metrics.part_count, 1);
+        assert_eq!(assembly_metrics.printable_part_count, 1);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+        assert!(
+            lowered_ops.iter().any(|op| matches!(
+                op,
+                solid_model::SolidOp::Shell {
+                    thickness,
+                    ..
+                } if (*thickness - 2.0).abs() < f64::EPSILON
+            )),
+            "{lowered_ops:?}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_extrude_constructor() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { extrude_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { extrude_part }
+            geometry: Solid/extrude(size: [x: 36, y: 18, z: 0], height: 12)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("extrude-solid-output-runtime-lowering", source)
+            .expect("extrude solid output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("extrude solid output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        let lowered_ops = output
+            .bundle
+            .solids
+            .values()
+            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
+            .collect::<Vec<_>>();
+        let profile_count = output
+            .bundle
+            .solids
+            .values()
+            .map(|graph| graph.profiles.len())
+            .sum::<usize>();
+
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.primitive_node_count, 1);
+        assert_eq!(assembly_metrics.part_count, 1);
+        assert_eq!(assembly_metrics.printable_part_count, 1);
+        assert_eq!(profile_count, 1);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+        assert!(
+            lowered_ops.iter().any(|op| matches!(
+                op,
+                solid_model::SolidOp::Extrude {
+                    height,
+                    ..
+                } if (*height - 12.0).abs() < f64::EPSILON
+            )),
+            "{lowered_ops:?}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_revolve_constructor() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { revolve_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { revolve_part }
+            geometry: Solid/revolve(inner_radius: 4, outer_radius: 9, height: 12)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("revolve-solid-output-runtime-lowering", source)
+            .expect("revolve solid output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("revolve solid output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        let lowered_ops = output
+            .bundle
+            .solids
+            .values()
+            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
+            .collect::<Vec<_>>();
+        let profile_count = output
+            .bundle
+            .solids
+            .values()
+            .map(|graph| graph.profiles.len())
+            .sum::<usize>();
+
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.primitive_node_count, 1);
+        assert_eq!(assembly_metrics.part_count, 1);
+        assert_eq!(assembly_metrics.printable_part_count, 1);
+        assert_eq!(profile_count, 1);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+        assert!(
+            lowered_ops
+                .iter()
+                .any(|op| matches!(op, solid_model::SolidOp::Revolve { .. })),
+            "{lowered_ops:?}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_output_lowers_loft_constructor() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { loft_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { loft_part }
+            geometry: Solid/loft(
+                bottom_size: [x: 36, y: 20, z: 0]
+                top_size: [x: 18, y: 10, z: 0]
+                height: 12
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)
+"#;
+        let mut runtime = LiveRuntime::from_source("loft-solid-output-runtime-lowering", source)
+            .expect("loft solid output source should compile");
+        let output = runtime
+            .solid_model_output()
+            .expect("loft solid output should lower into a SolidModelBundle");
+        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
+        let validation = output.bundle.validate();
+        let lowered_ops = output
+            .bundle
+            .solids
+            .values()
+            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
+            .collect::<Vec<_>>();
+        let profile_count = output
+            .bundle
+            .solids
+            .values()
+            .map(|graph| graph.profiles.len())
+            .sum::<usize>();
+
+        assert_eq!(output.output_root, "manufacturing");
+        assert_eq!(solid_metrics.primitive_node_count, 1);
+        assert_eq!(assembly_metrics.part_count, 1);
+        assert_eq!(assembly_metrics.printable_part_count, 1);
+        assert_eq!(profile_count, 2);
+        assert_eq!(
+            validation.status,
+            solid_model::SolidValidationStatus::Pass,
+            "{validation:?}"
+        );
+        assert!(
+            lowered_ops.iter().any(|op| matches!(
+                op,
+                solid_model::SolidOp::Loft {
+                    profiles
+                } if profiles.len() == 2
+            )),
+            "{lowered_ops:?}"
         );
     }
 

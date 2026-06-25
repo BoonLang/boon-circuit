@@ -254,6 +254,19 @@ impl Surface {
             active_cursor.cursor_request(cursor_request);
         }
     }
+
+    pub fn update_accessibility_if_active(&self, update: accesskit::TreeUpdate) {
+        let mut window_internal = self.window_internal.lock().unwrap();
+        window_internal.latest_accessibility_tree_update = Some(update.clone());
+        if let Some(adapter) = window_internal.adapter.as_mut() {
+            adapter.update_if_active(|| update);
+        }
+    }
+
+    pub fn take_accessibility_action_requests(&self) -> Vec<accesskit::ActionRequest> {
+        let mut window_internal = self.window_internal.lock().unwrap();
+        std::mem::take(&mut window_internal.accessibility_action_requests)
+    }
 }
 
 impl Drop for Surface {

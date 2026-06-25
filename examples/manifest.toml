@@ -387,6 +387,144 @@ performance_thresholds = [
 ]
 
 [[example]]
+id = "hello_3d"
+label = "Hello 3D"
+source = "examples/hello_3d/RUN.bn"
+scenario = "examples/hello_3d.scn"
+budget = "examples/hello_3d.budget.toml"
+category = "3d"
+order = 27
+default_tab_order = 27
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "world-output-available",
+  "one-camera-visible",
+  "one-light-visible",
+  "one-cube-instance-visible",
+  "pick-id-resolves-to-cube",
+]
+input_scenarios = [
+  "initial-world-output",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "world-scene-json",
+  "world-pick-target-json",
+  "future-renderer-owned-framebuffer",
+]
+performance_thresholds = [
+  "world-output-to-idle-p95-ms <= 3.0",
+  "transform-change-geometry-rebuilds = 0",
+  "material-change-geometry-rebuilds = 0",
+]
+
+[[example]]
+id = "printable_bracket_3d"
+label = "Printable Bracket 3D"
+source = "examples/printable_bracket_3d/RUN.bn"
+scenario = "examples/printable_bracket_3d.scn"
+budget = "examples/printable_bracket_3d.budget.toml"
+category = "3d"
+order = 28
+default_tab_order = 28
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "manufacturing-output-available",
+  "one-printable-part-present",
+  "two-subtractive-cylinder-tools-present",
+  "two-shared-part-instances-present",
+  "physical-material-present",
+]
+input_scenarios = [
+  "initial-manufacturing-output",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "solid-model-json",
+  "solid-validation-json",
+  "future-solid-mesh-framebuffer",
+]
+performance_thresholds = [
+  "solid-output-to-idle-p95-ms <= 3.0",
+  "visual-mesh-rebuilds = 0",
+  "three-mf-exports = 0",
+]
+
+[[example]]
+id = "parametric_car_3d"
+label = "Parametric Car 3D"
+source = "examples/parametric_car_3d/RUN.bn"
+scenario = "examples/parametric_car_3d.scn"
+budget = "examples/parametric_car_3d.budget.toml"
+category = "3d"
+order = 29
+default_tab_order = 29
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "manufacturing-output-available",
+  "car-body-printable-part-present",
+  "shared-wheel-prototype-four-instances",
+  "visual-only-windows-not-printable",
+  "body-and-wheel-physical-materials-present",
+]
+input_scenarios = [
+  "initial-car-manufacturing-output",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "solid-model-json",
+  "solid-validation-json",
+  "future-car-worldscene-framebuffer",
+]
+performance_thresholds = [
+  "solid-output-to-idle-p95-ms <= 5.0",
+  "shared-wheel-geometry-rebuilds = 1",
+  "visual-mesh-rebuilds = 0",
+  "three-mf-exports = 0",
+]
+
+[[example]]
+id = "parametric_car_rich_3d"
+label = "Parametric Car Rich 3D"
+source = "examples/parametric_car_rich_3d/RUN.bn"
+scenario = "examples/parametric_car_rich_3d.scn"
+budget = "examples/parametric_car_rich_3d.budget.toml"
+category = "3d"
+order = 29
+default_tab_order = 29
+shown_by_default = false
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "manufacturing-output-available",
+  "lofted-body-printable-part-present",
+  "revolved-wheel-prototype-four-instances",
+  "shell-windows-visual-only-not-printable",
+  "body-and-wheel-physical-materials-present",
+]
+input_scenarios = [
+  "initial-rich-car-manufacturing-output",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "solid-model-json",
+  "solid-validation-json",
+  "future-rich-car-worldscene-framebuffer",
+]
+performance_thresholds = [
+  "solid-output-to-idle-p95-ms <= 6.0",
+  "shared-wheel-geometry-rebuilds = 1",
+  "visual-mesh-rebuilds = 0",
+  "three-mf-exports = 0",
+]
+
+[[example]]
 id = "counter"
 label = "Counter"
 source = "examples/counter.bn"

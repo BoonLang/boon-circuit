@@ -542,12 +542,17 @@ impl<'a> Checker<'a> {
         let flow_bindings = flow_bindings(program);
         let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
         let render_contracts_started = Instant::now();
-        let render_contracts =
-            RenderContractRegistry::default().with_active_root(if scene_root(program).is_some() {
+        let render_contracts = RenderContractRegistry::default().with_active_root(
+            if manufacturing_root(program).is_some() {
+                "manufacturing"
+            } else if world_root(program).is_some() {
+                "world"
+            } else if scene_root(program).is_some() {
                 "scene"
             } else {
                 "document"
-            });
+            },
+        );
         let render_contracts_ms = typecheck_elapsed_ms(render_contracts_started);
         let mut checker = Self {
             program,
@@ -774,12 +779,10 @@ impl<'a> Checker<'a> {
     }
 
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
-        if !self.collect_type_hints && matches!(statement.kind, AstStatementKind::Function { .. }) {
-            return;
-        }
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
+            || statement_field(statement).as_deref() == Some("world")
             || self.statement_enters_render_context(statement);
         if let Some(expr_id) = statement.expr {
             let flow = self.ensure_expr(expr_id);
@@ -2830,7 +2833,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(field) = statement_output_name(statement)
-                && field != "document"
+                && !matches!(field.as_str(), "document" | "scene" | "world")
                 && let Some(ty) =
                     self.static_statement_type_with_bindings(statement, active_functions, bindings)
             {
@@ -2932,7 +2935,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(field) = statement_output_name(statement)
-                && field != "document"
+                && !matches!(field.as_str(), "document" | "scene" | "world")
                 && let Some(ty) = self.static_statement_type(statement, active_functions)
             {
                 insert_ordered_shape_field(fields, field_order, field, ty);
@@ -3032,6 +3035,7 @@ impl<'a> Checker<'a> {
                 | "List/move_field_last"
                 | "SOURCE" => ty,
                 "List/count" | "List/sum" => Type::Number,
+                "List/join_field" => Type::Text,
                 "List/append" => {
                     let append_ty = args
                         .iter()
@@ -4789,6 +4793,24 @@ fn scene_root(program: &ParsedProgram) -> Option<&AstStatement> {
     })
 }
 
+fn world_root(program: &ParsedProgram) -> Option<&AstStatement> {
+    program.ast.statements.iter().find(|statement| {
+        matches!(
+            &statement.kind,
+            AstStatementKind::Field { name } if name == "world"
+        )
+    })
+}
+
+fn manufacturing_root(program: &ParsedProgram) -> Option<&AstStatement> {
+    program.ast.statements.iter().find(|statement| {
+        matches!(
+            &statement.kind,
+            AstStatementKind::Field { name } if name == "manufacturing"
+        )
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
@@ -4981,6 +5003,8 @@ impl Default for RenderContractRegistry {
             roots: [
                 ("document", RuntimeRootContract::document()),
                 ("scene", RuntimeRootContract::scene()),
+                ("world", RuntimeRootContract::world()),
+                ("manufacturing", RuntimeRootContract::manufacturing()),
             ]
             .into_iter()
             .collect(),
@@ -5062,6 +5086,70 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Scene/Element/button", "Button")
         .with_fixed_constructor("Scene/Element/paragraph", "Paragraph")
         .with_fixed_constructor("Scene/Element/link", "Link")
+    }
+
+    fn world() -> Self {
+        Self::new([
+            "AppearanceMaterial",
+            "Camera",
+            "DirectionalLight",
+            "Group",
+            "IndexedMesh",
+            "ModelInstance",
+            "PerspectiveCamera",
+            "PointLight",
+            "PrimitiveGeometry",
+            "Transform3D",
+            "World",
+        ])
+        .with_fixed_constructor("World/new", "World")
+        .with_fixed_constructor("World/camera", "Camera")
+        .with_fixed_constructor("World/perspective_camera", "PerspectiveCamera")
+        .with_fixed_constructor("World/light", "DirectionalLight")
+        .with_fixed_constructor("World/point_light", "PointLight")
+        .with_fixed_constructor("World/material", "AppearanceMaterial")
+        .with_fixed_constructor("World/transform", "Transform3D")
+        .with_fixed_constructor("World/primitive", "PrimitiveGeometry")
+        .with_fixed_constructor("World/indexed_mesh", "IndexedMesh")
+        .with_fixed_constructor("World/model", "ModelInstance")
+        .with_fixed_constructor("World/group", "Group")
+    }
+
+    fn manufacturing() -> Self {
+        Self::new([
+            "Assembly",
+            "Part",
+            "PartInstance",
+            "SolidBox",
+            "SolidCone",
+            "SolidCylinder",
+            "SolidDifference",
+            "SolidExtrude",
+            "SolidLoft",
+            "SolidRevolve",
+            "SolidRoundedBox",
+            "SolidShell",
+            "SolidSphere",
+            "SolidTorus",
+            "SolidTransform",
+            "SolidUnion",
+        ])
+        .with_fixed_constructor("Assembly/new", "Assembly")
+        .with_fixed_constructor("Part/new", "Part")
+        .with_fixed_constructor("Part/instance", "PartInstance")
+        .with_fixed_constructor("Solid/box", "SolidBox")
+        .with_fixed_constructor("Solid/rounded_box", "SolidRoundedBox")
+        .with_fixed_constructor("Solid/sphere", "SolidSphere")
+        .with_fixed_constructor("Solid/cylinder", "SolidCylinder")
+        .with_fixed_constructor("Solid/cone", "SolidCone")
+        .with_fixed_constructor("Solid/torus", "SolidTorus")
+        .with_fixed_constructor("Solid/extrude", "SolidExtrude")
+        .with_fixed_constructor("Solid/revolve", "SolidRevolve")
+        .with_fixed_constructor("Solid/loft", "SolidLoft")
+        .with_fixed_constructor("Solid/shell", "SolidShell")
+        .with_fixed_constructor("Solid/union", "SolidUnion")
+        .with_fixed_constructor("Solid/difference", "SolidDifference")
+        .with_fixed_constructor("Solid/translate", "SolidTransform")
     }
 }
 
@@ -8644,6 +8732,7 @@ fn statement_pipeline_hint_type(
             | "List/move_field_last"
             | "SOURCE" => ty,
             "List/count" | "List/sum" => Type::Number,
+            "List/join_field" => Type::Text,
             "List/append" => {
                 let append_ty = args
                     .iter()
@@ -10928,6 +11017,63 @@ document: []
         }
     }
 
+    #[test]
+    fn scalar_function_arg_is_not_polluted_by_same_named_row_scope() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+store: [
+    active_signal_key: TEXT { A_SIGNAL }
+    signal_catalog:
+        LIST {
+            [key: TEXT { A_SIGNAL }, name: TEXT { A[3:0] }]
+        }
+    labels:
+        signal_catalog |> List/map(signal, new: [label: signal.name])
+    request:
+        request_label(signal: active_signal_key)
+]
+
+FUNCTION request_label(signal) {
+    signal == TEXT { NONE } |> WHEN {
+        True => TEXT { no-request }
+        False =>
+            TEXT { request }
+            |> Text/concat(with: signal, separator: "|")
+    }
+}
+
+document: []
+"#;
+        let parsed =
+            boon_parser::parse_source("function-scalar-arg-row-scope-collision.bn", source)
+                .unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "scalar helper argument should not inherit same-named row-scope shape: {:?}",
+            report.diagnostics
+        );
+        let entry = report
+            .function_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.name == "request_label")
+            .expect("request_label function type should be reported");
+        assert_eq!(entry.args, vec!["signal".to_owned()]);
+        assert!(
+            type_is_text_formattable_scalar(&entry.arg_types[0]),
+            "request_label.signal should remain scalar-compatible, found {:?}",
+            entry.arg_types[0]
+        );
+        let runtime_report = check_runtime_profiled(&parsed).0;
+        assert!(
+            !runtime_report.has_errors(),
+            "runtime typecheck must also keep function-local argument bindings: {:?}",
+            runtime_report.diagnostics
+        );
+    }
+
     fn function_arg_shape<'a>(
         report: &'a TypeCheckReport,
         function: &str,
@@ -11557,6 +11703,159 @@ FUNCTION row(todo) {
         let document_shape =
             RenderContractRegistry::default().constructor_shape("Element/text", BTreeMap::new());
         assert!(!registry.is_renderable_object_type(&document_shape));
+    }
+
+    #[test]
+    fn world_root_uses_separate_world_contract() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+world: World/new(
+    camera: World/perspective_camera(
+        transform: World/transform(translation: [x: 0, y: 0, z: 6])
+    )
+    lights: LIST {
+        World/light(transform: World/transform(translation: [x: 2, y: 4, z: 3]))
+    }
+    materials: LIST {
+        World/material(base_color: [r: 0.2, g: 0.55, b: 0.95, a: 1])
+    }
+    geometries: LIST {
+        World/primitive(kind: Cube, size: [x: 1, y: 1, z: 1])
+    }
+    instances: LIST {
+        World/model(
+            geometry: TEXT { cube }
+            transform: World/transform(rotation_z_degrees: 45)
+            material: TEXT { blue }
+            part_id: TEXT { body }
+            feature_id: TEXT { cube_feature }
+            pick_id: 1
+        )
+    }
+)
+"#;
+        let parsed = boon_parser::parse_source("world-root-contract.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "world root should typecheck through generic World/* constructors: {:?}",
+            report.diagnostics
+        );
+        let labels = report
+            .type_hint_table
+            .entries
+            .iter()
+            .map(|entry| entry.detail_label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(labels.contains("kind: World"), "{labels}");
+        assert!(labels.contains("kind: PerspectiveCamera"), "{labels}");
+        assert!(labels.contains("kind: ModelInstance"), "{labels}");
+        assert!(
+            !labels.contains("kind: Document"),
+            "world root must not be typed as a document render contract: {labels}"
+        );
+    }
+
+    #[test]
+    fn manufacturing_root_uses_solid_contract() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+
+manufacturing: Assembly/new(
+    parts: LIST {
+        Part/new(
+            id: TEXT { bracket }
+            geometry: Solid/difference(
+                base: Solid/union(items: LIST {
+                    Solid/rounded_box(size: [x: 70, y: 34, z: 6], radius: 2)
+                    Solid/translate(
+                        child: Solid/rounded_box(size: [x: 70, y: 7, z: 42], radius: 2)
+                        by: [x: 0, y: -13, z: 18]
+                    )
+                })
+                tools: LIST {
+                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: -23, y: 0, z: 0])
+                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: 23, y: 0, z: 0])
+                }
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { cone_preview }
+            geometry: Solid/cone(radius0: 8, radius1: 3, height: 20)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { torus_preview }
+            geometry: Solid/torus(major_radius: 12, minor_radius: 2)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { shell_preview }
+            geometry: Solid/shell(
+                child: Solid/box(size: [x: 40, y: 24, z: 16])
+                thickness: 2
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { extrude_preview }
+            geometry: Solid/extrude(size: [x: 36, y: 18, z: 0], height: 12)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { revolve_preview }
+            geometry: Solid/revolve(inner_radius: 4, outer_radius: 9, height: 12)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { loft_preview }
+            geometry: Solid/loft(
+                bottom_size: [x: 36, y: 20, z: 0]
+                top_size: [x: 18, y: 10, z: 0]
+                height: 12
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+    instances: LIST {
+        Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket })
+        Part/instance(id: TEXT { bracket_b }, part: TEXT { bracket })
+    }
+)
+"#;
+        let parsed = boon_parser::parse_source("manufacturing-root-contract.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "manufacturing root should typecheck through generic Assembly/Part/Solid constructors: {:?}",
+            report.diagnostics
+        );
+        let labels = report
+            .type_hint_table
+            .entries
+            .iter()
+            .map(|entry| entry.detail_label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(labels.contains("kind: Assembly"), "{labels}");
+        assert!(labels.contains("kind: Part"), "{labels}");
+        assert!(labels.contains("kind: SolidDifference"), "{labels}");
+        assert!(labels.contains("kind: SolidCone"), "{labels}");
+        assert!(labels.contains("kind: SolidTorus"), "{labels}");
     }
 
     #[test]

@@ -35254,13 +35254,14 @@ fn preview_try_apply_focused_keyboard_input(
                         })
                 {
                     let submitted_text = input_state.focused_text.clone();
+                    let submitted_node = focused_node.clone();
                     let carries_text = live_runtime
                         .lock()
                         .map(|runtime| runtime.source_payload_has_text(&source))
                         .unwrap_or(false);
                     let mut submit = boon_runtime::LiveSourceEvent {
                         source,
-                        text: carries_text.then_some(submitted_text),
+                        text: carries_text.then_some(submitted_text.clone()),
                         key: Some("Enter".to_owned()),
                         address: focused_event_address(&layout_proof, input_state, &focused_node),
                         target_text: focused_event_target_text(
@@ -35285,10 +35286,22 @@ fn preview_try_apply_focused_keyboard_input(
                         shared_render_state,
                         vec![submit],
                     )?;
-                    preview_sync_bound_text_inputs_from_runtime_state(
-                        shared_render_state,
-                        live_runtime,
-                    )?;
+                    let patched_retained_text =
+                        if carries_text && input_state.defer_focused_change_until_commit {
+                            preview_patch_retained_text_input_text(
+                                shared_render_state,
+                                &submitted_node,
+                                &submitted_text,
+                            )?
+                        } else {
+                            false
+                        };
+                    if !patched_retained_text {
+                        preview_sync_bound_text_inputs_from_runtime_state(
+                            shared_render_state,
+                            live_runtime,
+                        )?;
+                    }
                     applied_event = true;
                     preview_clear_focused_input_state(input_state);
                 }
@@ -37737,6 +37750,32 @@ fn preview_sync_bound_text_inputs_in_shared_state(
     changed
 }
 
+fn preview_patch_retained_text_input_text(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    node: &str,
+    text: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+        return Ok(false);
+    };
+    let Some(item) = frame.display_list.iter_mut().find(|item| {
+        item.node.0 == node && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+    }) else {
+        return Ok(false);
+    };
+    if item.text.as_deref() == Some(text) {
+        return Ok(true);
+    }
+    item.text = Some(text.to_owned());
+    shared.update_count = shared.update_count.saturating_add(1);
+    shared.last_error = None;
+    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    Ok(true)
+}
+
 fn preview_sync_bound_text_inputs_from_runtime_state(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
@@ -39747,7 +39786,7 @@ fn preview_apply_live_events_internal(
         );
         let needs_full_bound_input_state_summary = bound_input_state_summary_reason.is_some();
         let mut full_bound_input_state_summary = None;
-        let mut bound_input_state_summary_ms = 0.0;
+        let bound_input_state_summary_ms;
         if needs_full_bound_input_state_summary {
             let bound_input_state_summary_started = Instant::now();
             full_bound_input_state_summary = live_runtime
@@ -39755,6 +39794,8 @@ fn preview_apply_live_events_internal(
                 .map(|mut runtime| runtime.document_state_summary())
                 .ok();
             bound_input_state_summary_ms = elapsed_ms(bound_input_state_summary_started);
+        } else {
+            bound_input_state_summary_ms = 0.0;
         }
         let bound_input_state_summary = full_bound_input_state_summary
             .as_ref()
@@ -45355,7 +45396,6 @@ fn preview_semantic_bound_input_currentness_paths_for_layout_hash(
     let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
         return paths;
     };
-    let mut projection_prefixes = BTreeSet::new();
     for changed_path in semantic_data_paths {
         for (node, source_bindings) in &snapshot
             .data_binding_targets
@@ -45370,9 +45410,6 @@ fn preview_semantic_bound_input_currentness_paths_for_layout_hash(
             for (binding_path, _) in source_bindings {
                 if document_state_value_path_can_refresh_targeted(binding_path) {
                     paths.insert(binding_path.clone());
-                    if let Some(prefix) = document_state_value_projection_prefix(binding_path) {
-                        projection_prefixes.insert(prefix);
-                    }
                 }
             }
             if let Some(text_paths) = snapshot
@@ -45389,38 +45426,9 @@ fn preview_semantic_bound_input_currentness_paths_for_layout_hash(
                     }
                     if document_state_value_path_can_refresh_targeted(text_path) {
                         paths.insert(text_path.clone());
-                        if let Some(prefix) = document_state_value_projection_prefix(text_path) {
-                            projection_prefixes.insert(prefix);
-                        }
                     }
                 }
             }
-        }
-    }
-    if projection_prefixes.is_empty() {
-        return paths;
-    }
-    for path in snapshot
-        .data_binding_targets
-        .text_binding_paths_by_node
-        .values()
-        .flatten()
-    {
-        if projection_prefixes
-            .iter()
-            .any(|prefix| document_state_value_path_has_projection_prefix(path, prefix))
-            && document_state_value_path_can_refresh_targeted(path)
-        {
-            paths.insert(path.clone());
-        }
-    }
-    for (path, _, _) in &snapshot.data_binding_targets.source_intent_binding_targets {
-        if projection_prefixes
-            .iter()
-            .any(|prefix| document_state_value_path_has_projection_prefix(path, prefix))
-            && document_state_value_path_can_refresh_targeted(path)
-        {
-            paths.insert(path.clone());
         }
     }
     paths

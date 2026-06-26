@@ -17165,9 +17165,7 @@ impl LoadedRuntime {
             }
         }
         runtime_step_profile.root_lowering_ms = runtime_elapsed_ms(root_lowering_started);
-        let clear_caches_started = Instant::now();
-        generic.generic_derived_state.clear_value_caches();
-        runtime_step_profile.clear_value_caches_ms = runtime_elapsed_ms(clear_caches_started);
+        runtime_step_profile.clear_value_caches_ms = 0.0;
         let list_delta_started = Instant::now();
         let list_delta_counters =
             generic.apply_count_delta_operators(&count_delta_preimages, &deltas[delta_start..])?;

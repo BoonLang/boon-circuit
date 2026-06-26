@@ -33432,8 +33432,11 @@ struct PreviewNativeInputState {
     focused_address: Option<String>,
     focused_target_text: Option<String>,
     focused_change_source: Option<String>,
+    focused_submit_source: Option<String>,
     focused_escape_source: Option<String>,
     focused_key_down_source: Option<String>,
+    focused_target_key: Option<u64>,
+    focused_target_generation: Option<u64>,
     focused_selection_proxy: bool,
     focused_text: String,
     focused_caret_index: usize,
@@ -33478,6 +33481,7 @@ struct PreviewHoveredClickCandidate {
     target_key: Option<u64>,
     target_generation: Option<u64>,
     editor_change_source: Option<String>,
+    editor_submit_source: Option<String>,
     editor_escape_source: Option<String>,
     editor_key_down_source: Option<String>,
     focused_text: Option<String>,
@@ -34704,8 +34708,11 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
     input_state.focused_address = None;
     input_state.focused_target_text = None;
     input_state.focused_change_source = None;
+    input_state.focused_submit_source = None;
     input_state.focused_escape_source = None;
     input_state.focused_key_down_source = None;
+    input_state.focused_target_key = None;
+    input_state.focused_target_generation = None;
     input_state.focused_selection_proxy = false;
     input_state.focused_text.clear();
     input_state.focused_caret_index = 0;
@@ -34735,8 +34742,9 @@ fn preview_focus_selected_editor_proxy_from_route_table(
         return false;
     };
     let change_source = route_table.text_editor_source_for_intent("change");
-    let key_down_source = route_table
-        .text_editor_source_for_intent("submit")
+    let submit_source = route_table.text_editor_source_for_intent("submit");
+    let key_down_source = submit_source
+        .clone()
         .or_else(|| route_table.text_editor_source_for_intent("key_down"));
     if change_source.is_none() && key_down_source.is_none() {
         return false;
@@ -34745,8 +34753,11 @@ fn preview_focus_selected_editor_proxy_from_route_table(
     input_state.focused_address = Some(address);
     input_state.focused_target_text = target_text.or_else(|| route_table.target_text(node));
     input_state.focused_change_source = change_source;
+    input_state.focused_submit_source = submit_source;
     input_state.focused_escape_source = route_table.text_editor_source_for_intent("escape");
     input_state.focused_key_down_source = key_down_source;
+    input_state.focused_target_key = route_table.target_key(node);
+    input_state.focused_target_generation = route_table.target_generation(node);
     input_state.focused_selection_proxy = true;
     preview_clear_key_repeat(input_state);
     input_state.focused_text = route_table
@@ -34778,8 +34789,11 @@ fn preview_focus_selected_editor_proxy_from_candidate(
     input_state.focused_address = Some(address);
     input_state.focused_target_text = candidate.target_text.clone();
     input_state.focused_change_source = candidate.editor_change_source.clone();
+    input_state.focused_submit_source = candidate.editor_submit_source.clone();
     input_state.focused_escape_source = candidate.editor_escape_source.clone();
     input_state.focused_key_down_source = candidate.editor_key_down_source.clone();
+    input_state.focused_target_key = candidate.target_key;
+    input_state.focused_target_generation = candidate.target_generation;
     input_state.focused_selection_proxy = true;
     preview_clear_key_repeat(input_state);
     input_state.focused_text = candidate.focused_text.clone().unwrap_or_default();
@@ -34943,10 +34957,15 @@ fn preview_refresh_retained_focus_after_enter(
     );
     input_state.focused_change_source =
         live_source_for_node_intent(layout_proof, focused_node, "change");
+    input_state.focused_submit_source =
+        live_source_for_node_intent(layout_proof, focused_node, "submit");
     input_state.focused_escape_source =
         live_source_for_node_intent(layout_proof, focused_node, "escape");
     input_state.focused_key_down_source =
         preview_key_down_source_for_node(layout_proof, focused_node);
+    input_state.focused_target_key = layout_row_key_for_node(layout_proof, focused_node);
+    input_state.focused_target_generation =
+        layout_row_generation_for_node(layout_proof, focused_node);
     input_state.focused_selection_proxy = false;
     input_state.focused_text =
         preview_focused_text_for_node(layout_proof, focused_node, live_runtime)
@@ -35205,6 +35224,119 @@ fn preview_try_apply_focused_keyboard_input(
         .pressed_keys
         .iter()
         .any(|key| key == "Shift" || key == "RightShift");
+    if keyboard_events.len() == 1 {
+        let event = &keyboard_events[0];
+        if event.pressed
+            && matches!(event.key.as_str(), "Return" | "KeypadEnter" | "Escape")
+            && let Some(focused_node) = input_state.focused_node.clone()
+        {
+            let source = if matches!(event.key.as_str(), "Escape") {
+                input_state
+                    .focused_escape_source
+                    .clone()
+                    .or_else(|| input_state.focused_key_down_source.clone())
+            } else {
+                input_state
+                    .focused_submit_source
+                    .clone()
+                    .or_else(|| input_state.focused_key_down_source.clone())
+            };
+            if let Some(source) = source {
+                let keyboard_started = Instant::now();
+                input_state.last_keyboard_event_sequence =
+                    input_state.last_keyboard_event_sequence.max(event.sequence);
+                let submitted_text = input_state.focused_text.clone();
+                let carries_text = matches!(event.key.as_str(), "Return" | "KeypadEnter")
+                    && live_runtime
+                        .lock()
+                        .map(|runtime| runtime.source_payload_has_text(&source))
+                        .unwrap_or(false);
+                let address = input_state.focused_address.clone();
+                let mut live_event = boon_runtime::LiveSourceEvent {
+                    source,
+                    text: carries_text.then_some(submitted_text.clone()),
+                    key: Some(if matches!(event.key.as_str(), "Escape") {
+                        "Escape".to_owned()
+                    } else {
+                        "Enter".to_owned()
+                    }),
+                    address: address.clone(),
+                    target_text: input_state.focused_target_text.clone(),
+                    target_occurrence: None,
+                    target_key: address
+                        .is_none()
+                        .then_some(input_state.focused_target_key)
+                        .flatten(),
+                    target_generation: address
+                        .is_none()
+                        .then_some(input_state.focused_target_generation)
+                        .flatten(),
+                    ..boon_runtime::LiveSourceEvent::default()
+                };
+                if event.key.as_str() == "Escape" {
+                    live_event.text = None;
+                }
+                preview_apply_live_events_no_return(
+                    source_path,
+                    source_text,
+                    runtime_units,
+                    live_runtime,
+                    shared_render_state,
+                    vec![live_event],
+                )?;
+                let patched_retained_text =
+                    if carries_text && input_state.defer_focused_change_until_commit {
+                        preview_patch_retained_text_input_text(
+                            shared_render_state,
+                            &focused_node,
+                            &submitted_text,
+                        )?
+                    } else {
+                        false
+                    };
+                if !patched_retained_text {
+                    preview_sync_bound_text_inputs_from_runtime_state(
+                        shared_render_state,
+                        live_runtime,
+                    )?;
+                }
+                preview_clear_focused_input_state(input_state);
+                preview_clear_key_repeat(input_state);
+                let keyboard_ms = elapsed_ms(keyboard_started);
+                let hover_overlay_started = Instant::now();
+                preview_apply_hover_overlay(shared_render_state, input_state)?;
+                let hover_overlay_ms = elapsed_ms(hover_overlay_started);
+                let focus_overlay_started = Instant::now();
+                preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+                let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+                record_preview_native_input_timing(PreviewNativeInputTimingSample {
+                    scope: preview_current_interaction_timing_scope(),
+                    fast_path: "focused_keyboard",
+                    resolve_ms: 0.0,
+                    apply_ms: keyboard_ms,
+                    hover_overlay_ms,
+                    focus_overlay_ms,
+                    total_ms: elapsed_ms(input_total_started),
+                });
+                if preview_profiling_enabled() {
+                    record_preview_native_input_profile(json!({
+                        "source_path": source_path,
+                        "capture_scope": input.capture_scope,
+                        "fast_path": "focused_keyboard",
+                        "keyboard_events": input.keyboard_events.len(),
+                        "layout_clone_ms": 0.0,
+                        "keyboard_ms": keyboard_ms,
+                        "applied_event": true,
+                        "cached_focus_event": true,
+                        "hover_overlay_ms": hover_overlay_ms,
+                        "focus_overlay_ms": focus_overlay_ms,
+                        "total_ms": elapsed_ms(input_total_started)
+                    }));
+                }
+                return Ok(true);
+            }
+        }
+    }
     let layout_clone_started = Instant::now();
     let layout_proof = {
         let shared = shared_render_state
@@ -35847,6 +35979,8 @@ fn preview_try_apply_simple_source_click_input(
                             target_generation: route_table.target_generation(node),
                             editor_change_source: route_table
                                 .text_editor_source_for_intent("change"),
+                            editor_submit_source: route_table
+                                .text_editor_source_for_intent("submit"),
                             editor_escape_source: route_table
                                 .text_editor_source_for_intent("escape"),
                             editor_key_down_source: route_table
@@ -36177,6 +36311,7 @@ fn preview_try_apply_simple_pointer_move_input(
                         target_key: route_table.target_key(&node),
                         target_generation: route_table.target_generation(&node),
                         editor_change_source: route_table.text_editor_source_for_intent("change"),
+                        editor_submit_source: route_table.text_editor_source_for_intent("submit"),
                         editor_escape_source: route_table.text_editor_source_for_intent("escape"),
                         editor_key_down_source: route_table
                             .text_editor_source_for_intent("submit")
@@ -36395,8 +36530,11 @@ fn preview_handle_mouse_release_for_route_hit(
         )
         .or_else(|| input_state.focused_address.clone());
         input_state.focused_change_source = route_table.change_source(&node);
+        input_state.focused_submit_source = route_table.source_for_node_intent(&node, "submit");
         input_state.focused_escape_source = route_table.escape_source(&node);
         input_state.focused_key_down_source = route_table.key_down_source(&node);
+        input_state.focused_target_key = route_table.target_key(&node);
+        input_state.focused_target_generation = route_table.target_generation(&node);
         input_state.focused_selection_proxy = false;
         preview_clear_key_repeat(input_state);
         input_state.focused_text = route_table
@@ -36490,8 +36628,11 @@ fn preview_handle_mouse_release_for_route_hit(
         input_state.focused_address = route_table.address(&node);
         input_state.focused_target_text = route_table.target_text(&node);
         input_state.focused_change_source = route_table.change_source(&node);
+        input_state.focused_submit_source = route_table.source_for_node_intent(&node, "submit");
         input_state.focused_escape_source = route_table.escape_source(&node);
         input_state.focused_key_down_source = route_table.key_down_source(&node);
+        input_state.focused_target_key = route_table.target_key(&node);
+        input_state.focused_target_generation = route_table.target_generation(&node);
         input_state.focused_selection_proxy = false;
         if input_state.focused_change_source.is_some() {
             input_state.focused_text = route_table
@@ -36902,10 +37043,15 @@ fn preview_apply_real_window_input_with_units(
                     );
                 input_state.focused_change_source =
                     live_source_for_node_intent(layout, &node, "change");
+                input_state.focused_submit_source =
+                    live_source_for_node_intent(layout, &node, "submit");
                 input_state.focused_escape_source =
                     live_source_for_node_intent(layout, &node, "escape");
                 input_state.focused_key_down_source =
                     preview_key_down_source_for_node(layout, &node);
+                input_state.focused_target_key = layout_row_key_for_node(layout, &node);
+                input_state.focused_target_generation =
+                    layout_row_generation_for_node(layout, &node);
                 input_state.focused_selection_proxy = false;
                 preview_clear_key_repeat(input_state);
                 input_state.focused_text =
@@ -36982,10 +37128,15 @@ fn preview_apply_real_window_input_with_units(
                     );
                 input_state.focused_change_source =
                     live_source_for_node_intent(layout, &node, "change");
+                input_state.focused_submit_source =
+                    live_source_for_node_intent(layout, &node, "submit");
                 input_state.focused_escape_source =
                     live_source_for_node_intent(layout, &node, "escape");
                 input_state.focused_key_down_source =
                     preview_key_down_source_for_node(layout, &node);
+                input_state.focused_target_key = layout_row_key_for_node(layout, &node);
+                input_state.focused_target_generation =
+                    layout_row_generation_for_node(layout, &node);
                 input_state.focused_selection_proxy = false;
                 input_state.focused_text.clear();
                 input_state.focused_caret_index = 0;
@@ -38671,6 +38822,10 @@ fn preview_resolve_input_focus_for_layout(
         input_state.focused_change_source =
             live_source_for_node_intent(layout_proof, &resolved, "change");
     }
+    if input_state.focused_submit_source.is_none() {
+        input_state.focused_submit_source =
+            live_source_for_node_intent(layout_proof, &resolved, "submit");
+    }
     if input_state.focused_escape_source.is_none() {
         input_state.focused_escape_source =
             live_source_for_node_intent(layout_proof, &resolved, "escape");
@@ -38678,6 +38833,13 @@ fn preview_resolve_input_focus_for_layout(
     if input_state.focused_key_down_source.is_none() {
         input_state.focused_key_down_source =
             preview_key_down_source_for_node(layout_proof, &resolved);
+    }
+    if input_state.focused_target_key.is_none() {
+        input_state.focused_target_key = layout_row_key_for_node(layout_proof, &resolved);
+    }
+    if input_state.focused_target_generation.is_none() {
+        input_state.focused_target_generation =
+            layout_row_generation_for_node(layout_proof, &resolved);
     }
     Some(resolved)
 }
@@ -40875,6 +41037,55 @@ fn source_intent_indexes(assertions: &[Value]) -> (Value, Value) {
     )
 }
 
+fn patched_source_intent_indexes(
+    previous_layout_proof: &Value,
+    updates: &[(String, String, String)],
+) -> Option<(Value, Value)> {
+    let mut by_node = previous_layout_proof.get("source_intent_index")?.clone();
+    let mut by_value = previous_layout_proof
+        .get("source_intent_value_index")?
+        .clone();
+    for (node, intent, source_path) in updates {
+        let old_source_path = by_node
+            .get(node)
+            .and_then(|node_index| node_index.get(intent))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let node_index = by_node
+            .as_object_mut()?
+            .entry(node.clone())
+            .or_insert_with(|| json!({}));
+        node_index
+            .as_object_mut()?
+            .insert(intent.clone(), json!(source_path));
+        let intent_index = by_value
+            .as_object_mut()?
+            .entry(intent.clone())
+            .or_insert_with(|| json!({}));
+        if let Some(old_source_path) = old_source_path
+            && old_source_path != *source_path
+            && let Some(old_nodes) = intent_index
+                .as_object_mut()?
+                .get_mut(&old_source_path)
+                .and_then(Value::as_array_mut)
+        {
+            old_nodes.retain(|value| value.as_str() != Some(node.as_str()));
+        }
+        let nodes = intent_index
+            .as_object_mut()?
+            .entry(source_path.clone())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()?;
+        if !nodes
+            .iter()
+            .any(|value| value.as_str() == Some(node.as_str()))
+        {
+            nodes.push(json!(node));
+        }
+    }
+    Some((by_node, by_value))
+}
+
 fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
     if let Some(index) = layout_proof.get("source_intent_index") {
         return index
@@ -42721,8 +42932,11 @@ fn preview_focus_node_from_accessibility(
         route_table.target_text(node),
     );
     input_state.focused_change_source = route_table.change_source(node);
+    input_state.focused_submit_source = route_table.source_for_node_intent(node, "submit");
     input_state.focused_escape_source = route_table.escape_source(node);
     input_state.focused_key_down_source = route_table.key_down_source(node);
+    input_state.focused_target_key = route_table.target_key(node);
+    input_state.focused_target_generation = route_table.target_generation(node);
     input_state.focused_selection_proxy = false;
     preview_clear_key_repeat(input_state);
     input_state.focused_text = route_table
@@ -43266,6 +43480,7 @@ impl PreviewHitRouteTable {
             target_key: self.target_key(&source_node),
             target_generation: self.target_generation(&source_node),
             editor_change_source: self.text_editor_source_for_intent("change"),
+            editor_submit_source: self.text_editor_source_for_intent("submit"),
             editor_escape_source: self.text_editor_source_for_intent("escape"),
             editor_key_down_source: self
                 .text_editor_source_for_intent("submit")
@@ -47170,7 +47385,39 @@ fn preview_partial_text_render_scene_patch_for_targets(
     let mut operations = Vec::new();
     let mut patched_targets = BTreeSet::new();
     let mut first_rejection = None;
-    for target in targets {
+    let (grouped_style_targets, remaining_targets): (
+        Vec<DocumentDirectLayoutPatchTarget>,
+        Vec<DocumentDirectLayoutPatchTarget>,
+    ) = targets
+        .iter()
+        .cloned()
+        .partition(preview_target_can_use_grouped_style_render_scene_patch);
+    if !grouped_style_targets.is_empty() {
+        match preview_grouped_style_render_scene_patch_for_targets(layout, &grouped_style_targets) {
+            Some(PreviewRenderScenePatchDecision {
+                patch: Some(patch),
+                rejection,
+                patched_targets: grouped_patched_targets,
+            }) => {
+                operations.extend(patch.operations);
+                patched_targets.extend(grouped_patched_targets);
+                if let Some(reason) = rejection {
+                    first_rejection.get_or_insert(reason);
+                }
+            }
+            Some(PreviewRenderScenePatchDecision {
+                patch: None,
+                rejection,
+                ..
+            }) => {
+                first_rejection.get_or_insert(rejection.unwrap_or("grouped_style_rejected"));
+            }
+            None => {
+                first_rejection.get_or_insert("grouped_style_rejected");
+            }
+        }
+    }
+    for target in &remaining_targets {
         match preview_text_render_scene_patch_operation_for_target(
             document_frame,
             layout,
@@ -47197,6 +47444,18 @@ fn preview_partial_text_render_scene_patch_for_targets(
         rejection: first_rejection,
         patched_targets,
     }
+}
+
+fn preview_target_can_use_grouped_style_render_scene_patch(
+    target: &DocumentDirectLayoutPatchTarget,
+) -> bool {
+    !target.target.attr.starts_with("__source_intent:")
+        && target.target.attr != "text"
+        && !matches!(
+            target.target.attr.as_str(),
+            "label" | "value" | "display_value" | "color"
+        )
+        && !preview_style_attr_affects_layout(&target.target.attr)
 }
 
 fn preview_layout_frame_with_patched_render_scene_targets(
@@ -47252,15 +47511,10 @@ fn preview_grouped_style_render_scene_patch_for_targets(
     if targets.is_empty() || targets.len() > MAX_GROUPED_STYLE_RENDER_SCENE_PATCH_TARGETS {
         return None;
     }
-    if targets.iter().any(|target| {
-        target.target.attr.starts_with("__source_intent:")
-            || target.target.attr == "text"
-            || matches!(
-                target.target.attr.as_str(),
-                "label" | "value" | "display_value" | "color"
-            )
-            || preview_style_attr_affects_layout(&target.target.attr)
-    }) {
+    if !targets
+        .iter()
+        .all(preview_target_can_use_grouped_style_render_scene_patch)
+    {
         return None;
     }
 
@@ -47521,6 +47775,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
     let mut document_patches = Vec::new();
+    let mut source_intent_updates = Vec::<(String, String, String)>::new();
     let document_frame_patch_started = Instant::now();
     for patch in patches {
         let Some((path, value)) = document_data_patch_value(patch) else {
@@ -47595,6 +47850,11 @@ fn preview_try_patch_paint_space_for_root_deltas(
                 if source_path.trim().is_empty() {
                     continue;
                 }
+                source_intent_updates.push((
+                    patch_target.node.0.clone(),
+                    intent.to_owned(),
+                    source_path.clone(),
+                ));
                 if let Some(binding) = node.source_binding.as_ref()
                     && binding.intent == intent
                 {
@@ -47892,7 +48152,8 @@ fn preview_try_patch_paint_space_for_root_deltas(
     if let Some(source_intents) = source_intents.as_ref() {
         let source_intent_index_started = Instant::now();
         let (source_intent_index, source_intent_value_index) =
-            source_intent_indexes(source_intents);
+            patched_source_intent_indexes(previous_layout_proof, &source_intent_updates)
+                .unwrap_or_else(|| source_intent_indexes(source_intents));
         layout_patch_profile.source_intent_index_ms = elapsed_ms(source_intent_index_started);
         updated_source_intent_indexes = Some((source_intent_index, source_intent_value_index));
     }

@@ -21123,6 +21123,23 @@ impl RuntimeDocumentLoweringTables {
 }
 
 impl ListSummaryFields {
+    fn window_bounds(&self, len: usize, limits: SummaryLimits) -> (usize, usize) {
+        let (start, count) = if self.uses_column_window() {
+            (limits.chunk_column_start, limits.chunk_columns)
+        } else {
+            (limits.list_row_start, limits.list_rows)
+        };
+        let start = start.min(len);
+        let end = count.map_or(len, |limit| start.saturating_add(limit).min(len));
+        (start, end)
+    }
+
+    fn uses_column_window(&self) -> bool {
+        let row_scope = self.row_scope.to_ascii_lowercase();
+        let list = self.list.to_ascii_lowercase();
+        row_scope.contains("column") || list.contains("column")
+    }
+
     fn from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Self> {
         let object = artifact_object(value, context)?;
         let fields = artifact_string_array_field(object, "fields", context)?;
@@ -33807,6 +33824,15 @@ impl GenericScheduledRuntime {
                 }
                 continue;
             }
+            if self.can_defer_root_list_find_projection_materialization(
+                &field,
+                &current_dirty_reads,
+                protected_source_event_root_targets,
+            ) {
+                self.generic_derived_state
+                    .insert_deferred_dirty_root(path.clone());
+                continue;
+            }
             if matches!(field.kind, DerivedValueKind::ListView) {
                 if let Some(profile) = source_action_profile.as_deref_mut() {
                     profile.source_action_root_list_view_materialization_count = profile
@@ -36613,6 +36639,43 @@ impl GenericScheduledRuntime {
             true,
             &[],
         )
+    }
+
+    fn can_defer_root_list_find_projection_materialization(
+        &self,
+        field: &GenericDerivedRootField,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+        protected_source_event_root_targets: &BTreeSet<String>,
+    ) -> bool {
+        if !matches!(field.kind, DerivedValueKind::ListView)
+            || protected_source_event_root_targets.contains(&field.path)
+        {
+            return false;
+        }
+        let Some(projection) = self
+            .list_projections
+            .projections
+            .iter()
+            .find(|projection| runtime_path_matches_target(&field.path, &projection.target))
+        else {
+            return false;
+        };
+        let RuntimeListProjectionKind::Find { value, .. } = &projection.kind else {
+            return false;
+        };
+        let selector_reads = root_read_keys_for_path(value)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if selector_reads.is_empty()
+            || !current_dirty_reads
+                .iter()
+                .all(|read| selector_reads.contains(read))
+        {
+            return false;
+        }
+        self.generic_derived_state
+            .root_dependents_for_reads(root_read_keys_for_path(&field.path))
+            .is_empty()
     }
 
     fn try_materialize_root_list_find_projection_field(
@@ -46376,7 +46439,11 @@ impl GenericScheduledRuntime {
         None
     }
 
-    fn root_currentness_field_for_path(&self, path: &str) -> Option<GenericDerivedRootField> {
+    fn root_currentness_field_for_path(
+        &self,
+        path: &str,
+        reason: RuntimeRootCurrentnessReason,
+    ) -> Option<GenericDerivedRootField> {
         if !self.generic_derived_state.has_deferred_dirty_roots() {
             return None;
         }
@@ -46387,6 +46454,9 @@ impl GenericScheduledRuntime {
                 .deferred_dirty_root_contains(&field.path)
         {
             return Some(field.clone());
+        }
+        if matches!(reason, RuntimeRootCurrentnessReason::ProjectionSelector) {
+            return None;
         }
         self.generic_derived
             .root_fields
@@ -46403,9 +46473,9 @@ impl GenericScheduledRuntime {
     fn ensure_root_current(
         &mut self,
         path: &str,
-        _reason: RuntimeRootCurrentnessReason,
+        reason: RuntimeRootCurrentnessReason,
     ) -> RuntimeResult<bool> {
-        let Some(field) = self.root_currentness_field_for_path(path) else {
+        let Some(field) = self.root_currentness_field_for_path(path, reason) else {
             return Ok(false);
         };
         if !self
@@ -47584,10 +47654,7 @@ impl GenericScheduledRuntime {
                 continue;
             }
             let len = self.storage.list_len(&list).unwrap_or_default();
-            let row_start = limits.list_row_start.min(len);
-            let row_end = limits
-                .list_rows
-                .map_or(len, |limit| row_start.saturating_add(limit).min(len));
+            let (row_start, row_end) = summary.window_bounds(len, limits);
             let mut rows = Vec::with_capacity(row_end.saturating_sub(row_start));
             let mut logical_item_count = 0usize;
             for index in 0..len {
@@ -47618,10 +47685,7 @@ impl GenericScheduledRuntime {
         }
         for summary in self.list_summary_fields.clone() {
             let len = self.storage.list_len(&summary.list).unwrap_or_default();
-            let row_start = limits.list_row_start.min(len);
-            let row_end = limits
-                .list_rows
-                .map_or(len, |limit| row_start.saturating_add(limit).min(len));
+            let (row_start, row_end) = summary.window_bounds(len, limits);
             let mut rows = Vec::with_capacity(row_end.saturating_sub(row_start));
             for index in row_start..row_end {
                 rows.push(JsonValue::Object(
@@ -72693,9 +72757,24 @@ FUNCTION new_todo(title) {
                 .as_array()
                 .unwrap()
                 .len(),
-            26
+            10
         );
         assert_eq!(output.state_summary["sheet_columns"][0]["label"], "A");
+        assert_eq!(output.state_summary["sheet_columns"][9]["label"], "J");
+        let sheet_columns_materialization = output.state_summary["__boon_materialization"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["collection"] == "sheet_columns")
+            .expect("sheet_columns materialization report should be present");
+        assert_eq!(
+            sheet_columns_materialization["logical_item_count"],
+            json!(26)
+        );
+        assert_eq!(
+            sheet_columns_materialization["materialized_item_count"],
+            json!(10)
+        );
         assert_eq!(
             output.state_summary["store"]["sheet_rows"]
                 .as_array()
@@ -72802,12 +72881,25 @@ FUNCTION new_todo(title) {
         let mut runtime =
             LiveRuntime::from_source("cells-selected-input-targeted-values", &source).unwrap();
         runtime
-            .apply_source_event(LiveSourceEvent {
+            .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.select".to_owned(),
                 address: Some("B0".to_owned()),
                 ..LiveSourceEvent::default()
             })
             .unwrap();
+        {
+            let generic = runtime
+                .runtime
+                .generic
+                .as_ref()
+                .expect("Cells should use the generic runtime");
+            assert!(
+                generic
+                    .generic_derived_state
+                    .deferred_dirty_root_contains("store.selected_input"),
+                "selecting a cell should leave selected_input demand-current until read"
+            );
+        }
         let values = runtime.document_state_values(&[
             "store.selected_input.address".to_owned(),
             "store.selected_input.editing_text".to_owned(),
@@ -72825,6 +72917,20 @@ FUNCTION new_todo(title) {
             .generic
             .as_ref()
             .expect("Cells should use the generic runtime");
+        assert!(
+            generic
+                .generic_derived_state
+                .deferred_dirty_root_contains("store.selected_input"),
+            "targeted document values should use the indexed projection without materializing the selected_input root view"
+        );
+        assert_eq!(
+            generic
+                .storage
+                .list_row_textlike("selected_input", 0, "address")
+                .unwrap(),
+            "A0",
+            "targeted projection reads should not update root projection storage until the root itself is demanded"
+        );
         assert_eq!(
             generic.list_scan_counters.list_find_rows_scanned, 0,
             "targeted document values should use the List/find text index instead of scanning"

@@ -46322,6 +46322,35 @@ fn verify_native_cells_interaction_speed(
             .then(|| "interaction-speed role contained a failing step".to_owned()),
     );
 
+    let real_window_click_shape_pass = role_report_json.as_ref().is_some_and(|report| {
+        report
+            .get("real_window_click_shape_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    let simple_click_button_shape_rejects = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("simple_click_button_shape_rejects"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let simple_source_click_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("simple_source_click_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:real-window-click-shape-fast-path",
+        real_window_click_shape_pass,
+        format!(
+            "simple_source_click_count={simple_source_click_count}, simple_click_button_shape_rejects={simple_click_button_shape_rejects}"
+        ),
+        (!real_window_click_shape_pass).then(|| {
+            "Cells interaction speed gate must exercise the real-window release shape without simple-click button_shape rejects".to_owned()
+        }),
+    );
+
     let workflow_coverage_pass = role_report_json.as_ref().is_some_and(|report| {
         report
             .get("workflow_coverage_pass")
@@ -46459,6 +46488,31 @@ fn verify_native_cells_interaction_speed(
         .and_then(|report| report.get("native_input_reject_counts"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let logical_cell_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("logical_cell_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let materialized_cell_count_max = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("materialized_cell_count_max"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let rendered_cell_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("rendered_cell_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let formula_evaluated_cell_count_max = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("formula_evaluated_cell_count_max"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let formula_recomputed_field_count_max = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("formula_recomputed_field_count_max"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
     write_native_gate_report(
         args,
         "verify-native-cells-interaction-speed",
@@ -46490,6 +46544,29 @@ fn verify_native_cells_interaction_speed(
                 .and_then(|report| report.get("workflow_event_records"))
                 .cloned()
                 .unwrap_or_else(|| json!([])),
+            "operator_host_input": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("operator_host_input"))
+                .cloned()
+                .unwrap_or_else(|| json!(false)),
+            "real_os_input": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("real_os_input"))
+                .cloned()
+                .unwrap_or_else(|| json!(false)),
+            "evidence_tier": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("evidence_tier"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "input_injection_method": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("input_injection_method"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "real_window_click_shape_pass": real_window_click_shape_pass,
+            "simple_source_click_count": simple_source_click_count,
+            "simple_click_button_shape_rejects": simple_click_button_shape_rejects,
             "workflow_latency_ms_p95": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("workflow_latency_ms_p95"))
@@ -46501,6 +46578,21 @@ fn verify_native_cells_interaction_speed(
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(f64::INFINITY),
             "selected_address": selected_address,
+            "logical_cell_count": logical_cell_count,
+            "materialized_cell_count_max": materialized_cell_count_max,
+            "rendered_cell_count": rendered_cell_count,
+            "formula_evaluated_cell_count_max": formula_evaluated_cell_count_max,
+            "formula_recomputed_field_count_max": formula_recomputed_field_count_max,
+            "formula_evaluated_cell_samples": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("formula_evaluated_cell_samples"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "materialization_reports": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("materialization_reports"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
             "interaction_latency_ms_p95": p95_ms,
             "interaction_latency_ms_max": max_ms,
             "preview_shared_render_update_count": render_update_count,

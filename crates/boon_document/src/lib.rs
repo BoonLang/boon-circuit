@@ -5230,6 +5230,7 @@ fn style_key_affects_paint(key: &str) -> bool {
         || key == "depth"
         || key == "shadow"
         || key == "outline"
+        || key.starts_with("__selected_")
 }
 
 fn style_key_affects_material(key: &str) -> bool {

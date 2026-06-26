@@ -2651,6 +2651,12 @@ fn state_style_value<'a>(style: &'a StyleMap, key: &str) -> Option<&'a StyleValu
             return Some(value);
         }
     }
+    if style_bool_raw(style, "selected") == Some(true) {
+        let selected_key = format!("__selected_{key}");
+        if let Some(value) = style.get(&selected_key) {
+            return Some(value);
+        }
+    }
     style.get(key)
 }
 

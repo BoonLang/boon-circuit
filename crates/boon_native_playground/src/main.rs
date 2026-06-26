@@ -579,6 +579,7 @@ fn run_cells_interaction_speed(
         "A3",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -592,6 +593,7 @@ fn run_cells_interaction_speed(
         "Num2",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -605,6 +607,7 @@ fn run_cells_interaction_speed(
         "Num0",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -618,6 +621,7 @@ fn run_cells_interaction_speed(
         "Return",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -631,6 +635,7 @@ fn run_cells_interaction_speed(
         "C0",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -651,6 +656,7 @@ fn run_cells_interaction_speed(
             key,
             &source_path,
             &source,
+            &runtime_units,
             &live_runtime,
             &shared_render_state,
             &mut input_state,
@@ -665,6 +671,7 @@ fn run_cells_interaction_speed(
         "A0",
         &source_path,
         &source,
+        &runtime_units,
         &live_runtime,
         &shared_render_state,
         &mut input_state,
@@ -685,6 +692,7 @@ fn run_cells_interaction_speed(
             key,
             &source_path,
             &source,
+            &runtime_units,
             &live_runtime,
             &shared_render_state,
             &mut input_state,
@@ -726,6 +734,7 @@ fn run_cells_interaction_speed(
             address,
             &source_path,
             &source,
+            &runtime_units,
             &live_runtime,
             &shared_render_state,
             &mut input_state,
@@ -850,10 +859,39 @@ fn run_cells_interaction_speed(
             .collect::<Vec<_>>()
     );
     report_value["native_input_reject_counts"] = json!(native_input_reject_counts);
-    report_value["click_interaction_timing_ms"] =
+    let click_interaction_timing_ms =
         interaction_timing_scope_summary_json(&interaction_timings, PREVIEW_TIMING_SCOPE_CLICK);
-    report_value["click_native_input_timing_ms"] =
+    let click_native_input_timing_ms =
         native_input_timing_scope_summary_json(&native_input_timings, PREVIEW_TIMING_SCOPE_CLICK);
+    let stage_from_interaction = |key: &str| {
+        click_interaction_timing_ms
+            .get(key)
+            .map(stage_counter_from_summary)
+            .unwrap_or_else(|| stage_counter_ms(&[]))
+    };
+    let stage_from_native_input = |key: &str| {
+        click_native_input_timing_ms
+            .get(key)
+            .map(stage_counter_from_summary)
+            .unwrap_or_else(|| stage_counter_ms(&[]))
+    };
+    report_value["click_interaction_timing_ms"] = click_interaction_timing_ms.clone();
+    report_value["click_native_input_timing_ms"] = click_native_input_timing_ms.clone();
+    report_value["stage_counters"] = json!({
+        "interaction_latency": stage_counter_ms(&latencies_ms),
+        "workflow_latency": stage_counter_ms(&workflow_latencies_ms),
+        "native_input_total": stage_from_native_input("total_input"),
+        "native_input_apply": stage_from_native_input("apply"),
+        "native_input_resolve": stage_from_native_input("resolve"),
+        "runtime_apply": stage_from_interaction("runtime_apply"),
+        "runtime_step_apply": stage_from_interaction("runtime_step_apply"),
+        "runtime_state_summary": stage_from_interaction("runtime_state_summary"),
+        "layout_rebuild": stage_from_interaction("layout_rebuild"),
+        "layout_patch_function": stage_from_interaction("layout_patch_function_total"),
+        "bound_input_state_summary": stage_from_interaction("bound_input_state_summary"),
+        "bound_input_sync": stage_from_interaction("bound_input_sync"),
+        "shared_update": stage_from_interaction("shared_update"),
+    });
     report_value["per_step_pass_fail"] = json!([
         {
             "id": "cells-interaction-speed:target-resolved",
@@ -915,6 +953,7 @@ fn cells_interaction_click_cell(
     address: &str,
     source_path: &Path,
     source: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -935,6 +974,7 @@ fn cells_interaction_click_cell(
         input,
         source_path,
         source,
+        runtime_units,
         live_runtime,
         shared_render_state,
         input_state,
@@ -950,6 +990,7 @@ fn cells_interaction_double_click_cell(
     address: &str,
     source_path: &Path,
     source: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -970,6 +1011,7 @@ fn cells_interaction_double_click_cell(
         input,
         source_path,
         source,
+        runtime_units,
         live_runtime,
         shared_render_state,
         input_state,
@@ -985,6 +1027,7 @@ fn cells_interaction_keyboard(
     key: &str,
     source_path: &Path,
     source: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -1002,6 +1045,7 @@ fn cells_interaction_keyboard(
         input,
         source_path,
         source,
+        runtime_units,
         live_runtime,
         shared_render_state,
         input_state,
@@ -1019,6 +1063,7 @@ fn cells_interaction_apply_input(
     input: boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
     source: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -1028,10 +1073,11 @@ fn cells_interaction_apply_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let input_started = Instant::now();
     preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
-    preview_apply_real_window_input(
+    preview_apply_real_window_input_with_units(
         &input,
         source_path,
         source,
+        runtime_units,
         Some(live_runtime),
         shared_render_state,
         input_state,
@@ -34389,12 +34435,18 @@ fn preview_refresh_cached_focus_payloads(
             .clone()
             .or_else(|| focused_target_text(layout_proof, focused_node)),
     );
-    if let Some(text) = state_summary_value_for_data_path(&summary, &input_state.focused_text)
-        .map(json_value_to_document_text)
-        .filter(|text| !text.is_empty())
-        .or_else(|| document_text_binding_value_for_node(layout_proof, focused_node, &summary))
-    {
-        input_state.focused_text = text;
+    let focused_text_from_path =
+        state_summary_value_for_data_path(&summary, &input_state.focused_text)
+            .map(json_value_to_document_text)
+            .filter(|text| !text.is_empty());
+    if input_state.focused_text.is_empty() || focused_text_from_path.is_some() {
+        if let Some(text) = focused_text_from_path
+            .or_else(|| document_text_binding_value_for_node(layout_proof, focused_node, &summary))
+        {
+            input_state.focused_text = text;
+        }
+    }
+    if !input_state.focused_text.is_empty() {
         input_state.focused_caret_index = input_state
             .focused_caret_index
             .min(preview_text_char_count(&input_state.focused_text));
@@ -37111,22 +37163,6 @@ fn preview_resolved_focused_node(
     input_state: &PreviewNativeInputState,
 ) -> Option<String> {
     let requested_node = input_state.focused_node.as_deref()?;
-    if let Some(address) = input_state.focused_address.as_deref() {
-        if focused_address(layout_proof, requested_node).as_deref() == Some(address) {
-            return Some(requested_node.to_owned());
-        }
-        if let Some(node) = focused_node_for_address(layout_proof, address) {
-            return Some(node);
-        }
-    }
-    if let Some(target_text) = input_state.focused_target_text.as_deref() {
-        if focused_target_text(layout_proof, requested_node).as_deref() == Some(target_text) {
-            return Some(requested_node.to_owned());
-        }
-        if let Some(node) = focused_node_for_target_text(layout_proof, target_text) {
-            return Some(node);
-        }
-    }
     if let Some(change_source) = input_state.focused_change_source.as_deref() {
         if live_source_for_node_intent(layout_proof, requested_node, "change").as_deref()
             == Some(change_source)
@@ -37148,6 +37184,22 @@ fn preview_resolved_focused_node(
         if let Some(node) =
             focused_node_for_source_identity(layout_proof, "key_down", key_down_source, None)
         {
+            return Some(node);
+        }
+    }
+    if let Some(target_text) = input_state.focused_target_text.as_deref() {
+        if focused_target_text(layout_proof, requested_node).as_deref() == Some(target_text) {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) = focused_node_for_target_text(layout_proof, target_text) {
+            return Some(node);
+        }
+    }
+    if let Some(address) = input_state.focused_address.as_deref() {
+        if focused_address(layout_proof, requested_node).as_deref() == Some(address) {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(node) = focused_node_for_address(layout_proof, address) {
             return Some(node);
         }
     }
@@ -38692,6 +38744,9 @@ fn apply_layout_row_identity_to_event(
     fallback_hit_region: Option<&Value>,
     event: &mut boon_runtime::LiveSourceEvent,
 ) {
+    if event_has_address_payload(event) {
+        return;
+    }
     apply_source_intent_row_binding_to_event(layout_proof, node, event);
     let hit_region = document_hit_region_for_node(layout_proof, node);
     let hit_region = hit_region.as_ref().or(fallback_hit_region);
@@ -38708,6 +38763,13 @@ fn apply_layout_row_identity_to_event(
         event.target_key = Some(key);
         event.target_generation.get_or_insert(generation);
     }
+}
+
+fn event_has_address_payload(event: &boon_runtime::LiveSourceEvent) -> bool {
+    event
+        .address
+        .as_deref()
+        .is_some_and(|address| !address.is_empty())
 }
 
 fn apply_source_intent_row_binding_to_event(
@@ -41691,6 +41753,9 @@ impl PreviewHitRouteTable {
     }
 
     fn apply_row_identity_to_event(&self, node: &str, event: &mut boon_runtime::LiveSourceEvent) {
+        if event_has_address_payload(event) {
+            return;
+        }
         if let Some(intent) = self.source_intent_for_event(node, event) {
             if event.list_id.is_none() {
                 event.list_id = intent.list_id.clone();
@@ -73478,49 +73543,6 @@ document:
             && inner.y + inner.height <= outer.y + outer.height + EPSILON
     }
 
-    fn frame_text_debug_for_node(
-        frame: &boon_document::LayoutFrame,
-        node: &str,
-    ) -> serde_json::Value {
-        let hit_bounds = frame
-            .hit_regions
-            .iter()
-            .find(|hit| hit.node.0 == node)
-            .map(|hit| {
-                json!({
-                    "x": hit.bounds.x,
-                    "y": hit.bounds.y,
-                    "width": hit.bounds.width,
-                    "height": hit.bounds.height,
-                })
-            });
-        let texts = frame
-            .display_list
-            .iter()
-            .filter_map(|item| {
-                item.text.as_ref().map(|text| {
-                    json!({
-                        "node": item.node.0,
-                        "kind": format!("{:?}", item.kind),
-                        "text": text,
-                        "bounds": {
-                            "x": item.bounds.x,
-                            "y": item.bounds.y,
-                            "width": item.bounds.width,
-                            "height": item.bounds.height,
-                        }
-                    })
-                })
-            })
-            .take(40)
-            .collect::<Vec<_>>();
-        json!({
-            "node": node,
-            "hit_bounds": hit_bounds,
-            "text_samples": texts,
-        })
-    }
-
     fn frame_caret_column_for_node(frame: &boon_document::LayoutFrame, node: &str) -> Option<f64> {
         frame
             .display_list
@@ -75130,112 +75152,16 @@ document:
             source_hit_center_for_target(&current_layout, "cell.sources.editor.select", Some("A3"))
                 .unwrap();
         let (_, _, formula_node) = formula_bar_input_center(&current_layout);
-        let a3_binding_debug = current_layout
-            .get("layout_frame_hash")
-            .and_then(serde_json::Value::as_str)
-            .and_then(cached_document_render_snapshot)
-            .map(|snapshot| {
-                let paths = snapshot
-                    .data_binding_targets
-                    .iter()
-                    .filter(|(path, targets)| {
-                        path.contains(":79:1:")
-                            || path.contains("display_text")
-                            || targets.iter().any(|target| target.node.0 == a3_node)
-                    })
-                    .take(64)
-                    .map(|(path, targets)| {
-                        json!({
-                            "path": path,
-                            "targets": targets
-                                .iter()
-                                .map(|target| json!({
-                                    "node": target.node.0,
-                                    "attr": target.attr,
-                                }))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                json!({
-                    "paths": paths,
-                    "target_count": snapshot
-                        .data_binding_targets
-                        .values()
-                        .map(Vec::len)
-                        .sum::<usize>(),
-                    "path_count": snapshot.data_binding_targets.len()
-                })
-            })
-            .unwrap_or_else(|| json!(null));
         let frame = latest_preview_frame(&shared_render_state);
-        let formula_binding_debug = current_layout
-            .get("layout_frame_hash")
-            .and_then(serde_json::Value::as_str)
-            .and_then(cached_document_render_snapshot)
-            .map(|snapshot| {
-                let paths = snapshot
-                    .data_binding_targets
-                    .iter()
-                    .filter(|(path, targets)| {
-                        path.contains("selected_input")
-                            || path.contains("@row:79:1")
-                            || targets.iter().any(|target| target.node.0 == formula_node)
-                    })
-                    .take(96)
-                    .map(|(path, targets)| {
-                        json!({
-                            "path": path,
-                            "targets": targets
-                                .iter()
-                                .map(|target| json!({
-                                    "node": target.node.0,
-                                    "attr": target.attr,
-                                }))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                json!({
-                    "paths": paths,
-                    "target_count": snapshot
-                        .data_binding_targets
-                        .values()
-                        .map(Vec::len)
-                        .sum::<usize>(),
-                    "path_count": snapshot.data_binding_targets.len()
-                })
-            })
-            .unwrap_or_else(|| json!(null));
         assert_eq!(
             frame_visible_text_for_node(&frame, &a3_node).as_deref(),
             Some("20"),
-            "A3 visible text should be updated in the retained preview frame: frame_debug={}, a3_summary={}, binding_debug={}, interaction_profiles={}",
-            serde_json::to_string_pretty(&frame_text_debug_for_node(&frame, &a3_node)).unwrap(),
-            serde_json::to_string_pretty(
-                &summary["cells"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|cell| {
-                        cell.get("address").and_then(serde_json::Value::as_str) == Some("A3")
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| json!(null))
-            )
-            .unwrap(),
-            serde_json::to_string_pretty(&a3_binding_debug).unwrap(),
-            serde_json::to_string_pretty(&take_preview_interaction_profiles()).unwrap()
+            "A3 visible text should be updated in the retained preview frame"
         );
         assert_eq!(
             frame_text_for_node(&frame, &formula_node).as_deref(),
             Some("20"),
-            "formula bar should show the committed A3 value after Enter: selected_input={}, formula_debug={}, binding_debug={}, profiles={}",
-            serde_json::to_string_pretty(&summary["store"]["selected_input"]).unwrap(),
-            serde_json::to_string_pretty(&frame_text_debug_for_node(&frame, &formula_node))
-                .unwrap(),
-            serde_json::to_string_pretty(&formula_binding_debug).unwrap(),
-            serde_json::to_string_pretty(&take_preview_interaction_profiles()).unwrap()
+            "formula bar should show the committed A3 value after Enter"
         );
         let c0_value_before_formula_edit = summary["cells"]
             .as_array()
@@ -75268,25 +75194,8 @@ document:
         .unwrap();
         let after_c0_click_summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(
-            after_c0_click_summary["store"]["selected_address"],
-            "C0",
-            "C0 click should select C0 before formula-bar focus; selected_input={}, input_focus={:?}/{:?}, c0_intents={}",
-            serde_json::to_string(&after_c0_click_summary["store"]["selected_input"]).unwrap(),
-            input_state.focused_address,
-            input_state.focused_target_text,
-            serde_json::to_string(
-                &current_layout["source_intent_assertions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|intent| {
-                        intent.get("node").and_then(serde_json::Value::as_str)
-                            == Some(c0_node.as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            )
-            .unwrap()
+            after_c0_click_summary["store"]["selected_address"], "C0",
+            "C0 click should select C0 before formula-bar focus"
         );
         preview_apply_real_window_input(
             &deterministic_click_input_from_index(2, formula_x, formula_y),
@@ -75347,8 +75256,8 @@ document:
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["store"]["selected_address"], "C0");
         assert_eq!(
-            summary["store"]["selected_input"]["formula_text"],
-            "=sum(A0:A3)"
+            summary["store"]["selected_input"]["formula_text"], "=sum(A0:A3)",
+            "C0 formula edit should commit edited formula"
         );
         assert_eq!(summary["store"]["selected_input"]["value"], "50");
         let frame = latest_preview_frame(&shared_render_state);

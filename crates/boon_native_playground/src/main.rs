@@ -574,9 +574,22 @@ fn run_cells_interaction_speed(
     let mut keyboard_sequence = 1_u64;
     let started = Instant::now();
 
-    cells_interaction_double_click_cell(
-        "edit-a3",
+    cells_interaction_click_cell(
+        "select-a3-for-edit",
         "A3",
+        &source_path,
+        &source,
+        &runtime_units,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_click_formula_bar(
+        "focus-a3-formula-bar",
         &source_path,
         &source,
         &runtime_units,
@@ -630,9 +643,22 @@ fn run_cells_interaction_speed(
         &mut workflow_latencies_ms,
         &mut event_records,
     )?;
-    cells_interaction_double_click_cell(
-        "edit-c0",
+    cells_interaction_click_cell(
+        "select-c0-for-formula-edit",
         "C0",
+        &source_path,
+        &source,
+        &runtime_units,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_click_formula_bar(
+        "focus-c0-formula-bar",
         &source_path,
         &source,
         &runtime_units,
@@ -666,9 +692,22 @@ fn run_cells_interaction_speed(
             &mut event_records,
         )?;
     }
-    cells_interaction_double_click_cell(
-        "edit-a0",
+    cells_interaction_click_cell(
+        "select-a0-for-dependency-edit",
         "A0",
+        &source_path,
+        &source,
+        &runtime_units,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_click_formula_bar(
+        "focus-a0-formula-bar",
         &source_path,
         &source,
         &runtime_units,
@@ -971,6 +1010,63 @@ fn cells_interaction_click_cell(
         label,
         "cell-click",
         format!("address={address}, node={node}"),
+        input,
+        source_path,
+        source,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        input_state,
+        latencies_ms,
+        workflow_latencies_ms,
+        event_records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_interaction_click_formula_bar(
+    label: &str,
+    source_path: &Path,
+    source: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    click_index: &mut u64,
+    latencies_ms: &mut Vec<f64>,
+    workflow_latencies_ms: &mut Vec<f64>,
+    event_records: &mut Vec<CellsInteractionSpeedEventRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = cells_interaction_current_layout(shared_render_state)?;
+    let (x, y, node) = formula_bar_input_center(&layout)?;
+    let detail = {
+        let payload_summary = live_runtime
+            .lock()
+            .map(|mut runtime| preview_payload_state_summary(&mut runtime))
+            .ok();
+        let selected = payload_summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .pointer("/store/selected_address")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("missing");
+        let binding_address = payload_summary.as_ref().and_then(|summary| {
+            source_intent_binding_value_for_node(&layout, &node, "address", summary)
+        });
+        let binding_paths = source_intent_binding_paths_for_node(&layout, &node, "address");
+        let route_address = focused_address(&layout, &node);
+        format!(
+            "node={node}, selected_before={selected}, route_address={route_address:?}, binding_address={binding_address:?}, binding_paths={binding_paths:?}"
+        )
+    };
+    let input = deterministic_click_input_from_index(*click_index, x, y);
+    *click_index = click_index.saturating_add(1);
+    cells_interaction_apply_input(
+        label,
+        "formula-bar-click",
+        detail,
         input,
         source_path,
         source,
@@ -7786,6 +7882,7 @@ struct DocumentDataBindingSnapshotIndex {
     collection_targets: Vec<(String, Vec<DocumentDataBindingTarget>)>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
     source_intent_binding_targets: Vec<(String, String, String)>,
+    source_intent_binding_targets_by_node: BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
@@ -7794,6 +7891,8 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
         let mut collection_targets = Vec::new();
         let mut text_binding_paths_by_node = BTreeMap::new();
         let mut source_intent_binding_targets = Vec::new();
+        let mut source_intent_binding_targets_by_node =
+            BTreeMap::<String, Vec<(String, String)>>::new();
         for (path, path_targets) in &targets {
             if let Some(row) = document_row_field_path(path) {
                 row_field_targets
@@ -7826,6 +7925,10 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
                         target.node.0.clone(),
                         intent.to_owned(),
                     ));
+                    source_intent_binding_targets_by_node
+                        .entry(target.node.0.clone())
+                        .or_default()
+                        .push((path.clone(), intent.to_owned()));
                 }
             }
         }
@@ -7835,6 +7938,7 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
             collection_targets,
             text_binding_paths_by_node,
             source_intent_binding_targets,
+            source_intent_binding_targets_by_node,
         }
     }
 }
@@ -34200,6 +34304,83 @@ fn source_hit_center_for_target(
     Ok((x, y, target_node))
 }
 
+fn formula_bar_input_center(
+    layout_proof: &Value,
+) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+    if let Some(display_items) = layout_proof
+        .get("display_item_samples")
+        .and_then(serde_json::Value::as_array)
+    {
+        let item = display_items
+            .iter()
+            .find(|item| {
+                item.get("kind").and_then(serde_json::Value::as_str) == Some("text_input")
+                    && item
+                        .pointer("/bounds/y")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some_and(|y| y < 50.0)
+                    && item
+                        .pointer("/bounds/width")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some_and(|width| width > 200.0)
+            })
+            .ok_or("formula bar text input should be present")?;
+        let node = item
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("formula bar text input missing node")?
+            .to_owned();
+        if let Some(hit_region) = layout_proof
+            .get("hit_target_assertions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|hit| hit.get("node").and_then(serde_json::Value::as_str) == Some(node.as_str()))
+        {
+            let bounds = hit_region
+                .get("bounds")
+                .ok_or("formula bar input hit target missing bounds")?;
+            let x = bounds
+                .get("x")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                + bounds
+                    .get("width")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_default()
+                    / 2.0;
+            let y = bounds
+                .get("y")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                + bounds
+                    .get("height")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_default()
+                    / 2.0;
+            return Ok((x, y, node));
+        }
+    }
+    let route_table = PreviewHitRouteTable::from_layout_proof(layout_proof)
+        .ok_or("formula bar input has no hit target and no typed route table")?;
+    let node = route_table
+        .display_items
+        .iter()
+        .find(|item| {
+            matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                && item.bounds.y < 50.0
+                && item.bounds.width > 200.0
+        })
+        .map(|item| item.node.0.clone())
+        .ok_or("formula bar text input should be present in typed route table")?;
+    let hit = route_table
+        .hit_for_node(&node)
+        .ok_or("formula bar input has no typed hit target")?;
+    let x = f64::from(hit.bounds.x + hit.bounds.width / 2.0);
+    let y = f64::from(hit.bounds.y + hit.bounds.height / 2.0);
+    Ok((x, y, node))
+}
+
 fn source_hit_width_for_node(
     layout_proof: &Value,
     target_node: &str,
@@ -35385,17 +35566,35 @@ fn preview_handle_mouse_release_for_route_hit(
             .lock()
             .ok()
             .map(|shared| shared.layout_proof.clone());
+        let runtime_state_summary = live_runtime
+            .lock()
+            .ok()
+            .map(|mut runtime| preview_payload_state_summary(&mut runtime));
+        let resolved_address = layout_proof.as_ref().and_then(|layout| {
+            runtime_state_summary.as_ref().and_then(|summary| {
+                source_intent_binding_value_for_node(layout, &node, "address", summary)
+            })
+        });
+        let resolved_target_text = layout_proof.as_ref().and_then(|layout| {
+            runtime_state_summary.as_ref().and_then(|summary| {
+                source_intent_binding_value_for_node(layout, &node, "target", summary)
+            })
+        });
         input_state.focused_node = Some(node.clone());
-        input_state.focused_address = resolve_optional_source_intent_payload_value_for_focus(
-            layout_proof.as_ref(),
-            None,
-            route_table.address(&node),
-        );
-        input_state.focused_target_text = resolve_optional_source_intent_payload_value_for_focus(
-            layout_proof.as_ref(),
-            None,
-            route_table.target_text(&node),
-        );
+        input_state.focused_address = resolved_address.or_else(|| {
+            resolve_optional_source_intent_payload_value_for_focus(
+                layout_proof.as_ref(),
+                runtime_state_summary.as_ref(),
+                route_table.address(&node),
+            )
+        });
+        input_state.focused_target_text = resolved_target_text.or_else(|| {
+            resolve_optional_source_intent_payload_value_for_focus(
+                layout_proof.as_ref(),
+                runtime_state_summary.as_ref(),
+                route_table.target_text(&node),
+            )
+        });
         input_state.focused_change_source = route_table.change_source(&node);
         input_state.focused_escape_source = route_table.escape_source(&node);
         input_state.focused_key_down_source = route_table.key_down_source(&node);
@@ -35457,6 +35656,8 @@ fn preview_handle_mouse_release_for_route_hit(
         }
         if let Some(mut event) = route_table.live_source_event_for_hit(hit, position, double_click)
         {
+            event.address = input_state.focused_address.clone().or(event.address);
+            event.target_text = input_state.focused_target_text.clone().or(event.target_text);
             if double_click {
                 event.text = Some(input_state.focused_text.clone());
             }
@@ -36558,8 +36759,17 @@ fn preview_sync_bound_text_inputs_in_shared_state(
     let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
         return false;
     };
-    let source_intent_updates = source_intent_binding_updates_for_state(&snapshot, state_summary);
     let text_binding_paths = text_binding_paths_by_node(&snapshot);
+    let Some(frame) = shared.layout_frame_override.as_ref().map(Arc::as_ref) else {
+        return false;
+    };
+    let source_intent_update_nodes =
+        bound_input_source_intent_update_nodes(frame, text_binding_paths);
+    let source_intent_updates = source_intent_binding_updates_for_nodes(
+        &snapshot,
+        state_summary,
+        &source_intent_update_nodes,
+    );
     let mut changed = false;
     if !source_intent_updates.is_empty()
         && let Some(assertions) = shared
@@ -36605,21 +36815,18 @@ fn preview_sync_bound_text_inputs_in_shared_state(
             shared.layout_proof["source_intent_value_index"] = source_intent_value_index;
         }
     }
-    let Some(frame) = shared.layout_frame_override.as_ref().map(Arc::as_ref) else {
-        return changed;
-    };
     let mut text_updates = Vec::<(usize, String)>::new();
     for (index, item) in frame.display_list.iter().enumerate() {
         let node = item.node.0.as_str();
         let text_binding_paths_for_node = text_binding_paths.get(node);
-        let text_from_binding = text_binding_paths_for_node
-            .and_then(|paths| document_text_binding_value_for_paths(paths, state_summary));
         if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            if !text_binding_paths_for_node
-                .is_some_and(|paths| paths.iter().any(|path| !path.starts_with('@')))
-            {
+            let Some(paths) = text_binding_paths_for_node else {
+                continue;
+            };
+            if !paths.iter().any(|path| !path.starts_with('@')) {
                 continue;
             }
+            let text_from_binding = document_text_binding_value_for_paths(paths, state_summary);
             let Some(next_text) = text_from_binding else {
                 continue;
             };
@@ -36628,6 +36835,8 @@ fn preview_sync_bound_text_inputs_in_shared_state(
             }
             continue;
         }
+        let text_from_binding = text_binding_paths_for_node
+            .and_then(|paths| document_text_binding_value_for_paths(paths, state_summary));
         let current_address = source_intent_updates
             .get(&(node.to_owned(), "address".to_owned()))
             .cloned()
@@ -36682,8 +36891,14 @@ fn preview_bound_input_sync_full_state_summary_reason(
     let Some(frame) = layout_frame else {
         return None;
     };
-    let source_intent_updates = source_intent_binding_updates_for_state(&snapshot, state_summary);
     let text_binding_paths = text_binding_paths_by_node(&snapshot);
+    let source_intent_update_nodes =
+        bound_input_source_intent_update_nodes(frame, text_binding_paths);
+    let source_intent_updates = source_intent_binding_updates_for_nodes(
+        &snapshot,
+        state_summary,
+        &source_intent_update_nodes,
+    );
     for item in &frame.display_list {
         if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
             continue;
@@ -36751,8 +36966,107 @@ fn source_intent_binding_updates_for_state(
     updates
 }
 
+fn source_intent_binding_updates_for_nodes(
+    snapshot: &DocumentRenderSnapshot,
+    state_summary: &Value,
+    nodes: &BTreeSet<String>,
+) -> BTreeMap<(String, String), String> {
+    let mut updates = BTreeMap::new();
+    for node in nodes {
+        let Some(bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        else {
+            continue;
+        };
+        for (path, intent) in bindings {
+            let Some(value) = state_summary_value_for_data_path(state_summary, path) else {
+                continue;
+            };
+            let source_path = json_value_to_document_source_path(value);
+            if source_path.trim().is_empty() {
+                continue;
+            }
+            updates.insert((node.clone(), intent.clone()), source_path);
+        }
+    }
+    updates
+}
+
+fn source_intent_binding_value_for_node(
+    layout_proof: &Value,
+    node: &str,
+    intent: &str,
+    state_summary: &Value,
+) -> Option<String> {
+    let layout_hash = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)?;
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    let bindings = snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+        .get(node)?;
+    let mut bindings = bindings
+        .iter()
+        .filter(|(_, binding_intent)| binding_intent == intent)
+        .collect::<Vec<_>>();
+    bindings.sort_by(|(left, _), (right, _)| {
+        document_text_binding_path_rank(left)
+            .cmp(&document_text_binding_path_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    bindings.into_iter().find_map(|(path, _)| {
+        let value = state_summary_value_for_data_path(state_summary, path)?;
+        let source_path = json_value_to_document_source_path(value);
+        (!source_path.trim().is_empty()).then_some(source_path)
+    })
+}
+
+fn source_intent_binding_paths_for_node(
+    layout_proof: &Value,
+    node: &str,
+    intent: &str,
+) -> Vec<String> {
+    let Some(layout_hash) = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return Vec::new();
+    };
+    snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+        .get(node)
+        .into_iter()
+        .flatten()
+        .filter_map(|(path, binding_intent)| (binding_intent == intent).then_some(path.clone()))
+        .collect()
+}
+
 fn text_binding_paths_by_node(snapshot: &DocumentRenderSnapshot) -> &BTreeMap<String, Vec<String>> {
     &snapshot.data_binding_targets.text_binding_paths_by_node
+}
+
+fn bound_input_source_intent_update_nodes(
+    frame: &boon_document::LayoutFrame,
+    text_binding_paths: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    frame
+        .display_list
+        .iter()
+        .filter(|item| {
+            matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                || text_binding_paths
+                    .get(item.node.0.as_str())
+                    .is_some_and(|paths| paths.iter().any(|path| !path.starts_with('@')))
+        })
+        .map(|item| item.node.0.clone())
+        .collect()
 }
 
 fn display_item_declares_text_input_focus(item: &boon_document::DisplayItem) -> bool {
@@ -38290,12 +38604,7 @@ fn preview_apply_live_events_internal(
             Some(patched_result.layout_frame.as_ref()),
             state_summary,
         );
-        let public_bound_input_summary = preview_layout_has_public_bound_text_input(
-            &patched_result.proof,
-            patched_result.layout_frame.as_ref(),
-        );
-        let needs_full_bound_input_state_summary =
-            bound_input_state_summary_reason.is_some() || public_bound_input_summary;
+        let needs_full_bound_input_state_summary = bound_input_state_summary_reason.is_some();
         let mut full_bound_input_state_summary = None;
         let mut bound_input_state_summary_ms = 0.0;
         if needs_full_bound_input_state_summary {
@@ -39585,9 +39894,9 @@ fn resolve_source_intent_payload_value(layout_proof: &Value, value: String) -> S
 }
 
 fn preview_payload_state_summary(runtime: &mut boon_runtime::LiveRuntime) -> Value {
-    let mut summary = runtime.state_summary();
-    let document_summary = runtime.document_state_summary();
-    merge_missing_json_fields(&mut summary, &document_summary);
+    let mut summary = runtime.document_state_summary();
+    let runtime_summary = runtime.state_summary();
+    merge_missing_json_fields(&mut summary, &runtime_summary);
     summary
 }
 

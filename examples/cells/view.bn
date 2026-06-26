@@ -196,10 +196,6 @@ FUNCTION cell_view(cell) {
         element: [
             event: [
                 click: cell.sources.editor.select
-                change: cell.sources.editor.change
-                key_down: cell.sources.editor.commit
-                escape: cell.sources.editor.cancel
-                blur: cell.sources.editor.blur
             ]
         ]
         style: [

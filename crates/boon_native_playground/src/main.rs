@@ -1090,11 +1090,6 @@ fn deterministic_keyboard_input_from_keys(
             },
         )
         .collect::<Vec<_>>();
-    let last_sequence = keyboard_events
-        .iter()
-        .map(|event| event.sequence)
-        .max()
-        .unwrap_or(start_sequence);
     boon_native_app_window::NativeInputAdapterProof {
         installed: true,
         capture_scope: "deterministic_recent_keyboard_events".to_owned(),
@@ -1113,7 +1108,7 @@ fn deterministic_keyboard_input_from_keys(
         mouse_button_event_count: 0,
         mouse_scroll_event_count: 0,
         mouse_total_event_count: 0,
-        keyboard_key_event_count: last_sequence,
+        keyboard_key_event_count: keyboard_events.len() as u64,
         mouse_button_events: Vec::new(),
         keyboard_events,
         mouse_window_pos: None,
@@ -7743,7 +7738,7 @@ struct DocumentDataBindingSnapshotIndex {
     targets: DocumentDataBindingIndex,
     row_field_targets: DocumentDataBindingRowFieldIndex,
     collection_targets: Vec<(String, Vec<DocumentDataBindingTarget>)>,
-    text_binding_paths_by_node: BTreeMap<String, String>,
+    text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
     source_intent_binding_targets: Vec<(String, String, String)>,
 }
 
@@ -7767,9 +7762,17 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
             }
             for target in path_targets {
                 if target.attr == "text" {
-                    text_binding_paths_by_node
+                    let paths = text_binding_paths_by_node
                         .entry(target.node.0.clone())
-                        .or_insert_with(|| path.clone());
+                        .or_insert_with(Vec::new);
+                    if !paths.iter().any(|existing| existing == path) {
+                        paths.push(path.clone());
+                        paths.sort_by(|left, right| {
+                            document_text_binding_path_rank(left)
+                                .cmp(&document_text_binding_path_rank(right))
+                                .then_with(|| left.cmp(right))
+                        });
+                    }
                 }
                 if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
                     source_intent_binding_targets.push((
@@ -7788,6 +7791,10 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
             source_intent_binding_targets,
         }
     }
+}
+
+fn document_text_binding_path_rank(path: &str) -> u8 {
+    u8::from(path.starts_with('@'))
 }
 
 impl std::ops::Deref for DocumentDataBindingSnapshotIndex {
@@ -26918,6 +26925,7 @@ fn lower_canonical_element_text(
         };
         document_context_clear_data_reads(context);
         let mut recorded_text = false;
+        let mut record_text_reads = false;
         match field.as_str() {
             "label"
                 if !matches!(
@@ -26929,21 +26937,25 @@ fn lower_canonical_element_text(
                 if canonical_element_function(child, expressions).is_none()
                     && node.text.is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
-                    && !text.is_empty()
                 {
-                    node.text = Some(boon_document_model::TextValue { text });
-                    recorded_text = true;
+                    record_text_reads = true;
+                    if !text.is_empty() {
+                        node.text = Some(boon_document_model::TextValue { text });
+                        recorded_text = true;
+                    }
                 }
             }
             "text" | "value" | "display_value" => {
                 if node.text.is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
-                    && !text.is_empty()
                     && !(matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput)
                         && text.contains(".event."))
                 {
-                    node.text = Some(boon_document_model::TextValue { text });
-                    recorded_text = true;
+                    record_text_reads = true;
+                    if !text.is_empty() {
+                        node.text = Some(boon_document_model::TextValue { text });
+                        recorded_text = true;
+                    }
                 }
             }
             "placeholder" => {
@@ -26964,16 +26976,18 @@ fn lower_canonical_element_text(
                 if node.text.is_none()
                     && canonical_element_function(child, expressions).is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
-                    && !text.is_empty()
                 {
-                    node.text = Some(boon_document_model::TextValue { text });
-                    recorded_text = true;
+                    record_text_reads = true;
+                    if !text.is_empty() {
+                        node.text = Some(boon_document_model::TextValue { text });
+                        recorded_text = true;
+                    }
                 }
             }
             _ => {}
         }
         let reads = document_context_take_data_reads(context);
-        if recorded_text {
+        if recorded_text || record_text_reads {
             document_context_record_target_reads(context, node, "text", reads);
         }
     }
@@ -26996,19 +27010,20 @@ fn lower_canonical_element_call_arg_text(
             continue;
         };
         document_context_clear_data_reads(context);
-        if let Some(text) = expressions
+        let text = expressions
             .get(arg.value)
             .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
             .filter(|text| {
-                !text.is_empty()
-                    && !(matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput)
-                        && text.contains(".event."))
-            })
-        {
-            node.text = Some(boon_document_model::TextValue { text });
+                !(matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && text.contains(".event."))
+            });
+        if let Some(text) = text {
             let mut reads = document_context_take_data_reads(context);
             reads.extend(document_expr_origin_paths(arg.value, expressions, context));
             document_context_record_target_reads(context, node, "text", reads);
+            if !text.is_empty() {
+                node.text = Some(boon_document_model::TextValue { text });
+            }
         } else {
             let _ = document_context_take_data_reads(context);
         }
@@ -27079,7 +27094,6 @@ fn document_text_or_nested_text(
     context: &DocumentEvalContext<'_>,
 ) -> Option<String> {
     document_text_value(statement, expressions, context, false)
-        .filter(|text| !text.is_empty())
         .or_else(|| {
             statement
                 .children
@@ -29010,7 +29024,7 @@ fn document_data_read_key_for_list_field(
 }
 
 fn document_origin_with_suffix(origin: &str, suffix_path: &str) -> Option<String> {
-    if origin.starts_with("@list:") {
+    if origin.starts_with("@list:") || origin.starts_with("@row:") {
         if suffix_path.is_empty() {
             return None;
         }
@@ -33130,7 +33144,14 @@ fn document_resolved_value<'a>(
                 .and_then(|object| object.get(first))
         })?
     };
-    for part in suffix {
+    let mut row_origin_reads = BTreeSet::new();
+    for (index, part) in suffix.iter().enumerate() {
+        if let Some(row_origin) = document_row_origin_for_item(current) {
+            let suffix_path = suffix[index..].join(".");
+            if let Some(path) = document_origin_with_suffix(&row_origin, &suffix_path) {
+                row_origin_reads.insert(path);
+            }
+        }
         current = current.as_object()?.get(*part)?;
     }
     if first == "PASSED" {
@@ -33145,6 +33166,7 @@ fn document_resolved_value<'a>(
     } else if !context.locals.contains_key(first) {
         document_context_record_data_read(context, path.to_owned());
     }
+    document_context_record_data_reads(context, row_origin_reads);
     Some(current)
 }
 
@@ -35413,9 +35435,22 @@ fn preview_handle_mouse_release_for_route_hit(
         input_state.focused_change_source = route_table.change_source(&node);
         input_state.focused_escape_source = route_table.escape_source(&node);
         input_state.focused_key_down_source = route_table.key_down_source(&node);
-        input_state.focused_text.clear();
-        input_state.focused_caret_index = 0;
-        input_state.replace_focused_text_on_next_edit = false;
+        if input_state.focused_change_source.is_some() {
+            input_state.focused_text = route_table
+                .focused_text(&node, live_runtime)
+                .or_else(|| route_table.document_value(&node))
+                .unwrap_or_default();
+            input_state.focused_caret_index = route_table
+                .caret_index_for_text_hit(hit, position.x, &input_state.focused_text)
+                .min(preview_text_char_count(&input_state.focused_text));
+            input_state.replace_focused_text_on_next_edit =
+                route_table.text_input_should_replace_on_type(&node);
+            preview_reset_caret_blink(input_state);
+        } else {
+            input_state.focused_text.clear();
+            input_state.focused_caret_index = 0;
+            input_state.replace_focused_text_on_next_edit = false;
+        }
         preview_clear_key_repeat(input_state);
         preview_set_interaction_diagnostic_subphase(
             "simple_source_click.prepare_focusable.key_focus.live_event",
@@ -36524,11 +36559,15 @@ fn preview_sync_bound_text_inputs_in_shared_state(
     let mut text_updates = Vec::<(usize, String)>::new();
     for (index, item) in frame.display_list.iter().enumerate() {
         let node = item.node.0.as_str();
-        let text_from_binding = text_binding_paths
-            .get(node)
-            .and_then(|path| state_summary_value_for_data_path(state_summary, path))
-            .map(json_value_to_document_text);
+        let text_binding_paths_for_node = text_binding_paths.get(node);
+        let text_from_binding = text_binding_paths_for_node
+            .and_then(|paths| document_text_binding_value_for_paths(paths, state_summary));
         if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
+            if !text_binding_paths_for_node
+                .is_some_and(|paths| paths.iter().any(|path| !path.starts_with('@')))
+            {
+                continue;
+            }
             let Some(next_text) = text_from_binding else {
                 continue;
             };
@@ -36598,11 +36637,11 @@ fn preview_bound_input_sync_full_state_summary_reason(
             continue;
         }
         let node = item.node.0.as_str();
-        if let Some(path) = text_binding_paths.get(node) {
-            if state_summary_value_for_data_path(state_summary, path).is_some() {
+        if let Some(paths) = text_binding_paths.get(node) {
+            if document_text_binding_value_for_paths(paths, state_summary).is_some() {
                 continue;
             }
-            return Some(format!("missing_text_input_binding_path:{node}:{path}"));
+            return Some(format!("missing_text_input_binding_path:{node}:{paths:?}"));
         }
         let current_address = source_intent_updates
             .get(&(node.to_owned(), "address".to_owned()))
@@ -36618,6 +36657,28 @@ fn preview_bound_input_sync_full_state_summary_reason(
         }
     }
     None
+}
+
+fn preview_layout_has_public_bound_text_input(
+    layout_proof: &Value,
+    layout_frame: &boon_document::LayoutFrame,
+) -> bool {
+    let Some(layout_hash) = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return false;
+    };
+    let text_binding_paths = text_binding_paths_by_node(&snapshot);
+    layout_frame.display_list.iter().any(|item| {
+        matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+            && text_binding_paths
+                .get(item.node.0.as_str())
+                .is_some_and(|paths| paths.iter().any(|path| !path.starts_with('@')))
+    })
 }
 
 fn source_intent_binding_updates_for_state(
@@ -36638,7 +36699,7 @@ fn source_intent_binding_updates_for_state(
     updates
 }
 
-fn text_binding_paths_by_node(snapshot: &DocumentRenderSnapshot) -> &BTreeMap<String, String> {
+fn text_binding_paths_by_node(snapshot: &DocumentRenderSnapshot) -> &BTreeMap<String, Vec<String>> {
     &snapshot.data_binding_targets.text_binding_paths_by_node
 }
 
@@ -38177,7 +38238,12 @@ fn preview_apply_live_events_internal(
             Some(patched_result.layout_frame.as_ref()),
             state_summary,
         );
-        let needs_full_bound_input_state_summary = bound_input_state_summary_reason.is_some();
+        let public_bound_input_summary = preview_layout_has_public_bound_text_input(
+            &patched_result.proof,
+            patched_result.layout_frame.as_ref(),
+        );
+        let needs_full_bound_input_state_summary =
+            bound_input_state_summary_reason.is_some() || public_bound_input_summary;
         let mut full_bound_input_state_summary = None;
         let mut bound_input_state_summary_ms = 0.0;
         if needs_full_bound_input_state_summary {
@@ -39579,8 +39645,13 @@ fn document_text_binding_value_for_node(
     node: &str,
     summary: &Value,
 ) -> Option<String> {
-    for path in document_text_binding_paths_for_node(layout_proof, node) {
-        if let Some(value) = state_summary_value_for_data_path(summary, &path) {
+    let paths = document_text_binding_paths_for_node(layout_proof, node);
+    document_text_binding_value_for_paths(&paths, summary)
+}
+
+fn document_text_binding_value_for_paths(paths: &[String], summary: &Value) -> Option<String> {
+    for path in paths {
+        if let Some(value) = state_summary_value_for_data_path(summary, path) {
             return Some(json_value_to_document_text(value));
         }
     }
@@ -39610,6 +39681,11 @@ fn document_text_binding_paths_for_node(layout_proof: &Value, node: &str) -> Vec
             node,
         ));
     }
+    paths.sort_by(|left, right| {
+        document_text_binding_path_rank(left)
+            .cmp(&document_text_binding_path_rank(right))
+            .then_with(|| left.cmp(right))
+    });
     paths
 }
 
@@ -39671,7 +39747,14 @@ fn state_summary_value_for_row_field_path<'a>(
     summary: &'a Value,
     row_path: DocumentRowFieldPath<'_>,
 ) -> Option<&'a Value> {
-    let list = row_path.list?;
+    let Some(list) = row_path.list else {
+        return state_summary_value_for_hidden_row_field_path(
+            summary,
+            row_path.key,
+            row_path.generation,
+            row_path.field,
+        );
+    };
     let mut list_names = vec![list.to_owned()];
     if let Some((_, tail)) = list.rsplit_once('.') {
         list_names.push(tail.to_owned());
@@ -39700,6 +39783,35 @@ fn state_summary_value_for_row_field_path<'a>(
         }
     }
     None
+}
+
+fn state_summary_value_for_hidden_row_field_path<'a>(
+    value: &'a Value,
+    key: u64,
+    generation: u64,
+    field: &str,
+) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => {
+            if let Some(boon) = object.get("$boon") {
+                let row_key = boon.get("row_key").and_then(serde_json::Value::as_u64);
+                let row_generation = boon
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1);
+                if row_key == Some(key) && row_generation == generation {
+                    return state_summary_value_for_data_path(value, field);
+                }
+            }
+            object.values().find_map(|child| {
+                state_summary_value_for_hidden_row_field_path(child, key, generation, field)
+            })
+        }
+        Value::Array(values) => values.iter().find_map(|child| {
+            state_summary_value_for_hidden_row_field_path(child, key, generation, field)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
 }
 
 fn focused_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
@@ -41179,6 +41291,7 @@ struct PreviewHitRouteTable {
     display_items: Vec<boon_document::DisplayItem>,
     display_items_by_node: BTreeMap<String, Vec<usize>>,
     hit_index_by_node: BTreeMap<String, usize>,
+    text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
 }
 
 impl PreviewHitRouteTable {
@@ -41284,6 +41397,10 @@ impl PreviewHitRouteTable {
             display_items,
             display_items_by_node,
             hit_index_by_node,
+            text_binding_paths_by_node: snapshot
+                .data_binding_targets
+                .text_binding_paths_by_node
+                .clone(),
         })
     }
 
@@ -41663,6 +41780,13 @@ impl PreviewHitRouteTable {
     ) -> Option<String> {
         let mut runtime = live_runtime.lock().ok()?;
         let summary = preview_payload_state_summary(&mut runtime);
+        if let Some(text) = self
+            .text_binding_paths_by_node
+            .get(node)
+            .and_then(|paths| document_text_binding_value_for_paths(paths, &summary))
+        {
+            return Some(text);
+        }
         if let Some(text) = self
             .document_value(node)
             .and_then(|path| state_summary_value_for_data_path(&summary, &path))
@@ -43221,11 +43345,7 @@ fn preview_semantic_unpatched_data_binding_fast_path_rejection_for_layout_hash(
         if has_patch {
             continue;
         }
-        if snapshot
-            .data_binding_targets
-            .get(path)
-            .is_some_and(|targets| !targets.is_empty())
-        {
+        if !document_snapshot_data_binding_targets(&snapshot, path).is_empty() {
             return Some(format!("semantic_unpatched_data_binding:{path}"));
         }
     }
@@ -44971,6 +45091,51 @@ fn preview_partial_text_render_scene_patch_for_targets(
     }
 }
 
+fn preview_layout_frame_with_patched_render_scene_targets(
+    previous_layout: &boon_document::LayoutFrame,
+    document_frame: &boon_document_model::DocumentFrame,
+    targets: &[DocumentDirectLayoutPatchTarget],
+    layout_node_index: Option<&DocumentLayoutNodeIndex>,
+) -> Result<Option<DirectLayoutFramePatchResult>, &'static str> {
+    let paint_targets = targets
+        .iter()
+        .filter(|target| !target.target.attr.starts_with("__source_intent:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if paint_targets.is_empty() {
+        return Ok(None);
+    }
+    let total_started = Instant::now();
+    let layout_clone_started = Instant::now();
+    let mut layout = previous_layout.clone();
+    let layout_frame_clone_ms = elapsed_ms(layout_clone_started);
+    let target_patch_started = Instant::now();
+    let target_count = preview_apply_batched_direct_paint_targets(
+        &mut layout,
+        document_frame,
+        &paint_targets,
+        layout_node_index,
+    )?;
+    let target_patch_ms = elapsed_ms(target_patch_started);
+    let touched_node_ids = paint_targets
+        .iter()
+        .flat_map(|target| preview_direct_layout_patch_touched_nodes(document_frame, target))
+        .collect::<BTreeSet<_>>();
+    Ok(Some(DirectLayoutFramePatchResult {
+        layout,
+        touched_node_ids,
+        layout_frame_clone_ms,
+        row_group_ms: 0.0,
+        target_patch_ms,
+        row_group_patch_ms: 0.0,
+        total_ms: elapsed_ms(total_started),
+        target_count,
+        row_group_count: 0,
+        batched_target_count: target_count,
+        batched_target_group_count: usize::from(target_count > 0),
+    }))
+}
+
 fn preview_grouped_style_render_scene_patch_for_targets(
     layout: &boon_document::LayoutFrame,
     targets: &[DocumentDirectLayoutPatchTarget],
@@ -45409,27 +45574,66 @@ fn preview_try_patch_paint_space_for_root_deltas(
         let render_scene_patch = render_scene_patch
             .as_ref()
             .expect("all-target render-scene patch decision should carry a patch");
-        layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
-        layout_patch_profile.retained_layout_reused_entry_count =
-            snapshot.retained_layout_cache.entries.len();
-        layout_patch_profile.direct_target_count = direct_patch_targets.len();
-        (
-            Arc::clone(&snapshot.derived_indexes),
-            Arc::clone(&snapshot.layout_frame),
-            Arc::clone(&snapshot.retained_layout_cache),
-            json!({
-                "status": "pass",
-                "entry_count": snapshot.retained_layout_cache.entries.len(),
-                "reused_count": snapshot.retained_layout_cache.entries.len(),
-                "dirty_count": 0,
-                "removed_count": 0,
-                "refreshed_count": 0,
-                "patch_operation_count": 0,
-                "render_scene_patch_operation_count": render_scene_patch.operations.len(),
-                "reason": "render_scene_text_patch"
-            }),
-            false,
+        let render_scene_layout_patch = preview_layout_frame_with_patched_render_scene_targets(
+            snapshot.layout_frame.as_ref(),
+            &frame,
+            &direct_patch_targets,
+            layout_node_index.as_deref(),
         )
+        .map_err(|reason| format!("render_scene_layout_frame_patch_failed:{reason}"))?;
+        layout_patch_profile.direct_target_count = direct_patch_targets.len();
+        if let Some(render_scene_layout_patch) = render_scene_layout_patch {
+            layout_patch_profile.layout_frame_clone_ms =
+                render_scene_layout_patch.layout_frame_clone_ms;
+            layout_patch_profile.direct_target_patch_ms = render_scene_layout_patch.target_patch_ms;
+            layout_patch_profile.direct_layout_patch_total_ms = render_scene_layout_patch.total_ms;
+            layout_patch_profile.direct_target_count = render_scene_layout_patch.target_count;
+            layout_patch_profile.batched_direct_target_count =
+                render_scene_layout_patch.batched_target_count;
+            layout_patch_profile.batched_direct_target_group_count =
+                render_scene_layout_patch.batched_target_group_count;
+            layout_patch_profile.direct_layout_frame_patch = true;
+            let layout = Arc::new(render_scene_layout_patch.layout);
+            let retained_layout_cache_update_started = Instant::now();
+            let (retained_layout_cache, retained_layout_cache_update) =
+                retained_layout_cache_update_for_document_layout(
+                    &frame,
+                    &snapshot.derived_indexes,
+                    layout.as_ref(),
+                    &snapshot.retained_layout_cache,
+                    Some(&render_scene_layout_patch.touched_node_ids),
+                )?;
+            layout_patch_profile.retained_layout_cache_update_ms =
+                elapsed_ms(retained_layout_cache_update_started);
+            (
+                Arc::clone(&snapshot.derived_indexes),
+                layout,
+                retained_layout_cache,
+                retained_layout_cache_update,
+                true,
+            )
+        } else {
+            layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
+            layout_patch_profile.retained_layout_reused_entry_count =
+                snapshot.retained_layout_cache.entries.len();
+            (
+                Arc::clone(&snapshot.derived_indexes),
+                Arc::clone(&snapshot.layout_frame),
+                Arc::clone(&snapshot.retained_layout_cache),
+                json!({
+                    "status": "pass",
+                    "entry_count": snapshot.retained_layout_cache.entries.len(),
+                    "reused_count": snapshot.retained_layout_cache.entries.len(),
+                    "dirty_count": 0,
+                    "removed_count": 0,
+                    "refreshed_count": 0,
+                    "patch_operation_count": 0,
+                    "render_scene_patch_operation_count": render_scene_patch.operations.len(),
+                    "reason": "render_scene_metadata_patch"
+                }),
+                false,
+            )
+        }
     } else if source_binding_only_layout_reuse {
         layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
         layout_patch_profile.retained_layout_reused_entry_count =
@@ -45537,7 +45741,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
             .as_ref()
             .map(|patch| patch.operations.len())
             .unwrap_or(0),
-        "retained_layout_frame_reuse_without_clone": source_binding_only_layout_reuse || render_scene_patch_layout_reuse,
+        "retained_layout_frame_reuse_without_clone": layout_patch_profile.retained_layout_frame_reuse_without_clone,
         "document_eval_lower_ms": 0.0,
         "artifact_serialize_ms": 0.0,
         "artifact_write_ms": 0.0
@@ -45993,11 +46197,38 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let (layout, cached_patched_layout, direct_patched_layout, touched_node_ids) =
         if render_scene_patch_layout_reuse {
             direct_layout_frame_patch_rejection = None;
-            layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
-            layout_patch_profile.retained_layout_reused_entry_count =
-                snapshot.retained_layout_cache.entries.len();
+            let render_scene_layout_patch = preview_layout_frame_with_patched_render_scene_targets(
+                snapshot.layout_frame.as_ref(),
+                &frame,
+                &direct_patch_targets,
+                layout_node_index.as_deref(),
+            )
+            .map_err(|reason| format!("render_scene_layout_frame_patch_failed:{reason}"))?;
             layout_patch_profile.direct_target_count = direct_patch_targets.len();
-            (Arc::clone(&snapshot.layout_frame), false, false, None)
+            if let Some(render_scene_layout_patch) = render_scene_layout_patch {
+                layout_patch_profile.layout_frame_clone_ms =
+                    render_scene_layout_patch.layout_frame_clone_ms;
+                layout_patch_profile.direct_target_patch_ms =
+                    render_scene_layout_patch.target_patch_ms;
+                layout_patch_profile.direct_layout_patch_total_ms =
+                    render_scene_layout_patch.total_ms;
+                layout_patch_profile.direct_target_count = render_scene_layout_patch.target_count;
+                layout_patch_profile.batched_direct_target_count =
+                    render_scene_layout_patch.batched_target_count;
+                layout_patch_profile.batched_direct_target_group_count =
+                    render_scene_layout_patch.batched_target_group_count;
+                (
+                    Arc::new(render_scene_layout_patch.layout),
+                    false,
+                    true,
+                    Some(render_scene_layout_patch.touched_node_ids),
+                )
+            } else {
+                layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
+                layout_patch_profile.retained_layout_reused_entry_count =
+                    snapshot.retained_layout_cache.entries.len();
+                (Arc::clone(&snapshot.layout_frame), false, false, None)
+            }
         } else if let Some(cached) = cached_patched_snapshot.as_ref() {
             direct_layout_frame_patch_rejection = None;
             let layout_clone_started = Instant::now();
@@ -46063,44 +46294,45 @@ fn preview_try_patch_document_layout_for_root_deltas(
     } else {
         record_preview_render_scene_patch_decision("rejected", render_scene_patch_rejection);
     }
-    let (retained_layout_cache, retained_layout_cache_update) = if render_scene_patch_layout_reuse {
-        (
-            Arc::clone(&snapshot.retained_layout_cache),
-            retained_layout_cache_reuse_without_clone_report(
+    let (retained_layout_cache, retained_layout_cache_update) =
+        if render_scene_patch_layout_reuse && !direct_patched_layout {
+            (
+                Arc::clone(&snapshot.retained_layout_cache),
+                retained_layout_cache_reuse_without_clone_report(
+                    &snapshot.retained_layout_cache,
+                    "render_scene_text_patch",
+                ),
+            )
+        } else if let Some(cached) = cached_patched_snapshot.as_ref() {
+            (
+                Arc::clone(&cached.retained_layout_cache),
+                json!({
+                    "cached_patched_layout": true,
+                    "entry_count": cached.retained_layout_cache.entries.len()
+                }),
+            )
+        } else if source_binding_only_layout_reuse {
+            (
+                Arc::clone(&snapshot.retained_layout_cache),
+                retained_layout_cache_reuse_without_clone_report(
+                    &snapshot.retained_layout_cache,
+                    "source_binding_only_patch",
+                ),
+            )
+        } else {
+            let retained_layout_cache_update_started = Instant::now();
+            retained_layout_cache_update_for_document_layout(
+                &frame,
+                &derived_indexes,
+                layout.as_ref(),
                 &snapshot.retained_layout_cache,
-                "render_scene_text_patch",
-            ),
-        )
-    } else if let Some(cached) = cached_patched_snapshot.as_ref() {
-        (
-            Arc::clone(&cached.retained_layout_cache),
-            json!({
-                "cached_patched_layout": true,
-                "entry_count": cached.retained_layout_cache.entries.len()
-            }),
-        )
-    } else if source_binding_only_layout_reuse {
-        (
-            Arc::clone(&snapshot.retained_layout_cache),
-            retained_layout_cache_reuse_without_clone_report(
-                &snapshot.retained_layout_cache,
-                "source_binding_only_patch",
-            ),
-        )
-    } else {
-        let retained_layout_cache_update_started = Instant::now();
-        retained_layout_cache_update_for_document_layout(
-            &frame,
-            &derived_indexes,
-            layout.as_ref(),
-            &snapshot.retained_layout_cache,
-            touched_node_ids.as_ref(),
-        )
-        .inspect(|_| {
-            layout_patch_profile.retained_layout_cache_update_ms =
-                elapsed_ms(retained_layout_cache_update_started);
-        })?
-    };
+                touched_node_ids.as_ref(),
+            )
+            .inspect(|_| {
+                layout_patch_profile.retained_layout_cache_update_ms =
+                    elapsed_ms(retained_layout_cache_update_started);
+            })?
+        };
     let compact_hot_proof = !full_proof && preview_compact_timing_enabled();
     let source_intent_index_started = Instant::now();
     let (source_intent_index, source_intent_value_index) = source_intent_indexes(&source_intents);
@@ -46118,7 +46350,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
             .as_ref()
             .map(|patch| patch.operations.len())
             .unwrap_or(0),
-        "retained_layout_frame_reuse_without_clone": source_binding_only_layout_reuse || render_scene_patch_layout_reuse,
+        "retained_layout_frame_reuse_without_clone": layout_patch_profile.retained_layout_frame_reuse_without_clone,
         "incremental_layout_frame_hash": true,
         "layout_hash_patch_count": layout_hash_patches.len(),
         "patched_target_count": patched_targets,
@@ -74898,17 +75130,112 @@ document:
             source_hit_center_for_target(&current_layout, "cell.sources.editor.select", Some("A3"))
                 .unwrap();
         let (_, _, formula_node) = formula_bar_input_center(&current_layout);
+        let a3_binding_debug = current_layout
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .and_then(cached_document_render_snapshot)
+            .map(|snapshot| {
+                let paths = snapshot
+                    .data_binding_targets
+                    .iter()
+                    .filter(|(path, targets)| {
+                        path.contains(":79:1:")
+                            || path.contains("display_text")
+                            || targets.iter().any(|target| target.node.0 == a3_node)
+                    })
+                    .take(64)
+                    .map(|(path, targets)| {
+                        json!({
+                            "path": path,
+                            "targets": targets
+                                .iter()
+                                .map(|target| json!({
+                                    "node": target.node.0,
+                                    "attr": target.attr,
+                                }))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "paths": paths,
+                    "target_count": snapshot
+                        .data_binding_targets
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+                    "path_count": snapshot.data_binding_targets.len()
+                })
+            })
+            .unwrap_or_else(|| json!(null));
         let frame = latest_preview_frame(&shared_render_state);
+        let formula_binding_debug = current_layout
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .and_then(cached_document_render_snapshot)
+            .map(|snapshot| {
+                let paths = snapshot
+                    .data_binding_targets
+                    .iter()
+                    .filter(|(path, targets)| {
+                        path.contains("selected_input")
+                            || path.contains("@row:79:1")
+                            || targets.iter().any(|target| target.node.0 == formula_node)
+                    })
+                    .take(96)
+                    .map(|(path, targets)| {
+                        json!({
+                            "path": path,
+                            "targets": targets
+                                .iter()
+                                .map(|target| json!({
+                                    "node": target.node.0,
+                                    "attr": target.attr,
+                                }))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "paths": paths,
+                    "target_count": snapshot
+                        .data_binding_targets
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+                    "path_count": snapshot.data_binding_targets.len()
+                })
+            })
+            .unwrap_or_else(|| json!(null));
         assert_eq!(
             frame_visible_text_for_node(&frame, &a3_node).as_deref(),
             Some("20"),
-            "A3 visible text should be updated in the retained preview frame: {}",
-            serde_json::to_string_pretty(&frame_text_debug_for_node(&frame, &a3_node)).unwrap()
+            "A3 visible text should be updated in the retained preview frame: frame_debug={}, a3_summary={}, binding_debug={}, interaction_profiles={}",
+            serde_json::to_string_pretty(&frame_text_debug_for_node(&frame, &a3_node)).unwrap(),
+            serde_json::to_string_pretty(
+                &summary["cells"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|cell| {
+                        cell.get("address").and_then(serde_json::Value::as_str) == Some("A3")
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            )
+            .unwrap(),
+            serde_json::to_string_pretty(&a3_binding_debug).unwrap(),
+            serde_json::to_string_pretty(&take_preview_interaction_profiles()).unwrap()
         );
         assert_eq!(
             frame_text_for_node(&frame, &formula_node).as_deref(),
             Some("20"),
-            "formula bar should show the committed A3 value after Enter"
+            "formula bar should show the committed A3 value after Enter: selected_input={}, formula_debug={}, binding_debug={}, profiles={}",
+            serde_json::to_string_pretty(&summary["store"]["selected_input"]).unwrap(),
+            serde_json::to_string_pretty(&frame_text_debug_for_node(&frame, &formula_node))
+                .unwrap(),
+            serde_json::to_string_pretty(&formula_binding_debug).unwrap(),
+            serde_json::to_string_pretty(&take_preview_interaction_profiles()).unwrap()
         );
         let c0_value_before_formula_edit = summary["cells"]
             .as_array()
@@ -74988,6 +75315,15 @@ document:
             input_state.focused_text, "store.selected_input.editing_text",
             "formula focus should cache resolved editing text before keyboard input; focused_address={:?}, focused_target_text={:?}",
             input_state.focused_address, input_state.focused_target_text
+        );
+        assert_eq!(
+            input_state.focused_text,
+            "=sum(A0:A2)",
+            "formula focus should use selected_input editing text; focused_node={:?}, focused_address={:?}, focused_target_text={:?}, payload_selected_input={}",
+            input_state.focused_node,
+            input_state.focused_address,
+            input_state.focused_target_text,
+            serde_json::to_string(&focus_payload_summary["store"]["selected_input"]).unwrap()
         );
         preview_apply_real_window_input(
             &test_keyboard_input(

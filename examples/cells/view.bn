@@ -196,6 +196,10 @@ FUNCTION cell_view(cell) {
         element: [
             event: [
                 click: cell.sources.editor.select
+                change: cell.sources.editor.change
+                key_down: cell.sources.editor.commit
+                escape: cell.sources.editor.cancel
+                blur: cell.sources.editor.blur
             ]
         ]
         style: [
@@ -207,8 +211,8 @@ FUNCTION cell_view(cell) {
             outline: [color: Oklch[lightness:0.58,chroma:0.18,hue:250]]
             font: [size: 10, color: Oklch[lightness:0.12]]
         ]
-        label: cell.value
-        text: cell.value
+        label: cell.display_text
+        text: cell.display_text
         target: cell.address
         key: cell.address
         address: cell.address

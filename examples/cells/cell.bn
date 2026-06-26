@@ -50,6 +50,12 @@ FUNCTION new_cell(cell) {
                 }
             }
 
+        display_text:
+            editing |> WHEN {
+                True => editing_text
+                False => value
+            }
+
         value:
             compute_value(address: address, formula_text: formula_text)
 

@@ -67,6 +67,7 @@ FUNCTION formula_bar() {
                     background: [color: Oklch[lightness:1]]
                     border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
                     font: [size: 12, color: Oklch[lightness:0.12]]
+                    input_live_change: False
                 ]
                 label: TEXT { fx input }
                 text: store.selected_input.editing_text

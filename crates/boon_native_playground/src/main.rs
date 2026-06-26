@@ -8721,6 +8721,7 @@ fn document_change_set_supports_incremental_derived_indexes(
                 | PatchInvalidationClass::Style
                 | PatchInvalidationClass::Binding
                 | PatchInvalidationClass::SourceBinding
+                | PatchInvalidationClass::ConditionalStructure
                 | PatchInvalidationClass::Layout
                 | PatchInvalidationClass::LayoutOnly
                 | PatchInvalidationClass::HitRegion
@@ -33435,6 +33436,7 @@ struct PreviewNativeInputState {
     focused_text: String,
     focused_caret_index: usize,
     replace_focused_text_on_next_edit: bool,
+    defer_focused_change_until_commit: bool,
     caret_blink_started_at: Option<Instant>,
     focus_overlay_nodes: BTreeSet<String>,
     focus_overlay_initialized: bool,
@@ -34516,6 +34518,26 @@ fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -
     false
 }
 
+fn preview_text_input_live_change_enabled(layout_proof: &Value, node: &str) -> bool {
+    document_display_item_style_bool(layout_proof, node, "input_live_change").unwrap_or(true)
+}
+
+fn document_display_item_style_bool(layout_proof: &Value, node: &str, key: &str) -> Option<bool> {
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| {
+            let item_node = item.get("node").and_then(serde_json::Value::as_str)?;
+            if item_node != node {
+                return None;
+            }
+            item.get("style")?.get(key)?.as_bool()
+        })
+}
+
 fn preview_key_down_source_for_node(layout_proof: &Value, node: &str) -> Option<String> {
     live_source_for_node_intent(layout_proof, node, "key_down")
 }
@@ -34681,6 +34703,7 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
     input_state.focused_text.clear();
     input_state.focused_caret_index = 0;
     input_state.replace_focused_text_on_next_edit = false;
+    input_state.defer_focused_change_until_commit = false;
     input_state.caret_blink_started_at = None;
     preview_clear_key_repeat(input_state);
 }
@@ -34688,6 +34711,45 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
 fn preview_clear_key_repeat(input_state: &mut PreviewNativeInputState) {
     input_state.held_repeat_key = None;
     input_state.held_repeat_next_at = None;
+}
+
+fn preview_focus_selected_editor_proxy_from_route_table(
+    route_table: &PreviewHitRouteTable,
+    node: &str,
+    target_text: Option<String>,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    input_state: &mut PreviewNativeInputState,
+) -> bool {
+    if route_table.change_source(node).is_some() || route_table.key_down_source(node).is_some() {
+        return false;
+    }
+    let address = route_table.address(node).or_else(|| target_text.clone());
+    let Some(address) = address else {
+        return false;
+    };
+    let change_source = route_table.text_editor_source_for_intent("change");
+    let key_down_source = route_table
+        .text_editor_source_for_intent("submit")
+        .or_else(|| route_table.text_editor_source_for_intent("key_down"));
+    if change_source.is_none() && key_down_source.is_none() {
+        return false;
+    }
+    input_state.focused_node = Some(node.to_owned());
+    input_state.focused_address = Some(address);
+    input_state.focused_target_text = target_text.or_else(|| route_table.target_text(node));
+    input_state.focused_change_source = change_source;
+    input_state.focused_escape_source = route_table.text_editor_source_for_intent("escape");
+    input_state.focused_key_down_source = key_down_source;
+    preview_clear_key_repeat(input_state);
+    input_state.focused_text = route_table
+        .focused_text(node, live_runtime)
+        .or_else(|| route_table.document_value(node))
+        .unwrap_or_default();
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit = false;
+    input_state.defer_focused_change_until_commit = false;
+    preview_reset_caret_blink(input_state);
+    true
 }
 
 fn preview_refresh_cached_focus_payloads(
@@ -34854,6 +34916,8 @@ fn preview_refresh_retained_focus_after_enter(
     input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
     input_state.replace_focused_text_on_next_edit =
         preview_text_input_should_replace_on_type(layout_proof, focused_node);
+    input_state.defer_focused_change_until_commit =
+        !preview_text_input_live_change_enabled(layout_proof, focused_node);
     preview_reset_caret_blink(input_state);
 }
 
@@ -34903,6 +34967,9 @@ fn preview_apply_repeatable_text_input_key(
                 preview_delete_at_caret(input_state);
             }
             preview_reset_caret_blink(input_state);
+            if input_state.defer_focused_change_until_commit {
+                return Ok(None);
+            }
             if let Some(source) = preview_focused_change_source(layout, focused_node, input_state) {
                 let runtime_state_summary = focused_payload_summary_if_needed(
                     layout,
@@ -34978,6 +35045,9 @@ fn preview_apply_repeatable_text_input_key(
                 preview_prepare_text_edit(input_state);
                 preview_insert_char_at_caret(input_state, character);
                 preview_reset_caret_blink(input_state);
+                if input_state.defer_focused_change_until_commit {
+                    return Ok(None);
+                }
                 if let Some(source) =
                     preview_focused_change_source(layout, focused_node, input_state)
                 {
@@ -35176,6 +35246,10 @@ fn preview_try_apply_focused_keyboard_input(
                         shared_render_state,
                         vec![submit],
                     )?;
+                    preview_sync_bound_text_inputs_from_runtime_state(
+                        shared_render_state,
+                        live_runtime,
+                    )?;
                     applied_event = true;
                     preview_clear_focused_input_state(input_state);
                 }
@@ -35222,6 +35296,10 @@ fn preview_try_apply_focused_keyboard_input(
                         live_runtime,
                         shared_render_state,
                         vec![escape],
+                    )?;
+                    preview_sync_bound_text_inputs_from_runtime_state(
+                        shared_render_state,
+                        live_runtime,
                     )?;
                     applied_event = true;
                     preview_clear_focused_input_state(input_state);
@@ -35543,7 +35621,21 @@ fn preview_try_apply_simple_source_click_input(
                         events.push(blur);
                     }
                     events.push(event);
-                    (events, node, target_text, preserve_focus, false, None)
+                    let focus_state_applied = preview_focus_selected_editor_proxy_from_route_table(
+                        &route_table,
+                        &node,
+                        target_text.clone(),
+                        live_runtime,
+                        input_state,
+                    );
+                    (
+                        events,
+                        node,
+                        target_text,
+                        preserve_focus,
+                        focus_state_applied,
+                        None,
+                    )
                 } else {
                     click_resolve_source = "hover_candidate";
                     let click_candidate = candidate.clone();
@@ -35691,12 +35783,21 @@ fn preview_try_apply_simple_source_click_input(
                             events.push(blur);
                         }
                         events.push(event);
+                        let node_owned = node.to_owned();
+                        let focus_state_applied =
+                            preview_focus_selected_editor_proxy_from_route_table(
+                                route_table,
+                                &node_owned,
+                                target_text.clone(),
+                                live_runtime,
+                                input_state,
+                            );
                         (
                             events,
-                            node.to_owned(),
+                            node_owned,
                             target_text,
                             preserve_focus,
-                            false,
+                            focus_state_applied,
                             Some(click_candidate),
                         )
                     }
@@ -35795,12 +35896,20 @@ fn preview_try_apply_simple_source_click_input(
                         }
                         events.push(event);
                         click_event_build_ms += elapsed_ms(event_build_started);
+                        let focus_state_applied =
+                            preview_focus_selected_editor_proxy_from_route_table(
+                                route_table,
+                                &node,
+                                target_text.clone(),
+                                live_runtime,
+                                input_state,
+                            );
                         (
                             events,
                             node,
                             target_text,
                             preserve_focus,
-                            false,
+                            focus_state_applied,
                             click_candidate,
                         )
                     }
@@ -36181,6 +36290,7 @@ fn preview_handle_mouse_release_for_route_hit(
             .min(preview_text_char_count(&input_state.focused_text));
         input_state.replace_focused_text_on_next_edit =
             route_table.text_input_should_replace_on_type(&node);
+        input_state.defer_focused_change_until_commit = !route_table.text_input_live_change(&node);
         preview_reset_caret_blink(input_state);
         if !was_already_focused && let Some(source) = route_table.focus_source(&node) {
             let mut focus_event = boon_runtime::LiveSourceEvent {
@@ -36274,11 +36384,14 @@ fn preview_handle_mouse_release_for_route_hit(
                 .min(preview_text_char_count(&input_state.focused_text));
             input_state.replace_focused_text_on_next_edit =
                 route_table.text_input_should_replace_on_type(&node);
+            input_state.defer_focused_change_until_commit =
+                !route_table.text_input_live_change(&node);
             preview_reset_caret_blink(input_state);
         } else {
             input_state.focused_text.clear();
             input_state.focused_caret_index = 0;
             input_state.replace_focused_text_on_next_edit = false;
+            input_state.defer_focused_change_until_commit = false;
         }
         preview_clear_key_repeat(input_state);
         preview_set_interaction_diagnostic_subphase(
@@ -36686,6 +36799,8 @@ fn preview_apply_real_window_input_with_units(
                 .min(preview_text_char_count(&input_state.focused_text));
                 input_state.replace_focused_text_on_next_edit =
                     preview_text_input_should_replace_on_type(layout, &node);
+                input_state.defer_focused_change_until_commit =
+                    !preview_text_input_live_change_enabled(layout, &node);
                 preview_reset_caret_blink(input_state);
                 if !was_already_focused
                     && let Some(source) = live_source_for_node_intent(layout, &node, "focus")
@@ -36752,6 +36867,7 @@ fn preview_apply_real_window_input_with_units(
                 input_state.focused_text.clear();
                 input_state.focused_caret_index = 0;
                 input_state.replace_focused_text_on_next_edit = false;
+                input_state.defer_focused_change_until_commit = false;
                 preview_clear_key_repeat(input_state);
                 if let Some(event) =
                     live_source_event_for_hit_region(layout, &hit_region, position, false)
@@ -37511,6 +37627,29 @@ fn preview_sync_bound_text_inputs_in_shared_state(
     changed
 }
 
+fn preview_sync_bound_text_inputs_from_runtime_state(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let state_summary = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "live runtime mutex poisoned while syncing bound text inputs")?;
+        preview_payload_state_summary(&mut runtime)
+    };
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let changed = preview_sync_bound_text_inputs_in_shared_state(&mut shared, &state_summary);
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_error = None;
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
 fn preview_bound_input_sync_full_state_summary_reason(
     layout_proof: &Value,
     layout_frame: Option<&boon_document::LayoutFrame>,
@@ -38174,6 +38313,18 @@ fn preview_resolved_focused_node(
     input_state: &PreviewNativeInputState,
 ) -> Option<String> {
     let requested_node = input_state.focused_node.as_deref()?;
+    if live_source_for_node_intent(layout_proof, requested_node, "change").is_none() {
+        if let Some(address) = input_state.focused_address.as_deref()
+            && focused_address(layout_proof, requested_node).as_deref() == Some(address)
+        {
+            return Some(requested_node.to_owned());
+        }
+        if let Some(target_text) = input_state.focused_target_text.as_deref()
+            && focused_target_text(layout_proof, requested_node).as_deref() == Some(target_text)
+        {
+            return Some(requested_node.to_owned());
+        }
+    }
     if let Some(change_source) = input_state.focused_change_source.as_deref() {
         if live_source_for_node_intent(layout_proof, requested_node, "change").as_deref()
             == Some(change_source)
@@ -38224,6 +38375,8 @@ fn preview_resolve_input_focus_for_layout(
     let resolved = preview_resolved_focused_node(layout_proof, input_state)?;
     if input_state.focused_node.as_deref() != Some(resolved.as_str()) {
         input_state.focused_node = Some(resolved.clone());
+        input_state.defer_focused_change_until_commit =
+            !preview_text_input_live_change_enabled(layout_proof, &resolved);
     }
     if input_state.focused_address.is_none() {
         input_state.focused_address = focused_address(layout_proof, &resolved);
@@ -42293,6 +42446,7 @@ fn preview_focus_node_from_accessibility(
     input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
     input_state.replace_focused_text_on_next_edit =
         route_table.text_input_should_replace_on_type(node);
+    input_state.defer_focused_change_until_commit = !route_table.text_input_live_change(node);
     preview_reset_caret_blink(input_state);
     if !was_already_focused && let Some(source) = route_table.focus_source(node) {
         let mut focus = boon_runtime::LiveSourceEvent {
@@ -43086,6 +43240,35 @@ impl PreviewHitRouteTable {
     fn text_input_should_replace_on_type(&self, node: &str) -> bool {
         let _ = node;
         false
+    }
+
+    fn text_input_live_change(&self, node: &str) -> bool {
+        self.display_items_by_node
+            .get(node)
+            .into_iter()
+            .flat_map(|indices| indices.iter())
+            .filter_map(|index| self.display_items.get(*index))
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .and_then(|item| {
+                item.style.get("input_live_change").and_then(|value| {
+                    if let boon_document_model::StyleValue::Bool(value) = value {
+                        Some(*value)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    fn text_editor_source_for_intent(&self, expected: &str) -> Option<String> {
+        self.display_items
+            .iter()
+            .filter(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && !display_style_bool(&item.style, "disabled")
+            })
+            .find_map(|item| self.source_for_node_intent(&item.node.0, expected))
     }
 
     fn caret_index_for_text_hit(
@@ -76124,8 +76307,12 @@ document:
                 (node, address, focus_style, focused_style)
             })
             .collect::<Vec<_>>();
+        let wrong_address_focus_nodes = focused_nodes
+            .iter()
+            .filter(|(_, address, _, _)| address.as_deref() != Some("B0"))
+            .collect::<Vec<_>>();
         assert!(
-            focused_nodes.is_empty(),
+            wrong_address_focus_nodes.is_empty(),
             "scrolling the grid must not transfer B0 focus to a reused visible cell node; focused nodes: {focused_nodes:?}"
         );
     }
@@ -76273,8 +76460,12 @@ document:
         let (x, y, formula_node) = formula_bar_input_center(&initial_layout);
         assert_eq!(
             live_source_for_node_intent(&initial_layout, &formula_node, "click").as_deref(),
-            Some("cell.sources.editor.select"),
-            "selected formula bar click source should resolve through the runtime SourceBinding"
+            None,
+            "formula-bar focus is owned by the native text-input hit path"
+        );
+        assert!(
+            !preview_text_input_live_change_enabled(&initial_layout, &formula_node),
+            "formula-bar edits should defer runtime change events until commit"
         );
         assert_eq!(
             live_source_for_node_intent(&initial_layout, &formula_node, "change").as_deref(),
@@ -76377,8 +76568,11 @@ document:
 
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["store"]["selected_address"], "A0");
-        assert_eq!(summary["store"]["selected_input"]["editing_text"], "42");
-        assert_eq!(summary["store"]["selected_input"]["editing"], true);
+        assert_ne!(
+            summary["store"]["selected_input"]["editing_text"], "42",
+            "formula-bar keystrokes should stay in the retained native draft until commit"
+        );
+        assert_eq!(input_state.focused_text, "42");
         let shared = shared_render_state.lock().unwrap();
         let formula_item = shared
             .layout_frame_override

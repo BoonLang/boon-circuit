@@ -32525,6 +32525,7 @@ fn run_isolated_weston_idle_wake_observation(
         .args(&desktop_args)
         .env("WAYLAND_DISPLAY", &socket)
         .env("XDG_SESSION_TYPE", "wayland")
+        .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
         .env(
             "BOON_NATIVE_PLAYGROUND_BINARY_HASH",
             file_hash(binary.to_string_lossy().as_ref()),
@@ -41513,7 +41514,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = if dev_editor {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --skip-operator-host-input-probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&source_example_id),
@@ -41527,7 +41528,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 )
             } else {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --probe --skip-operator-host-input-probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --probe --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&label),

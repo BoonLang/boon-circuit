@@ -136,7 +136,8 @@ contract is:
 ```text
 source model: 26 columns x 100 rows
 visible projection: 26 columns x 100 rows
-visible addressed editors: 2600
+visible selectable cells: 2600
+visible text editors: formula bar plus any explicit active-cell editor
 required visible samples beyond A0-D0: Z0, A99, and Z99
 ```
 
@@ -147,8 +148,8 @@ authoritative list storage. They are not allowed to replace or shrink the
 underlying 26x100 runtime model.
 
 The Cells source owns the spreadsheet layout declaration. Header rows, row
-labels, compact editors, displayed values, edit-mode cell expressions, focused cell
-styling, and the scrollable body must be declared in the manifest-backed
+labels, selectable display cells, displayed values, edit-mode cell expressions,
+focused cell styling, and the scrollable body must be declared in the manifest-backed
 `examples/cells/*.bn` source files with generic `document` elements. The root
 `examples/cells.bn` is only the executable document entrypoint. The playground
 renderer only interprets those generic component attributes.

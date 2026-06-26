@@ -187,20 +187,15 @@ FUNCTION sheet_row_cells(sheet_row) {
         ]
         items:
             sheet_row.cells
-            |> List/map(cell, new: cell_input(cell: cell))
+            |> List/map(cell, new: cell_view(cell: cell))
     )
 }
 
-FUNCTION cell_input(cell) {
-    Element/text_input(
+FUNCTION cell_view(cell) {
+    Element/button(
         element: [
             event: [
                 click: cell.sources.editor.select
-                double_click: cell.sources.editor.events.change
-                change: cell.sources.editor.events.change
-                key_down: cell.sources.editor.commit
-                escape: cell.sources.editor.cancel
-                blur: cell.sources.editor.events.blur
             ]
         ]
         style: [
@@ -212,9 +207,8 @@ FUNCTION cell_input(cell) {
             outline: [color: Oklch[lightness:0.58,chroma:0.18,hue:250]]
             font: [size: 10, color: Oklch[lightness:0.12]]
         ]
-        label: cell.address
+        label: cell.value
         text: cell.value
-        placeholder: [text: Text/empty()]
         target: cell.address
         key: cell.address
         address: cell.address

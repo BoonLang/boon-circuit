@@ -7943,6 +7943,18 @@ fn cached_render_scene_patch_base_hash(hash: &str) -> Option<String> {
         .and_then(|cache| cache.get(hash).cloned())
 }
 
+fn render_scene_patch_geometry_base_hash(layout_hash: Option<&str>) -> Option<String> {
+    let mut current = layout_hash?.to_owned();
+    let mut seen = BTreeSet::new();
+    while seen.insert(current.clone()) {
+        let Some(base) = cached_render_scene_patch_base_hash(&current) else {
+            return Some(current);
+        };
+        current = base;
+    }
+    Some(current)
+}
+
 fn render_scene_patch_hash(patch: Option<&boon_document::RenderScenePatch>) -> String {
     let Some(patch) = patch else {
         return "none".to_owned();
@@ -9354,10 +9366,29 @@ fn native_gpu_app_owned_render_hook(
     let render_hook_started = Instant::now();
     let layout_artifact = visible_state.layout_artifact.as_str();
     let layout_cache_key = visible_state.layout_cache_key();
+    let render_scene_patch_lookup_started = Instant::now();
+    let current_render_scene_lowering_mode =
+        preview_render_scene_lowering_mode_for_hash(visible_state.layout_frame_hash.as_deref());
+    let render_scene_patch = visible_state
+        .layout_frame_hash
+        .as_deref()
+        .and_then(cached_render_scene_patch);
+    let render_scene_patch_base_hash = visible_state
+        .layout_frame_hash
+        .as_deref()
+        .and_then(cached_render_scene_patch_base_hash);
+    let render_scene_patch_hash = render_scene_patch_hash(render_scene_patch.as_deref());
+    let render_scene_patch_lookup_ms = elapsed_ms(render_scene_patch_lookup_started);
+    let render_frame_layout_cache_key = if visible_state.render_scene_patch_layout_reuse {
+        render_scene_patch_geometry_base_hash(visible_state.layout_frame_hash.as_deref())
+            .unwrap_or_else(|| layout_cache_key.to_owned())
+    } else {
+        layout_cache_key.to_owned()
+    };
     let layout_cache_started = Instant::now();
     let cache_stale = native_gpu_render_cache_stale(
         layout_frame_cache.as_ref().map(|(path, _)| path.as_str()),
-        layout_cache_key,
+        &render_frame_layout_cache_key,
     );
     if cache_stale {
         let layout_frame = match visible_state.layout_frame_override.as_deref() {
@@ -9373,7 +9404,7 @@ fn native_gpu_app_owned_render_hook(
                 )?
             }
         };
-        *layout_frame_cache = Some((layout_cache_key.to_owned(), layout_frame));
+        *layout_frame_cache = Some((render_frame_layout_cache_key.clone(), layout_frame));
     }
     let layout_cache_ms = elapsed_ms(layout_cache_started);
     let layout_frame = layout_frame_cache
@@ -9382,7 +9413,7 @@ fn native_gpu_app_owned_render_hook(
         .ok_or("layout frame cache was not initialized")?;
     let render_frame_cache_started = Instant::now();
     let render_cache_key = PreviewRenderFrameCacheKey {
-        layout_cache_key: layout_cache_key.to_owned(),
+        layout_cache_key: render_frame_layout_cache_key.clone(),
         width: context.width,
         height: context.height,
         last_error: last_error.map(str::to_owned),
@@ -9444,19 +9475,6 @@ fn native_gpu_app_owned_render_hook(
         )
     });
     let renderer_init_ms = elapsed_ms(renderer_init_started);
-    let render_scene_patch_lookup_started = Instant::now();
-    let current_render_scene_lowering_mode =
-        preview_render_scene_lowering_mode_for_hash(visible_state.layout_frame_hash.as_deref());
-    let render_scene_patch = visible_state
-        .layout_frame_hash
-        .as_deref()
-        .and_then(cached_render_scene_patch);
-    let render_scene_patch_base_hash = visible_state
-        .layout_frame_hash
-        .as_deref()
-        .and_then(cached_render_scene_patch_base_hash);
-    let render_scene_patch_hash = render_scene_patch_hash(render_scene_patch.as_deref());
-    let render_scene_patch_lookup_ms = elapsed_ms(render_scene_patch_lookup_started);
     let render_scene_cache_started = Instant::now();
     let mut render_scene_cache_hit = true;
     if render_scene_cache.as_ref().is_none_or(
@@ -28106,7 +28124,18 @@ fn lower_document_element(
             let target_attr = canonical_style_record_target_attr(&field).to_owned();
             node.style.insert(field, style_value);
             let reads = document_context_take_data_reads(context);
-            document_context_record_target_reads(context, &node, &target_attr, reads);
+            let equality_target_recorded = child.expr.is_some_and(|expr_id| {
+                document_context_record_equality_expr_target_reads(
+                    context,
+                    &node,
+                    &target_attr,
+                    expr_id,
+                    expressions,
+                )
+            });
+            if !equality_target_recorded {
+                document_context_record_target_reads(context, &node, &target_attr, reads);
+            }
         }
     }
 
@@ -39567,6 +39596,7 @@ struct PreviewVisibleRenderState {
     layout_frame_hash: Option<String>,
     scroll_transform: Value,
     layout_frame_override: Option<Arc<boon_document::LayoutFrame>>,
+    render_scene_patch_layout_reuse: bool,
 }
 
 impl PreviewVisibleRenderState {
@@ -39607,6 +39637,11 @@ impl PreviewVisibleRenderState {
                 .cloned()
                 .unwrap_or_else(|| json!(null)),
             layout_frame_override: shared.layout_frame_override.clone(),
+            render_scene_patch_layout_reuse: shared
+                .layout_proof
+                .pointer("/layout_profile/render_scene_patch_layout_reuse")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
         }
     }
 
@@ -42770,6 +42805,33 @@ fn document_static_equality_binding_changed(
     Some(was_equal != is_equal)
 }
 
+fn document_static_equality_binding_changed_from_frame(
+    frame: &boon_document_model::DocumentFrame,
+    target: &DocumentDataBindingTarget,
+    value: &Value,
+) -> Option<bool> {
+    let (attr, static_value) = parse_document_eq_static_binding_attr(&target.attr)?;
+    let node = frame.nodes.get(&target.node)?;
+    let current_value = node
+        .style
+        .get(attr)
+        .and_then(document_style_value_as_json)?;
+    let next_value = Value::Bool(json_values_equal(value, &static_value));
+    Some(!json_values_equal(&current_value, &next_value))
+}
+
+fn document_style_value_as_json(value: &boon_document_model::StyleValue) -> Option<Value> {
+    match value {
+        boon_document_model::StyleValue::Bool(value) => Some(Value::Bool(*value)),
+        boon_document_model::StyleValue::Number(value) => {
+            serde_json::Number::from_f64(*value).map(Value::Number)
+        }
+        boon_document_model::StyleValue::Text(value) => Some(Value::String(value.clone())),
+        boon_document_model::StyleValue::RichTextSpans(_)
+        | boon_document_model::StyleValue::EditorTypeHints(_) => serde_json::to_value(value).ok(),
+    }
+}
+
 fn document_patch_for_data_binding_target(
     frame: &boon_document_model::DocumentFrame,
     target: &DocumentDataBindingTarget,
@@ -43535,6 +43597,13 @@ fn preview_text_patch_keeps_layout_box(
     {
         return false;
     }
+    if item.bounds.width > 0.0
+        && item.bounds.height > 0.0
+        && preview_text_layout_dimension_is_stable(&item.style, "width")
+        && preview_text_layout_dimension_is_stable(&item.style, "height")
+    {
+        return true;
+    }
     let font_size = style_number_from_map(&item.style, "size").unwrap_or(14.0);
     let Some(metrics) = preview_measure_layout_text(next_text, font_size, &item.style) else {
         return false;
@@ -43557,6 +43626,27 @@ fn preview_text_patch_keeps_layout_box(
     let measured_width = measured_width + padding_x;
     let measured_height = metrics.height + padding_y;
     measured_width <= item.bounds.width + 0.5 && measured_height <= item.bounds.height + 0.5
+}
+
+fn preview_text_layout_dimension_is_stable(
+    style: &BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> bool {
+    match style.get(key) {
+        Some(boon_document_model::StyleValue::Number(value)) => *value > 0.0 && value.is_finite(),
+        Some(boon_document_model::StyleValue::Text(value)) => {
+            value.eq_ignore_ascii_case("fill")
+                || value
+                    .parse::<f32>()
+                    .is_ok_and(|number| number > 0.0 && number.is_finite())
+        }
+        Some(
+            boon_document_model::StyleValue::Bool(_)
+            | boon_document_model::StyleValue::RichTextSpans(_)
+            | boon_document_model::StyleValue::EditorTypeHints(_),
+        )
+        | None => false,
+    }
 }
 
 fn preview_measure_layout_text(
@@ -44675,7 +44765,9 @@ fn preview_try_patch_paint_space_for_root_deltas(
                 &path,
                 target,
                 &value,
-            ) {
+            )
+            .or_else(|| document_static_equality_binding_changed_from_frame(&frame, target, &value))
+            {
                 if changed {
                     layout_patch_profile.equality_static_changed_target_count =
                         layout_patch_profile
@@ -45255,7 +45347,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
                 &path,
                 target,
                 &value,
-            ) {
+            )
+            .or_else(|| document_static_equality_binding_changed_from_frame(&frame, target, &value))
+            {
                 if changed {
                     layout_patch_profile.equality_static_changed_target_count =
                         layout_patch_profile
@@ -45405,11 +45499,33 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let layout_cache_lookup_started = Instant::now();
     let cached_patched_snapshot = cached_document_render_snapshot(&layout_frame_hash);
     layout_patch_profile.layout_cache_lookup_ms = elapsed_ms(layout_cache_lookup_started);
+    let render_scene_patch_decision = preview_text_render_scene_patch_for_targets(
+        &frame,
+        snapshot.layout_frame.as_ref(),
+        &direct_patch_targets,
+        &layout_frame_hash,
+    );
+    for target in &direct_patch_targets {
+        record_preview_render_scene_patch_decision("target_attr", Some(&target.target.attr));
+    }
+    let render_scene_patch_rejection = render_scene_patch_decision.rejection;
+    let render_scene_patch = render_scene_patch_decision.patch;
+    let render_scene_patch_layout_reuse = render_scene_patch.is_some();
+    layout_patch_profile.render_scene_patch_attempted = true;
+    layout_patch_profile.render_scene_patch_rejection =
+        render_scene_patch_rejection.map(str::to_owned);
     let source_binding_only_layout_reuse = cached_patched_snapshot.is_none()
         && preview_direct_patch_targets_are_source_bindings_only(&direct_patch_targets);
     let direct_layout_frame_patch_rejection: Option<String>;
     let (layout, cached_patched_layout, direct_patched_layout, touched_node_ids) =
-        if let Some(cached) = cached_patched_snapshot.as_ref() {
+        if render_scene_patch_layout_reuse {
+            direct_layout_frame_patch_rejection = None;
+            layout_patch_profile.retained_layout_frame_reuse_without_clone = true;
+            layout_patch_profile.retained_layout_reused_entry_count =
+                snapshot.retained_layout_cache.entries.len();
+            layout_patch_profile.direct_target_count = direct_patch_targets.len();
+            (Arc::clone(&snapshot.layout_frame), false, false, None)
+        } else if let Some(cached) = cached_patched_snapshot.as_ref() {
             direct_layout_frame_patch_rejection = None;
             let layout_clone_started = Instant::now();
             let layout = Arc::clone(&cached.layout_frame);
@@ -45464,37 +45580,54 @@ fn preview_try_patch_document_layout_for_root_deltas(
             }
         };
     layout_patch_profile.direct_layout_frame_patch = direct_patched_layout;
-    let (retained_layout_cache, retained_layout_cache_update) =
-        if let Some(cached) = cached_patched_snapshot.as_ref() {
-            (
-                Arc::clone(&cached.retained_layout_cache),
-                json!({
-                    "cached_patched_layout": true,
-                    "entry_count": cached.retained_layout_cache.entries.len()
-                }),
-            )
-        } else if source_binding_only_layout_reuse {
-            (
-                Arc::clone(&snapshot.retained_layout_cache),
-                retained_layout_cache_reuse_without_clone_report(
-                    &snapshot.retained_layout_cache,
-                    "source_binding_only_patch",
-                ),
-            )
-        } else {
-            let retained_layout_cache_update_started = Instant::now();
-            retained_layout_cache_update_for_document_layout(
-                &frame,
-                &derived_indexes,
-                layout.as_ref(),
+    layout_patch_profile.render_scene_patch_applied = render_scene_patch.is_some();
+    layout_patch_profile.render_scene_patch_operation_count = render_scene_patch
+        .as_ref()
+        .map(|patch| patch.operations.len())
+        .unwrap_or(0);
+    if render_scene_patch.is_some() {
+        record_preview_render_scene_patch_decision("applied", None);
+    } else {
+        record_preview_render_scene_patch_decision("rejected", render_scene_patch_rejection);
+    }
+    let (retained_layout_cache, retained_layout_cache_update) = if render_scene_patch_layout_reuse {
+        (
+            Arc::clone(&snapshot.retained_layout_cache),
+            retained_layout_cache_reuse_without_clone_report(
                 &snapshot.retained_layout_cache,
-                touched_node_ids.as_ref(),
-            )
-            .inspect(|_| {
-                layout_patch_profile.retained_layout_cache_update_ms =
-                    elapsed_ms(retained_layout_cache_update_started);
-            })?
-        };
+                "render_scene_text_patch",
+            ),
+        )
+    } else if let Some(cached) = cached_patched_snapshot.as_ref() {
+        (
+            Arc::clone(&cached.retained_layout_cache),
+            json!({
+                "cached_patched_layout": true,
+                "entry_count": cached.retained_layout_cache.entries.len()
+            }),
+        )
+    } else if source_binding_only_layout_reuse {
+        (
+            Arc::clone(&snapshot.retained_layout_cache),
+            retained_layout_cache_reuse_without_clone_report(
+                &snapshot.retained_layout_cache,
+                "source_binding_only_patch",
+            ),
+        )
+    } else {
+        let retained_layout_cache_update_started = Instant::now();
+        retained_layout_cache_update_for_document_layout(
+            &frame,
+            &derived_indexes,
+            layout.as_ref(),
+            &snapshot.retained_layout_cache,
+            touched_node_ids.as_ref(),
+        )
+        .inspect(|_| {
+            layout_patch_profile.retained_layout_cache_update_ms =
+                elapsed_ms(retained_layout_cache_update_started);
+        })?
+    };
     let compact_hot_proof = !full_proof && preview_compact_timing_enabled();
     let source_intent_index_started = Instant::now();
     let (source_intent_index, source_intent_value_index) = source_intent_indexes(&source_intents);
@@ -45506,7 +45639,13 @@ fn preview_try_patch_document_layout_for_root_deltas(
         "direct_layout_frame_patch": direct_patched_layout,
         "direct_layout_frame_patch_rejection": direct_layout_frame_patch_rejection.clone(),
         "source_binding_only_layout_reuse": source_binding_only_layout_reuse,
-        "retained_layout_frame_reuse_without_clone": source_binding_only_layout_reuse,
+        "render_scene_patch_layout_reuse": render_scene_patch_layout_reuse,
+        "render_scene_patch_rejection": render_scene_patch_rejection,
+        "render_scene_patch_operation_count": render_scene_patch
+            .as_ref()
+            .map(|patch| patch.operations.len())
+            .unwrap_or(0),
+        "retained_layout_frame_reuse_without_clone": source_binding_only_layout_reuse || render_scene_patch_layout_reuse,
         "incremental_layout_frame_hash": true,
         "layout_hash_patch_count": layout_hash_patches.len(),
         "patched_target_count": patched_targets,
@@ -45600,8 +45739,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let snapshot_layout_frame = Arc::clone(&layout);
     layout_patch_profile.snapshot_cache_layout_clone_ms =
         elapsed_ms(snapshot_cache_layout_clone_started);
+    let patched_layout_frame_hash = layout_frame_hash.clone();
     cache_document_render_snapshot(
-        layout_frame_hash,
+        patched_layout_frame_hash.clone(),
         DocumentRenderSnapshot {
             document_frame: frame,
             derived_indexes,
@@ -45613,6 +45753,13 @@ fn preview_try_patch_document_layout_for_root_deltas(
             source_intents,
         },
     );
+    if let Some(render_scene_patch) = render_scene_patch {
+        cache_render_scene_patch_with_base(
+            patched_layout_frame_hash,
+            Some(layout_hash.to_owned()),
+            render_scene_patch,
+        );
+    }
     layout_patch_profile.snapshot_cache_ms = elapsed_ms(snapshot_cache_started);
     layout_patch_profile.patch_function_total_ms = elapsed_ms(patch_function_started);
     proof["layout_profile"]["layout_patch_profile"] = layout_patch_profile.to_report();
@@ -46390,9 +46537,8 @@ fn handle_preview_ipc_client(
                     "preview_pid": std::process::id()
                 })
             });
-        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            wake_handle.wake();
-        }
+        let should_wake =
+            response.get("status").and_then(serde_json::Value::as_str) == Some("pass");
         write_preview_ipc_response(
             &mut stream,
             &state,
@@ -46400,6 +46546,9 @@ fn handle_preview_ipc_client(
             request_started,
             &response,
         )?;
+        if should_wake {
+            wake_handle.wake();
+        }
         return Ok(());
     }
     let message_count = request
@@ -48095,15 +48244,8 @@ fn preview_operator_host_input_response_for_state(
         };
         let runtime_started = Instant::now();
         let runtime_source_path_known = runtime.has_source_path(&event.source);
-        let output = runtime
-            .apply_source_event_for_document_window(
-                event.clone(),
-                row_start,
-                row_count,
-                column_start,
-                column_count,
-            )
-            .map_err(|error| {
+        let output = if compact_response {
+            let output = runtime.apply_source_event_turn(event.clone()).map_err(|error| {
                 format!(
                     "{error}; preview_event_json={}; before_state_sample={}",
                     serde_json::to_string(event_json).unwrap_or_else(|_| "{}".to_owned()),
@@ -48121,6 +48263,41 @@ fn preview_operator_host_input_response_for_state(
                     .unwrap_or_else(|_| "{}".to_owned())
                 )
             })?;
+            boon_runtime::LiveStepOutput {
+                semantic_deltas: output.semantic_deltas,
+                render_patches: output.render_patches,
+                state_summary: serde_json::Value::Null,
+                apply_step_ms: output.apply_step_ms,
+                state_summary_ms: 0.0,
+            }
+        } else {
+            runtime
+                .apply_source_event_for_document_window(
+                    event.clone(),
+                    row_start,
+                    row_count,
+                    column_start,
+                    column_count,
+                )
+                .map_err(|error| {
+                    format!(
+                        "{error}; preview_event_json={}; before_state_sample={}",
+                        serde_json::to_string(event_json).unwrap_or_else(|_| "{}".to_owned()),
+                        serde_json::to_string(
+                            &before_state
+                                .as_ref()
+                                .map(bounded_state_summary_sample)
+                                .unwrap_or_else(|| {
+                                    json!({
+                                        "status": "omitted",
+                                        "reason": "operator-host-input compact_response used layout row identity without pre-event state summary"
+                                    })
+                                })
+                        )
+                        .unwrap_or_else(|_| "{}".to_owned())
+                    )
+                })?
+        };
         let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
         let mut preview_shared_render_state_updated = false;
         let mut post_input_layout_artifact = serde_json::Value::Null;
@@ -48297,10 +48474,12 @@ fn preview_operator_host_input_response_for_state(
                 };
                 if let Some(patched_result) = patched_layout {
                     let layout_source = patched_result.layout_source;
-                    cache_layout_runtime_state_snapshot_for_proof(
-                        &patched_result.proof,
-                        &output.state_summary,
-                    );
+                    if !compact_response {
+                        cache_layout_runtime_state_snapshot_for_proof(
+                            &patched_result.proof,
+                            &output.state_summary,
+                        );
+                    }
                     if let Ok(mut shared_render_state) = state.shared_render_state.lock() {
                         shared_render_state.layout_proof = patched_result.proof.clone();
                         shared_render_state.layout_frame_override =
@@ -48416,9 +48595,16 @@ fn preview_operator_host_input_response_for_state(
             "before_state_summary_omitted": before_state_summary_omitted,
             "route_ms": route_ms,
             "runtime_ms": runtime_ms,
+            "runtime_apply_ms": output.apply_step_ms,
+            "runtime_state_summary_ms": output.state_summary_ms,
             "layout_ms": layout_ms,
             "total_ms": input_started.elapsed().as_secs_f64() * 1000.0
         }));
+        let state_summary_hash = if compact_response {
+            "omitted-for-compact-response".to_owned()
+        } else {
+            boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?)
+        };
         let mut output_report = json!({
             "input_index": report_index,
             "event": live_source_event_report(&event),
@@ -48429,7 +48615,7 @@ fn preview_operator_host_input_response_for_state(
                 "method": "render-patch-backed-framebuffer-change-required",
                 "before_state_hash": before_state_hash,
                 "before_state_summary_omitted": before_state_summary_omitted,
-                "after_state_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
+                "after_state_hash": state_summary_hash.clone(),
                 "render_patch_count": output.render_patches.len(),
                 "app_owned_framebuffer_readback_required_by_preview_report": true,
                 "preview_shared_render_state_updated": preview_shared_render_state_updated,
@@ -48447,7 +48633,7 @@ fn preview_operator_host_input_response_for_state(
                 "document_patch_fast_path_rejection": document_patch_fast_path_rejection,
                 "document_patch_returned_targetless": document_patch_returned_targetless
             },
-            "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?)
+            "state_summary_hash": state_summary_hash
         });
         if compact_response {
             output_report["bounded_state_summary_sample"] = json!({
@@ -48483,7 +48669,7 @@ fn preview_operator_host_input_response_for_state(
         "input_injection_method": "operator_host_event_harness",
         "runtime_origin": runtime_origin,
         "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
-        "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event_for_document_window",
+        "public_runtime_api": if compact_response { "boon_runtime::LiveRuntime::apply_source_event_turn" } else { "boon_runtime::LiveRuntime::apply_source_event_for_document_window" },
         "private_runtime_dispatch_used": false,
         "source_event_only_ipc_shortcut": false,
         "preview_received_scenario_data": false,
@@ -51580,6 +51766,133 @@ mod tests {
     }
 
     #[test]
+    fn document_layout_text_invalidation_reuses_layout_and_updates_scene_text() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut frame,
+            root,
+            dev_node(
+                "counter-value",
+                boon_document_model::DocumentNodeKind::Text,
+                Some("0".to_owned()),
+                &[
+                    ("width", "Fill"),
+                    ("height", "76"),
+                    ("size", "64"),
+                    ("color", "#ffffff"),
+                ],
+            ),
+        );
+        let derived_indexes = document_derived_indexes_for_frame(&frame).unwrap();
+        let layout =
+            layout_frame_for_document_frame_with_indexes(&frame, &derived_indexes, (420.0, 120.0))
+                .unwrap();
+        let retained_layout_cache =
+            retained_layout_cache_for_document_layout(&frame, &derived_indexes, &layout).unwrap();
+        assert!(
+            preview_text_patch_keeps_layout_box(
+                &layout,
+                frame
+                    .nodes
+                    .get(&boon_document_model::DocumentNodeId(
+                        "counter-value".to_owned()
+                    ))
+                    .unwrap(),
+                "-1",
+                None,
+            ),
+            "fixed fill-width text boxes should remain layout-stable when the value changes"
+        );
+        let layout_hash = "test-document-layout-text-render-scene-sidecar";
+        cache_document_render_snapshot(
+            layout_hash.to_owned(),
+            DocumentRenderSnapshot {
+                document_frame: frame,
+                derived_indexes,
+                layout_frame: Arc::new(layout),
+                retained_layout_cache,
+                data_binding_targets: BTreeMap::from([(
+                    "store.count".to_owned(),
+                    vec![DocumentDataBindingTarget {
+                        node: boon_document_model::DocumentNodeId("counter-value".to_owned()),
+                        attr: "text".to_owned(),
+                    }],
+                )])
+                .into(),
+                structural_data_reads: BTreeSet::new(),
+                structural_data_read_aliases: Vec::new(),
+                source_intents: Vec::new(),
+            },
+        );
+        let proof = json!({
+            "layout_frame_hash": layout_hash,
+            "viewport": {"width": 420.0, "height": 120.0, "scale": 1.0}
+        });
+        let patch = boon_runtime::RenderPatch {
+            kind: "PatchRootField",
+            invalidation: boon_runtime::RenderInvalidation::Layout,
+            target: boon_runtime::RenderTarget::Static(Cow::Borrowed("store.count")),
+            value: boon_runtime::ProtocolValue::NumberText(-1),
+            list_id: None,
+            key: None,
+            generation: None,
+            source_id: None,
+            bind_epoch: None,
+        };
+
+        let result = preview_try_patch_document_layout_for_root_deltas(
+            &proof,
+            &json!({}),
+            &[patch],
+            Some((420.0, 120.0)),
+            0.0,
+            0.0,
+            true,
+        )
+        .unwrap()
+        .expect("fixed-box text layout invalidation should reuse layout with a render-scene patch");
+
+        assert!(!result.direct_layout_frame_patch);
+        assert!(
+            result
+                .layout_patch_profile
+                .retained_layout_frame_reuse_without_clone
+        );
+        assert_eq!(result.layout_patch_profile.fallback_full_layout_ms, 0.0);
+        assert!(result.layout_patch_profile.render_scene_patch_attempted);
+        assert!(result.layout_patch_profile.render_scene_patch_applied);
+        assert_eq!(
+            result
+                .layout_patch_profile
+                .render_scene_patch_operation_count,
+            1
+        );
+        assert_eq!(
+            result.proof["layout_profile"]["render_scene_patch_layout_reuse"],
+            json!(true)
+        );
+        let next_hash = result.proof["layout_frame_hash"]
+            .as_str()
+            .expect("patched proof should expose layout hash");
+        assert_eq!(
+            cached_render_scene_patch_base_hash(next_hash).as_deref(),
+            Some(layout_hash)
+        );
+        let patch = cached_render_scene_patch(next_hash).expect("cached text render scene patch");
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            result.layout_frame.as_ref(),
+            420,
+            120,
+            &mut columns,
+        );
+        assert_eq!(scene.text_runs[0].text, "0");
+        scene.apply_patch(&patch).unwrap();
+        assert_eq!(scene.text_runs[0].text, "-1");
+    }
+
+    #[test]
     fn paint_space_mixed_text_and_width_patch_keeps_text_as_render_scene_sidecar() {
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let root = boon_document_model::DocumentNodeId("root".to_owned());
@@ -54442,9 +54755,18 @@ label:
             .iter()
             .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
             .count();
+        assert_eq!(
+            text_input_count, 1,
+            "Cells layout should keep editing bounded to the formula bar, text_input_count={text_input_count}, labels={labels:?}"
+        );
+        let button_count = layout
+            .display_list
+            .iter()
+            .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Button))
+            .count();
         assert!(
-            text_input_count > 1,
-            "Cells layout should render grid cell text inputs, text_input_count={text_input_count}, labels={labels:?}"
+            button_count > 1,
+            "Cells layout should render selectable grid cell buttons, button_count={button_count}, labels={labels:?}"
         );
         let hit_target_count = proof
             .get("hit_target_count")
@@ -69981,6 +70303,65 @@ document:
     }
 
     #[test]
+    fn static_equality_binding_prunes_from_retained_frame_without_state_snapshot() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let insert_node =
+            |frame: &mut boon_document_model::DocumentFrame, id: &str, selected: bool| {
+                let mut node = boon_document_model::DocumentNode::new(
+                    id,
+                    boon_document_model::DocumentNodeKind::Button,
+                );
+                node.style.insert(
+                    "selected".to_owned(),
+                    boon_document_model::StyleValue::Bool(selected),
+                );
+                frame.nodes.insert(node.id.clone(), node);
+            };
+        insert_node(&mut frame, "row-unchanged", false);
+        insert_node(&mut frame, "row-old", true);
+        insert_node(&mut frame, "row-new", false);
+
+        let unchanged_target = DocumentDataBindingTarget {
+            node: boon_document_model::DocumentNodeId("row-unchanged".to_owned()),
+            attr: document_eq_static_binding_attr("selected", &json!("C0")).unwrap(),
+        };
+        assert_eq!(
+            document_static_equality_binding_changed_from_frame(
+                &frame,
+                &unchanged_target,
+                &json!("B0"),
+            ),
+            Some(false)
+        );
+
+        let old_selected_target = DocumentDataBindingTarget {
+            node: boon_document_model::DocumentNodeId("row-old".to_owned()),
+            attr: document_eq_static_binding_attr("selected", &json!("A0")).unwrap(),
+        };
+        assert_eq!(
+            document_static_equality_binding_changed_from_frame(
+                &frame,
+                &old_selected_target,
+                &json!("B0"),
+            ),
+            Some(true)
+        );
+
+        let new_selected_target = DocumentDataBindingTarget {
+            node: boon_document_model::DocumentNodeId("row-new".to_owned()),
+            attr: document_eq_static_binding_attr("selected", &json!("B0")).unwrap(),
+        };
+        assert_eq!(
+            document_static_equality_binding_changed_from_frame(
+                &frame,
+                &new_selected_target,
+                &json!("B0"),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn counter_button_event_group_argument_lowers_press_source_intent() {
         let source_path = repo_path("examples/counter.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
@@ -70279,8 +70660,13 @@ document:
             .expect("decrement output should be present");
         assert_eq!(
             decrement_output["framebuffer_delta_evidence"]["post_input_frame_method"],
-            json!("render-patch-state-delta-and-full-runtime-backed-layout-recompute"),
-            "button press must rebuild visible runtime-backed layout instead of taking the focus-only overlay path: {decrement_output}"
+            json!("render-patch-state-delta-and-paint-space-patch"),
+            "button press must update visible runtime-backed layout instead of taking the focus-only overlay path: {decrement_output}"
+        );
+        assert_eq!(
+            decrement_output["framebuffer_delta_evidence"]["post_input_layout_profile"]["render_scene_patch_layout_reuse"],
+            json!(true),
+            "fixed-box counter text should reuse retained layout with a render-scene sidecar: {decrement_output}"
         );
         let shared = shared_render_state
             .lock()
@@ -70293,13 +70679,27 @@ document:
             post_input_frame
                 .display_list
                 .iter()
-                .any(|item| item.text.as_deref() == Some("-1")),
-            "post-input counter frame should display -1, texts={:?}",
-            post_input_frame
-                .display_list
+                .any(|item| item.text.as_deref() == Some("0")),
+            "retained counter layout should keep the stable text box while the render-scene patch carries -1"
+        );
+        let next_hash = shared
+            .layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .expect("post-input layout proof should expose a layout hash");
+        let render_scene_patch =
+            cached_render_scene_patch(next_hash).expect("counter text sidecar should be cached");
+        assert!(
+            render_scene_patch
+                .operations
                 .iter()
-                .filter_map(|item| item.text.as_deref())
-                .collect::<Vec<_>>()
+                .any(|operation| matches!(
+                    operation,
+                    boon_document::RenderScenePatchOperation::TextContent { text, .. }
+                        if text == "-1"
+                )),
+            "post-input counter render-scene patch should display -1: {:?}",
+            render_scene_patch
         );
     }
 

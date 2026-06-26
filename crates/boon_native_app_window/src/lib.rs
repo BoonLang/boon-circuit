@@ -1618,6 +1618,7 @@ async fn run_surface_probe_inner(
     {
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
     }
+    config.present_mode = wgpu::PresentMode::AutoNoVsync;
     if options.readback_artifact_dir.is_some() {
         if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             return Err(NativeWindowError::Failed(format!(

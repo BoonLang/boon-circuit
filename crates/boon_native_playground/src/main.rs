@@ -34689,6 +34689,36 @@ fn source_intent_payload_may_need_summary(value: &str) -> bool {
         || value.starts_with("sheet_")
 }
 
+fn focused_payload_summary_if_needed(
+    layout_proof: &Value,
+    focused_node: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    input_state: &PreviewNativeInputState,
+) -> Option<Value> {
+    let address = input_state
+        .focused_address
+        .clone()
+        .or_else(|| focused_address(layout_proof, focused_node));
+    let target_text = input_state
+        .focused_target_text
+        .clone()
+        .or_else(|| focused_target_text(layout_proof, focused_node));
+    let needs_summary = address
+        .as_deref()
+        .is_some_and(source_intent_payload_may_need_summary)
+        || target_text
+            .as_deref()
+            .is_some_and(source_intent_payload_may_need_summary);
+    needs_summary
+        .then(|| {
+            live_runtime
+                .lock()
+                .ok()
+                .map(|mut runtime| preview_payload_state_summary(&mut runtime))
+        })
+        .flatten()
+}
+
 fn preview_key_is_repeatable(key: &str) -> bool {
     matches!(
         key,
@@ -34767,6 +34797,7 @@ fn preview_apply_repeatable_text_input_key(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
+    return_layout: bool,
 ) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     preview_refresh_cached_focus_payloads(layout, focused_node, live_runtime, input_state);
     match key {
@@ -34802,10 +34833,12 @@ fn preview_apply_repeatable_text_input_key(
             }
             preview_reset_caret_blink(input_state);
             if let Some(source) = preview_focused_change_source(layout, focused_node, input_state) {
-                let runtime_state_summary = live_runtime
-                    .lock()
-                    .ok()
-                    .map(|mut runtime| preview_payload_state_summary(&mut runtime));
+                let runtime_state_summary = focused_payload_summary_if_needed(
+                    layout,
+                    focused_node,
+                    live_runtime,
+                    input_state,
+                );
                 let mut change = boon_runtime::LiveSourceEvent {
                     source,
                     text: Some(input_state.focused_text.clone()),
@@ -34831,22 +34864,41 @@ fn preview_apply_repeatable_text_input_key(
                 };
                 apply_layout_row_identity_to_event(layout, focused_node, None, &mut change);
                 let change_report = live_source_event_report(&change);
-                return preview_apply_live_event(
-                    source_path,
-                    source_text,
-                    runtime_units,
-                    live_runtime,
-                    shared_render_state,
-                    change,
-                )
-                .map_err(|error| {
-                    format!(
-                        "{error}; repeatable_text_input_change_event={}",
-                        serde_json::to_string(&change_report).unwrap_or_default()
+                return if return_layout {
+                    preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        change,
                     )
-                    .into()
-                })
-                .map(Some);
+                    .map_err(|error| {
+                        format!(
+                            "{error}; repeatable_text_input_change_event={}",
+                            serde_json::to_string(&change_report).unwrap_or_default()
+                        )
+                        .into()
+                    })
+                    .map(Some)
+                } else {
+                    preview_apply_live_events_no_return(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        vec![change],
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "{error}; repeatable_text_input_change_event={}",
+                            serde_json::to_string(&change_report).unwrap_or_default()
+                        )
+                        .into()
+                    })
+                    .map(|()| None)
+                };
             }
             Ok(None)
         }
@@ -34858,10 +34910,12 @@ fn preview_apply_repeatable_text_input_key(
                 if let Some(source) =
                     preview_focused_change_source(layout, focused_node, input_state)
                 {
-                    let runtime_state_summary = live_runtime
-                        .lock()
-                        .ok()
-                        .map(|mut runtime| preview_payload_state_summary(&mut runtime));
+                    let runtime_state_summary = focused_payload_summary_if_needed(
+                        layout,
+                        focused_node,
+                        live_runtime,
+                        input_state,
+                    );
                     let mut change = boon_runtime::LiveSourceEvent {
                         source,
                         text: Some(input_state.focused_text.clone()),
@@ -34887,27 +34941,351 @@ fn preview_apply_repeatable_text_input_key(
                     };
                     apply_layout_row_identity_to_event(layout, focused_node, None, &mut change);
                     let change_report = live_source_event_report(&change);
-                    return preview_apply_live_event(
-                        source_path,
-                        source_text,
-                        runtime_units,
-                        live_runtime,
-                        shared_render_state,
-                        change,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "{error}; repeatable_text_input_change_event={}",
-                            serde_json::to_string(&change_report).unwrap_or_default()
+                    return if return_layout {
+                        preview_apply_live_event(
+                            source_path,
+                            source_text,
+                            runtime_units,
+                            live_runtime,
+                            shared_render_state,
+                            change,
                         )
-                        .into()
-                    })
-                    .map(Some);
+                        .map_err(|error| {
+                            format!(
+                                "{error}; repeatable_text_input_change_event={}",
+                                serde_json::to_string(&change_report).unwrap_or_default()
+                            )
+                            .into()
+                        })
+                        .map(Some)
+                    } else {
+                        preview_apply_live_events_no_return(
+                            source_path,
+                            source_text,
+                            runtime_units,
+                            live_runtime,
+                            shared_render_state,
+                            vec![change],
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "{error}; repeatable_text_input_change_event={}",
+                                serde_json::to_string(&change_report).unwrap_or_default()
+                            )
+                            .into()
+                        })
+                        .map(|()| None)
+                    };
                 }
             }
             Ok(None)
         }
     }
+}
+
+fn preview_try_apply_focused_keyboard_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let input_total_started = Instant::now();
+    if input.synthetic_input_probe
+        || input.scroll_delta_x.abs() > f64::EPSILON
+        || input.scroll_delta_y.abs() > f64::EPSILON
+        || input_state.active_drag.is_some()
+        || !input_state.pending_live_events.is_empty()
+        || !input.mouse_button_events.is_empty()
+        || !input.mouse_buttons_down.is_empty()
+        || input_state.focused_node.is_none()
+    {
+        return Ok(false);
+    }
+    let keyboard_events = input
+        .keyboard_events
+        .iter()
+        .filter(|event| event.sequence > input_state.last_keyboard_event_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
+    if keyboard_events.is_empty() {
+        return Ok(false);
+    }
+    let primary_modifier_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key_is_primary_modifier(key));
+    if primary_modifier_pressed {
+        preview_clear_key_repeat(input_state);
+        return Ok(false);
+    }
+    let shift_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key == "Shift" || key == "RightShift");
+    let layout_clone_started = Instant::now();
+    let layout_proof = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        shared.layout_proof.clone()
+    };
+    let layout_clone_ms = elapsed_ms(layout_clone_started);
+    let keyboard_started = Instant::now();
+    let mut applied_event = false;
+    for event in keyboard_events {
+        input_state.last_keyboard_event_sequence =
+            input_state.last_keyboard_event_sequence.max(event.sequence);
+        if key_is_primary_modifier(event.key.as_str()) {
+            preview_clear_key_repeat(input_state);
+            continue;
+        }
+        if !event.pressed {
+            if input_state
+                .held_repeat_key
+                .as_ref()
+                .is_some_and(|held| pressed_key_matches_repeat(event.key.as_str(), held))
+            {
+                preview_clear_key_repeat(input_state);
+            }
+            continue;
+        }
+        let Some(focused_node) = preview_resolve_input_focus_for_layout(&layout_proof, input_state)
+        else {
+            preview_clear_focused_input_state(input_state);
+            preview_clear_key_repeat(input_state);
+            continue;
+        };
+        match event.key.as_str() {
+            "Return" | "KeypadEnter" => {
+                if let Some(source) =
+                    live_source_for_node_intent(&layout_proof, &focused_node, "submit")
+                        .or_else(|| {
+                            live_source_for_node_intent(&layout_proof, &focused_node, "key_down")
+                        })
+                        .or_else(|| {
+                            preview_focused_key_down_source(
+                                &layout_proof,
+                                &focused_node,
+                                input_state,
+                            )
+                        })
+                {
+                    let submitted_text = input_state.focused_text.clone();
+                    let carries_text = live_runtime
+                        .lock()
+                        .map(|runtime| runtime.source_payload_has_text(&source))
+                        .unwrap_or(false);
+                    let mut submit = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: carries_text.then_some(submitted_text),
+                        key: Some("Enter".to_owned()),
+                        address: focused_event_address(&layout_proof, input_state, &focused_node),
+                        target_text: focused_event_target_text(
+                            &layout_proof,
+                            input_state,
+                            &focused_node,
+                        ),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    apply_layout_row_identity_to_event(
+                        &layout_proof,
+                        &focused_node,
+                        None,
+                        &mut submit,
+                    );
+                    preview_apply_live_events_no_return(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        vec![submit],
+                    )?;
+                    applied_event = true;
+                    preview_clear_focused_input_state(input_state);
+                }
+                preview_clear_key_repeat(input_state);
+            }
+            "Escape" => {
+                if let Some(source) =
+                    live_source_for_node_intent(&layout_proof, &focused_node, "escape")
+                        .or_else(|| input_state.focused_escape_source.clone())
+                        .or_else(|| {
+                            live_source_for_node_intent(&layout_proof, &focused_node, "key_down")
+                        })
+                        .or_else(|| {
+                            preview_focused_key_down_source(
+                                &layout_proof,
+                                &focused_node,
+                                input_state,
+                            )
+                        })
+                {
+                    let mut escape = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: Some("Escape".to_owned()),
+                        address: focused_event_address(&layout_proof, input_state, &focused_node),
+                        target_text: focused_event_target_text(
+                            &layout_proof,
+                            input_state,
+                            &focused_node,
+                        ),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    apply_layout_row_identity_to_event(
+                        &layout_proof,
+                        &focused_node,
+                        None,
+                        &mut escape,
+                    );
+                    preview_apply_live_events_no_return(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        vec![escape],
+                    )?;
+                    applied_event = true;
+                    preview_clear_focused_input_state(input_state);
+                }
+                preview_clear_key_repeat(input_state);
+            }
+            key if preview_key_is_repeatable(key) => {
+                if preview_focused_change_source(&layout_proof, &focused_node, input_state)
+                    .is_some()
+                {
+                    preview_apply_repeatable_text_input_key(
+                        key,
+                        shift_pressed,
+                        &layout_proof,
+                        &focused_node,
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        input_state,
+                        false,
+                    )?;
+                    applied_event = true;
+                    let now = Instant::now();
+                    input_state.held_repeat_key = Some(event.key.clone());
+                    input_state.held_repeat_next_at =
+                        now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
+                } else if let Some(source) =
+                    preview_focused_key_down_source(&layout_proof, &focused_node, input_state)
+                {
+                    let mut key_down = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: Some(normalized_repeat_key(key)),
+                        address: focused_event_address(&layout_proof, input_state, &focused_node),
+                        target_text: focused_event_target_text(
+                            &layout_proof,
+                            input_state,
+                            &focused_node,
+                        ),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    apply_layout_row_identity_to_event(
+                        &layout_proof,
+                        &focused_node,
+                        None,
+                        &mut key_down,
+                    );
+                    preview_apply_live_events_no_return(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        vec![key_down],
+                    )?;
+                    applied_event = true;
+                    let now = Instant::now();
+                    input_state.held_repeat_key = Some(event.key.clone());
+                    input_state.held_repeat_next_at =
+                        now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
+                }
+            }
+            _ => {
+                if let Some(source) =
+                    preview_focused_key_down_source(&layout_proof, &focused_node, input_state)
+                {
+                    let mut key_down = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: Some(normalized_repeat_key(event.key.as_str())),
+                        address: focused_event_address(&layout_proof, input_state, &focused_node),
+                        target_text: focused_event_target_text(
+                            &layout_proof,
+                            input_state,
+                            &focused_node,
+                        ),
+                        target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    apply_layout_row_identity_to_event(
+                        &layout_proof,
+                        &focused_node,
+                        None,
+                        &mut key_down,
+                    );
+                    preview_apply_live_events_no_return(
+                        source_path,
+                        source_text,
+                        runtime_units,
+                        live_runtime,
+                        shared_render_state,
+                        vec![key_down],
+                    )?;
+                    applied_event = true;
+                }
+                preview_clear_key_repeat(input_state);
+            }
+        }
+    }
+    let keyboard_ms = elapsed_ms(keyboard_started);
+    let hover_overlay_started = Instant::now();
+    preview_apply_hover_overlay(shared_render_state, input_state)?;
+    let hover_overlay_ms = elapsed_ms(hover_overlay_started);
+    let focus_overlay_started = Instant::now();
+    if applied_event || preview_focus_overlay_may_be_needed(shared_render_state, input_state) {
+        preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    }
+    let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    record_preview_native_input_timing(PreviewNativeInputTimingSample {
+        scope: preview_current_interaction_timing_scope(),
+        fast_path: "focused_keyboard",
+        resolve_ms: layout_clone_ms,
+        apply_ms: keyboard_ms,
+        hover_overlay_ms,
+        focus_overlay_ms,
+        total_ms: elapsed_ms(input_total_started),
+    });
+    if preview_profiling_enabled() {
+        record_preview_native_input_profile(json!({
+            "source_path": source_path,
+            "capture_scope": input.capture_scope,
+            "fast_path": "focused_keyboard",
+            "keyboard_events": input.keyboard_events.len(),
+            "layout_clone_ms": layout_clone_ms,
+            "keyboard_ms": keyboard_ms,
+            "applied_event": applied_event,
+            "hover_overlay_ms": hover_overlay_ms,
+            "focus_overlay_ms": focus_overlay_ms,
+            "total_ms": elapsed_ms(input_total_started)
+        }));
+    }
+    Ok(true)
 }
 
 fn preview_apply_real_window_input(
@@ -36039,6 +36417,17 @@ fn preview_apply_real_window_input_with_units(
     )? {
         return Ok(());
     }
+    if preview_try_apply_focused_keyboard_input(
+        input,
+        source_path,
+        source_text,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        input_state,
+    )? {
+        return Ok(());
+    }
     let input_total_started = Instant::now();
     let mut pending_live_events_ms = 0.0_f64;
     let mut drag_events_ms = 0.0_f64;
@@ -36527,6 +36916,7 @@ fn preview_apply_real_window_input_with_units(
                         live_runtime,
                         shared_render_state,
                         input_state,
+                        true,
                     )? {
                         latest_layout = Some(next_layout);
                     }
@@ -36626,6 +37016,7 @@ fn preview_apply_real_window_input_with_units(
                             live_runtime,
                             shared_render_state,
                             input_state,
+                            true,
                         )? {
                             latest_layout = Some(next_layout);
                         }
@@ -37270,6 +37661,18 @@ fn runtime_value_summary_source_path(value: &Value) -> Option<String> {
         _ => return None,
     };
     (!source_path.trim().is_empty()).then_some(source_path)
+}
+
+fn runtime_value_summary_document_text(value: &Value) -> Option<String> {
+    if let Some(value) = value.get("value") {
+        return Some(json_value_to_document_text(value));
+    }
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("string") => Some(value.get("value")?.as_str()?.to_owned()),
+        Some("number") => Some(json_value_to_document_text(value.get("value")?)),
+        Some("bool") => Some(json_value_to_document_text(value.get("value")?)),
+        _ => None,
+    }
 }
 
 fn source_intent_binding_paths_for_node(
@@ -41911,6 +42314,7 @@ struct PreviewHitRouteTable {
     display_items_by_node: BTreeMap<String, Vec<usize>>,
     hit_index_by_node: BTreeMap<String, usize>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
+    text_binding_values_by_node: BTreeMap<String, String>,
 }
 
 impl PreviewHitRouteTable {
@@ -41953,7 +42357,12 @@ impl PreviewHitRouteTable {
             .and_then(serde_json::Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
-        Self::from_snapshot_with_source_intents(&snapshot, layout_frame, source_intents)
+        Self::from_snapshot_with_source_intents(
+            &snapshot,
+            layout_frame,
+            source_intents,
+            shared.layout_proof.get("runtime_document_state_snapshot"),
+        )
     }
 
     fn from_layout_proof(layout_proof: &Value) -> Option<Self> {
@@ -41970,6 +42379,7 @@ impl PreviewHitRouteTable {
             &snapshot,
             snapshot.layout_frame.as_ref(),
             source_intents,
+            layout_proof.get("runtime_document_state_snapshot"),
         )
     }
 
@@ -41977,6 +42387,7 @@ impl PreviewHitRouteTable {
         snapshot: &DocumentRenderSnapshot,
         layout_frame: &boon_document::LayoutFrame,
         source_intents: &[Value],
+        state_summary: Option<&Value>,
     ) -> Option<Self> {
         let source_intents = source_intents
             .iter()
@@ -42009,6 +42420,21 @@ impl PreviewHitRouteTable {
                 .or_default()
                 .push(index);
         }
+        let text_binding_paths_by_node = snapshot
+            .data_binding_targets
+            .text_binding_paths_by_node
+            .clone();
+        let text_binding_values_by_node = state_summary
+            .map(|summary| {
+                text_binding_paths_by_node
+                    .iter()
+                    .filter_map(|(node, paths)| {
+                        document_text_binding_value_for_paths(paths, summary)
+                            .map(|text| (node.clone(), text))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         Some(Self {
             hit_table,
             source_intents,
@@ -42016,10 +42442,8 @@ impl PreviewHitRouteTable {
             display_items,
             display_items_by_node,
             hit_index_by_node,
-            text_binding_paths_by_node: snapshot
-                .data_binding_targets
-                .text_binding_paths_by_node
-                .clone(),
+            text_binding_paths_by_node,
+            text_binding_values_by_node,
         })
     }
 
@@ -42409,7 +42833,10 @@ impl PreviewHitRouteTable {
         node: &str,
         live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     ) -> Option<String> {
-        if let Some(text) = self.text_input_document_value(node) {
+        if let Some(text) = self.text_binding_values_by_node.get(node) {
+            return Some(text.clone());
+        }
+        if let Some(text) = self.focused_text_from_runtime_bindings(node, live_runtime) {
             return Some(text);
         }
         let mut runtime = live_runtime.lock().ok()?;
@@ -42434,6 +42861,34 @@ impl PreviewHitRouteTable {
             self.address(node),
         )?;
         focused_editing_text_for_address(&summary, &address)
+            .or_else(|| self.text_input_document_value(node))
+    }
+
+    fn focused_text_from_runtime_bindings(
+        &self,
+        node: &str,
+        live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    ) -> Option<String> {
+        let mut paths = self.text_binding_paths_by_node.get(node)?.clone();
+        paths.sort_by(|left, right| {
+            document_text_binding_path_rank(left)
+                .cmp(&document_text_binding_path_rank(right))
+                .then_with(|| left.cmp(right))
+        });
+        let paths = paths
+            .into_iter()
+            .filter(|path| !path.starts_with('@'))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return None;
+        }
+        let mut runtime = live_runtime.lock().ok()?;
+        let values = runtime.runtime_value_summaries(&paths, 2, 8, 2);
+        paths.iter().find_map(|path| {
+            values
+                .get(path)
+                .and_then(runtime_value_summary_document_text)
+        })
     }
 
     fn text_input_should_replace_on_type(&self, node: &str) -> bool {

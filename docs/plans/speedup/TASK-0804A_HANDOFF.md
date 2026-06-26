@@ -271,6 +271,16 @@ Do not mark TASK-0804A complete until all of these are true on fresh reports:
 - `crates/boon_native_playground/src/main.rs`.
 - `examples/cells.bn`.
 
+## 2026-06-26 Manual Cells Input Regression Note
+
+After a release playground launch of `boon_native_playground --role desktop
+--example cells`, manual user testing still reported that Cells do not react to
+mouse clicks at all. The focused Cells tests and release interaction-speed
+verifier may pass, but that is not sufficient evidence that the visible
+playground input path works. Treat the real native preview click path,
+app-window coordinate provenance, and Cells source-event routing as still
+unresolved until a fresh app-owned native proof matches manual behavior.
+
 ## One-Sentence Warning
 
 If the next attempt does not reduce the eager `cells.value` / indexed

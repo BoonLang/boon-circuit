@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1685,7 +1685,7 @@ fn run_novywave_interaction_speed(
     };
     let initial_state_summary = runtime.document_state_summary();
     let viewport = (1180.0, 720.0);
-    let (layout_proof, layout_frame) = {
+    let (mut layout_proof, layout_frame) = {
         let phase = phase_recorder.begin("initial_layout_proof");
         let result = native_document_layout_proof_with_project_state_embedded_for_viewport(
             &source_path,
@@ -1697,7 +1697,10 @@ fn run_novywave_interaction_speed(
         phase_recorder.fail_if_timed_out()?;
         result
     };
-    cache_layout_runtime_state_snapshot_for_proof(&layout_proof, &initial_state_summary);
+    cache_layout_runtime_state_snapshot_for_hot_layout_proof(
+        &mut layout_proof,
+        &initial_state_summary,
+    );
     let initial_layout_frame = layout_frame.clone();
     let (wave_center_x, wave_y, wave_node, wave_width) = {
         let phase = phase_recorder.begin("resolve_waveform_hit_target");
@@ -5943,6 +5946,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .world_scene
                 .clone();
             let preview_has_world_scene = preview_world_scene.is_some();
+            let input_delta = native_input_for_layout_surface(
+                &context.input_delta,
+                context.width,
+                context.height,
+            );
             if !context.accessibility_actions.is_empty() {
                 match preview_apply_accessibility_actions_with_units(
                     &context.accessibility_actions,
@@ -5974,7 +5982,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(world_scene) = preview_world_scene.as_ref() {
                 match preview_apply_world_scene_input(
-                    &context.input_delta,
+                    &input_delta,
                     world_scene,
                     &poll_shared_render_state,
                     &mut input_state,
@@ -5994,13 +6002,12 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-            } else if preview_input_has_unhandled_source_events(&context.input_delta, &input_state)
-            {
+            } else if preview_input_has_unhandled_source_events(&input_delta, &input_state) {
                 let world_editor_input_result = if let Some(world_editor_session) =
                     input_context.world_editor_session.as_ref()
                 {
                     preview_try_apply_world_editor_input(
-                        &context.input_delta,
+                        &input_delta,
                         world_editor_session,
                         &poll_shared_render_state,
                         &mut input_state,
@@ -6015,7 +6022,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Ok(false) => {
                         if let Err(error) = preview_apply_real_window_input_with_units(
-                            &context.input_delta,
+                            &input_delta,
                             &input_context.source_path,
                             &input_context.source_text,
                             &input_context.runtime_units,
@@ -6052,7 +6059,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             if !preview_has_world_scene
                 && let Err(error) = preview_apply_scroll_input_with_units(
-                    &context.input_delta,
+                    &input_delta,
                     Some(&input_context.source_path),
                     Some(&input_context.source_text),
                     Some(&input_context.runtime_units),
@@ -8330,12 +8337,23 @@ struct DocumentRenderSnapshot {
     runtime_document_state_values: BTreeMap<String, Value>,
     derived_indexes: Arc<boon_document::DocumentDerivedIndexBundle>,
     layout_frame: Arc<boon_document::LayoutFrame>,
+    display_items_by_node: BTreeMap<String, Vec<usize>>,
     retained_layout_cache: Arc<boon_document::DocumentRetainedLayoutCache>,
     data_binding_targets: Arc<DocumentDataBindingSnapshotIndex>,
     structural_data_reads: BTreeSet<String>,
     structural_data_read_aliases: Vec<(String, Vec<String>)>,
     source_intents: Vec<Value>,
     hit_route_static_cache_key: Option<String>,
+}
+
+fn document_display_items_by_node(
+    layout: &boon_document::LayoutFrame,
+) -> BTreeMap<String, Vec<usize>> {
+    let mut by_node = BTreeMap::<String, Vec<usize>>::new();
+    for (index, item) in layout.display_list.iter().enumerate() {
+        by_node.entry(item.node.0.clone()).or_default().push(index);
+    }
+    by_node
 }
 
 #[derive(Clone, Debug, Default)]
@@ -9246,6 +9264,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
                     runtime_document_state_values: BTreeMap::new(),
                     derived_indexes: Arc::clone(&entry.derived_indexes),
                     layout_frame: Arc::new(entry.layout_frame.clone()),
+                    display_items_by_node: document_display_items_by_node(&entry.layout_frame),
                     retained_layout_cache: Arc::clone(&entry.retained_layout_cache),
                     data_binding_targets: Arc::new(entry.data_binding_targets.clone().into()),
                     structural_data_reads: entry.structural_data_reads.clone(),
@@ -9764,6 +9783,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
         runtime_document_state_values,
         derived_indexes,
         layout_frame: Arc::clone(&layout_snapshot_frame),
+        display_items_by_node: document_display_items_by_node(layout_snapshot_frame.as_ref()),
         retained_layout_cache,
         data_binding_targets: data_binding_snapshot,
         structural_data_read_aliases: document_structural_data_read_aliases(&structural_data_reads),
@@ -11690,15 +11710,12 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
     let Some(frame) = render_state.layout_frame.as_mut() else {
         return;
     };
-    let caret_node = format!(
-        "dev-code-editor-line-text-{}",
-        shell.workspace.selected_buffer.caret().line
-    );
     let caret_visible = boon_document_model::StyleValue::Bool(shell.caret_visible);
     for item in &mut frame.display_list {
-        if item.node.0 == caret_node {
+        if dev_editor_item_source_line(item) == Some(shell.workspace.selected_buffer.caret().line) {
             item.style
                 .insert("editor_caret_visible".to_owned(), caret_visible);
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
             break;
         }
     }
@@ -11708,6 +11725,29 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
 
 fn editor_line_number_from_node_id(node_id: &str, prefix: &str) -> Option<usize> {
     node_id.strip_prefix(prefix)?.parse::<usize>().ok()
+}
+
+fn dev_editor_item_source_line(item: &boon_document::DisplayItem) -> Option<usize> {
+    item.style
+        .get("editor_source_line")
+        .and_then(|value| match value {
+            boon_document_model::StyleValue::Number(number)
+                if *number >= 1.0 && number.fract().abs() <= f64::EPSILON =>
+            {
+                Some(*number as usize)
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-text-")
+                .or_else(|| editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-"))
+                .or_else(|| {
+                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-gutter-")
+                })
+                .or_else(|| {
+                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-code-row-")
+                })
+        })
 }
 
 fn dev_editor_row_bg(model: &CodeEditorModel, line_number: usize) -> &'static str {
@@ -11780,8 +11820,8 @@ fn patch_dev_render_editor_visual_state(
     let bracket_columns_by_line = model.bracket_columns_by_line();
     let mut patched = false;
     for item in &mut frame.display_list {
-        if let Some(line_number) =
-            editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-text-")
+        if item.node.0.starts_with("dev-code-editor-line-text-")
+            && let Some(line_number) = dev_editor_item_source_line(item)
         {
             apply_dev_editor_visual_style(
                 &mut item.style,
@@ -11790,15 +11830,12 @@ fn patch_dev_render_editor_visual_state(
                 line_number,
                 shell.caret_visible,
             );
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
             patched = true;
-        } else if let Some(line_number) =
-            editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-")
-                .or_else(|| {
-                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-gutter-")
-                })
-                .or_else(|| {
-                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-code-row-")
-                })
+        } else if (item.node.0.starts_with("dev-code-editor-line-")
+            || item.node.0.starts_with("dev-code-editor-gutter-")
+            || item.node.0.starts_with("dev-code-editor-code-row-"))
+            && let Some(line_number) = dev_editor_item_source_line(item)
         {
             item.style.insert(
                 "bg".to_owned(),
@@ -11806,6 +11843,7 @@ fn patch_dev_render_editor_visual_state(
                     dev_editor_row_bg(model, line_number).to_owned(),
                 ),
             );
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
             patched = true;
         }
     }
@@ -11854,10 +11892,11 @@ fn patch_dev_render_editor_scroll(
     for (slot, item_index) in text_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
         if let Some((line_number, line)) = visible_lines.get(slot) {
-            item.node = boon_document_model::DocumentNodeId(format!(
-                "dev-code-editor-line-text-{line_number}"
-            ));
             item.text = Some(line.clone());
+            item.style.insert(
+                "editor_source_line".to_owned(),
+                boon_document_model::StyleValue::Number(*line_number as f64),
+            );
             item.style.insert(
                 "syntax_spans_json".to_owned(),
                 boon_document_model::StyleValue::RichTextSpans(syntax_span_styles(
@@ -11895,10 +11934,8 @@ fn patch_dev_render_editor_scroll(
                 shell.caret_visible,
             );
         } else {
-            item.node = boon_document_model::DocumentNodeId(format!(
-                "dev-code-editor-line-text-blank-{slot}"
-            ));
             item.text = Some(String::new());
+            item.style.remove("editor_source_line");
             item.style.insert(
                 "syntax_spans_json".to_owned(),
                 boon_document_model::StyleValue::RichTextSpans(Vec::new()),
@@ -11919,6 +11956,7 @@ fn patch_dev_render_editor_scroll(
             "rich_text".to_owned(),
             boon_document_model::StyleValue::Bool(true),
         );
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
     }
 
     let mut gutter_indices = frame
@@ -11941,14 +11979,59 @@ fn patch_dev_render_editor_scroll(
     for (slot, item_index) in gutter_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
         if let Some((line_number, _)) = visible_lines.get(slot) {
-            item.node = boon_document_model::DocumentNodeId(format!(
-                "dev-code-editor-gutter-{line_number}"
-            ));
             item.text = Some(format!("{line_number:>4}"));
+            item.style.insert(
+                "editor_source_line".to_owned(),
+                boon_document_model::StyleValue::Number(*line_number as f64),
+            );
+            item.style.insert(
+                "bg".to_owned(),
+                boon_document_model::StyleValue::Text(
+                    dev_editor_row_bg(model, *line_number).to_owned(),
+                ),
+            );
         } else {
-            item.node =
-                boon_document_model::DocumentNodeId(format!("dev-code-editor-gutter-blank-{slot}"));
             item.text = Some(String::new());
+            item.style.remove("editor_source_line");
+        }
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+    }
+
+    for prefix in ["dev-code-editor-line-", "dev-code-editor-code-row-"] {
+        let mut row_indices = frame
+            .display_list
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (item.node.0.starts_with(prefix)
+                    && !(prefix == "dev-code-editor-line-"
+                        && item.node.0.starts_with("dev-code-editor-line-text-")))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        row_indices.sort_by(|left, right| {
+            frame.display_list[*left]
+                .bounds
+                .y
+                .total_cmp(&frame.display_list[*right].bounds.y)
+        });
+        for (slot, item_index) in row_indices.into_iter().enumerate() {
+            let item = &mut frame.display_list[item_index];
+            if let Some((line_number, _)) = visible_lines.get(slot) {
+                item.style.insert(
+                    "editor_source_line".to_owned(),
+                    boon_document_model::StyleValue::Number(*line_number as f64),
+                );
+                item.style.insert(
+                    "bg".to_owned(),
+                    boon_document_model::StyleValue::Text(
+                        dev_editor_row_bg(model, *line_number).to_owned(),
+                    ),
+                );
+            } else {
+                item.style.remove("editor_source_line");
+            }
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
         }
     }
 
@@ -13114,6 +13197,17 @@ fn input_layout_position(
         window_width: f64::from(surface_width),
         window_height: f64::from(surface_height),
     })
+}
+
+fn native_input_for_layout_surface(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    surface_width: u32,
+    surface_height: u32,
+) -> boon_native_app_window::NativeInputAdapterProof {
+    let mut normalized = input.clone();
+    normalized.mouse_window_pos =
+        input_layout_position(input.mouse_window_pos, surface_width, surface_height);
+    normalized
 }
 
 fn type_inspector_resize_handle_hovered(
@@ -33732,6 +33826,8 @@ struct PreviewNativeInputState {
     caret_blink_started_at: Option<Instant>,
     focus_overlay_nodes: BTreeSet<String>,
     focus_overlay_initialized: bool,
+    selected_overlay_nodes: BTreeSet<String>,
+    selected_overlay_address: Option<String>,
     held_repeat_key: Option<String>,
     held_repeat_next_at: Option<Instant>,
     active_drag: Option<PreviewActiveDrag>,
@@ -34326,6 +34422,18 @@ fn unhandled_primary_mouse_releases(
     }
 }
 
+fn unhandled_primary_mouse_click_edges(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    last_press_sequence: u64,
+    last_release_sequence: u64,
+) -> Vec<boon_native_app_window::NativeMouseButtonEventProof> {
+    let releases = unhandled_primary_mouse_releases(input, last_release_sequence);
+    if !releases.is_empty() {
+        return releases;
+    }
+    unhandled_primary_mouse_presses(input, last_press_sequence)
+}
+
 fn preview_input_has_unhandled_source_events(
     input: &boon_native_app_window::NativeInputAdapterProof,
     input_state: &PreviewNativeInputState,
@@ -34338,8 +34446,12 @@ fn preview_input_has_unhandled_source_events(
             != input_state.last_hover_window_position
         || !unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count)
             .is_empty()
-        || !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
-            .is_empty()
+        || !unhandled_primary_mouse_click_edges(
+            input,
+            input_state.last_mouse_press_event_count,
+            input_state.last_mouse_button_event_count,
+        )
+        .is_empty()
         || input
             .keyboard_events
             .iter()
@@ -34962,8 +35074,7 @@ fn preview_caret_visible(input_state: &PreviewNativeInputState, now: Instant) ->
 }
 
 fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -> bool {
-    let _ = (layout_proof, node);
-    false
+    !preview_text_input_live_change_enabled(layout_proof, node)
 }
 
 fn preview_text_input_live_change_enabled(layout_proof: &Value, node: &str) -> bool {
@@ -35441,11 +35552,13 @@ fn preview_apply_repeatable_text_input_key(
     preview_refresh_cached_focus_payloads(layout, focused_node, live_runtime, input_state);
     match key {
         "Left" | "ArrowLeft" | "LeftArrow" => {
+            input_state.replace_focused_text_on_next_edit = false;
             input_state.focused_caret_index = input_state.focused_caret_index.saturating_sub(1);
             preview_reset_caret_blink(input_state);
             Ok(None)
         }
         "Right" | "ArrowRight" | "RightArrow" => {
+            input_state.replace_focused_text_on_next_edit = false;
             input_state.focused_caret_index = input_state
                 .focused_caret_index
                 .saturating_add(1)
@@ -35454,11 +35567,13 @@ fn preview_apply_repeatable_text_input_key(
             Ok(None)
         }
         "Home" => {
+            input_state.replace_focused_text_on_next_edit = false;
             input_state.focused_caret_index = 0;
             preview_reset_caret_blink(input_state);
             Ok(None)
         }
         "End" => {
+            input_state.replace_focused_text_on_next_edit = false;
             input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
             preview_reset_caret_blink(input_state);
             Ok(None)
@@ -35689,12 +35804,6 @@ fn preview_try_apply_focused_keyboard_input(
             };
             if let Some(source) = source {
                 let keyboard_started = Instant::now();
-                let layout_proof = {
-                    let shared = shared_render_state
-                        .lock()
-                        .map_err(|_| "preview render state mutex poisoned")?;
-                    shared.layout_proof.clone()
-                };
                 input_state.last_keyboard_event_sequence =
                     input_state.last_keyboard_event_sequence.max(event.sequence);
                 let submitted_text = input_state.focused_text.clone();
@@ -35738,24 +35847,6 @@ fn preview_try_apply_focused_keyboard_input(
                     shared_render_state,
                     vec![live_event],
                 )?;
-                let patched_retained_text =
-                    if carries_text && input_state.defer_focused_change_until_commit {
-                        preview_patch_retained_text_input_text(
-                            shared_render_state,
-                            &focused_node,
-                            &submitted_text,
-                        )?
-                    } else if matches!(event.key.as_str(), "Return" | "KeypadEnter") {
-                        preview_sync_blurred_text_input_from_runtime_state(
-                            shared_render_state,
-                            &layout_proof,
-                            &focused_node,
-                            live_runtime,
-                        )?
-                    } else {
-                        false
-                    };
-                let _ = patched_retained_text;
                 if !carries_text {
                     preview_sync_bound_text_inputs_from_runtime_state(
                         shared_render_state,
@@ -35771,29 +35862,6 @@ fn preview_try_apply_focused_keyboard_input(
                         address,
                     )?;
                 }
-                if carries_text {
-                    preview_patch_retained_focused_text_inputs(
-                        shared_render_state,
-                        &submitted_text,
-                    )?;
-                    preview_patch_retained_text_input_text(
-                        shared_render_state,
-                        &focused_node,
-                        &submitted_text,
-                    )?;
-                    preview_patch_retained_text_inputs_for_source(
-                        shared_render_state,
-                        &source_for_retained_text,
-                        &submitted_text,
-                    )?;
-                }
-                if carries_text && let Some(address) = focused_address_for_display.as_deref() {
-                    preview_patch_retained_text_inputs_for_address(
-                        shared_render_state,
-                        address,
-                        &submitted_text,
-                    )?;
-                }
                 preview_clear_focused_input_state(input_state);
                 preview_clear_key_repeat(input_state);
                 let keyboard_ms = elapsed_ms(keyboard_started);
@@ -35801,7 +35869,7 @@ fn preview_try_apply_focused_keyboard_input(
                 preview_apply_hover_overlay(shared_render_state, input_state)?;
                 let hover_overlay_ms = elapsed_ms(hover_overlay_started);
                 let focus_overlay_started = Instant::now();
-                preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+                preview_blur_retained_focus_node(shared_render_state, input_state, &focused_node)?;
                 let focus_overlay_ms = elapsed_ms(focus_overlay_started);
                 if carries_text {
                     preview_patch_retained_text_input_text(
@@ -35866,6 +35934,7 @@ fn preview_try_apply_focused_keyboard_input(
     let keyboard_started = Instant::now();
     let mut applied_event = false;
     let mut cleared_focus_after_runtime_event = false;
+    let mut cleared_focus_node = None::<String>;
     let mut post_focus_retained_text_patch =
         None::<(String, String, Option<String>, Option<String>)>;
     for event in keyboard_events {
@@ -35941,22 +36010,6 @@ fn preview_try_apply_focused_keyboard_input(
                         shared_render_state,
                         vec![submit],
                     )?;
-                    let patched_retained_text =
-                        if carries_text && input_state.defer_focused_change_until_commit {
-                            preview_patch_retained_text_input_text(
-                                shared_render_state,
-                                &submitted_node,
-                                &submitted_text,
-                            )?
-                        } else {
-                            preview_sync_blurred_text_input_from_runtime_state(
-                                shared_render_state,
-                                &layout_proof,
-                                &submitted_node,
-                                live_runtime,
-                            )?
-                        };
-                    let _ = patched_retained_text;
                     if !carries_text {
                         preview_sync_bound_text_inputs_from_runtime_state(
                             shared_render_state,
@@ -35971,29 +36024,6 @@ fn preview_try_apply_focused_keyboard_input(
                         )?;
                     }
                     if carries_text {
-                        preview_patch_retained_focused_text_inputs(
-                            shared_render_state,
-                            &submitted_text,
-                        )?;
-                        preview_patch_retained_text_input_text(
-                            shared_render_state,
-                            &submitted_node,
-                            &submitted_text,
-                        )?;
-                        preview_patch_retained_text_inputs_for_source(
-                            shared_render_state,
-                            &source_for_retained_text,
-                            &submitted_text,
-                        )?;
-                    }
-                    if carries_text && let Some(address) = submitted_address.as_deref() {
-                        preview_patch_retained_text_inputs_for_address(
-                            shared_render_state,
-                            address,
-                            &submitted_text,
-                        )?;
-                    }
-                    if carries_text {
                         post_focus_retained_text_patch = Some((
                             submitted_node.clone(),
                             submitted_text.clone(),
@@ -36002,6 +36032,7 @@ fn preview_try_apply_focused_keyboard_input(
                         ));
                     }
                     applied_event = true;
+                    cleared_focus_node = Some(submitted_node);
                     preview_clear_focused_input_state(input_state);
                     cleared_focus_after_runtime_event = true;
                 }
@@ -36054,6 +36085,7 @@ fn preview_try_apply_focused_keyboard_input(
                         live_runtime,
                     )?;
                     applied_event = true;
+                    cleared_focus_node = Some(focused_node.clone());
                     preview_clear_focused_input_state(input_state);
                     cleared_focus_after_runtime_event = true;
                 }
@@ -36160,7 +36192,10 @@ fn preview_try_apply_focused_keyboard_input(
     preview_apply_hover_overlay(shared_render_state, input_state)?;
     let hover_overlay_ms = elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
-    if applied_event || preview_focus_overlay_may_be_needed(shared_render_state, input_state) {
+    if let Some(node) = cleared_focus_node.as_deref() {
+        preview_blur_retained_focus_node(shared_render_state, input_state, node)?;
+    } else if applied_event || preview_focus_overlay_may_be_needed(shared_render_state, input_state)
+    {
         preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
     }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
@@ -36266,17 +36301,38 @@ fn preview_try_apply_simple_source_click_input(
         return reject("precondition", input_state);
     }
     let presses = unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count);
-    let releases =
-        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
-    if releases.len() != 1 || presses.len() > 1 {
+    let click_edges = unhandled_primary_mouse_click_edges(
+        input,
+        input_state.last_mouse_press_event_count,
+        input_state.last_mouse_button_event_count,
+    );
+    if click_edges.len() != 1 || presses.len() > 1 {
         return reject("button_shape", input_state);
     }
     let Some(position) = input.mouse_window_pos else {
         return reject("missing_position", input_state);
     };
     let position_key = preview_mouse_position_key(input.mouse_window_pos);
+    let release_sequence = click_edges[0].sequence;
+    if presses.len() <= 1
+        && preview_try_apply_retained_text_input_focus_click(
+            input,
+            source_path,
+            shared_render_state,
+            input_state,
+            position,
+            release_sequence,
+            input_total_started,
+        )?
+    {
+        for press in presses {
+            input_state.last_mouse_press_event_count =
+                input_state.last_mouse_press_event_count.max(press.sequence);
+        }
+        preview_remember_click_candidate(input_state, position_key, &None);
+        return Ok(true);
+    }
     preview_set_interaction_diagnostic_subphase("simple_source_click.resolve");
-    let release_sequence = releases[0].sequence;
     let resolve_started = Instant::now();
     let mut click_resolve_source = "hit_test";
     let mut route_table_lookup_ms = 0.0_f64;
@@ -36298,6 +36354,7 @@ fn preview_try_apply_simple_source_click_input(
                 })
                 .cloned()
         });
+    let previous_focused_node = input_state.focused_node.clone();
     let (events, node, target_text, preserve_focus, focus_state_applied, click_candidate) =
         if let Some(candidate) = cached_candidate {
             if candidate.text_change {
@@ -36745,7 +36802,7 @@ fn preview_try_apply_simple_source_click_input(
         input_state.last_mouse_press_event_count =
             input_state.last_mouse_press_event_count.max(press.sequence);
     }
-    let release = &releases[0];
+    let release = &click_edges[0];
     input_state.last_mouse_button_event_count = input_state
         .last_mouse_button_event_count
         .max(release.sequence);
@@ -36758,7 +36815,7 @@ fn preview_try_apply_simple_source_click_input(
     input_state.last_click_node = Some(node.clone());
     input_state.last_click_sequence = release.sequence;
     input_state.last_hover_window_position = preview_mouse_position_key(input.mouse_window_pos);
-    input_state.hovered_node = Some(node);
+    input_state.hovered_node = Some(node.clone());
     input_state.hovered_target_text = target_text;
     input_state.hovered_click_candidate = click_candidate;
     let remembered_candidate = input_state.hovered_click_candidate.clone();
@@ -36772,6 +36829,19 @@ fn preview_try_apply_simple_source_click_input(
         live_runtime,
         shared_render_state,
         events,
+    )?;
+    let mut bound_sync_nodes = BTreeSet::new();
+    bound_sync_nodes.insert(node.clone());
+    if let Some(previous_focused_node) = previous_focused_node {
+        bound_sync_nodes.insert(previous_focused_node);
+    }
+    if let Some(focused_node) = input_state.focused_node.as_ref() {
+        bound_sync_nodes.insert(focused_node.clone());
+    }
+    preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
+        shared_render_state,
+        live_runtime,
+        &bound_sync_nodes,
     )?;
     let apply_ms = elapsed_ms(apply_started);
     preview_set_interaction_diagnostic_subphase("simple_source_click.hover_overlay");
@@ -37412,6 +37482,159 @@ fn preview_prepare_text_input_route_click(
         &mut defer_focusable_mouse_events,
     )?;
     Ok(Some((events, node, target_text, preserve_focus)))
+}
+
+fn display_item_contains_position(
+    item: &boon_document::DisplayItem,
+    position: boon_native_app_window::NativeMouseWindowPosition,
+) -> bool {
+    let x = f64::from(item.bounds.x);
+    let y = f64::from(item.bounds.y);
+    let width = f64::from(item.bounds.width);
+    let height = f64::from(item.bounds.height);
+    position.x >= x && position.x <= x + width && position.y >= y && position.y <= y + height
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_try_apply_retained_text_input_focus_click(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    position: boon_native_app_window::NativeMouseWindowPosition,
+    release_sequence: u64,
+    input_total_started: Instant,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let resolve_started = Instant::now();
+    let Some((layout_proof, node, item_text, caret_index)) = ({
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        let frame = shared.layout_frame_override.as_deref();
+        frame.and_then(|frame| {
+            frame
+                .display_list
+                .iter()
+                .rev()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                        && display_item_contains_position(item, position)
+                })
+                .map(|item| {
+                    let text = item.text.clone().unwrap_or_default();
+                    let caret_index = preview_text_char_count(&text);
+                    (
+                        shared.layout_proof.clone(),
+                        item.node.0.clone(),
+                        text,
+                        caret_index,
+                    )
+                })
+        })
+    }) else {
+        return Ok(false);
+    };
+    if live_source_for_node_intent(&layout_proof, &node, "focus").is_some()
+        || (input_state.focused_node.as_deref() != Some(node.as_str())
+            && input_state.focused_node.as_deref().is_some_and(|focused| {
+                live_source_for_node_intent(&layout_proof, focused, "blur").is_some()
+            }))
+    {
+        return Ok(false);
+    }
+    let change_source = live_source_for_node_intent(&layout_proof, &node, "change");
+    let submit_source = live_source_for_node_intent(&layout_proof, &node, "submit");
+    let key_down_source =
+        preview_key_down_source_for_node(&layout_proof, &node).or_else(|| submit_source.clone());
+    if change_source.is_none() && key_down_source.is_none() {
+        return Ok(false);
+    }
+    let snapshot = layout_proof_runtime_state_snapshot(&layout_proof);
+    let focused_address = resolve_optional_source_intent_payload_value_for_focus(
+        Some(&layout_proof),
+        snapshot.as_ref(),
+        focused_address(&layout_proof, &node),
+    );
+    let focused_target_text = resolve_optional_source_intent_payload_value_for_focus(
+        Some(&layout_proof),
+        snapshot.as_ref(),
+        focused_target_text(&layout_proof, &node),
+    )
+    .or_else(|| focused_address.clone());
+    let focused_text = snapshot
+        .as_ref()
+        .and_then(|summary| document_text_binding_value_for_node(&layout_proof, &node, summary))
+        .or_else(|| (!item_text.is_empty()).then_some(item_text))
+        .or_else(|| document_value_for_node(&layout_proof, &node))
+        .unwrap_or_default();
+    let resolve_ms = elapsed_ms(resolve_started);
+
+    let apply_started = Instant::now();
+    input_state.focused_node = Some(node.clone());
+    input_state.focused_address = focused_address;
+    input_state.focused_target_text = focused_target_text;
+    input_state.focused_change_source = change_source;
+    input_state.focused_submit_source = submit_source;
+    input_state.focused_escape_source = live_source_for_node_intent(&layout_proof, &node, "escape");
+    input_state.focused_key_down_source = key_down_source;
+    input_state.focused_target_key = layout_row_key_for_node(&layout_proof, &node);
+    input_state.focused_target_generation = layout_row_generation_for_node(&layout_proof, &node);
+    input_state.focused_selection_proxy = false;
+    input_state.focused_text = focused_text;
+    input_state.focused_caret_index =
+        caret_index.min(preview_text_char_count(&input_state.focused_text));
+    input_state.replace_focused_text_on_next_edit =
+        preview_text_input_should_replace_on_type(&layout_proof, &node);
+    input_state.defer_focused_change_until_commit =
+        !preview_text_input_live_change_enabled(&layout_proof, &node);
+    preview_clear_key_repeat(input_state);
+    preview_reset_caret_blink(input_state);
+    input_state.last_click_node = Some(node.clone());
+    input_state.last_click_sequence = release_sequence;
+    input_state.last_mouse_button_event_count = input_state
+        .last_mouse_button_event_count
+        .max(release_sequence);
+    input_state.last_mouse_motion_event_count = input_state
+        .last_mouse_motion_event_count
+        .max(input.mouse_motion_event_count);
+    input_state.last_hover_window_position = preview_mouse_position_key(input.mouse_window_pos);
+    input_state.hovered_node = Some(node);
+    input_state.hovered_target_text = input_state.focused_target_text.clone();
+    input_state.hovered_click_candidate = None;
+    let apply_ms = elapsed_ms(apply_started);
+
+    let hover_overlay_started = Instant::now();
+    preview_apply_hover_overlay(shared_render_state, input_state)?;
+    let hover_overlay_ms = elapsed_ms(hover_overlay_started);
+    let focus_overlay_started = Instant::now();
+    preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    let focus_overlay_ms = elapsed_ms(focus_overlay_started);
+    record_preview_native_input_timing(PreviewNativeInputTimingSample {
+        scope: preview_current_interaction_timing_scope(),
+        fast_path: "retained_text_input_focus_click",
+        resolve_ms,
+        apply_ms,
+        hover_overlay_ms,
+        focus_overlay_ms,
+        total_ms: elapsed_ms(input_total_started),
+    });
+    if preview_profiling_enabled() {
+        record_preview_native_input_profile(json!({
+            "source_path": source_path,
+            "capture_scope": input.capture_scope,
+            "fast_path": "retained_text_input_focus_click",
+            "mouse_motion_event_count": input.mouse_motion_event_count,
+            "mouse_button_event_count": input.mouse_button_event_count,
+            "keyboard_events": input.keyboard_events.len(),
+            "node": input_state.focused_node,
+            "resolve_ms": resolve_ms,
+            "apply_ms": apply_ms,
+            "hover_overlay_ms": hover_overlay_ms,
+            "focus_overlay_ms": focus_overlay_ms,
+            "total_ms": elapsed_ms(input_total_started)
+        }));
+    }
+    Ok(true)
 }
 
 fn preview_apply_real_window_input_with_units(
@@ -38282,32 +38505,16 @@ fn preview_apply_focus_overlay(
         if item.focused
             && !next_focused
             && let Some(snapshot) = layout_proof_runtime_state_snapshot(&shared.layout_proof)
+            && (matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                || document_node_wants_text_cursor(&shared.layout_proof, &item.node.0))
             && let Some(next_text) =
-                if matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
-                    || document_node_wants_text_cursor(&shared.layout_proof, &item.node.0)
-                {
-                    document_text_binding_value_for_node(
-                        &shared.layout_proof,
-                        &item.node.0,
-                        &snapshot,
-                    )
+                document_text_binding_value_for_node(&shared.layout_proof, &item.node.0, &snapshot)
                     .or_else(|| document_value_for_node(&shared.layout_proof, &item.node.0))
-                } else {
-                    focused_address(&shared.layout_proof, &item.node.0)
-                        .and_then(|address| {
-                            resolve_optional_source_intent_payload_value_for_focus(
-                                Some(&shared.layout_proof),
-                                Some(&snapshot),
-                                Some(address),
-                            )
-                        })
-                        .and_then(|address| focused_display_text_for_address(&snapshot, &address))
-                        .or_else(|| document_value_for_node(&shared.layout_proof, &item.node.0))
-                }
         {
             blurred_text_by_node.insert(item.node.0.clone(), next_text);
         }
     }
+    let layout_proof = shared.layout_proof.clone();
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
@@ -38321,6 +38528,7 @@ fn preview_apply_focus_overlay(
         }
         if preview_apply_focus_overlay_to_item(
             item,
+            &layout_proof,
             resolved_focused_node.as_deref(),
             input_state,
             caret_visible,
@@ -38354,10 +38562,7 @@ fn preview_apply_selection_proxy_focus_overlay(
     if let Some(node) = input_state.focused_node.as_ref() {
         target_nodes.insert(node.clone());
     }
-    if target_nodes.is_empty() {
-        input_state.focus_overlay_initialized = true;
-        return Ok(false);
-    }
+    target_nodes.extend(input_state.selected_overlay_nodes.iter().cloned());
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
@@ -38370,12 +38575,39 @@ fn preview_apply_selection_proxy_focus_overlay(
     let focused_text = input_state.focused_text.clone();
     let focused_caret_index = input_state.focused_caret_index;
     let replace_focused_text_on_next_edit = input_state.replace_focused_text_on_next_edit;
+    let selected_address = input_state.focused_address.clone();
+    let layout_proof = shared.layout_proof.clone();
+    let selected_address_changed = input_state.selected_overlay_address != selected_address;
+    if selected_address_changed && input_state.selected_overlay_nodes.is_empty() {
+        target_nodes.extend(preview_current_selected_overlay_nodes(
+            shared.layout_frame_override.as_deref(),
+        ));
+    }
+    if let Some(address) = selected_address.as_deref() {
+        target_nodes.extend(preview_selected_overlay_nodes_for_address(
+            &layout_proof,
+            shared.layout_frame_override.as_deref(),
+            address,
+            selected_address_changed,
+        ));
+    }
+    if target_nodes.is_empty() {
+        input_state.focus_overlay_initialized = true;
+        input_state.selected_overlay_nodes.clear();
+        input_state.selected_overlay_address = selected_address;
+        return Ok(false);
+    }
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
     let mut changed = false;
     let mut next_overlay_nodes = BTreeSet::new();
-    for item in &mut frame.display_list {
+    let mut next_selected_overlay_nodes = BTreeSet::new();
+    let item_indexes = preview_display_item_indexes_for_nodes(&layout_proof, frame, &target_nodes);
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
         if !target_nodes.contains(&item.node.0) {
             continue;
         }
@@ -38389,6 +38621,17 @@ fn preview_apply_selection_proxy_focus_overlay(
             "__focused",
             boon_document_model::StyleValue::Bool(next_focused),
         );
+        changed |= preview_apply_address_selected_overlay_to_item(
+            item,
+            &layout_proof,
+            selected_address.as_deref(),
+        );
+        if matches!(
+            item.style.get("selected"),
+            Some(boon_document_model::StyleValue::Bool(true))
+        ) {
+            next_selected_overlay_nodes.insert(item.node.0.clone());
+        }
         if next_focused {
             if !replace_focused_text_on_next_edit && item.text.as_deref() != Some(&focused_text) {
                 item.text = Some(focused_text.clone());
@@ -38424,6 +38667,8 @@ fn preview_apply_selection_proxy_focus_overlay(
     }
     input_state.focus_overlay_nodes = next_overlay_nodes;
     input_state.focus_overlay_initialized = true;
+    input_state.selected_overlay_nodes = next_selected_overlay_nodes;
+    input_state.selected_overlay_address = selected_address;
     if changed {
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_dirty_reason =
@@ -38432,8 +38677,35 @@ fn preview_apply_selection_proxy_focus_overlay(
     Ok(changed)
 }
 
+fn preview_display_item_indexes_for_nodes(
+    layout_proof: &Value,
+    frame: &boon_document::LayoutFrame,
+    target_nodes: &BTreeSet<String>,
+) -> Vec<usize> {
+    let indexed = layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot)
+        .filter(|snapshot| !snapshot.display_items_by_node.is_empty())
+        .map(|snapshot| {
+            target_nodes
+                .iter()
+                .filter_map(|node| snapshot.display_items_by_node.get(node))
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        });
+    if let Some(indexes) = indexed
+        && !indexes.is_empty()
+    {
+        return indexes.into_iter().collect();
+    }
+    (0..frame.display_list.len()).collect()
+}
+
 fn preview_apply_focus_overlay_to_item(
     item: &mut boon_document::DisplayItem,
+    layout_proof: &Value,
     resolved_focused_node: Option<&str>,
     input_state: &PreviewNativeInputState,
     caret_visible: bool,
@@ -38450,6 +38722,11 @@ fn preview_apply_focus_overlay_to_item(
         &mut item.style,
         "__focused",
         boon_document_model::StyleValue::Bool(next_focused),
+    );
+    changed |= preview_apply_address_selected_overlay_to_item(
+        item,
+        layout_proof,
+        input_state.focused_address.as_deref(),
     );
     if item.style.remove("caret_column").is_some() {
         changed = true;
@@ -38497,6 +38774,66 @@ fn preview_apply_focus_overlay_to_item(
         }
     }
     Ok(changed)
+}
+
+fn preview_apply_address_selected_overlay_to_item(
+    item: &mut boon_document::DisplayItem,
+    layout_proof: &Value,
+    selected_address: Option<&str>,
+) -> bool {
+    if !item.style.contains_key("selected") {
+        return false;
+    }
+    let Some(selected_address) = selected_address else {
+        return false;
+    };
+    let Some(item_address) = focused_raw_address(layout_proof, &item.node.0)
+        .or_else(|| focused_address(layout_proof, &item.node.0))
+    else {
+        return false;
+    };
+    set_display_style_value(
+        &mut item.style,
+        "selected",
+        boon_document_model::StyleValue::Bool(item_address == selected_address),
+    )
+}
+
+fn preview_current_selected_overlay_nodes(
+    frame: Option<&boon_document::LayoutFrame>,
+) -> BTreeSet<String> {
+    frame
+        .into_iter()
+        .flat_map(|frame| frame.display_list.iter())
+        .filter(|item| {
+            matches!(
+                item.style.get("selected"),
+                Some(boon_document_model::StyleValue::Bool(true))
+            )
+        })
+        .map(|item| item.node.0.clone())
+        .collect()
+}
+
+fn preview_selected_overlay_nodes_for_address(
+    layout_proof: &Value,
+    frame: Option<&boon_document::LayoutFrame>,
+    selected_address: &str,
+    allow_fallback_scan: bool,
+) -> BTreeSet<String> {
+    let indexed_nodes = source_intent_nodes_for_value(layout_proof, &["address"], selected_address);
+    if !indexed_nodes.is_empty() || !allow_fallback_scan {
+        return indexed_nodes;
+    }
+    frame
+        .into_iter()
+        .flat_map(|frame| frame.display_list.iter())
+        .filter(|item| item.style.contains_key("selected"))
+        .filter(|item| {
+            focused_address(layout_proof, &item.node.0).as_deref() == Some(selected_address)
+        })
+        .map(|item| item.node.0.clone())
+        .collect()
 }
 
 fn preview_sync_blurred_text_input_from_runtime_state(
@@ -38671,11 +39008,28 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     }
     let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue)>::new();
     let mut text_updates = Vec::<(usize, String)>::new();
-    for (index, item) in frame.display_list.iter().enumerate() {
-        let node = item.node.0.as_str();
-        if target_nodes.is_some_and(|target_nodes| !target_nodes.contains(node)) {
+    let mut item_indexes = if let Some(target_nodes) = target_nodes
+        && !snapshot.display_items_by_node.is_empty()
+    {
+        target_nodes
+            .iter()
+            .filter_map(|node| snapshot.display_items_by_node.get(node))
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        (0..frame.display_list.len()).collect::<Vec<_>>()
+    };
+    if item_indexes.is_empty() && target_nodes.is_some() {
+        item_indexes = (0..frame.display_list.len()).collect::<Vec<_>>();
+    }
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get(index) else {
             continue;
-        }
+        };
+        let node = item.node.0.as_str();
         if let Some(bindings) = snapshot
             .data_binding_targets
             .state_binding_targets_by_node
@@ -38848,31 +39202,54 @@ fn preview_patch_retained_text_inputs_for_address(
     Ok(changed)
 }
 
-fn preview_patch_retained_focused_text_inputs(
+fn preview_blur_retained_focus_node(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    text: &str,
+    input_state: &mut PreviewNativeInputState,
+    node: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
+    let Some(frame_ref) = shared.layout_frame_override.as_ref().map(Arc::as_ref) else {
+        return Ok(false);
+    };
+    let item_indexes = preview_display_item_indexes_for_nodes(
+        &shared.layout_proof,
+        frame_ref,
+        &BTreeSet::from([node.to_owned()]),
+    );
+    if item_indexes.is_empty() {
+        input_state.focus_overlay_nodes.remove(node);
+        return Ok(false);
+    }
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
     let mut changed = false;
-    for item in frame.display_list.iter_mut().filter(|item| {
-        matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
-            && (item.focused
-                || matches!(
-                    item.style.get("__focused"),
-                    Some(boon_document_model::StyleValue::Bool(true))
-                )
-                || item.style.contains_key("caret_column"))
-    }) {
-        if item.text.as_deref() != Some(text) {
-            item.text = Some(text.to_owned());
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
+        if item.node.0 != node {
+            continue;
+        }
+        if item.focused {
+            item.focused = false;
+            changed = true;
+        }
+        changed |= set_display_style_value(
+            &mut item.style,
+            "__focused",
+            boon_document_model::StyleValue::Bool(false),
+        );
+        if item.style.remove("caret_column").is_some() {
+            changed = true;
+        }
+        if item.style.remove("caret_visible").is_some() {
             changed = true;
         }
     }
+    input_state.focus_overlay_nodes.remove(node);
     if changed {
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_error = None;
@@ -39046,6 +39423,51 @@ fn preview_sync_bound_text_inputs_from_runtime_state(
     Ok(changed)
 }
 
+fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    target_nodes: &BTreeSet<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (layout_proof, target_nodes) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        let mut target_nodes = target_nodes.clone();
+        if let Some(frame) = shared.layout_frame_override.as_deref() {
+            target_nodes.extend(frame.display_list.iter().filter_map(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    .then(|| item.node.0.clone())
+            }));
+        }
+        (shared.layout_proof.clone(), target_nodes)
+    };
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    let Some(state_summary) = preview_bound_text_input_targeted_state_summary_for_nodes(
+        &layout_proof,
+        live_runtime,
+        &target_nodes,
+    ) else {
+        return Ok(false);
+    };
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let changed = preview_sync_bound_text_inputs_in_shared_state_for_nodes(
+        &mut shared,
+        &state_summary,
+        Some(&target_nodes),
+    );
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_error = None;
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
 fn preview_bound_text_input_targeted_state_summary(
     layout_proof: &Value,
     frame: &boon_document::LayoutFrame,
@@ -39061,6 +39483,15 @@ fn preview_bound_text_input_targeted_state_summary(
     let mut paths = BTreeSet::new();
     let mut projection_prefixes = BTreeSet::new();
     for node in &source_intent_update_nodes {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
         if let Some(text_paths) = text_binding_paths.get(node) {
             for path in text_paths {
                 remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
@@ -39076,6 +39507,17 @@ fn preview_bound_text_input_targeted_state_summary(
             }
         }
     }
+    for item in frame.display_list.iter() {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(item.node.0.as_str())
+        {
+            for (path, _) in bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+    }
     for item in frame
         .display_list
         .iter()
@@ -39083,6 +39525,59 @@ fn preview_bound_text_input_targeted_state_summary(
     {
         if let Some(address) = focused_address(layout_proof, item.node.0.as_str()) {
             remember_targeted_document_state_path(&address, &mut paths, &mut projection_prefixes);
+        }
+    }
+    extend_targeted_document_state_projection_paths(&snapshot, &projection_prefixes, &mut paths);
+    if paths.is_empty() {
+        return None;
+    }
+    let required_paths = paths.iter().cloned().collect::<Vec<_>>();
+    let values = {
+        let mut runtime = live_runtime.lock().ok()?;
+        runtime.document_state_values(&required_paths)
+    };
+    if missing_state_summary_value_path(&values, &paths).is_some() {
+        return None;
+    }
+    let mut summary = Value::Object(serde_json::Map::new());
+    patch_state_summary_values(&mut summary, &values, &paths).then_some(summary)
+}
+
+fn preview_bound_text_input_targeted_state_summary_for_nodes(
+    layout_proof: &Value,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    target_nodes: &BTreeSet<String>,
+) -> Option<Value> {
+    let layout_hash = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)?;
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    let text_binding_paths = text_binding_paths_by_node(&snapshot);
+    let mut paths = BTreeSet::new();
+    let mut projection_prefixes = BTreeSet::new();
+    for node in target_nodes {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+        if let Some(text_paths) = text_binding_paths.get(node) {
+            for path in text_paths {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+        if let Some(source_bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in source_bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
         }
     }
     extend_targeted_document_state_projection_paths(&snapshot, &projection_prefixes, &mut paths);
@@ -40100,7 +40595,7 @@ fn preview_layout_for_scroll_window_with_units_for_viewport(
         "residual_x_px": residual_x,
         "residual_y_px": residual_y
     });
-    cache_layout_runtime_state_snapshot_for_proof(&layout_proof, &state_summary);
+    cache_layout_runtime_state_snapshot_for_hot_layout_proof(&mut layout_proof, &state_summary);
     Ok((layout_proof, layout_frame))
 }
 
@@ -40857,12 +41352,9 @@ fn preview_apply_live_events_internal(
             if current_layout_hash == previous_layout_hash.as_deref()
                 && shared_render_state.layout_frame_override.is_some()
             {
-                cache_layout_runtime_state_snapshot_for_proof(
-                    &shared_render_state.layout_proof,
-                    state_summary,
-                );
-                strip_runtime_state_snapshot_from_hot_layout_proof(
+                cache_layout_runtime_state_snapshot_for_hot_layout_proof(
                     &mut shared_render_state.layout_proof,
+                    state_summary,
                 );
                 let bound_input_sync_started = Instant::now();
                 synced_bound_inputs = preview_sync_bound_text_inputs_in_shared_state_for_nodes(
@@ -41137,8 +41629,7 @@ fn preview_apply_live_events_internal(
                 .map_err(|_| "preview render state mutex poisoned")?;
             shared_lock_wait_ms += elapsed_ms(shared_lock_started);
             let mut proof = patched_result.proof;
-            cache_layout_runtime_state_snapshot_for_proof(&proof, state_summary);
-            strip_runtime_state_snapshot_from_hot_layout_proof(&mut proof);
+            cache_layout_runtime_state_snapshot_for_hot_layout_proof(&mut proof, state_summary);
             shared_render_state.layout_proof = proof;
             shared_render_state.layout_frame_override = Some(patched_result.layout_frame);
             let bound_input_sync_started = Instant::now();
@@ -41311,7 +41802,10 @@ fn preview_apply_live_events_internal(
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
         if !return_layout {
-            strip_runtime_state_snapshot_from_hot_layout_proof(&mut post_input_layout);
+            cache_layout_runtime_state_snapshot_for_hot_layout_proof(
+                &mut post_input_layout,
+                state_summary,
+            );
         }
         shared_render_state.layout_proof = post_input_layout;
         shared_render_state.layout_frame_override = Some(Arc::new(post_input_frame));
@@ -42393,6 +42887,41 @@ fn source_event_address_payload(
 
 fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
     focused_source_intent_value(layout_proof, node, "address")
+}
+
+fn focused_raw_address(layout_proof: &Value, node: &str) -> Option<String> {
+    focused_raw_source_intent_value(layout_proof, node, "address")
+}
+
+fn focused_raw_source_intent_value(
+    layout_proof: &Value,
+    node: &str,
+    expected: &str,
+) -> Option<String> {
+    if let Some(value) = layout_proof
+        .get("source_intent_index")
+        .and_then(|index| index.get(node))
+        .and_then(|node_index| node_index.get(expected))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(value.to_owned());
+    }
+    layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|intent| {
+            let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+            if intent_node == node && intent_kind == expected {
+                intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        })
 }
 
 fn focused_source_intent_value(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
@@ -43633,6 +44162,7 @@ fn preview_world_editor_document_layout_snapshot(
             runtime_document_state_values: BTreeMap::new(),
             derived_indexes,
             layout_frame: Arc::new(layout.clone()),
+            display_items_by_node: document_display_items_by_node(&layout),
             retained_layout_cache,
             data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(BTreeMap::new())),
             structural_data_reads: BTreeSet::new(),
@@ -44895,8 +45425,7 @@ impl PreviewHitRouteTable {
     }
 
     fn text_input_should_replace_on_type(&self, node: &str) -> bool {
-        let _ = node;
-        false
+        !self.text_input_live_change(node)
     }
 
     fn text_input_live_change(&self, node: &str) -> bool {
@@ -45150,7 +45679,12 @@ fn preview_hit_route_cache_key(
     if shared.scroll_x_px.abs() > f64::EPSILON || shared.scroll_y_px.abs() > f64::EPSILON {
         return None;
     }
-    if let Some(key) = snapshot.hit_route_static_cache_key.as_ref() {
+    if !shared
+        .layout_proof
+        .get("source_intent_assertions")
+        .is_some()
+        && let Some(key) = snapshot.hit_route_static_cache_key.as_ref()
+    {
         return Some(key.clone());
     }
     if shared
@@ -46280,6 +46814,18 @@ fn layout_proof_runtime_state_snapshot(layout_proof: &Value) -> Option<Value> {
         .cloned()
         .or_else(|| {
             layout_proof
+                .get("runtime_document_state_snapshot_cache_key")
+                .and_then(Value::as_str)
+                .and_then(cached_layout_runtime_state_snapshot)
+        })
+        .or_else(|| {
+            if layout_proof
+                .get("runtime_document_state_snapshot_omitted")
+                .is_some()
+            {
+                return None;
+            }
+            layout_proof
                 .get("layout_frame_hash")
                 .and_then(Value::as_str)
                 .and_then(cached_layout_runtime_state_snapshot)
@@ -46288,33 +46834,69 @@ fn layout_proof_runtime_state_snapshot(layout_proof: &Value) -> Option<Value> {
 
 fn layout_proof_runtime_state_snapshot_arc(layout_proof: &Value) -> Option<Arc<Value>> {
     layout_proof
-        .get("layout_frame_hash")
-        .and_then(Value::as_str)
-        .and_then(cached_layout_runtime_state_snapshot_arc)
+        .get("runtime_document_state_snapshot")
+        .cloned()
+        .map(Arc::new)
         .or_else(|| {
             layout_proof
-                .get("runtime_document_state_snapshot")
-                .cloned()
-                .map(Arc::new)
+                .get("runtime_document_state_snapshot_cache_key")
+                .and_then(Value::as_str)
+                .and_then(cached_layout_runtime_state_snapshot_arc)
+        })
+        .or_else(|| {
+            if layout_proof
+                .get("runtime_document_state_snapshot_omitted")
+                .is_some()
+            {
+                return None;
+            }
+            layout_proof
+                .get("layout_frame_hash")
+                .and_then(Value::as_str)
+                .and_then(cached_layout_runtime_state_snapshot_arc)
         })
 }
 
-fn cache_layout_runtime_state_snapshot_for_proof(layout_proof: &Value, state_summary: &Value) {
+fn cache_layout_runtime_state_snapshot_for_proof(
+    layout_proof: &Value,
+    state_summary: &Value,
+) -> Option<String> {
     if let Some(layout_hash) = layout_proof
         .get("layout_frame_hash")
         .and_then(Value::as_str)
     {
-        cache_layout_runtime_state_snapshot(layout_hash, state_summary);
+        return Some(cache_layout_runtime_state_snapshot(
+            layout_hash,
+            state_summary,
+        ));
     }
+    None
 }
 
-fn strip_runtime_state_snapshot_from_hot_layout_proof(layout_proof: &mut Value) {
+fn cache_layout_runtime_state_snapshot_for_hot_layout_proof(
+    layout_proof: &mut Value,
+    state_summary: &Value,
+) {
+    let cache_key = cache_layout_runtime_state_snapshot_for_proof(layout_proof, state_summary);
+    strip_runtime_state_snapshot_from_hot_layout_proof(layout_proof, cache_key);
+}
+
+fn strip_runtime_state_snapshot_from_hot_layout_proof(
+    layout_proof: &mut Value,
+    cache_key: Option<String>,
+) {
     if let Some(object) = layout_proof.as_object_mut() {
         object.remove("runtime_document_state_snapshot");
         object.insert(
             "runtime_document_state_snapshot_omitted".to_owned(),
             json!("hot_state_snapshot_cache"),
         );
+        if let Some(cache_key) = cache_key {
+            object.insert(
+                "runtime_document_state_snapshot_cache_key".to_owned(),
+                json!(cache_key),
+            );
+        }
     }
 }
 
@@ -46325,17 +46907,18 @@ fn layout_runtime_state_snapshot_cache()
     CACHE.get_or_init(|| Mutex::new((BTreeMap::new(), VecDeque::new())))
 }
 
-fn cache_layout_runtime_state_snapshot(layout_hash: &str, state_summary: &Value) {
+fn cache_layout_runtime_state_snapshot(layout_hash: &str, state_summary: &Value) -> String {
     const MAX_CACHED_RUNTIME_STATE_SNAPSHOTS: usize = 64;
+    let cache_key = layout_runtime_state_snapshot_cache_key(layout_hash, state_summary);
 
     let Ok(mut cache) = layout_runtime_state_snapshot_cache().lock() else {
-        return;
+        return cache_key;
     };
     let (entries, order) = &mut *cache;
-    if !entries.contains_key(layout_hash) {
-        order.push_back(layout_hash.to_owned());
+    if !entries.contains_key(&cache_key) {
+        order.push_back(cache_key.clone());
     }
-    entries.insert(layout_hash.to_owned(), Arc::new(state_summary.clone()));
+    entries.insert(cache_key.clone(), Arc::new(state_summary.clone()));
     while entries.len() > MAX_CACHED_RUNTIME_STATE_SNAPSHOTS {
         let Some(oldest) = order.pop_front() else {
             break;
@@ -46344,6 +46927,13 @@ fn cache_layout_runtime_state_snapshot(layout_hash: &str, state_summary: &Value)
             continue;
         }
     }
+    cache_key
+}
+
+fn layout_runtime_state_snapshot_cache_key(layout_hash: &str, _state_summary: &Value) -> String {
+    static NEXT_RUNTIME_STATE_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_RUNTIME_STATE_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{layout_hash}:{id:016x}")
 }
 
 fn cached_layout_runtime_state_snapshot(layout_hash: &str) -> Option<Value> {
@@ -47119,6 +47709,7 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
             runtime_document_state_values: snapshot.runtime_document_state_values.clone(),
             derived_indexes: Arc::clone(&snapshot.derived_indexes),
             layout_frame: Arc::new(layout.clone()),
+            display_items_by_node: document_display_items_by_node(&layout),
             retained_layout_cache,
             data_binding_targets: snapshot.data_binding_targets.clone(),
             structural_data_reads: snapshot.structural_data_reads.clone(),
@@ -49394,6 +49985,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
             ),
             derived_indexes,
             layout_frame: Arc::clone(&layout),
+            display_items_by_node: document_display_items_by_node(layout.as_ref()),
             retained_layout_cache,
             data_binding_targets: snapshot.data_binding_targets.clone(),
             structural_data_reads: snapshot.structural_data_reads.clone(),
@@ -50136,6 +50728,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
             ),
             derived_indexes,
             layout_frame: snapshot_layout_frame,
+            display_items_by_node: document_display_items_by_node(layout.as_ref()),
             retained_layout_cache,
             data_binding_targets: snapshot.data_binding_targets.clone(),
             structural_data_reads: snapshot.structural_data_reads.clone(),
@@ -55605,6 +56198,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout_frame),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 structural_data_read_aliases: document_structural_data_read_aliases(
                     &structural_data_reads,
@@ -56136,6 +56730,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
                     BTreeMap::from([(
@@ -56251,6 +56846,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
                     BTreeMap::from([(
@@ -56364,6 +56960,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
                     BTreeMap::from([(
@@ -56495,6 +57092,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
                     BTreeMap::from([
@@ -57112,6 +57710,7 @@ mod tests {
             runtime_document_state_values: BTreeMap::new(),
             derived_indexes,
             layout_frame: Arc::new(layout_frame),
+            display_items_by_node: BTreeMap::new(),
             retained_layout_cache,
             structural_data_reads: BTreeSet::new(),
             structural_data_read_aliases: Vec::new(),
@@ -57274,6 +57873,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::clone(&layout_arc),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache: Arc::clone(&retained_layout_cache),
                 data_binding_targets: Arc::new(data_binding_targets.into()),
                 structural_data_reads: BTreeSet::new(),
@@ -57374,6 +57974,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
+                display_items_by_node: BTreeMap::new(),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(data_binding_targets.into()),
                 structural_data_reads: BTreeSet::new(),
@@ -57462,6 +58063,7 @@ mod tests {
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout.clone()),
+                display_items_by_node: document_display_items_by_node(&layout),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(BTreeMap::new().into()),
                 structural_data_reads: BTreeSet::new(),
@@ -64908,17 +65510,20 @@ label:
 
         assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
         let expected_line = BOON_EDITOR_DEFERRED_SYNTAX_LINES + 9;
-        let expected_node = format!("dev-code-editor-line-text-{expected_line}");
         let line = render_state
             .layout_frame
             .as_ref()
             .and_then(|frame| {
-                frame
-                    .display_list
-                    .iter()
-                    .find(|item| item.node.0 == expected_node.as_str())
+                frame.display_list.iter().find(|item| {
+                    item.node.0.starts_with("dev-code-editor-line-text-")
+                        && dev_editor_item_source_line(item) == Some(expected_line)
+                })
             })
             .expect("patched line should be visible");
+        assert_eq!(
+            line.node.0, "dev-code-editor-line-text-1",
+            "fast scroll patch should retain slot node IDs so cached derived indexes stay valid"
+        );
         assert_eq!(
             line.style.get("rich_text"),
             Some(&boon_document_model::StyleValue::Bool(true))
@@ -64941,6 +65546,21 @@ label:
                 .expect("patched frame should exist"),
         );
         assert_eq!(style_report["status"], "pass");
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        render_state
+            .derived_indexes
+            .as_ref()
+            .expect("dev render state should cache derived indexes")
+            .try_render_scene(
+                render_state
+                    .layout_frame
+                    .as_ref()
+                    .expect("patched frame should exist"),
+                1180,
+                820,
+                &mut columns,
+            )
+            .expect("fast-scrolled dev frame must render with cached derived indexes");
     }
 
     #[test]
@@ -74965,6 +75585,7 @@ document:
             runtime_document_state_values,
             derived_indexes,
             layout_frame: Arc::new(layout_frame),
+            display_items_by_node: BTreeMap::new(),
             retained_layout_cache,
             structural_data_reads: BTreeSet::new(),
             structural_data_read_aliases: Vec::new(),
@@ -78730,6 +79351,61 @@ document:
     }
 
     #[test]
+    fn cells_real_window_click_normalizes_window_coordinates_to_layout_surface() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-real-window-coordinate-normalization",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (b0_x, b0_y, _b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let mut raw_window_input =
+            real_window_shaped_click_input_from_index(0, b0_x * 0.5, b0_y * 0.5);
+        raw_window_input.mouse_window_pos =
+            raw_window_input.mouse_window_pos.map(|mut position| {
+                position.window_width = 460.0;
+                position.window_height = 360.0;
+                position
+            });
+        let normalized_input = native_input_for_layout_surface(&raw_window_input, 920, 720);
+        preview_apply_real_window_input(
+            &normalized_input,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "B0");
+        assert_eq!(
+            summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+    }
+
+    #[test]
     fn cells_clicking_another_cell_blurs_and_saves_current_draft() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
@@ -79394,6 +80070,7 @@ document:
                 runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout_frame.clone()),
+                display_items_by_node: document_display_items_by_node(&layout_frame),
                 retained_layout_cache,
                 data_binding_targets: Arc::new(BTreeMap::new().into()),
                 structural_data_reads: BTreeSet::new(),

@@ -33654,7 +33654,7 @@ fn verify_native_dev_editor_scroll_speed(
                 "id": "scroll-x:dev-code-editor",
                 "node": "dev-code-editor",
                 "axis": "horizontal",
-                "bounds": {"x": 0.0, "y": 656.0, "width": 1180.0, "height": 18.0}
+                "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
             }
         ]
     });
@@ -41627,7 +41627,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                     "id": "scroll-x:dev-code-editor",
                     "node": "dev-code-editor",
                     "axis": "horizontal",
-                    "bounds": {"x": 0.0, "y": 656.0, "width": 1180.0, "height": 18.0}
+                    "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
                 }
             ],
             "hit_target_samples": [

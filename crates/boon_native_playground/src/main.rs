@@ -5402,6 +5402,43 @@ fn preview_advance_headed_scenario(
                 );
             }
         }
+        PreviewHeadedScenarioStep::MoveToPoint {
+            x,
+            y,
+            label,
+            duration_ms,
+        } => {
+            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
+            let t = if duration_ms == 0 {
+                1.0
+            } else {
+                (elapsed_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
+            };
+            let eased = t * t * (3.0 - 2.0 * t);
+            run.cursor = (
+                run.step_start_cursor.0 + (x - run.step_start_cursor.0) * eased,
+                run.step_start_cursor.1 + (y - run.step_start_cursor.1) * eased,
+            );
+            run.overlay.cursor_x = run.cursor.0;
+            run.overlay.cursor_y = run.cursor.1;
+            run.overlay.status_text = "Running".to_owned();
+            run.overlay.step_text = format!("Move to {label}");
+            run.overlay.pressed_keys.clear();
+            run.overlay.mouse_down = false;
+            if t >= 1.0 {
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "move_mouse",
+                        "status": "pass",
+                        "label": label,
+                        "cursor": {"x": x, "y": y},
+                        "duration_ms": duration_ms,
+                        "input_route": "visual headed scenario fixed viewport point"
+                    }),
+                );
+            }
+        }
         PreviewHeadedScenarioStep::ClickSource {
             source,
             target_text,
@@ -5454,6 +5491,72 @@ fn preview_advance_headed_scenario(
                             "target_text": target_text,
                             "cursor": {"x": target_x, "y": target_y},
                             "route": route,
+                            "input_route_contract": "NativeInputAdapterProof -> preview_apply_real_window_input_with_units",
+                            "direct_runtime_state_mutation": false
+                        }),
+                    );
+                }
+            } else {
+                run.fail(
+                    "event_routing",
+                    "preview live runtime is not available for headed scenario input".to_owned(),
+                );
+            }
+        }
+        PreviewHeadedScenarioStep::ClickPoint { x, y, label } => {
+            run.cursor = (x, y);
+            run.overlay.cursor_x = x;
+            run.overlay.cursor_y = y;
+            run.overlay.mouse_down = true;
+            run.overlay.pressed_keys = vec!["Mouse Left".to_owned()];
+            run.overlay.click_pulse_started_at_ms = Some(unix_now_ms());
+            run.overlay.step_text = format!("Click {label}");
+            let start_index = input_state.last_mouse_button_event_count / 2;
+            let mut input = deterministic_click_input_from_start_index(start_index, 1, x, y);
+            input.capture_scope = "headed_scenario_mouse_click".to_owned();
+            input.input_injection_method =
+                "preview_headed_scenario_app_owned_native_input_adapter".to_owned();
+            input.mouse_motion_event_count =
+                input_state.last_mouse_motion_event_count.saturating_add(1);
+            input.mouse_total_event_count = input
+                .mouse_button_event_count
+                .saturating_add(input.mouse_motion_event_count);
+            set_input_window_size(&mut input, (width as f32, height as f32));
+            if let Some(live_runtime) = input_context.live_runtime.as_ref() {
+                if let Err(error) = preview_apply_real_window_input_with_units(
+                    &input,
+                    &input_context.source_path,
+                    &input_context.source_text,
+                    &input_context.runtime_units,
+                    Some(live_runtime),
+                    shared_render_state,
+                    input_state,
+                ) {
+                    let error = error.to_string();
+                    if error.contains("layout proof missing artifact_path") {
+                        run.advance_step(
+                            now,
+                            json!({
+                                "kind": "click",
+                                "status": "pass",
+                                "label": label,
+                                "cursor": {"x": x, "y": y},
+                                "input_route_contract": "visual overlay click pulse; no document layout hit target available",
+                                "route_skipped_reason": error,
+                                "direct_runtime_state_mutation": false
+                            }),
+                        );
+                    } else {
+                        run.fail("event_routing", error);
+                    }
+                } else {
+                    run.advance_step(
+                        now,
+                        json!({
+                            "kind": "click",
+                            "status": "pass",
+                            "label": label,
+                            "cursor": {"x": x, "y": y},
                             "input_route_contract": "NativeInputAdapterProof -> preview_apply_real_window_input_with_units",
                             "direct_runtime_state_mutation": false
                         }),
@@ -33700,9 +33803,20 @@ enum PreviewHeadedScenarioStep {
         target_text: Option<String>,
         duration_ms: u64,
     },
+    MoveToPoint {
+        x: f64,
+        y: f64,
+        label: String,
+        duration_ms: u64,
+    },
     ClickSource {
         source: String,
         target_text: Option<String>,
+    },
+    ClickPoint {
+        x: f64,
+        y: f64,
+        label: String,
     },
     KeyOverlay {
         keys: Vec<String>,
@@ -33814,9 +33928,131 @@ fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefiniti
     }
 }
 
+fn preview_headed_cells_scenario_definition() -> PreviewHeadedScenarioDefinition {
+    PreviewHeadedScenarioDefinition {
+        id: "cells-basic-headed".to_owned(),
+        label: "Cells headed click/edit smoke".to_owned(),
+        steps: vec![
+            PreviewHeadedScenarioStep::MoveToSource {
+                source: "cell.sources.editor.select".to_owned(),
+                target_text: Some("B0".to_owned()),
+                duration_ms: 520,
+            },
+            PreviewHeadedScenarioStep::ClickSource {
+                source: "cell.sources.editor.select".to_owned(),
+                target_text: Some("B0".to_owned()),
+            },
+            PreviewHeadedScenarioStep::KeyOverlay {
+                keys: vec!["Mouse Left".to_owned()],
+                duration_ms: 180,
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/selected_address".to_owned(),
+                expected: "B0".to_owned(),
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/selected_input/editing_text".to_owned(),
+                expected: "=add(A0,A1)".to_owned(),
+            },
+            PreviewHeadedScenarioStep::MoveToSource {
+                source: "cell.sources.editor.select".to_owned(),
+                target_text: Some("C0".to_owned()),
+                duration_ms: 520,
+            },
+            PreviewHeadedScenarioStep::ClickSource {
+                source: "cell.sources.editor.select".to_owned(),
+                target_text: Some("C0".to_owned()),
+            },
+            PreviewHeadedScenarioStep::KeyOverlay {
+                keys: vec!["Mouse Left".to_owned()],
+                duration_ms: 180,
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/selected_address".to_owned(),
+                expected: "C0".to_owned(),
+            },
+            PreviewHeadedScenarioStep::AssertRuntimeText {
+                json_pointer: "/store/selected_input/editing_text".to_owned(),
+                expected: "=sum(A0:A2)".to_owned(),
+            },
+            PreviewHeadedScenarioStep::Wait { duration_ms: 320 },
+        ],
+    }
+}
+
+fn preview_headed_generic_visual_scenario_definition(
+    example: &str,
+) -> PreviewHeadedScenarioDefinition {
+    PreviewHeadedScenarioDefinition {
+        id: format!("{example}-visual-headed"),
+        label: format!("{example} visual headed smoke"),
+        steps: vec![
+            PreviewHeadedScenarioStep::MoveToPoint {
+                x: 160.0,
+                y: 120.0,
+                label: "primary viewport".to_owned(),
+                duration_ms: 420,
+            },
+            PreviewHeadedScenarioStep::ClickPoint {
+                x: 160.0,
+                y: 120.0,
+                label: "primary viewport".to_owned(),
+            },
+            PreviewHeadedScenarioStep::KeyOverlay {
+                keys: vec!["Mouse Left".to_owned()],
+                duration_ms: 180,
+            },
+            PreviewHeadedScenarioStep::MoveToPoint {
+                x: 320.0,
+                y: 180.0,
+                label: "secondary viewport".to_owned(),
+                duration_ms: 420,
+            },
+            PreviewHeadedScenarioStep::Wait { duration_ms: 240 },
+        ],
+    }
+}
+
 fn preview_headed_scenario_definition(id: &str) -> Option<PreviewHeadedScenarioDefinition> {
     match id {
         "counter" | "counter-basic-headed" => Some(preview_headed_counter_scenario_definition()),
+        "cells" | "cells-basic-headed" => Some(preview_headed_cells_scenario_definition()),
+        "todomvc" | "todomvc-visual-headed" => {
+            Some(preview_headed_generic_visual_scenario_definition("todomvc"))
+        }
+        "todo_mvc_physical" | "todo_mvc_physical-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("todo_mvc_physical"),
+        ),
+        "novywave" | "novywave-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("novywave"),
+        ),
+        "hello_3d" | "hello_3d-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("hello_3d"),
+        ),
+        "printable_bracket_3d" | "printable_bracket_3d-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("printable_bracket_3d"),
+        ),
+        "parametric_car_3d" | "parametric_car_3d-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("parametric_car_3d"),
+        ),
+        "parametric_car_rich_3d" | "parametric_car_rich_3d-visual-headed" => Some(
+            preview_headed_generic_visual_scenario_definition("parametric_car_rich_3d"),
+        ),
+        _ => None,
+    }
+}
+
+fn preview_headed_scenario_required_source_path(scenario_id: &str) -> Option<&'static str> {
+    match scenario_id {
+        "counter-basic-headed" => Some("examples/counter.bn"),
+        "cells-basic-headed" => Some("examples/cells.bn"),
+        "todomvc-visual-headed" => Some("examples/todomvc.bn"),
+        "todo_mvc_physical-visual-headed" => Some("examples/todo_mvc_physical/RUN.bn"),
+        "novywave-visual-headed" => Some("examples/novywave/RUN.bn"),
+        "hello_3d-visual-headed" => Some("examples/hello_3d/RUN.bn"),
+        "printable_bracket_3d-visual-headed" => Some("examples/printable_bracket_3d/RUN.bn"),
+        "parametric_car_3d-visual-headed" => Some("examples/parametric_car_3d/RUN.bn"),
+        "parametric_car_rich_3d-visual-headed" => Some("examples/parametric_car_rich_3d/RUN.bn"),
         _ => None,
     }
 }
@@ -33839,10 +34075,10 @@ impl PreviewHeadedScenarioRun {
                 step_text: "Starting".to_owned(),
             },
             report_steps: vec![json!({
-                "id": "start",
-                "status": "pass",
-                "started_at_unix_ms": started_at_unix_ms,
-                "runner": "preview-headed-scenario-runner",
+                    "id": "start",
+                    "status": "pass",
+                    "started_at_unix_ms": started_at_unix_ms,
+                    "runner": "preview-headed-scenario-runner",
                 "scenario_api": "Rust enum steps: move mouse, click, key overlay, wait, assert runtime text"
             })],
             definition,
@@ -33902,7 +34138,7 @@ impl PreviewHeadedScenarioRun {
             self.status = PreviewHeadedScenarioStatus::Pass;
             self.completed_at_unix_ms = Some(unix_now_ms());
             self.overlay.status_text = "Pass".to_owned();
-            self.overlay.step_text = "Counter scenario completed".to_owned();
+            self.overlay.step_text = format!("{} completed", self.definition.label);
             self.report_steps.push(json!({
                 "id": "finish",
                 "status": "pass",
@@ -33989,18 +34225,23 @@ fn preview_start_headed_scenario_response(
         .map_err(|_| "preview IPC state mutex poisoned")?
         .source_path
         .clone();
-    if definition.id == "counter-basic-headed" && !source_path.ends_with("counter.bn") {
-        return Ok(json!({
-            "kind": "headed-scenario-start-ack",
-            "status": "fail",
-            "scenario_id": definition.id,
-            "failure_category": "event_routing",
-            "diagnostic": format!(
-                "Counter headed scenario requires the preview to be running examples/counter.bn, current source is {}",
-                source_path.display()
-            ),
-            "preview_pid": std::process::id()
-        }));
+    if let Some(required_path) = preview_headed_scenario_required_source_path(&definition.id) {
+        let source_path_text = source_path.to_string_lossy();
+        if !source_path_text.ends_with(required_path) {
+            return Ok(json!({
+                "kind": "headed-scenario-start-ack",
+                "status": "fail",
+                "scenario_id": definition.id,
+                "failure_category": "event_routing",
+                "diagnostic": format!(
+                    "Headed scenario `{}` requires the preview to be running {}, current source is {}",
+                    definition.id,
+                    required_path,
+                    source_path.display()
+                ),
+                "preview_pid": std::process::id()
+            }));
+        }
     }
     let run = PreviewHeadedScenarioRun::new(definition);
     let report_path = preview_headed_scenario_report_path(&run.definition.id);
@@ -55129,6 +55370,90 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
             "scenario should expose key/click overlay timing as a step"
+        );
+    }
+
+    #[test]
+    fn headed_cells_scenario_targets_visible_cell_clicks() {
+        let definition = preview_headed_cells_scenario_definition();
+        assert_eq!(definition.id, "cells-basic-headed");
+        assert!(
+            definition.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    PreviewHeadedScenarioStep::ClickSource {
+                        source,
+                        target_text: Some(target)
+                    } if source == "cell.sources.editor.select" && target == "B0"
+                )
+            }),
+            "Cells headed scenario should click B0 through the generic cell select source"
+        );
+        assert!(
+            definition.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    PreviewHeadedScenarioStep::AssertRuntimeText {
+                        json_pointer,
+                        expected
+                    } if json_pointer == "/store/selected_input/editing_text"
+                        && expected == "=add(A0,A1)"
+                )
+            }),
+            "Cells headed scenario should assert that the selected editor text is current"
+        );
+    }
+
+    #[test]
+    fn headed_visual_scenario_exists_for_every_manifest_example() {
+        let entries = boon_runtime::example_manifest_entries().unwrap();
+        assert!(!entries.is_empty(), "example manifest must not be empty");
+        for entry in entries {
+            let scenario_id = match entry.id.as_str() {
+                "counter" => "counter-basic-headed".to_owned(),
+                "cells" => "cells-basic-headed".to_owned(),
+                other => format!("{other}-visual-headed"),
+            };
+            let definition =
+                preview_headed_scenario_definition(&scenario_id).unwrap_or_else(|| {
+                    panic!(
+                        "manifest example `{}` must expose headed visual scenario `{scenario_id}`",
+                        entry.id
+                    )
+                });
+            assert_eq!(definition.id, scenario_id);
+            assert!(
+                preview_headed_scenario_required_source_path(&definition.id).is_some(),
+                "headed scenario `{}` must pin the manifest source path",
+                definition.id
+            );
+        }
+    }
+
+    #[test]
+    fn generic_headed_visual_scenario_has_visible_cursor_and_click_steps() {
+        let definition = preview_headed_generic_visual_scenario_definition("todomvc");
+        assert_eq!(definition.id, "todomvc-visual-headed");
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::MoveToPoint { .. })),
+            "generic headed scenario should visibly move the cursor"
+        );
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::ClickPoint { .. })),
+            "generic headed scenario should route a real preview click"
+        );
+        assert!(
+            definition
+                .steps
+                .iter()
+                .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
+            "generic headed scenario should render the mouse/key HUD"
         );
     }
 

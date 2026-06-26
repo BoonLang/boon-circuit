@@ -5278,7 +5278,7 @@ fn verify_scenario_manifest_integrity(args: &[String]) -> Result<(), Box<dyn std
             "id": entry.id,
             "label": entry.label,
             "source": entry.source,
-            "source_hash": source_hash,
+            "source_hash": source_hash.clone(),
             "source_files": source_files,
             "scenario": entry.scenario,
             "scenario_hash": scenario_hash,
@@ -35697,6 +35697,30 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 .to_owned(),
         ),
     );
+    let headed_visual_evidence = native_headed_visual_evidence(&example, &source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:headed-visual-cursor-readback"),
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            format!(
+                "preview E2E for `{example}` requires fresh headed visual cursor/readback evidence"
+            )
+        }),
+    );
+    extra["headed_visual_evidence"] = headed_visual_evidence;
 
     extra["blocked_reason"] = if blockers.is_empty() {
         serde_json::Value::Null
@@ -35935,6 +35959,27 @@ fn verify_native_gpu_preview_e2e_hello_3d(
         format!("{} schema_pass={role_schema_pass}", role_report.display()),
         (!role_schema_pass).then(|| "hello_3d preview role report schema failed".to_owned()),
     );
+    let headed_visual_evidence = native_headed_visual_evidence(&example, &source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-preview-e2e-hello_3d:headed-visual-cursor-readback",
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            "hello_3d preview E2E requires fresh headed visual cursor/readback evidence".to_owned()
+        }),
+    );
     let stdout_tail = run_output
         .as_ref()
         .map(|output| {
@@ -36004,6 +36049,7 @@ fn verify_native_gpu_preview_e2e_hello_3d(
             "external_render_proof": external_proof,
             "world_scene_orbit_probe": orbit_probe,
             "operator_host_pointer_orbit": orbit,
+            "headed_visual_evidence": headed_visual_evidence,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "native_gpu_contract": true,
@@ -36014,15 +36060,28 @@ fn verify_native_gpu_preview_e2e_hello_3d(
 }
 
 fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let scenario_id = value_arg(args, "--scenario").unwrap_or_else(|| "counter".to_owned());
-    let report = report_arg(args)
-        .unwrap_or_else(|| PathBuf::from("target/reports/native-gpu/headed-scenario-counter.json"));
-    let role_report =
-        PathBuf::from("target/reports/native-gpu/roles/preview-headed-scenario-counter.json");
-    let loop_report =
-        PathBuf::from("target/reports/native-gpu/roles/preview-loop-headed-scenario-counter.json");
-    let scenario_report =
-        PathBuf::from("target/reports/native-gpu/headed-scenario-counter-basic-headed.json");
+    let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let default_scenario = native_headed_visual_scenario_id(&example);
+    let scenario_id = value_arg(args, "--scenario").unwrap_or_else(|| default_scenario.to_owned());
+    let source_path = entry.source.as_str();
+    let source_text = boon_runtime::source_text_for_entry(&entry)?;
+    let source_files = manifest_source_files(&entry);
+    let project_source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "target/reports/native-gpu/headed-scenario-{example}.json"
+        ))
+    });
+    let role_report = PathBuf::from(format!(
+        "target/reports/native-gpu/roles/preview-headed-scenario-{example}.json"
+    ));
+    let loop_report = PathBuf::from(format!(
+        "target/reports/native-gpu/roles/preview-loop-headed-scenario-{example}.json"
+    ));
+    let scenario_report = PathBuf::from(format!(
+        "target/reports/native-gpu/headed-scenario-{scenario_id}.json"
+    ));
     if let Some(parent) = report.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -36035,30 +36094,65 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
 
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
+    let example_ok = native_headed_visual_example_supported(&example);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-headed-scenario:example-selector",
+        example_ok,
+        format!("example={example}, source_path={source_path}"),
+        (!example_ok).then(|| {
+            "headed scenario gate supports every examples/manifest.toml example".to_owned()
+        }),
+    );
+    let release_profile = entry.source_files.len() > 1
+        || !entry.build_files.is_empty()
+        || example.ends_with("_3d")
+        || example == "cells";
+    let mut build_args = vec!["build", "-p", "boon_native_playground"];
+    if release_profile {
+        build_args.push("--release");
+    }
+    let build = Command::new("cargo").args(&build_args).status()?;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "native-gpu-headed-scenario:playground-build",
         build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
+        format!("cargo {} status={build}", build_args.join(" ")),
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    let run_output = if build.success() {
+    let hold_ms = match example.as_str() {
+        "cells" => "7200",
+        _ => "4200",
+    };
+    let timeout_seconds = match example.as_str() {
+        "todo_mvc_physical" | "novywave" => "180s",
+        "cells"
+        | "hello_3d"
+        | "printable_bracket_3d"
+        | "parametric_car_3d"
+        | "parametric_car_rich_3d" => "90s",
+        _ => "45s",
+    };
+    let binary_path = if release_profile {
+        "target/release/boon_native_playground"
+    } else {
+        "target/debug/boon_native_playground"
+    };
+    let run_output = if build.success() && example_ok {
         Some(
             Command::new("timeout")
                 .args([
-                    "24s",
-                    "target/debug/boon_native_playground",
+                    timeout_seconds,
+                    binary_path,
                     "--role",
                     "preview",
                     "--code-file",
-                    "examples/counter.bn",
+                    source_path,
                     "--hold-ms",
-                    "4200",
+                    hold_ms,
                     "--demand-driven-loop",
                     "--auto-headed-scenario",
                     &scenario_id,
@@ -36129,13 +36223,33 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
     let role_overlay_visible = role_json
         .pointer("/details/app_window_surface_proof/external_render_proof/headed_scenario_overlay_visible")
         .and_then(serde_json::Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || (scenario_json
+            .pointer("/overlay/cursor_visible")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && scenario_json
+                .pointer("/overlay/key_hud_visible")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true));
     let role_overlay_readback = role_json
         .pointer(
             "/details/app_window_surface_proof/external_render_proof/proof/artifact/capture_method",
         )
         .and_then(serde_json::Value::as_str)
-        == Some("wgpu-generated-shader-app-owned-readback");
+        .or_else(|| {
+            role_json
+                .pointer("/details/app_window_surface_proof/readback_artifact/capture_method")
+                .and_then(serde_json::Value::as_str)
+        })
+        .is_some_and(|method| {
+            matches!(
+                method,
+                "wgpu-generated-shader-app-owned-readback"
+                    | "wgpu-generated-shader-app-owned-render-scene-readback"
+                    | "wgpu-visible-surface-copy-src-readback"
+            )
+        });
     let role_overlay_dirty_chunk = role_json
         .pointer("/details/app_window_surface_proof/external_render_proof/proof/metrics/dirty_upload_chunk_ids")
         .and_then(serde_json::Value::as_array)
@@ -36145,7 +36259,15 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
                     .as_str()
                     .is_some_and(|chunk| chunk.contains("headed-scenario-cursor-marker"))
             })
-        });
+        })
+        || (scenario_json
+            .pointer("/overlay/cursor_visible")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && scenario_json
+                .pointer("/overlay/key_hud_visible")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -36157,7 +36279,7 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
             scenario_json.get("status")
         ),
         (!scenario_pass)
-            .then(|| "headed Counter scenario did not finish with status pass".to_owned()),
+            .then(|| format!("headed {example} scenario did not finish with status pass")),
     );
     push_audit_check(
         &mut checks,
@@ -36215,38 +36337,154 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let status = if blockers.is_empty() { "pass" } else { "fail" };
     let role_report_label = role_report.display().to_string();
     let scenario_report_label = scenario_report.display().to_string();
-    let value = json!({
-        "status": status,
-        "command": "verify-native-gpu-headed-scenario",
-        "scenario": scenario_id,
-        "example": "counter",
-        "checks": checks,
-        "blockers": blockers,
-        "role_report": role_report_label,
-        "role_report_json": role_json,
-        "scenario_report": scenario_report_label,
-        "scenario_report_sha256": if scenario_report.exists() {
-            serde_json::Value::String(file_hash(scenario_report.to_string_lossy().as_ref()))
-        } else {
-            serde_json::Value::Null
-        },
-        "scenario_report_json": scenario_json,
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail
-    });
-    write_json(&report, &value)?;
-    if status == "pass" {
-        Ok(())
+    let role_artifact = if role_report.exists() {
+        vec![artifact_hash(&role_report)?]
     } else {
-        Err(format!(
-            "native GPU headed scenario failed; wrote {}",
-            report.display()
-        )
-        .into())
+        Vec::new()
+    };
+    let readback_artifact = role_json
+        .pointer("/details/app_window_surface_proof/external_render_proof/proof/artifact")
+        .or_else(|| role_json.pointer("/details/app_window_surface_proof/readback_artifact"))
+        .cloned()
+        .unwrap_or_else(|| json!(null));
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-headed-scenario",
+        checks,
+        blockers,
+        json!({
+            "scenario": scenario_id,
+            "example": example,
+            "source_path": source_path,
+            "source_hash": file_hash(source_path),
+            "project_source_hash": project_source_hash,
+            "profile": if release_profile { "release" } else { "debug" },
+            "playground_binary_path": binary_path,
+            "scenario_hash": if Path::new(&entry.scenario).exists() {
+                file_hash(entry.scenario.as_str())
+            } else {
+                "n/a".to_owned()
+            },
+            "program_hash": file_hash(source_path),
+            "role_report": role_report_label,
+            "role_report_json": role_json,
+            "scenario_report": scenario_report_label,
+            "scenario_report_sha256": if scenario_report.exists() {
+                serde_json::Value::String(file_hash(scenario_report.to_string_lossy().as_ref()))
+            } else {
+                serde_json::Value::Null
+            },
+            "scenario_report_json": scenario_json,
+            "readback_artifact": readback_artifact,
+            "visual_capture_method": "app-owned-wgpu-readback-with-visible-cursor-overlay",
+            "operator_host_input": true,
+            "real_os_input": false,
+            "human_observation": false,
+            "preview_receives_example_name": false,
+            "evidence_tier": "host-synthetic",
+            "artifact_sha256s": role_artifact,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail
+        }),
+    )
+}
+
+fn native_headed_visual_scenario_id(example: &str) -> String {
+    match example {
+        "counter" => "counter-basic-headed".to_owned(),
+        "cells" => "cells-basic-headed".to_owned(),
+        other => format!("{other}-visual-headed"),
     }
+}
+
+fn native_headed_visual_example_supported(example: &str) -> bool {
+    boon_runtime::example_manifest_entry(example).is_ok()
+}
+
+fn native_headed_visual_report_path(example: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "target/reports/native-gpu/headed-scenario-{example}.json"
+    ))
+}
+
+fn native_headed_visual_evidence(example: &str, expected_source_hash: &str) -> serde_json::Value {
+    let path = native_headed_visual_report_path(example);
+    let Ok(Some(report)) = read_optional_json(&path) else {
+        return json!({
+            "status": "missing",
+            "path": path,
+            "reason": "headed visual report is missing"
+        });
+    };
+    let status_pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let command_ok = report.get("command").and_then(serde_json::Value::as_str)
+        == Some("verify-native-gpu-headed-scenario");
+    let example_ok = report.get("example").and_then(serde_json::Value::as_str) == Some(example);
+    let source_hash_matches = report
+        .get("project_source_hash")
+        .or_else(|| report.get("source_files_hash"))
+        .or_else(|| report.get("source_hash"))
+        .and_then(serde_json::Value::as_str)
+        == Some(expected_source_hash);
+    let git_fresh =
+        report.get("git_commit").and_then(serde_json::Value::as_str) == Some(git_commit().as_str());
+    let worktree_fresh = report
+        .get("worktree_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        == Some(worktree_fingerprint().as_str());
+    let cursor_visible = report
+        .pointer("/scenario_report_json/overlay/cursor_visible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let key_hud_visible = report
+        .pointer("/scenario_report_json/overlay/key_hud_visible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let readback_method = report
+        .pointer("/readback_artifact/capture_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let readback_ok = matches!(
+        readback_method,
+        "wgpu-generated-shader-app-owned-readback"
+            | "wgpu-generated-shader-app-owned-render-scene-readback"
+            | "wgpu-visible-surface-copy-src-readback"
+    );
+    let pass = status_pass
+        && command_ok
+        && example_ok
+        && source_hash_matches
+        && git_fresh
+        && worktree_fresh
+        && cursor_visible
+        && key_hud_visible
+        && readback_ok;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "path": path,
+        "report_sha256": if path.exists() {
+            file_hash(path.to_string_lossy().as_ref())
+        } else {
+            "missing".to_owned()
+        },
+        "status_pass": status_pass,
+        "command_ok": command_ok,
+        "example_ok": example_ok,
+        "source_hash_matches": source_hash_matches,
+        "git_fresh": git_fresh,
+        "worktree_fresh": worktree_fresh,
+        "cursor_visible": cursor_visible,
+        "key_hud_visible": key_hud_visible,
+        "readback_method": readback_method,
+        "readback_ok": readback_ok,
+        "scenario": report.get("scenario").cloned().unwrap_or_else(|| json!(null)),
+        "visual_capture_method": report
+            .get("visual_capture_method")
+            .cloned()
+            .unwrap_or_else(|| json!(null))
+    })
 }
 
 fn native_preview_e2e_scenario_labels(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
@@ -45864,6 +46102,35 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
             )
         }),
     );
+    let speed_source_hash =
+        source_hash_for_report_source_files(&manifest_source_files(&entry), &source)?;
+    let headed_visual_evidence = native_headed_visual_evidence(&entry.id, &speed_source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!(
+            "native-example-speed:{}:headed-visual-cursor-readback",
+            entry.id
+        ),
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            format!(
+                "speed gate for `{}` requires fresh headed visual cursor/readback evidence",
+                entry.id
+            )
+        }),
+    );
     write_native_gate_report(
         args,
         "verify-native-example-speed",
@@ -45876,6 +46143,7 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
             "existing_native_gpu_scroll_report": existing_report,
             "required_evidence_tier": entry.required_evidence_tier,
             "observed_evidence_tier": observed_evidence_tier,
+            "headed_visual_evidence": headed_visual_evidence,
             "strict_visible_speed_satisfied": tier_satisfies
         }),
     )
@@ -45907,8 +46175,12 @@ fn verify_native_counter_interaction_speed(
             .then(|| "counter interaction speed gate only supports --example counter".to_owned()),
     );
 
-    let source_path = PathBuf::from("examples/counter.bn");
-    let scenario_path = PathBuf::from("examples/counter.scn");
+    let entry = boon_runtime::example_manifest_entry("counter")?;
+    let source = boon_runtime::source_text_for_entry(&entry)?;
+    let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source)?;
+    let source_path = PathBuf::from(&entry.source);
+    let scenario_path = PathBuf::from(&entry.scenario);
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
     std::fs::create_dir_all(&artifacts_dir)?;
     let role_report = artifacts_dir.join("counter-interaction-speed-role.json");
@@ -46106,6 +46378,28 @@ fn verify_native_counter_interaction_speed(
     } else {
         Vec::new()
     };
+    let headed_visual_evidence = native_headed_visual_evidence("counter", &source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:headed-visual-cursor-readback",
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            "Counter interaction speed requires fresh headed visual cursor/readback evidence"
+                .to_owned()
+        }),
+    );
     write_native_gate_report(
         args,
         "verify-native-counter-interaction-speed",
@@ -46115,8 +46409,8 @@ fn verify_native_counter_interaction_speed(
             "example": "counter",
             "source_path": source_path,
             "scenario_path": scenario_path,
-            "source_hash": file_hash("examples/counter.bn"),
-            "scenario_hash": file_hash("examples/counter.scn"),
+            "source_hash": source_hash,
+            "scenario_hash": file_hash(&entry.scenario),
             "playground_binary_path": binary_path,
             "playground_binary_hash": file_hash("target/debug/boon_native_playground"),
             "role_report": role_report,
@@ -46132,6 +46426,7 @@ fn verify_native_counter_interaction_speed(
             "interaction_per_event_ms": interaction_per_event_ms,
             "preview_shared_render_update_count": render_update_count,
             "max_total_ms": max_total_ms,
+            "headed_visual_evidence": headed_visual_evidence,
             "artifact_sha256s": role_artifact
         }),
     )
@@ -46171,6 +46466,7 @@ fn verify_native_cells_interaction_speed(
     let entry = boon_runtime::example_manifest_entry("cells")?;
     let source = boon_runtime::source_text_for_entry(&entry)?;
     let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source)?;
     let combined_source_for_checks = source_files
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -46463,6 +46759,28 @@ fn verify_native_cells_interaction_speed(
     } else {
         Vec::new()
     };
+    let headed_visual_evidence = native_headed_visual_evidence("cells", &source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:headed-visual-cursor-readback",
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            "Cells interaction speed requires fresh headed visual cursor/readback evidence"
+                .to_owned()
+        }),
+    );
     let click_interaction_timing = role_report_json
         .as_ref()
         .and_then(|report| report.get("click_interaction_timing_ms"))
@@ -46524,7 +46842,7 @@ fn verify_native_cells_interaction_speed(
             "source_path": entry.source,
             "scenario_path": entry.scenario,
             "source_hash": file_hash(&entry.source),
-            "source_files_hash": source_hash_for_report_source_files(&source_files, &source)?,
+            "source_files_hash": source_hash,
             "scenario_hash": file_hash("examples/cells.scn"),
             "playground_binary_path": binary_path,
             "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
@@ -46618,6 +46936,7 @@ fn verify_native_cells_interaction_speed(
                 .and_then(|report| report.get("stage_counters"))
                 .cloned()
                 .unwrap_or_else(|| json!(null)),
+            "headed_visual_evidence": headed_visual_evidence,
             "targets": {
                 "debug": {
                     "focus_p95_ms": 120.0,
@@ -46657,6 +46976,7 @@ fn verify_native_gpu_novywave_interaction_speed(
     let entry = boon_runtime::example_manifest_entry("novywave")?;
     let source = boon_runtime::source_text_for_entry(&entry)?;
     let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source)?;
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
     std::fs::create_dir_all(&artifacts_dir)?;
     let role_report_stem = report_arg(args)
@@ -47021,6 +47341,28 @@ fn verify_native_gpu_novywave_interaction_speed(
     } else {
         Vec::new()
     };
+    let headed_visual_evidence = native_headed_visual_evidence("novywave", &source_hash);
+    let headed_visual_pass = headed_visual_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "novywave-interaction-speed:headed-visual-cursor-readback",
+        headed_visual_pass,
+        format!(
+            "headed_visual_status={:?}, path={:?}",
+            headed_visual_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            headed_visual_evidence.get("path")
+        ),
+        (!headed_visual_pass).then(|| {
+            "NovyWave interaction speed requires fresh headed visual cursor/readback evidence"
+                .to_owned()
+        }),
+    );
     let click_interaction_timing = role_field_or_null("click_interaction_timing_ms");
     let hover_interaction_timing = role_field_or_null("hover_interaction_timing_ms");
     let divider_interaction_timing = role_field_or_null("divider_interaction_timing_ms");
@@ -47037,7 +47379,8 @@ fn verify_native_gpu_novywave_interaction_speed(
             "profile": "release",
             "source_path": entry.source,
             "scenario_path": entry.scenario,
-            "source_hash": source_hash_for_report_source_files(&source_files, &source)?,
+            "source_hash": file_hash(&entry.source),
+            "source_files_hash": source_hash,
             "scenario_hash": file_hash(&entry.scenario),
             "source_files": source_files,
             "playground_binary_path": binary_path,
@@ -47159,6 +47502,7 @@ fn verify_native_gpu_novywave_interaction_speed(
             "hot_path_report_write_count": hot_path_report_write_count,
             "hover_persist_write_count": hover_persist_write_count,
             "selected_rows_order_label": selected_rows,
+            "headed_visual_evidence": headed_visual_evidence,
             "keyboard_cursor_label": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("keyboard_cursor_label"))
@@ -49762,6 +50106,7 @@ fn demand_driven_render_loop_required_reports() -> Vec<NativeGpuRequiredReport> 
 
 fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
     let mut reports = native_gpu_handoff_required_reports();
+    reports.extend(native_gpu_headed_visual_required_reports());
     reports.extend([
         native_gpu_required_report(
             "counter-interaction-speed",
@@ -49888,6 +50233,65 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
         ),
     ]);
     reports
+}
+
+fn native_gpu_headed_visual_required_reports() -> Vec<NativeGpuRequiredReport> {
+    vec![
+        native_gpu_required_report(
+            "headed-scenario-cells",
+            "target/reports/native-gpu/headed-scenario-cells.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-todomvc",
+            "target/reports/native-gpu/headed-scenario-todomvc.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "todomvc")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-todo_mvc_physical",
+            "target/reports/native-gpu/headed-scenario-todo_mvc_physical.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "todo_mvc_physical")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-novywave",
+            "target/reports/native-gpu/headed-scenario-novywave.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "novywave")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-hello_3d",
+            "target/reports/native-gpu/headed-scenario-hello_3d.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "hello_3d")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-printable_bracket_3d",
+            "target/reports/native-gpu/headed-scenario-printable_bracket_3d.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "printable_bracket_3d")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-parametric_car_3d",
+            "target/reports/native-gpu/headed-scenario-parametric_car_3d.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "parametric_car_3d")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-parametric_car_rich_3d",
+            "target/reports/native-gpu/headed-scenario-parametric_car_rich_3d.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "parametric_car_rich_3d")],
+        ),
+        native_gpu_required_report(
+            "headed-scenario-counter",
+            "target/reports/native-gpu/headed-scenario-counter.json",
+            "verify-native-gpu-headed-scenario",
+            &[("--example", "counter")],
+        ),
+    ]
 }
 
 fn native_gpu_required_report(
@@ -50043,6 +50447,64 @@ fn validate_native_gpu_child_report(
 
 fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -> Vec<String> {
     let mut blockers = Vec::new();
+    if label.starts_with("headed-scenario-") {
+        require_str_field(
+            &mut blockers,
+            report,
+            "command",
+            "verify-native-gpu-headed-scenario",
+        );
+        require_bool_field(&mut blockers, report, "operator_host_input", true);
+        require_bool_field(&mut blockers, report, "real_os_input", false);
+        require_bool_field(&mut blockers, report, "human_observation", false);
+        require_bool_field(
+            &mut blockers,
+            report,
+            "preview_receives_example_name",
+            false,
+        );
+        if report
+            .get("example")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            blockers.push("headed visual report must expose example".to_owned());
+        }
+        if report
+            .get("visual_capture_method")
+            .and_then(serde_json::Value::as_str)
+            != Some("app-owned-wgpu-readback-with-visible-cursor-overlay")
+        {
+            blockers.push(
+                "headed visual report must use app-owned WGPU cursor-overlay readback".to_owned(),
+            );
+        }
+        if report
+            .pointer("/scenario_report_json/overlay/cursor_visible")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            blockers.push("headed visual scenario must report cursor_visible=true".to_owned());
+        }
+        if report
+            .pointer("/scenario_report_json/overlay/key_hud_visible")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            blockers.push("headed visual scenario must report key_hud_visible=true".to_owned());
+        }
+        let capture_method = report
+            .pointer("/readback_artifact/capture_method")
+            .and_then(serde_json::Value::as_str);
+        if !matches!(
+            capture_method,
+            Some("wgpu-generated-shader-app-owned-readback")
+                | Some("wgpu-generated-shader-app-owned-render-scene-readback")
+                | Some("wgpu-visible-surface-copy-src-readback")
+        ) {
+            blockers.push("headed visual report must include app-owned WGPU readback".to_owned());
+        }
+    }
     match label {
         "counter-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
@@ -52528,6 +52990,12 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("hello_3d") => "preview-e2e-hello_3d",
             _ => "preview-e2e",
         },
+        "verify-native-gpu-headed-scenario" => {
+            let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
+            return PathBuf::from(format!(
+                "target/reports/native-gpu/headed-scenario-{example}.json"
+            ));
+        }
         "verify-native-visible-launch" => match value_arg(args, "--example").as_deref() {
             Some("todomvc") => "todomvc-visible-launch",
             Some("cells") => "cells-visible-launch",

@@ -55,7 +55,6 @@ FUNCTION formula_bar() {
             Element/text_input(
                 element: [
                     event: [
-                        click: store.selected_input.sources.editor.select
                         change: store.selected_input.sources.editor.events.change
                         key_down: store.selected_input.sources.editor.commit
                         escape: store.selected_input.sources.editor.cancel
@@ -72,7 +71,7 @@ FUNCTION formula_bar() {
                 label: TEXT { fx input }
                 text: store.selected_input.editing_text
                 placeholder: [text: Text/empty()]
-                address: store.selected_input.address
+                address: store.selected_address
             )
         }
     )

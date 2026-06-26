@@ -787,6 +787,7 @@ fn run_cells_interaction_speed(
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let interaction_timings = take_preview_interaction_timings();
     let native_input_timings = take_preview_native_input_timings();
+    let native_input_profiles = take_preview_native_input_profiles();
     let native_input_reject_counts = take_preview_native_input_reject_counts();
     let (state_summary, update_count, layout_hash, last_error) = {
         let mut runtime = live_runtime
@@ -895,6 +896,13 @@ fn run_cells_interaction_speed(
             .iter()
             .take(128)
             .map(preview_native_input_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["native_input_profile_samples"] = json!(
+        native_input_profiles
+            .iter()
+            .take(128)
+            .cloned()
             .collect::<Vec<_>>()
     );
     report_value["native_input_reject_counts"] = json!(native_input_reject_counts);
@@ -34441,6 +34449,30 @@ fn preview_key_down_source_for_node(layout_proof: &Value, node: &str) -> Option<
     live_source_for_node_intent(layout_proof, node, "key_down")
 }
 
+fn preview_focused_change_source(
+    layout_proof: &Value,
+    focused_node: &str,
+    input_state: &PreviewNativeInputState,
+) -> Option<String> {
+    live_source_for_node_intent(layout_proof, focused_node, "change").or_else(|| {
+        (input_state.focused_node.as_deref() == Some(focused_node))
+            .then(|| input_state.focused_change_source.clone())
+            .flatten()
+    })
+}
+
+fn preview_focused_key_down_source(
+    layout_proof: &Value,
+    focused_node: &str,
+    input_state: &PreviewNativeInputState,
+) -> Option<String> {
+    preview_key_down_source_for_node(layout_proof, focused_node).or_else(|| {
+        (input_state.focused_node.as_deref() == Some(focused_node))
+            .then(|| input_state.focused_key_down_source.clone())
+            .flatten()
+    })
+}
+
 fn preview_node_accepts_key_focus(layout_proof: &Value, node: &str) -> bool {
     preview_key_down_source_for_node(layout_proof, node).is_some()
 }
@@ -34593,6 +34625,21 @@ fn preview_refresh_cached_focus_payloads(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     input_state: &mut PreviewNativeInputState,
 ) {
+    let needs_summary = input_state
+        .focused_address
+        .as_deref()
+        .is_some_and(source_intent_payload_may_need_summary)
+        || input_state
+            .focused_target_text
+            .as_deref()
+            .is_some_and(source_intent_payload_may_need_summary)
+        || source_intent_payload_may_need_summary(&input_state.focused_text);
+    if !needs_summary {
+        input_state.focused_caret_index = input_state
+            .focused_caret_index
+            .min(preview_text_char_count(&input_state.focused_text));
+        return;
+    }
     let Some(summary) = live_runtime
         .lock()
         .ok()
@@ -34632,6 +34679,14 @@ fn preview_refresh_cached_focus_payloads(
             .focused_caret_index
             .min(preview_text_char_count(&input_state.focused_text));
     }
+}
+
+fn source_intent_payload_may_need_summary(value: &str) -> bool {
+    value.starts_with("store.")
+        || value.starts_with('@')
+        || value.starts_with("cell.")
+        || value.starts_with("row.")
+        || value.starts_with("sheet_")
 }
 
 fn preview_key_is_repeatable(key: &str) -> bool {
@@ -34746,7 +34801,7 @@ fn preview_apply_repeatable_text_input_key(
                 preview_delete_at_caret(input_state);
             }
             preview_reset_caret_blink(input_state);
-            if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+            if let Some(source) = preview_focused_change_source(layout, focused_node, input_state) {
                 let runtime_state_summary = live_runtime
                     .lock()
                     .ok()
@@ -34800,7 +34855,9 @@ fn preview_apply_repeatable_text_input_key(
                 preview_prepare_text_edit(input_state);
                 preview_insert_char_at_caret(input_state, character);
                 preview_reset_caret_blink(input_state);
-                if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+                if let Some(source) =
+                    preview_focused_change_source(layout, focused_node, input_state)
+                {
                     let runtime_state_summary = live_runtime
                         .lock()
                         .ok()
@@ -34946,15 +35003,6 @@ fn preview_try_apply_simple_source_click_input(
     let (events, node, target_text, preserve_focus, focus_state_applied, click_candidate) =
         if let Some(candidate) = cached_candidate {
             if candidate.text_change {
-                return reject("text_change", input_state);
-            }
-            if candidate.link {
-                return reject("link", input_state);
-            }
-            let preserve_focus = input_state.focused_node.as_deref()
-                == Some(candidate.node.as_str())
-                && candidate.accepts_key_focus;
-            if candidate.accepts_key_focus && !preserve_focus {
                 click_resolve_source = "hit_test";
                 let shared = shared_render_state
                     .lock()
@@ -34968,74 +35016,110 @@ fn preview_try_apply_simple_source_click_input(
                 else {
                     return reject("missing_hit_region", input_state);
                 };
-                let Some((events, node, target_text)) = preview_prepare_focusable_route_click(
-                    &route_table,
-                    hit,
-                    position,
-                    release_sequence,
-                    live_runtime,
-                    shared_render_state,
-                    input_state,
-                )?
+                drop(shared);
+                let Some((events, node, target_text, preserve_focus)) =
+                    preview_prepare_text_input_route_click(
+                        &route_table,
+                        hit,
+                        position,
+                        release_sequence,
+                        live_runtime,
+                        shared_render_state,
+                        input_state,
+                    )?
                 else {
-                    return reject("key_focus", input_state);
+                    return reject("text_change", input_state);
                 };
                 (events, node, target_text, preserve_focus, true, None)
-            } else if input_state.focused_node.is_some() && !preserve_focus {
-                click_resolve_source = "hit_test";
-                let shared = shared_render_state
-                    .lock()
-                    .map_err(|_| "preview render state mutex poisoned")?;
-                let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
-                    return reject("missing_typed_route_table", input_state);
-                };
-                let Some(hit) = route_table.hit_test(position.x, position.y) else {
-                    return reject("missing_hit_region", input_state);
-                };
-                let Some(event) = route_table.live_source_event_for_hit(hit, position, false)
-                else {
-                    return reject("missing_live_event", input_state);
-                };
-                let node = candidate.node;
-                let target_text = route_table.target_text(&node);
-                let mut events = Vec::new();
-                if let Some(blur) = preview_focused_blur_event_for_route_table(
-                    &route_table,
-                    input_state,
-                    live_runtime,
-                ) {
-                    events.push(blur);
-                }
-                events.push(event);
-                (events, node, target_text, preserve_focus, false, None)
+            } else if candidate.link {
+                return reject("link", input_state);
             } else {
-                click_resolve_source = "hover_candidate";
-                let click_candidate = candidate.clone();
-                let (pointer_x, pointer_y, pointer_width, pointer_height) =
-                    pointer_payload_for_cached_bounds(candidate.bounds, position);
-                let event = boon_runtime::LiveSourceEvent {
-                    source: candidate.source.clone(),
-                    text: candidate.target_text.clone(),
-                    key: None,
-                    address: candidate.address.clone(),
-                    pointer_x,
-                    pointer_y,
-                    pointer_width,
-                    pointer_height,
-                    target_text: candidate.target_text.clone(),
-                    target_occurrence: candidate.target_occurrence,
-                    target_key: candidate.target_key,
-                    target_generation: candidate.target_generation,
-                    ..boon_runtime::LiveSourceEvent::default()
-                };
-                (
-                    vec![event],
-                    candidate.node,
-                    candidate.target_text,
-                    preserve_focus,
-                    false,
-                    Some(click_candidate),
-                )
+                let preserve_focus = input_state.focused_node.as_deref()
+                    == Some(candidate.node.as_str())
+                    && candidate.accepts_key_focus;
+                if candidate.accepts_key_focus && !preserve_focus {
+                    click_resolve_source = "hit_test";
+                    let shared = shared_render_state
+                        .lock()
+                        .map_err(|_| "preview render state mutex poisoned")?;
+                    let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
+                        return reject("missing_typed_route_table", input_state);
+                    };
+                    let Some(hit) = route_table
+                        .hit_for_node(&candidate.node)
+                        .or_else(|| route_table.hit_test(position.x, position.y))
+                    else {
+                        return reject("missing_hit_region", input_state);
+                    };
+                    let Some((events, node, target_text)) = preview_prepare_focusable_route_click(
+                        &route_table,
+                        hit,
+                        position,
+                        release_sequence,
+                        live_runtime,
+                        shared_render_state,
+                        input_state,
+                    )?
+                    else {
+                        return reject("key_focus", input_state);
+                    };
+                    (events, node, target_text, preserve_focus, true, None)
+                } else if input_state.focused_node.is_some() && !preserve_focus {
+                    click_resolve_source = "hit_test";
+                    let shared = shared_render_state
+                        .lock()
+                        .map_err(|_| "preview render state mutex poisoned")?;
+                    let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
+                        return reject("missing_typed_route_table", input_state);
+                    };
+                    let Some(hit) = route_table.hit_test(position.x, position.y) else {
+                        return reject("missing_hit_region", input_state);
+                    };
+                    let Some(event) = route_table.live_source_event_for_hit(hit, position, false)
+                    else {
+                        return reject("missing_live_event", input_state);
+                    };
+                    let node = candidate.node;
+                    let target_text = route_table.target_text(&node);
+                    let mut events = Vec::new();
+                    if let Some(blur) = preview_focused_blur_event_for_route_table(
+                        &route_table,
+                        input_state,
+                        live_runtime,
+                    ) {
+                        events.push(blur);
+                    }
+                    events.push(event);
+                    (events, node, target_text, preserve_focus, false, None)
+                } else {
+                    click_resolve_source = "hover_candidate";
+                    let click_candidate = candidate.clone();
+                    let (pointer_x, pointer_y, pointer_width, pointer_height) =
+                        pointer_payload_for_cached_bounds(candidate.bounds, position);
+                    let event = boon_runtime::LiveSourceEvent {
+                        source: candidate.source.clone(),
+                        text: candidate.target_text.clone(),
+                        key: None,
+                        address: candidate.address.clone(),
+                        pointer_x,
+                        pointer_y,
+                        pointer_width,
+                        pointer_height,
+                        target_text: candidate.target_text.clone(),
+                        target_occurrence: candidate.target_occurrence,
+                        target_key: candidate.target_key,
+                        target_generation: candidate.target_generation,
+                        ..boon_runtime::LiveSourceEvent::default()
+                    };
+                    (
+                        vec![event],
+                        candidate.node,
+                        candidate.target_text,
+                        preserve_focus,
+                        false,
+                        Some(click_candidate),
+                    )
+                }
             }
         } else {
             preview_set_interaction_diagnostic_subphase(
@@ -35059,84 +35143,104 @@ fn preview_try_apply_simple_source_click_input(
                 if route_table.source_for_node_intent(node, "change").is_some()
                     && route_table.wants_text_cursor(node)
                 {
-                    return reject("text_change", input_state);
-                }
-                let preserve_focus = input_state.focused_node.as_deref() == Some(node)
-                    && route_table.accepts_key_focus(node);
-                if route_table.accepts_key_focus(node) && !preserve_focus {
                     let Some(hit) = route_table.hit_test(position.x, position.y) else {
                         return reject("missing_hit_region", input_state);
                     };
-                    let Some((events, node, target_text)) = preview_prepare_focusable_route_click(
-                        route_table,
-                        hit,
-                        position,
-                        release_sequence,
-                        live_runtime,
-                        shared_render_state,
-                        input_state,
-                    )?
+                    drop(shared);
+                    let Some((events, node, target_text, preserve_focus)) =
+                        preview_prepare_text_input_route_click(
+                            route_table,
+                            hit,
+                            position,
+                            release_sequence,
+                            live_runtime,
+                            shared_render_state,
+                            input_state,
+                        )?
                     else {
-                        return reject("key_focus", input_state);
+                        return reject("text_change", input_state);
                     };
                     (events, node, target_text, preserve_focus, true, None)
                 } else {
-                    if route_table.link_url(node).is_some() {
-                        return reject("link", input_state);
-                    }
-                    let target_text = input_state
-                        .hovered_target_text
-                        .clone()
-                        .or_else(|| route_table.target_text(node));
-                    let (pointer_x, pointer_y, pointer_width, pointer_height) =
-                        pointer_payload_for_cached_bounds(bounds, position);
-                    let target_occurrence = route_table.target_occurrence_for_source(node, &source);
-                    let click_candidate = PreviewHoveredClickCandidate {
-                        node: node.to_owned(),
-                        source: source.clone(),
-                        bounds,
-                        target_text: target_text.clone(),
-                        address: route_table.address(node),
-                        target_occurrence,
-                        target_key: route_table.target_key(node),
-                        target_generation: route_table.target_generation(node),
-                        accepts_key_focus: route_table.accepts_key_focus(node),
-                        text_change: false,
-                        link: false,
-                    };
-                    let mut event = boon_runtime::LiveSourceEvent {
-                        source,
-                        text: target_text.clone(),
-                        key: None,
-                        address: route_table.address(node),
-                        pointer_x,
-                        pointer_y,
-                        pointer_width,
-                        pointer_height,
-                        target_text: target_text.clone(),
-                        target_occurrence,
-                        ..boon_runtime::LiveSourceEvent::default()
-                    };
-                    route_table.apply_row_identity_to_event(node, &mut event);
-                    let mut events = Vec::new();
-                    if !preserve_focus
-                        && let Some(blur) = preview_focused_blur_event_for_route_table(
-                            route_table,
-                            input_state,
-                            live_runtime,
+                    let preserve_focus = input_state.focused_node.as_deref() == Some(node)
+                        && route_table.accepts_key_focus(node);
+                    if route_table.accepts_key_focus(node) && !preserve_focus {
+                        let Some(hit) = route_table.hit_test(position.x, position.y) else {
+                            return reject("missing_hit_region", input_state);
+                        };
+                        let Some((events, node, target_text)) =
+                            preview_prepare_focusable_route_click(
+                                route_table,
+                                hit,
+                                position,
+                                release_sequence,
+                                live_runtime,
+                                shared_render_state,
+                                input_state,
+                            )?
+                        else {
+                            return reject("key_focus", input_state);
+                        };
+                        (events, node, target_text, preserve_focus, true, None)
+                    } else {
+                        if route_table.link_url(node).is_some() {
+                            return reject("link", input_state);
+                        }
+                        let target_text = input_state
+                            .hovered_target_text
+                            .clone()
+                            .or_else(|| route_table.target_text(node));
+                        let (pointer_x, pointer_y, pointer_width, pointer_height) =
+                            pointer_payload_for_cached_bounds(bounds, position);
+                        let target_occurrence =
+                            route_table.target_occurrence_for_source(node, &source);
+                        let click_candidate = PreviewHoveredClickCandidate {
+                            node: node.to_owned(),
+                            source: source.clone(),
+                            bounds,
+                            target_text: target_text.clone(),
+                            address: route_table.address(node),
+                            target_occurrence,
+                            target_key: route_table.target_key(node),
+                            target_generation: route_table.target_generation(node),
+                            accepts_key_focus: route_table.accepts_key_focus(node),
+                            text_change: false,
+                            link: false,
+                        };
+                        let mut event = boon_runtime::LiveSourceEvent {
+                            source,
+                            text: target_text.clone(),
+                            key: None,
+                            address: route_table.address(node),
+                            pointer_x,
+                            pointer_y,
+                            pointer_width,
+                            pointer_height,
+                            target_text: target_text.clone(),
+                            target_occurrence,
+                            ..boon_runtime::LiveSourceEvent::default()
+                        };
+                        route_table.apply_row_identity_to_event(node, &mut event);
+                        let mut events = Vec::new();
+                        if !preserve_focus
+                            && let Some(blur) = preview_focused_blur_event_for_route_table(
+                                route_table,
+                                input_state,
+                                live_runtime,
+                            )
+                        {
+                            events.push(blur);
+                        }
+                        events.push(event);
+                        (
+                            events,
+                            node.to_owned(),
+                            target_text,
+                            preserve_focus,
+                            false,
+                            Some(click_candidate),
                         )
-                    {
-                        events.push(blur);
                     }
-                    events.push(event);
-                    (
-                        events,
-                        node.to_owned(),
-                        target_text,
-                        preserve_focus,
-                        false,
-                        Some(click_candidate),
-                    )
                 }
             } else {
                 let Some(route_table) = route_table.as_ref() else {
@@ -35158,68 +35262,85 @@ fn preview_try_apply_simple_source_click_input(
                     .is_some()
                     && route_table.wants_text_cursor(&node)
                 {
-                    return reject("text_change", input_state);
-                }
-                preview_set_interaction_diagnostic_subphase(
-                    "simple_source_click.resolve.focus_policy",
-                );
-                let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
-                    && route_table.accepts_key_focus(&node);
-                if route_table.accepts_key_focus(&node) && !preserve_focus {
-                    preview_set_interaction_diagnostic_subphase(
-                        "simple_source_click.resolve.prepare_focusable_click",
-                    );
-                    let Some((events, node, target_text)) = preview_prepare_focusable_route_click(
-                        route_table,
-                        hit,
-                        position,
-                        release_sequence,
-                        live_runtime,
-                        shared_render_state,
-                        input_state,
-                    )?
+                    drop(shared);
+                    let Some((events, node, target_text, preserve_focus)) =
+                        preview_prepare_text_input_route_click(
+                            route_table,
+                            hit,
+                            position,
+                            release_sequence,
+                            live_runtime,
+                            shared_render_state,
+                            input_state,
+                        )?
                     else {
-                        return reject("key_focus", input_state);
+                        return reject("text_change", input_state);
                     };
                     (events, node, target_text, preserve_focus, true, None)
                 } else {
                     preview_set_interaction_diagnostic_subphase(
-                        "simple_source_click.resolve.link_check",
+                        "simple_source_click.resolve.focus_policy",
                     );
-                    if route_table.link_url(&node).is_some() {
-                        return reject("link", input_state);
-                    }
-                    preview_set_interaction_diagnostic_subphase(
-                        "simple_source_click.resolve.click_candidate",
-                    );
-                    let click_candidate = route_table.click_candidate_for_hit(hit, false);
-                    preview_set_interaction_diagnostic_subphase(
-                        "simple_source_click.resolve.live_source_event",
-                    );
-                    let Some(event) = route_table.live_source_event_for_hit(hit, position, false)
-                    else {
-                        return reject("missing_live_event", input_state);
-                    };
-                    let target_text = route_table.target_text(&node);
-                    let mut events = Vec::new();
-                    if !preserve_focus
-                        && let Some(blur) = preview_focused_blur_event_for_route_table(
-                            route_table,
-                            input_state,
-                            live_runtime,
+                    let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
+                        && route_table.accepts_key_focus(&node);
+                    if route_table.accepts_key_focus(&node) && !preserve_focus {
+                        preview_set_interaction_diagnostic_subphase(
+                            "simple_source_click.resolve.prepare_focusable_click",
+                        );
+                        let Some((events, node, target_text)) =
+                            preview_prepare_focusable_route_click(
+                                route_table,
+                                hit,
+                                position,
+                                release_sequence,
+                                live_runtime,
+                                shared_render_state,
+                                input_state,
+                            )?
+                        else {
+                            return reject("key_focus", input_state);
+                        };
+                        (events, node, target_text, preserve_focus, true, None)
+                    } else {
+                        preview_set_interaction_diagnostic_subphase(
+                            "simple_source_click.resolve.link_check",
+                        );
+                        if route_table.link_url(&node).is_some() {
+                            return reject("link", input_state);
+                        }
+                        preview_set_interaction_diagnostic_subphase(
+                            "simple_source_click.resolve.click_candidate",
+                        );
+                        let click_candidate = route_table.click_candidate_for_hit(hit, false);
+                        preview_set_interaction_diagnostic_subphase(
+                            "simple_source_click.resolve.live_source_event",
+                        );
+                        let Some(event) =
+                            route_table.live_source_event_for_hit(hit, position, false)
+                        else {
+                            return reject("missing_live_event", input_state);
+                        };
+                        let target_text = route_table.target_text(&node);
+                        let mut events = Vec::new();
+                        if !preserve_focus
+                            && let Some(blur) = preview_focused_blur_event_for_route_table(
+                                route_table,
+                                input_state,
+                                live_runtime,
+                            )
+                        {
+                            events.push(blur);
+                        }
+                        events.push(event);
+                        (
+                            events,
+                            node,
+                            target_text,
+                            preserve_focus,
+                            false,
+                            click_candidate,
                         )
-                    {
-                        events.push(blur);
                     }
-                    events.push(event);
-                    (
-                        events,
-                        node,
-                        target_text,
-                        preserve_focus,
-                        false,
-                        click_candidate,
-                    )
                 }
             }
         };
@@ -35562,37 +35683,65 @@ fn preview_handle_mouse_release_for_route_hit(
         let double_click = batch_can_double_click
             && input_state.last_click_node.as_deref() == Some(node.as_str())
             && release_sequence.saturating_sub(input_state.last_click_sequence) <= 4;
-        let layout_proof = shared_render_state
-            .lock()
-            .ok()
-            .map(|shared| shared.layout_proof.clone());
-        let runtime_state_summary = live_runtime
-            .lock()
-            .ok()
-            .map(|mut runtime| preview_payload_state_summary(&mut runtime));
-        let resolved_address = layout_proof.as_ref().and_then(|layout| {
-            runtime_state_summary.as_ref().and_then(|summary| {
-                source_intent_binding_value_for_node(layout, &node, "address", summary)
-            })
+        let layout_hash = shared_render_state.lock().ok().and_then(|shared| {
+            shared
+                .layout_proof
+                .get("layout_frame_hash")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
         });
-        let resolved_target_text = layout_proof.as_ref().and_then(|layout| {
-            runtime_state_summary.as_ref().and_then(|summary| {
-                source_intent_binding_value_for_node(layout, &node, "target", summary)
-            })
+        let resolved_address = layout_hash.as_deref().and_then(|layout_hash| {
+            source_intent_binding_value_for_node_from_runtime(
+                layout_hash,
+                &node,
+                "address",
+                live_runtime,
+            )
         });
+        let resolved_target_text = layout_hash
+            .as_deref()
+            .and_then(|layout_hash| {
+                source_intent_binding_value_for_node_from_runtime(
+                    layout_hash,
+                    &node,
+                    "target",
+                    live_runtime,
+                )
+            })
+            .or_else(|| resolved_address.clone());
+        let route_address = route_table.address(&node);
+        let route_target_text = route_table.target_text(&node);
+        let needs_layout_fallback = resolved_address.is_none()
+            || (resolved_target_text.is_none() && route_target_text.is_some());
+        let layout_proof = needs_layout_fallback
+            .then(|| {
+                shared_render_state
+                    .lock()
+                    .ok()
+                    .map(|shared| shared.layout_proof.clone())
+            })
+            .flatten();
+        let runtime_state_summary = if needs_layout_fallback {
+            live_runtime
+                .lock()
+                .ok()
+                .map(|mut runtime| runtime.document_state_summary())
+        } else {
+            None
+        };
         input_state.focused_node = Some(node.clone());
         input_state.focused_address = resolved_address.or_else(|| {
             resolve_optional_source_intent_payload_value_for_focus(
                 layout_proof.as_ref(),
                 runtime_state_summary.as_ref(),
-                route_table.address(&node),
+                route_address.clone(),
             )
         });
         input_state.focused_target_text = resolved_target_text.or_else(|| {
             resolve_optional_source_intent_payload_value_for_focus(
                 layout_proof.as_ref(),
                 runtime_state_summary.as_ref(),
-                route_table.target_text(&node),
+                route_target_text.clone(),
             )
         });
         input_state.focused_change_source = route_table.change_source(&node);
@@ -35657,7 +35806,10 @@ fn preview_handle_mouse_release_for_route_hit(
         if let Some(mut event) = route_table.live_source_event_for_hit(hit, position, double_click)
         {
             event.address = input_state.focused_address.clone().or(event.address);
-            event.target_text = input_state.focused_target_text.clone().or(event.target_text);
+            event.target_text = input_state
+                .focused_target_text
+                .clone()
+                .or(event.target_text);
             if double_click {
                 event.text = Some(input_state.focused_text.clone());
             }
@@ -35791,6 +35943,49 @@ fn preview_prepare_focusable_route_click(
         return Ok(None);
     }
     Ok(Some((events, node, target_text)))
+}
+
+fn preview_prepare_text_input_route_click(
+    route_table: &PreviewHitRouteTable,
+    hit: &boon_document::HitSideTableEntry,
+    position: boon_native_app_window::NativeMouseWindowPosition,
+    release_sequence: u64,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<
+    Option<(
+        Vec<boon_runtime::LiveSourceEvent>,
+        String,
+        Option<String>,
+        bool,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    let node = hit.node.0.clone();
+    if route_table.change_source(&node).is_none() || !route_table.wants_text_cursor(&node) {
+        return Ok(None);
+    }
+    if route_table.link_url(&node).is_some() {
+        return Ok(None);
+    }
+    let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str());
+    let target_text = route_table.target_text(&node);
+    let mut events = Vec::new();
+    let mut defer_focusable_mouse_events = false;
+    preview_handle_mouse_release_for_route_hit(
+        route_table,
+        hit,
+        position,
+        release_sequence,
+        false,
+        live_runtime,
+        shared_render_state,
+        input_state,
+        &mut events,
+        &mut defer_focusable_mouse_events,
+    )?;
+    Ok(Some((events, node, target_text, preserve_focus)))
 }
 
 fn preview_apply_real_window_input_with_units(
@@ -36236,6 +36431,7 @@ fn preview_apply_real_window_input_with_units(
             "Return" | "KeypadEnter" => {
                 if let Some(source) = live_source_for_node_intent(layout, &focused_node, "submit")
                     .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
+                    .or_else(|| preview_focused_key_down_source(layout, &focused_node, input_state))
                 {
                     let submitted_text = input_state.focused_text.clone();
                     let carries_text = live_runtime
@@ -36288,6 +36484,7 @@ fn preview_apply_real_window_input_with_units(
                 if let Some(source) = live_source_for_node_intent(layout, &focused_node, "escape")
                     .or_else(|| input_state.focused_escape_source.clone())
                     .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
+                    .or_else(|| preview_focused_key_down_source(layout, &focused_node, input_state))
                 {
                     let mut escape = boon_runtime::LiveSourceEvent {
                         source,
@@ -36318,7 +36515,7 @@ fn preview_apply_real_window_input_with_units(
                 }
             }
             key if preview_key_is_repeatable(key) => {
-                if live_source_for_node_intent(layout, &focused_node, "change").is_some() {
+                if preview_focused_change_source(layout, &focused_node, input_state).is_some() {
                     if let Some(next_layout) = preview_apply_repeatable_text_input_key(
                         key,
                         shift_pressed,
@@ -36337,7 +36534,8 @@ fn preview_apply_real_window_input_with_units(
                     input_state.held_repeat_key = Some(event.key.clone());
                     input_state.held_repeat_next_at =
                         now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
-                } else if let Some(source) = preview_key_down_source_for_node(layout, &focused_node)
+                } else if let Some(source) =
+                    preview_focused_key_down_source(layout, &focused_node, input_state)
                 {
                     let mut key_down = boon_runtime::LiveSourceEvent {
                         source,
@@ -36364,7 +36562,9 @@ fn preview_apply_real_window_input_with_units(
                 }
             }
             _ => {
-                if let Some(source) = preview_key_down_source_for_node(layout, &focused_node) {
+                if let Some(source) =
+                    preview_focused_key_down_source(layout, &focused_node, input_state)
+                {
                     let mut key_down = boon_runtime::LiveSourceEvent {
                         source,
                         text: None,
@@ -36414,7 +36614,7 @@ fn preview_apply_real_window_input_with_units(
                         preview_clear_key_repeat(input_state);
                         break;
                     };
-                    if live_source_for_node_intent(layout, &focused_node, "change").is_some() {
+                    if preview_focused_change_source(layout, &focused_node, input_state).is_some() {
                         if let Some(next_layout) = preview_apply_repeatable_text_input_key(
                             &key,
                             shift_pressed,
@@ -36430,7 +36630,7 @@ fn preview_apply_real_window_input_with_units(
                             latest_layout = Some(next_layout);
                         }
                     } else if let Some(source) =
-                        preview_key_down_source_for_node(layout, &focused_node)
+                        preview_focused_key_down_source(layout, &focused_node, input_state)
                     {
                         let mut key_down = boon_runtime::LiveSourceEvent {
                             source,
@@ -37022,6 +37222,54 @@ fn source_intent_binding_value_for_node(
         let source_path = json_value_to_document_source_path(value);
         (!source_path.trim().is_empty()).then_some(source_path)
     })
+}
+
+fn source_intent_binding_value_for_node_from_runtime(
+    layout_hash: &str,
+    node: &str,
+    intent: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+) -> Option<String> {
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    let bindings = snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+        .get(node)?;
+    let mut paths = bindings
+        .iter()
+        .filter(|(_, binding_intent)| binding_intent == intent)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        document_text_binding_path_rank(left)
+            .cmp(&document_text_binding_path_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    let mut runtime = live_runtime.lock().ok()?;
+    paths.into_iter().find_map(|path| {
+        if path.starts_with('@') {
+            return None;
+        }
+        let values = runtime.runtime_value_summaries(std::slice::from_ref(&path), 2, 8, 2);
+        let value = values.get(&path)?;
+        runtime_value_summary_source_path(value)
+    })
+}
+
+fn runtime_value_summary_source_path(value: &Value) -> Option<String> {
+    if let Some(value) = value.get("value") {
+        let source_path = json_value_to_document_source_path(value);
+        if !source_path.trim().is_empty() {
+            return Some(source_path);
+        }
+    }
+    let source_path = match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("string") => value.get("value")?.as_str()?.to_owned(),
+        Some("number") => json_value_to_document_text(value.get("value")?),
+        Some("bool") => json_value_to_document_text(value.get("value")?),
+        _ => return None,
+    };
+    (!source_path.trim().is_empty()).then_some(source_path)
 }
 
 fn source_intent_binding_paths_for_node(
@@ -42147,11 +42395,23 @@ impl PreviewHitRouteTable {
             .find_map(|item| item.text.clone())
     }
 
+    fn text_input_document_value(&self, node: &str) -> Option<String> {
+        self.display_items_by_node
+            .get(node)?
+            .iter()
+            .filter_map(|index| self.display_items.get(*index))
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .and_then(|item| item.text.clone())
+    }
+
     fn focused_text(
         &self,
         node: &str,
         live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     ) -> Option<String> {
+        if let Some(text) = self.text_input_document_value(node) {
+            return Some(text);
+        }
         let mut runtime = live_runtime.lock().ok()?;
         let summary = preview_payload_state_summary(&mut runtime);
         if let Some(text) = self

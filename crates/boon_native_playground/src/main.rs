@@ -7892,10 +7892,14 @@ type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>
 
 type DocumentDataBindingRowFieldIndex =
     BTreeMap<(u64, u64), Vec<(String, Vec<DocumentDataBindingTarget>)>>;
+type DocumentDataBindingStaticEqualityIndex =
+    BTreeMap<String, BTreeMap<String, Vec<DocumentDataBindingTarget>>>;
 
 #[derive(Clone, Debug)]
 struct DocumentDataBindingSnapshotIndex {
     targets: DocumentDataBindingIndex,
+    non_static_targets: DocumentDataBindingIndex,
+    static_equality_targets: DocumentDataBindingStaticEqualityIndex,
     row_field_targets: DocumentDataBindingRowFieldIndex,
     collection_targets: Vec<(String, Vec<DocumentDataBindingTarget>)>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
@@ -7905,6 +7909,8 @@ struct DocumentDataBindingSnapshotIndex {
 
 impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
     fn from(targets: DocumentDataBindingIndex) -> Self {
+        let mut non_static_targets = DocumentDataBindingIndex::new();
+        let mut static_equality_targets = DocumentDataBindingStaticEqualityIndex::new();
         let mut row_field_targets: DocumentDataBindingRowFieldIndex = BTreeMap::new();
         let mut collection_targets = Vec::new();
         let mut text_binding_paths_by_node = BTreeMap::new();
@@ -7912,6 +7918,23 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
         let mut source_intent_binding_targets_by_node =
             BTreeMap::<String, Vec<(String, String)>>::new();
         for (path, path_targets) in &targets {
+            for target in path_targets {
+                if let Some((_, static_value)) = parse_document_eq_static_binding_attr(&target.attr)
+                    && let Ok(key) = document_static_equality_value_key(&static_value)
+                {
+                    static_equality_targets
+                        .entry(path.clone())
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .push(target.clone());
+                    continue;
+                }
+                non_static_targets
+                    .entry(path.clone())
+                    .or_default()
+                    .push(target.clone());
+            }
             if let Some(row) = document_row_field_path(path) {
                 row_field_targets
                     .entry((row.key, row.generation))
@@ -7952,6 +7975,8 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
         }
         Self {
             targets,
+            non_static_targets,
+            static_equality_targets,
             row_field_targets,
             collection_targets,
             text_binding_paths_by_node,
@@ -7963,6 +7988,24 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
 
 fn document_text_binding_path_rank(path: &str) -> u8 {
     u8::from(path.starts_with('@'))
+}
+
+fn document_static_equality_state_values(
+    data_binding_targets: &DocumentDataBindingSnapshotIndex,
+    state_summary: Option<&Value>,
+) -> BTreeMap<String, Value> {
+    let Some(state_summary) = state_summary else {
+        return BTreeMap::new();
+    };
+    data_binding_targets
+        .static_equality_targets
+        .keys()
+        .filter_map(|path| {
+            state_summary_value_for_data_path(state_summary, path)
+                .cloned()
+                .map(|value| (path.clone(), value))
+        })
+        .collect()
 }
 
 impl std::ops::Deref for DocumentDataBindingSnapshotIndex {
@@ -8036,13 +8079,15 @@ struct DocumentPatchLayoutResult {
 #[derive(Clone, Debug)]
 struct DocumentRenderSnapshot {
     document_frame: boon_document_model::DocumentFrame,
+    runtime_document_state_values: BTreeMap<String, Value>,
     derived_indexes: Arc<boon_document::DocumentDerivedIndexBundle>,
     layout_frame: Arc<boon_document::LayoutFrame>,
     retained_layout_cache: Arc<boon_document::DocumentRetainedLayoutCache>,
-    data_binding_targets: DocumentDataBindingSnapshotIndex,
+    data_binding_targets: Arc<DocumentDataBindingSnapshotIndex>,
     structural_data_reads: BTreeSet<String>,
     structural_data_read_aliases: Vec<(String, Vec<String>)>,
     source_intents: Vec<Value>,
+    hit_route_static_cache_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -8949,15 +8994,17 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
                 hash,
                 DocumentRenderSnapshot {
                     document_frame: entry.document_frame.clone(),
+                    runtime_document_state_values: BTreeMap::new(),
                     derived_indexes: Arc::clone(&entry.derived_indexes),
                     layout_frame: Arc::new(entry.layout_frame.clone()),
                     retained_layout_cache: Arc::clone(&entry.retained_layout_cache),
-                    data_binding_targets: entry.data_binding_targets.clone().into(),
+                    data_binding_targets: Arc::new(entry.data_binding_targets.clone().into()),
                     structural_data_reads: entry.structural_data_reads.clone(),
                     structural_data_read_aliases: document_structural_data_read_aliases(
                         &entry.structural_data_reads,
                     ),
                     source_intents: entry.source_intents.clone(),
+                    hit_route_static_cache_key: None,
                 },
             );
         }
@@ -9456,21 +9503,31 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
             "layout_cache_key_used": layout_cache_key_used
         }),
     );
-    cache_document_render_snapshot(
-        layout_frame_hash.clone(),
-        DocumentRenderSnapshot {
-            document_frame: frame,
-            derived_indexes,
-            layout_frame: Arc::new(layout.clone()),
-            retained_layout_cache,
-            data_binding_targets: data_binding_targets.into(),
-            structural_data_read_aliases: document_structural_data_read_aliases(
-                &structural_data_reads,
-            ),
-            structural_data_reads,
-            source_intents: source_intent_assertions,
-        },
+    let data_binding_snapshot =
+        Arc::new(DocumentDataBindingSnapshotIndex::from(data_binding_targets));
+    let runtime_document_state_values = document_static_equality_state_values(
+        data_binding_snapshot.as_ref(),
+        runtime_state.as_ref(),
     );
+    let layout_snapshot_frame = Arc::new(layout.clone());
+    let mut render_snapshot = DocumentRenderSnapshot {
+        document_frame: frame,
+        runtime_document_state_values,
+        derived_indexes,
+        layout_frame: Arc::clone(&layout_snapshot_frame),
+        retained_layout_cache,
+        data_binding_targets: data_binding_snapshot,
+        structural_data_read_aliases: document_structural_data_read_aliases(&structural_data_reads),
+        structural_data_reads,
+        source_intents: source_intent_assertions,
+        hit_route_static_cache_key: None,
+    };
+    render_snapshot.hit_route_static_cache_key = Some(preview_hit_route_cache_key_for_snapshot(
+        &render_snapshot,
+        layout_snapshot_frame.as_ref(),
+        &render_snapshot.source_intents,
+    ));
+    cache_document_render_snapshot(layout_frame_hash.clone(), render_snapshot);
     write_layout_proof_progress(
         "render-snapshot-cache-updated",
         json!({
@@ -29337,9 +29394,13 @@ fn document_context_record_target_reads_with_attr(
 const DOCUMENT_EQ_STATIC_BINDING_PREFIX: &str = "__eq_static:";
 
 fn document_eq_static_binding_attr(attr: &str, static_value: &Value) -> Option<String> {
-    serde_json::to_string(static_value)
+    document_static_equality_value_key(static_value)
         .ok()
         .map(|encoded| format!("{DOCUMENT_EQ_STATIC_BINDING_PREFIX}{attr}:{encoded}"))
+}
+
+fn document_static_equality_value_key(static_value: &Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string(static_value)
 }
 
 fn parse_document_eq_static_binding_attr(attr: &str) -> Option<(&str, Value)> {
@@ -35381,6 +35442,10 @@ fn preview_try_apply_simple_source_click_input(
     let release_sequence = releases[0].sequence;
     let resolve_started = Instant::now();
     let mut click_resolve_source = "hit_test";
+    let mut route_table_lookup_ms = 0.0_f64;
+    let mut hit_test_ms = 0.0_f64;
+    let mut click_event_build_ms = 0.0_f64;
+    let mut route_table_key_source = "none";
     let cached_candidate = input_state
         .hovered_click_candidate
         .as_ref()
@@ -35516,7 +35581,13 @@ fn preview_try_apply_simple_source_click_input(
             let shared = shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
+            let route_table_lookup_started = Instant::now();
             let route_table = PreviewHitRouteTable::from_shared(&shared);
+            route_table_key_source = route_table
+                .as_ref()
+                .map(|route_table| route_table.route_key_source)
+                .unwrap_or("missing");
+            route_table_lookup_ms += elapsed_ms(route_table_lookup_started);
             if preview_mouse_position_key(input.mouse_window_pos)
                 == input_state.last_hover_window_position
                 && let (Some(node), Some(bounds)) = (
@@ -35635,9 +35706,11 @@ fn preview_try_apply_simple_source_click_input(
                     return reject("missing_typed_route_table", input_state);
                 };
                 preview_set_interaction_diagnostic_subphase("simple_source_click.resolve.hit_test");
+                let hit_test_started = Instant::now();
                 let Some(hit) = route_table.hit_test(position.x, position.y) else {
                     return reject("missing_hit_region", input_state);
                 };
+                hit_test_ms += elapsed_ms(hit_test_started);
                 let node = hit.node.0.clone();
                 preview_set_interaction_diagnostic_subphase(
                     "simple_source_click.resolve.classify_hit",
@@ -35699,6 +35772,7 @@ fn preview_try_apply_simple_source_click_input(
                         preview_set_interaction_diagnostic_subphase(
                             "simple_source_click.resolve.click_candidate",
                         );
+                        let event_build_started = Instant::now();
                         let click_candidate = route_table.click_candidate_for_hit(hit, false);
                         preview_set_interaction_diagnostic_subphase(
                             "simple_source_click.resolve.live_source_event",
@@ -35720,6 +35794,7 @@ fn preview_try_apply_simple_source_click_input(
                             events.push(blur);
                         }
                         events.push(event);
+                        click_event_build_ms += elapsed_ms(event_build_started);
                         (
                             events,
                             node,
@@ -35809,6 +35884,10 @@ fn preview_try_apply_simple_source_click_input(
             "pointer_move_ms": 0.0,
             "mouse_release_ms": apply_ms,
             "simple_click_resolve_ms": resolve_ms,
+            "simple_click_route_table_ms": route_table_lookup_ms,
+            "simple_click_route_table_key_source": route_table_key_source,
+            "simple_click_hit_test_ms": hit_test_ms,
+            "simple_click_event_build_ms": click_event_build_ms,
             "click_resolve_source": click_resolve_source,
             "keyboard_ms": 0.0,
             "hover_overlay_ms": hover_overlay_ms,
@@ -40705,7 +40784,7 @@ fn document_text_binding_paths_for_node(layout_proof: &Value, node: &str) -> Vec
         .and_then(serde_json::Value::as_str)
         && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
     {
-        for (path, targets) in &snapshot.data_binding_targets {
+        for (path, targets) in snapshot.data_binding_targets.iter() {
             if targets
                 .iter()
                 .any(|target| target.node.0 == node && target.attr == "text")
@@ -41728,13 +41807,15 @@ fn preview_world_editor_document_layout_snapshot(
         layout_frame_hash,
         DocumentRenderSnapshot {
             document_frame: frame,
+            runtime_document_state_values: BTreeMap::new(),
             derived_indexes,
             layout_frame: Arc::new(layout.clone()),
             retained_layout_cache,
-            data_binding_targets: DocumentDataBindingSnapshotIndex::from(BTreeMap::new()),
+            data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(BTreeMap::new())),
             structural_data_reads: BTreeSet::new(),
             structural_data_read_aliases: Vec::new(),
             source_intents,
+            hit_route_static_cache_key: None,
         },
     );
     Ok(PreviewWorldEditorLayoutSnapshot {
@@ -42325,6 +42406,13 @@ struct PreviewSourceIntentRecord {
 
 #[derive(Clone, Debug)]
 struct PreviewHitRouteTable {
+    static_table: Arc<PreviewHitRouteStaticTable>,
+    state_summary: Option<Arc<Value>>,
+    route_key_source: &'static str,
+}
+
+#[derive(Debug)]
+struct PreviewHitRouteStaticTable {
     hit_table: Arc<boon_document::HitSideTable>,
     source_intents: Vec<PreviewSourceIntentRecord>,
     source_intents_by_node: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
@@ -42333,34 +42421,18 @@ struct PreviewHitRouteTable {
     hit_index_by_node: BTreeMap<String, usize>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
     source_intent_binding_paths_by_node: BTreeMap<String, Vec<(String, String)>>,
-    state_summary: Option<Arc<Value>>,
+}
+
+impl std::ops::Deref for PreviewHitRouteTable {
+    type Target = PreviewHitRouteStaticTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.static_table.as_ref()
+    }
 }
 
 impl PreviewHitRouteTable {
     fn from_shared(shared: &PreviewSharedRenderState) -> Option<Arc<Self>> {
-        if let Some(cache_key) = preview_hit_route_cache_key(shared) {
-            if let Some(cached) = preview_hit_route_cache()
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(&cache_key).cloned())
-            {
-                return Some(cached);
-            }
-            let table = Arc::new(Self::from_shared_uncached(shared)?);
-            if let Ok(mut cache) = preview_hit_route_cache().lock() {
-                if cache.len() >= 16
-                    && let Some(first_key) = cache.keys().next().cloned()
-                {
-                    cache.remove(&first_key);
-                }
-                cache.insert(cache_key, table.clone());
-            }
-            return Some(table);
-        }
-        Some(Arc::new(Self::from_shared_uncached(shared)?))
-    }
-
-    fn from_shared_uncached(shared: &PreviewSharedRenderState) -> Option<Self> {
         let layout_frame_hash = shared
             .layout_proof
             .get("layout_frame_hash")
@@ -42376,14 +42448,51 @@ impl PreviewHitRouteTable {
             .and_then(serde_json::Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
-        let state_summary = layout_proof_runtime_state_snapshot(&shared.layout_proof);
-        Self::from_snapshot_with_source_intents(
-            layout_frame_hash,
-            &snapshot,
-            layout_frame,
-            source_intents,
+        let state_summary = layout_proof_runtime_state_snapshot(&shared.layout_proof).map(Arc::new);
+        let route_key_source = if snapshot.hit_route_static_cache_key.is_some() {
+            "snapshot"
+        } else {
+            "computed"
+        };
+        let static_table = if let Some(cache_key) =
+            preview_hit_route_cache_key(shared, &snapshot, layout_frame, source_intents)
+        {
+            if let Some(cached) = preview_hit_route_cache()
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&cache_key).cloned())
+            {
+                cached
+            } else {
+                let table = Arc::new(Self::static_table_from_snapshot_with_source_intents(
+                    layout_frame_hash,
+                    &snapshot,
+                    layout_frame,
+                    source_intents,
+                )?);
+                if let Ok(mut cache) = preview_hit_route_cache().lock() {
+                    if cache.len() >= 16
+                        && let Some(first_key) = cache.keys().next().cloned()
+                    {
+                        cache.remove(&first_key);
+                    }
+                    cache.insert(cache_key, table.clone());
+                }
+                table
+            }
+        } else {
+            Arc::new(Self::static_table_from_snapshot_with_source_intents(
+                layout_frame_hash,
+                &snapshot,
+                layout_frame,
+                source_intents,
+            )?)
+        };
+        Some(Arc::new(Self {
+            static_table,
             state_summary,
-        )
+            route_key_source,
+        }))
     }
 
     fn from_layout_proof(layout_proof: &Value) -> Option<Self> {
@@ -42397,22 +42506,25 @@ impl PreviewHitRouteTable {
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
         let state_summary = layout_proof_runtime_state_snapshot(layout_proof);
-        Self::from_snapshot_with_source_intents(
+        let static_table = Arc::new(Self::static_table_from_snapshot_with_source_intents(
             layout_frame_hash,
             &snapshot,
             snapshot.layout_frame.as_ref(),
             source_intents,
-            state_summary,
-        )
+        )?);
+        Some(Self {
+            static_table,
+            state_summary: state_summary.map(Arc::new),
+            route_key_source: "layout_proof",
+        })
     }
 
-    fn from_snapshot_with_source_intents(
+    fn static_table_from_snapshot_with_source_intents(
         layout_frame_hash: &str,
         snapshot: &DocumentRenderSnapshot,
         layout_frame: &boon_document::LayoutFrame,
         source_intents: &[Value],
-        state_summary: Option<Value>,
-    ) -> Option<Self> {
+    ) -> Option<PreviewHitRouteStaticTable> {
         let source_intents = source_intents
             .iter()
             .filter_map(preview_source_intent_record)
@@ -42450,7 +42562,7 @@ impl PreviewHitRouteTable {
             .data_binding_targets
             .source_intent_binding_targets_by_node
             .clone();
-        Some(Self {
+        Some(PreviewHitRouteStaticTable {
             hit_table,
             source_intents,
             source_intents_by_node,
@@ -42459,7 +42571,6 @@ impl PreviewHitRouteTable {
             hit_index_by_node,
             text_binding_paths_by_node,
             source_intent_binding_paths_by_node,
-            state_summary: state_summary.map(Arc::new),
         })
     }
 
@@ -42530,43 +42641,62 @@ impl PreviewHitRouteTable {
         }
         let center_x = hit.bounds.x + hit.bounds.width / 2.0;
         let center_y = hit.bounds.y + hit.bounds.height / 2.0;
-        self.hit_table
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.node != hit.node)
-            .filter(|(_, candidate)| {
+        self.source_node_for_hit_bucket_candidates(
+            self.hit_table
+                .candidate_indices_at(hit.bounds.x, hit.bounds.y),
+            hit,
+            source_intents,
+            center_x,
+            center_y,
+            |candidate| {
                 rect_contains_typed(candidate.bounds, hit.bounds.x, hit.bounds.y)
                     && rect_contains_typed(
                         candidate.bounds,
                         hit.bounds.x + hit.bounds.width,
                         hit.bounds.y + hit.bounds.height,
                     )
+            },
+        )
+        .or_else(|| {
+            self.source_node_for_hit_bucket_candidates(
+                self.hit_table.candidate_indices_at(center_x, center_y),
+                hit,
+                source_intents,
+                center_x,
+                center_y,
+                |candidate| rect_contains_typed(candidate.bounds, center_x, center_y),
+            )
+        })
+    }
+
+    fn source_node_for_hit_bucket_candidates<F>(
+        &self,
+        candidate_indices: Option<&Vec<usize>>,
+        hit: &boon_document::HitSideTableEntry,
+        source_intents: &[&str],
+        center_x: f32,
+        center_y: f32,
+        contains: F,
+    ) -> Option<String>
+    where
+        F: Fn(&boon_document::HitSideTableEntry) -> bool,
+    {
+        candidate_indices?
+            .iter()
+            .filter_map(|index| {
+                self.hit_table
+                    .entries
+                    .get(*index)
+                    .map(|entry| (*index, entry))
             })
+            .filter(|(_, candidate)| candidate.node != hit.node)
+            .filter(|(_, candidate)| contains(candidate))
             .filter(|(_, candidate)| {
                 source_intents
                     .iter()
                     .any(|intent| self.node_has_source_intent(&candidate.node.0, intent))
             })
             .min_by(|left, right| compare_preview_hit_entries(left, right, center_x, center_y))
-            .or_else(|| {
-                self.hit_table
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.node != hit.node)
-                    .filter(|(_, candidate)| {
-                        rect_contains_typed(candidate.bounds, center_x, center_y)
-                    })
-                    .filter(|(_, candidate)| {
-                        source_intents
-                            .iter()
-                            .any(|intent| self.node_has_source_intent(&candidate.node.0, intent))
-                    })
-                    .min_by(|left, right| {
-                        compare_preview_hit_entries(left, right, center_x, center_y)
-                    })
-            })
             .map(|(_, entry)| entry.node.0.clone())
     }
 
@@ -43053,11 +43183,11 @@ impl PreviewHitRouteTable {
 }
 
 fn preview_hit_side_table_for_layout(
-    layout_frame_hash: &str,
+    _layout_frame_hash: &str,
     snapshot: &DocumentRenderSnapshot,
     layout_frame: &boon_document::LayoutFrame,
 ) -> Option<Arc<boon_document::HitSideTable>> {
-    let cache_key = preview_hit_side_table_cache_key(layout_frame_hash, layout_frame);
+    let cache_key = preview_hit_side_table_cache_key(snapshot, layout_frame);
     if let Some(cached) = preview_hit_side_table_cache()
         .lock()
         .ok()
@@ -43090,16 +43220,19 @@ fn preview_hit_side_table_cache()
 }
 
 fn preview_hit_side_table_cache_key(
-    layout_frame_hash: &str,
+    snapshot: &DocumentRenderSnapshot,
     layout_frame: &boon_document::LayoutFrame,
 ) -> String {
     format!(
-        "{layout_frame_hash}:{}",
-        preview_hit_region_geometry_fingerprint(layout_frame)
+        "{:016x}",
+        preview_hit_region_route_fingerprint(snapshot, layout_frame)
     )
 }
 
-fn preview_hit_region_geometry_fingerprint(layout_frame: &boon_document::LayoutFrame) -> u64 {
+fn preview_hit_region_route_fingerprint(
+    snapshot: &DocumentRenderSnapshot,
+    layout_frame: &boon_document::LayoutFrame,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     layout_frame.hit_regions.len().hash(&mut hasher);
     for hit in &layout_frame.hit_regions {
@@ -43109,16 +43242,71 @@ fn preview_hit_region_geometry_fingerprint(layout_frame: &boon_document::LayoutF
         hit.bounds.y.to_bits().hash(&mut hasher);
         hit.bounds.width.to_bits().hash(&mut hasher);
         hit.bounds.height.to_bits().hash(&mut hasher);
+        if let Some(hot) = snapshot.derived_indexes.hot_ids.ids_by_node.get(&hit.node) {
+            hot.0.hash(&mut hasher);
+            snapshot
+                .derived_indexes
+                .hot_ids
+                .generations
+                .get(hot)
+                .map(|generation| generation.0)
+                .hash(&mut hasher);
+            for binding in snapshot
+                .derived_indexes
+                .typed_bindings
+                .bindings_for_node(*hot)
+            {
+                binding.reference.node.0.hash(&mut hasher);
+                binding.reference.ordinal.hash(&mut hasher);
+                binding.binding_id.0.hash(&mut hasher);
+                binding.route.source_path.hash(&mut hasher);
+                binding.route.intent.hash(&mut hasher);
+                binding.intern_id.0.hash(&mut hasher);
+            }
+        }
+        if let Some(node) = snapshot.document_frame.nodes.get(&hit.node) {
+            document_route_style_u64_any(&node.style, &["row_key", "target_key", "__row_key"])
+                .hash(&mut hasher);
+            document_route_style_u64_any(
+                &node.style,
+                &[
+                    "row_generation",
+                    "target_generation",
+                    "generation",
+                    "__row_generation",
+                ],
+            )
+            .hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
 
-fn preview_hit_route_cache() -> &'static Mutex<BTreeMap<String, Arc<PreviewHitRouteTable>>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<PreviewHitRouteTable>>>> = OnceLock::new();
+fn document_route_style_u64_any(
+    style: &BTreeMap<String, boon_document_model::StyleValue>,
+    keys: &[&str],
+) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        style
+            .get(*key)
+            .and_then(style_number_from_value)
+            .filter(|value| *value >= 0.0)
+            .map(|value| value as u64)
+    })
+}
+
+fn preview_hit_route_cache() -> &'static Mutex<BTreeMap<String, Arc<PreviewHitRouteStaticTable>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<PreviewHitRouteStaticTable>>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn preview_hit_route_cache_key(shared: &PreviewSharedRenderState) -> Option<String> {
+fn preview_hit_route_cache_key(
+    shared: &PreviewSharedRenderState,
+    snapshot: &DocumentRenderSnapshot,
+    layout_frame: &boon_document::LayoutFrame,
+    source_intents: &[Value],
+) -> Option<String> {
     if shared.scroll_x_px.abs() > f64::EPSILON || shared.scroll_y_px.abs() > f64::EPSILON {
         return None;
     }
@@ -43134,11 +43322,91 @@ fn preview_hit_route_cache_key(shared: &PreviewSharedRenderState) -> Option<Stri
     {
         return None;
     }
-    shared
-        .layout_proof
-        .get("layout_frame_hash")
-        .and_then(serde_json::Value::as_str)
-        .map(|hash| format!("{hash}:{}", shared.update_count))
+    if let Some(key) = snapshot.hit_route_static_cache_key.as_ref() {
+        return Some(key.clone());
+    }
+    Some(preview_hit_route_cache_key_for_snapshot(
+        snapshot,
+        layout_frame,
+        source_intents,
+    ))
+}
+
+fn preview_hit_route_cache_key_for_snapshot(
+    snapshot: &DocumentRenderSnapshot,
+    layout_frame: &boon_document::LayoutFrame,
+    source_intents: &[Value],
+) -> String {
+    format!(
+        "{:016x}:{:016x}:{:016x}",
+        preview_hit_region_route_fingerprint(snapshot, layout_frame),
+        preview_source_intents_route_fingerprint(source_intents),
+        preview_display_route_fingerprint(layout_frame),
+    )
+}
+
+fn preview_source_intents_route_fingerprint(source_intents: &[Value]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source_intents.len().hash(&mut hasher);
+    for intent in source_intents {
+        intent
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .hash(&mut hasher);
+        intent
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .hash(&mut hasher);
+        intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            .hash(&mut hasher);
+        intent
+            .get("implicit")
+            .and_then(serde_json::Value::as_bool)
+            .hash(&mut hasher);
+        intent
+            .get("list_id")
+            .and_then(serde_json::Value::as_str)
+            .hash(&mut hasher);
+        for key in ["target_key", "target_generation", "source_id", "bind_epoch"] {
+            intent
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn preview_display_route_fingerprint(layout_frame: &boon_document::LayoutFrame) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    layout_frame.display_list.len().hash(&mut hasher);
+    for item in &layout_frame.display_list {
+        item.node.0.hash(&mut hasher);
+        preview_document_node_kind_route_code(&item.kind).hash(&mut hasher);
+        item.text.hash(&mut hasher);
+        item.focused.hash(&mut hasher);
+        display_style_bool(&item.style, "disabled").hash(&mut hasher);
+        display_item_has_focus_overlay_state(item).hash(&mut hasher);
+        display_style_text(&item.style, "link_url").hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn preview_document_node_kind_route_code(kind: &boon_document_model::DocumentNodeKind) -> u8 {
+    match kind {
+        boon_document_model::DocumentNodeKind::Root => 0,
+        boon_document_model::DocumentNodeKind::Stack => 1,
+        boon_document_model::DocumentNodeKind::Row => 2,
+        boon_document_model::DocumentNodeKind::Text => 3,
+        boon_document_model::DocumentNodeKind::Button => 4,
+        boon_document_model::DocumentNodeKind::Checkbox => 5,
+        boon_document_model::DocumentNodeKind::TextInput => 6,
+        boon_document_model::DocumentNodeKind::Table => 7,
+        boon_document_model::DocumentNodeKind::TableCell => 8,
+        boon_document_model::DocumentNodeKind::ScrollRoot => 9,
+    }
 }
 
 fn preview_source_intent_record(value: &Value) -> Option<PreviewSourceIntentRecord> {
@@ -45005,6 +45273,7 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
         layout_frame_hash,
         DocumentRenderSnapshot {
             document_frame: snapshot.document_frame.clone(),
+            runtime_document_state_values: snapshot.runtime_document_state_values.clone(),
             derived_indexes: Arc::clone(&snapshot.derived_indexes),
             layout_frame: Arc::new(layout.clone()),
             retained_layout_cache,
@@ -45012,6 +45281,7 @@ fn preview_try_relayout_cached_document_frame_for_viewport(
             structural_data_reads: snapshot.structural_data_reads.clone(),
             structural_data_read_aliases: snapshot.structural_data_read_aliases.clone(),
             source_intents: snapshot.source_intents.clone(),
+            hit_route_static_cache_key: None,
         },
     );
     Ok(Some((proof, layout)))
@@ -46676,6 +46946,34 @@ fn preview_style_attr_is_render_scene_identity_only(attr: &str) -> bool {
     matches!(attr, "selected")
 }
 
+fn preview_direct_patch_targets_preserve_hit_route(
+    targets: &[DocumentDirectLayoutPatchTarget],
+) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            let attr = target.target.attr.as_str();
+            attr.strip_prefix("__source_intent:")
+                .is_none_or(preview_source_intent_payload_attr_preserves_hit_route)
+                && !matches!(
+                    attr,
+                    "source_intent"
+                        | "source_binding"
+                        | "__source_binding"
+                        | "disabled"
+                        | "focus"
+                        | "link_url"
+                        | "__focused"
+                        | "caret_column"
+                        | "caret_visible"
+                )
+                && !preview_style_attr_affects_layout(attr)
+        })
+}
+
+fn preview_source_intent_payload_attr_preserves_hit_route(intent: &str) -> bool {
+    matches!(intent, "target" | "address")
+}
+
 fn preview_geometry_render_scene_patch_operation_for_touched_nodes(
     layout: &boon_document::LayoutFrame,
     touched_node_ids: &BTreeSet<boon_document_model::DocumentNodeId>,
@@ -46787,7 +47085,12 @@ fn preview_try_patch_paint_space_for_root_deltas(
             record_preview_paint_space_patch_reject("unsupported_patch_value");
             return Ok(None);
         };
-        let targets = document_snapshot_data_binding_targets(&snapshot, &path);
+        let targets = document_snapshot_data_binding_targets_for_patch(
+            &snapshot,
+            &path,
+            previous_state_summary,
+            &value,
+        );
         if targets.is_empty() {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
             continue;
@@ -47184,12 +47487,22 @@ fn preview_try_patch_paint_space_for_root_deltas(
         proof["source_intent_value_index"] = source_intent_value_index;
     }
     layout_patch_profile.proof_build_ms = elapsed_ms(proof_build_started);
+    let hit_route_static_cache_key =
+        if preview_direct_patch_targets_preserve_hit_route(&direct_patch_targets) {
+            snapshot.hit_route_static_cache_key.clone()
+        } else {
+            None
+        };
     let source_intents = source_intents.unwrap_or_else(|| snapshot.source_intents.clone());
     let snapshot_cache_started = Instant::now();
     cache_document_render_snapshot(
         layout_frame_hash.clone(),
         DocumentRenderSnapshot {
             document_frame: frame,
+            runtime_document_state_values: document_static_equality_state_values(
+                &snapshot.data_binding_targets,
+                Some(state_summary),
+            ),
             derived_indexes,
             layout_frame: Arc::clone(&layout),
             retained_layout_cache,
@@ -47197,6 +47510,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
             structural_data_reads: snapshot.structural_data_reads.clone(),
             structural_data_read_aliases: snapshot.structural_data_read_aliases.clone(),
             source_intents,
+            hit_route_static_cache_key,
         },
     );
     if let Some(render_scene_patch) = render_scene_patch {
@@ -47398,6 +47712,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
     let mut document_patches = Vec::new();
+    let mut source_intent_route_changed = false;
     let collect_patch_samples = full_proof || !preview_compact_timing_enabled();
     let document_frame_patch_started = Instant::now();
     for patch in patches {
@@ -47407,7 +47722,12 @@ fn preview_try_patch_document_layout_for_root_deltas(
                     .into(),
             );
         };
-        let targets = document_snapshot_data_binding_targets(&snapshot, &path);
+        let targets = document_snapshot_data_binding_targets_for_patch(
+            &snapshot,
+            &path,
+            previous_state_summary,
+            &value,
+        );
         if targets.is_empty() {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
             continue;
@@ -47450,6 +47770,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
                 value: patch_value.clone(),
             });
             if let Some(intent) = patch_target.attr.strip_prefix("__source_intent:") {
+                if !preview_source_intent_payload_attr_preserves_hit_route(intent) {
+                    source_intent_route_changed = true;
+                }
                 let source_path = json_value_to_document_source_path(&patch_value);
                 if source_path.trim().is_empty() {
                     continue;
@@ -47841,10 +48164,21 @@ fn preview_try_patch_document_layout_for_root_deltas(
     layout_patch_profile.snapshot_cache_layout_clone_ms =
         elapsed_ms(snapshot_cache_layout_clone_started);
     let patched_layout_frame_hash = layout_frame_hash.clone();
+    let hit_route_static_cache_key = if !source_intent_route_changed
+        && preview_direct_patch_targets_preserve_hit_route(&direct_patch_targets)
+    {
+        snapshot.hit_route_static_cache_key.clone()
+    } else {
+        None
+    };
     cache_document_render_snapshot(
         patched_layout_frame_hash.clone(),
         DocumentRenderSnapshot {
             document_frame: frame,
+            runtime_document_state_values: document_static_equality_state_values(
+                &snapshot.data_binding_targets,
+                Some(state_summary),
+            ),
             derived_indexes,
             layout_frame: snapshot_layout_frame,
             retained_layout_cache,
@@ -47852,6 +48186,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
             structural_data_reads: snapshot.structural_data_reads.clone(),
             structural_data_read_aliases: snapshot.structural_data_read_aliases.clone(),
             source_intents,
+            hit_route_static_cache_key,
         },
     );
     if let Some(render_scene_patch) = render_scene_patch {
@@ -48083,12 +48418,81 @@ fn document_snapshot_data_binding_targets<'a>(
     document_snapshot_data_binding_targets_slow(snapshot, path)
 }
 
+fn document_snapshot_data_binding_targets_for_patch<'a>(
+    snapshot: &'a DocumentRenderSnapshot,
+    path: &str,
+    previous_state_summary: Option<&Value>,
+    value: &Value,
+) -> Vec<&'a DocumentDataBindingTarget> {
+    let aliases = document_data_path_aliases(path);
+    if aliases
+        .iter()
+        .any(|alias| alias.starts_with("@list:") || alias.starts_with("@row:"))
+    {
+        return document_snapshot_data_binding_targets(snapshot, path);
+    }
+
+    let mut matched = Vec::new();
+    let mut saw_indexed_binding_path = false;
+    for binding_path in snapshot.data_binding_targets.targets.keys() {
+        if !aliases
+            .iter()
+            .any(|alias| document_data_paths_overlap_normalized(alias, binding_path))
+        {
+            continue;
+        }
+        saw_indexed_binding_path = true;
+        if let Some(targets) = snapshot
+            .data_binding_targets
+            .non_static_targets
+            .get(binding_path)
+        {
+            push_unique_document_data_binding_targets(&mut matched, targets);
+        }
+        let Some(static_targets_by_value) = snapshot
+            .data_binding_targets
+            .static_equality_targets
+            .get(binding_path)
+        else {
+            continue;
+        };
+        let mut pushed_static_targets = false;
+        for alias in &aliases {
+            if let Some(previous_value) = previous_state_summary
+                .and_then(|summary| state_summary_value_for_data_path(summary, alias))
+                .or_else(|| snapshot.runtime_document_state_values.get(alias))
+                && let Ok(previous_key) = document_static_equality_value_key(previous_value)
+                && let Some(targets) = static_targets_by_value.get(&previous_key)
+            {
+                push_unique_document_data_binding_targets(&mut matched, targets);
+                pushed_static_targets = true;
+            }
+        }
+        if let Ok(next_key) = document_static_equality_value_key(value)
+            && let Some(targets) = static_targets_by_value.get(&next_key)
+        {
+            push_unique_document_data_binding_targets(&mut matched, targets);
+            pushed_static_targets = true;
+        }
+        if !pushed_static_targets {
+            for targets in static_targets_by_value.values() {
+                push_unique_document_data_binding_targets(&mut matched, targets);
+            }
+        }
+    }
+
+    if saw_indexed_binding_path {
+        return matched;
+    }
+    document_snapshot_data_binding_targets(snapshot, path)
+}
+
 fn document_snapshot_data_binding_targets_slow<'a>(
     snapshot: &'a DocumentRenderSnapshot,
     path: &str,
 ) -> Vec<&'a DocumentDataBindingTarget> {
     let mut matched = Vec::new();
-    for (binding_path, targets) in &snapshot.data_binding_targets {
+    for (binding_path, targets) in snapshot.data_binding_targets.iter() {
         if binding_path == path || document_data_paths_overlap(path, binding_path) {
             push_unique_document_data_binding_targets(&mut matched, targets);
         }
@@ -53159,6 +53563,7 @@ mod tests {
             hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout_frame),
                 retained_layout_cache,
@@ -53167,7 +53572,8 @@ mod tests {
                 ),
                 structural_data_reads,
                 source_intents: Vec::new(),
-                data_binding_targets: data_binding_targets.into(),
+                data_binding_targets: Arc::new(data_binding_targets.into()),
+                hit_route_static_cache_key: None,
             },
         );
         json!({ "layout_frame_hash": hash })
@@ -53688,20 +54094,23 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::from([(
-                    "store.color".to_owned(),
-                    vec![DocumentDataBindingTarget {
-                        node: boon_document_model::DocumentNodeId("label".to_owned()),
-                        attr: "color".to_owned(),
-                    }],
-                )])
-                .into(),
+                data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
+                    BTreeMap::from([(
+                        "store.color".to_owned(),
+                        vec![DocumentDataBindingTarget {
+                            node: boon_document_model::DocumentNodeId("label".to_owned()),
+                            attr: "color".to_owned(),
+                        }],
+                    )]),
+                )),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -53800,20 +54209,23 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::from([(
-                    "store.label".to_owned(),
-                    vec![DocumentDataBindingTarget {
-                        node: boon_document_model::DocumentNodeId("label".to_owned()),
-                        attr: "text".to_owned(),
-                    }],
-                )])
-                .into(),
+                data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
+                    BTreeMap::from([(
+                        "store.label".to_owned(),
+                        vec![DocumentDataBindingTarget {
+                            node: boon_document_model::DocumentNodeId("label".to_owned()),
+                            attr: "text".to_owned(),
+                        }],
+                    )]),
+                )),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -53910,20 +54322,23 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::from([(
-                    "store.count".to_owned(),
-                    vec![DocumentDataBindingTarget {
-                        node: boon_document_model::DocumentNodeId("counter-value".to_owned()),
-                        attr: "text".to_owned(),
-                    }],
-                )])
-                .into(),
+                data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
+                    BTreeMap::from([(
+                        "store.count".to_owned(),
+                        vec![DocumentDataBindingTarget {
+                            node: boon_document_model::DocumentNodeId("counter-value".to_owned()),
+                            attr: "text".to_owned(),
+                        }],
+                    )]),
+                )),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -54038,29 +54453,32 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::from([
-                    (
-                        "store.label".to_owned(),
-                        vec![DocumentDataBindingTarget {
-                            node: boon_document_model::DocumentNodeId("label".to_owned()),
-                            attr: "text".to_owned(),
-                        }],
-                    ),
-                    (
-                        "store.panel_width".to_owned(),
-                        vec![DocumentDataBindingTarget {
-                            node: boon_document_model::DocumentNodeId("panel".to_owned()),
-                            attr: "width".to_owned(),
-                        }],
-                    ),
-                ])
-                .into(),
+                data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(
+                    BTreeMap::from([
+                        (
+                            "store.label".to_owned(),
+                            vec![DocumentDataBindingTarget {
+                                node: boon_document_model::DocumentNodeId("label".to_owned()),
+                                attr: "text".to_owned(),
+                            }],
+                        ),
+                        (
+                            "store.panel_width".to_owned(),
+                            vec![DocumentDataBindingTarget {
+                                node: boon_document_model::DocumentNodeId("panel".to_owned()),
+                                attr: "width".to_owned(),
+                            }],
+                        ),
+                    ]),
+                )),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -54652,13 +55070,15 @@ mod tests {
         .unwrap();
         let snapshot = DocumentRenderSnapshot {
             document_frame,
+            runtime_document_state_values: BTreeMap::new(),
             derived_indexes,
             layout_frame: Arc::new(layout_frame),
             retained_layout_cache,
             structural_data_reads: BTreeSet::new(),
             structural_data_read_aliases: Vec::new(),
             source_intents: Vec::new(),
-            data_binding_targets: data_binding_targets.into(),
+            data_binding_targets: Arc::new(data_binding_targets.into()),
+            hit_route_static_cache_key: None,
         };
 
         let mut attrs =
@@ -54812,13 +55232,15 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::clone(&layout_arc),
                 retained_layout_cache: Arc::clone(&retained_layout_cache),
-                data_binding_targets: data_binding_targets.into(),
+                data_binding_targets: Arc::new(data_binding_targets.into()),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents,
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -54910,13 +55332,15 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout),
                 retained_layout_cache,
-                data_binding_targets: data_binding_targets.into(),
+                data_binding_targets: Arc::new(data_binding_targets.into()),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let proof = json!({
@@ -54996,13 +55420,15 @@ mod tests {
             layout_hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout.clone()),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::new().into(),
+                data_binding_targets: Arc::new(BTreeMap::new().into()),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents,
+                hit_route_static_cache_key: None,
             },
         );
         let previous = json!({
@@ -72404,6 +72830,76 @@ document:
     }
 
     #[test]
+    fn static_equality_patch_lookup_uses_old_and_new_value_index() {
+        let mut data_binding_targets = BTreeMap::new();
+        data_binding_targets.insert(
+            "store.selected_address".to_owned(),
+            vec![
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("row-old".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("A0")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("row-new".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("B0")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("row-unchanged".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("C0")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("formula-bar".to_owned()),
+                    attr: "text".to_owned(),
+                },
+            ],
+        );
+        let document_frame = boon_document_model::DocumentFrame::empty("root");
+        let derived_indexes = document_derived_indexes_for_frame(&document_frame).unwrap();
+        let layout_frame = boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree { node_count: 0 },
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let retained_layout_cache = retained_layout_cache_for_document_layout(
+            &document_frame,
+            &derived_indexes,
+            &layout_frame,
+        )
+        .unwrap();
+        let runtime_document_state_values =
+            BTreeMap::from([("store.selected_address".to_owned(), json!("A0"))]);
+        let snapshot = DocumentRenderSnapshot {
+            document_frame,
+            runtime_document_state_values,
+            derived_indexes,
+            layout_frame: Arc::new(layout_frame),
+            retained_layout_cache,
+            structural_data_reads: BTreeSet::new(),
+            structural_data_read_aliases: Vec::new(),
+            source_intents: Vec::new(),
+            data_binding_targets: Arc::new(data_binding_targets.into()),
+            hit_route_static_cache_key: None,
+        };
+
+        let mut nodes = document_snapshot_data_binding_targets_for_patch(
+            &snapshot,
+            "store.selected_address",
+            None,
+            &json!("B0"),
+        )
+        .into_iter()
+        .map(|target| target.node.0.as_str())
+        .collect::<Vec<_>>();
+        nodes.sort_unstable();
+
+        assert_eq!(nodes, vec!["formula-bar", "row-new", "row-old"]);
+    }
+
+    #[test]
     fn static_equality_binding_prunes_from_retained_frame_without_state_snapshot() {
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let insert_node =
@@ -76670,13 +77166,15 @@ document:
             hash.to_owned(),
             DocumentRenderSnapshot {
                 document_frame,
+                runtime_document_state_values: BTreeMap::new(),
                 derived_indexes,
                 layout_frame: Arc::new(layout_frame.clone()),
                 retained_layout_cache,
-                data_binding_targets: BTreeMap::new().into(),
+                data_binding_targets: Arc::new(BTreeMap::new().into()),
                 structural_data_reads: BTreeSet::new(),
                 structural_data_read_aliases: Vec::new(),
                 source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
             },
         );
         let layout_proof = json!({ "layout_frame_hash": hash });

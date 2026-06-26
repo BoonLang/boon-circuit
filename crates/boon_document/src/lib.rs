@@ -309,6 +309,10 @@ impl HitSideTable {
     pub fn bucket_indices(&self, bucket: HitSpatialBucket) -> Option<&Vec<usize>> {
         self.buckets.get(&hit_bucket_key(bucket))
     }
+
+    pub fn candidate_indices_at(&self, x: f32, y: f32) -> Option<&Vec<usize>> {
+        self.bucket_indices(hit_bucket_for_point(x, y, self.bucket_size))
+    }
 }
 
 fn hit_bucket_for_point(x: f32, y: f32, bucket_size: f32) -> HitSpatialBucket {

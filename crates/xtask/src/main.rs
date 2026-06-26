@@ -46322,24 +46322,50 @@ fn verify_native_cells_interaction_speed(
             .then(|| "interaction-speed role contained a failing step".to_owned()),
     );
 
+    let workflow_coverage_pass = role_report_json.as_ref().is_some_and(|report| {
+        report
+            .get("workflow_coverage_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    let workflow_event_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("workflow_event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let workflow_checks = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("workflow_checks"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:workflow-coverage",
+        workflow_coverage_pass && workflow_event_count >= 6,
+        format!(
+            "workflow_coverage_pass={workflow_coverage_pass}, workflow_event_count={workflow_event_count}"
+        ),
+        (!(workflow_coverage_pass && workflow_event_count >= 6)).then(|| {
+            "Cells interaction speed gate must cover selection, explicit cell editing, range formula commit, dependency update, and formula-bar sync".to_owned()
+        }),
+    );
+
     let selected_address = role_report_json
         .as_ref()
         .and_then(|report| report.get("selected_address"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("missing")
         .to_owned();
-    let focused_b0 = selected_address == "B0";
+    let final_state_observed = selected_address != "missing";
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "cells-interaction-speed:b0-focused",
-        focused_b0,
+        "cells-interaction-speed:final-state-observed",
+        final_state_observed,
         format!("selected_address={selected_address}"),
-        (!focused_b0).then(|| {
-            format!(
-                "Cells focus interaction did not select B0; selected_address={selected_address}"
-            )
-        }),
+        (!final_state_observed)
+            .then(|| "Cells interaction role did not expose a final selected address".to_owned()),
     );
 
     let p95_ms = role_report_json
@@ -46384,16 +46410,21 @@ fn verify_native_cells_interaction_speed(
         .and_then(|report| report.get("preview_shared_render_update_count"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default();
-    let render_update_ok = render_update_count >= event_count;
+    let measured_event_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(event_count);
+    let render_update_ok = render_update_count >= measured_event_count;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "cells-interaction-speed:render-updated-for-each-click",
         render_update_ok,
-        format!("render_update_count={render_update_count}, event_count={event_count}"),
+        format!("render_update_count={render_update_count}, event_count={measured_event_count}"),
         (!render_update_ok).then(|| {
             format!(
-                "Cells interaction render updates lagged clicks: render_update_count={render_update_count}, event_count={event_count}"
+                "Cells interaction render updates lagged clicks: render_update_count={render_update_count}, event_count={measured_event_count}"
             )
         }),
     );
@@ -46449,7 +46480,26 @@ fn verify_native_cells_interaction_speed(
                 .and_then(|report| report.get("status"))
                 .cloned()
                 .unwrap_or_else(|| json!("missing")),
-            "event_count": event_count,
+            "event_count": measured_event_count,
+            "requested_event_count": event_count,
+            "workflow_event_count": workflow_event_count,
+            "workflow_coverage_pass": workflow_coverage_pass,
+            "workflow_checks": workflow_checks,
+            "workflow_event_records": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("workflow_event_records"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "workflow_latency_ms_p95": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("workflow_latency_ms_p95"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY),
+            "workflow_latency_ms_max": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("workflow_latency_ms_max"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY),
             "selected_address": selected_address,
             "interaction_latency_ms_p95": p95_ms,
             "interaction_latency_ms_max": max_ms,
@@ -46471,6 +46521,11 @@ fn verify_native_cells_interaction_speed(
                 .unwrap_or(0),
             "native_input_timing_samples": native_input_timing_samples,
             "native_input_reject_counts": native_input_reject_counts,
+            "stage_counters": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("stage_counters"))
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
             "targets": {
                 "debug": {
                     "focus_p95_ms": 120.0,
@@ -49971,12 +50026,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     }),
             );
             if report
-                .get("selected_address")
-                .and_then(serde_json::Value::as_str)
-                != Some("B0")
+                .get("workflow_coverage_pass")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
             {
-                blockers.push("selected_address must be B0".to_owned());
+                blockers.push("workflow_coverage_pass must be true".to_owned());
             }
+            require_u64_at_least(&mut blockers, report, "workflow_event_count", 6);
         }
         "novywave-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);

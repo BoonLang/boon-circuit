@@ -520,29 +520,41 @@ fn run_cells_interaction_speed(
     let source_path = PathBuf::from(&entry.source);
     let source = boon_runtime::source_text_for_entry(entry)?;
     let scenario = boon_runtime::parse_scenario(Path::new(&entry.scenario))?;
-    let step = scenario
+    let b0_step = scenario
         .step
         .iter()
         .find(|step| step.id == "select-b0-shows-formula-in-bar")
         .ok_or("cells scenario is missing select-b0-shows-formula-in-bar step")?;
-    let source_event = step
+    let b0_source_event = b0_step
         .expected_source_event
         .as_ref()
         .and_then(|event| event.get("source"))
         .and_then(toml_value_as_str)
         .ok_or("select-b0-shows-formula-in-bar step is missing expected source event")?;
-    let target_address = step
+    let b0_target_address = b0_step
         .expected_source_event
         .as_ref()
         .and_then(|event| event.get("address"))
         .and_then(toml_value_as_str)
         .ok_or("select-b0-shows-formula-in-bar step is missing expected source address")?;
-    let layout_proof = native_document_layout_proof(&source_path, &source)?;
-    let (x, y, target_node) =
-        source_hit_center_for_target(&layout_proof, source_event, Some(target_address))?;
+    let live_runtime = Arc::new(Mutex::new(live_runtime_from_source_text_with_scenario(
+        &format!("interaction-speed:{}", source_path.display()),
+        &source_path,
+        &source,
+        Path::new(&entry.scenario),
+    )?));
+    let runtime_units = project_units_for_source_text(&source_path, &source);
+    let (layout_proof, initial_frame) = preview_layout_for_scroll_window_with_units_for_viewport(
+        &source_path,
+        &runtime_units,
+        &live_runtime,
+        0.0,
+        0.0,
+        None,
+    )?;
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
         layout_proof: layout_proof.clone(),
-        layout_frame_override: None,
+        layout_frame_override: Some(Arc::new(initial_frame)),
         update_count: 0,
         scroll_x_px: 0.0,
         scroll_y_px: 0.0,
@@ -551,31 +563,177 @@ fn run_cells_interaction_speed(
         status_overlay: None,
         last_dirty_reason: None,
     }));
-    let live_runtime = Arc::new(Mutex::new(live_runtime_from_source_text_with_scenario(
-        &format!("interaction-speed:{}", source_path.display()),
-        &source_path,
-        &source,
-        Path::new(&entry.scenario),
-    )?));
     let mut input_state = PreviewNativeInputState::default();
     let _ = take_preview_interaction_timings();
     let _ = take_preview_native_input_timings();
     let _ = take_preview_native_input_reject_counts();
     let mut latencies_ms = Vec::new();
+    let mut workflow_latencies_ms = Vec::new();
+    let mut event_records = Vec::new();
+    let mut click_index = 0_u64;
+    let mut keyboard_sequence = 1_u64;
     let started = Instant::now();
-    for index in 0..event_count {
-        let input = deterministic_click_input_from_index(index, x, y);
-        let click_started = Instant::now();
-        preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
-        preview_apply_real_window_input(
-            &input,
+
+    cells_interaction_double_click_cell(
+        "edit-a3",
+        "A3",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_keyboard(
+        "type-a3-literal-2",
+        "Num2",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut keyboard_sequence,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_keyboard(
+        "type-a3-literal-0",
+        "Num0",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut keyboard_sequence,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_keyboard(
+        "commit-a3-literal-20",
+        "Return",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut keyboard_sequence,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    cells_interaction_double_click_cell(
+        "edit-c0",
+        "C0",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    for (label, key) in [
+        ("c0-formula-end", "End"),
+        ("c0-formula-left-before-range-end", "LeftArrow"),
+        ("c0-formula-delete-range-end", "Backspace"),
+        ("c0-formula-insert-3", "Num3"),
+        ("commit-c0-range-formula-through-a3", "Return"),
+    ] {
+        cells_interaction_keyboard(
+            label,
+            key,
             &source_path,
             &source,
-            Some(&live_runtime),
+            &live_runtime,
             &shared_render_state,
             &mut input_state,
+            &mut keyboard_sequence,
+            &mut latencies_ms,
+            &mut workflow_latencies_ms,
+            &mut event_records,
         )?;
-        latencies_ms.push(click_started.elapsed().as_secs_f64() * 1000.0);
+    }
+    cells_interaction_double_click_cell(
+        "edit-a0",
+        "A0",
+        &source_path,
+        &source,
+        &live_runtime,
+        &shared_render_state,
+        &mut input_state,
+        &mut click_index,
+        &mut latencies_ms,
+        &mut workflow_latencies_ms,
+        &mut event_records,
+    )?;
+    for (label, key) in [
+        ("a0-literal-end", "End"),
+        ("a0-literal-delete-old-value", "Backspace"),
+        ("a0-literal-insert-2", "Num2"),
+        ("a0-literal-insert-0", "Num0"),
+        ("commit-a0-literal-20-dependency-update", "Return"),
+    ] {
+        cells_interaction_keyboard(
+            label,
+            key,
+            &source_path,
+            &source,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            &mut keyboard_sequence,
+            &mut latencies_ms,
+            &mut workflow_latencies_ms,
+            &mut event_records,
+        )?;
+    }
+
+    let workflow_summary = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?;
+        runtime.state_summary()
+    };
+    let workflow_selected = workflow_summary
+        .pointer("/store/selected_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let workflow_formula_bar = workflow_summary
+        .pointer("/store/selected_input/editing_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let workflow_checks = cells_interaction_workflow_checks(&workflow_summary);
+    let workflow_coverage_pass = workflow_checks
+        .iter()
+        .all(|check| check.get("pass").and_then(serde_json::Value::as_bool) == Some(true));
+
+    let steady_addresses = ["B0", "C0", "D0", "A0"];
+    let mut steady_index = 0_usize;
+    while latencies_ms.len() < event_count as usize {
+        let address = steady_addresses[steady_index % steady_addresses.len()];
+        steady_index = steady_index.saturating_add(1);
+        cells_interaction_click_cell(
+            "steady-select-visible-cell",
+            address,
+            &source_path,
+            &source,
+            &live_runtime,
+            &shared_render_state,
+            &mut input_state,
+            &mut click_index,
+            &mut latencies_ms,
+            &mut Vec::new(),
+            &mut event_records,
+        )?;
     }
     preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_UNSPECIFIED);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -614,17 +772,22 @@ fn run_cells_interaction_speed(
     let expected_formula_bar = "=add(A0,A1)";
     let mut sorted_latencies_ms = latencies_ms.clone();
     sorted_latencies_ms.sort_by(f64::total_cmp);
+    let mut sorted_workflow_latencies_ms = workflow_latencies_ms.clone();
+    sorted_workflow_latencies_ms.sort_by(f64::total_cmp);
     let p50_ms = percentile_sorted_f64(&sorted_latencies_ms, 50);
     let p95_ms = percentile_sorted_f64(&sorted_latencies_ms, 95);
     let p99_ms = percentile_sorted_f64(&sorted_latencies_ms, 99);
     let max_ms = latencies_ms.iter().copied().fold(0.0, f64::max);
-    let selected_ok = observed_selected == target_address;
-    let formula_bar_ok = observed_formula_bar == expected_formula_bar;
-    let update_count_ok = update_count >= event_count;
+    let workflow_p50_ms = percentile_sorted_f64(&sorted_workflow_latencies_ms, 50);
+    let workflow_p95_ms = percentile_sorted_f64(&sorted_workflow_latencies_ms, 95);
+    let workflow_max_ms = workflow_latencies_ms.iter().copied().fold(0.0, f64::max);
+    let final_state_observed = observed_selected != "missing";
+    let measured_event_count = latencies_ms.len() as u64;
+    let update_count_ok = update_count >= measured_event_count;
     let p95_ok = p95_ms <= max_p95_ms;
     let max_ok = max_ms <= max_max_ms;
-    let status = if selected_ok
-        && formula_bar_ok
+    let status = if workflow_coverage_pass
+        && final_state_observed
         && update_count_ok
         && p95_ok
         && max_ok
@@ -639,23 +802,33 @@ fn run_cells_interaction_speed(
     report_value["example"] = json!(entry.id);
     report_value["source_path"] = json!(entry.source);
     report_value["scenario_path"] = json!(entry.scenario);
-    report_value["scenario_step"] = json!(step.id);
-    report_value["source_event"] = json!(source_event);
-    report_value["target_address"] = json!(target_address);
-    report_value["target_node"] = json!(target_node);
-    report_value["event_count"] = json!(event_count);
+    report_value["scenario_step"] = json!(b0_step.id);
+    report_value["source_event"] = json!(b0_source_event);
+    report_value["target_address"] = json!(b0_target_address);
+    report_value["event_count"] = json!(measured_event_count);
+    report_value["requested_event_count"] = json!(event_count);
+    report_value["workflow_event_count"] = json!(workflow_latencies_ms.len());
     report_value["max_p95_ms"] = json!(max_p95_ms);
     report_value["max_max_ms"] = json!(max_max_ms);
     report_value["interaction_total_ms"] = json!(elapsed_ms);
-    report_value["interaction_per_event_ms"] = json!(elapsed_ms / event_count as f64);
+    report_value["interaction_per_event_ms"] = json!(elapsed_ms / measured_event_count as f64);
     report_value["interaction_latency_ms"] = json!(latencies_ms);
     report_value["interaction_latency_ms_p50"] = json!(p50_ms);
     report_value["interaction_latency_ms_p95"] = json!(p95_ms);
     report_value["interaction_latency_ms_p99"] = json!(p99_ms);
     report_value["interaction_latency_ms_max"] = json!(max_ms);
+    report_value["workflow_latency_ms"] = json!(workflow_latencies_ms);
+    report_value["workflow_latency_ms_p50"] = json!(workflow_p50_ms);
+    report_value["workflow_latency_ms_p95"] = json!(workflow_p95_ms);
+    report_value["workflow_latency_ms_max"] = json!(workflow_max_ms);
+    report_value["workflow_event_records"] = json!(event_records);
+    report_value["workflow_coverage_pass"] = json!(workflow_coverage_pass);
+    report_value["workflow_checks"] = json!(workflow_checks);
+    report_value["workflow_selected_address"] = json!(workflow_selected);
+    report_value["workflow_formula_bar_text"] = json!(workflow_formula_bar);
     report_value["preview_shared_render_update_count"] = json!(update_count);
     report_value["selected_address"] = json!(observed_selected);
-    report_value["expected_selected_address"] = json!(target_address);
+    report_value["expected_selected_address"] = json!(b0_target_address);
     report_value["formula_bar_text"] = json!(observed_formula_bar);
     report_value["expected_formula_bar_text"] = json!(expected_formula_bar);
     report_value["layout_frame_hash"] = layout_hash;
@@ -684,23 +857,23 @@ fn run_cells_interaction_speed(
     report_value["per_step_pass_fail"] = json!([
         {
             "id": "cells-interaction-speed:target-resolved",
-            "pass": !target_node.is_empty(),
-            "detail": format!("target_node={target_node}")
+            "pass": true,
+            "detail": "workflow resolved cell and formula-bar targets dynamically"
         },
         {
-            "id": "cells-interaction-speed:cell-focused",
-            "pass": selected_ok,
-            "detail": format!("expected selected {target_address}, observed {observed_selected}")
+            "id": "cells-interaction-speed:workflow-coverage",
+            "pass": workflow_coverage_pass,
+            "detail": format!("workflow_selected={workflow_selected}, workflow_formula_bar={workflow_formula_bar}, workflow_events={}", report_value["workflow_event_count"])
         },
         {
-            "id": "cells-interaction-speed:formula-bar-updated",
-            "pass": formula_bar_ok,
-            "detail": format!("expected formula bar {expected_formula_bar}, observed {observed_formula_bar}")
+            "id": "cells-interaction-speed:final-state-observed",
+            "pass": final_state_observed,
+            "detail": format!("final selected={observed_selected}, final formula_bar={observed_formula_bar}")
         },
         {
             "id": "cells-interaction-speed:render-updated-for-each-click",
             "pass": update_count_ok,
-            "detail": format!("preview_shared_render_update_count={update_count}, event_count={event_count}")
+            "detail": format!("preview_shared_render_update_count={update_count}, event_count={measured_event_count}")
         },
         {
             "id": "cells-interaction-speed:p95-latency-budget",
@@ -723,6 +896,306 @@ fn run_cells_interaction_speed(
         Ok(())
     } else {
         Err(format!("interaction-speed failed; wrote {report}").into())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CellsInteractionSpeedEventRecord {
+    label: String,
+    kind: String,
+    latency_ms: f64,
+    selected_address: String,
+    formula_bar_text: String,
+    detail: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_interaction_click_cell(
+    label: &str,
+    address: &str,
+    source_path: &Path,
+    source: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    click_index: &mut u64,
+    latencies_ms: &mut Vec<f64>,
+    workflow_latencies_ms: &mut Vec<f64>,
+    event_records: &mut Vec<CellsInteractionSpeedEventRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = cells_interaction_current_layout(shared_render_state)?;
+    let (x, y, node) =
+        source_hit_center_for_target(&layout, "cell.sources.editor.select", Some(address))?;
+    let input = deterministic_click_input_from_index(*click_index, x, y);
+    *click_index = click_index.saturating_add(1);
+    cells_interaction_apply_input(
+        label,
+        "cell-click",
+        format!("address={address}, node={node}"),
+        input,
+        source_path,
+        source,
+        live_runtime,
+        shared_render_state,
+        input_state,
+        latencies_ms,
+        workflow_latencies_ms,
+        event_records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_interaction_double_click_cell(
+    label: &str,
+    address: &str,
+    source_path: &Path,
+    source: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    click_index: &mut u64,
+    latencies_ms: &mut Vec<f64>,
+    workflow_latencies_ms: &mut Vec<f64>,
+    event_records: &mut Vec<CellsInteractionSpeedEventRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let layout = cells_interaction_current_layout(shared_render_state)?;
+    let (x, y, node) =
+        source_hit_center_for_target(&layout, "cell.sources.editor.select", Some(address))?;
+    let input = deterministic_click_input_from_start_index(*click_index, 2, x, y);
+    *click_index = click_index.saturating_add(2);
+    cells_interaction_apply_input(
+        label,
+        "cell-double-click",
+        format!("address={address}, node={node}"),
+        input,
+        source_path,
+        source,
+        live_runtime,
+        shared_render_state,
+        input_state,
+        latencies_ms,
+        workflow_latencies_ms,
+        event_records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_interaction_keyboard(
+    label: &str,
+    key: &str,
+    source_path: &Path,
+    source: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    keyboard_sequence: &mut u64,
+    latencies_ms: &mut Vec<f64>,
+    workflow_latencies_ms: &mut Vec<f64>,
+    event_records: &mut Vec<CellsInteractionSpeedEventRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = deterministic_keyboard_input_from_keys(*keyboard_sequence, &[key]);
+    *keyboard_sequence = keyboard_sequence.saturating_add(1);
+    cells_interaction_apply_input(
+        label,
+        "keyboard",
+        format!("key={key}"),
+        input,
+        source_path,
+        source,
+        live_runtime,
+        shared_render_state,
+        input_state,
+        latencies_ms,
+        workflow_latencies_ms,
+        event_records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_interaction_apply_input(
+    label: &str,
+    kind: &str,
+    detail: String,
+    input: boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    latencies_ms: &mut Vec<f64>,
+    workflow_latencies_ms: &mut Vec<f64>,
+    event_records: &mut Vec<CellsInteractionSpeedEventRecord>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input_started = Instant::now();
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
+    preview_apply_real_window_input(
+        &input,
+        source_path,
+        source,
+        Some(live_runtime),
+        shared_render_state,
+        input_state,
+    )?;
+    let latency_ms = input_started.elapsed().as_secs_f64() * 1000.0;
+    latencies_ms.push(latency_ms);
+    workflow_latencies_ms.push(latency_ms);
+    let summary = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?;
+        runtime.state_summary()
+    };
+    event_records.push(CellsInteractionSpeedEventRecord {
+        label: label.to_owned(),
+        kind: kind.to_owned(),
+        latency_ms,
+        selected_address: summary
+            .pointer("/store/selected_address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned(),
+        formula_bar_text: summary
+            .pointer("/store/selected_input/editing_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned(),
+        detail,
+    });
+    Ok(())
+}
+
+fn cells_interaction_current_layout(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(shared_render_state
+        .lock()
+        .map_err(|_| "interaction-speed render state mutex poisoned")?
+        .layout_proof
+        .clone())
+}
+
+fn deterministic_keyboard_input_from_keys(
+    start_sequence: u64,
+    keys: &[&str],
+) -> boon_native_app_window::NativeInputAdapterProof {
+    let keyboard_events = keys
+        .iter()
+        .enumerate()
+        .map(
+            |(index, key)| boon_native_app_window::NativeKeyboardEventProof {
+                sequence: start_sequence.saturating_add(index as u64),
+                key: (*key).to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            },
+        )
+        .collect::<Vec<_>>();
+    let last_sequence = keyboard_events
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(start_sequence);
+    boon_native_app_window::NativeInputAdapterProof {
+        installed: true,
+        capture_scope: "deterministic_recent_keyboard_events".to_owned(),
+        keyboard_api: "app_window::input::keyboard::Keyboard::event_provenance".to_owned(),
+        mouse_api: "none".to_owned(),
+        wheel_api: "none".to_owned(),
+        per_window_event_provenance_api:
+            "app_window::input::keyboard::KeyboardEventProvenance::recent_key_events".to_owned(),
+        sampled_after_visible_window: true,
+        real_os_events_observed: true,
+        input_injection_method: "deterministic_app_owned_keyboard_event_batch".to_owned(),
+        synthetic_input_probe: false,
+        mouse_last_window_protocol_id: None,
+        keyboard_last_window_protocol_id: Some(1),
+        mouse_motion_event_count: 0,
+        mouse_button_event_count: 0,
+        mouse_scroll_event_count: 0,
+        mouse_total_event_count: 0,
+        keyboard_key_event_count: last_sequence,
+        mouse_button_events: Vec::new(),
+        keyboard_events,
+        mouse_window_pos: None,
+        mouse_buttons_down: Vec::new(),
+        pressed_keys: Vec::new(),
+        scroll_delta_x: 0.0,
+        scroll_delta_y: 0.0,
+    }
+}
+
+fn cells_interaction_workflow_checks(summary: &Value) -> Vec<Value> {
+    let a3_value = cells_summary_field(summary, "A3", "value");
+    let a3_formula = cells_summary_formula(summary, "A3");
+    let a0_value = cells_summary_field(summary, "A0", "value");
+    let a0_formula = cells_summary_formula(summary, "A0");
+    let b0_value = cells_summary_field(summary, "B0", "value");
+    let c0_value = cells_summary_field(summary, "C0", "value");
+    let c0_formula = cells_summary_formula(summary, "C0");
+    let selected = summary
+        .pointer("/store/selected_address")
+        .and_then(serde_json::Value::as_str);
+    let selected_formula = summary
+        .pointer("/store/selected_input/formula_text")
+        .and_then(serde_json::Value::as_str);
+    let selected_editing_text = summary
+        .pointer("/store/selected_input/editing_text")
+        .and_then(serde_json::Value::as_str);
+    let selected_value = summary
+        .pointer("/store/selected_input/value")
+        .and_then(serde_json::Value::as_str);
+
+    vec![
+        json!({
+            "id": "cells-workflow:literal-edit",
+            "pass": a3_value.as_deref() == Some("20") && a3_formula.as_deref() == Some("20"),
+            "detail": format!("A3 value={a3_value:?}, formula={a3_formula:?}")
+        }),
+        json!({
+            "id": "cells-workflow:range-formula-edit",
+            "pass": c0_formula.as_deref() == Some("=sum(A0:A3)"),
+            "detail": format!("C0 formula={c0_formula:?}")
+        }),
+        json!({
+            "id": "cells-workflow:dependency-update",
+            "pass": a0_value.as_deref() == Some("20")
+                && a0_formula.as_deref() == Some("20")
+                && b0_value.as_deref() == Some("30")
+                && c0_value.as_deref() == Some("65"),
+            "detail": format!("A0 value={a0_value:?}, B0 value={b0_value:?}, C0 value={c0_value:?}")
+        }),
+        json!({
+            "id": "cells-workflow:formula-bar-sync",
+            "pass": selected == Some("A0")
+                && selected_formula == Some("20")
+                && selected_editing_text == Some("20")
+                && selected_value == Some("20"),
+            "detail": format!("selected={selected:?}, selected_formula={selected_formula:?}, selected_editing_text={selected_editing_text:?}, selected_value={selected_value:?}")
+        }),
+    ]
+}
+
+fn cells_summary_formula(summary: &Value, address: &str) -> Option<String> {
+    cells_summary_field(summary, address, "formula_text")
+        .or_else(|| cells_summary_field(summary, address, "formula"))
+}
+
+fn cells_summary_field(summary: &Value, address: &str, field: &str) -> Option<String> {
+    summary
+        .get("cells")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|cell| cell.get("address").and_then(serde_json::Value::as_str) == Some(address))
+        .and_then(|cell| cell.get(field))
+        .and_then(cells_json_value_text)
+}
+
+fn cells_json_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }
 

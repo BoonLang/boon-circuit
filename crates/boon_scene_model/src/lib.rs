@@ -2305,9 +2305,7 @@ fn mesh_chunk_from_supported_difference(
 }
 
 fn visual_hole_overlaps_prism(hole: &VisualHole2D, prism: &VisualPrism2D) -> bool {
-    hole.max_z > prism.min_z
-        && hole.min_z < prism.max_z
-        && point_in_ring(hole.center, &prism.outer)
+    hole.max_z > prism.min_z && hole.min_z < prism.max_z && point_in_ring(hole.center, &prism.outer)
 }
 
 fn mesh_chunk_from_supported_intersection(

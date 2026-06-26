@@ -13,7 +13,8 @@ use boon_typecheck::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -787,6 +788,7 @@ fn run_cells_interaction_speed(
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let interaction_timings = take_preview_interaction_timings();
     let native_input_timings = take_preview_native_input_timings();
+    let interaction_profiles = take_preview_interaction_profiles();
     let native_input_profiles = take_preview_native_input_profiles();
     let native_input_reject_counts = take_preview_native_input_reject_counts();
     let (state_summary, update_count, layout_hash, last_error) = {
@@ -888,6 +890,14 @@ fn run_cells_interaction_speed(
             .iter()
             .take(128)
             .map(preview_interaction_timing_sample_json)
+            .collect::<Vec<_>>()
+    );
+    report_value["interaction_profile_count"] = json!(interaction_profiles.len());
+    report_value["interaction_profile_samples"] = json!(
+        interaction_profiles
+            .iter()
+            .take(128)
+            .cloned()
             .collect::<Vec<_>>()
     );
     report_value["native_input_timing_count"] = json!(native_input_timings.len());
@@ -36061,67 +36071,24 @@ fn preview_handle_mouse_release_for_route_hit(
         let double_click = batch_can_double_click
             && input_state.last_click_node.as_deref() == Some(node.as_str())
             && release_sequence.saturating_sub(input_state.last_click_sequence) <= 4;
-        let layout_hash = shared_render_state.lock().ok().and_then(|shared| {
-            shared
-                .layout_proof
-                .get("layout_frame_hash")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
-        let resolved_address = layout_hash.as_deref().and_then(|layout_hash| {
-            source_intent_binding_value_for_node_from_runtime(
-                layout_hash,
-                &node,
-                "address",
-                live_runtime,
-            )
-        });
-        let resolved_target_text = layout_hash
-            .as_deref()
-            .and_then(|layout_hash| {
-                source_intent_binding_value_for_node_from_runtime(
-                    layout_hash,
-                    &node,
-                    "target",
-                    live_runtime,
-                )
-            })
-            .or_else(|| resolved_address.clone());
         let route_address = route_table.address(&node);
         let route_target_text = route_table.target_text(&node);
-        let needs_layout_fallback = resolved_address.is_none()
-            || (resolved_target_text.is_none() && route_target_text.is_some());
-        let layout_proof = needs_layout_fallback
-            .then(|| {
-                shared_render_state
-                    .lock()
-                    .ok()
-                    .map(|shared| shared.layout_proof.clone())
-            })
-            .flatten();
-        let runtime_state_summary = if needs_layout_fallback {
-            live_runtime
-                .lock()
-                .ok()
-                .map(|mut runtime| runtime.document_state_summary())
-        } else {
-            None
-        };
+        let layout_proof = shared_render_state
+            .lock()
+            .ok()
+            .map(|shared| shared.layout_proof.clone());
         input_state.focused_node = Some(node.clone());
-        input_state.focused_address = resolved_address.or_else(|| {
-            resolve_optional_source_intent_payload_value_for_focus(
-                layout_proof.as_ref(),
-                runtime_state_summary.as_ref(),
-                route_address.clone(),
-            )
-        });
-        input_state.focused_target_text = resolved_target_text.or_else(|| {
-            resolve_optional_source_intent_payload_value_for_focus(
-                layout_proof.as_ref(),
-                runtime_state_summary.as_ref(),
-                route_target_text.clone(),
-            )
-        });
+        input_state.focused_address = resolve_optional_source_intent_payload_value_for_focus(
+            layout_proof.as_ref(),
+            None,
+            route_address.clone(),
+        );
+        input_state.focused_target_text = resolve_optional_source_intent_payload_value_for_focus(
+            layout_proof.as_ref(),
+            None,
+            route_target_text.clone(),
+        )
+        .or_else(|| input_state.focused_address.clone());
         input_state.focused_change_source = route_table.change_source(&node);
         input_state.focused_escape_source = route_table.escape_source(&node);
         input_state.focused_key_down_source = route_table.key_down_source(&node);
@@ -38843,6 +38810,8 @@ fn preview_apply_live_events_internal(
     let mut runtime_recompute_candidate_samples = Vec::new();
     let mut runtime_recomputed_field_samples = Vec::new();
     let mut summary_source = "none";
+    let mut targeted_currentness_path_count = 0_u64;
+    let mut targeted_currentness_missing_path = None::<String>;
     let mut semantic_delta_samples = Vec::new();
     let mut semantic_data_paths_for_layout = BTreeSet::new();
     let mut render_patch_samples = Vec::new();
@@ -38964,6 +38933,13 @@ fn preview_apply_live_events_internal(
                 )
             })
             .or_else(|| {
+                preview_semantic_bound_input_text_currentness_rejection_for_layout_hash(
+                    previous_layout_hash.as_deref(),
+                    &semantic_data_paths_for_layout,
+                    &render_patch_data_paths_for_layout,
+                )
+            })
+            .or_else(|| {
                 preview_semantic_structural_fast_path_rejection_for_layout_hash(
                     previous_layout_hash.as_deref(),
                     &semantic_data_paths_for_layout,
@@ -38985,10 +38961,46 @@ fn preview_apply_live_events_internal(
                 runtime_state_summary_ms += elapsed_ms(patch_started);
                 return patched;
             }
+            if document_patch_fast_path_rejection_for_summary
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("semantic_bound_input_text_currentness:"))
+                && !render_patches_for_layout.is_empty()
+                && let Some(mut patched) = previous_state_summary.as_ref().and_then(|summary| {
+                    patched_window_state_summary_for_render_patches(
+                        summary,
+                        &render_patches_for_layout,
+                    )
+                })
+            {
+                let paths = preview_semantic_bound_input_currentness_paths_for_layout_hash(
+                    previous_layout_hash.as_deref(),
+                    &semantic_data_paths_for_layout,
+                    &render_patch_data_paths_for_layout,
+                );
+                targeted_currentness_path_count = paths.len() as u64;
+                if !paths.is_empty() {
+                    let targeted_started = Instant::now();
+                    let path_values =
+                        runtime.document_state_values(&paths.iter().cloned().collect::<Vec<_>>());
+                    targeted_currentness_missing_path =
+                        missing_state_summary_value_path(&path_values, &paths);
+                    if targeted_currentness_missing_path.is_none()
+                        && patch_state_summary_values(&mut patched, &path_values, &paths)
+                    {
+                        summary_source = "patched_previous_window_with_targeted_currentness";
+                        runtime_state_summary_ms += elapsed_ms(patch_started);
+                        return patched;
+                    }
+                    runtime_state_summary_ms += elapsed_ms(targeted_started);
+                }
+            }
             let summary_started = Instant::now();
             preview_set_interaction_diagnostic_subphase("live_events.full_or_window_state_summary");
+            let summary_rejection = document_patch_fast_path_rejection_for_summary.as_deref();
+            let rejection_allows_window_summary = summary_rejection
+                .is_some_and(|reason| reason.starts_with("semantic_bound_input_text_currentness:"));
             let summary = if render_patches_for_layout.is_empty()
-                || document_patch_fast_path_rejection_for_summary.is_some()
+                || (summary_rejection.is_some() && !rejection_allows_window_summary)
             {
                 summary_source = if render_patches_for_layout.is_empty() {
                     "post_turn_full_document"
@@ -39095,6 +39107,8 @@ fn preview_apply_live_events_internal(
                 "render_patch_samples": render_patch_samples,
                 "changed": false,
                 "summary_source": summary_source,
+                "targeted_currentness_path_count": targeted_currentness_path_count,
+                "targeted_currentness_missing_path": targeted_currentness_missing_path.clone(),
                 "runtime_lock_wait_ms": runtime_lock_wait_ms,
                 "runtime_apply_ms": runtime_apply_ms,
                 "runtime_step_apply_ms": runtime_step_apply_ms,
@@ -39380,6 +39394,8 @@ fn preview_apply_live_events_internal(
                 "render_patch_samples": render_patch_samples,
                 "changed": true,
                 "summary_source": summary_source,
+                "targeted_currentness_path_count": targeted_currentness_path_count,
+                "targeted_currentness_missing_path": targeted_currentness_missing_path.clone(),
                 "layout_source": layout_source,
                 "document_patch_fast_path_rejection": null,
                 "patched_target_count": patched_target_count,
@@ -39553,6 +39569,8 @@ fn preview_apply_live_events_internal(
             "render_patch_samples": render_patch_samples,
             "changed": true,
             "summary_source": summary_source,
+            "targeted_currentness_path_count": targeted_currentness_path_count,
+            "targeted_currentness_missing_path": targeted_currentness_missing_path.clone(),
             "runtime_lock_wait_ms": runtime_lock_wait_ms,
             "runtime_apply_ms": runtime_apply_ms,
             "runtime_step_apply_ms": runtime_step_apply_ms,
@@ -42307,14 +42325,15 @@ struct PreviewSourceIntentRecord {
 
 #[derive(Clone, Debug)]
 struct PreviewHitRouteTable {
-    hit_table: boon_document::HitSideTable,
+    hit_table: Arc<boon_document::HitSideTable>,
     source_intents: Vec<PreviewSourceIntentRecord>,
     source_intents_by_node: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
     display_items: Vec<boon_document::DisplayItem>,
     display_items_by_node: BTreeMap<String, Vec<usize>>,
     hit_index_by_node: BTreeMap<String, usize>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
-    text_binding_values_by_node: BTreeMap<String, String>,
+    source_intent_binding_paths_by_node: BTreeMap<String, Vec<(String, String)>>,
+    state_summary: Option<Arc<Value>>,
 }
 
 impl PreviewHitRouteTable {
@@ -42357,11 +42376,13 @@ impl PreviewHitRouteTable {
             .and_then(serde_json::Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
+        let state_summary = layout_proof_runtime_state_snapshot(&shared.layout_proof);
         Self::from_snapshot_with_source_intents(
+            layout_frame_hash,
             &snapshot,
             layout_frame,
             source_intents,
-            shared.layout_proof.get("runtime_document_state_snapshot"),
+            state_summary,
         )
     }
 
@@ -42375,28 +42396,29 @@ impl PreviewHitRouteTable {
             .and_then(serde_json::Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
+        let state_summary = layout_proof_runtime_state_snapshot(layout_proof);
         Self::from_snapshot_with_source_intents(
+            layout_frame_hash,
             &snapshot,
             snapshot.layout_frame.as_ref(),
             source_intents,
-            layout_proof.get("runtime_document_state_snapshot"),
+            state_summary,
         )
     }
 
     fn from_snapshot_with_source_intents(
+        layout_frame_hash: &str,
         snapshot: &DocumentRenderSnapshot,
         layout_frame: &boon_document::LayoutFrame,
         source_intents: &[Value],
-        state_summary: Option<&Value>,
+        state_summary: Option<Value>,
     ) -> Option<Self> {
         let source_intents = source_intents
             .iter()
             .filter_map(preview_source_intent_record)
             .collect::<Vec<_>>();
-        let hit_table = snapshot
-            .derived_indexes
-            .try_hit_side_table(&snapshot.document_frame, layout_frame)
-            .ok()?;
+        let hit_table =
+            preview_hit_side_table_for_layout(layout_frame_hash, snapshot, layout_frame)?;
         let mut source_intents_by_node = BTreeMap::<String, BTreeMap<String, Vec<usize>>>::new();
         for (index, intent) in source_intents.iter().enumerate() {
             source_intents_by_node
@@ -42424,17 +42446,10 @@ impl PreviewHitRouteTable {
             .data_binding_targets
             .text_binding_paths_by_node
             .clone();
-        let text_binding_values_by_node = state_summary
-            .map(|summary| {
-                text_binding_paths_by_node
-                    .iter()
-                    .filter_map(|(node, paths)| {
-                        document_text_binding_value_for_paths(paths, summary)
-                            .map(|text| (node.clone(), text))
-                    })
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let source_intent_binding_paths_by_node = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .clone();
         Some(Self {
             hit_table,
             source_intents,
@@ -42443,7 +42458,8 @@ impl PreviewHitRouteTable {
             display_items_by_node,
             hit_index_by_node,
             text_binding_paths_by_node,
-            text_binding_values_by_node,
+            source_intent_binding_paths_by_node,
+            state_summary: state_summary.map(Arc::new),
         })
     }
 
@@ -42715,13 +42731,38 @@ impl PreviewHitRouteTable {
         Some(event)
     }
 
-    fn target_text(&self, node: &str) -> Option<String> {
-        self.source_for_node_intent(node, "target")
-            .or_else(|| self.source_for_node_intent(node, "address"))
+    fn source_intent_payload_value(&self, node: &str, intent: &str) -> Option<String> {
+        self.source_intent_binding_payload_value(node, intent)
+            .or_else(|| self.source_for_node_intent(node, intent))
+    }
+
+    fn source_intent_binding_payload_value(&self, node: &str, intent: &str) -> Option<String> {
+        let summary = self.state_summary.as_deref()?;
+        let mut paths = self
+            .source_intent_binding_paths_by_node
+            .get(node)?
+            .iter()
+            .filter_map(|(path, binding_intent)| (binding_intent == intent).then_some(path))
+            .collect::<Vec<_>>();
+        paths.sort_by(|left, right| {
+            document_text_binding_path_rank(left)
+                .cmp(&document_text_binding_path_rank(right))
+                .then_with(|| left.cmp(right))
+        });
+        paths.into_iter().find_map(|path| {
+            let value = state_summary_value_for_data_path(summary, path)?;
+            let source_path = json_value_to_document_source_path(value);
+            (!source_path.trim().is_empty()).then_some(source_path)
+        })
     }
 
     fn address(&self, node: &str) -> Option<String> {
-        self.source_for_node_intent(node, "address")
+        self.source_intent_payload_value(node, "address")
+    }
+
+    fn target_text(&self, node: &str) -> Option<String> {
+        self.source_intent_payload_value(node, "target")
+            .or_else(|| self.source_intent_payload_value(node, "address"))
     }
 
     fn target_key(&self, node: &str) -> Option<u64> {
@@ -42833,8 +42874,29 @@ impl PreviewHitRouteTable {
         node: &str,
         live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     ) -> Option<String> {
-        if let Some(text) = self.text_binding_values_by_node.get(node) {
-            return Some(text.clone());
+        if let Some(summary) = self.state_summary.as_deref() {
+            if let Some(text) = self
+                .text_binding_paths_by_node
+                .get(node)
+                .and_then(|paths| document_text_binding_value_for_paths(paths, summary))
+            {
+                return Some(text);
+            }
+            if let Some(text) = self
+                .document_value(node)
+                .and_then(|path| state_summary_value_for_data_path(summary, &path))
+                .map(json_value_to_document_text)
+            {
+                return Some(text);
+            }
+            if let Some(address) = resolve_optional_source_intent_payload_value_for_focus(
+                None,
+                Some(summary),
+                self.address(node),
+            ) && let Some(text) = focused_editing_text_for_address(summary, &address)
+            {
+                return Some(text);
+            }
         }
         if let Some(text) = self.focused_text_from_runtime_bindings(node, live_runtime) {
             return Some(text);
@@ -42956,7 +43018,7 @@ impl PreviewHitRouteTable {
             }
             if !seen_nodes.insert(intent.node.clone())
                 || self
-                    .source_for_node_intent(&intent.node, target_intent)
+                    .source_intent_payload_value(&intent.node, target_intent)
                     .as_deref()
                     != Some(target_text.as_str())
             {
@@ -42988,6 +43050,67 @@ impl PreviewHitRouteTable {
             .map(|source_hit| pointer_payload_for_typed_bounds(source_hit.bounds, position))
             .unwrap_or_else(|| pointer_payload_for_typed_bounds(hit.bounds, position))
     }
+}
+
+fn preview_hit_side_table_for_layout(
+    layout_frame_hash: &str,
+    snapshot: &DocumentRenderSnapshot,
+    layout_frame: &boon_document::LayoutFrame,
+) -> Option<Arc<boon_document::HitSideTable>> {
+    let cache_key = preview_hit_side_table_cache_key(layout_frame_hash, layout_frame);
+    if let Some(cached) = preview_hit_side_table_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Some(cached);
+    }
+    let table = Arc::new(
+        snapshot
+            .derived_indexes
+            .try_hit_side_table(&snapshot.document_frame, layout_frame)
+            .ok()?,
+    );
+    if let Ok(mut cache) = preview_hit_side_table_cache().lock() {
+        if cache.len() >= 32
+            && let Some(first_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&first_key);
+        }
+        cache.insert(cache_key, Arc::clone(&table));
+    }
+    Some(table)
+}
+
+fn preview_hit_side_table_cache()
+-> &'static Mutex<BTreeMap<String, Arc<boon_document::HitSideTable>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<boon_document::HitSideTable>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn preview_hit_side_table_cache_key(
+    layout_frame_hash: &str,
+    layout_frame: &boon_document::LayoutFrame,
+) -> String {
+    format!(
+        "{layout_frame_hash}:{}",
+        preview_hit_region_geometry_fingerprint(layout_frame)
+    )
+}
+
+fn preview_hit_region_geometry_fingerprint(layout_frame: &boon_document::LayoutFrame) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    layout_frame.hit_regions.len().hash(&mut hasher);
+    for hit in &layout_frame.hit_regions {
+        hit.id.hash(&mut hasher);
+        hit.node.0.hash(&mut hasher);
+        hit.bounds.x.to_bits().hash(&mut hasher);
+        hit.bounds.y.to_bits().hash(&mut hasher);
+        hit.bounds.width.to_bits().hash(&mut hasher);
+        hit.bounds.height.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn preview_hit_route_cache() -> &'static Mutex<BTreeMap<String, Arc<PreviewHitRouteTable>>> {
@@ -44189,6 +44312,38 @@ fn patched_window_state_summary_for_render_patches(
     Some(next)
 }
 
+fn patch_state_summary_values(
+    summary: &mut Value,
+    values: &Value,
+    required_paths: &BTreeSet<String>,
+) -> bool {
+    let (Some(root), Some(values)) = (summary.as_object_mut(), values.as_object()) else {
+        return false;
+    };
+    for path in required_paths {
+        if !document_state_value_path_can_refresh_targeted(path) {
+            continue;
+        }
+        let Some(value) = values.get(path) else {
+            return false;
+        };
+        insert_nested_json_value(root, path, value.clone());
+    }
+    true
+}
+
+fn missing_state_summary_value_path(
+    values: &Value,
+    required_paths: &BTreeSet<String>,
+) -> Option<String> {
+    let values = values.as_object()?;
+    required_paths
+        .iter()
+        .filter(|path| document_state_value_path_can_refresh_targeted(path))
+        .find(|path| !values.contains_key(*path))
+        .cloned()
+}
+
 fn patch_summary_row_array_field(
     rows: &mut [Value],
     key: u64,
@@ -44439,6 +44594,158 @@ fn preview_semantic_unpatched_data_binding_fast_path_rejection_for_layout_hash(
         }
     }
     None
+}
+
+fn preview_semantic_bound_input_text_currentness_rejection_for_layout_hash(
+    layout_hash: Option<&str>,
+    semantic_data_paths: &BTreeSet<String>,
+    patch_data_paths: &BTreeSet<String>,
+) -> Option<String> {
+    if semantic_data_paths.is_empty() {
+        return None;
+    }
+    let layout_hash = layout_hash?;
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    for changed_path in semantic_data_paths {
+        for (node, source_bindings) in &snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+        {
+            let source_binding_changed = source_bindings
+                .iter()
+                .any(|(binding_path, _)| document_data_paths_overlap(changed_path, binding_path));
+            if !source_binding_changed {
+                continue;
+            }
+            let Some(text_paths) = snapshot
+                .data_binding_targets
+                .text_binding_paths_by_node
+                .get(node)
+            else {
+                continue;
+            };
+            if let Some(text_path) = text_paths.iter().find(|text_path| {
+                !patch_data_paths
+                    .iter()
+                    .any(|patch_path| document_data_paths_overlap(patch_path, text_path))
+            }) {
+                return Some(format!(
+                    "semantic_bound_input_text_currentness:{changed_path}:{node}:{text_path}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn preview_semantic_bound_input_currentness_paths_for_layout_hash(
+    layout_hash: Option<&str>,
+    semantic_data_paths: &BTreeSet<String>,
+    patch_data_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    if semantic_data_paths.is_empty() {
+        return paths;
+    }
+    let Some(layout_hash) = layout_hash else {
+        return paths;
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return paths;
+    };
+    let mut projection_prefixes = BTreeSet::new();
+    for changed_path in semantic_data_paths {
+        for (node, source_bindings) in &snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+        {
+            let source_binding_changed = source_bindings
+                .iter()
+                .any(|(binding_path, _)| document_data_paths_overlap(changed_path, binding_path));
+            if !source_binding_changed {
+                continue;
+            }
+            for (binding_path, _) in source_bindings {
+                if document_state_value_path_can_refresh_targeted(binding_path) {
+                    paths.insert(binding_path.clone());
+                    if let Some(prefix) = document_state_value_projection_prefix(binding_path) {
+                        projection_prefixes.insert(prefix);
+                    }
+                }
+            }
+            if let Some(text_paths) = snapshot
+                .data_binding_targets
+                .text_binding_paths_by_node
+                .get(node)
+            {
+                for text_path in text_paths {
+                    if patch_data_paths
+                        .iter()
+                        .any(|patch_path| document_data_paths_overlap(patch_path, text_path))
+                    {
+                        continue;
+                    }
+                    if document_state_value_path_can_refresh_targeted(text_path) {
+                        paths.insert(text_path.clone());
+                        if let Some(prefix) = document_state_value_projection_prefix(text_path) {
+                            projection_prefixes.insert(prefix);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if projection_prefixes.is_empty() {
+        return paths;
+    }
+    for path in snapshot
+        .data_binding_targets
+        .text_binding_paths_by_node
+        .values()
+        .flatten()
+    {
+        if projection_prefixes
+            .iter()
+            .any(|prefix| document_state_value_path_has_projection_prefix(path, prefix))
+            && document_state_value_path_can_refresh_targeted(path)
+        {
+            paths.insert(path.clone());
+        }
+    }
+    for (path, _, _) in &snapshot.data_binding_targets.source_intent_binding_targets {
+        if projection_prefixes
+            .iter()
+            .any(|prefix| document_state_value_path_has_projection_prefix(path, prefix))
+            && document_state_value_path_can_refresh_targeted(path)
+        {
+            paths.insert(path.clone());
+        }
+    }
+    paths
+}
+
+fn document_state_value_path_can_refresh_targeted(path: &str) -> bool {
+    !path.starts_with('@') && !path.trim().is_empty()
+}
+
+fn document_state_value_projection_prefix(path: &str) -> Option<String> {
+    if path.starts_with('@') {
+        return None;
+    }
+    let mut parts = path.split('.').filter(|part| !part.is_empty());
+    let first = parts.next()?;
+    if first == "store" {
+        let second = parts.next()?;
+        return Some(format!("{first}.{second}"));
+    }
+    Some(first.to_owned())
+}
+
+fn document_state_value_path_has_projection_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn document_style_value_from_state_value(value: &Value) -> boon_document_model::StyleValue {

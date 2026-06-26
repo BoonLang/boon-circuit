@@ -15441,6 +15441,10 @@ impl LiveRuntime {
             .runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
     }
 
+    pub fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
+        self.runtime.document_state_values(paths)
+    }
+
     pub fn document_state_summary(&mut self) -> JsonValue {
         self.runtime.document_state_summary()
     }
@@ -16759,6 +16763,21 @@ impl LoadedRuntime {
             .generic_derived_state
             .set_candidate_defer_read_context(previous_context);
         summary
+    }
+
+    fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
+        let Some(generic) = self.generic.as_mut() else {
+            return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
+        };
+        generic.generic_derived_state.clear_value_caches();
+        let previous_context = generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(RuntimeCandidateDeferReadContext::SparseValueSummary);
+        let values = generic.document_state_values(paths);
+        generic
+            .generic_derived_state
+            .set_candidate_defer_read_context(previous_context);
+        values
     }
 
     fn apply_counted_step(&mut self, step: &ScenarioStep) -> RuntimeResult<CountedStepOutput> {
@@ -46117,6 +46136,75 @@ impl GenericScheduledRuntime {
         JsonValue::Object(values)
     }
 
+    fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
+        let mut values = serde_json::Map::new();
+        for path in paths {
+            if path.starts_with('@') {
+                continue;
+            }
+            if let Some(value) = self.document_state_value(path) {
+                values.insert(path.clone(), value);
+            }
+        }
+        JsonValue::Object(values)
+    }
+
+    fn document_state_value(&mut self, path: &str) -> Option<JsonValue> {
+        if let Some(value) = self.document_state_list_projection_value(path) {
+            return Some(value);
+        }
+        if let Some(alias) = runtime_event_source_path_alias(path)
+            && let Some(value) = self.document_state_list_projection_value(&alias)
+        {
+            return Some(value);
+        }
+        if let Some(value) = self.runtime_scalar_json(path) {
+            return Some(value);
+        }
+        if !path.contains('.') {
+            let store_path = format!("store.{path}");
+            if let Some(value) = self
+                .document_state_list_projection_value(&store_path)
+                .or_else(|| self.runtime_scalar_json(&store_path))
+            {
+                return Some(value);
+            }
+        }
+        self.structured_root_child_boon_value(path)
+            .map(|value| boon_value_json(&value))
+    }
+
+    fn document_state_list_projection_value(&mut self, path: &str) -> Option<JsonValue> {
+        let projections = self.list_projections.projections.clone();
+        for projection in projections {
+            let Some(tail) = runtime_path_tail_for_target(path, &projection.target) else {
+                continue;
+            };
+            let RuntimeListProjectionKind::Find { field, value } = &projection.kind else {
+                continue;
+            };
+            if !tail.indexes.is_empty() {
+                continue;
+            }
+            let projection_list = self.projection_storage_list_name(&projection.list);
+            let projection_list = projection_list.as_deref().unwrap_or(&projection.list);
+            self.ensure_root_current(value, RuntimeRootCurrentnessReason::ProjectionSelector)
+                .ok()?;
+            let selected = self
+                .storage
+                .root_textlike_ref(value)
+                .map(str::to_owned)
+                .unwrap_or_else(|_| value.clone());
+            let row = self.list_find_projection(projection_list, field, &selected)?;
+            let row = JsonValue::Object(row);
+            if tail.rest.is_empty() {
+                return Some(row);
+            }
+            return runtime_value_at_path(&row, &tail.rest).cloned();
+        }
+        None
+    }
+
     fn runtime_path_summary(
         &mut self,
         path: &str,
@@ -51551,6 +51639,12 @@ struct RuntimePathTail {
 
 fn runtime_path_matches_target(path: &str, target: &str) -> bool {
     path == target || path == row_field_name(target)
+}
+
+fn runtime_event_source_path_alias(path: &str) -> Option<String> {
+    path.contains(".events.")
+        .then(|| path.replace(".events.", "."))
+        .filter(|alias| alias != path)
 }
 
 fn root_state_path_matches_runtime_path(root_path: &str, path: &str) -> bool {
@@ -72652,6 +72746,45 @@ FUNCTION new_todo(title) {
                 .list_row_textlike("selected_input", 0, "value")
                 .unwrap(),
             "6"
+        );
+    }
+
+    #[test]
+    fn cells_selected_input_document_state_values_use_indexed_list_find_projection() {
+        let source = cells_project_source_for_test();
+        let mut runtime =
+            LiveRuntime::from_source("cells-selected-input-targeted-values", &source).unwrap();
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.select".to_owned(),
+                address: Some("B0".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let values = runtime.document_state_values(&[
+            "store.selected_input.address".to_owned(),
+            "store.selected_input.editing_text".to_owned(),
+            "store.selected_input.sources.editor.events.blur".to_owned(),
+        ]);
+        assert_eq!(values["store.selected_input.address"], "B0");
+        assert_eq!(values["store.selected_input.editing_text"], "=add(A0,A1)");
+        assert_eq!(
+            values["store.selected_input.sources.editor.events.blur"]["source_path"],
+            "cell.sources.editor.blur"
+        );
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .expect("Cells should use the generic runtime");
+        assert_eq!(
+            generic.list_scan_counters.list_find_rows_scanned, 0,
+            "targeted document values should use the List/find text index instead of scanning"
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits > 0,
+            "targeted document values should report a List/find text index hit"
         );
     }
 

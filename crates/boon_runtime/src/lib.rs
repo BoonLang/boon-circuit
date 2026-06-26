@@ -17181,8 +17181,8 @@ impl LoadedRuntime {
             generic.list_scan_counters_for_step(dirty_entries_deduplicated(&deltas[delta_start..]));
         runtime_step_profile.list_scan_metrics_ms = runtime_elapsed_ms(list_scan_metrics_started);
         let metrics_snapshot_started = Instant::now();
-        let root_materialization_stats = generic.root_materialization_stats.clone();
-        let function_call_stats = generic.function_call_stats.clone();
+        let root_materialization_stats = std::mem::take(&mut generic.root_materialization_stats);
+        let function_call_stats = std::mem::take(&mut generic.function_call_stats);
         generic
             .generic_derived_state
             .copy_candidate_defer_probe_to_profile(&mut runtime_step_profile);
@@ -46138,11 +46138,14 @@ impl GenericScheduledRuntime {
 
     fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
         let mut values = serde_json::Map::new();
+        let mut projection_cache = BTreeMap::new();
         for path in paths {
             if path.starts_with('@') {
                 continue;
             }
-            if let Some(value) = self.document_state_value(path) {
+            if let Some(value) =
+                self.document_state_value_with_projection_cache(path, &mut projection_cache)
+            {
                 values.insert(path.clone(), value);
             }
         }
@@ -46150,11 +46153,23 @@ impl GenericScheduledRuntime {
     }
 
     fn document_state_value(&mut self, path: &str) -> Option<JsonValue> {
-        if let Some(value) = self.document_state_list_projection_value(path) {
+        let mut projection_cache = BTreeMap::new();
+        self.document_state_value_with_projection_cache(path, &mut projection_cache)
+    }
+
+    fn document_state_value_with_projection_cache(
+        &mut self,
+        path: &str,
+        projection_cache: &mut BTreeMap<String, Option<JsonValue>>,
+    ) -> Option<JsonValue> {
+        if let Some(value) =
+            self.document_state_list_projection_value_cached(path, projection_cache)
+        {
             return Some(value);
         }
         if let Some(alias) = runtime_event_source_path_alias(path)
-            && let Some(value) = self.document_state_list_projection_value(&alias)
+            && let Some(value) =
+                self.document_state_list_projection_value_cached(&alias, projection_cache)
         {
             return Some(value);
         }
@@ -46164,7 +46179,7 @@ impl GenericScheduledRuntime {
         if !path.contains('.') {
             let store_path = format!("store.{path}");
             if let Some(value) = self
-                .document_state_list_projection_value(&store_path)
+                .document_state_list_projection_value_cached(&store_path, projection_cache)
                 .or_else(|| self.runtime_scalar_json(&store_path))
             {
                 return Some(value);
@@ -46175,6 +46190,15 @@ impl GenericScheduledRuntime {
     }
 
     fn document_state_list_projection_value(&mut self, path: &str) -> Option<JsonValue> {
+        let mut projection_cache = BTreeMap::new();
+        self.document_state_list_projection_value_cached(path, &mut projection_cache)
+    }
+
+    fn document_state_list_projection_value_cached(
+        &mut self,
+        path: &str,
+        projection_cache: &mut BTreeMap<String, Option<JsonValue>>,
+    ) -> Option<JsonValue> {
         let projections = self.list_projections.projections.clone();
         for projection in projections {
             let Some(tail) = runtime_path_tail_for_target(path, &projection.target) else {
@@ -46188,19 +46212,32 @@ impl GenericScheduledRuntime {
             }
             let projection_list = self.projection_storage_list_name(&projection.list);
             let projection_list = projection_list.as_deref().unwrap_or(&projection.list);
-            self.ensure_root_current(value, RuntimeRootCurrentnessReason::ProjectionSelector)
-                .ok()?;
-            let selected = self
-                .storage
-                .root_textlike_ref(value)
-                .map(str::to_owned)
-                .unwrap_or_else(|_| value.clone());
-            let row = self.list_find_projection(projection_list, field, &selected)?;
-            let row = JsonValue::Object(row);
-            if tail.rest.is_empty() {
-                return Some(row);
+            let cache_key = format!(
+                "{}\x1f{}\x1f{}\x1f{}",
+                projection.target, projection_list, field, value
+            );
+            if !projection_cache.contains_key(&cache_key) {
+                let row = (|| -> Option<JsonValue> {
+                    self.ensure_root_current(
+                        value,
+                        RuntimeRootCurrentnessReason::ProjectionSelector,
+                    )
+                    .ok()?;
+                    let selected = self
+                        .storage
+                        .root_textlike_ref(value)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|_| value.clone());
+                    self.list_find_projection(projection_list, field, &selected)
+                        .map(JsonValue::Object)
+                })();
+                projection_cache.insert(cache_key.clone(), row);
             }
-            return runtime_value_at_path(&row, &tail.rest).cloned();
+            let row = projection_cache.get(&cache_key)?.as_ref()?;
+            if tail.rest.is_empty() {
+                return Some(row.clone());
+            }
+            return runtime_value_at_path(row, &tail.rest).cloned();
         }
         None
     }

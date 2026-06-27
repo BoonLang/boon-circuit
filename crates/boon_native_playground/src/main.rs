@@ -36326,6 +36326,26 @@ fn preview_refresh_selection_proxy_focused_text_from_selected_input(
     preview_reset_caret_blink(input_state);
 }
 
+fn preview_refresh_selection_proxy_focused_text_from_state_summary(
+    state_summary: &Value,
+    input_state: &mut PreviewNativeInputState,
+) -> bool {
+    if !input_state.focused_selection_proxy {
+        return false;
+    }
+    let Some(address) = input_state.focused_address.as_deref() else {
+        return false;
+    };
+    let Some(text) = focused_editing_text_for_address(state_summary, address) else {
+        return false;
+    };
+    input_state.focused_text = text;
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit = false;
+    preview_reset_caret_blink(input_state);
+    true
+}
+
 fn preview_refresh_selection_proxy_focused_text_from_retained_input(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -37984,7 +38004,7 @@ fn preview_try_apply_simple_source_click_input(
     preview_set_interaction_diagnostic_subphase("simple_source_click.apply_live_events");
     let apply_started = Instant::now();
     let live_events_started = Instant::now();
-    preview_apply_live_events_no_return(
+    let post_turn_state_summary = preview_apply_live_events_state_summary(
         source_path,
         source_text,
         runtime_units,
@@ -38013,7 +38033,9 @@ fn preview_try_apply_simple_source_click_input(
     }
     let bound_input_sync_ms = elapsed_ms(bound_input_sync_started);
     let selection_proxy_refresh_started = Instant::now();
-    if !preview_refresh_selection_proxy_focused_text_from_retained_input(
+    if !post_turn_state_summary.as_ref().is_some_and(|summary| {
+        preview_refresh_selection_proxy_focused_text_from_state_summary(summary, input_state)
+    }) && !preview_refresh_selection_proxy_focused_text_from_retained_input(
         shared_render_state,
         input_state,
     ) {
@@ -42361,6 +42383,7 @@ fn preview_apply_live_events(
         shared_render_state,
         events,
         true,
+        false,
     )
 }
 
@@ -42379,8 +42402,29 @@ fn preview_apply_live_events_no_return(
         shared_render_state,
         events,
         false,
+        false,
     )?;
     Ok(())
+}
+
+fn preview_apply_live_events_state_summary(
+    source_path: &Path,
+    _source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    events: Vec<boon_runtime::LiveSourceEvent>,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let value = preview_apply_live_events_internal(
+        source_path,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        events,
+        false,
+        true,
+    )?;
+    Ok((!value.is_null()).then_some(value))
 }
 
 fn preview_apply_live_events_internal(
@@ -42390,6 +42434,7 @@ fn preview_apply_live_events_internal(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     events: Vec<boon_runtime::LiveSourceEvent>,
     return_layout: bool,
+    return_state_summary: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if events.is_empty() {
         let shared = shared_render_state
@@ -42979,7 +43024,11 @@ fn preview_apply_live_events_internal(
                     "total_ms": elapsed_ms(total_started)
                 }));
             }
-            return Ok(Value::Null);
+            return Ok(if return_state_summary {
+                state_summary.clone()
+            } else {
+                Value::Null
+            });
         }
     }
     let mut layout_paint_space_patch_outer_ms = 0.0;
@@ -43154,7 +43203,11 @@ fn preview_apply_live_events_internal(
             } else {
                 boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied
             });
-            Value::Null
+            if return_state_summary {
+                state_summary.clone()
+            } else {
+                Value::Null
+            }
         };
         let shared_update_ms = elapsed_ms(shared_update_started);
         record_preview_interaction_timing(PreviewInteractionTimingSample {
@@ -43304,6 +43357,8 @@ fn preview_apply_live_events_internal(
     if post_input_passed {
         if return_layout {
             return_value = post_input_layout.clone();
+        } else if return_state_summary {
+            return_value = state_summary.clone();
         }
         let mut shared_render_state = shared_render_state
             .lock()

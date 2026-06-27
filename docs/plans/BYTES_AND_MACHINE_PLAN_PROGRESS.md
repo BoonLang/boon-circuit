@@ -23276,3 +23276,69 @@ Remaining blockers reported by
 - `boon_plan` still imports parser AST types.
 - `boon_runtime` still depends on frontend crates
   `boon_parser`, `boon_ir`, and `boon_typecheck`.
+
+## 2026-06-27 - Cells Visible Click Summary Reuse and Runtime Work Gate
+
+Status: full release Cells visible-click E2E passes on fresh app-owned native
+evidence. This is still not the whole TASK-0804A 60 FPS spreadsheet milestone:
+scroll, richer edit/fanout interactions, and deeper sparse `List/chunk`
+materialization remain separate work.
+
+What changed:
+
+- The simple source-click path now reuses the post-turn state summary produced
+  by `preview_apply_live_events_internal` to refresh the selection proxy focused
+  text before falling back to retained input or a second runtime read.
+- This removed the duplicate selected-input runtime read from the click hot path;
+  the focused B0 sample reported `selection_proxy_refresh_ms` around `0.001ms`.
+- `verify-native-cells-visible-click-e2e` now reports and gates a
+  `runtime_work_contract` requiring selection/formula-bar clicks to avoid list
+  scans, root materialization, and recomputed cell fields.
+- Added `docs/plans/CELLS_60FPS_ARCHITECTURE_OPTIONS.md` to capture the zoomed
+  out options: direct input scheduling, first-class retained render scene,
+  sparse `List/chunk`, and edit-session overlay.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p xtask -p boon_native_playground`: pass, with existing
+  native GPU dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `cargo test -q -p boon_runtime cells_`: pass, `23` tests.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  expected fail. The report is schema-valid but blocked on
+  `Cells interaction speed requires fresh headed visual cursor/readback evidence`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass.
+
+Fresh release report highlights:
+
+- `target_count=64`.
+- `input_wake_to_formula_visible_ms_p95=16.066404000001057`.
+- `click_to_formula_visible_ms_p95=27.224705`.
+- `click_to_formula_visible_ms_max=28.164638999999998`.
+- `retained_update_contract.status="pass"` with `64/64`
+  `visible_state_sync` samples, `64` committed render patches, and `0` full
+  document lowers.
+- `runtime_work_contract.status="pass"` with `0` total list-find rows scanned,
+  `0` total rows scanned, `0` total summary fields scanned, `0` root
+  materialization candidates, and `0` recomputed fields across all `64` click
+  samples.
+
+Remaining blockers:
+
+- The current pass is visible click only. The broader 60 FPS target still needs
+  fresh release evidence for scroll and full Cells interaction-speed scenarios.
+- The current interaction-speed release report is still blocked by missing fresh
+  headed visual cursor/readback evidence before it can be used as the full
+  interaction-speed proof.
+- `List/chunk(cells, size: 26, ...)` still needs a true demand-windowed runtime
+  representation below the summary layer for larger sparse grids.
+- Native input scheduling can still be tightened by collapsing late input
+  resample/pre-present boundaries.
+- Selection/formula-bar updates should eventually mutate a first-class retained
+  render scene rather than relying on the native input overlay patch path.

@@ -48016,6 +48016,11 @@ fn verify_native_cells_visible_click_e2e(
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
+    let runtime_work_contract = cells_visible_click_runtime_work_contract_summary(&live_probe);
+    let runtime_work_contract_pass = runtime_work_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     let bounded_click_to_present_outlier_cap_ms = max_click_to_present_ms + max_click_to_formula_ms;
     let cold_sample_count = live_probe
         .get("cold_sample_count")
@@ -48250,6 +48255,37 @@ fn verify_native_cells_visible_click_e2e(
             "Cells visible click must use retained committed update timing samples with render patches and no full document lower fallback".to_owned()
         }),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:runtime-work-contract",
+        runtime_work_contract_pass,
+        format!(
+            "status={:?}, total={}, zero_scans={}, zero_root_materialization={}, zero_recompute={}",
+            runtime_work_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            runtime_work_contract
+                .get("click_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            runtime_work_contract
+                .get("zero_scan_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            runtime_work_contract
+                .get("zero_root_materialization_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            runtime_work_contract
+                .get("zero_recompute_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (!runtime_work_contract_pass).then(|| {
+            "Cells visible click must not perform list scans, root materialization, or full-grid recompute on selection/formula-bar updates".to_owned()
+        }),
+    );
 
     let role_artifacts = live_probe
         .get("artifact_paths")
@@ -48376,6 +48412,7 @@ fn verify_native_cells_visible_click_e2e(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "retained_update_contract": retained_update_contract,
+            "runtime_work_contract": runtime_work_contract,
             "bounded_click_to_present_outlier_policy": "steady driver-to-app-wake outliers are accepted only when every max-budget violation remains below max_click_to_present_ms + max_click_to_formula_ms, the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms, and the sample produced a changed app-owned readback/proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below the same bounded cap and produce changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
@@ -48610,6 +48647,125 @@ fn cells_visible_click_retained_update_contract_summary(
         "layout_source_counts": layout_source_counts,
         "summary_source_counts": summary_source_counts,
         "render_scene_patch_source_counts": render_scene_patch_source_counts,
+        "sample_failures": sample_failures,
+    })
+}
+
+fn cells_visible_click_runtime_work_contract_summary(
+    live_probe: &serde_json::Value,
+) -> serde_json::Value {
+    let mut click_sample_count = 0_u64;
+    let mut interaction_sample_count = 0_u64;
+    let mut zero_scan_sample_count = 0_u64;
+    let mut zero_root_materialization_sample_count = 0_u64;
+    let mut zero_recompute_sample_count = 0_u64;
+    let mut total_rows_scanned = 0_u64;
+    let mut total_list_find_rows_scanned = 0_u64;
+    let mut total_summary_fields_scanned = 0_u64;
+    let mut total_root_materialization_candidates = 0_u64;
+    let mut total_recomputed_fields = 0_u64;
+    let mut sample_failures = Vec::new();
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let interaction = sample.get("interaction_timing");
+        let Some(interaction) = interaction.filter(|value| value.is_object()) else {
+            sample_failures.push(json!({
+                "index": sample_index,
+                "reason": "missing_interaction_timing"
+            }));
+            continue;
+        };
+        interaction_sample_count = interaction_sample_count.saturating_add(1);
+        let rows_scanned = interaction
+            .pointer("/runtime_list_scan_counters/rows_scanned")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let list_find_rows_scanned = interaction
+            .pointer("/runtime_list_scan_counters/list_find_rows_scanned")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let summary_fields_scanned = interaction
+            .pointer("/runtime_list_scan_counters/summary_fields_scanned")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let root_materialization_candidates = interaction
+            .pointer("/runtime_root_materialization_stats/candidate_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let recomputed_fields = interaction
+            .get("runtime_recomputed_field_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        total_rows_scanned = total_rows_scanned.saturating_add(rows_scanned);
+        total_list_find_rows_scanned =
+            total_list_find_rows_scanned.saturating_add(list_find_rows_scanned);
+        total_summary_fields_scanned =
+            total_summary_fields_scanned.saturating_add(summary_fields_scanned);
+        total_root_materialization_candidates =
+            total_root_materialization_candidates.saturating_add(root_materialization_candidates);
+        total_recomputed_fields = total_recomputed_fields.saturating_add(recomputed_fields);
+        let zero_scans =
+            rows_scanned == 0 && list_find_rows_scanned == 0 && summary_fields_scanned == 0;
+        let zero_root_materialization = root_materialization_candidates == 0;
+        let zero_recompute = recomputed_fields == 0;
+        if zero_scans {
+            zero_scan_sample_count = zero_scan_sample_count.saturating_add(1);
+        }
+        if zero_root_materialization {
+            zero_root_materialization_sample_count =
+                zero_root_materialization_sample_count.saturating_add(1);
+        }
+        if zero_recompute {
+            zero_recompute_sample_count = zero_recompute_sample_count.saturating_add(1);
+        }
+        if !(zero_scans && zero_root_materialization && zero_recompute) {
+            sample_failures.push(json!({
+                "index": sample_index,
+                "target_address": sample
+                    .get("target_address")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "rows_scanned": rows_scanned,
+                "list_find_rows_scanned": list_find_rows_scanned,
+                "summary_fields_scanned": summary_fields_scanned,
+                "root_materialization_candidates": root_materialization_candidates,
+                "recomputed_fields": recomputed_fields,
+                "recomputed_field_samples": interaction
+                    .get("runtime_recomputed_field_samples")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "reason": "runtime_work_exceeded_selection_click_contract"
+            }));
+        }
+    }
+    let status = if click_sample_count > 0
+        && interaction_sample_count == click_sample_count
+        && zero_scan_sample_count == click_sample_count
+        && zero_root_materialization_sample_count == click_sample_count
+        && zero_recompute_sample_count == click_sample_count
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "click_sample_count": click_sample_count,
+        "interaction_sample_count": interaction_sample_count,
+        "zero_scan_sample_count": zero_scan_sample_count,
+        "zero_root_materialization_sample_count": zero_root_materialization_sample_count,
+        "zero_recompute_sample_count": zero_recompute_sample_count,
+        "total_rows_scanned": total_rows_scanned,
+        "total_list_find_rows_scanned": total_list_find_rows_scanned,
+        "total_summary_fields_scanned": total_summary_fields_scanned,
+        "total_root_materialization_candidates": total_root_materialization_candidates,
+        "total_recomputed_fields": total_recomputed_fields,
         "sample_failures": sample_failures,
     })
 }

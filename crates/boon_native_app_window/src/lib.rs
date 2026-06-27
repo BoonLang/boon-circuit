@@ -2232,6 +2232,7 @@ async fn run_surface_probe_inner(
     let mut last_render_loop_report_write_ms: Option<f64> = None;
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
+    let mut deferred_unsampled_input_resample = false;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
@@ -2352,6 +2353,20 @@ async fn run_surface_probe_inner(
                 continue;
             }
         }
+        let current_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        let unsampled_input_wake_count =
+            current_input_event_wake_count > sampled_input_event_wake_count;
+        if unsampled_input_wake_count && !deferred_unsampled_input_resample {
+            deferred_unsampled_input_resample = true;
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+            if hooks.as_ref().is_none_or(|hooks| hooks.poll.is_none()) {
+                accept_input_cursor(&mut mouse, &mut input_cursor, &input);
+            }
+            continue;
+        }
+        deferred_unsampled_input_resample = false;
         if !render_loop_state.should_render(Instant::now(), false) {
             let bookkeeping_elapsed = bookkeeping_started.elapsed();
             render_loop_state.note_idle_poll_substeps(

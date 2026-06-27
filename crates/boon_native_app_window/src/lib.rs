@@ -20,6 +20,7 @@ const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
+const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -904,6 +905,15 @@ impl NativeRenderLoopState {
             .saturating_add(event_gap_count);
         self.last_input_resample_event_gap_count = event_gap_count;
         self.last_input_resample_kind = Some("deferred_next_loop".to_owned());
+    }
+
+    pub fn note_input_pre_present_resample(&mut self, event_gap_count: u64) {
+        self.input_deferred_resample_count = self.input_deferred_resample_count.saturating_add(1);
+        self.input_deferred_resample_event_gap_count = self
+            .input_deferred_resample_event_gap_count
+            .saturating_add(event_gap_count);
+        self.last_input_resample_event_gap_count = event_gap_count;
+        self.last_input_resample_kind = Some("pre_present_drop".to_owned());
     }
 
     pub fn note_idle_poll_substeps(
@@ -2262,7 +2272,7 @@ async fn run_surface_probe_inner(
     let mut last_render_loop_report_write_ms: Option<f64> = None;
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
-    let mut deferred_unsampled_input_resample = false;
+    let mut consecutive_unsampled_input_resamples = 0_u8;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
@@ -2399,11 +2409,14 @@ async fn run_surface_probe_inner(
         let current_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let unsampled_input_wake_count =
             current_input_event_wake_count > sampled_input_event_wake_count;
-        if unsampled_input_wake_count && !deferred_unsampled_input_resample {
+        if unsampled_input_wake_count
+            && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+        {
             render_loop_state.note_input_deferred_resample(
                 current_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
             );
-            deferred_unsampled_input_resample = true;
+            consecutive_unsampled_input_resamples =
+                consecutive_unsampled_input_resamples.saturating_add(1);
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
             render_loop_state.scheduled_wake_count =
                 render_loop_state.scheduled_wake_count.saturating_add(1);
@@ -2412,7 +2425,9 @@ async fn run_surface_probe_inner(
             }
             continue;
         }
-        deferred_unsampled_input_resample = false;
+        if !unsampled_input_wake_count {
+            consecutive_unsampled_input_resamples = 0;
+        }
         if !render_loop_state.should_render(Instant::now(), false) {
             let bookkeeping_elapsed = bookkeeping_started.elapsed();
             render_loop_state.note_idle_poll_substeps(
@@ -2578,6 +2593,23 @@ async fn run_surface_probe_inner(
             } else {
                 None
             };
+        let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        if pre_present_input_event_wake_count > sampled_input_event_wake_count
+            && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+        {
+            render_loop_state.note_input_pre_present_resample(
+                pre_present_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
+            );
+            consecutive_unsampled_input_resamples =
+                consecutive_unsampled_input_resamples.saturating_add(1);
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+            continue;
+        }
+        if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
+            consecutive_unsampled_input_resamples = 0;
+        }
         last_interactive_surface_readback_queued = interactive_readback.is_some();
         last_interactive_surface_readback_skipped_for_external_proof =
             skip_interactive_surface_readback;
@@ -4038,6 +4070,17 @@ mod tests {
         assert_eq!(
             state.last_input_resample_kind.as_deref(),
             Some("deferred_next_loop")
+        );
+
+        state.note_input_pre_present_resample(4);
+        assert_eq!(state.input_inline_resample_count, 1);
+        assert_eq!(state.input_deferred_resample_count, 2);
+        assert_eq!(state.input_inline_resample_event_gap_count, 2);
+        assert_eq!(state.input_deferred_resample_event_gap_count, 7);
+        assert_eq!(state.last_input_resample_event_gap_count, 4);
+        assert_eq!(
+            state.last_input_resample_kind.as_deref(),
+            Some("pre_present_drop")
         );
     }
 

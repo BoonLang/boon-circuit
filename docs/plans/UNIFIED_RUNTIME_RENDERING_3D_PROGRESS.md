@@ -20317,3 +20317,46 @@ Next executable work:
   parser/typechecker/IR dependencies.
 - Only after this gate passes, start NativeRegionIR and Rust/Zig codegen
   slices from the cleaned compiler API.
+
+## 2026-06-27 - Native Input Stale-Present Guard
+
+Status: implemented a bounded U5 scheduler correctness slice after the
+subagent review. This does not complete TASK-0804A because the strict Cells
+visible-click budget still fails.
+
+What changed:
+
+- Replaced the one-shot late-input resample boolean with a bounded consecutive
+  resample counter.
+- Added a pre-submit/present input generation guard in the native app-window
+  render loop. If input arrives after rendering but before submit/present, the
+  frame is dropped and the loop resamples instead of presenting stale content.
+- Added the `pre_present_drop` input-resample report kind while preserving the
+  existing deferred counter fields.
+- Left scheduler-only same-content host-input validation unchanged for this
+  slice because it covers focus/hover/caret repaint behavior and has broader
+  tests.
+
+Evidence before commit:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_app_window`: pass, `32` tests.
+- `cargo check -q -p boon_native_app_window`: pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  fail; `input_wake_to_formula_visible_ms_p95=16.998277ms` exceeds the
+  `16.7ms` budget. Other important facts: selected cell/formula visibility
+  passed, `click_to_formula_visible_ms_p95=27.381178ms`,
+  `input_wake_to_present_ms_p95=16.998277ms`, changed readback passed,
+  `stale_for_latest_input=false`, and the latest preview-loop report had
+  `input_deferred_resample_count=1`, `last_input_resample_kind=deferred_next_loop`.
+
+Current interpretation:
+
+- The input loop no longer knowingly presents a frame stale for the latest input
+  generation under normal bounded conditions.
+- The remaining strict p95 failure is now a retained rendering/cache budget
+  problem, not a full-grid runtime scan or ignored-click problem in this
+  release run. The latest render proof showed retained chunk reuse and a patch
+  render path; the next useful implementation should force Cells
+  selection/formula-bar updates through the committed nonstructural retained
+  patch route and make the verifier reject full lower/rebuild fallback there.

@@ -934,13 +934,12 @@ fn run_cells_interaction_speed(
     report_value["layout_frame_hash"] = layout_hash;
     report_value["preview_last_error"] = json!(last_error);
     report_value["interaction_timing_count"] = json!(interaction_timings.len());
-    report_value["interaction_timing_samples"] = json!(
-        interaction_timings
-            .iter()
-            .take(128)
-            .map(preview_interaction_timing_sample_json)
-            .collect::<Vec<_>>()
-    );
+    let interaction_timing_sample_values = interaction_timings
+        .iter()
+        .take(128)
+        .map(preview_interaction_timing_sample_json)
+        .collect::<Vec<_>>();
+    report_value["interaction_timing_samples"] = json!(interaction_timing_sample_values);
     report_value["interaction_profile_count"] = json!(interaction_profiles.len());
     report_value["interaction_profile_samples"] = json!(
         interaction_profiles
@@ -950,13 +949,12 @@ fn run_cells_interaction_speed(
             .collect::<Vec<_>>()
     );
     report_value["native_input_timing_count"] = json!(native_input_timings.len());
-    report_value["native_input_timing_samples"] = json!(
-        native_input_timings
-            .iter()
-            .take(128)
-            .map(preview_native_input_timing_sample_json)
-            .collect::<Vec<_>>()
-    );
+    let native_input_timing_sample_values = native_input_timings
+        .iter()
+        .take(128)
+        .map(preview_native_input_timing_sample_json)
+        .collect::<Vec<_>>();
+    report_value["native_input_timing_samples"] = json!(native_input_timing_sample_values);
     report_value["native_input_profile_samples"] = json!(
         native_input_profiles
             .iter()
@@ -968,6 +966,32 @@ fn run_cells_interaction_speed(
     report_value["simple_source_click_count"] = json!(simple_source_click_count);
     report_value["simple_click_button_shape_rejects"] = json!(simple_click_button_shape_rejects);
     report_value["real_window_click_shape_pass"] = json!(real_window_click_shape_pass);
+    let selection_formula_retained_patch_summary =
+        cells_interaction_selection_formula_retained_patch_summary(
+            &event_records,
+            &interaction_timing_sample_values,
+            &native_input_timing_sample_values,
+        );
+    let selection_formula_retained_patch_count = selection_formula_retained_patch_summary
+        .get("selection_formula_retained_patch_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let selection_formula_retained_touched_node_count = selection_formula_retained_patch_summary
+        .get("selection_formula_retained_touched_node_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let selection_formula_full_layout_count = selection_formula_retained_patch_summary
+        .get("selection_formula_full_layout_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    report_value["selection_formula_retained_patch_summary"] =
+        selection_formula_retained_patch_summary.clone();
+    report_value["selection_formula_retained_patch_count"] =
+        json!(selection_formula_retained_patch_count);
+    report_value["selection_formula_retained_touched_node_count"] =
+        json!(selection_formula_retained_touched_node_count);
+    report_value["selection_formula_full_layout_count"] =
+        json!(selection_formula_full_layout_count);
     let click_interaction_timing_ms =
         interaction_timing_scope_summary_json(&interaction_timings, PREVIEW_TIMING_SCOPE_CLICK);
     let click_native_input_timing_ms =
@@ -1028,6 +1052,11 @@ fn run_cells_interaction_speed(
             "detail": format!("simple_source_click_count={simple_source_click_count}, simple_click_button_shape_rejects={simple_click_button_shape_rejects}")
         },
         {
+            "id": "cells-interaction-speed:selection-formula-retained-patch",
+            "pass": selection_formula_retained_patch_count > 0 && selection_formula_full_layout_count == 0,
+            "detail": format!("selection_formula_retained_patch_count={selection_formula_retained_patch_count}, selection_formula_retained_touched_node_count={selection_formula_retained_touched_node_count}, selection_formula_full_layout_count={selection_formula_full_layout_count}")
+        },
+        {
             "id": "cells-interaction-speed:p95-latency-budget",
             "pass": p95_ok,
             "detail": format!("interaction_latency_ms_p95={p95_ms:.3}, max_p95_ms={max_p95_ms:.3}")
@@ -1073,6 +1102,90 @@ struct CellsInteractionFormulaCounts {
     evaluated_cell_sample_count: usize,
     recomputed_field_count_max: u64,
     evaluated_cell_samples: Vec<String>,
+}
+
+fn cells_interaction_selection_formula_retained_patch_summary(
+    event_records: &[CellsInteractionSpeedEventRecord],
+    interaction_samples: &[Value],
+    native_input_samples: &[Value],
+) -> Value {
+    let selection_formula_event_count = event_records
+        .iter()
+        .filter(|record| matches!(record.kind.as_str(), "cell-click" | "formula-bar-click"))
+        .count() as u64;
+    let simple_source_click_count = native_input_samples
+        .iter()
+        .filter(|profile| {
+            profile.get("fast_path").and_then(Value::as_str) == Some("simple_source_click")
+        })
+        .count() as u64;
+    let retained_text_input_focus_click_count = native_input_samples
+        .iter()
+        .filter(|profile| {
+            profile.get("fast_path").and_then(Value::as_str)
+                == Some("retained_text_input_focus_click")
+        })
+        .count() as u64;
+    let mut retained_layout_patch_count = 0_u64;
+    let mut full_layout_count = 0_u64;
+    let mut rejected_fast_path_count = 0_u64;
+    let mut touched_node_count = 0_u64;
+    let mut layout_source_counts = BTreeMap::<String, u64>::new();
+    for profile in interaction_samples {
+        let layout_source = profile
+            .get("layout_source")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        *layout_source_counts
+            .entry(layout_source.to_owned())
+            .or_default() += 1;
+        match layout_source {
+            "visible_state_sync" | "paint_space_patch" | "patched_document_frame" => {
+                retained_layout_patch_count = retained_layout_patch_count.saturating_add(1);
+                touched_node_count = touched_node_count.saturating_add(
+                    profile
+                        .get("coalesced_render_patch_count")
+                        .or_else(|| profile.get("render_patch_count"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+            "full_document_lower" => {
+                full_layout_count = full_layout_count.saturating_add(1);
+            }
+            _ => {}
+        }
+        if profile
+            .get("document_patch_fast_path_rejected")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            rejected_fast_path_count = rejected_fast_path_count.saturating_add(1);
+        }
+    }
+    let selection_formula_retained_patch_count = simple_source_click_count
+        .saturating_add(retained_text_input_focus_click_count)
+        .min(retained_layout_patch_count.saturating_add(retained_text_input_focus_click_count));
+    json!({
+        "status": if selection_formula_event_count > 0
+            && selection_formula_retained_patch_count > 0
+            && full_layout_count == 0
+            && rejected_fast_path_count == 0
+        {
+            "pass"
+        } else {
+            "fail"
+        },
+        "selection_formula_event_count": selection_formula_event_count,
+        "selection_formula_retained_patch_count": selection_formula_retained_patch_count,
+        "selection_formula_retained_touched_node_count": touched_node_count,
+        "selection_formula_full_layout_count": full_layout_count,
+        "selection_formula_document_patch_fast_path_rejected_count": rejected_fast_path_count,
+        "simple_source_click_count": simple_source_click_count,
+        "retained_text_input_focus_click_count": retained_text_input_focus_click_count,
+        "retained_layout_patch_count": retained_layout_patch_count,
+        "layout_source_counts": layout_source_counts
+    })
 }
 
 fn cells_interaction_materialization_counts_from_summary(

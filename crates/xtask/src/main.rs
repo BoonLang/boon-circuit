@@ -47521,6 +47521,26 @@ fn verify_native_cells_interaction_speed(
         .and_then(|report| report.get("simple_source_click_count"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default();
+    let selection_formula_retained_patch_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selection_formula_retained_patch_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let selection_formula_retained_touched_node_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selection_formula_retained_touched_node_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let selection_formula_full_layout_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selection_formula_full_layout_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let selection_formula_retained_patch_summary = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selection_formula_retained_patch_summary"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -47531,6 +47551,21 @@ fn verify_native_cells_interaction_speed(
         ),
         (!real_window_click_shape_pass).then(|| {
             "Cells interaction speed gate must exercise the real-window release shape without simple-click button_shape rejects".to_owned()
+        }),
+    );
+    let selection_formula_retained_patch_ok = selection_formula_retained_patch_count > 0
+        && selection_formula_retained_touched_node_count > 0
+        && selection_formula_full_layout_count == 0;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:selection-formula-retained-patch",
+        selection_formula_retained_patch_ok,
+        format!(
+            "retained_patch_count={selection_formula_retained_patch_count}, touched_node_count={selection_formula_retained_touched_node_count}, full_layout_count={selection_formula_full_layout_count}"
+        ),
+        (!selection_formula_retained_patch_ok).then(|| {
+            "Cells selection/formula-bar interactions must expose retained patch evidence and zero full-layout fallback".to_owned()
         }),
     );
 
@@ -47772,6 +47807,10 @@ fn verify_native_cells_interaction_speed(
             "real_window_click_shape_pass": real_window_click_shape_pass,
             "simple_source_click_count": simple_source_click_count,
             "simple_click_button_shape_rejects": simple_click_button_shape_rejects,
+            "selection_formula_retained_patch_summary": selection_formula_retained_patch_summary,
+            "selection_formula_retained_patch_count": selection_formula_retained_patch_count,
+            "selection_formula_retained_touched_node_count": selection_formula_retained_touched_node_count,
+            "selection_formula_full_layout_count": selection_formula_full_layout_count,
             "workflow_latency_ms_p95": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("workflow_latency_ms_p95"))
@@ -47991,6 +48030,10 @@ fn verify_native_cells_visible_click_e2e(
         || live_probe
             .pointer("/readback_probe/accepted_by_retained_bound_text_sync")
             .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        || live_probe
+            .pointer("/visual_formula_probe/visual_formula_changed")
+            .and_then(serde_json::Value::as_bool)
             == Some(true);
     let click_to_formula_ms = live_probe
         .get("click_to_formula_visible_ms_p95")
@@ -48055,6 +48098,12 @@ fn verify_native_cells_visible_click_e2e(
         == Some("pass");
     let runtime_work_contract = cells_visible_click_runtime_work_contract_summary(&live_probe);
     let runtime_work_contract_pass = runtime_work_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let formula_transition_contract =
+        cells_visible_click_formula_transition_contract_summary(&live_probe);
+    let formula_transition_contract_pass = formula_transition_contract
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
@@ -48323,6 +48372,33 @@ fn verify_native_cells_visible_click_e2e(
             "Cells visible click must not perform list scans, root materialization, or full-grid recompute on selection/formula-bar updates".to_owned()
         }),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:formula-bar-visible-transition",
+        formula_transition_contract_pass,
+        format!(
+            "status={:?}, changed_samples={}, required_samples={}, visual_pass_required_samples={}",
+            formula_transition_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            formula_transition_contract
+                .get("changed_formula_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            formula_transition_contract
+                .get("change_required_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            formula_transition_contract
+                .get("visual_pass_required_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (!formula_transition_contract_pass).then(|| {
+            "Cells visible click must prove the top formula input text changed for targets with a different formula".to_owned()
+        }),
+    );
 
     let role_artifacts = live_probe
         .get("artifact_paths")
@@ -48450,6 +48526,7 @@ fn verify_native_cells_visible_click_e2e(
                 .unwrap_or(serde_json::Value::Null),
             "retained_update_contract": retained_update_contract,
             "runtime_work_contract": runtime_work_contract,
+            "formula_transition_contract": formula_transition_contract,
             "bounded_click_to_present_outlier_policy": "steady driver-to-app-wake outliers are accepted only when every max-budget violation remains below max_click_to_present_ms + max_click_to_formula_ms, the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms, and the sample produced a changed app-owned readback/proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below the same bounded cap and produce changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
@@ -48807,6 +48884,95 @@ fn cells_visible_click_runtime_work_contract_summary(
     })
 }
 
+fn cells_visible_click_formula_transition_contract_summary(
+    live_probe: &serde_json::Value,
+) -> serde_json::Value {
+    let mut click_sample_count = 0_u64;
+    let mut change_required_sample_count = 0_u64;
+    let mut changed_formula_sample_count = 0_u64;
+    let mut visual_pass_required_sample_count = 0_u64;
+    let mut sample_failures = Vec::new();
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let before = sample
+            .get("formula_bar_text_before_click")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let after = sample
+            .get("formula_bar_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let expected = sample
+            .get("expected_formula_bar_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let change_required = sample
+            .get("formula_bar_change_required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(before != expected);
+        let changed = sample
+            .get("formula_bar_changed_from_previous")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(before != after);
+        let visual_pass = sample
+            .pointer("/visual_formula_probe/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        if change_required {
+            change_required_sample_count = change_required_sample_count.saturating_add(1);
+            if changed {
+                changed_formula_sample_count = changed_formula_sample_count.saturating_add(1);
+            }
+            if visual_pass {
+                visual_pass_required_sample_count =
+                    visual_pass_required_sample_count.saturating_add(1);
+            }
+            if !(changed && after == expected && visual_pass) {
+                sample_failures.push(json!({
+                    "index": sample_index,
+                    "target_address": sample
+                        .get("target_address")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "before_formula_bar_text": before,
+                    "formula_bar_text": after,
+                    "expected_formula_bar_text": expected,
+                    "changed_from_previous": changed,
+                    "visual_formula_probe_status": sample
+                        .pointer("/visual_formula_probe/status")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "reason": "formula_bar_text_did_not_visibly_transition_to_expected_value"
+                }));
+            }
+        }
+    }
+    let status = if click_sample_count > 0
+        && change_required_sample_count > 0
+        && changed_formula_sample_count == change_required_sample_count
+        && visual_pass_required_sample_count == change_required_sample_count
+        && sample_failures.is_empty()
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "click_sample_count": click_sample_count,
+        "change_required_sample_count": change_required_sample_count,
+        "changed_formula_sample_count": changed_formula_sample_count,
+        "visual_pass_required_sample_count": visual_pass_required_sample_count,
+        "sample_failures": sample_failures,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct CellsVisibleClickTarget {
     address: String,
@@ -49022,6 +49188,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
         Duration::from_secs(5),
     )
     .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+    let mut previous_formula_bar_text =
+        runtime_value_response_string(&before_runtime_values, "store.selected_input.editing_text")
+            .unwrap_or_else(|| "missing".to_owned());
 
     let (calibration_x, calibration_y) =
         native_driver_weston_coordinates(first_driver_target, 240.0, 220.0);
@@ -49239,6 +49408,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             loop_input_event_wake_count_from_report(&loop_before_click);
         let click_started_monotonic_ns = monotonic_now_ns();
         let click_started = Instant::now();
+        let formula_bar_text_before_click = previous_formula_bar_text.clone();
         let driver_run = spawn_weston_click_driver(
             &driver_path,
             &socket,
@@ -49362,6 +49532,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("status")
             .and_then(serde_json::Value::as_str)
             == Some("pass");
+        let formula_bar_change_required = formula_bar_text_before_click != target.expected_formula;
+        let formula_bar_changed_from_previous = formula_bar_text_before_click != formula_bar_text;
+        let formula_bar_change_visible = !formula_bar_change_required
+            || (formula_bar_changed_from_previous && visual_formula_pass);
         let harness_click_to_present_ms = present_probe
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
@@ -49447,6 +49621,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             && present_pass
             && readback_pass
             && visual_formula_pass
+            && formula_bar_change_visible
             && selected_address == target.address
             && formula_bar_text == target.expected_formula;
         let last_poll_diagnostics = present_probe
@@ -49506,6 +49681,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "index": index,
             "target_address": target.address,
             "expected_formula_bar_text": target.expected_formula,
+            "formula_bar_text_before_click": formula_bar_text_before_click,
+            "formula_bar_change_required": formula_bar_change_required,
+            "formula_bar_changed_from_previous": formula_bar_changed_from_previous,
+            "formula_bar_change_visible": formula_bar_change_visible,
             "selected_address": selected_address,
             "formula_bar_text": formula_bar_text,
             "driver_coordinates": {
@@ -49581,6 +49760,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         last_loop_after = loop_after;
         last_sample = sample.clone();
         click_samples.push(sample);
+        previous_formula_bar_text = formula_bar_text;
         thread::sleep(Duration::from_millis(25));
     }
     let loop_after = last_loop_after;

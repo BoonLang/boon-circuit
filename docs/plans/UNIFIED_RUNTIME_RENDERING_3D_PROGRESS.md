@@ -20778,3 +20778,81 @@ External references consulted for the architecture options:
   `https://hyperformula.handsontable.com/docs/guide/dependency-graph.html`
 - Microsoft Excel recalculation:
   `https://learn.microsoft.com/en-us/office/client-developer/excel/excel-recalculation`
+
+## 2026-06-28 Cells visual-click evidence tightening
+
+Changes made:
+
+- Added role-level Cells interaction-speed counters for
+  `selection_formula_retained_patch_count`,
+  `selection_formula_retained_touched_node_count`, and
+  `selection_formula_full_layout_count`.
+- Added a Cells visible-click formula-bar transition contract. Each measured
+  click sample now records the top formula input text before the click, the
+  expected text after the click, whether the text actually changed, and whether
+  the retained visual formula proof passed.
+- The visible-click gate now accepts the existing app-owned retained
+  text-input sync proof as visual-change evidence, instead of requiring only a
+  full-frame readback hash change.
+
+Fresh local evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p xtask -p boon_native_playground`: pass, with existing
+  dead-code warnings in native GPU/playground crates.
+- `cargo build -q -p xtask`: pass, with existing dead-code warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release
+  --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  fail, but now for the right reasons:
+  - formula transition contract: pass
+    (`change_required_sample_count=64`,
+    `changed_formula_sample_count=64`,
+    `visual_pass_required_sample_count=64`).
+  - retained update contract: pass.
+  - runtime work contract: pass.
+  - remaining blockers:
+    first cold sample made the live probe status fail, max
+    `click_to_formula_visible_ms=55.617ms`, and the max/present policy still
+    classifies one cold sample as an unbounded outlier.
+  - steady evidence is materially better than the max blocker:
+    `steady_click_to_formula_visible_ms.p95=31.075ms`,
+    `steady_click_to_formula_visible_ms.max=32.306ms`,
+    `steady_input_wake_to_formula_visible_ms.p95=16.404ms`.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release
+  --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  fail only because headed visual evidence is stale against the dirty worktree.
+  The role evidence itself reports:
+  - `interaction_latency_ms_p95=9.268ms`,
+  - `interaction_latency_ms_max=21.996ms`,
+  - `selection_formula_retained_patch_count=51`,
+  - `selection_formula_retained_touched_node_count=67`,
+  - `selection_formula_full_layout_count=0`,
+  - retained patch summary status pass.
+
+Interpretation:
+
+- The user's reported failure mode must not be measured by state-only checks.
+  The new report distinguishes runtime currentness, retained patching, and
+  visible formula-bar text transitions.
+- Current evidence says the top formula input does update in the isolated
+  app-owned verifier, including `A0 -> A2` (`5 -> 15`) and the formula cells
+  (`15 -> =add(A0,A1) -> =sum(A0:A2) -> 5`).
+- The remaining Cells speed blockers are now input/present scheduling and
+  max-outlier policy, not `List/find` scans, full-grid recompute, or missing
+  formula-bar currentness.
+
+Next architecture options:
+
+1. Tighten app-window input scheduling in
+   `crates/boon_native_app_window/src/lib.rs`: drain/coalesce app-window input
+   provenance until stable before the poll hook, and avoid sample/continue or
+   pre-present deferral for click press/release pairs that can be handled in
+   the same frame.
+2. Move selection/formula-bar visual updates toward a direct retained patch
+   primitive over `{old_selected_cell, new_selected_cell, formula_bar_node,
+   focused_node}`, so the hot path can avoid even the broader
+   `visible_state_sync` accounting where possible.
+3. Keep runtime/list/currentness contracts as guards, but do not spend the next
+   slice on generic runtime rewrites unless the fresh counters regress. The
+   native reports currently show zero full-layout fallback for selection/formula
+   interactions and pass the runtime work contract.

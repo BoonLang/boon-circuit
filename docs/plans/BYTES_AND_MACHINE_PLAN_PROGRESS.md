@@ -23160,3 +23160,43 @@ Next architecture options:
 - Continue MachinePlan/default-switch work once the current native evidence is
   preserved, rather than spending the next iteration only on tiny timing
   margins.
+
+## 2026-06-27 - BYTES Aggregate Child Replay Commands
+
+Status: implemented a small Phase 9/Phase 10 readiness-tooling improvement.
+This does not switch the default executor and does not claim final
+BYTES/MachinePlan readiness.
+
+What changed:
+
+- `verify-bytes-machine-plan-all` now copies each child report's
+  `command_argv` into the aggregate `child_reports` row.
+- `boon_report_schema` now requires aggregate child rows to carry a non-empty
+  string `command_argv`, checks that non-baseline children mention the expected
+  command, and verifies any embedded `--report` argument matches the child
+  report path.
+- The goal is to make stale-child refresh loops aggregate-driven instead of
+  forcing the operator to open each child JSON report to recover replay
+  commands.
+
+Evidence before commit:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass, with existing native
+  GPU dead-code warnings.
+- `cargo test -q -p boon_report_schema`: pass, `29` tests.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  expected fail. The regenerated aggregate has `status="fail"`,
+  `checked_report_count=56`, and child rows now include replayable
+  `command_argv` values. The failure remains stale child evidence after recent
+  commits/rebuilds, not a default-switch pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass for the failing aggregate report shape.
+
+Remaining blockers:
+
+- Many BYTES child reports still need regeneration after commits/rebuilds
+  before the aggregate can be cited as fresh passing evidence.
+- Phase 10 remains blocked: `boon_cli run` still defaults to legacy until the
+  broader parity, performance, no-fallback, and readiness criteria pass.

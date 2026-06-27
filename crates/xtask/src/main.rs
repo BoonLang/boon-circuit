@@ -60165,12 +60165,17 @@ fn verify_bytes_machine_plan_all_with_required(
             let child_sha256 = cached_sha256_file(path)?;
             let expression_kinds = child_expression_kinds(&child);
             let source_payload_typing = child_source_payload_typing_summary(&child);
+            let command_argv = child
+                .get("command_argv")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             let mut child_report = json!({
                 "label": required_report.label,
                 "path": required_report.path,
                 "sha256": child_sha256,
                 "status": status.unwrap_or("missing"),
                 "command": command.unwrap_or("missing"),
+                "command_argv": command_argv,
                 "measurement_mode": mode.unwrap_or("missing"),
                 "git_commit": git.unwrap_or("missing"),
                 "schema_valid": schema_result.is_ok(),

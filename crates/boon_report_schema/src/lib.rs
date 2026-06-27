@@ -7534,6 +7534,43 @@ fn verify_bytes_machine_plan_all_report(
             )
             .into());
         }
+        let command_argv = child
+            .get("command_argv")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} child report `{label}` missing command_argv",
+                    report_path.display()
+                )
+            })?;
+        if command_argv.is_empty() || command_argv.iter().any(|arg| arg.as_str().is_none()) {
+            return Err(format!(
+                "{} child report `{label}` command_argv is empty or malformed",
+                report_path.display()
+            )
+            .into());
+        }
+        if label != "phase0-baseline"
+            && !command_argv
+                .iter()
+                .any(|arg| arg.as_str() == Some(expected_child.command))
+        {
+            return Err(format!(
+                "{} child report `{label}` command_argv does not contain expected command `{}`",
+                report_path.display(),
+                expected_child.command
+            )
+            .into());
+        }
+        if let Some(report_arg) = command_argv_value_after(command_argv, "--report")
+            && report_arg != path
+        {
+            return Err(format!(
+                "{} child report `{label}` command_argv --report `{report_arg}` does not match child path `{path}`",
+                report_path.display()
+            )
+            .into());
+        }
         let mode = child
             .get("measurement_mode")
             .and_then(JsonValue::as_str)

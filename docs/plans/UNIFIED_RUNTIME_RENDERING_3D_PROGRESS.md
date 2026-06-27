@@ -20193,3 +20193,39 @@ Architecture note:
   boundary, but the near-threshold visible-click rerun confirms that the deeper
   fix is still architectural: either a bounded app-window input event queue or
   retained-frame/dirty-area rendering, not more unmeasured micro-tuning.
+
+## 2026-06-27 - BYTES Aggregate Replayability Slice
+
+Status: U1/U11 readiness tooling improved. This slice reduces stale-report
+refresh friction but does not complete the default executor switch or the
+unified goal.
+
+What changed:
+
+- `verify-bytes-machine-plan-all` now embeds each required child report's
+  `command_argv` directly in the aggregate `child_reports` rows.
+- The report schema now validates those aggregate child replay commands,
+  including command presence and `--report` path consistency where present.
+- This keeps stale child reports honest while making the next refresh loop
+  deterministic from the aggregate alone.
+
+Evidence before commit:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass, with existing native
+  GPU dead-code warnings.
+- `cargo test -q -p boon_report_schema`: pass, `29` tests.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  expected fail. Child rows now contain replayable `command_argv`; blockers
+  remain stale child report schema/freshness after recent commits/rebuilds.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass for the failing aggregate report shape.
+
+Next executable work:
+
+- Commit the tooling slice, then refresh stale BYTES child reports from the
+  aggregate `child_reports[].command_argv` values and rerun
+  `verify-bytes-machine-plan-all`.
+- Keep Phase 10 blocked until readiness stops reporting partial phases, stale
+  support reports, and the legacy default executor.

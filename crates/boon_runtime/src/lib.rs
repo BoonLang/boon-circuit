@@ -33327,7 +33327,15 @@ impl GenericScheduledRuntime {
         if let Some(index) = self.storage.bound_index(list, key, generation)? {
             let invalidation_started = Instant::now();
             let mut changed_reads = BTreeSet::new();
-            insert_changed_list_field_read_keys(&mut changed_reads, list, index, changed_field);
+            let current = self.storage.list_row_value_opt(list, index, changed_field);
+            insert_changed_list_field_read_keys_for_values(
+                &mut changed_reads,
+                list,
+                index,
+                changed_field,
+                None,
+                current.as_ref(),
+            );
             self.invalidate_derived_value_caches_for_reads(changed_reads);
             source_action_profile.source_action_indexed_followup_invalidation_ms +=
                 runtime_elapsed_ms(invalidation_started);
@@ -33504,7 +33512,15 @@ impl GenericScheduledRuntime {
             return Ok(Vec::new());
         };
         let mut changed_reads = BTreeSet::new();
-        insert_changed_list_field_read_keys(&mut changed_reads, list, index, changed_field);
+        let current = self.storage.list_row_value_opt(list, index, changed_field);
+        insert_changed_list_field_read_keys_for_values(
+            &mut changed_reads,
+            list,
+            index,
+            changed_field,
+            None,
+            current.as_ref(),
+        );
         self.invalidate_derived_value_caches_for_reads(changed_reads.iter().cloned());
         if !self.indexed_row_dependency_state_complete(list, index) {
             return self.recompute_generic_derived_for_row(list, key, generation);
@@ -37243,7 +37259,6 @@ impl GenericScheduledRuntime {
             .into_iter()
             .collect::<BTreeSet<_>>();
         reads.insert(list_read_key(&projection.list));
-        reads.insert(list_column_read_key(&projection.list, &find_field));
         reads.insert(list_lookup_text_read_key(
             &projection.list,
             &find_field,
@@ -37262,6 +37277,9 @@ impl GenericScheduledRuntime {
         let lookup_storage_ms = runtime_elapsed_ms(lookup_storage_started);
         let indexed_lookup_ms = runtime_elapsed_ms(indexed_lookup_started);
         let source_index = indices.and_then(|indices| indices.into_iter().next());
+        if !probe.used_index {
+            reads.insert(list_column_read_key(&projection.list, &find_field));
+        }
         self.list_scan_counters.row_occurrences_scanned = self
             .list_scan_counters
             .row_occurrences_scanned
@@ -38929,12 +38947,14 @@ impl GenericScheduledRuntime {
         self.generic_derived_state
             .replace_numeric_stability_guards(key.clone(), numeric_stability_guards.clone());
         let mut changed_reads = RootReadKeys::new();
-        changed_reads.push(list_column_read_key(&key.list, &key.field));
-        changed_reads.push(GenericReadKey::ListField {
-            list: key.list.clone(),
-            index: key.index,
-            field: key.field.clone(),
-        });
+        push_changed_list_field_read_keys_for_values(
+            &mut changed_reads,
+            &key.list,
+            key.index,
+            &key.field,
+            current.as_ref(),
+            Some(&field_value),
+        );
         if current.as_ref() != Some(&field_value) {
             self.storage.set_or_replace_list_row_value(
                 &key.list,
@@ -42989,13 +43009,15 @@ impl GenericScheduledRuntime {
         if let BoonValue::ListRef(list) = &list {
             let field = normalized_field_name(field);
             frame.reads.insert(list_read_key(list));
-            frame.reads.insert(list_column_read_key(list, &field));
             frame
                 .reads
                 .insert(list_lookup_text_read_key(list, &field, &expected));
             let (indices, probe) =
                 self.cached_find_list_indices_by_textlike_indexed(list, &field, &expected)?;
             let index = indices.and_then(|indices| indices.into_iter().next());
+            if !probe.used_index {
+                frame.reads.insert(list_column_read_key(list, &field));
+            }
             self.list_scan_counters.row_occurrences_scanned = self
                 .list_scan_counters
                 .row_occurrences_scanned
@@ -43027,15 +43049,16 @@ impl GenericScheduledRuntime {
                     .list_find_rows_scanned
                     .saturating_add(probe.candidate_count);
             }
-            if index.is_none()
-                && self.generic_derived.contains_field(list, &field)
-                && let Some(index) =
+            if index.is_none() && self.generic_derived.contains_field(list, &field) {
+                frame.reads.insert(list_column_read_key(list, &field));
+                if let Some(index) =
                     self.scan_list_find_derived_textlike(list, &field, &expected, frame)?
-            {
-                return Ok(BoonValue::RowRef {
-                    list: list.clone(),
-                    index,
-                });
+                {
+                    return Ok(BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    });
+                }
             }
             return Ok(index
                 .map(|index| BoonValue::RowRef {
@@ -43047,13 +43070,15 @@ impl GenericScheduledRuntime {
         if let BoonValue::ListSelection { list, indices } = &list {
             let field = normalized_field_name(field);
             frame.reads.insert(list_read_key(list));
-            frame.reads.insert(list_column_read_key(list, &field));
             frame
                 .reads
                 .insert(list_lookup_text_read_key(list, &field, &expected));
             let (output, probe) = self.cached_find_list_indices_in_selection_by_textlike_indexed(
                 list, &field, &expected, indices, true,
             )?;
+            if !probe.used_index {
+                frame.reads.insert(list_column_read_key(list, &field));
+            }
             if probe.used_index {
                 self.list_scan_counters.row_occurrences_scanned = self
                     .list_scan_counters
@@ -47201,15 +47226,17 @@ impl GenericScheduledRuntime {
                         .root_textlike_ref(value)
                         .map(str::to_owned)
                         .unwrap_or_else(|_| value.clone());
+                    let (row, probe) =
+                        self.list_find_projection(projection_list, field, &selected)?;
                     self.record_root_list_find_projection_reads(
                         &projection.target,
                         projection_list,
                         field,
                         value,
                         &selected,
+                        probe.used_index,
                     );
-                    self.list_find_projection(projection_list, field, &selected)
-                        .map(JsonValue::Object)
+                    row.map(JsonValue::Object)
                 })();
                 projection_cache.insert(cache_key.clone(), row);
             }
@@ -47514,7 +47541,8 @@ impl GenericScheduledRuntime {
                     .root_textlike_ref(&value)
                     .map(str::to_owned)
                     .unwrap_or(value);
-                if let Some(value) = self.list_find_projection(&projection.list, &field, &selected)
+                if let Some((Some(value), _probe)) =
+                    self.list_find_projection(&projection.list, &field, &selected)
                 {
                     return Some(JsonValue::Object(value));
                 }
@@ -48816,17 +48844,20 @@ impl GenericScheduledRuntime {
                         .root_textlike_ref(value)
                         .map(str::to_owned)
                         .unwrap_or_else(|_| value.clone());
-                    self.record_root_list_find_projection_reads(
-                        &projection.target,
-                        projection_list,
-                        field,
-                        value,
-                        &selected_address,
-                    );
-                    if let Some(value) =
+                    if let Some((row, probe)) =
                         self.list_find_projection(projection_list, field, &selected_address)
                     {
-                        insert_nested_json(root, &projection.target, JsonValue::Object(value));
+                        self.record_root_list_find_projection_reads(
+                            &projection.target,
+                            projection_list,
+                            field,
+                            value,
+                            &selected_address,
+                            probe.used_index,
+                        );
+                        if let Some(row) = row {
+                            insert_nested_json(root, &projection.target, JsonValue::Object(row));
+                        }
                     }
                 }
             }
@@ -49068,7 +49099,7 @@ impl GenericScheduledRuntime {
         list: &str,
         field: &str,
         address: &str,
-    ) -> Option<serde_json::Map<String, JsonValue>> {
+    ) -> Option<(Option<serde_json::Map<String, JsonValue>>, TextLookupProbe)> {
         let field = normalized_field_name(field);
         let (indices, probe) = self
             .cached_find_list_indices_by_textlike_indexed(list, &field, address)
@@ -49104,12 +49135,16 @@ impl GenericScheduledRuntime {
                 .list_find_rows_scanned
                 .saturating_add(probe.candidate_count);
         }
-        let index = indices.and_then(|indices| indices.into_iter().next())?;
-        self.list_summary_fields
-            .iter()
-            .find(|summary| summary.list == list)
-            .cloned()
-            .and_then(|summary| self.summary_row_json(&summary, index).ok())
+        let row = indices
+            .and_then(|indices| indices.into_iter().next())
+            .and_then(|index| {
+                self.list_summary_fields
+                    .iter()
+                    .find(|summary| summary.list == list)
+                    .cloned()
+                    .and_then(|summary| self.summary_row_json(&summary, index).ok())
+            });
+        Some((row, probe))
     }
 
     fn record_root_list_find_projection_reads(
@@ -49119,14 +49154,17 @@ impl GenericScheduledRuntime {
         field: &str,
         selector_path: &str,
         selected: &str,
+        used_index: bool,
     ) {
         let field = normalized_field_name(field);
         let mut reads = root_read_keys_for_path(selector_path)
             .into_iter()
             .collect::<BTreeSet<_>>();
         reads.insert(list_read_key(list));
-        reads.insert(list_column_read_key(list, &field));
         reads.insert(list_lookup_text_read_key(list, &field, selected));
+        if !used_index {
+            reads.insert(list_column_read_key(list, &field));
+        }
         self.generic_derived_state
             .replace_root_reads(target.to_owned(), reads);
     }
@@ -57885,6 +57923,54 @@ fn insert_changed_list_field_read_keys(
         index,
         field: field.to_owned(),
     });
+}
+
+fn field_value_text_lookup_value(value: &FieldValue) -> Option<&str> {
+    match value {
+        FieldValue::Text(value) | FieldValue::Enum(value) => Some(value.as_str()),
+        FieldValue::Bool(_) | FieldValue::Bytes(_) | FieldValue::Json(_) => None,
+    }
+}
+
+fn insert_changed_list_field_read_keys_for_values(
+    reads: &mut BTreeSet<GenericReadKey>,
+    list: &str,
+    index: usize,
+    field: &str,
+    previous: Option<&FieldValue>,
+    current: Option<&FieldValue>,
+) {
+    insert_changed_list_field_read_keys(reads, list, index, field);
+    for value in previous
+        .and_then(field_value_text_lookup_value)
+        .into_iter()
+        .chain(current.and_then(field_value_text_lookup_value))
+    {
+        reads.insert(list_lookup_text_read_key(list, field, value));
+    }
+}
+
+fn push_changed_list_field_read_keys_for_values(
+    reads: &mut RootReadKeys,
+    list: &str,
+    index: usize,
+    field: &str,
+    previous: Option<&FieldValue>,
+    current: Option<&FieldValue>,
+) {
+    reads.push(list_column_read_key(list, field));
+    reads.push(GenericReadKey::ListField {
+        list: list.to_owned(),
+        index,
+        field: field.to_owned(),
+    });
+    for value in previous
+        .and_then(field_value_text_lookup_value)
+        .into_iter()
+        .chain(current.and_then(field_value_text_lookup_value))
+    {
+        reads.push(list_lookup_text_read_key(list, field, value));
+    }
 }
 
 fn sort_root_scalar_targets_for_same_event_reads(targets: &mut Vec<SourceRouteScalarTarget>) {
@@ -74354,6 +74440,10 @@ FUNCTION new_todo(title) {
             selected_reads.contains(&list_lookup_text_read_key("cells", "address", "B0")),
             "root List/find projection should record the exact indexed lookup read; reads={selected_reads:?}"
         );
+        assert!(
+            !selected_reads.contains(&list_column_read_key("cells", "address")),
+            "indexed root List/find projection should avoid broad column invalidation; reads={selected_reads:?}"
+        );
         assert_eq!(
             generic.list_scan_counters.list_find_rows_scanned, 0,
             "windowed selected_input summary should use the List/find text index instead of scanning"
@@ -85574,6 +85664,75 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 .reads
                 .contains(&list_lookup_text_read_key(&list, "key", "row-2")),
             "List/find should register the exact lookup dependency for formula/currentness fanout"
+        );
+        assert!(
+            !frame.reads.contains(&list_column_read_key(&list, "key")),
+            "indexed List/find should not retain a broad column dependency; reads={:?}",
+            frame.reads
+        );
+    }
+
+    #[test]
+    fn exact_list_lookup_invalidation_tracks_old_and_new_text_values() {
+        let cached_reads = BTreeSet::from([list_lookup_text_read_key("records", "key", "row-2")]);
+        let guards = BTreeMap::new();
+        let root_numbers = BTreeMap::new();
+
+        let mut unrelated_change = BTreeSet::new();
+        insert_changed_list_field_read_keys_for_values(
+            &mut unrelated_change,
+            "records",
+            0,
+            "key",
+            Some(&FieldValue::Text("row-1".to_owned())),
+            Some(&FieldValue::Text("row-3".to_owned())),
+        );
+        assert!(
+            !cache_entry_invalidated_by_reads(
+                &cached_reads,
+                &guards,
+                &unrelated_change,
+                &root_numbers
+            ),
+            "a row that changes between unrelated key values must not invalidate an exact lookup"
+        );
+
+        let mut changed_to_match = BTreeSet::new();
+        insert_changed_list_field_read_keys_for_values(
+            &mut changed_to_match,
+            "records",
+            0,
+            "key",
+            Some(&FieldValue::Text("row-1".to_owned())),
+            Some(&FieldValue::Text("row-2".to_owned())),
+        );
+        assert!(
+            cache_entry_invalidated_by_reads(
+                &cached_reads,
+                &guards,
+                &changed_to_match,
+                &root_numbers
+            ),
+            "a row changing to the expected lookup value must invalidate the exact lookup"
+        );
+
+        let mut changed_from_match = BTreeSet::new();
+        insert_changed_list_field_read_keys_for_values(
+            &mut changed_from_match,
+            "records",
+            1,
+            "key",
+            Some(&FieldValue::Text("row-2".to_owned())),
+            Some(&FieldValue::Text("row-3".to_owned())),
+        );
+        assert!(
+            cache_entry_invalidated_by_reads(
+                &cached_reads,
+                &guards,
+                &changed_from_match,
+                &root_numbers
+            ),
+            "a row changing away from the expected lookup value must invalidate the exact lookup"
         );
     }
 

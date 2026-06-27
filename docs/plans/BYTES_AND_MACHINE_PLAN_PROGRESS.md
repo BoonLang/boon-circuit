@@ -23508,3 +23508,53 @@ Follow-up native report refresh:
   missing final count, and stale headed visual evidence (`git_fresh=false`,
   `worktree_fresh=false`). It also did not exercise the direct layout-sidecar
   field.
+
+## 2026-06-28 - Exact Indexed List Lookup Invalidation
+
+Status: implemented a generic runtime/currentness slice from the Cells
+architecture review. This is not a Cells-specific workaround and it does not
+complete the full 60 FPS spreadsheet milestone.
+
+What changed:
+
+- Indexed `List/find` reads now record the exact
+  `list_lookup_text:{list}.{field}={value}` dependency without also recording
+  broad `list_column:{list}.{field}` reads when the text lookup index is used.
+- Scan/fallback paths still keep the broad list-column dependency.
+- Text-like row field changes now emit exact old/new lookup read keys in
+  addition to broad field reads, so a dependent exact lookup invalidates when a
+  row changes from or to the selected value.
+- Root `List/find` projections now preserve exact lookup dependency recording
+  even when the selected row is currently missing, so a later matching row can
+  wake the projection.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime exact_list_lookup_invalidation_tracks_old_and_new_text_values`:
+  pass.
+- `cargo test -q -p boon_runtime list_index_find`: pass (`4` tests).
+- `cargo test -q -p boon_runtime pure_boon_cells`: pass (`4` tests).
+- `cargo test -q -p boon_runtime cells_`: pass (`23` tests).
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  fail on final current-code rerun. The report is schema-valid and still proves
+  retained/runtime contracts (`full_document_lower_count=0`,
+  `total_list_find_rows_scanned=0`, `total_recomputed_fields=0`), but misses
+  latency budgets with `click_to_formula_visible_ms_p95=34.059249`,
+  `click_to_formula_visible_ms_max=36.528202`, and
+  `input_wake_to_formula_visible_ms_p95=19.559588999998596`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+
+Remaining architecture options:
+
+- Native input scheduling still needs a direct same-loop late-input resample
+  design or an equivalent proof that no extra pre-present frame boundary remains.
+  A post-acquire stale-frame deferral experiment was tried and reverted because
+  it regressed the release visible-click report (`input_wake_to_formula_visible_ms_p95`
+  about `18.58ms`).
+- A first-class `CellsViewportModel`/GPU grid renderer would be the bigger
+  change for huge sheets: fixed metrics, 2D visible range plus overscan,
+  retained selection/editor overlay, and compact visible draw lists.
+- A spreadsheet formula graph is still the long-term engine shape: parsed
+  formulas, direct/range dependencies, scalable range intervals, cycle states,
+  and demand-current visible evaluation.

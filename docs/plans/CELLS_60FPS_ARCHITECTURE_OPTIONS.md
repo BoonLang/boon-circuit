@@ -26,6 +26,16 @@ architecture debt that can reappear on larger sheets or richer formulas:
 - full summary APIs can still pull more currentness work than a hot interaction
   should need.
 
+2026-06-28 update: a parallel architecture pass split the next work into native
+input scheduling, runtime/list currentness, and external spreadsheet/UI design.
+All three agreed that Cells should move toward a sparse spreadsheet engine plus
+a retained/virtualized viewport, not more Cells-only Boon patches. The bounded
+implementation slice taken in this pass was generic runtime work: exact indexed
+`List/find` dependencies now avoid broad list-column reads on indexed hits, and
+changed text-like list fields emit exact old/new lookup invalidation keys. This
+preserves the existing `List/find` text index while reducing false fanout for
+formula/currentness dependencies.
+
 ## External Patterns To Copy Carefully
 
 - AG Grid and Handsontable virtualize rows and columns and render only viewport
@@ -72,6 +82,18 @@ Best use: near-term p95/max latency stability.
 
 Risk: duplicate/lost edge handling if input cursor acceptance is wrong.
 
+Current evidence: focused release Cells visible-click samples already keep the
+hot retained overlay work small, with interaction around low single-digit
+milliseconds and direct input-overlay render-scene patch encoding. The remaining
+tail is mostly app-window input wake/present scheduling variance plus occasional
+runtime-current spikes. A safe next patch here should resample late app-window
+input in the same loop before presenting, while preserving stale-frame rejection.
+An attempted narrower post-acquire deferral experiment was reverted after it
+regressed the release visible-click gate (`input_wake_to_formula_visible_ms_p95`
+rose to about `18.58ms` and max click-to-formula exceeded the bounded cap). The
+next scheduling fix should be a real same-loop resample/re-render design, not a
+later discard point.
+
 ## Option B: First-Class Retained Render Scene
 
 Goal: make selection/formula-bar changes mutate retained render state directly.
@@ -104,6 +126,14 @@ Best use: larger-than-2600 grids and richer formulas.
 
 Risk: stale hidden row fields if currentness barriers miss a demand read.
 
+Implemented slice: exact indexed list lookup invalidation is now more precise.
+`List/find(cells, field: address, value: target)` records
+`list_lookup_text:cells.address=target` without also recording the broad
+`list_column:cells.address` dependency when the text index is used. Field
+changes still emit broad field reads for broad dependents, but also emit exact
+old/new lookup keys so formulas/projections that depend on a single address are
+invalidated only when a row changes from or to that address.
+
 ## Option D: Edit Session Overlay
 
 Goal: keep active selection, formula-bar text, caret, and in-cell editing out of
@@ -121,6 +151,23 @@ Best use: spreadsheet-like feel and lower runtime pressure.
 
 Risk: must preserve Boon semantics for apps that intentionally bind selection or
 editing state as source data.
+
+External comparison summary:
+
+- spreadsheet/data-grid frameworks converge on fixed row/column metrics,
+  2D viewport virtualization, and small overscan;
+- canvas/GPU grids keep the interactive surface as one retained drawing target
+  rather than thousands of per-cell widgets;
+- spreadsheet engines separate formula parsing, dependency graph maintenance,
+  and recalculation/currentness;
+- retained UI/render stacks split app state changes from GPU upload/draw phases.
+
+The practical Boon target is therefore:
+
+`host input -> hit test -> address -> edit/selection overlay -> formula text from indexed runtime -> retained patch -> present`
+
+Formula evaluation and dependent recalculation should stay current-on-demand and
+fanout-limited, not part of the pointer-to-visible selection path.
 
 ## Implemented Slice: Post-Turn Summary Reuse
 

@@ -20587,3 +20587,49 @@ Follow-up native report refresh:
   count, and stale headed visual evidence (`git_fresh=false`,
   `worktree_fresh=false`). Its role artifact also did not exercise
   `layout_render_scene_patch_direct_encode`.
+
+## 2026-06-28 - Exact Indexed List Lookup Invalidation
+
+Status: implemented a focused U5/runtime currentness improvement after a
+parallel architecture review of Cells. The change narrows generic indexed
+`List/find` dependency fanout; it is not a 60 FPS completion claim.
+
+What changed:
+
+- Successful indexed `List/find` reads now depend on exact text lookup keys
+  rather than also depending on the full list column.
+- Text-like list field changes publish exact old/new lookup keys alongside the
+  existing broad field keys, preserving broad dependents while allowing exact
+  lookup dependents to stay clean on unrelated row changes.
+- Root `List/find` projections record exact lookup dependencies even when the
+  projection currently has no matching row.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime exact_list_lookup_invalidation_tracks_old_and_new_text_values`:
+  pass.
+- `cargo test -q -p boon_runtime list_index_find`: pass.
+- `cargo test -q -p boon_runtime pure_boon_cells`: pass.
+- `cargo test -q -p boon_runtime cells_`: pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  fail on final current-code rerun. Retained/runtime contracts pass with no
+  full lower, no scans, no recomputed fields, and no root materialization, but
+  latency misses remain: `click_to_formula_visible_ms_p95=34.059249`,
+  `click_to_formula_visible_ms_max=36.528202`,
+  `input_wake_to_formula_visible_ms_p95=19.559588999998596`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+
+Remaining blockers:
+
+- The native Cells click report is close to the input-wake budget, but the next
+  lever is likely app-window input scheduling/readback variance rather than
+  another Cells Boon patch.
+  A post-acquire deferral-only scheduling experiment was reverted after it
+  worsened the release visible-click report to
+  `input_wake_to_formula_visible_ms_p95=18.580495999998675` and introduced
+  bounded max failures.
+- Layout-sidecar direct WGPU patch encoding exists in code but still needs a
+  live verifier scenario that actually exercises it.
+- Full spreadsheet architecture still wants a retained viewport/grid model and
+  explicit formula dependency graph before much larger sheets are honest.

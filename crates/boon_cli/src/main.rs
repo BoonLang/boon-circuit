@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
-use boon_plan::{TargetProfile, compile_typed_program, verify_plan};
+use boon_compiler::compile_typed_program;
+use boon_plan::{TargetProfile, verify_plan};
 use boon_runtime::{
     VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report,
     run_plan_initial_state, run_plan_root_scalar_scenario, run_plan_scenario_events,

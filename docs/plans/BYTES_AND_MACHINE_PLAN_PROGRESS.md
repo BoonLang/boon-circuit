@@ -23200,3 +23200,39 @@ Remaining blockers:
   before the aggregate can be cited as fresh passing evidence.
 - Phase 10 remains blocked: `boon_cli run` still defaults to legacy until the
   broader parity, performance, no-fallback, and readiness criteria pass.
+
+## 2026-06-27 - Compiler Facade Boundary Started
+
+Status: started the post-speedup compiler-boundary milestone without beginning
+production Rust/Zig/Wasm codegen and without changing the default executor.
+
+What changed:
+
+- Added a new `boon_compiler` crate as the public compiler orchestration facade.
+- `boon_compiler::compile_typed_program` currently delegates to the existing
+  `boon_plan` backend, preserving plan output while creating the crate boundary
+  needed for later MachinePlan v2 / NativeRegionIR / Rust and Zig codegen work.
+- Routed external compiler orchestration call sites in `boon_cli`,
+  `boon_runtime`, `boon_report_schema`, and `xtask` through `boon_compiler`.
+- Left `boon_plan::compile_typed_program` in place as a compatibility backend;
+  internal `boon_plan` tests still exercise it directly.
+- Added a `boon_compiler` parity test proving Counter compiles through the new
+  facade to the same plan hash as the current backend.
+
+Evidence before commit:
+
+- `cargo test -q -p boon_compiler`: pass, `1` test.
+- `cargo check -q -p boon_compiler -p boon_cli -p boon_runtime -p boon_report_schema -p xtask`:
+  pass, with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_compiler -p boon_report_schema`: pass,
+  `boon_compiler` `1` test and `boon_report_schema` `29` tests.
+- `cargo fmt --all -- --check`: pass after formatting.
+
+Remaining blockers:
+
+- This is only the compatibility facade. `boon_plan` still depends on
+  `boon_ir` and parser AST types, so the full compiler-boundary acceptance is
+  not complete.
+- Do not start production Rust/Zig codegen until the semantic IR boundary,
+  MachinePlan v2 / NativeRegionIR design, dependency verifier, and current
+  default-readiness gates are in better shape.

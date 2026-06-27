@@ -545,12 +545,22 @@ dependencies = [
 name = "boon_cli"
 version = "0.1.0"
 dependencies = [
+ "boon_compiler",
  "boon_ir",
  "boon_parser",
  "boon_plan",
  "boon_runtime",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "boon_compiler"
+version = "0.1.0"
+dependencies = [
+ "boon_ir",
+ "boon_parser",
+ "boon_plan",
 ]
 
 [[package]]
@@ -731,6 +741,7 @@ dependencies = [
 name = "boon_report_schema"
 version = "0.1.0"
 dependencies = [
+ "boon_compiler",
  "boon_ir",
  "boon_parser",
  "boon_plan",
@@ -746,6 +757,7 @@ version = "0.1.0"
 dependencies = [
  "bitvec",
  "boon_bridge",
+ "boon_compiler",
  "boon_ir",
  "boon_parser",
  "boon_plan",
@@ -4248,6 +4260,7 @@ dependencies = [
  "accesskit",
  "boon_3mf",
  "boon_bridge",
+ "boon_compiler",
  "boon_document",
  "boon_document_model",
  "boon_driver",

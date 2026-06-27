@@ -61393,7 +61393,7 @@ fn verify_bytes_byte_bank_layout(args: &[String]) -> Result<(), Box<dyn std::err
         let parsed = boon_parser::parse_source(case.source, source)?;
         let ir = boon_ir::lower(&parsed)?;
         let plan =
-            boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+            boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
         let verification = boon_plan::verify_plan(&plan)?;
         let fixed_bytes_scalars = plan
             .storage_layout
@@ -63435,7 +63435,8 @@ fn verify_bytes_file_read_plan(args: &[String]) -> Result<(), Box<dyn std::error
     let ir = boon_ir::lower(&parsed)?;
     boon_ir::verify_hidden_identity(&ir)?;
     boon_ir::verify_static_schedule(&ir)?;
-    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan =
+        boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
     let plan_hash = boon_plan::plan_sha256(&plan)?;
     let plan_verification = boon_plan::verify_plan(&plan)?;
     let plan_has_file_read = plan.regions.iter().any(|region| {
@@ -63481,8 +63482,10 @@ fn verify_bytes_file_read_plan(args: &[String]) -> Result<(), Box<dyn std::error
     let dynamic_ir = boon_ir::lower(&dynamic_parsed)?;
     boon_ir::verify_hidden_identity(&dynamic_ir)?;
     boon_ir::verify_static_schedule(&dynamic_ir)?;
-    let dynamic_plan =
-        boon_plan::compile_typed_program(&dynamic_ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let dynamic_plan = boon_compiler::compile_typed_program(
+        &dynamic_ir,
+        boon_plan::TargetProfile::SoftwareDefault,
+    )?;
     let dynamic_plan_hash = boon_plan::plan_sha256(&dynamic_plan)?;
     let dynamic_plan_verification = boon_plan::verify_plan(&dynamic_plan)?;
     let dynamic_file_read_ops = dynamic_plan
@@ -64115,7 +64118,8 @@ fn verify_bytes_file_write_plan(args: &[String]) -> Result<(), Box<dyn std::erro
     let ir = boon_ir::lower(&parsed)?;
     boon_ir::verify_hidden_identity(&ir)?;
     boon_ir::verify_static_schedule(&ir)?;
-    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan =
+        boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
     let plan_hash = boon_plan::plan_sha256(&plan)?;
     let plan_verification = boon_plan::verify_plan(&plan)?;
     let file_write_ops = plan
@@ -64164,8 +64168,10 @@ fn verify_bytes_file_write_plan(args: &[String]) -> Result<(), Box<dyn std::erro
     let dynamic_ir = boon_ir::lower(&dynamic_parsed)?;
     boon_ir::verify_hidden_identity(&dynamic_ir)?;
     boon_ir::verify_static_schedule(&dynamic_ir)?;
-    let dynamic_plan =
-        boon_plan::compile_typed_program(&dynamic_ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let dynamic_plan = boon_compiler::compile_typed_program(
+        &dynamic_ir,
+        boon_plan::TargetProfile::SoftwareDefault,
+    )?;
     let dynamic_plan_hash = boon_plan::plan_sha256(&dynamic_plan)?;
     let dynamic_plan_verification = boon_plan::verify_plan(&dynamic_plan)?;
     let dynamic_file_write_ops = dynamic_plan

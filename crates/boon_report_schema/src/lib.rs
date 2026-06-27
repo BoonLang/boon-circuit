@@ -8627,7 +8627,8 @@ fn verify_dynamic_path_file_write_summary(
     })?;
     boon_ir::verify_hidden_identity(&ir)?;
     boon_ir::verify_static_schedule(&ir)?;
-    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan =
+        boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
     let plan_hash = boon_plan::plan_sha256(&plan)?;
     if summary.get("plan_hash").and_then(JsonValue::as_str) != Some(plan_hash.as_str()) {
         return Err(format!(
@@ -10982,7 +10983,8 @@ fn verify_dynamic_path_file_read_summary(
     })?;
     boon_ir::verify_hidden_identity(&ir)?;
     boon_ir::verify_static_schedule(&ir)?;
-    let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
+    let plan =
+        boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)?;
     let plan_hash = boon_plan::plan_sha256(&plan)?;
     if summary.get("plan_hash").and_then(JsonValue::as_str) != Some(plan_hash.as_str()) {
         return Err(format!(
@@ -22723,7 +22725,7 @@ fn compile_report_machine_plan(
             report_path.display()
         )
     })?;
-    boon_plan::compile_typed_program(&ir, target_profile).map_err(|error| {
+    boon_compiler::compile_typed_program(&ir, target_profile).map_err(|error| {
         format!(
             "{} could not compile source-derived MachinePlan: {error}",
             report_path.display()
@@ -27809,8 +27811,9 @@ mod tests {
         boon_ir::verify_hidden_identity(&ir).unwrap();
         boon_ir::verify_static_schedule(&ir).unwrap();
         let graph_node_count = ir.graph_node_count;
-        let plan = boon_plan::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)
-            .unwrap();
+        let plan =
+            boon_compiler::compile_typed_program(&ir, boon_plan::TargetProfile::SoftwareDefault)
+                .unwrap();
         (plan, graph_node_count)
     }
 

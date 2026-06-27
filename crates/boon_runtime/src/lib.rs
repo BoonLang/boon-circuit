@@ -4,6 +4,7 @@
 
 use bitvec::prelude::*;
 use boon_bridge::{BridgeBlobRef, BridgePageRef, BridgeTaskCompletion, BridgeValue};
+use boon_compiler::compile_typed_program;
 #[cfg(test)]
 use boon_ir::lower;
 use boon_ir::{
@@ -22,7 +23,7 @@ use boon_plan::{
     InitialValueKind as PlanInitialValueKind, MachinePlan, PlanConstantId, PlanConstantValue,
     PlanDerivedExpression, PlanExpressionKind, PlanListProjection, PlanOpKind, PlanRowExpression,
     PlanRowSelectPattern, PlanSourceGuard, PlanValueType, RegionKind, TargetProfile, ValueRef,
-    compile_typed_program, plan_sha256, verify_plan,
+    plan_sha256, verify_plan,
 };
 use boon_scene_model::{
     AppearanceMaterial, AppearanceMaterialId, Bounds3D, Camera, CameraId, CameraProjection,

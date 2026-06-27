@@ -20229,3 +20229,38 @@ Next executable work:
   `verify-bytes-machine-plan-all`.
 - Keep Phase 10 blocked until readiness stops reporting partial phases, stale
   support reports, and the legacy default executor.
+
+## 2026-06-27 - Compiler Facade Boundary Started
+
+Status: started the codegen prerequisite path from the post-speedup roadmap.
+This is not Rust/Zig codegen yet; it is the crate boundary needed before those
+backends can be cleanly designed.
+
+What changed:
+
+- Added `crates/boon_compiler` as the repository-owned compiler facade.
+- The facade preserves existing behavior by delegating
+  `compile_typed_program` to the current `boon_plan` backend.
+- External crates that compile Boon IR to MachinePlan now call
+  `boon_compiler::compile_typed_program` instead of calling the plan backend
+  directly.
+- Added a Counter parity test proving the facade and backend produce identical
+  plan hashes for the existing source.
+
+Evidence before commit:
+
+- `cargo test -q -p boon_compiler`: pass, `1` test.
+- `cargo check -q -p boon_compiler -p boon_cli -p boon_runtime -p boon_report_schema -p xtask`:
+  pass, with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_compiler -p boon_report_schema`: pass,
+  `boon_compiler` `1` test and `boon_report_schema` `29` tests.
+- `cargo fmt --all -- --check`: pass after formatting.
+
+Next executable work:
+
+- Add a compiler-boundary verifier that reports the current dependency graph
+  honestly: facade exists and external orchestration uses it, but `boon_plan`
+  still imports `boon_ir` / parser AST until the backend extraction is done.
+- Keep Rust/Zig codegen behind this boundary work; starting codegen directly
+  from current `TypedProgram` or v1 `MachinePlan` would deepen the wrong
+  dependency shape.

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_compiler.workspace = true
 boon_ir.workspace = true
 boon_parser.workspace = true
 boon_plan.workspace = true

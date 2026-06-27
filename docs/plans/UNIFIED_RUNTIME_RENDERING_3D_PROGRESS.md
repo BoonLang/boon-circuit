@@ -20142,3 +20142,54 @@ Next validation step:
 - Commit the runtime slice, refresh the headed Cells report from a clean
   worktree, then rerun the release Cells interaction-speed gate so the native
   aggregate no longer fails on stale visual evidence.
+
+## 2026-06-27 - Native Input Resample Diagnostics
+
+Status: implemented a bounded native input scheduling slice after the
+subagent/zoom-out review. The app-window render loop now detects input wakes
+that land during input sampling and can resample inline before calling the
+preview poll hook. Input wakes that land later still use the existing deferred
+next-loop path, but both paths now have explicit counters in
+`NativeRenderLoopState` and top-level app-window loop reports.
+
+What changed:
+
+- Added `input_inline_resample_count`,
+  `input_deferred_resample_count`, event-gap counters, and last-resample fields
+  to `NativeRenderLoopState`.
+- Added a bounded two-iteration inline resample before
+  `poll_native_window_hooks` when the input generation changes during sampling.
+- Preserved the existing deferred path for input that arrives after hook
+  sampling, and made that path observable instead of invisible scheduler churn.
+- Corrected a stale idle-wait unit assertion: scheduled wakes below the passive
+  input poll cap correctly use the earlier scheduled deadline.
+
+Evidence:
+
+- `cargo fmt --all -- --check` passed.
+- `cargo test -q -p boon_native_app_window` passed: `32` tests.
+- `cargo check -q -p boon_native_app_window` passed.
+- `cargo check -q -p boon_native_playground` passed with existing native GPU
+  warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  first passed, then failed one rerun narrowly at
+  `input_wake_to_formula_visible_ms_p95=17.251013999999486`, then passed again
+  with `input_wake_to_formula_visible_ms_p95=16.509635000000344`,
+  `click_to_formula_visible_ms_p95=26.775382`,
+  `simple_source_click_count=64`, `generic_fallback_count=0`, one bounded
+  click-to-present outlier, and zero unbounded outliers.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  passed.
+
+Latest app-window loop report facts:
+
+- `input_inline_resample_count=0`, `input_deferred_resample_count=1`,
+  `input_deferred_resample_event_gap_count=2`, `last_input_resample_kind` was
+  `deferred_next_loop`, and `stale_for_latest_input=false`.
+
+Architecture note:
+
+- This slice improves observability and removes one avoidable stale-sample
+  boundary, but the near-threshold visible-click rerun confirms that the deeper
+  fix is still architectural: either a bounded app-window input event queue or
+  retained-frame/dirty-area rendering, not more unmeasured micro-tuning.

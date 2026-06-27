@@ -23117,3 +23117,46 @@ Next step:
 
 - Commit this slice, refresh headed Cells evidence from the clean worktree, and
   rerun the native Cells interaction-speed gate.
+
+## 2026-06-27 - Native Input Resample Diagnostics
+
+Status: added a bounded native app-window input scheduling/observability slice
+after the zoom-out review. This does not replace the future event-queue
+architecture, but it gives the current demand-driven loop explicit counters for
+input wakes that land during or after sampling.
+
+What changed:
+
+- `NativeRenderLoopState` now tracks inline and deferred input resamples plus
+  event-gap counts.
+- The interactive render loop performs up to two inline resamples when the input
+  wake generation changes while sampling, before the preview poll hook runs.
+- The old deferred next-loop behavior remains for input that arrives later, but
+  it is now visible in app-window loop reports.
+
+Evidence:
+
+- `cargo fmt --all -- --check` passed.
+- `cargo test -q -p boon_native_app_window` passed: `32` tests.
+- `cargo check -q -p boon_native_app_window` passed.
+- `cargo check -q -p boon_native_playground` passed with existing native GPU
+  warnings.
+- The focused Cells visible-click gate remained near the strict budget: one
+  rerun failed narrowly at `input_wake_to_formula_visible_ms_p95=17.251ms`,
+  then the latest rerun passed at `16.509635000000344ms`, with
+  `simple_source_click_count=64`, `generic_fallback_count=0`, one bounded
+  outlier, and zero unbounded outliers.
+- Schema validation passed for
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json`.
+
+Next architecture options:
+
+- Implement a bounded app-window event queue so the render loop drains exact
+  timestamped events instead of reconstructing click batches from coalesced
+  state.
+- Implement retained-frame/dirty-area or scroll-copy rendering so Cells does
+  not redraw the whole visible scene for small selection/formula-bar changes or
+  scroll-strip updates.
+- Continue MachinePlan/default-switch work once the current native evidence is
+  preserved, rather than spending the next iteration only on tiny timing
+  margins.

@@ -743,6 +743,12 @@ pub struct NativeRenderLoopState {
     pub rendered_frame_count: u64,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
+    pub input_inline_resample_count: u64,
+    pub input_deferred_resample_count: u64,
+    pub input_inline_resample_event_gap_count: u64,
+    pub input_deferred_resample_event_gap_count: u64,
+    pub last_input_resample_event_gap_count: u64,
+    pub last_input_resample_kind: Option<String>,
     pub idle_poll_size_scale_total_us: u64,
     pub idle_poll_input_sample_total_us: u64,
     pub idle_poll_accessibility_total_us: u64,
@@ -789,6 +795,12 @@ impl NativeRenderLoopState {
             rendered_frame_count: 0,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
+            input_inline_resample_count: 0,
+            input_deferred_resample_count: 0,
+            input_inline_resample_event_gap_count: 0,
+            input_deferred_resample_event_gap_count: 0,
+            last_input_resample_event_gap_count: 0,
+            last_input_resample_kind: None,
             idle_poll_size_scale_total_us: 0,
             idle_poll_input_sample_total_us: 0,
             idle_poll_accessibility_total_us: 0,
@@ -874,6 +886,24 @@ impl NativeRenderLoopState {
 
     pub fn note_input_poll(&mut self) {
         self.input_poll_count = self.input_poll_count.saturating_add(1);
+    }
+
+    pub fn note_input_inline_resample(&mut self, event_gap_count: u64) {
+        self.input_inline_resample_count = self.input_inline_resample_count.saturating_add(1);
+        self.input_inline_resample_event_gap_count = self
+            .input_inline_resample_event_gap_count
+            .saturating_add(event_gap_count);
+        self.last_input_resample_event_gap_count = event_gap_count;
+        self.last_input_resample_kind = Some("inline_before_hook".to_owned());
+    }
+
+    pub fn note_input_deferred_resample(&mut self, event_gap_count: u64) {
+        self.input_deferred_resample_count = self.input_deferred_resample_count.saturating_add(1);
+        self.input_deferred_resample_event_gap_count = self
+            .input_deferred_resample_event_gap_count
+            .saturating_add(event_gap_count);
+        self.last_input_resample_event_gap_count = event_gap_count;
+        self.last_input_resample_kind = Some("deferred_next_loop".to_owned());
     }
 
     pub fn note_idle_poll_substeps(
@@ -2288,9 +2318,22 @@ async fn run_surface_probe_inner(
         render_loop_state.note_poll_started(hold_started.elapsed().as_secs_f64() * 1000.0);
         render_loop_state.consume_due_wake(poll_started_at);
         let input_sample_started = Instant::now();
-        let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        let mut sampled_input_event_wake_count_before =
+            input_event_wake_count.load(Ordering::Relaxed);
+        let mut input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        let mut sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            if sampled_input_event_wake_count <= sampled_input_event_wake_count_before {
+                break;
+            }
+            let resample_gap =
+                sampled_input_event_wake_count - sampled_input_event_wake_count_before;
+            render_loop_state.note_input_inline_resample(resample_gap);
+            sampled_input_event_wake_count_before = sampled_input_event_wake_count;
+            input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+            sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        }
         let input_sample_elapsed = input_sample_started.elapsed();
-        let sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         last_sampled_input_event_wake_count = sampled_input_event_wake_count;
         let accessibility_started = Instant::now();
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
@@ -2357,6 +2400,9 @@ async fn run_surface_probe_inner(
         let unsampled_input_wake_count =
             current_input_event_wake_count > sampled_input_event_wake_count;
         if unsampled_input_wake_count && !deferred_unsampled_input_resample {
+            render_loop_state.note_input_deferred_resample(
+                current_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
+            );
             deferred_unsampled_input_resample = true;
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
             render_loop_state.scheduled_wake_count =
@@ -3153,7 +3199,7 @@ fn write_render_loop_state_report(
             "scheduled_wake"
         }
     });
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "status": status,
         "role": role.as_str(),
         "pid": pid,
@@ -3259,6 +3305,32 @@ fn write_render_loop_state_report(
         "loop_error": loop_error,
         "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
+    if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "input_inline_resample_count".to_owned(),
+            serde_json::json!(state.input_inline_resample_count),
+        );
+        object.insert(
+            "input_deferred_resample_count".to_owned(),
+            serde_json::json!(state.input_deferred_resample_count),
+        );
+        object.insert(
+            "input_inline_resample_event_gap_count".to_owned(),
+            serde_json::json!(state.input_inline_resample_event_gap_count),
+        );
+        object.insert(
+            "input_deferred_resample_event_gap_count".to_owned(),
+            serde_json::json!(state.input_deferred_resample_event_gap_count),
+        );
+        object.insert(
+            "last_input_resample_event_gap_count".to_owned(),
+            serde_json::json!(state.last_input_resample_event_gap_count),
+        );
+        object.insert(
+            "last_input_resample_kind".to_owned(),
+            serde_json::json!(state.last_input_resample_kind),
+        );
+    }
     let bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| NativeWindowError::Failed(format!("serialize loop state: {error}")))?;
     std::fs::write(path, bytes).map_err(|error| {
@@ -3934,12 +4006,39 @@ mod tests {
         assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
 
         state.schedule_wake_after(now, Duration::from_millis(30));
-        assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
+        assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(30));
 
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented(state.dirty_revision);
         state.schedule_wake_after(now, Duration::from_millis(4));
         assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn input_resample_counters_distinguish_inline_and_deferred_turns() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+
+        state.note_input_inline_resample(2);
+        assert_eq!(state.input_inline_resample_count, 1);
+        assert_eq!(state.input_deferred_resample_count, 0);
+        assert_eq!(state.input_inline_resample_event_gap_count, 2);
+        assert_eq!(state.input_deferred_resample_event_gap_count, 0);
+        assert_eq!(state.last_input_resample_event_gap_count, 2);
+        assert_eq!(
+            state.last_input_resample_kind.as_deref(),
+            Some("inline_before_hook")
+        );
+
+        state.note_input_deferred_resample(3);
+        assert_eq!(state.input_inline_resample_count, 1);
+        assert_eq!(state.input_deferred_resample_count, 1);
+        assert_eq!(state.input_inline_resample_event_gap_count, 2);
+        assert_eq!(state.input_deferred_resample_event_gap_count, 3);
+        assert_eq!(state.last_input_resample_event_gap_count, 3);
+        assert_eq!(
+            state.last_input_resample_kind.as_deref(),
+            Some("deferred_next_loop")
+        );
     }
 
     #[test]

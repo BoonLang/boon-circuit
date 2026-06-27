@@ -20101,3 +20101,44 @@ Architecture notes from the zoom-out pass:
 - A deeper WGPU milestone is still open: a retained frame texture or chunk
   atlas that redraws only dirty chunks. The current patch lowers command/draw
   overhead but still clears and draws the visible scene.
+
+## 2026-06-27 - Direct Runtime List Chunk Materialization
+
+Status: implemented the next generic runtime/list slice behind Cells
+`store.sheet_rows`: root `List/chunk(...)` projections can now materialize
+directly from a storage-backed source list or list selection instead of falling
+back through full generic vector/list-map evaluation.
+
+What changed:
+
+- Added a generic `direct_chunk_projection` root list-view materialization path
+  in `boon_runtime`.
+- The path keeps the logical source list intact, writes chunk rows with row-ref
+  item arrays, records source list/column read keys, and reports zero
+  `full_eval_row_count` / `list_map_row_count`.
+- Unsupported chunk sources still fall back to the existing evaluator; this is
+  not a Cells-specific shortcut and does not shrink the logical grid.
+
+Evidence before commit:
+
+- `cargo test -q -p boon_runtime root_list_chunk_direct_materialization_uses_storage_backed_projection -- --nocapture`
+  passed.
+- `cargo test -q -p boon_runtime list_chunk_projects_windowed_derived_record_lists -- --nocapture`
+  passed.
+- `cargo check -q -p boon_runtime` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo build -q -p xtask` passed with existing native GPU warnings.
+- `timeout 900s target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  wrote `status="fail"` because the headed visual child reported
+  `worktree_fresh=false` while this patch was still uncommitted. The role run
+  itself passed with `interaction_latency_ms_p95=8.57806`,
+  `interaction_latency_ms_max=19.353151`, `logical_cell_count=2600`,
+  `materialized_cell_count_max=240`, `rendered_cell_count=210`,
+  `formula_evaluated_cell_count_max=4`, and
+  `formula_recomputed_field_count_max=6`.
+
+Next validation step:
+
+- Commit the runtime slice, refresh the headed Cells report from a clean
+  worktree, then rerun the release Cells interaction-speed gate so the native
+  aggregate no longer fails on stale visual evidence.

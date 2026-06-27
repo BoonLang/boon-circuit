@@ -37552,6 +37552,317 @@ impl GenericScheduledRuntime {
         }))
     }
 
+    fn try_materialize_root_list_chunk_projection_field(
+        &mut self,
+        field: &GenericDerivedRootField,
+        target_list: &str,
+        current_dirty_reads: &BTreeSet<GenericReadKey>,
+        field_cache_hits_before: usize,
+        field_cache_misses_before: usize,
+        field_cache_stores_before: usize,
+    ) -> RuntimeResult<Option<RootListViewMaterializationResult>> {
+        let Some(projection) = self
+            .list_projections
+            .projections
+            .iter()
+            .find(|projection| runtime_path_matches_target(&field.path, &projection.target))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let (item_field, label_field) = match &projection.kind {
+            RuntimeListProjectionKind::Chunk {
+                item_field,
+                label_field,
+            } => (item_field.clone(), label_field.clone()),
+            RuntimeListProjectionKind::Find { .. } => return Ok(None),
+        };
+        let columns = projection.columns;
+        if columns == 0 {
+            return Ok(None);
+        }
+        let Some(source) = self.root_list_chunk_projection_row_index_source(&projection)? else {
+            return Ok(None);
+        };
+
+        let eval_started = Instant::now();
+        let mut reads = root_read_keys_for_path(&projection.list)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        reads.insert(list_read_key(source.list()));
+        let template = self
+            .storage
+            .lists
+            .row_template(target_list)
+            .cloned()
+            .ok_or_else(|| {
+                format!("generic runtime has no row template for list `{target_list}`")
+            })?;
+        let source_len = source.len();
+        self.record_list_view_direct_rows(source_len);
+        let row_count = if projection.rows > 0 {
+            projection.rows
+        } else {
+            source_len.div_ceil(columns)
+        };
+        let mut rows = Vec::with_capacity(row_count);
+        for row_index in 0..row_count {
+            let start = row_index.saturating_mul(columns);
+            let end = start.saturating_add(columns).min(source_len);
+            let mut items = Vec::with_capacity(end.saturating_sub(start));
+            for target_index in start..end {
+                let Some(source_index) = source.index_at(target_index) else {
+                    continue;
+                };
+                for field in self
+                    .storage
+                    .list_row_field_names(source.list(), source_index)?
+                {
+                    reads.insert(list_column_read_key(source.list(), &field));
+                }
+                items.push(boon_value_json(&BoonValue::RowRef {
+                    list: source.list().to_owned(),
+                    index: source_index,
+                }));
+            }
+            let mut columns = ValueColumns::default();
+            columns.insert_value(label_field.clone(), FieldValue::Text(row_index.to_string()));
+            columns.insert_value("index".to_owned(), FieldValue::Json(json!(row_index)));
+            columns.insert_value(
+                item_field.clone(),
+                FieldValue::Json(JsonValue::Array(items)),
+            );
+            rows.push(template.materialize(columns)?);
+        }
+        let eval_ms = runtime_elapsed_ms(eval_started);
+
+        self.generic_derived_state
+            .replace_root_reads(field.path.clone(), reads);
+        let previous_snapshot_started = Instant::now();
+        let previous_rows = self.storage.list_visible_snapshots(target_list)?;
+        let previous_snapshot_ms = runtime_elapsed_ms(previous_snapshot_started);
+        let diff_started = Instant::now();
+        let changed =
+            self.root_list_view_changed_reads(&field.path, target_list, &previous_rows, &rows);
+        let diff_ms = runtime_elapsed_ms(diff_started);
+        let root_source_identities = vec![None; rows.len()];
+        let source_identity_changed = self
+            .storage
+            .root_source_identities_changed(target_list, &root_source_identities)?;
+
+        if !runtime_root_list_view_profile_enabled() {
+            if changed.changed_reads.is_empty() && !source_identity_changed {
+                return Ok(Some(RootListViewMaterializationResult {
+                    changed_reads: BTreeSet::new(),
+                    profile: None,
+                }));
+            }
+            let changed_reads = if source_identity_changed && changed.changed_reads.is_empty() {
+                self.root_list_view_broad_changed_read_keys(&field.path, target_list)
+            } else {
+                changed.changed_reads
+            };
+            self.clear_indexed_lookup_cache();
+            let patched_in_place = self
+                .storage
+                .replace_or_patch_list_rows_with_root_source_identities(
+                    target_list,
+                    rows,
+                    root_source_identities,
+                )?;
+            if !patched_in_place {
+                self.rebind_list_sources(target_list)?;
+            }
+            return Ok(Some(RootListViewMaterializationResult {
+                changed_reads,
+                profile: None,
+            }));
+        }
+
+        let (
+            current_dirty_root_read_count,
+            current_dirty_list_read_count,
+            current_dirty_list_column_read_count,
+            current_dirty_list_field_read_count,
+        ) = generic_read_key_kind_counts(current_dirty_reads);
+        let mut profile = LiveRuntimeRootListViewProfile {
+            list: target_list.to_owned(),
+            list_storage_mode: "direct_chunk_projection".to_owned(),
+            list_value_shape: format!("{}_chunk_projection", source.value_shape()),
+            row_count: rows.len(),
+            previous_row_count: previous_rows.len(),
+            changed_row_count: changed.changed_row_count,
+            changed_field_count: changed.changed_field_count,
+            broad_fallback: changed.broad_fallback,
+            current_dirty_read_count: current_dirty_reads.len(),
+            current_dirty_root_read_count,
+            current_dirty_list_read_count,
+            current_dirty_list_column_read_count,
+            current_dirty_list_field_read_count,
+            full_eval_row_count: 0,
+            full_eval_unchanged_row_count: 0,
+            source_identity_count: 0,
+            field_cache_hits: self
+                .root_list_view_field_cache_hits
+                .saturating_sub(field_cache_hits_before),
+            field_cache_misses: self
+                .root_list_view_field_cache_misses
+                .saturating_sub(field_cache_misses_before),
+            field_cache_stores: self
+                .root_list_view_field_cache_stores
+                .saturating_sub(field_cache_stores_before),
+            eval_ms,
+            list_values_ms: 0.0,
+            row_materialize_ms: eval_ms,
+            previous_snapshot_ms,
+            diff_ms,
+            replace_ms: 0.0,
+            rebind_ms: 0.0,
+            in_place_patch: false,
+            in_place_patch_row_count: 0,
+            field_only_attempt: false,
+            field_only_patch: false,
+            field_only_fallback_reason: None,
+            field_only_patch_row_count: 0,
+            field_only_skipped_field_count: 0,
+            field_only_evaluated_field_count: 0,
+            field_only_changed_field_count: 0,
+            targeted_skip_disabled_by_currentness_refresh_count: 0,
+            targeted_skip_disabled_dirty_row_count: 0,
+            targeted_skip_disabled_dirty_field_count: 0,
+            compiled_frontier_field_count: 0,
+            compiled_frontier_classifiable_field_count: 0,
+            compiled_frontier_unclassified_field_count: 0,
+            compiled_frontier_row_dependent_field_count: 0,
+            compiled_frontier_whole_row_dependent_field_count: 0,
+            compiled_frontier_row_field_dependency_count: 0,
+            compiled_frontier_predicted_dirty_field_count: 0,
+            compiled_frontier_predicted_clean_field_count: 0,
+            field_profile_total_ms: 0.0,
+            eval_minus_field_profiles_ms: eval_ms,
+            eval_unattributed_ms: eval_ms,
+            list_map_call_count: 0,
+            list_map_row_count: 0,
+            list_map_output_cache_hit_count: 0,
+            list_map_output_cache_miss_count: 0,
+            list_map_output_cache_store_count: 0,
+            list_map_output_cache_dirty_forced_miss_count: 0,
+            list_map_total_ms: 0.0,
+            list_map_values_ms: 0.0,
+            list_map_row_eval_ms: 0.0,
+            user_function_call_count: 0,
+            user_function_cache_hit_count: 0,
+            user_function_cache_hit_read_key_count: 0,
+            user_function_cache_hit_numeric_guard_count: 0,
+            user_function_body_read_key_count: 0,
+            user_function_body_numeric_guard_count: 0,
+            user_function_arg_eval_ms: 0.0,
+            user_function_cache_key_ms: 0.0,
+            user_function_cache_hit_ms: 0.0,
+            user_function_body_ms: 0.0,
+            user_function_record_env_fingerprint_ms: 0.0,
+            user_function_record_field_loop_ms: 0.0,
+            field_cache_value_hit_count: 0,
+            field_cache_field_value_hit_count: 0,
+            field_cache_dirty_forced_miss_count: 0,
+            field_cache_dirty_forced_miss_read_key_count: 0,
+            field_cache_hit_read_key_count: 0,
+            field_cache_hit_numeric_guard_count: 0,
+            field_cache_miss_read_key_count: 0,
+            field_cache_miss_numeric_guard_count: 0,
+            value_columns_insert_count: 0,
+            record_map_insert_count: rows.len().saturating_mul(3),
+            direct_find_profile: None,
+            field_profiles: Vec::new(),
+        };
+        if changed.changed_reads.is_empty() && !source_identity_changed {
+            return Ok(Some(RootListViewMaterializationResult {
+                changed_reads: BTreeSet::new(),
+                profile: Some(profile),
+            }));
+        }
+        let changed_reads = if source_identity_changed && changed.changed_reads.is_empty() {
+            self.root_list_view_broad_changed_read_keys(&field.path, target_list)
+        } else {
+            changed.changed_reads
+        };
+        let replace_started = Instant::now();
+        self.clear_indexed_lookup_cache();
+        let patched_in_place = self
+            .storage
+            .replace_or_patch_list_rows_with_root_source_identities(
+                target_list,
+                rows,
+                root_source_identities,
+            )?;
+        profile.replace_ms = runtime_elapsed_ms(replace_started);
+        if !patched_in_place {
+            let rebind_started = Instant::now();
+            self.rebind_list_sources(target_list)?;
+            profile.rebind_ms = runtime_elapsed_ms(rebind_started);
+        } else {
+            profile.in_place_patch = true;
+            profile.in_place_patch_row_count = profile.row_count;
+        }
+        Ok(Some(RootListViewMaterializationResult {
+            changed_reads,
+            profile: Some(profile),
+        }))
+    }
+
+    fn root_list_chunk_projection_row_index_source(
+        &mut self,
+        projection: &RuntimeListProjection,
+    ) -> RuntimeResult<Option<RootListViewRowIndexSource>> {
+        if projection.columns == 0 {
+            return Ok(None);
+        }
+        if self
+            .generic_derived
+            .root_field_plan(&projection.list)
+            .is_some()
+        {
+            self.ensure_root_current(
+                &projection.list,
+                RuntimeRootCurrentnessReason::ProjectionStorage,
+            )?;
+        }
+        if let Some(list) = self.storage.list_name_for_path(&projection.list) {
+            let len = self.storage.list_len(list)?;
+            return Ok(Some(RootListViewRowIndexSource::ListRef {
+                list: list.to_owned(),
+                len,
+            }));
+        }
+        let Some(value) = self
+            .generic_derived_state
+            .root_value_cache
+            .get(&projection.list)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        match value {
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                Ok(Some(RootListViewRowIndexSource::ListRef { list, len }))
+            }
+            BoonValue::ListSelection { list, indices } => {
+                Ok(Some(RootListViewRowIndexSource::ListSelection {
+                    list,
+                    indices,
+                }))
+            }
+            BoonValue::RowRef { list, index } => {
+                Ok(Some(RootListViewRowIndexSource::SingleRowRef {
+                    list,
+                    index,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn materialize_root_list_view_field_with_cache_state(
         &mut self,
         field: &GenericDerivedRootField,
@@ -37571,6 +37882,16 @@ impl GenericScheduledRuntime {
         let field_cache_hits_before = self.root_list_view_field_cache_hits;
         let field_cache_misses_before = self.root_list_view_field_cache_misses;
         let field_cache_stores_before = self.root_list_view_field_cache_stores;
+        if let Some(result) = self.try_materialize_root_list_chunk_projection_field(
+            field,
+            &list,
+            current_dirty_reads,
+            field_cache_hits_before,
+            field_cache_misses_before,
+            field_cache_stores_before,
+        )? {
+            return Ok(result);
+        }
         if let Some(result) = self.try_materialize_root_list_find_projection_field(
             field,
             &list,
@@ -74950,6 +75271,90 @@ FUNCTION new_signal(signal) {
         assert_eq!(windowed_rows[0]["signals"][0]["name"], "data1");
         assert_eq!(windowed_rows[1]["row_number"], "2");
         assert_eq!(windowed_rows[1]["signals"][0]["name"], "data2");
+    }
+
+    #[test]
+    fn root_list_chunk_direct_materialization_uses_storage_backed_projection() {
+        let source = r#"
+signals:
+    LIST {
+        [name: TEXT { clk }, family: TEXT { clock }]
+        [name: TEXT { data0 }, family: TEXT { data }]
+        [name: TEXT { data1 }, family: TEXT { data }]
+        [name: TEXT { data2 }, family: TEXT { data }]
+    }
+    |> List/map(signal, new: new_signal(signal: signal))
+
+store: [
+    elements: [
+        filter: SOURCE
+    ]
+    query:
+        TEXT { data } |> HOLD query {
+            LATEST {
+                elements.filter.text
+            }
+        }
+    search_results:
+        signals |> List/filter_text_contains(field: "name", needle: query, prefer_field: "family", empty_field: "family", empty_value: TEXT { data })
+    visible_rows:
+        List/chunk(search_results, size: 2, items: signals, label: row_number)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Signals }))
+
+FUNCTION new_signal(signal) {
+    [
+        name: signal.name
+        family: signal.family
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("root-list-chunk-direct", source).unwrap();
+        let initial = runtime.state_summary();
+        let initial_rows = initial["store"]["visible_rows"].as_array().unwrap();
+        assert_eq!(initial_rows.len(), 2);
+        assert_eq!(initial_rows[0]["signals"][0]["name"], "data0");
+        assert_eq!(initial_rows[1]["signals"][0]["name"], "data2");
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.elements.filter".to_owned(),
+                text: Some("clk".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("filter text should refresh chunked visible rows");
+        let summary = runtime.state_summary();
+        let rows = summary["store"]["visible_rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["row_number"], "0");
+        assert_eq!(rows[0]["signals"][0]["name"], "clk");
+
+        let sample = output
+            .root_materialization_stats
+            .samples
+            .iter()
+            .find(|sample| sample.path == "store.visible_rows")
+            .expect("visible_rows chunk projection should record a materialization sample");
+        let profile = sample
+            .list_view_profile
+            .as_ref()
+            .expect("chunk projection should expose a list-view profile");
+        assert_eq!(profile.list_storage_mode, "direct_chunk_projection");
+        assert_eq!(profile.full_eval_row_count, 0);
+        assert_eq!(profile.list_map_call_count, 0);
+        assert_eq!(profile.list_map_row_count, 0);
+        assert_eq!(profile.row_count, 1);
+        assert_eq!(profile.previous_row_count, 2);
+        assert!(
+            profile.list_value_shape.ends_with("_chunk_projection"),
+            "direct chunk profile should classify the source shape: {profile:?}"
+        );
+        assert!(
+            output.list_scan_counters.list_view_direct_rows >= 1,
+            "direct chunk path should report direct row handling: {:?}",
+            output.list_scan_counters
+        );
     }
 
     #[test]

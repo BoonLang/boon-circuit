@@ -23078,3 +23078,42 @@ Remaining broader-goal blockers:
 - The next broader slices remain MachinePlan/codegen/default-switch readiness,
   Zig/Rust codegen planning, and the deeper retained WGPU architecture where a
   retained frame texture or chunk atlas redraws only dirty chunks.
+
+## 2026-06-27 - Direct Runtime List Chunk Materialization
+
+Status: added a focused generic runtime materialization path for root
+`List/chunk(...)` projections. This is a small architecture slice toward the
+spreadsheet-style runtime model: `store.sheet_rows` can be materialized from
+storage-backed source row indexes without full generic list/vector evaluation.
+
+What changed:
+
+- `boon_runtime` now recognizes storage-backed root `List/chunk` projections
+  and builds chunk rows directly with row-ref item arrays.
+- The direct path records source list and row-column read keys, reports
+  `list_storage_mode="direct_chunk_projection"`, and keeps
+  `full_eval_row_count=0` / `list_map_row_count=0`.
+- Non-storage-backed chunk sources still use the existing full evaluator, so
+  this remains a bounded generic improvement rather than a Cells fixture hack.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_list_chunk_direct_materialization_uses_storage_backed_projection -- --nocapture`
+  passed.
+- `cargo test -q -p boon_runtime list_chunk_projects_windowed_derived_record_lists -- --nocapture`
+  passed.
+- `cargo check -q -p boon_runtime` passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo build -q -p xtask` passed with existing native GPU warnings.
+- A pre-commit release Cells interaction-speed run reached
+  `role_report_status="pass"` with `interaction_latency_ms_p95=8.57806`,
+  `interaction_latency_ms_max=19.353151`, `logical_cell_count=2600`,
+  `materialized_cell_count_max=240`, and
+  `formula_evaluated_cell_count_max=4`; the aggregate report stayed
+  `status="fail"` only because the headed visual child marked the uncommitted
+  worktree stale.
+
+Next step:
+
+- Commit this slice, refresh headed Cells evidence from the clean worktree, and
+  rerun the native Cells interaction-speed gate.

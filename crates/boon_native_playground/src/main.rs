@@ -36326,6 +36326,42 @@ fn preview_refresh_selection_proxy_focused_text_from_selected_input(
     preview_reset_caret_blink(input_state);
 }
 
+fn preview_refresh_selection_proxy_focused_text_from_retained_input(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> bool {
+    if !input_state.focused_selection_proxy {
+        return false;
+    }
+    let Some(address) = input_state.focused_address.as_deref() else {
+        return false;
+    };
+    let Some(text) = retained_text_input_text_for_address(shared_render_state, address) else {
+        return false;
+    };
+    input_state.focused_text = text;
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit = false;
+    preview_reset_caret_blink(input_state);
+    true
+}
+
+fn retained_text_input_text_for_address(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    address: &str,
+) -> Option<String> {
+    let shared = shared_render_state.lock().ok()?;
+    let frame = shared.layout_frame_override.as_deref()?;
+    frame
+        .display_list
+        .iter()
+        .find(|item| {
+            matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                && focused_address(&shared.layout_proof, &item.node.0).as_deref() == Some(address)
+        })
+        .and_then(|item| item.text.clone())
+}
+
 fn preview_refresh_cached_focus_payloads(
     layout_proof: &Value,
     focused_node: &str,
@@ -37977,7 +38013,12 @@ fn preview_try_apply_simple_source_click_input(
     }
     let bound_input_sync_ms = elapsed_ms(bound_input_sync_started);
     let selection_proxy_refresh_started = Instant::now();
-    preview_refresh_selection_proxy_focused_text_from_selected_input(live_runtime, input_state);
+    if !preview_refresh_selection_proxy_focused_text_from_retained_input(
+        shared_render_state,
+        input_state,
+    ) {
+        preview_refresh_selection_proxy_focused_text_from_selected_input(live_runtime, input_state);
+    }
     let selection_proxy_refresh_ms = elapsed_ms(selection_proxy_refresh_started);
     let apply_ms = elapsed_ms(apply_started);
     preview_set_interaction_diagnostic_subphase("simple_source_click.hover_overlay");
@@ -40185,11 +40226,11 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         record_preview_retained_bound_sync_stats(stats);
         return false;
     };
-    let mut source_intent_update_nodes =
-        bound_input_source_intent_update_nodes(frame, text_binding_paths);
-    if let Some(target_nodes) = target_nodes {
-        source_intent_update_nodes.retain(|node| target_nodes.contains(node));
-    }
+    let source_intent_update_nodes = if let Some(target_nodes) = target_nodes {
+        target_nodes.clone()
+    } else {
+        bound_input_source_intent_update_nodes(frame, text_binding_paths)
+    };
     let source_intent_updates = source_intent_binding_updates_for_nodes(
         &snapshot,
         state_summary,
@@ -40612,14 +40653,16 @@ fn selected_input_editing_text_for_address(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     address: &str,
 ) -> Option<String> {
-    let fast_paths = [
+    let paths = [
         "store.selected_input.address",
         "store.selected_input.editing_text",
+        "store.selected_input.formula_text",
+        "store.selected_input.display_text",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect::<Vec<_>>();
-    let values = live_runtime.lock().ok()?.document_state_values(&fast_paths);
+    let values = live_runtime.lock().ok()?.document_state_values(&paths);
     if values
         .get("store.selected_input.address")
         .and_then(serde_json::Value::as_str)
@@ -40627,17 +40670,12 @@ fn selected_input_editing_text_for_address(
     {
         return None;
     }
-    document_state_values_text(&values, "store.selected_input.editing_text").or_else(|| {
-        selected_input_text_for_address(
-            live_runtime,
-            address,
-            &[
-                "store.selected_input.formula_text",
-                "store.selected_input.display_text",
-                "store.selected_input.value",
-            ],
-        )
-    })
+    document_state_values_text(&values, "store.selected_input.editing_text")
+        .or_else(|| document_state_values_text(&values, "store.selected_input.formula_text"))
+        .or_else(|| document_state_values_text(&values, "store.selected_input.display_text"))
+        .or_else(|| {
+            selected_input_text_for_address(live_runtime, address, &["store.selected_input.value"])
+        })
 }
 
 fn selected_input_display_text_for_address(

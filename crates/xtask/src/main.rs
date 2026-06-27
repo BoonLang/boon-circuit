@@ -48010,6 +48010,12 @@ fn verify_native_cells_visible_click_e2e(
         .get("click_to_runtime_current_observed_ms")
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
+    let retained_update_contract =
+        cells_visible_click_retained_update_contract_summary(&live_probe);
+    let retained_update_contract_pass = retained_update_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     let bounded_click_to_present_outlier_cap_ms = max_click_to_present_ms + max_click_to_formula_ms;
     let cold_sample_count = live_probe
         .get("cold_sample_count")
@@ -48209,6 +48215,41 @@ fn verify_native_cells_visible_click_e2e(
                 .to_owned()
         }),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:retained-committed-update-contract",
+        retained_update_contract_pass,
+        format!(
+            "status={:?}, total={}, retained={}, full_lower={}, patch_rejected={}, committed_render_patch={}",
+            retained_update_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            retained_update_contract
+                .get("click_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retained_update_contract
+                .get("retained_committed_update_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retained_update_contract
+                .get("full_document_lower_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retained_update_contract
+                .get("document_patch_fast_path_rejected_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retained_update_contract
+                .get("committed_render_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (!retained_update_contract_pass).then(|| {
+            "Cells visible click must use retained committed update timing samples with render patches and no full document lower fallback".to_owned()
+        }),
+    );
 
     let role_artifacts = live_probe
         .get("artifact_paths")
@@ -48334,6 +48375,7 @@ fn verify_native_cells_visible_click_e2e(
                 .get("click_measurement_timing")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "retained_update_contract": retained_update_contract,
             "bounded_click_to_present_outlier_policy": "steady driver-to-app-wake outliers are accepted only when every max-budget violation remains below max_click_to_present_ms + max_click_to_formula_ms, the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms, and the sample produced a changed app-owned readback/proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below the same bounded cap and produce changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
@@ -48426,6 +48468,149 @@ fn cells_visual_formula_probe_from_readback(
         "full_frame_visual_changed": full_frame_visual_changed,
         "retained_text_update_count": text_update_count,
         "visual_formula_changed": visual_formula_changed
+    })
+}
+
+fn cells_visible_click_retained_update_contract_summary(
+    live_probe: &serde_json::Value,
+) -> serde_json::Value {
+    let mut click_sample_count = 0_u64;
+    let mut interaction_sample_count = 0_u64;
+    let mut retained_committed_update_count = 0_u64;
+    let mut full_document_lower_count = 0_u64;
+    let mut document_patch_fast_path_rejected_count = 0_u64;
+    let mut committed_render_patch_count = 0_u64;
+    let mut committed_render_scene_patch_applied_count = 0_u64;
+    let mut layout_source_counts = BTreeMap::<String, u64>::new();
+    let mut summary_source_counts = BTreeMap::<String, u64>::new();
+    let mut render_scene_patch_source_counts = BTreeMap::<String, u64>::new();
+    let mut sample_failures = Vec::new();
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let interaction = sample.get("interaction_timing");
+        let Some(interaction) = interaction.filter(|value| value.is_object()) else {
+            sample_failures.push(json!({
+                "index": sample_index,
+                "reason": "missing_interaction_timing"
+            }));
+            continue;
+        };
+        interaction_sample_count = interaction_sample_count.saturating_add(1);
+        let layout_source = interaction
+            .get("layout_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        *layout_source_counts
+            .entry(layout_source.to_owned())
+            .or_default() += 1;
+        let summary_source = interaction
+            .get("summary_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        *summary_source_counts
+            .entry(summary_source.to_owned())
+            .or_default() += 1;
+        let retained_committed_update = matches!(
+            layout_source,
+            "visible_state_sync" | "paint_space_patch" | "patched_document_frame"
+        );
+        if retained_committed_update {
+            retained_committed_update_count = retained_committed_update_count.saturating_add(1);
+        }
+        if layout_source == "full_document_lower" {
+            full_document_lower_count = full_document_lower_count.saturating_add(1);
+        }
+        if interaction
+            .get("document_patch_fast_path_rejected")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            document_patch_fast_path_rejected_count =
+                document_patch_fast_path_rejected_count.saturating_add(1);
+        }
+        let render_patch_count = interaction
+            .get("render_patch_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let coalesced_render_patch_count = interaction
+            .get("coalesced_render_patch_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if render_patch_count > 0 || coalesced_render_patch_count > 0 {
+            committed_render_patch_count = committed_render_patch_count.saturating_add(1);
+        }
+        if interaction
+            .pointer("/layout_patch_profile/render_scene_patch_applied")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            committed_render_scene_patch_applied_count =
+                committed_render_scene_patch_applied_count.saturating_add(1);
+        }
+        let render_scene_patch_source = sample
+            .pointer("/present_probe/last_external_render_proof/render_scene_patch_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        *render_scene_patch_source_counts
+            .entry(render_scene_patch_source.to_owned())
+            .or_default() += 1;
+        if !retained_committed_update
+            || layout_source == "full_document_lower"
+            || render_patch_count == 0 && coalesced_render_patch_count == 0
+            || interaction
+                .get("document_patch_fast_path_rejected")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            sample_failures.push(json!({
+                "index": sample_index,
+                "target_address": sample
+                    .get("target_address")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "layout_source": layout_source,
+                "summary_source": summary_source,
+                "render_patch_count": render_patch_count,
+                "coalesced_render_patch_count": coalesced_render_patch_count,
+                "document_patch_fast_path_rejected": interaction
+                    .get("document_patch_fast_path_rejected")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "render_scene_patch_source": render_scene_patch_source,
+                "reason": "non_retained_or_unpatched_committed_update"
+            }));
+        }
+    }
+    let status = if click_sample_count > 0
+        && interaction_sample_count == click_sample_count
+        && retained_committed_update_count == click_sample_count
+        && committed_render_patch_count == click_sample_count
+        && full_document_lower_count == 0
+        && document_patch_fast_path_rejected_count == 0
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "click_sample_count": click_sample_count,
+        "interaction_sample_count": interaction_sample_count,
+        "retained_committed_update_count": retained_committed_update_count,
+        "full_document_lower_count": full_document_lower_count,
+        "document_patch_fast_path_rejected_count": document_patch_fast_path_rejected_count,
+        "committed_render_patch_count": committed_render_patch_count,
+        "committed_render_scene_patch_applied_count": committed_render_scene_patch_applied_count,
+        "layout_source_counts": layout_source_counts,
+        "summary_source_counts": summary_source_counts,
+        "render_scene_patch_source_counts": render_scene_patch_source_counts,
+        "sample_failures": sample_failures,
     })
 }
 

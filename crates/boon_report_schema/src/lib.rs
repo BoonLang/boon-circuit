@@ -2256,6 +2256,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-example-speed"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-interaction-speed"
+                | "verify-native-cells-visible-click-e2e"
                 | "verify-native-dev-editor-speed"
                 | "verify-boon-driver-schema"
                 | "verify-boon-driver-e2e"

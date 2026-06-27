@@ -7717,9 +7717,7 @@ fn verify_bytes_machine_plan_all_report(
             .into());
         }
         if label != "phase0-baseline"
-            && !command_argv
-                .iter()
-                .any(|arg| arg.as_str() == Some(expected_child.command))
+            && !child_command_argv_proves_expected_command(command_argv, expected_child.command)
         {
             return Err(format!(
                 "{} child report `{label}` command_argv does not contain expected command `{}`",
@@ -27649,6 +27647,33 @@ fn report_command_is(report: &JsonValue, expected: &str) -> bool {
     report.get("command").and_then(JsonValue::as_str) == Some(expected)
 }
 
+fn child_command_argv_proves_expected_command(command_argv: &[JsonValue], expected: &str) -> bool {
+    if command_argv
+        .iter()
+        .any(|arg| arg.as_str() == Some(expected))
+    {
+        return true;
+    }
+
+    match expected {
+        "run-plan-scenario-events" => {
+            command_argv_has_arg(command_argv, "run")
+                && command_argv_value_after(command_argv, "--engine") == Some("compare")
+        }
+        "semantic" => {
+            command_argv_has_arg(command_argv, "run")
+                && command_argv_value_after(command_argv, "--engine").is_none()
+        }
+        _ => false,
+    }
+}
+
+fn command_argv_has_arg(command_argv: &[JsonValue], expected: &str) -> bool {
+    command_argv
+        .iter()
+        .any(|arg| arg.as_str() == Some(expected))
+}
+
 fn report_is_runtime_execution_layer(report: &JsonValue) -> bool {
     matches!(
         report.get("layer").and_then(JsonValue::as_str),
@@ -27849,6 +27874,49 @@ mod tests {
         assert!(!schema_accepts(
             bad_indexed_flag,
             "bytes-byte-bank-layout-bad-indexed-flag"
+        ));
+    }
+
+    #[test]
+    fn bytes_machine_plan_child_argv_accepts_boon_cli_run_logical_commands() {
+        let compare_argv = json!([
+            "target/debug/boon_cli",
+            "run",
+            "examples/todomvc.bn",
+            "--scenario",
+            "examples/todomvc.scn",
+            "--engine",
+            "compare",
+            "--report",
+            "target/reports/bytes-plan/todomvc-full-engine-compare.json"
+        ]);
+        let compare_argv = compare_argv.as_array().unwrap();
+        assert!(child_command_argv_proves_expected_command(
+            compare_argv,
+            "run-plan-scenario-events"
+        ));
+        assert!(!child_command_argv_proves_expected_command(
+            compare_argv,
+            "semantic"
+        ));
+
+        let semantic_argv = json!([
+            "target/debug/boon_cli",
+            "run",
+            "examples/cells.bn",
+            "--scenario",
+            "examples/cells.scn",
+            "--report",
+            "target/reports/bytes-plan/cells-ascii-formula-run.json"
+        ]);
+        let semantic_argv = semantic_argv.as_array().unwrap();
+        assert!(child_command_argv_proves_expected_command(
+            semantic_argv,
+            "semantic"
+        ));
+        assert!(!child_command_argv_proves_expected_command(
+            semantic_argv,
+            "run-plan-scenario-events"
         ));
     }
 

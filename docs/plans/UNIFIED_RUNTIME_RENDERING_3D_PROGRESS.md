@@ -20360,3 +20360,52 @@ Current interpretation:
   render path; the next useful implementation should force Cells
   selection/formula-bar updates through the committed nonstructural retained
   patch route and make the verifier reject full lower/rebuild fallback there.
+
+## 2026-06-27 - Cells Interaction-Speed Evidence Refreshed
+
+Status: refreshed U5/TASK-0804A native Cells interaction-speed evidence from
+the current clean worktree. This clears the previous headed visual
+cursor/readback blocker for the interaction-speed report. This is still not the
+whole unified goal; scroll, aggregates, compiler-boundary extraction, native-web,
+accessibility, 3D, and manufacturing phases remain open.
+
+What changed:
+
+- No source code changes.
+- Regenerated the strict headed Cells visual proof at
+  `target/reports/native-gpu/headed-scenario-cells.json`.
+- Regenerated the release Cells interaction-speed report at
+  `target/reports/native-gpu/cells-interaction-speed-release.json`.
+
+Evidence:
+
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`:
+  pass.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/headed-scenario-cells.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass.
+
+Fresh report highlights:
+
+- `headed_visual_evidence.status="pass"`, `git_fresh=true`,
+  `worktree_fresh=true`, `cursor_visible=true`, `key_hud_visible=true`, and
+  `readback_method="wgpu-generated-shader-app-owned-render-scene-readback"`.
+- Release interaction latency is under the strict `16.7ms` p95 budget in the
+  refreshed report. Treat the report JSON as authoritative for exact timing
+  values because native harness timings vary run to run.
+- `event_count=64`, `workflow_event_count=19`,
+  `simple_source_click_count=48`, and `real_window_click_shape_pass=true`.
+- `materialized_cell_count_max=240`, `rendered_cell_count=210`,
+  `formula_evaluated_cell_count_max=4`, and
+  `formula_recomputed_field_count_max=6`.
+
+Next executable work:
+
+- Refresh or rerun the aggregate reports that still depend on stale child
+  hashes.
+- Continue the compiler-boundary extraction before starting Rust/Zig codegen.
+- Continue U5/U6 retained render-scene and sparse `List/chunk` work so the
+  Cells improvements become architecture, not only refreshed evidence.

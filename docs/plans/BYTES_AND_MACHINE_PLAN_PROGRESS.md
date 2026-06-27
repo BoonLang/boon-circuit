@@ -23314,6 +23314,17 @@ Evidence:
   `Cells interaction speed requires fresh headed visual cursor/readback evidence`.
 - `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-interaction-speed-release.json`:
   pass.
+- Later same-day refresh from the current clean worktree:
+  `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`
+  passed, then
+  `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  passed. Both reports schema-validated. The refreshed interaction-speed report
+  has `headed_visual_evidence.status="pass"` and release interaction latency
+  under the strict `16.7ms` p95 budget. Treat the report JSON as authoritative
+  for exact timing values because native harness timings vary run to run. The
+  refreshed report also shows bounded Cells work: `materialized_cell_count_max`
+  around the visible/overscan range, `rendered_cell_count` around the visible
+  grid, and low formula-evaluated/recomputed cell counts.
 
 Fresh release report highlights:
 
@@ -23331,11 +23342,9 @@ Fresh release report highlights:
 
 Remaining blockers:
 
-- The current pass is visible click only. The broader 60 FPS target still needs
-  fresh release evidence for scroll and full Cells interaction-speed scenarios.
-- The current interaction-speed release report is still blocked by missing fresh
-  headed visual cursor/readback evidence before it can be used as the full
-  interaction-speed proof.
+- The current Cells visible-click and interaction-speed release reports pass.
+  The broader 60 FPS target still needs fresh release evidence for scroll,
+  aggregate gates, and the remaining sparse runtime/render architecture.
 - `List/chunk(cells, size: 26, ...)` still needs a true demand-windowed runtime
   representation below the summary layer for larger sparse grids.
 - Native input scheduling can still be tightened by collapsing late input
